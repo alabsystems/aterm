@@ -5,3 +5,4 @@
 
 mod derived_supervise_tape;
 mod models_occupancy;
+mod models_wakes;

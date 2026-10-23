@@ -1350,8 +1350,10 @@ pub const VERBS: &[VerbSpec] = &[
          state=<held|live|review|folded|stale|unseen|superseded|resolved-ok|resolved-warn|dismissed|answered|evicted|carried|withdrawn|recorded|quit> \
          glass=<row|-> rep=<n> key=<k|-> title=<t> detail=<d> actions=<a|-> \
          [progress=<n>/100|busy=1] [load=<network|disk|cpu>] [reveal=pending] [since_ms=<ms>] \
-         [need=<now|working|notice|later>] [rev=<digest_revision>]` (free text pct-encoded; `rev` \
-         is present on open digest entries). Bare `<n>` keeps the newest `n` (default 64, max \
+         [need=<now|working|notice|later>] [rev=<confirmation>]` (free text pct-encoded; `rev` \
+         is an opaque per-entry observation on open digest entries, changed by each accepted \
+         report, including an identical repeat; unrelated entries do not change it). Bare `<n>` \
+         keeps the newest `n` (default 64, max \
          512); `since=<id>` pages forward from `<id>`; `tag=` and `sev=` (floor) filter; \
          `need=later` selects exceptions to review; `live` selects unretired band rows \
          (`need=later live` for open exceptions; `reveal=pending` marks a row still inside its \
@@ -1377,9 +1379,11 @@ pub const VERBS: &[VerbSpec] = &[
          <detail>]` files a non-urgent exception in the menu-bar item and Settings ▸ Messages \
          (`OK later=<id> how=<new|restated|duplicate|quiet>`; up to 4 wire entries, filed after \
          14 d; `url=` adds an Open in browser button). `notice settle <key> <id> <revision>` \
-         resolves that open digest entry only while its key and revision (`id` and `rev` from \
+         resolves that open digest entry only while its key and confirmation (`id` and `rev` from \
          its `messages need=later live` row) still match (`OK settled=<id|-> \
-         how=<resolved-ok|gone>`); a changed, replaced or filed entry is left alone, and a \
+         how=<resolved-ok|gone>`); an entry repeated, changed, replaced or filed since that \
+         observation is left alone. \
+         The token is independent of UI revisions; an exhausted token refuses settlement. A \
          dismissal is never forgotten. `notice dismiss <id|review>` dismisses a row or files the \
          open exceptions; `notice act <id> <label|index|details>` presses a button (`OK \
          acted=<label> performed=<1|0>`). Titles <= 6 words / 48 chars; keys `1..=40` of \

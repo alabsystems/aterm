@@ -62,6 +62,30 @@ impl DeclarerRefusal {
 /// THE PROOF THAT A PEER IS OF THIS SESSION'S TREE.
 /// # Errors
 /// [`DeclarerRefusal`]: no peer, a chain that never meets the tab, or one that does not hold up.
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "WakeBook",
+        action = "DeclareOther",
+        project = "conformance_wakes::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "WakeBook",
+        action = "ForeignAwait",
+        project = "conformance_wakes::project"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::refines(
+        machine = "WakeBook",
+        action = "ForeignTake",
+        project = "conformance_wakes::project"
+    )
+)]
 pub fn prove(
     chain: &[ProcLink],
     pty_child: AgentId,

@@ -275,6 +275,12 @@ fn the_ledger_joins_the_four_sources() {
     assert_eq!(l.worker, WORKER);
     assert_eq!(l.manager.as_deref(), Some(MANAGER));
     assert!(l.aligned);
+    let clock = l.sources.iter().find(|s| s.name == "clock").expect("row");
+    assert!(
+        clock.ok && clock.detail.starts_with(ANCHOR_DEPRECATED),
+        "the anchor path says it is deprecated: {}",
+        clock.detail
+    );
     type Placed = (u64, Option<i64>, Result<usize, String>, Option<i64>);
     let turns: Vec<Placed> = l
         .turns
@@ -1052,4 +1058,463 @@ fn a_log_that_cannot_be_read_places_nothing_and_says_so() {
     );
     assert_eq!(l.mail.len(), 1);
     assert_eq!(l.mail[0].t, None);
+}
+
+/// A ledger named with no `--source`: the default.
+fn default_opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
+    LedgerOpts {
+        worker: format!("@{WORKER}"),
+        journal,
+        ..LedgerOpts::default()
+    }
+}
+
+/// THE DEFAULT IS THE LOG: a ledger named with no source reads the worker's `log
+/// class=turn` and this session's `log kinds=mail`, never a clock anchor nor
+/// `timeline`, and places every turn by its log record; NEGATIVE CONTROL: the
+/// anchor default asks for a clock, and the anchor's own tests name it.
+#[test]
+fn the_default_source_is_the_log() {
+    assert_eq!(LedgerOpts::default().source, LedgerSource::Log);
+    let mut host = log_host(true);
+    let l = read(&mut host, &default_opts(None), &mut |sid| {
+        panic!("the default asked for @{sid}'s clock anchor")
+    });
+    for asked in ["@s-work log class=turn", "@self log kinds=mail"] {
+        assert!(
+            host.requests.iter().any(|r| r == asked),
+            "{asked}: {:?}",
+            host.requests
+        );
+    }
+    assert!(
+        !host.requests.iter().any(|r| r.ends_with(" timeline")),
+        "{:?}",
+        host.requests
+    );
+    assert!(l.aligned);
+    assert!(
+        l.turns.iter().all(|t| t.t.is_some() && t.began),
+        "{:#?}",
+        l.turns
+    );
+    let clock = l.sources.iter().find(|s| s.name == "clock").expect("row");
+    assert!(
+        clock.ok && !clock.detail.contains("deprecated"),
+        "{}",
+        clock.detail
+    );
+}
+
+/// The default ledger's three renders, byte for byte
+/// (`fixtures/ledger-log-default.{txt,md,html}`): the journal's path reads `<journal>`, and
+/// the page's fixed style and script are left out of the HTML's.
+#[test]
+fn the_default_ledger_renders_its_goldens() {
+    let (dir, path) = journal_file("golden", &journal_lines());
+    let l = read(
+        &mut log_host(true),
+        &default_opts(Some(path.clone())),
+        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
+    );
+    let named = path.display().to_string();
+    let shown = |format: Format| render(&l, format).replace(&named, "<journal>");
+    let html = shown(Format::Html)
+        .replace(super::super::ledger_html::STYLE, "<style>…</style>\n")
+        .replace(super::super::ledger_html::SCRIPT, "…\n");
+    for (got, want, what) in [
+        (
+            shown(Format::Text),
+            include_str!("fixtures/ledger-log-default.txt"),
+            "text",
+        ),
+        (
+            shown(Format::Md),
+            include_str!("fixtures/ledger-log-default.md"),
+            "md",
+        ),
+        (
+            html,
+            include_str!("fixtures/ledger-log-default.html"),
+            "html",
+        ),
+    ] {
+        assert!(got == want, "the {what} render moved:\n{got}");
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// AN UNREAD LOG GUESSES NO TIME: when the worker's `log` cannot be read, the default ledger
+/// places no turn and says, where the latency would be, that the session log could not be
+/// read, and its journal times (wall times) print as they are, with no `~`, in text, md and
+/// html; the deprecated anchor path with no anchor still marks its guesses `~`; NEGATIVE
+/// CONTROL: a log the ledger read places its turns.
+#[test]
+fn an_unread_log_guesses_no_time() {
+    let (dir, path) = journal_file("log-unread", &journal_lines());
+    let l = read(
+        &mut whole_host(),
+        &default_opts(Some(path.clone())),
+        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
+    );
+    assert!(!l.aligned && !l.guessed, "{:?}", l.sources);
+    assert!(l.turns.iter().all(|t| t.t.is_none()));
+    assert!(l.journal.iter().any(|r| r.line == "TIMEOUT"));
+    let text = render(&l, Format::Text);
+    assert!(
+        text.contains("- (the session log could not be read)")
+            && !text.contains("the clock could not be placed"),
+        "{text}"
+    );
+    for (what, page) in [
+        ("text", text.clone()),
+        ("md", render(&l, Format::Md)),
+        ("html", render(&l, Format::Html)),
+    ] {
+        assert!(!page.contains('~'), "the {what} render guesses:\n{page}");
+    }
+    let read_log = read(
+        &mut log_host(true),
+        &default_opts(Some(path.clone())),
+        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
+    );
+    assert!(read_log.aligned && !read_log.guessed);
+    assert!(read_log.turns.iter().all(|t| t.t.is_some()));
+    let anchorless = read(&mut whole_host(), &opts(Some(path.clone())), &mut |sid| {
+        Err(format!("no live instance hosts @{sid}"))
+    });
+    assert!(anchorless.guessed && !anchorless.aligned);
+    let text = render(&anchorless, Format::Text);
+    assert!(
+        text.contains("~") && text.contains("- (the clock could not be placed)"),
+        "{text}"
+    );
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// EVERY JOURNAL WORD HAS ITS OWN MARK: each [`Word`] but `EVENT`, and each [`Noted`] word
+/// (a line the journal keeps as `other`), marks its lines with a kind no other word, `EVENT`
+/// phase, turn, reply or mail shares, and never `unread`; each `EVENT` phase the loops print
+/// has its mark; an older build's `other` line of a word this build reads takes that word's
+/// mark; every mark is in [`MarkKind::ALL`]; NEGATIVE CONTROL: a word, an `EVENT` phase or a
+/// kind this reader does not know reads `unread`.
+#[test]
+fn every_journal_word_has_its_own_mark() {
+    let mark = |line: &str| MarkKind::of_record(&JournalRecord::of_line(1, None, line, None));
+    let not_a_words = [
+        MarkKind::Turn,
+        MarkKind::Reply,
+        MarkKind::MailIn,
+        MarkKind::MailOut,
+        MarkKind::Unread,
+    ];
+    let mut events = Vec::new();
+    for (phase, want) in [
+        ("idle", MarkKind::Idle),
+        ("turn", MarkKind::Idle),
+        ("idle-no-report", MarkKind::Idle),
+        ("resumed", MarkKind::Idle),
+        ("question", MarkKind::Question),
+        ("prompt", MarkKind::Prompt),
+        ("limited", MarkKind::Limited),
+        ("still-limited", MarkKind::Limited),
+        ("survey", MarkKind::Survey),
+        ("context", MarkKind::Context),
+        ("compacted", MarkKind::Context),
+        ("busy", MarkKind::Busy),
+    ] {
+        assert_eq!(
+            mark(&format!("EVENT {phase} seq=1 x")),
+            want,
+            "EVENT {phase}"
+        );
+        events.push(want);
+    }
+    for phase in [
+        aterm_phase::Phase::Busy,
+        aterm_phase::Phase::Prompt,
+        aterm_phase::Phase::Limited {
+            message: String::new(),
+            reset: None,
+        },
+        aterm_phase::Phase::Idle,
+        aterm_phase::Phase::Question,
+    ] {
+        let m = mark(&format!("EVENT {} seq=1 x", phase.name()));
+        assert!(events.contains(&m), "EVENT {} reads {m:?}", phase.name());
+    }
+    let mut owners: BTreeMap<&str, String> = BTreeMap::new();
+    let printed = Word::ALL
+        .into_iter()
+        .filter(|w| *w != Word::Event)
+        .map(|w| (format!("{w:?}"), w.printed()))
+        .chain(
+            Noted::ALL
+                .into_iter()
+                .map(|w| (format!("{w:?}"), w.printed().to_string())),
+        );
+    for (word, printed) in printed {
+        for line in [format!("{printed} seq=1 x"), printed.clone()] {
+            let m = mark(&line);
+            assert!(
+                !not_a_words.contains(&m) && !events.contains(&m),
+                "{word} has no mark of its own: {m:?} ({line})"
+            );
+            match owners.get(m.name()) {
+                Some(other) if *other != word => panic!("{word} shares {m:?} with {other}"),
+                _ => owners.insert(m.name(), word.clone()),
+            };
+        }
+    }
+    for w in Noted::ALL {
+        let r = JournalRecord::of_line(1, None, &format!("{} seq=1 x", w.printed()), None);
+        assert_eq!(
+            (r.kind.as_str(), MarkKind::of_record(&r)),
+            ("other", MarkKind::Noted(w)),
+            "{w:?} is kept as `other` and marked by its word"
+        );
+    }
+    let mut seen: Vec<MarkKind> = owners
+        .keys()
+        .map(|name| {
+            *MarkKind::ALL
+                .iter()
+                .find(|m| m.name() == *name)
+                .unwrap_or_else(|| panic!("{name} is not in MarkKind::ALL"))
+        })
+        .collect();
+    seen.extend(events);
+    seen.extend(not_a_words);
+    let mut names: Vec<&str> = MarkKind::ALL.iter().map(|m| m.name()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(names.len(), MarkKind::ALL.len(), "two marks share a name");
+    assert!(
+        MarkKind::ALL.iter().all(|m| seen.contains(m)),
+        "a mark nothing marks"
+    );
+    for line in [
+        "PROBING seq=1 held",
+        "EVENT zebra seq=1 x",
+        "reset seq=1 rule=limit-reset@v1 x",
+        "DONEX seq=1 x",
+        "NOT seq=1 x",
+    ] {
+        assert_eq!(mark(line), MarkKind::Unread, "{line}");
+    }
+    let mut newer = JournalRecord::of_line(1, None, "HOLD seq=1 point x", None);
+    newer.kind = "zebra".to_string();
+    assert_eq!(
+        MarkKind::of_record(&newer),
+        MarkKind::Unread,
+        "another build's word"
+    );
+    let mut older = JournalRecord::of_line(1, None, "HOLD seq=1 point x", None);
+    older.kind = "other".to_string();
+    assert_eq!(
+        MarkKind::of_record(&older),
+        MarkKind::Hold,
+        "an older build kept HOLD as `other`"
+    );
+}
+
+/// A LOOP JOURNALS ONLY WHAT THE LEDGER READS: a test build's journal refuses a line whose
+/// word the ledger would read `unread` (`assert_marked`), so every loop test that journals
+/// holds its producers to [`Word`] and [`Noted`]; a `Noted` word, a `Word` and an `EVENT`
+/// phase pass; NEGATIVE CONTROL: a word no loop writes panics, on the journal's own write.
+#[test]
+fn a_loop_journals_only_what_the_ledger_reads() {
+    for line in [
+        "DONE seq=4 rule=finished@v1 the worker reported it",
+        "NOT ESCALATED seq=2 the notice n1 stands: x",
+        "KEPT attention for the loop that takes the session over",
+        "HOLD-ENDED seq=3 a person, but nobody has touched the box",
+        "EVENT idle seq=1 x",
+        "TIMEOUT",
+    ] {
+        super::assert_marked(line);
+        assert!(
+            super::super::journal::Journal::off()
+                .record(1, line, &mut Vec::new())
+                .is_none(),
+            "{line}"
+        );
+    }
+    let refused = std::panic::catch_unwind(|| {
+        super::super::journal::Journal::off().record(1, "PROBING seq=1 x", &mut Vec::new())
+    });
+    let why = refused.expect_err("an unread word is refused");
+    let why = why
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .unwrap_or_default();
+    assert!(why.contains("`PROBING seq=1 x`"), "{why}");
+}
+
+/// THE PAGE COLOURS EACH MARK AS ITS LEGEND ROW DOES: the script draws every mark by the
+/// item's swatch class (`colour(it.cls)`, never its kind), and each class a mark is drawn in
+/// takes the colour its `.swatch` rule in the style shows (the golden page leaves the script
+/// out, so only this reads it); NEGATIVE CONTROL: a mark coloured by its kind, or a class
+/// the script has no colour for, fails.
+#[test]
+fn the_page_colours_each_mark_as_its_legend_row_does() {
+    use super::super::ledger_html::{SCRIPT, STYLE, swatch};
+    let calls = SCRIPT.matches("colour(").count();
+    let by_class = SCRIPT.matches("colour(it.cls)").count();
+    assert!(
+        by_class >= 2,
+        "the turn's and the watcher's marks: {by_class}"
+    );
+    assert_eq!(
+        by_class,
+        calls - 1,
+        "every mark is coloured by its class (the other call is the definition)"
+    );
+    let body = SCRIPT
+        .split_once("function colour(cls) {")
+        .and_then(|(_, rest)| rest.split_once("\n  }\n"))
+        .map(|(body, _)| body)
+        .expect("the script's colour function");
+    let drawn = |cls: &str| -> String {
+        let branch = format!("if (cls === \"{cls}\") {{ return \"");
+        let rest = match body.split_once(&branch) {
+            Some((_, rest)) => rest,
+            None => body
+                .rsplit_once("return \"")
+                .map(|(_, rest)| rest)
+                .expect("a default colour"),
+        };
+        rest.split_once('"')
+            .map(|(colour, _)| colour.to_string())
+            .expect("a quoted colour")
+    };
+    let shown = |cls: &str| -> String {
+        let rule = format!(".swatch.{cls} {{ background: ");
+        STYLE
+            .split_once(&rule)
+            .and_then(|(_, rest)| rest.split_once(';'))
+            .map(|(colour, _)| colour.to_string())
+            .unwrap_or_else(|| panic!("no swatch rule for {cls}"))
+    };
+    for m in MarkKind::ALL {
+        if matches!(m, MarkKind::Reply | MarkKind::MailIn | MarkKind::MailOut) {
+            continue;
+        }
+        let cls = swatch(m);
+        assert_eq!(drawn(cls), shown(cls), "{m:?} is drawn in {cls}");
+    }
+}
+
+/// EVERY MARK HAS ITS OWN LEGEND ROW: the page's legend names each [`MarkKind`] once, after
+/// the reply its `working` bar, each in a swatch the style draws; an item's data says its
+/// swatch; NEGATIVE CONTROL: the golden page (`the_default_ledger_renders_its_goldens`)
+/// holds the legend's rows byte for byte.
+#[test]
+fn every_mark_has_its_own_legend_row() {
+    use super::super::ledger_html::{STYLE, legend, swatch};
+    let (dir, path) = journal_file("legend", &journal_lines());
+    let l = read(
+        &mut log_host(true),
+        &default_opts(Some(path.clone())),
+        &mut |sid| panic!("the default asked for @{sid}'s clock anchor"),
+    );
+    let html = render(&l, Format::Html);
+    let rows = legend();
+    assert_eq!(
+        rows.len(),
+        MarkKind::ALL.len() + 1,
+        "one row per mark, and working"
+    );
+    for m in MarkKind::ALL {
+        let row = format!(
+            "<li data-kind=\"{}\"><span class=\"swatch {}\"></span>",
+            m.name(),
+            swatch(m)
+        );
+        assert_eq!(html.matches(&row).count(), 1, "{m:?}: {row}");
+    }
+    assert_eq!(
+        rows.iter().position(|r| r.0 == "working"),
+        rows.iter().position(|r| r.0 == "reply").map(|i| i + 1),
+        "the working bar follows the reply"
+    );
+    for (_, cls, what) in &rows {
+        assert!(
+            STYLE.contains(&format!(".swatch.{cls} {{")),
+            "no swatch rule for {cls}"
+        );
+        assert!(!what.is_empty());
+    }
+    for (kind, cls) in [
+        ("approved", "event"),
+        ("reconnect", "warn"),
+        ("timeout", "bad"),
+        ("turn", "turn"),
+        ("mail-in", "mail"),
+    ] {
+        assert!(
+            html.contains(&format!("\"kind\":\"{kind}\",\"cls\":\"{cls}\"")),
+            "an item's data says its swatch: {kind}"
+        );
+    }
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir(dir);
+}
+
+/// A CARRIED TURN THE LOG HOLDS IS PLACED BY IT: a turn carried from an earlier aterm is
+/// placed by its own log record, and the history row does not call it timeless; the
+/// anchor path cannot place it and says so; NEGATIVE CONTROL: a turn the log does not
+/// hold has no time.
+#[test]
+fn a_carried_turn_the_log_holds_is_placed_by_it() {
+    let body = "turn 7 submitted=1 status=settled started_ms=5 dur_ms=3 seq=4 hash=0 \
+                arch=7730:9 carried=1 text=old\n\
+                turn 8 submitted=1 status=settled started_ms=9 dur_ms=3 seq=5 hash=0 \
+                arch=7730:10 text=next\n";
+    let history_detail = |l: &Ledger| {
+        l.sources
+            .iter()
+            .find(|s| s.name == "history")
+            .expect("row")
+            .detail
+            .clone()
+    };
+    let mut host = log_host(true);
+    host.replies
+        .insert("history".to_string(), VecDeque::from(vec![ok(body)]));
+    host.replies.insert(
+        "log".to_string(),
+        VecDeque::from(vec![
+            ok(&format!(
+                "5 open t1 turn par=r1 ledger=7 by=ctl src=screen conf=strong t={}\n",
+                EPOCH + 500
+            )),
+            log_mail_reply(),
+        ]),
+    );
+    let l = read(&mut host, &default_opts(None), &mut |sid| {
+        panic!("the default asked for @{sid}'s clock anchor")
+    });
+    assert_eq!(l.turns[0].t, Some(EPOCH + 500), "placed by its own record");
+    assert_eq!(
+        l.turns[1].t, None,
+        "a turn the log does not hold has no time"
+    );
+    let detail = history_detail(&l);
+    assert!(
+        detail.contains("1 carried from an earlier aterm") && !detail.contains("no time"),
+        "{detail}"
+    );
+    let mut host = whole_host();
+    host.replies
+        .insert("history".to_string(), VecDeque::from(vec![ok(body)]));
+    let a = read(&mut host, &opts(None), &mut anchors);
+    assert_eq!(a.turns[0].t, None, "the anchor cannot place a carried turn");
+    assert!(
+        history_detail(&a).contains("1 carried from an earlier aterm (no time)"),
+        "{}",
+        history_detail(&a)
+    );
 }

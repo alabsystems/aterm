@@ -3444,6 +3444,31 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
 }
 
 #[test]
+fn a_long_option_flag_protects_its_files_and_exempts_its_pattern() {
+    let home = Path::new("/Users/_owner");
+    let secrets = default_secrets(Some(home));
+    for line in [
+        "jq --slurp . ordinary.json ~/.ssh/id_rsa",
+        "rg --ignore token ~/.ssh/id_rsa",
+        "rg --ignore-file ~/.ssh/id_rsa token ordinary.txt",
+    ] {
+        let why = secrets_free(&[line.to_string()], &secrets, Some(home)).unwrap_err();
+        assert!(why.contains("a read of a secret"), "{line}: {why}");
+    }
+    for line in [
+        "jq --slurp . a.json b.json",
+        "rg --ignore ~/.ssh/id_rsa ordinary.txt",
+        "rg --ignore-file .ignore token ordinary.txt",
+    ] {
+        assert_eq!(
+            secrets_free(&[line.to_string()], &secrets, Some(home)),
+            Ok(()),
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn a_bash_read_of_a_secret_is_not_read_only() {
     for cmd in [
         "cat ~/.ssh/id_rsa",

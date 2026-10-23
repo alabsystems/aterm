@@ -179,7 +179,7 @@ fn passthrough_os(prefix: &Prefix, args: &[&OsString], notice: Option<&str>) -> 
 }
 
 fn not_native(prefix: &Prefix, args: &[String], cmd: &str) -> ExitCode {
-    passthrough(prefix, args, Some(&format!("'{cmd}' is not native yet")))
+    passthrough(prefix, args, Some(&format!("'{cmd}' is not native")))
 }
 
 fn failed(msg: &str) -> ExitCode {
@@ -233,7 +233,7 @@ fn from_install(prefix: &Prefix, args: &[String], r: Result<(), InstallError>) -
 fn after_native_progress(error: InstallError, completed: bool) -> InstallError {
     match error {
         InstallError::PassThrough(reason) if completed => InstallError::Failed(format!(
-            "{reason}; an earlier native attempt may have retained changes; refusing whole-command delegation"
+            "abrew: {reason}; earlier native steps may already have changed the prefix, so the whole command does not go to real brew"
         )),
         error => error,
     }
@@ -294,7 +294,8 @@ fn native_args(
 ) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
     let canonical = canonical_kind_switches(rest);
     let rest: &[String] = &canonical;
-    let unsupported = || InstallError::PassThrough(format!("'{cmd}' arguments are not native yet"));
+    let unsupported =
+        || InstallError::PassThrough(format!("'{cmd}' with these arguments is not native"));
     let unknown = || {
         const DELEGATED_KNOWN: &[&str] = &[
             "audit",
@@ -317,7 +318,7 @@ fn native_args(
             "zap",
         ];
         if COMMANDS.contains(&cmd) || DELEGATED_KNOWN.contains(&cmd) {
-            unsupported()
+            InstallError::PassThrough(format!("'{cmd}' is not native"))
         } else {
             InstallError::PassThrough(format!("'{cmd}' is not a command abrew knows natively"))
         }
@@ -523,7 +524,7 @@ fn native_args(
         return Err(unsupported());
     }
     if cmd == "cleanup" {
-        cleanup_max_age(rest).map_err(|error| InstallError::Failed(error.to_string()))?;
+        cleanup_max_age(rest).map_err(|error| InstallError::Failed(format!("abrew: {error}")))?;
     }
     let ops = if cmd == "info" {
         operands_without_flag_values(rest, &["--days", "--category"])
@@ -662,9 +663,8 @@ fn native_args(
 }
 
 fn bundle_args(rest: &[String]) -> Result<Option<Vec<bundle::BrewfileEntry>>, InstallError> {
-    let unsupported = || {
-        InstallError::PassThrough("bundle arguments or Brewfile rows are not native yet".to_owned())
-    };
+    let unsupported =
+        || InstallError::PassThrough("bundle arguments or Brewfile rows are not native".to_owned());
     match rest.first().map(String::as_str) {
         Some("status" | "remove") if rest.len() == 1 => Ok(None),
         Some("dump") => {
@@ -1150,53 +1150,58 @@ fn command_names(include_aliases: bool) -> Vec<&'static str> {
 }
 
 const HELP_MAIN: &str = "\
-abrew — aterm's Homebrew (docs/DESIGN-abrew-2026-10-19.md)
+abrew — aterm's Homebrew
 
 Usage: abrew <command> [args]
 
 Common commands:
-  install [--cask] <name>         install a supported bottle or cask
+  install [--cask] <name>…        install bottles and casks
   uninstall [--cask] <name>…      remove installed packages
-  reinstall, upgrade, outdated    refresh installed packages
-  update                          refresh formula data and taps
+  reinstall, upgrade, outdated    refresh installed packages, list stale ones
+  update                          refresh formula and cask data, and taps
   search <text>, info <name>      look packages up
   list [--cask] [--versions] [-l] what is installed
   doctor                          what needs attention
   deps, uses, leaves, missing     the dependency graph
   pin, unpin, link, unlink        manage kegs
-  tap, untap, bundle              taps and the Homebrew fallback bundle
-  services, postinstall, -s       delegate to real Homebrew
+  tap, untap                      manage taps
+  bundle                          Brewfiles, and the pinned real Homebrew
   cleanup, autoremove, fetch      housekeeping
-  completions bash|zsh|fish       shell discovery
+  completions bash|zsh|fish       print a shell completion script
+  on, off, status                 the brew reroute switch
 
 Real Homebrew, unchanged:  brew --real <command>…   ABREW_REAL=1   abrew off
-Native installs are limited to relocation-free bottles and zip/tar casks
-whose artifacts and constraints are plain data. Source builds, services and
-unsupported flags/recipes run real brew with a notice, using its own prefix.
+abrew pours bottles that need no relocation (or, on macOS with the developer
+tools, `:any` relocation) and installs tar, zip, DMG and single-file casks
+whose artifacts and constraints are plain data. Everything else (source
+builds, post-install recipes, pkg casks, services, unsupported flags) runs
+real brew, with a notice, in its own prefix.
+
+Further help: abrew help <command>; abrew commands; aterm help abrew
 ";
 
 fn help_for(cmd: &str) -> &'static str {
     match cmd {
         "install" => {
-            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] [--no-quarantine] <name>…\n  Source (-s) and --HEAD forms run real Homebrew. Multi-name installs plan\n  every name first; a batch with a non-native member delegates whole.\n"
+            "Usage: abrew install [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] [--quiet|-q] [--no-quarantine] <name>…\n  --ignore-dependencies and --quiet stay native only with --formula; -s, --HEAD\n  and flags abrew does not take run real Homebrew. Every name is planned first:\n  one that needs real Homebrew sends the whole command there.\n"
         }
         "uninstall" | "remove" => {
-            "Usage: abrew uninstall [--formula|--cask] [--ignore-dependencies] [--dry-run|-n] <name>…\n"
+            "Usage: abrew uninstall [--formula|--cask] [--ignore-dependencies] [--force|-f] [--dry-run|-n] <name>…\n  --force removes every installed version, pinned or not.\n"
         }
         "list" | "ls" => {
-            "Usage: abrew list [--formula|--cask] [--versions] [--multiple] [--pinned] [--full-name] [-l|--long] [name…]\n       abrew list --versions --json [--formula|--cask]\n"
+            "Usage: abrew list [--formula|--cask] [--versions] [--multiple] [--pinned] [--full-name] [-l|--long] [-1] [name…]\n       abrew list --versions --json [--formula|--cask]\n"
         }
         "info" => {
-            "Usage: abrew info [--formula|--cask] [--json[=v1|v2]] [--installed] [name…]\n       abrew info --analytics [--days N] [--category C] [--formula|--cask] <name>…\n"
+            "Usage: abrew info [--formula|--cask] [--json[=v1|v2]] [--installed] [name…]\n       abrew info --analytics [--days 30|90|365] [--category C] [--formula|--cask] <name>…\n  C is install, install-on-request or build-error.\n"
         }
         "outdated" => {
-            "Usage: abrew outdated [--formula|--cask] [--greedy] [--verbose|-v|--quiet|-q] [--json[=v1|v2]] [name…]\n"
+            "Usage: abrew outdated [--formula|--cask] [--greedy] [--verbose|-v|--quiet|-q] [--json[=v2]] [name…]\n"
         }
         "options" => {
-            "Usage: abrew options [--compact] [--installed] [name…]\n  No names evaluates every formula, as in brew; tapped formulae run real Homebrew.\n"
+            "Usage: abrew options [--compact] [--installed] [name…]\n  No names: every formula, as in brew. Tapped formulae run real Homebrew.\n"
         }
         "cleanup" => {
-            "Usage: abrew cleanup [--dry-run|-n] [--prune=<days>|--prune=all|--scrub|-s] [name…]\n  With names, old-version cleanup is scoped and shared cached downloads are kept.\n  Omit names to prune downloads with --prune or --scrub.\n"
+            "Usage: abrew cleanup [--dry-run|-n] [--prune=<days>|--prune=all|--scrub|-s] [name…]\n  Removes old versions (only the named packages', when names are given). With no\n  names, --prune=<days> also deletes cached downloads at least that old, and\n  --prune=all or --scrub every cached download.\n"
         }
         "missing" => "Usage: abrew missing [--hide=<name>,…] [name…]\n",
         "deps" => {
@@ -1206,13 +1211,13 @@ fn help_for(cmd: &str) -> &'static str {
             "Usage: abrew desc [--formula|--cask] <name>…\n       abrew desc [--formula|--cask] (--search|-s|--name|-n|--description|-d) <text>|/<regex>/\n"
         }
         "search" => {
-            "Usage: abrew search [--formula|--cask] [--desc] <text>|/<regex>/\n  Regex search is case-sensitive, like brew; patterns the native engine refuses run real Homebrew.\n"
+            "Usage: abrew search [--formula|--cask] [--desc] <text>|/<regex>/\n  Text ignores case and punctuation; a /regex/ is case-sensitive, as in brew.\n  Shows at most 200 matches. Patterns the native engine refuses run real brew.\n"
         }
         "bundle" => {
-            "Usage: abrew bundle [--version T --sha256 H] [--force] | status | remove | dump | install|check [--file Brewfile] (cleanup delegates to real brew)\n  With no subcommand (direct abrew only), lays the pinned Homebrew under the abrew prefix (design §5). Typed as `brew bundle`, it runs real Homebrew.\n"
+            "Usage: abrew bundle [--version V --sha256 H] [--force]\n       abrew bundle status | remove\n       abrew bundle dump [--file F] [--force]\n       abrew bundle install | check [--file F]\n  With no subcommand, lays the pinned real Homebrew under the abrew prefix;\n  delegated commands prefer it. Bare `brew bundle` is Homebrew's Brewfile\n  install and runs real Homebrew, as do other subcommands and Brewfiles with\n  rows abrew cannot read.\n"
         }
         "services" => {
-            "Usage: abrew services <Homebrew arguments>\n  Delegates unchanged to real Homebrew; no native service manager is installed.\n"
+            "Usage: abrew services <args>…\n  Runs real Homebrew's `brew services` unchanged; abrew has no service manager.\n"
         }
         _ => HELP_MAIN,
     }
@@ -1694,7 +1699,7 @@ mod admission_tests {
                 other => panic!("expected passthrough, got {other:?}"),
             }
         };
-        assert!(msg(&["services", "list"]).contains("not native yet"));
+        assert!(msg(&["services", "list"]).contains("'services' is not native"));
         assert!(valid_cask_version("4.2.1,20260531.1"));
         assert!(valid_cask_version("1.0"));
         assert!(!valid_cask_version("../1.0"));
@@ -1723,7 +1728,7 @@ mod admission_tests {
             assert!(!fresh.root.exists(), "{q:?}");
         }
         assert!(msg(&["frobnicate"]).contains("not a command abrew knows"));
-        assert!(msg(&["zap"]).contains("arguments are not native yet"));
-        assert!(msg(&["audit"]).contains("arguments are not native yet"));
+        assert!(msg(&["zap"]).contains("'zap' is not native"));
+        assert!(msg(&["audit"]).contains("'audit' is not native"));
     }
 }

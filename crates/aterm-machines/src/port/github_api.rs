@@ -73,9 +73,23 @@ fn read_with(client: &agh::Github, endpoint: &str) -> Result<GithubResponse, Str
     .limit(RESPONSE_MAX)
     .probe_404(false)
     .follow_moved(false);
-    let answer = client
-        .call(&call)
-        .map_err(|_| "GitHub rejected the credential or repository request (output withheld)")?;
+    let answer = match client.call(&call) {
+        Ok(answer) => answer,
+        // GitHub refused the token itself (expired or revoked): a definite answer, unlike a
+        // failure to reach it, so it comes back as its status, keeping nothing GitHub sent.
+        Err(error) if error.http.as_ref().is_some_and(|http| http.status == 401) => {
+            return Ok(GithubResponse {
+                status: 401,
+                headers: Vec::new(),
+                body: Vec::new(),
+            });
+        }
+        Err(_) => {
+            return Err(
+                "GitHub rejected the credential or repository request (output withheld)".into(),
+            );
+        }
+    };
     Ok(GithubResponse {
         status: answer.status,
         headers: answer.headers,
@@ -167,8 +181,17 @@ mod tests {
                 &[("Location", "https://example.invalid/next")],
                 TOKEN,
             );
-            let why = read_with(&client, "/user").unwrap_err();
-            assert!(!why.contains(std::str::from_utf8(TOKEN).unwrap()));
+            match read_with(&client, "/user") {
+                Ok(refused) => {
+                    assert_eq!(status, 401, "only a refused token is an answer");
+                    assert_eq!(refused.status, 401);
+                    assert!(refused.headers.is_empty() && refused.body.is_empty());
+                }
+                Err(why) => {
+                    assert_eq!(status, 302);
+                    assert!(!why.contains(std::str::from_utf8(TOKEN).unwrap()));
+                }
+            }
             let requests = transport.requests();
             assert_eq!(requests.len(), 1);
             assert_eq!(requests[0].auth_profile.as_deref(), Some(PROFILE));

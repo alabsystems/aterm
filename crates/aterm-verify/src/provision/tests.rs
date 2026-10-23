@@ -13,6 +13,7 @@ use super::*;
 enum Member<'a> {
     Dir,
     File(&'a [u8], u32),
+    Symlink(&'a str),
 }
 
 fn octal(field: &mut [u8], value: u64) {
@@ -28,9 +29,13 @@ fn tar(members: &[(&str, Member<'_>)]) -> Vec<u8> {
         let (kind, mode, body): (u8, u32, &[u8]) = match member {
             Member::Dir => (b'5', 0o755, &[]),
             Member::File(body, mode) => (b'0', *mode, body),
+            Member::Symlink(_) => (b'2', 0o777, &[]),
         };
         let mut h = [0u8; 512];
         h[..name.len()].copy_from_slice(name.as_bytes());
+        if let Member::Symlink(target) = member {
+            h[157..157 + target.len()].copy_from_slice(target.as_bytes());
+        }
         octal(&mut h[100..108], u64::from(mode));
         octal(&mut h[108..116], 0);
         octal(&mut h[116..124], 0);
@@ -192,6 +197,7 @@ impl stable::Rustup for Bare {
 
 struct Fake {
     served: BTreeMap<String, Vec<u8>>,
+    refused: BTreeMap<String, String>,
     fetched: RefCell<Vec<String>>,
     fetched_into: RefCell<Vec<(PathBuf, u64)>>,
     spawns: RefCell<Vec<Spawn>>,
@@ -211,6 +217,7 @@ impl Fake {
     fn new() -> Self {
         Self {
             served: BTreeMap::new(),
+            refused: BTreeMap::new(),
             fetched: RefCell::default(),
             spawns: RefCell::default(),
             signed: RefCell::default(),
@@ -237,6 +244,12 @@ impl Fake {
         self
     }
 
+    /// Fail the fetch of `url` with `error`, as `System::run` words curl's failure.
+    fn refuse(mut self, url: &str, error: &str) -> Self {
+        self.refused.insert(url.to_string(), error.to_string());
+        self
+    }
+
     fn spawned(&self, program_ends: &str) -> Vec<Spawn> {
         self.spawns
             .borrow()
@@ -258,6 +271,9 @@ impl Host for Fake {
         self.fetched_into
             .borrow_mut()
             .push((dest.to_path_buf(), bytes));
+        if let Some(error) = self.refused.get(url) {
+            return Err(error.clone());
+        }
         let bytes = self.served.get(url).ok_or_else(|| format!("404 {url}"))?;
         assert!(
             std::fs::read_dir(dest.parent().unwrap())
@@ -427,6 +443,8 @@ fn binaryen_row(sha256: &str, bytes: u64) -> Row {
             strip: 1,
             anchor: Anchor::Sha256,
             keep: &[],
+            cap: None,
+            holds: Holds::Program,
         },
     )
 }
@@ -525,6 +543,8 @@ fn pwsh_row(archive: &[u8]) -> Row {
                 team: MICROSOFT_TEAM,
             },
             keep: &["LICENSE.txt", "ThirdPartyNotices.txt"],
+            cap: None,
+            holds: Holds::Program,
         },
     )
 }
@@ -1036,9 +1056,10 @@ fn browser_fixture(m: &Machine, zip: &[u8]) -> (crate::browser::Pin, Target) {
         dir: pin.dir.clone(),
         exe: pin.binary.to_string_lossy().into_owned(),
         version: pin.version.clone(),
-        sha256: Some(pin.sha256),
+        sha256: Some(pin.sha256.to_string()),
         platform: m.platform.clone(),
         features: None,
+        sizes: Vec::new(),
     };
     (pin, t)
 }
@@ -1499,4 +1520,444 @@ fn a_translated_run_provisions_the_macs_own_rows() {
     assert_eq!(platform_of("macos", "x86_64", false), "macos-x86_64");
     assert_eq!(platform_of("macos", "aarch64", false), "macos-aarch64");
     assert_eq!(platform_of("linux", "x86_64", true), "linux-x86_64");
+}
+
+const ROOT_URL: &str = "https://fixture.invalid/release-{v}/root.tar.gz";
+
+/// A fixture of the root row's shape: one plain member, an image of 3000 bytes, under `cap`.
+fn root_row(archive: &[u8], cap: u64) -> Row {
+    fixture_row(
+        "ubuntu-root",
+        "ubuntu-root",
+        ROOT_URL,
+        &sha256(archive),
+        archive.len() as u64,
+        |archives| Install::Unpack {
+            archives,
+            strip: 0,
+            anchor: Anchor::Sha256,
+            keep: &[aterm_vz::pins::ROOT_MEMBER],
+            cap: Some(cap),
+            holds: Holds::Image { bytes: 3000 },
+        },
+    )
+}
+
+#[test]
+fn the_root_image_is_unpacked_read_only_under_its_rows_own_cap() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let ext4 = vec![0x53u8; 3000];
+    let archive = gzip(&tar(&[(
+        aterm_vz::pins::ROOT_MEMBER,
+        Member::File(&ext4, 0o644),
+    )]));
+    let url = ROOT_URL.replace("{v}", aterm_vz::pins::RELEASE);
+    let host = Fake::new().serve(&url, archive.clone());
+
+    match provide(&root_row(&archive, 2999), &m, &host, &mut |_| {}) {
+        State::Failed(why) => assert!(why.contains("did not unpack"), "{why}"),
+        other => panic!("a member past its row's cap: {other:?}"),
+    }
+    assert_eq!(
+        names(&m.tooling),
+        Vec::<String>::new(),
+        "nothing left behind"
+    );
+
+    let image = m
+        .tooling
+        .join(format!("ubuntu-noble-root-{}", aterm_vz::pins::RELEASE))
+        .join(aterm_vz::pins::ROOT_MEMBER);
+    assert_eq!(
+        provide(&root_row(&archive, 6000), &m, &host, &mut |_| {}),
+        State::Placed(image.clone())
+    );
+    assert_eq!(std::fs::read(&image).unwrap(), ext4);
+    assert_eq!(mode(&image), 0o444, "base is never written");
+    assert_eq!(
+        aterm_vz::pins::root_tool().placed_in(&m.tooling),
+        Some(image.clone()),
+        "where the lab finds it"
+    );
+    let stamp = place::read_stamp(image.parent().unwrap()).unwrap();
+    assert_eq!(stamp.sha256.as_deref(), Some(sha256(&archive).as_str()));
+    let fetched = host.fetched.borrow().len();
+    assert_eq!(
+        provide(&root_row(&archive, 6000), &m, &host, &mut |_| {}),
+        State::Present(image)
+    );
+    assert_eq!(
+        host.fetched.borrow().len(),
+        fetched,
+        "a placed base is kept"
+    );
+
+    let two = gzip(&tar(&[(
+        aterm_vz::pins::ROOT_MEMBER,
+        Member::File(&ext4, 0o755),
+    )]));
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let host = Fake::new().serve(&url, two.clone());
+    let placed = provide(&root_row(&two, 6000), &m, &host, &mut |_| {});
+    let State::Placed(image) = placed else {
+        panic!("{placed:?}")
+    };
+    assert_eq!(
+        mode(&image),
+        0o444,
+        "an executable member is made read-only too"
+    );
+}
+
+/// A fixture URL ending in `file`'s own name, as the real row's do.
+fn fixture_url(file: aterm_vz::pins::File) -> &'static str {
+    leak(format!(
+        "https://fixture.invalid/release-{{v}}/unpacked/{}",
+        file.name()
+    ))
+}
+
+fn kernel_row(files: [(&[u8], String); 2]) -> Row {
+    let urls = [
+        fixture_url(aterm_vz::pins::VMLINUZ),
+        fixture_url(aterm_vz::pins::INITRD),
+    ];
+    let files: Vec<Archive> = urls
+        .into_iter()
+        .zip(files)
+        .map(|(url, (bytes, sha256))| Archive {
+            platform: "macos-aarch64",
+            url,
+            sha256: leak(sha256),
+            bytes: bytes.len() as u64,
+        })
+        .collect();
+    Row {
+        name: "ubuntu-kernel",
+        tool: Some("ubuntu-kernel"),
+        install: Install::Files {
+            files: Box::leak(files.into_boxed_slice()),
+        },
+    }
+}
+
+#[test]
+fn a_files_row_holds_each_file_to_its_pin_and_keeps_them_together() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let at = |f| fixture_url(f).replace("{v}", aterm_vz::pins::RELEASE);
+    let (vmlinuz, initrd) = (b"gzip kernel".to_vec(), b"an initrd".to_vec());
+    let host = Fake::new()
+        .serve(&at(aterm_vz::pins::VMLINUZ), vmlinuz.clone())
+        .serve(&at(aterm_vz::pins::INITRD), initrd.clone());
+
+    let off = kernel_row([
+        (&vmlinuz, sha256(&vmlinuz)),
+        (&initrd, sha256(b"another initrd")),
+    ]);
+    match provide(&off, &m, &host, &mut |_| {}) {
+        State::Failed(why) => assert!(why.contains("hashes to"), "{why}"),
+        other => panic!("the second file off its pin: {other:?}"),
+    }
+    assert_eq!(
+        names(&m.tooling),
+        Vec::<String>::new(),
+        "nothing left behind"
+    );
+
+    let row = kernel_row([(&vmlinuz, sha256(&vmlinuz)), (&initrd, sha256(&initrd))]);
+    let dir = aterm_vz::pins::kernel_tool()
+        .pinned_root(&m.tooling)
+        .unwrap();
+    let exe = dir.join(aterm_vz::pins::VMLINUZ.name());
+    assert_eq!(
+        provide(&row, &m, &host, &mut |_| {}),
+        State::Placed(exe.clone())
+    );
+    assert_eq!(
+        names(&dir),
+        [
+            "stamp.json",
+            aterm_vz::pins::INITRD.name(),
+            aterm_vz::pins::VMLINUZ.name(),
+        ]
+    );
+    for (name, bytes) in [
+        (aterm_vz::pins::VMLINUZ.name(), &vmlinuz),
+        (aterm_vz::pins::INITRD.name(), &initrd),
+    ] {
+        assert_eq!(std::fs::read(dir.join(name)).unwrap(), *bytes);
+        assert_eq!(mode(&dir.join(name)), 0o444, "{name}");
+    }
+    let lookup = aterm_uds::host::Lookup {
+        named: None,
+        tooling: Some(m.tooling.clone()),
+        path: None,
+    };
+    assert_eq!(
+        aterm_vz::pins::kernel_tool().find_in(&lookup),
+        Some(exe.clone()),
+        "where the lab finds the kernel, the initrd beside it"
+    );
+    let parents: Vec<PathBuf> = host
+        .fetched_into
+        .borrow()
+        .iter()
+        .map(|(p, _)| p.parent().unwrap().to_path_buf())
+        .collect();
+    assert!(
+        parents.windows(2).all(|w| w[0] != w[1]),
+        "each file lands in a download directory of its own: {parents:?}"
+    );
+    let fetched = host.fetched.borrow().len();
+    assert_eq!(provide(&row, &m, &host, &mut |_| {}), State::Present(exe));
+    assert_eq!(host.fetched.borrow().len(), fetched);
+
+    let bumped = kernel_row([
+        (&vmlinuz, sha256(&vmlinuz)),
+        (b"an initrz", sha256(b"an initrz")),
+    ]);
+    assert!(
+        matches!(check(&bumped, &m, &host), State::Missing(_)),
+        "a changed pin of either file is another row's stamp"
+    );
+}
+
+#[test]
+fn the_linux_lanes_image_rows_are_ubuntus_pinned_files() {
+    let root = row("ubuntu-root").unwrap();
+    let Install::Unpack {
+        archives,
+        strip,
+        anchor,
+        keep,
+        cap,
+        holds,
+    } = root.install
+    else {
+        panic!("{root:?}")
+    };
+    assert_eq!(
+        archives,
+        [Archive {
+            platform: "macos-aarch64",
+            url: aterm_vz::pins::ROOT_ARCHIVE.url,
+            sha256: aterm_vz::pins::ROOT_ARCHIVE.sha256,
+            bytes: aterm_vz::pins::ROOT_ARCHIVE.bytes,
+        }]
+    );
+    assert_eq!(
+        (strip, anchor, holds),
+        (
+            0,
+            Anchor::Sha256,
+            Holds::Image {
+                bytes: aterm_vz::pins::ROOT_MEMBER_BYTES
+            }
+        )
+    );
+    assert_eq!(keep, [aterm_vz::pins::ROOT_MEMBER]);
+    assert!(
+        cap.is_some_and(|c| c >= 2 * aterm_vz::pins::ROOT_MEMBER_BYTES),
+        "the root row's cap is at least twice its member: {cap:?}"
+    );
+    const {
+        assert!(
+            aterm_vz::pins::ROOT_MEMBER_BYTES > place::UNPACKED_CAP / 2,
+            "why it names its own: the member is past half the shared cap"
+        );
+    }
+    let kernel = row("ubuntu-kernel").unwrap();
+    let names: Vec<(&str, &str)> = kernel
+        .files_for("macos-aarch64")
+        .iter()
+        .map(|f| (f.url, f.sha256))
+        .collect();
+    assert_eq!(
+        names,
+        [
+            (aterm_vz::pins::VMLINUZ.url, aterm_vz::pins::VMLINUZ.sha256),
+            (aterm_vz::pins::INITRD.url, aterm_vz::pins::INITRD.sha256),
+        ]
+    );
+    assert!(kernel.files_for("macos-x86_64").is_empty());
+    for r in [root, kernel] {
+        assert_eq!(r.when(), When::Linux, "{}", r.name);
+        assert_eq!(r.version(), Some(aterm_vz::pins::RELEASE));
+    }
+    let picked = |opts: &Options| -> Vec<&str> { select(opts).iter().map(|r| r.name).collect() };
+    let linux = Options {
+        linux: true,
+        ..Options::default()
+    };
+    assert!(picked(&linux).contains(&"ubuntu-root") && picked(&linux).contains(&"ubuntu-kernel"));
+    assert!(!picked(&Options::default()).contains(&"ubuntu-root"));
+}
+
+#[test]
+fn a_release_ubuntu_archived_names_the_archive_host_and_the_bump() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let root = row("ubuntu-root").unwrap();
+    let url = aterm_vz::pins::ROOT_ARCHIVE.url_at(aterm_vz::pins::RELEASE);
+    let curl = "/usr/bin/curl exited Some(1): curl: (1) Protocol \"http\" disabled (in redirect)";
+    let host = Fake::new().refuse(&url, curl);
+    match provide(root, &m, &host, &mut |_| {}) {
+        State::CouldNotRun(why) => {
+            for needle in [
+                "ubuntu-root 20260926:",
+                "release-20260926",
+                aterm_vz::pins::ARCHIVE_HOST,
+                "Bump the image pin",
+                curl,
+            ] {
+                assert!(why.contains(needle), "{needle}: {why}");
+            }
+        }
+        other => panic!("{other:?}"),
+    }
+    let offline = "/usr/bin/curl exited Some(6): curl: (6) Could not resolve host";
+    let host = Fake::new().refuse(&url, offline);
+    match provide(root, &m, &host, &mut |_| {}) {
+        State::Failed(why) => assert!(
+            why.ends_with(offline) && !why.contains(aterm_vz::pins::ARCHIVE_HOST),
+            "the negative control: another failure is curl's own: {why}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(names(&m.tooling), Vec::<String>::new());
+}
+
+/// A run whose only row Ubuntu archived is COULD NOT RUN in the archive's words, never a
+/// red FAIL (§3). NEGATIVE CONTROL: a run whose fetch fails otherwise is FAIL.
+#[test]
+fn a_run_that_meets_an_archived_release_could_not_run() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let url = aterm_vz::pins::ROOT_ARCHIVE.url_at(aterm_vz::pins::RELEASE);
+    let opts = Options {
+        rows: vec!["ubuntu-root".into()],
+        ..Options::default()
+    };
+    let curl = "/usr/bin/curl exited Some(1): curl: (1) Protocol \"http\" disabled (in redirect)";
+    let mut said = Vec::new();
+    let code = run(&opts, &m, &Fake::new().refuse(&url, curl), &mut |l| {
+        said.push(l.to_string());
+    });
+    assert_eq!(code, crate::exit::COULD_NOT_RUN, "{said:#?}");
+    assert!(
+        said.iter()
+            .any(|l| l.starts_with("COULD NOT RUN — ubuntu-root 20260926: Ubuntu has moved")),
+        "{said:#?}"
+    );
+    assert_eq!(
+        said.last().map(String::as_str),
+        Some("COULD NOT RUN — 1 of 1 rows pin a file upstream no longer serves here")
+    );
+
+    let offline = "/usr/bin/curl exited Some(6): curl: (6) Could not resolve host";
+    let mut said = Vec::new();
+    let code = run(&opts, &m, &Fake::new().refuse(&url, offline), &mut |l| {
+        said.push(l.to_string());
+    });
+    assert_eq!(code, crate::exit::FAILED, "{said:#?}");
+}
+
+/// A kernel row that lost its initrd, or holds one of another size, is not in place: a
+/// check says so and a run fetches the row again. NEGATIVE CONTROL: the whole row reads in
+/// place and fetches nothing.
+#[test]
+fn a_files_row_missing_a_file_is_not_in_place() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let m = machine(home.path());
+    let at = |f| fixture_url(f).replace("{v}", aterm_vz::pins::RELEASE);
+    let (vmlinuz, initrd) = (b"gzip kernel".to_vec(), b"an initrd".to_vec());
+    let host = Fake::new()
+        .serve(&at(aterm_vz::pins::VMLINUZ), vmlinuz.clone())
+        .serve(&at(aterm_vz::pins::INITRD), initrd.clone());
+    let row = kernel_row([(&vmlinuz, sha256(&vmlinuz)), (&initrd, sha256(&initrd))]);
+    let State::Placed(exe) = provide(&row, &m, &host, &mut |_| {}) else {
+        panic!("the row places")
+    };
+    assert_eq!(check(&row, &m, &host), State::Present(exe.clone()));
+    let fetched = host.fetched.borrow().len();
+
+    let lost = exe.with_file_name(aterm_vz::pins::INITRD.name());
+    std::fs::remove_file(&lost).unwrap();
+    match check(&row, &m, &host) {
+        State::Missing(why) => assert!(
+            why.contains(&format!(
+                "lacks {} at its pinned size",
+                aterm_vz::pins::INITRD.name()
+            )),
+            "{why}"
+        ),
+        other => panic!("a row without its initrd: {other:?}"),
+    }
+    assert_eq!(
+        provide(&row, &m, &host, &mut |_| {}),
+        State::Placed(exe.clone())
+    );
+    assert_eq!(host.fetched.borrow().len(), fetched + 2, "fetched again");
+    assert_eq!(std::fs::read(&lost).unwrap(), initrd);
+
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&lost, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+    std::fs::write(&lost, b"an initr").unwrap();
+    assert!(matches!(check(&row, &m, &host), State::Missing(_)));
+    assert_eq!(provide(&row, &m, &host, &mut |_| {}), State::Placed(exe));
+    assert_eq!(std::fs::read(&lost).unwrap(), initrd);
+}
+
+/// The root image is held to being a regular file of its size: a member that is a link
+/// (which `keep`'s check would follow) or of another size is refused, nothing placed.
+#[test]
+fn a_root_image_that_is_a_link_or_of_another_size_is_refused() {
+    let ext4 = vec![0x53u8; 3000];
+    let cases: [(&str, Vec<u8>, &str); 2] = [
+        (
+            "a link",
+            gzip(&tar(&[
+                ("real.img", Member::File(&ext4, 0o644)),
+                (aterm_vz::pins::ROOT_MEMBER, Member::Symlink("real.img")),
+            ])),
+            "holds no image",
+        ),
+        (
+            "another size",
+            gzip(&tar(&[(
+                aterm_vz::pins::ROOT_MEMBER,
+                Member::File(&ext4[..2999], 0o644),
+            )])),
+            "of 2999 bytes, not the pinned image's 3000",
+        ),
+    ];
+    let url = ROOT_URL.replace("{v}", aterm_vz::pins::RELEASE);
+    for (what, archive, needle) in cases {
+        let home = aterm_tempfile::tempdir().unwrap();
+        let m = machine(home.path());
+        let host = Fake::new().serve(&url, archive.clone());
+        match provide(&root_row(&archive, 6000), &m, &host, &mut |_| {}) {
+            State::Failed(why) => assert!(why.contains(needle), "{what}: {why}"),
+            other => panic!("{what}: {other:?}"),
+        }
+        assert_eq!(names(&m.tooling), Vec::<String>::new(), "{what}");
+    }
+}
+
+/// The lane holds the placed kernel to the stamp this row writes: the two digests are one.
+#[test]
+fn the_kernel_rows_stamp_is_the_one_the_lane_holds_it_to() {
+    let kernel = row("ubuntu-kernel").unwrap();
+    assert_eq!(
+        files_digest(
+            &kernel.files_for(aterm_vz::pins::PLATFORM),
+            aterm_vz::pins::RELEASE
+        ),
+        aterm_vz::pins::kernel_stamp_sha256()
+    );
 }

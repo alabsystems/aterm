@@ -675,7 +675,12 @@ fn ran_tail(rest: &str) -> bool {
         .strip_suffix(" · ctrl+o")
         .and_then(|r| r.rsplit_once(" · "))
         .is_some_and(|(what, took)| !what.is_empty() && duration(took));
-    outcome || timed
+    let cut = rest
+        .rsplit_once(" · ")
+        .filter(|(_, took)| duration(took))
+        .and_then(|(r, _)| r.strip_suffix(" · ✓"))
+        .is_some_and(|what| !what.is_empty());
+    outcome || timed || cut
 }
 
 fn duration(text: &str) -> bool {
@@ -2149,6 +2154,12 @@ pub mod fixtures {
         include_str!("fixtures/muse-1.4.12-R6909.1-lab-tool-row-bash-ran.txt");
     pub const TOOL_ROW_BASH_RAN_DESCRIBED: &str =
         include_str!("fixtures/muse-1.4.12-R6909.1-lab-tool-row-bash-ran-described.txt");
+    pub const TOOL_ROW_BASH_RAN_DESCRIBED_50: &str =
+        include_str!("fixtures/muse-1.4.12-R6909.1-lab-tool-row-bash-ran-described-50col.txt");
+    pub const TOOL_ROW_BASH_RAN_DESCRIBED_40: &str =
+        include_str!("fixtures/muse-1.4.12-R6909.1-lab-tool-row-bash-ran-described-40col.txt");
+    pub const TOOL_ROW_BASH_RAN_DESCRIBED_30: &str =
+        include_str!("fixtures/muse-1.4.12-R6909.1-lab-tool-row-bash-ran-described-30col.txt");
     pub const TOOL_ROW_READ_MEMORY: &str =
         include_str!("fixtures/muse-1.4.10-R6427.1-lab-tool-row-read-memory.txt");
     pub const TOOL_ROW_ADD_MEMORY: &str =

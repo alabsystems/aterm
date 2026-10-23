@@ -1,0 +1,39 @@
+aterm drive ledger — worker @s-work · manager @s-mgr · 2026-09-10 00:31:40 · times UTC+00:00
+SOURCES
+  ✓ clock      the session log's own wall times: each turn by its record's t= joined by ledger=, each message by its mail mark's joined by inbox=; no clock anchor is read
+  ✓ history    3 turn(s) from @s-work
+  ✓ log        @s-work log class=turn: 3 of 3 turn(s) placed by ledger= (1 by its close: the open was evicted); 1 closed turn(s) whose open was evicted name no ledger= (no `turn` exchange opened them, or an older aterm closed them): joined to nothing; the ring evicted 9 record(s) before this read
+  ✓ offscreen  10 row(s) read from @s-work's archive (origin 7730): reply sizes for 3 of 3 turn(s)
+  ✓ journal    <journal>: 11 line(s) about @s-work, 1 about other sessions skipped, 1 unreadable line(s) skipped
+  ✓ mail       @self (s-mgr): 1 message(s) from @s-work in the inbox; 2 post(s) to it in the log
+SUMMARY
+  turns driven      3 (2 settled, 1 timeout)
+  worker busy       9.5s in the turn verbs (sum of dur_ms) · 1m09s working over 3 turn(s) (turn start → the EVENT that ended it)
+  manager latency   median 1m05s · max 1m20s over 2 EVENT idle/question · 1 still waiting
+  approvals         1
+  dismissals        1
+  context           1 context · 1 compacted
+  reconnects        1
+  mail              1 in · 2 out
+TIMELINE
+  TIME       LANE     WHAT                                                                                              DURATION/LATENCY
+  00:26:45   fabric   mail out: task to the worker                                                                      -
+  00:26:50   manager  turn 1 began: Go on the amended lever                                                             settled in 1.8s
+  00:26:50   worker   turn 1 reply: 3 rows                                                                              working 9s
+  00:27:00   watcher  EVENT idle seq=5 complete=1 rows=689 ⏺ Done with the lever.                                       answered in 1m20s
+  00:27:10   watcher  APPROVED seq=6 git log --oneline -5                                                               -
+  00:28:20   manager  turn 2 began: Second turn, while you work                                                         timeout after 6.0s
+  00:28:20   worker   turn 2 reply: 2 rows                                                                              working 49s
+  00:28:30   watcher  EVENT prompt seq=8 kind=bash classify=read-only command=ls -la                                    -
+  00:29:10   watcher  EVENT question seq=9 ⏺ Keep the harness or rewrite it?                                            answered in 50s
+  00:29:20   watcher  DISMISSED survey seq=10                                                                           -
+  00:29:30   watcher  EVENT context seq=11 9% until auto-compact                                                        -
+  00:29:40   watcher  EVENT compacted seq=12                                                                            -
+  00:29:50   watcher  RECONNECT await seq 9 failed: server closed the connection                                        -
+  00:29:55   watcher  RECONNECTED after 1834 ms                                                                         -
+  00:30:00   manager  turn 3 began: Third turn: stop and report                                                         settled in 1.7s
+  00:30:00   worker   turn 3 reply: 4 rows                                                                              working 9s
+  00:30:05   fabric   mail in: report from the worker, 2009 B, trust=agent                                              -
+  00:30:09   fabric   mail out: task to the worker, not landed yet                                                      -
+  00:30:10   watcher  EVENT idle seq=13 complete=0 rows=12 ⏺ Stopped at the gate.                                       no turn since
+  00:30:20   watcher  TIMEOUT                                                                                           -

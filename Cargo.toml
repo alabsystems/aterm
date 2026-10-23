@@ -45,7 +45,7 @@ default-members = [
     "crates/aterm-spec-models", "crates/aterm-sysprobe", "crates/aterm-tempfile",
     "crates/aterm-theme-pack", "crates/aterm-time", "crates/aterm-toml", "crates/aterm-toolchain",
     "crates/aterm-tracing", "crates/aterm-tty", "crates/aterm-types", "crates/aterm-uds",
-    "crates/aterm-unicode-width", "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals",
+    "crates/aterm-unicode-width", "crates/aterm-update", "crates/aterm-update-core", "crates/aterm-vitals", "crates/aterm-vz",
     "crates/aterm-wasm", "crates/aterm-wasm-abi", "crates/aterm-wasm-abi-macros", "crates/aterm-wayland",
     "crates/aterm-win32", "crates/aterm-window",
     "crates/aterm-x11", "crates/aterm-xkb",
@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.126.0"
+version = "0.127.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -254,6 +254,7 @@ aterm-update = { path = "crates/aterm-update" }
 aterm-update-core = { path = "crates/aterm-update-core" }
 aterm-vitals = { path = "crates/aterm-vitals" }
 aterm-verify = { path = "crates/aterm-verify" }
+aterm-vz = { path = "crates/aterm-vz" }
 # Host boundary for the wasm modules: `console.error` panic hook and syn-free
 # `#[export]` ABI layer.
 aterm-wasm-abi = { path = "crates/aterm-wasm-abi" }

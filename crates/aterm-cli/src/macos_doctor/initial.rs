@@ -1226,31 +1226,25 @@ pub(super) fn read_permissions_live(apply: bool) -> Result<Vec<Row>, String> {
             let sys = aterm_machines::port::Live::new();
             let ready = aterm_machines::init_accounts::accessibility_ready(&sys).unwrap_or(false);
             if ready {
-                return (
-                    true,
-                    "Accessibility & UI Automation granted → Desired: granted".to_owned(),
-                );
+                return (true, "granted".to_owned());
             }
             let needed = aterm_machines::init_accounts::accessibility_needed(&sys)
                 .unwrap_or(false);
             if apply {
                 let _ = aterm_machines::init_accounts::request_accessibility(&sys);
                 if aterm_machines::init_accounts::accessibility_ready(&sys).unwrap_or(false) {
-                    return (
-                        true,
-                        "Accessibility & UI Automation granted → Desired: granted".to_owned(),
-                    );
+                    return (true, "granted".to_owned());
                 }
             }
             if !needed {
                 (
                     true,
-                    "AppleEvents automation ready (Accessibility optional until account sign-out or alert remote-control click)".to_owned(),
+                    "needed only to sign out of Messages or FaceTime (nothing to sign out now) or to press an alert's button by remote control".to_owned(),
                 )
             } else {
                 (
                     false,
-                    "Accessibility not granted → Desired: enable aterm in System Settings > Privacy & Security > Accessibility".to_owned(),
+                    "not granted: turn aterm on in System Settings > Privacy & Security > Accessibility".to_owned(),
                 )
             }
         });
@@ -1268,13 +1262,8 @@ pub(super) fn read_permissions_live(apply: bool) -> Result<Vec<Row>, String> {
         .is_some_and(|facts| facts.grant() == aterm_containment::consent::DevToolGrant::Granted);
     let clt_ready = matches!(clt, CcVerdict::Ready { .. });
     let clt_detail = match &clt {
-        CcVerdict::Ready { driver } => {
-            format!("{} builds a C program → Desired: ready", driver.display())
-        }
-        _ => format!(
-            "{} → Desired: ready (`aterm init --only base.clt`)",
-            clt.line()
-        ),
+        CcVerdict::Ready { driver } => format!("{} builds a C program", driver.display()),
+        _ => clt.line(),
     };
     Ok(vec![
         readiness_row("Command Line Tools", clt_ready, clt_detail),
@@ -4219,7 +4208,7 @@ mod tests {
                 if *self.answers.lock().unwrap() {
                     Look::Answers
                 } else {
-                    Look::Unreached(NO_ROUTE.into())
+                    Look::Held(NO_ROUTE.into())
                 }
             }
             fn keep(&self, into: &Path, replaces: &Replaces) -> aterm_secrets::Result<()> {
@@ -4493,7 +4482,11 @@ mod tests {
         );
         assert!(password.is_some(), "kept for a try that reaches the vault");
         assert_eq!(rows.len(), 21);
-        let offline = format!("the vault does not answer, so nothing was changed: {NO_ROUTE}; ");
+        let offline = format!(
+            "the vault does not answer, so nothing was changed: {NO_ROUTE}; if macOS asked \
+             whether this app may find devices on your local network and it was not allowed, \
+             turn it on in System Settings > Privacy & Security > Local Network; "
+        );
         assert!(
             rows.iter()
                 .all(|row| row.status == "blocked" && row.detail.starts_with(&offline)),

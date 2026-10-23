@@ -617,6 +617,10 @@ pub fn cmd_instance(args: &[String]) -> Res {
     count("--lines", &lines)?;
     let font_px = take_value(&mut a, "--font-px")?;
     let scale = take_value(&mut a, "--scale")?;
+    let scene = take_value(&mut a, "--scene")?;
+    if scene.as_deref().is_some_and(|s| s != "band-icons") {
+        return Err(Fail::usage("instance: --scene takes band-icons"));
+    }
     let image = take_value(&mut a, "--image")?.map(|p| from_caller(&p));
     let toml = take_values(&mut a, "--toml")?;
     let toml_after = take_values(&mut a, "--toml-after")?;
@@ -682,6 +686,9 @@ pub fn cmd_instance(args: &[String]) -> Res {
     }
     let mut env = world.env();
     env.extend(extra_env);
+    if let Some(scene) = scene {
+        env.push(("ATERM_DEBUG_SCENE".to_string(), scene));
+    }
     let mut inst = Instance::start_in(
         &world,
         Launch {

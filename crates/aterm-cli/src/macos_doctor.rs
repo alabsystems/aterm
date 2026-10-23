@@ -486,13 +486,13 @@ fn automatic_retry_due(
     Ok(age.map_or(true, |age| age >= std::time::Duration::from_secs(60)))
 }
 
-const HELD: &str = "aterm tried this by itself and it did not take, so it will not try again on its own; Apply in System State, or run aterm doctor --apply, to try again";
+const HELD: &str = "aterm tried this by itself and it did not take, so this build does not try it again on its own; Apply in System State, or run aterm doctor --apply, to try again";
 
-const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own when ten minutes have passed, on setup's next try or at aterm's next launch; Apply in System State, or run aterm doctor --apply, to try now";
+const WAITING: &str = "aterm tried this by itself and it did not take; it tries once more on its own at setup's next try or aterm's next launch once ten minutes have passed; Apply in System State, or run aterm doctor --apply, to try now";
 
-const SETTLED: &str = "aterm set this once in this setup and it has changed since, so setup leaves it; Apply in System State, or run aterm doctor --apply, to set it again";
+const SETTLED: &str = "this setup had it as wanted once and it has changed since; Apply in System State, or run aterm doctor --apply, to set it again";
 
-const SETTLED_OWED: &str = "Notification Center's widget list is left to setup's own step for it, whose row says how that went; Apply in System State, or run aterm doctor --apply, to clear it now";
+const SETTLED_OWED: &str = "Notification Center's widget list is left to the Full Disk Access follow-up, whose row says how that went; Apply in System State, or run aterm doctor --apply, to clear it now";
 
 const TRIES: u32 = 2;
 
@@ -1361,7 +1361,7 @@ fn journal_refused(refused: &[String]) -> Row {
         name: "Change journal".into(),
         status: "error".into(),
         detail: format!(
-            "the journal refused the record of what was put back or relaunched anyway: {}",
+            "the change journal refused these records; the changes went ahead anyway: {}",
             refused.join("; ")
         ),
     }
@@ -1531,7 +1531,7 @@ fn append_workstation(
         Ok(rows) if rows.is_empty() => report.rows.push(Row {
             name: name.into(),
             status: "unverified".into(),
-            detail: "the shared setup engine returned no settings to verify".into(),
+            detail: "setup returned no settings to verify".into(),
         }),
         Ok(rows) => report.rows.extend(rows),
         Err(detail) => report.rows.push(Row {
@@ -1614,7 +1614,7 @@ fn execute_pass(
             report.rows.push(Row {
                 name: "Preference activation".into(),
                 status: "drift".into(),
-                detail: "a previous pass still needs activation; run doctor --apply to retry"
+                detail: "a previous pass still needs activation; run aterm doctor --apply to retry"
                     .into(),
             });
         }
@@ -2029,7 +2029,7 @@ fn follow_up_locked_at(root: &Path) -> Result<Option<Report>, String> {
 fn unknown_original(saved: &Saved) -> Option<String> {
     (contained(&saved.target) && !saved.granted && saved.value.is_none()).then(|| {
         format!(
-            "{} was saved before aterm had Full Disk Access, while macOS hid it from aterm, \
+            "{} was backed up while macOS hid it from aterm (before aterm had Full Disk Access), \
              so its original is unknown; it is left as it is",
             saved.target.describe()
         )
@@ -2059,11 +2059,10 @@ fn withheld(host: &dyn Host, target: &Target) -> Option<String> {
 fn restore_waits(target: &Target) -> String {
     format!(
         "{} is in another app's container, which macOS opens only to a process whose app holds \
-         Full Disk Access; its original stays in the backup: run Restore again from an app that \
-         holds it: from aterm's System State on this Mac, or a command in an aterm tab, once \
-         aterm has Full Disk Access; aterm doctor --restore in another terminal once that \
-         terminal app has it; over SSH, once Remote Login's \"Allow full disk access for remote \
-         users\" is on (System Settings > General > Sharing)",
+         Full Disk Access; its original stays in the backup: run Restore again from System State \
+         or an aterm tab once aterm has Full Disk Access, aterm doctor --restore in another \
+         terminal app that has it, or over SSH once Remote Login's \"Allow full disk access for \
+         remote users\" is on (System Settings > General > Sharing)",
         target.describe()
     )
 }

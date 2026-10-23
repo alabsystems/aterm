@@ -6,7 +6,10 @@
 use super::*;
 use crate::anchors::anchor_text;
 use crate::prompt::fixtures::{
-    TOOL_DISK_FULL_2_1_309, TOOL_ERROR_AUTO_MODE_2_1_309, TOOL_PRESTART_PRINTED_2_1_309,
+    TOOL_DISK_FULL_2_1_309, TOOL_DISK_FULL_40_2_1_309, TOOL_DISK_FULL_60_2_1_309,
+    TOOL_ERROR_AUTO_MODE_2_1_309, TOOL_PRESTART_PRINTED_2_1_309,
+    TOOL_PRESTART_PRINTED_EXIT0_179_2_1_309, TOOL_PRESTART_PRINTED_EXIT1_40_2_1_309,
+    TOOL_PRESTART_PRINTED_EXIT1_60_2_1_309, TOOL_PRESTART_PRINTED_EXIT1_179_2_1_309,
     TRANSCRIPT_DEGRADED_EACCES_2_1_304, composer, ink_wrap, rows, screen,
 };
 
@@ -438,6 +441,109 @@ fn a_narrow_panes_notice_reads_across_its_wrap() {
     );
 }
 
+/// THE TOOL NOTICE IN A NARROW PANE, AS CLAUDE CODE DRAWS IT (2.1.309,
+/// MEASURED at 60 and 40 columns): the statfs form's rows under the exit
+/// line are the rewrap of its words at the pane's width less five, its
+/// directory phrase ends on the third row at both widths, and it reads with
+/// ENOSPC at its head row. The words are the 144-column capture's, its uid
+/// aside.
+#[test]
+fn a_narrow_panes_notice_as_drawn_reads() {
+    let (r, at, rows) = measured_tool();
+    let measured: Vec<&str> = r[at..at + rows].iter().map(|row| row.trim()).collect();
+    let words_144 = measured.join(" ");
+    let head = format!("{RESULT_BODY}{}", anchor_text("wall.disk_full.tool"));
+    let dir = anchor_text("wall.disk_full.tool_dir");
+    for (cols, text) in [
+        (60, TOOL_DISK_FULL_60_2_1_309),
+        (40, TOOL_DISK_FULL_40_2_1_309),
+    ] {
+        let r = screen(text);
+        let at = r
+            .iter()
+            .position(|row| row.starts_with(&head))
+            .expect("the notice row");
+        assert!(exit_row(&r[at - 1]), "under its exit line, at {cols}");
+        let drawn: Vec<String> = r[at..]
+            .iter()
+            .take_while(|row| row.starts_with(RESULT_BODY))
+            .map(|row| row.trim().to_string())
+            .collect();
+        let words = drawn.join(" ");
+        assert_eq!(words, words_144, "at {cols}");
+        assert_eq!(
+            ink_wrap(&words, cols - RESULT_BODY.len()),
+            drawn,
+            "the rewrap is the vendor's, at {cols}"
+        );
+        let ends = (0..drawn.len()).find(|&k| drawn[..=k].join(" ").contains(dir));
+        assert_eq!(ends, Some(2), "the phrase's row, at {cols}");
+        let d = disk_full(&r).unwrap_or_else(|| panic!("at {cols}"));
+        assert_eq!(
+            (d.code, d.source, d.row),
+            (Code::Enospc, Source::ToolOutput, at),
+            "at {cols}"
+        );
+    }
+}
+
+/// THE TOOL NOTICE READS TO ITS SIXTH ROW AND NO FURTHER: the quota form
+/// (the bundle's template around the measured tail) rewrapped at 40
+/// columns, its temporary directory a path deep enough that the directory
+/// phrase ends on the notice's sixth row, reads with EDQUOT; deep enough
+/// that the phrase ends on its seventh, it is not read, that row taken for
+/// a later line of the command's output. A bound one row lower or higher
+/// fails one side.
+#[test]
+fn the_tool_notice_reads_to_its_sixth_row_and_no_further() {
+    let (r, at, rows) = measured_tool();
+    let measured: Vec<&str> = r[at..at + rows].iter().map(|row| row.trim()).collect();
+    let words = measured.join(" ");
+    let tail = &words[words
+        .find("Free space on that volume")
+        .expect("the measured tail")..];
+    let dir = anchor_text("wall.disk_full.tool_dir");
+    let quota = |volume: &str| {
+        format!(
+            "{}a test write beside this command's output file, on the volume holding \
+             {volume}{dir}, failed with EDQUOT, so whatever this command printed was lost and its \
+             own writes may have failed with \"Disk quota exceeded\". {tail}",
+            anchor_text("wall.disk_full.tool_quota")
+        )
+    };
+    // The notice wrapped in a 40-column pane around a directory `depth`
+    // folders deep, and the row (from 0) its directory phrase ends on.
+    let wrapped = |depth: usize| {
+        let volume = format!("/Volumes/scratch/{}claude-502", "deep/".repeat(depth));
+        let rows = ink_wrap(&quota(&volume), 40 - RESULT_BODY.len());
+        let ends = (0..rows.len())
+            .find(|&k| rows[..=k].join(" ").contains(dir))
+            .expect("the directory phrase");
+        (rows, ends)
+    };
+    let ending_on = |row: usize| {
+        (0..40)
+            .map(wrapped)
+            .find(|(_, ends)| *ends == row)
+            .map(|(rows, _)| rows)
+            .unwrap_or_else(|| panic!("a directory whose phrase ends on row {row}"))
+    };
+    let sixth = ending_on(5);
+    let notice: Vec<&str> = sixth.iter().map(String::as_str).collect();
+    assert_eq!(
+        disk_full(&with_notice(&notice)).map(|d| (d.code, d.row)),
+        Some((Code::Edquot, at)),
+        "the phrase on the sixth row: {sixth:#?}"
+    );
+    let seventh = ending_on(6);
+    let notice: Vec<&str> = seventh.iter().map(String::as_str).collect();
+    assert_eq!(
+        disk_full(&with_notice(&notice)),
+        None,
+        "the phrase on the seventh row: {seventh:#?}"
+    );
+}
+
 #[test]
 fn a_tools_lost_output_row_reads_only_as_the_vendors_row() {
     let tool = TOOL_HEAD_BEFORE_2_1_309;
@@ -526,7 +632,60 @@ fn in_error_place(text: &str, cols: usize) -> Vec<String> {
     let drawn = std::iter::once(format!("{glyph}{}", wrapped[0]))
         .chain(wrapped[1..].iter().map(|w| format!("{RESULT_BODY}{w}")));
     r.splice(at..at + rows, drawn);
+    in_pane(r, cols)
+}
+
+/// `r` in a `cols`-column pane: its rules (the composer's) redrawn across
+/// that width, as Claude Code draws them (MEASURED: 40, 60, 144 and 179
+/// columns).
+fn in_pane(mut r: Vec<String>, cols: usize) -> Vec<String> {
+    for row in &mut r {
+        if crate::phase::is_rule(row) {
+            *row = "─".repeat(cols);
+        }
+    }
     r
+}
+
+/// The text of the error result that opens on `⎿` row `at`: that row's,
+/// then each message row's.
+fn result_text(r: &[String], at: usize) -> Vec<String> {
+    std::iter::once(result_row(crate::text::trim_end(&r[at])).expect("a `⎿` row"))
+        .chain(
+            r[at + 1..]
+                .iter()
+                .take_while(|row| message_row(row))
+                .map(|row| row.trim()),
+        )
+        .map(str::to_string)
+        .collect()
+}
+
+/// A measured capture of the pre-start words as a failed command's output
+/// (exit 1): its screen, its exit line's row, and the text of the words'
+/// rows under it.
+fn printed_under_exit(text: &str) -> (Vec<String>, usize, Vec<String>) {
+    let r = screen(text);
+    let exit = r
+        .iter()
+        .position(|row| exit_row(row))
+        .expect("the exit line");
+    let words = r[exit + 1..]
+        .iter()
+        .take_while(|row| message_row(row))
+        .map(|row| row.trim().to_string())
+        .collect();
+    (r, exit, words)
+}
+
+/// That capture with its words moved onto the `⎿` row in place of the exit
+/// line: the place Claude Code draws its own notice, in the same renderer.
+fn on_result_row(r: &[String], exit: usize) -> Vec<String> {
+    let glyph = r[exit][..r[exit].find(FAILED_RESULT).expect("the exit line")].to_string();
+    let mut moved = r.to_vec();
+    let first = moved.remove(exit + 1);
+    moved[exit] = format!("{glyph}{}", first.trim());
+    moved
 }
 
 #[test]
@@ -569,36 +728,168 @@ fn a_command_not_started_reads_in_the_place_of_its_error_result() {
     }
 }
 
+/// A PRINTED COPY READS AT NO WIDTH: the bundle's words printed by a
+/// command, drawn in every pane from 40 to 220 columns, are never read as
+/// the notice, and the notice itself, word-wrapped into its error result's
+/// place, reads with its code at every one of those widths. Where each of
+/// the copy's breaks falls just after a space or inside the directory (the
+/// full form's at 170, 179, 193 and 218 columns) its rows are a word wrap's
+/// at a room five columns narrower than the notice's, and only the pane's
+/// width tells them apart. CONTROL: under a composer five columns narrower,
+/// the copy reads exactly at those widths, its rows the template's.
 #[test]
-fn a_printed_copy_reads_only_where_its_rows_are_a_word_wraps() {
+fn a_printed_copy_reads_at_no_width() {
     let quota = pre_start_words(anchor_text("wall.disk_full.pre_start_quota"), "EDQUOT");
     for (words, code) in [(full_words(), Code::Enospc), (quota, Code::Edquot)] {
         let line = format!("Error: {words}");
-        let chars: Vec<char> = line.chars().collect();
-        let dir_at = line[..line.find(MEASURED_DIR).expect("the directory")]
-            .chars()
-            .count();
-        let inside_dir = dir_at + 1..dir_at + MEASURED_DIR.chars().count();
+        let like = word_like_widths(&line);
+        if code == Code::Enospc {
+            assert_eq!(like, [170, 179, 193, 218], "the full form's");
+        }
         for cols in 40..=220 {
             let real = disk_full(&in_error_place(&words, cols)).map(|d| (d.code, d.source));
             assert_eq!(real, Some((code, Source::ToolOutput)), "{code:?} at {cols}");
-            let like_words = (cols - 10..chars.len())
-                .step_by(cols - 10)
-                .all(|b| chars[b - 1] == ' ' || inside_dir.contains(&b));
+            let copy = in_printed_place(&line, cols);
+            assert_eq!(disk_full(&copy), None, "{code:?} printed at {cols}");
             assert_eq!(
-                disk_full(&in_printed_place(&line, cols)).is_some(),
-                like_words,
-                "{code:?} printed at {cols}"
+                disk_full(&in_pane(copy, cols - RESULT_BODY.len())).is_some(),
+                like.contains(&cols),
+                "{code:?} printed at {cols}, under a narrower composer"
             );
         }
     }
+}
+
+/// The panes (40 to 220 columns) in which a command's printed `line` has
+/// rows a word wrap also draws: each break of its column wrap, at `cols -
+/// 10`, falls just after a space or inside the measured directory.
+fn word_like_widths(line: &str) -> Vec<usize> {
+    let chars: Vec<char> = line.chars().collect();
+    let dir_at = line[..line.find(MEASURED_DIR).expect("the directory")]
+        .chars()
+        .count();
+    let inside_dir = dir_at + 1..dir_at + MEASURED_DIR.chars().count();
+    (40..=220usize)
+        .filter(|cols| {
+            (cols - 10..chars.len())
+                .step_by(cols - 10)
+                .all(|b| chars[b - 1] == ' ' || inside_dir.contains(&b))
+        })
+        .collect()
+}
+
+/// THE MEASURED COPY AT 179 COLUMNS IS REFUSED BY WIDTH (2.1.309,
+/// MEASURED): a command's printed copy of the words on the `⎿` row, wrapped
+/// by column at 169 with each break just after a space (`… so the file`,
+/// `… a directory on`), rows a word wrap at a room of 169 also draws, which
+/// this reader read as the notice before it measured the pane. Claude
+/// Code's own word wrap at 179 columns puts `that` on the first row and
+/// `another` on the second (MEASURED the same day: the words as a failed
+/// command's output), so here the next word would have fit and the copy is
+/// not read. CONTROL: the copy's rows are [`in_printed_place`]'s at 179,
+/// and under a 174-column composer (a room of 169) they read.
+#[test]
+fn the_measured_copy_at_179_columns_is_refused_by_width() {
     let line = format!("Error: {}", full_words());
-    for cols in [144, 100, 120, 145, 165, 200] {
+    let copy = screen(TOOL_PRESTART_PRINTED_EXIT0_179_2_1_309);
+    let head = |r: &[String]| {
+        r.iter()
+            .position(|row| result_row(row).is_some_and(|t| t.starts_with("Error: The command")))
+            .expect("the printed head")
+    };
+    let at = head(&copy);
+    let rows = result_text(&copy, at);
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    assert!(
+        rows[0].ends_with(" so the file") && rows[1].ends_with(" a directory on"),
+        "{rows:#?}"
+    );
+    let modelled = in_printed_place(&line, 179);
+    assert_eq!(
+        result_text(&modelled, head(&modelled)),
+        rows,
+        "the column wrap"
+    );
+    assert_eq!(ink_wrap(&line, 169), rows, "a word wrap's rows at 169");
+    let (_, _, vendor) = printed_under_exit(TOOL_PRESTART_PRINTED_EXIT1_179_2_1_309);
+    assert!(
+        vendor[0].ends_with(" so the file that") && vendor[1].ends_with(" on another"),
+        "{vendor:#?}"
+    );
+    assert_eq!(disk_full(&copy), None, "the copy");
+    let d = disk_full(&in_pane(copy, 174)).expect("the control: a room of 169");
+    assert_eq!((d.code, d.row), (Code::Enospc, at));
+}
+
+/// THE VENDOR'S WRAP OF THE WORDS IS THE ROOM'S (2.1.309, MEASURED at 40,
+/// 60 and 179 columns): the pre-start words a failed command printed are
+/// drawn under its exit line as a word wrap at the pane's width less five,
+/// the room [`message_room`] reads off the composer's rule. Moved onto the
+/// `⎿` row in place of the exit line (where Claude Code draws its own
+/// notice, in the same error renderer) they read with ENOSPC, and they are
+/// the rows [`in_error_place`] draws there. Where they lie, under the exit
+/// line, they are a command's output and are not read.
+#[test]
+fn the_vendors_wrap_of_the_words_is_the_rooms() {
+    let line = format!("Error: {}", full_words());
+    let (_, at, _) = measured_error();
+    for (cols, text) in [
+        (40, TOOL_PRESTART_PRINTED_EXIT1_40_2_1_309),
+        (60, TOOL_PRESTART_PRINTED_EXIT1_60_2_1_309),
+        (179, TOOL_PRESTART_PRINTED_EXIT1_179_2_1_309),
+    ] {
+        let (r, exit, words) = printed_under_exit(text);
+        let frame = crate::phase::composer_frame(&r).expect("the composer");
         assert_eq!(
-            disk_full(&in_printed_place(&line, cols)),
-            None,
-            "printed at {cols}"
+            message_room(&r, frame),
+            cols - RESULT_BODY.len(),
+            "at {cols}"
         );
+        assert_eq!(
+            ink_wrap(&line, cols - RESULT_BODY.len()),
+            words,
+            "at {cols}"
+        );
+        assert_eq!(disk_full(&r), None, "a command's output, at {cols}");
+        let moved = on_result_row(&r, exit);
+        let d = disk_full(&moved).unwrap_or_else(|| panic!("moved, at {cols}"));
+        assert_eq!(
+            (d.code, d.source, d.row),
+            (Code::Enospc, Source::ToolOutput, exit),
+            "at {cols}"
+        );
+        assert_eq!(
+            result_text(&in_error_place(&full_words(), cols), at),
+            words,
+            "at {cols}"
+        );
+    }
+}
+
+/// ALL OF THE NOTICE OR NOTHING: Claude Code draws the notice whole (one
+/// line of the ten its error renderer draws), so cut after any of its rows
+/// (the rows under the cut blank, as a screen read mid-draw would hold
+/// them) it is not read, at 40 and 60 columns and at each width where a
+/// printed copy's rows are a word wrap's; whole, in the same place, it is.
+#[test]
+fn a_notice_cut_short_is_not_read() {
+    let (_, at, _) = measured_error();
+    for cols in [40, 60, 170, 179, 193, 218] {
+        let placed = in_error_place(&full_words(), cols);
+        let rows = result_text(&placed, at).len();
+        assert!(rows >= 3, "at {cols}");
+        assert_eq!(
+            disk_full(&placed).map(|d| d.row),
+            Some(at),
+            "whole, at {cols}"
+        );
+        for kept in 1..rows {
+            let mut cut = placed.clone();
+            for row in &mut cut[at + kept..at + rows] {
+                row.clear();
+            }
+            assert_eq!(disk_full(&cut), None, "{kept} of {rows} rows at {cols}");
+        }
     }
 }
 
@@ -624,7 +915,7 @@ fn in_printed_place(line: &str, cols: usize) -> Vec<String> {
         })
         .collect();
     r.splice(at..at + rows, drawn);
-    r
+    in_pane(r, cols)
 }
 
 #[test]

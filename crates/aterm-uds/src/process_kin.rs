@@ -289,7 +289,9 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
 
 /// See the Apple twin: every `/proc/<pid>/stat` ([`super::stat_row`]), judged by
 /// [`super::procfs::group_of`]. A process gone by its read is skipped; any other failed read
-/// leaves the listing incomplete.
+/// leaves the listing incomplete, and so does a `/proc` mounted with `hidepid`
+/// ([`group_listing_can_be_whole`]), which hides from its listing, or refuses the files of,
+/// another user's processes and this uid's non-dumpable ones.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn group_members(pgid: u32) -> Option<GroupMembers> {
@@ -304,7 +306,31 @@ pub fn group_members(pgid: u32) -> Option<GroupMembers> {
         let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
         Some((pid, super::stat_row(&entry.path().join("stat"))))
     });
-    Some(super::procfs::group_of(rows, pgid))
+    Some(super::procfs::group_of(
+        rows,
+        pgid,
+        group_listing_can_be_whole(),
+    ))
+}
+
+/// Whether a [`group_members`] listing here can be complete: on Linux, whether `/proc` lists
+/// every process to every reader ([`super::procfs::shows_every_process`] over
+/// `/proc/self/mountinfo`); on Apple, whose kernel lists a group itself, it can; elsewhere
+/// nothing lists one.
+#[must_use]
+pub fn group_listing_can_be_whole() -> bool {
+    #[cfg(target_vendor = "apple")]
+    {
+        true
+    }
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        super::proc_shows_every_process()
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+    {
+        false
+    }
 }
 
 /// See the Apple twin: no group lister is wired here.
@@ -334,7 +360,9 @@ pub struct Markers {
 }
 
 /// `pid`'s [`Markers`], read between two identity reads that must agree ([`bracketed`]): from
-/// `KERN_PROCARGS2` on macOS, `/proc/<pid>/environ` on Linux.
+/// `KERN_PROCARGS2` on macOS, `/proc/<pid>/environ` on Linux. A pid reused between the reads
+/// shows on both. An exec shows only where the identity has a pid version (Apple): on Linux it
+/// keeps the pid and the start, so the words may be either image's, each one the process's own.
 #[must_use]
 pub fn read_process_markers(pid: i32) -> Option<Markers> {
     #[cfg(target_os = "macos")]
@@ -492,8 +520,10 @@ pub fn at_program_check(pid: i32) -> Option<bool> {
     aterm_sysprobe::jobs::at_start(pid).map(|at| at == aterm_sysprobe::jobs::AtStart::Held)
 }
 
-/// See the Apple twin: Linux has no program check, so a live process of this uid is never
-/// held there; another uid's, or a gone pid, reads `None` as on Apple.
+/// See the Apple twin: Linux has no program check, so a process its identity read names
+/// ([`read_identity`]: live, this uid's) is never held there, and one it does not (a gone pid,
+/// a zombie, another uid's process, a thread's id, pid 1) is unread, as Apple's `ESRCH` and
+/// `EPERM` are.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 #[must_use]
 pub fn at_program_check(pid: i32) -> Option<bool> {
@@ -623,20 +653,122 @@ mod tests {
         );
     }
 
+    /// A read between two identity reads that disagree is refused: an exit, a pid reused (a
+    /// later birth) on every kernel, and an exec where the identity has a pid version. Linux's
+    /// identity has none, so an exec there reads as the same process and the read stands; only
+    /// a tier's own reads (the executable under the roots) see it. NEGATIVE CONTROL: compare the
+    /// two reads' pid versions alone, and on Linux, where both are `None`, the reused pid's read
+    /// stands.
     #[test]
     fn markers_read_across_an_exec_are_refused() {
-        let id = |idversion| super::super::Identity {
+        let id = |birth, idversion| super::super::Identity {
             pid: 71,
-            birth: super::super::Birth(1_000_002),
-            idversion: Some(idversion),
+            birth: super::super::Birth(birth),
+            idversion,
         };
         let script = |reads: Vec<Option<super::super::Identity>>| {
             let mut reads = reads.into_iter();
             bracketed(71, move |_| reads.next().flatten(), || Some("env"))
         };
-        assert_eq!(script(vec![Some(id(7)), Some(id(7))]), Some("env"));
-        assert_eq!(script(vec![Some(id(7)), Some(id(8))]), None, "an exec");
-        assert_eq!(script(vec![Some(id(7)), None]), None, "an exit");
+        let apple = |idversion| Some(id(1_000_002, Some(idversion)));
+        assert_eq!(script(vec![apple(7), apple(7)]), Some("env"));
+        assert_eq!(script(vec![apple(7), apple(8)]), None, "an exec");
+        assert_eq!(script(vec![apple(7), None]), None, "an exit");
+        let linux = |ticks| Some(id(ticks, None));
+        assert_eq!(
+            script(vec![linux(51_832_760), linux(51_832_901)]),
+            None,
+            "a pid reused between the reads"
+        );
+        assert_eq!(
+            script(vec![linux(51_832_760), linux(51_832_760)]),
+            Some("env"),
+            "an exec under one pid and start is one identity"
+        );
+    }
+
+    /// Set on [`a_marked_child_stand_in`] to make it the marked child.
+    const MARKED_CHILD_ENV: &str = "ATERM_UDS_MARKED_CHILD";
+
+    /// The line [`a_marked_child_stand_in`] writes once it runs.
+    const MARKED_CHILD_RUNS: &str = "the marked child runs";
+
+    /// The one-minute hang detector of the marked child's waits.
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    /// The child [`a_spawned_childs_markers_are_read_off_its_exec_environment`] reads: with
+    /// [`MARKED_CHILD_ENV`] set it writes [`MARKED_CHILD_RUNS`] and returns once its stdin
+    /// closes, which its parent's end closes too; without it, it returns.
+    #[test]
+    fn a_marked_child_stand_in() {
+        if std::env::var_os(MARKED_CHILD_ENV).is_none() {
+            return;
+        }
+        println!("{MARKED_CHILD_RUNS}");
+        let _ = std::io::Read::read(&mut std::io::stdin(), &mut [0u8; 1]);
+    }
+
+    /// A child's three markers are read off the kernel's copy of its exec environment
+    /// (`KERN_PROCARGS2` on macOS, `/proc/<pid>/environ` on Linux) between two identity reads,
+    /// and nothing once it has exited, unreaped or reaped, or for pid 1. The child is this test
+    /// binary, run in place: macOS withholds a platform binary's environment (`/bin/sleep`'s).
+    /// NEGATIVE CONTROLS: hand the macOS parser an empty buffer in place of the child's
+    /// arguments, and its markers do not read; read Linux's `environ` without the identity
+    /// reads around it (`bracketed`), and the exited child's empty `environ` reads as withheld
+    /// markers.
+    #[test]
+    fn a_spawned_childs_markers_are_read_off_its_exec_environment() {
+        use super::super::{ProcessPresence, process_presence};
+        let me = i32::try_from(std::process::id()).expect("pid");
+        let run = format!("{me}-1");
+        let mut child = crate::spawnfd::command(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                "process::kin::tests::a_marked_child_stand_in",
+                "--nocapture",
+                "--quiet",
+                "--test-threads=1",
+            ])
+            .env(MARKED_CHILD_ENV, "1")
+            .env(VERIFY_RUN_VAR, &run)
+            .env("ATERM_CHILD", "1")
+            .env("ATERM_PARENT_SESSION_ID", "s-markers")
+            .stdin(crate::spawnfd::Stdio::piped())
+            .stdout(crate::spawnfd::Stdio::piped())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("re-run this test binary as the marked child");
+        crate::deadline::prints(&mut child, MARKED_CHILD_RUNS, HANG);
+        let pid = i32::try_from(child.id()).expect("pid");
+        let read = read_process_markers(pid);
+        drop(child.stdin.take());
+        let deadline = std::time::Instant::now() + HANG;
+        while process_presence(pid) != ProcessPresence::Exited {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the marked child (pid {pid}) did not exit within its hang detector"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let unreaped = read_process_markers(pid);
+        let _ = child.wait();
+        if !cfg!(any(target_os = "macos", target_os = "linux")) {
+            assert_eq!(read, None, "no marker reader here");
+            return;
+        }
+        assert_eq!(
+            read,
+            Some(Markers {
+                withheld: false,
+                parent_session: Some("s-markers".into()),
+                child: Some("1".into()),
+                verify_run: Some(run),
+            }),
+            "the child's markers"
+        );
+        assert_eq!(unreaped, None, "an exited child its parent has not reaped");
+        assert_eq!(read_process_markers(pid), None, "a reaped child");
+        assert_eq!(read_process_markers(1), None, "launchd's or init's");
     }
 
     #[test]
@@ -885,6 +1017,12 @@ mod tests {
         }
         assert!(listed, "a child in the group is listed");
         assert_eq!(read_lineage(pid), None, "a reaped child reads nothing");
+        assert_eq!(at_program_check(pid), None, "a reaped child is not judged");
+        assert_eq!(
+            at_program_check(1),
+            None,
+            "launchd's or init's is not judged"
+        );
         assert!(boot_id().is_some(), "this boot's id reads");
     }
 

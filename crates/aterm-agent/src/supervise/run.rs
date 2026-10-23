@@ -1740,10 +1740,13 @@ impl Review for Alone {
     fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(false)
     }
-    fn say(&mut self, _line: &str) -> Result<(), String> {
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        super::ledger::assert_marked(line);
         Ok(())
     }
-    fn note(&mut self, _line: &str) {}
+    fn note(&mut self, line: &str) {
+        super::ledger::assert_marked(line);
+    }
     fn unattended(&self) -> bool {
         false
     }

@@ -119,6 +119,20 @@ fn now() -> Clocks {
     state::clocks().unwrap_or_default()
 }
 
+/// Whether `save`, of `file`, was made; a failure is logged, and the mug stops on it.
+fn saved(file: &Path, save: std::io::Result<()>) -> bool {
+    match save {
+        Ok(()) => true,
+        Err(err) => {
+            aterm_log::warn!(
+                "caffeine: could not save {}: {err}; stopping mug",
+                file.display()
+            );
+            false
+        }
+    }
+}
+
 /// Everything the mug knows and holds.
 struct Mug {
     paths: Paths,
@@ -171,19 +185,10 @@ impl Mug {
         None
     }
 
-    /// Publish this mug's mode.
-    fn save(&self) -> bool {
+    /// Publish this mug's mode, encoded at `now`.
+    fn save(&self, now: Clocks) -> bool {
         let file = self.paths.state_file();
-        match state::save(&file, self.mode) {
-            Ok(()) => true,
-            Err(err) => {
-                aterm_log::warn!(
-                    "caffeine: could not save {}: {err}; stopping mug",
-                    file.display()
-                );
-                false
-            }
-        }
+        saved(&file, state::save_at(&file, self.mode, now))
     }
 
     /// Hold the activity while on and show its actual state.
@@ -195,7 +200,7 @@ impl Mug {
             if self.awake.is_none() {
                 aterm_log::warn!("caffeine: the keep-awake activity did not begin; turning off");
                 self.mode = Mode::Off;
-                if !self.save() {
+                if !self.save(now) {
                     return false;
                 }
             }
@@ -212,7 +217,7 @@ impl Mug {
     fn set(&mut self, mode: Mode, now: Clocks) -> Next {
         let requested = mode.settled(now);
         self.mode = requested;
-        if !self.apply(now) || (self.mode == requested && !self.save()) {
+        if !self.apply(now) || (self.mode == requested && !self.save(now)) {
             return Next::Stop(Exit::Quit);
         }
         Next::Tick(next_tick_secs(self.mode, now))
@@ -271,6 +276,7 @@ impl Mug {
             if !self.apply(now) {
                 return Next::Stop(Exit::Quit);
             }
+            self.refresh(now);
         } else if let stop @ Next::Stop(_) = self.set(settled, now) {
             return stop;
         }
@@ -297,13 +303,34 @@ impl Mug {
         Next::Stop(Exit::Quit)
     }
 
-    /// Take the saved mode at `now`, saving it back when the file keeps it on the wall clock
-    /// alone ([`state::take`]), so that no later read of the file, by `status`, a bridge or the
-    /// next mug, reads it against a wall clock changed since. Whether that save, if due, was made.
+    /// Save a timed mode again once the date has been changed since its save ([`state::refresh`]),
+    /// so that a build before `ends`, which reads the file's end on the wall clock alone, reads
+    /// the end this mug holds within a tick of the change. A failure leaves this build's readers
+    /// right and the mug running; it is logged.
+    fn refresh(&self, now: Clocks) {
+        let file = self.paths.state_file();
+        if let Err(err) = state::refresh(&file, self.mode, now) {
+            aterm_log::warn!(
+                "caffeine: could not save {} again after a change of the date: {err}",
+                file.display()
+            );
+        }
+    }
+
+    /// Take the saved mode at `now`, saving it back when the file is one to ([`state::take`]):
+    /// one on the wall clock alone, or one whose deadline the restore changed. So no later read
+    /// of the file, by `status`, a bridge or the next mug, reads another time than the mug holds.
+    /// A writer's change that lands before that save is taken instead
+    /// ([`state::take_saving`]). Whether the save, if due, was made.
     fn take(&mut self, now: Clocks) -> bool {
-        let (mode, wall_only) = state::take(&self.paths.state_file(), now);
-        self.mode = mode;
-        !wall_only || self.save()
+        let file = self.paths.state_file();
+        match state::take_saving(&file, now) {
+            Ok(mode) => {
+                self.mode = mode;
+                true
+            }
+            Err(err) => saved(&file, Err(err)),
+        }
     }
 
     /// Take the writer's mode.
@@ -466,6 +493,22 @@ aterm_objc::declare_class! {
                 return TERMINATE_NOW;
             }
             if self.quit_from_outside() { TERMINATE_CANCEL } else { TERMINATE_NOW }
+        }
+
+        /// As the app's delegate, what `-terminate:` posts just before it exits the process, from
+        /// inside `-run` (a logout, a restart or a shutdown): [`run`] never gets back to its
+        /// discard of the copy, so it is made here. `-stop:`, how the menu's Quit and an update's
+        /// restart end `-run`, posts nothing.
+        @sel(applicationWillTerminate:)
+        fn application_will_terminate(&self, _note: Id) {
+            if MainThread::new().is_none() {
+                return;
+            }
+            let code_dir = match self.ivars().mug.try_borrow() {
+                Ok(mug) => mug.paths.code_dir(),
+                Err(_) => return,
+            };
+            discard_own_copy(&code_dir);
         }
     }
 }
@@ -816,11 +859,8 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         exit: None,
     };
     let code = autoreleasepool(|_| run_app(main, mug));
-    if code == ExitCode::SUCCESS
-        && crate::code::runs_from_copy(&code_dir)
-        && let Err(e) = crate::code::discard_copies(&code_dir)
-    {
-        eprintln!("aterm caffeine: {}: {e}", code_dir.display());
+    if code == ExitCode::SUCCESS {
+        discard_own_copy(&code_dir);
     }
     if code == Exit::Restart.code() {
         instance.release_named();
@@ -828,6 +868,16 @@ pub(super) fn run(ctx: ServeContext) -> ExitCode {
         drop(instance);
     }
     code
+}
+
+/// Remove the copy under `code_dir` this mug runs from, with every other one that may go
+/// ([`crate::code::discard_copies`]), when it runs from one; a failure is said on stderr.
+fn discard_own_copy(code_dir: &Path) {
+    if crate::code::runs_from_copy(code_dir)
+        && let Err(e) = crate::code::discard_copies(code_dir)
+    {
+        eprintln!("aterm caffeine: {}: {e}", code_dir.display());
+    }
 }
 
 /// [`run`]'s AppKit half.
@@ -1266,6 +1316,120 @@ mod tests {
         }
     }
 
+    /// A deadline a day away on a span of an hour (a hand-edited or damaged file), taken at the
+    /// start or from a writer: the mug holds the hour and saves it so, and a read half an hour on
+    /// (`status`, a bridge, the next mug) has the half hour left the mug holds, not a full hour
+    /// again.
+    #[test]
+    fn a_deadline_past_its_span_is_saved_in_to_it() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut mug = scratch_mug(dir.path());
+        let file = mug.paths.state_file();
+        std::fs::create_dir_all(&mug.paths.state_dir).expect("state dir");
+        let far = format!(
+            "mode=until\nends={}\nspan={HOUR}\ndeadline={}\nboot={}\n",
+            NOW.since_boot + 24 * HOUR,
+            NOW.wall + 24 * HOUR,
+            state::boot_text(crate::instance::boot_id().expect("this boot"))
+        );
+        for from_writer in [false, true] {
+            let how = if from_writer {
+                "from a writer"
+            } else {
+                "at the start"
+            };
+            std::fs::write(&file, &far).expect("a far deadline");
+            let taken = if from_writer {
+                mug.reload(NOW) == Next::Tick(TICK_SECS)
+            } else {
+                mug.take(NOW)
+            };
+            assert!(taken, "{how}");
+            assert_eq!(mug.mode.remaining(NOW), Some(HOUR), "{how}");
+            let later = NOW + HOUR / 2;
+            assert_eq!(
+                state::load(&file, later).remaining(later),
+                Some(HOUR / 2),
+                "{how}"
+            );
+        }
+    }
+
+    /// Activate for 8 Hours, then the date set back or forward a day: the next tick saves the
+    /// mode again, so the file's wall-clock end, all a build before `ends` reads, is where the
+    /// wall clock now puts the end the mug holds. A tick with the date unchanged, and the one
+    /// after the save, leave the file alone.
+    #[test]
+    fn a_change_of_the_date_saves_the_wall_clock_end_again() {
+        use std::os::unix::fs::MetadataExt as _;
+        let identity = |file: &Path| {
+            let meta = std::fs::metadata(file).expect("the state file");
+            (meta.dev(), meta.ino())
+        };
+        let wall_end = |file: &Path| {
+            std::fs::read_to_string(file)
+                .expect("the state file")
+                .lines()
+                .find_map(|line| line.strip_prefix("deadline="))
+                .map(|end| end.parse::<u64>().expect("a number"))
+        };
+        for wall in [NOW.wall - 24 * HOUR + 600, NOW.wall + 24 * HOUR + 600] {
+            let dir = aterm_tempfile::tempdir().expect("tempdir");
+            let mut mug = scratch_mug(dir.path());
+            let file = mug.paths.state_file();
+            let _ = mug.choose(MenuAction::Activate(Choice::Hours8), NOW);
+            assert_eq!(wall_end(&file), Some(NOW.wall + 8 * HOUR));
+            let saved = identity(&file);
+            assert_eq!(mug.tick(NOW + TICK_SECS, false), Next::Tick(TICK_SECS));
+            assert_eq!(identity(&file), saved, "the date unchanged: {wall}");
+            let later = Clocks {
+                since_boot: NOW.since_boot + 600,
+                wall,
+            };
+            assert_eq!(mug.tick(later, false), Next::Tick(TICK_SECS));
+            let left = mug.mode.remaining(later);
+            assert_eq!(left, Some(8 * HOUR - 600), "{wall}");
+            assert_eq!(
+                wall_end(&file),
+                left.map(|left| later.wall + left),
+                "{wall}"
+            );
+            let refreshed = identity(&file);
+            assert_ne!(refreshed, saved, "{wall}");
+            assert_eq!(mug.tick(later + TICK_SECS, false), Next::Tick(TICK_SECS));
+            assert_eq!(identity(&file), refreshed, "saved once: {wall}");
+        }
+    }
+
+    /// A writer's change saved after the mug's, with the date set back a day since and the
+    /// writer's notification not yet taken: the tick that comes first saves nothing of the mug's
+    /// over it, whatever the writer chose.
+    #[test]
+    fn a_tick_after_a_change_of_the_date_keeps_a_writers_mode() {
+        let later = Clocks {
+            since_boot: NOW.since_boot + 600,
+            wall: NOW.wall - 24 * HOUR + 600,
+        };
+        for writers in [
+            Mode::Off,
+            Mode::Forever,
+            Mode::chosen(Choice::Hours1, later),
+        ] {
+            let dir = aterm_tempfile::tempdir().expect("tempdir");
+            let mut mug = scratch_mug(dir.path());
+            let file = mug.paths.state_file();
+            let _ = mug.choose(MenuAction::Activate(Choice::Hours8), NOW);
+            state::save_at(&file, writers, later).expect("the writer's save");
+            let text = std::fs::read_to_string(&file).expect("the writer's file");
+            assert_eq!(mug.tick(later, false), Next::Tick(TICK_SECS), "{writers:?}");
+            assert_eq!(
+                std::fs::read_to_string(&file).expect("the state file"),
+                text,
+                "{writers:?}"
+            );
+        }
+    }
+
     #[test]
     fn enable_at_startup_writes_and_removes_the_login_plist() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1535,6 +1699,7 @@ mod tests {
                 sel!(workspaceDidWake:),
                 sel!(stateChanged:),
                 sel!(stopRun:),
+                sel!(applicationWillTerminate:),
             ] {
                 assert!(
                     aterm_objc::send::send_bool_sel(

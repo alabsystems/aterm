@@ -928,6 +928,12 @@ pub enum Look {
     Answers,
     /// Transient transport failure or unreached source.
     Unreached(String),
+    /// Unreached, the last failure [`transport::Unheard::held`]: a timeout or no route to the
+    /// host, as macOS leaves this app's lookups and LAN connects while it holds them for a
+    /// person's answer to its Local Network question or after a Don't Allow. A host that is
+    /// off, or a server that takes the connection and then stalls, fails alike, so it is a hint
+    /// to name the setting, never a finding.
+    Held(String),
     /// The endpoint or path holds no vault.
     NoVault(String),
 }
@@ -994,6 +1000,7 @@ fn look_with(
                         }
                         tries.pause(LOOK_PAUSE);
                     }
+                    Err(unheard) if unheard.held => return Look::Held(unheard.why.0),
                     Err(unheard) => return Look::Unreached(unheard.why.0),
                 }
             }
@@ -3377,7 +3384,7 @@ mod tests {
         );
         assert_eq!(
             look_with(&alab(), HANG_DETECTOR, Duration::ZERO, &say, &mut tries),
-            Look::Unreached("dns: no answer within 8000ms".into())
+            Look::Held("dns: no answer within 8000ms".into())
         );
         assert_eq!((tries.gets, tries.pauses.len()), (1, 0));
         assert!(
@@ -3430,7 +3437,7 @@ mod tests {
         );
         assert_eq!(
             look_with(&alab(), HANG_DETECTOR, patience, &|_| {}, &mut tries),
-            Look::Unreached("try 6".into())
+            Look::Held("try 6".into())
         );
         assert_eq!(tries.gets, 6, "tries at 0, 10, 20, 30, 40 and 50 s");
         assert_eq!(tries.pauses, [LOOK_PAUSE; 5]);

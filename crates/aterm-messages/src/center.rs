@@ -2456,6 +2456,13 @@ impl MessageCenter {
         self.digest.revision()
     }
 
+    /// The opaque freshness of one open entry, independent of digest painting.
+    pub(crate) fn digest_confirmation(&self, id: MessageId) -> Option<u64> {
+        self.digest
+            .find_id(id)
+            .map(|i| self.digest.get(i).confirmation)
+    }
+
     /// How many messages the door demoted to a record.
     #[must_use]
     pub const fn demotions(&self) -> u32 {
@@ -2481,6 +2488,7 @@ impl MessageCenter {
             }
             LaterVerdict::Repeat(i) => {
                 let e = self.digest.get_mut(i);
+                e.confirm();
                 e.repeats = e.repeats.saturating_add(1);
                 e.ask.take_action_of(&ask);
                 return Posted {
@@ -2490,6 +2498,7 @@ impl MessageCenter {
             }
             LaterVerdict::Restate(i) => {
                 let e = self.digest.get_mut(i);
+                e.confirm();
                 let id = e.id;
                 e.msg = msg;
                 e.ask = ask;
@@ -2517,6 +2526,7 @@ impl MessageCenter {
             posted_at: now,
             anchor_wall: stamp.unix_ms,
             repeats: 1,
+            confirmation: 1,
             missed_at: None,
             restated_at: now,
         });
@@ -2941,6 +2951,7 @@ impl MessageCenter {
                 posted_at: now,
                 anchor_wall: wall.unix_ms,
                 repeats: r.repeats,
+                confirmation: 1,
                 missed_at: None,
                 restated_at: now,
             });
@@ -3426,6 +3437,52 @@ mod tests {
 
     fn glass_ids(c: &MessageCenter) -> Vec<MessageId> {
         c.on_glass().map(|l| l.id).collect()
+    }
+
+    #[test]
+    fn exhausted_entry_confirmations_never_wrap_or_allow_conditional_settlement() {
+        use crate::wire::{NoticeRequest, WireGate};
+        let now = t0();
+        let mut c = fresh(now);
+        let NoticeRequest::Later(later) = NoticeRequest::parse(
+            "later k Renew the key -- only you hold its passphrase -- Renew the key",
+        )
+        .unwrap() else {
+            panic!("a later entry");
+        };
+        let msg = later.into_message();
+        let id = c.post(msg.clone(), stamp(0), now).id;
+        let i = c.digest.find_id(id).unwrap();
+        c.digest.get_mut(i).confirmation = u64::MAX - 1;
+        let before = (c.revision(), c.digest_revision(), c.projection_revision());
+        for _ in 0..2 {
+            assert_eq!(
+                c.post(msg.clone(), stamp(0), now).outcome,
+                PostOutcome::Duplicate
+            );
+        }
+        let rows = crate::wire::message_rows(
+            &c,
+            &crate::wire::parse_read_args("live need=later").unwrap(),
+            0,
+            &str::to_string,
+        );
+        assert!(rows[0].ends_with(&format!(" rev={}", u64::MAX)));
+        let mut gate = WireGate::default();
+        for revision in [u64::MAX - 1, u64::MAX] {
+            let req = NoticeRequest::parse(&format!("settle k {id} {revision}")).unwrap();
+            let result = crate::wire::apply(&mut c, &mut gate, req, stamp(0), now);
+            assert_eq!(result.reply, "OK settled=- how=gone");
+            assert_eq!(
+                (result.paint, result.note),
+                (crate::wire::Paint::None, false)
+            );
+        }
+        assert!(c.digest_entry(id).is_some());
+        assert_eq!(
+            (c.revision(), c.digest_revision(), c.projection_revision()),
+            before
+        );
     }
 
     fn pending_retired(c: &MessageCenter) -> Vec<(MessageId, Retired, String, u32)> {

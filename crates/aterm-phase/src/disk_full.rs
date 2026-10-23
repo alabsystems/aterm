@@ -50,6 +50,7 @@ pub struct DiskFull {
 #[must_use]
 pub fn disk_full(rows: &[String]) -> Option<DiskFull> {
     let frame = crate::phase::composer_frame(rows)?;
+    let room = message_room(rows, frame);
     let under = (frame.bottom + 1..rows.len()).rev().find_map(|i| {
         notification(rows, i)
             .or_else(|| goal_cleared(rows, i, false))
@@ -70,6 +71,7 @@ pub fn disk_full(rows: &[String]) -> Option<DiskFull> {
                 return None;
             }
             notification(rows, i)
+                .or_else(|| pre_start(rows, i, room))
                 .or_else(|| tool_output(rows, i, true))
                 .or_else(|| goal_cleared(rows, i, true))
         })
@@ -79,11 +81,22 @@ pub fn disk_full(rows: &[String]) -> Option<DiskFull> {
                 .rev()
                 .take(TOOL_ROWS)
                 .take_while(|&i| !rows[i].starts_with('❯'))
-                .find_map(|i| tool_output(rows, i, true).or_else(|| goal_cleared(rows, i, true)))
+                .find_map(|i| {
+                    pre_start(rows, i, room)
+                        .or_else(|| tool_output(rows, i, true))
+                        .or_else(|| goal_cleared(rows, i, true))
+                })
         })
 }
 
 const TOOL_ROWS: usize = 40;
+
+/// Width a result's message wraps at: the composer rule's width (the pane's)
+/// less the message indent.
+fn message_room(rows: &[String], frame: crate::phase::Frame) -> usize {
+    crate::question::cells(crate::text::trim_end(&rows[frame.top]))
+        .saturating_sub(RESULT_BODY.len())
+}
 
 fn segments(row: &str) -> impl Iterator<Item = &str> {
     let trimmed = row.trim_start();
@@ -171,9 +184,6 @@ fn result_head(rows: &[String], i: usize) -> Option<&str> {
 }
 
 fn tool_output(rows: &[String], i: usize, vendor: bool) -> Option<DiskFull> {
-    if vendor && let Some(found) = pre_start(rows, i) {
-        return Some(found);
-    }
     let heads = [
         const { crate::anchors::anchor_text("wall.disk_full.tool") },
         const { crate::anchors::anchor_text("wall.disk_full.tool_inodes") },
@@ -227,19 +237,23 @@ fn message_row(row: &str) -> bool {
         .is_some_and(|text| !text.is_empty() && !text.starts_with(' '))
 }
 
-fn pre_start(rows: &[String], i: usize) -> Option<DiskFull> {
-    let seg = result_row(crate::text::trim_end(&rows[i]))?.strip_prefix(FAILED_RESULT)?;
-    let joined = std::iter::once(seg)
+/// Pre-start notice on the `⎿` row: the whole template, word-wrapped at
+/// `room`. A printed copy (wrapped by column) or a cut notice is refused.
+fn pre_start(rows: &[String], i: usize, room: usize) -> Option<DiskFull> {
+    let head = result_row(crate::text::trim_end(&rows[i]))?;
+    let seg = head.strip_prefix(FAILED_RESULT)?;
+    let drawn: Vec<&str> = std::iter::once(head)
         .chain(
             rows[i + 1..]
                 .iter()
                 .take_while(|r| message_row(r))
                 .map(|r| crate::text::trim(r)),
         )
-        .collect::<Vec<_>>()
-        .join(" ");
-    let said =
-        joined.strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start") })?;
+        .collect();
+    let joined = drawn.join(" ");
+    let said = joined
+        .strip_prefix(FAILED_RESULT)?
+        .strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start") })?;
     let (code, rest) = [
         (
             const { crate::anchors::anchor_text("wall.disk_full.pre_start_full") },
@@ -266,11 +280,24 @@ fn pre_start(rows: &[String], i: usize) -> Option<DiskFull> {
         .strip_prefix(const { crate::anchors::anchor_text("wall.disk_full.pre_start_ran") })?
         .strip_prefix(' ')?;
     let whole = advice == const { crate::anchors::anchor_text("wall.disk_full.free_space") };
-    (!dir.is_empty() && whole).then(|| DiskFull {
+    (!dir.is_empty() && whole && word_wrapped(&drawn, room)).then(|| DiskFull {
         code,
         source: Source::ToolOutput,
         row: i,
         message: seg.to_string(),
+    })
+}
+
+/// Whether each row break is a word wrap's at `room`. A row that fills
+/// `room` carries its trailing space onto the next row, as
+/// `prompt::fixtures::ink_wrap` models Ink's wrap.
+fn word_wrapped(drawn: &[&str], room: usize) -> bool {
+    let mut carried = 0;
+    drawn.windows(2).all(|pair| {
+        let used = carried + crate::question::cells(pair[0]);
+        let next = pair[1].split(' ').next().unwrap_or_default();
+        carried = usize::from(used >= room);
+        used + 1 + crate::question::cells(next) > room
     })
 }
 

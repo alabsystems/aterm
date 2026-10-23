@@ -152,9 +152,14 @@ impl From<ProcessBirth> for Birth {
 }
 
 /// Process identity token (`<pid>@<birth>:<idversion>`, or `<pid>@<birth>` where the kernel
-/// keeps no pid version) re-read before each pid signal. On Linux the signal goes through a
-/// pidfd opened before the last read ([`signal_by_handle`]), so a pid reused after it is never
-/// signalled; elsewhere a reuse after that read, and an exec anywhere, is not excluded.
+/// keeps no pid version) re-read before each pid signal. Two reads that agree saw no reuse of
+/// the pid between them, and, where the identity has a pid version (Apple), no exec. Linux's has
+/// none: an exec keeps the pid and the start, so it reads as the same identity, and only a
+/// caller's own reads (the executable it judged) can see it. On Linux the signal goes through a
+/// pidfd opened before the last read ([`signal_by_handle`]), so a pid reused after that read is
+/// never signalled, unless the kernel refuses the pidfd and the signal goes by pid; elsewhere
+/// such a reuse is not excluded. An exec after the last read is excluded on no kernel: a pidfd
+/// names the process, not its program.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Identity {
     /// The pid.
@@ -459,8 +464,9 @@ mod kin;
 pub use kin::held_among;
 pub use kin::{
     GroupMembers, HeldNow, Lineage, MARKER_VARS, MAX_GROUP_PIDS, Markers, VERIFY_RUN_VAR,
-    at_program_check, boot_id, group_members, held_programs, launchd_idversion, launched_before,
-    pid_namespace, read_identity, read_lineage, read_process_markers, thread_ran,
+    at_program_check, boot_id, group_listing_can_be_whole, group_members, held_programs,
+    launchd_idversion, launched_before, pid_namespace, read_identity, read_lineage,
+    read_process_markers, thread_ran,
 };
 
 #[cfg(target_vendor = "apple")]
@@ -1275,11 +1281,28 @@ fn proc_stat_status_stat(pid: i32) -> Option<[String; 3]> {
     Some([read("stat").ok()?, read("status").ok()?, read("stat").ok()?])
 }
 
-/// One `/proc/<pid>/stat` read of a group listing: its text, gone (`ENOENT`, `ESRCH`), or
-/// unreadable.
+/// Whether this host's `/proc` lists every process to every reader
+/// ([`procfs::shows_every_process`] over `/proc/self/mountinfo`; a mount table that does not
+/// read shows nothing).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn proc_shows_every_process() -> bool {
+    read_proc_text(std::path::Path::new("/proc/self/mountinfo"))
+        .is_ok_and(|mounts| procfs::shows_every_process(&mounts))
+}
+
+/// One `/proc/<pid>/stat` read of a group listing ([`stat_read`]).
 #[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
 fn stat_row(path: &std::path::Path) -> procfs::StatRead {
-    match read_proc_text(path) {
+    stat_read(read_proc_text(path))
+}
+
+/// A `/proc/<pid>/stat` read as a group listing takes it: its text, gone (`ENOENT`, `ESRCH`),
+/// or unreadable (any other error). Under a `hidepid=1` mount another user's `/proc/<pid>` is
+/// listed and its files answer `EPERM`, so such a row is unreadable and no listing there is
+/// whole; under `hidepid=2` the kernel lists no such directory at all.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn stat_read(read: std::io::Result<String>) -> procfs::StatRead {
+    match read {
         Ok(text) => procfs::StatRead::Text(text),
         Err(why)
             if why.kind() == std::io::ErrorKind::NotFound
@@ -1370,19 +1393,13 @@ pub mod procfs {
         aterm_sysprobe::jobs::linux::parse_stat(stat)
     }
 
-    /// A zombie (`Z`) or a dead task (`X`, and the older `x`): the row's own task has exited.
-    #[cfg(any(unix, windows))]
-    const fn task_exited(state: u8) -> bool {
-        matches!(state, b'Z' | b'X' | b'x')
-    }
-
-    /// A process that has exited and holds nothing: its row's task has exited
-    /// ([`task_exited`]) and no other thread runs. A main thread that exited while its other
-    /// threads run reads `Z` too (`ps` shows `Zl`) with more than one thread, and that process
-    /// still runs.
+    /// A process that has exited and holds nothing: its row's task has exited (a zombie, `Z`,
+    /// or dead, `X` and the older `x`) and no other thread runs. A main thread that exited
+    /// while its other threads run reads `Z` too (`ps` shows `Zl`) with more than one thread,
+    /// and that process still runs. Every reader here judges a row's life by this one rule.
     #[cfg(any(unix, windows))]
     fn exited(line: &aterm_sysprobe::jobs::linux::StatLine) -> bool {
-        task_exited(line.state) && line.threads <= 1
+        matches!(line.state, b'Z' | b'X' | b'x') && line.threads <= 1
     }
 
     /// Whether `stat`, `pid`'s `/proc/<pid>/stat`, names `pid` as a process that has exited
@@ -1406,12 +1423,12 @@ pub mod procfs {
 
     /// `pid`'s [`super::Lineage`] from its `stat`, its `status` and `stat` read again after
     /// `status`, for a reader whose effective uid is `euid`: both `stat` reads name `pid` with
-    /// one start (a pid reused between them reads another), neither is a zombie or dead, the
-    /// `status` is this uid's and names `pid` as its thread group (a thread's id is no
-    /// process), and the fields are the second read's. Linux keeps no pid version, so the
-    /// identity has none ([`super::Identity::idversion`]), and its birth and unique id are both
-    /// its start in clock ticks after boot. A terminal is kept as the kernel numbers it
-    /// (`tty_nr`), `None` for none.
+    /// one start (a pid reused between them reads another), neither has exited ([`exited`]: a
+    /// process whose main thread alone exited runs), the `status` is this uid's and names `pid`
+    /// as its thread group (a thread's id is no process), and the fields are the second read's.
+    /// Linux keeps no pid version, so the identity has none ([`super::Identity::idversion`]),
+    /// and its birth and unique id are both its start in clock ticks after boot. A terminal is
+    /// kept as the kernel numbers it (`tty_nr`), `None` for none.
     #[cfg(any(unix, windows))]
     #[must_use]
     pub fn lineage(
@@ -1423,7 +1440,7 @@ pub mod procfs {
     ) -> Option<super::Lineage> {
         let first = stat_line(stat, pid)?;
         let now = stat_line(again, pid)?;
-        if now.start != first.start || task_exited(first.state) || task_exited(now.state) {
+        if now.start != first.start || exited(&first) || exited(&now) {
             return None;
         }
         if effective_uid(status)? != euid || thread_group(status)? != pid {
@@ -1455,20 +1472,23 @@ pub mod procfs {
     }
 
     /// The members of process group `pgid` among `rows` (each a pid and the read of its
-    /// `/proc/<pid>/stat`): a row whose text names its own pid in `pgid`, unless it has exited
-    /// ([`exited`]: an exited stage leader is a zombie in its group until it is reaped, and
-    /// holds nothing; a process whose main thread alone exited is still listed). A gone row is
-    /// skipped. The listing is complete only when every other row read and parsed and at most
-    /// [`super::MAX_GROUP_PIDS`] members were found (the first that many are kept).
+    /// `/proc/<pid>/stat`), listed off a `/proc` that does or does not list every process
+    /// (`shows_every`, [`shows_every_process`]): a row whose text names its own pid in `pgid`,
+    /// unless it has exited ([`exited`]: an exited stage leader is a zombie in its group until
+    /// it is reaped, and holds nothing; a process whose main thread alone exited is still
+    /// listed). A gone row is skipped. The listing is complete only when the `/proc` lists
+    /// every process, every other row read and parsed, and at most [`super::MAX_GROUP_PIDS`]
+    /// members were found (the first that many are kept).
     #[cfg(any(unix, windows))]
     #[must_use]
     pub fn group_of(
         rows: impl IntoIterator<Item = (i32, StatRead)>,
         pgid: u32,
+        shows_every: bool,
     ) -> super::GroupMembers {
         let mut members = super::GroupMembers {
             pids: Vec::new(),
-            complete: true,
+            complete: shows_every,
         };
         for (pid, read) in rows {
             let text = match read {
@@ -1495,10 +1515,38 @@ pub mod procfs {
         members
     }
 
+    /// Whether the `/proc` a `/proc/self/mountinfo` text mounts at `/proc` lists every process
+    /// to every reader: each `proc` mount there sets no `hidepid`, or sets it `0` or `off`.
+    /// Any other `hidepid` hides another user's processes, and this uid's own that it may not
+    /// trace (a non-dumpable one), from the listing (`invisible`, `ptraceable`; `2`, `4`), or
+    /// refuses their files (`noaccess`, `1`); and a text with no `proc` mount at `/proc` shows
+    /// nothing. Both answer `false`.
+    #[must_use]
+    pub fn shows_every_process(mountinfo: &str) -> bool {
+        let mut mounted = false;
+        for line in mountinfo.lines() {
+            let Some((mount, fs)) = line.split_once(" - ") else {
+                continue;
+            };
+            if mount.split(' ').nth(4) != Some("/proc") || fs.split(' ').next() != Some("proc") {
+                continue;
+            }
+            let hides = line
+                .split([' ', ','])
+                .filter_map(|word| word.strip_prefix("hidepid="))
+                .any(|mode| !matches!(mode, "0" | "off"));
+            if hides {
+                return false;
+            }
+            mounted = true;
+        }
+        mounted
+    }
+
     /// The start of `pid` from its `stat`, its `status` and `stat` read again after `status`,
-    /// for a reader whose effective uid is `euid`, on [`lineage`]'s terms: one start in both
-    /// reads, neither a zombie or dead, and a `status` of this uid naming `pid` as its thread
-    /// group.
+    /// for a reader whose effective uid is `euid`: the start of its [`lineage`], on the boot
+    /// clock at `per_second` ticks a second ([`tick_start`]).
+    #[cfg(any(unix, windows))]
     #[must_use]
     pub fn start(
         stat: &str,
@@ -1508,16 +1556,10 @@ pub mod procfs {
         euid: u32,
         per_second: u64,
     ) -> Option<BootClock> {
-        let dead = |state: char| matches!(state, 'Z' | 'X' | 'x');
-        let (state, ticks) = stat_start(stat, pid)?;
-        let (state_again, ticks_again) = stat_start(again, pid)?;
-        if ticks_again != ticks || dead(state) || dead(state_again) {
-            return None;
-        }
-        if effective_uid(status)? != euid || thread_group(status)? != pid {
-            return None;
-        }
-        tick_start(ticks, per_second)
+        tick_start(
+            lineage(stat, status, again, pid, euid)?.uniqueid,
+            per_second,
+        )
     }
 }
 
@@ -2125,8 +2167,10 @@ mod start_tests {
     /// Field 22 counted from the command name's last `)`, the effective uid as the second
     /// `Uid:` id, a tick as its first instant; another pid's line, a zombie (in either read),
     /// another euid, two disagreeing `stat` reads, a thread's id, a short line and a zero tick
-    /// rate answer `None`. NEGATIVE CONTROL: judge the first read's state alone, and the process
-    /// that died between the reads has a start.
+    /// rate answer `None`; a process whose main thread alone exited has its start. NEGATIVE
+    /// CONTROL: judge the first read's state alone, and the process that died between the reads
+    /// has a start.
+    #[cfg(any(unix, windows))]
     #[test]
     fn a_linux_start_is_read_off_proc_as_linux_writes_it() {
         assert_eq!(procfs::stat_start(TRICKY, 7), Some(('S', 51_832_760)));
@@ -2156,6 +2200,19 @@ mod start_tests {
             procfs::start(TRICKY, &thread_status, TRICKY, 7, 502, 100),
             None,
             "a thread's id"
+        );
+        let main_thread_gone = ZOMBIE.replacen(" 20 0 1 0 ", " 20 0 3 0 ", 1);
+        assert_eq!(
+            procfs::start(
+                &main_thread_gone,
+                &tricky_status,
+                &main_thread_gone,
+                7,
+                502,
+                100
+            ),
+            at(51_832_760),
+            "a process whose main thread alone exited (`Zl`) runs"
         );
         for (case, stat, again, euid, per_second) in [
             ("a zombie", ZOMBIE, ZOMBIE, 502, 100),
@@ -2192,12 +2249,16 @@ mod start_tests {
 
     /// A lineage off `/proc` as Linux writes it: the fields counted from the command name's
     /// last `)`, the start tick as both birth and unique id, no pid version, and the group and
-    /// terminal of the second read. A zombie, a dead process, one that died between the reads,
-    /// another euid, a pid reused between the reads, a thread's id, a cut line and another pid's
-    /// line read nothing. NEGATIVE CONTROLS: drop the second read's start check, and the reused
-    /// pid reads; drop the second read's state check, and the process that died between the
-    /// reads reads live; map the terminal to `None`, and a member with one would be proven free
-    /// of it.
+    /// terminal of the second read, one the kernel prints negative (its `int` with the sign bit
+    /// set) as its device; a process whose main thread alone exited (`Z` with other threads)
+    /// reads, as the group listing and the presence read take it. A zombie, a dead process, one
+    /// that died between the reads, another euid, a pid reused between the reads, a thread's id,
+    /// a terminal that does not read, a cut line and another pid's line read nothing. NEGATIVE
+    /// CONTROLS: drop the second read's start check, and the reused pid reads; drop the second
+    /// read's state check, and the process that died between the reads reads live; map the
+    /// terminal to `None`, and a member with one would be proven free of it; read a terminal
+    /// that does not convert as none (`parse_stat`), and the negative one would too; judge a
+    /// row's state alone, whatever its threads, and the running process reads nothing.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_linux_lineage_is_read_off_proc_as_linux_writes_it() {
@@ -2221,6 +2282,25 @@ mod start_tests {
         let grouped = TRICKY.replacen(") S 1 1 1 0 -1 ", ") S 1 500 500 34817 -1 ", 1);
         let read = procfs::lineage(&grouped, &status, &grouped, 7, 502).expect("a member");
         assert_eq!((read.pgid, read.tty), (500, Some(34817)), "{read:?}");
+        let far = TRICKY.replacen(") S 1 1 1 0 -1 ", ") S 1 500 500 -2147448832 -1 ", 1);
+        let read = procfs::lineage(&far, &status, &far, 7, 502).expect("a member");
+        assert_eq!(
+            read.tty,
+            Some(0x8000_8800),
+            "pts 524288, past 2^19: {read:?}"
+        );
+        let main_thread_gone = ZOMBIE.replacen(" 20 0 1 0 ", " 20 0 3 0 ", 1);
+        assert_eq!(
+            procfs::lineage(&main_thread_gone, &status, &main_thread_gone, 7, 502)
+                .map(|l| l.identity),
+            Some(Identity {
+                pid: 7,
+                birth: Birth(51_832_760),
+                idversion: None,
+            }),
+            "a process whose main thread alone exited (`Zl`) runs"
+        );
+        let unread_tty = TRICKY.replacen(") S 1 1 1 0 -1 ", ") S 1 1 1 x -1 ", 1);
         let cut = &TRICKY[..40];
         for (case, stat, again, status, euid) in [
             ("a zombie", ZOMBIE, ZOMBIE, status.clone(), 502),
@@ -2247,6 +2327,13 @@ mod start_tests {
                 502,
             ),
             ("a thread's id", TRICKY, TRICKY, status_of(6), 502),
+            (
+                "a terminal that does not read",
+                &*unread_tty,
+                &*unread_tty,
+                status.clone(),
+                502,
+            ),
             ("cut short", cut, cut, status.clone(), 502),
             ("another pid's line", CAT, CAT, status.clone(), 502),
         ] {
@@ -2261,10 +2348,12 @@ mod start_tests {
     /// A group is listed from every `/proc/<pid>/stat`: its live members by `pgrp` (a command
     /// name of `x) (y` among them, and a process whose main thread alone exited, `Z` with three
     /// threads), never its zombie leader or a dead row, a gone row skipped; an unreadable or
-    /// garbled row, or more members than the bound, leave it incomplete. NEGATIVE CONTROLS:
-    /// stop skipping zombies, and the exited leader is listed; skip every `Z` row whatever its
-    /// threads, and the running process is left out of a listing that reads complete; read an
-    /// unreadable row as gone, and a listing with a hole reads complete.
+    /// garbled row, more members than the bound, or a `/proc` that does not list every process
+    /// leave it incomplete. NEGATIVE CONTROLS: stop skipping zombies, and the exited leader is
+    /// listed; skip every `Z` row whatever its threads, and the running process is left out of
+    /// a listing that reads complete; read an unreadable row as gone, and a listing with a hole
+    /// reads complete; start the listing complete whatever its `/proc` shows, and one off a
+    /// `/proc` that hides processes reads complete.
     #[cfg(any(unix, windows))]
     #[test]
     fn a_linux_group_is_listed_from_proc_without_its_zombies() {
@@ -2295,25 +2384,124 @@ mod start_tests {
                 main_thread_gone.clone(),
             ]
         };
-        let listed = procfs::group_of(rows(), 500);
+        let listed = procfs::group_of(rows(), 500, true);
         assert_eq!(listed.pids, [501, 502, 506], "{listed:?}");
         assert!(listed.complete, "{listed:?}");
+        let hidden = procfs::group_of(rows(), 500, false);
+        assert_eq!(hidden.pids, [501, 502, 506], "{hidden:?}");
+        assert!(
+            !hidden.complete,
+            "a /proc that does not list every process: {hidden:?}"
+        );
         let mut holed = rows();
         holed.push((506, StatRead::Unreadable));
         assert!(
-            !procfs::group_of(holed, 500).complete,
+            !procfs::group_of(holed, 500, true).complete,
             "a row that did not read"
         );
         let mut garbled = rows();
         garbled.push((507, StatRead::Text("507 (sh) S 1 500".to_owned())));
         assert!(
-            !procfs::group_of(garbled, 500).complete,
+            !procfs::group_of(garbled, 500, true).complete,
             "a row that did not parse"
         );
         let many = (1000..1257).map(|pid| row(pid, 'S', 500));
-        let full = procfs::group_of(many, 500);
+        let full = procfs::group_of(many, 500, true);
         assert_eq!(full.pids.len(), super::MAX_GROUP_PIDS);
         assert!(!full.complete, "past the bound");
+    }
+
+    /// Whether `/proc` lists every process is read off its mount: a `proc` mount at `/proc`
+    /// with no `hidepid`, or `hidepid=0` or `off`, does; one with any other mode (`noaccess`,
+    /// `invisible`, `ptraceable`, or their numbers), a table with no `proc` mount at `/proc`,
+    /// and an empty one do not. A `proc` mount elsewhere and other file systems under `/proc`
+    /// are not it. NEGATIVE CONTROL: read the mode `invisible` as shown, and a `/proc` that
+    /// hides this uid's non-dumpable processes from its listing reads as listing them.
+    #[test]
+    fn a_proc_mounted_to_hide_processes_shows_no_listing_whole() {
+        let line = |at: &str, fs: &str, options: &str| {
+            format!(
+                "22 1 0:21 / {at} rw,nosuid,nodev,noexec,relatime shared:12 - {fs} {fs} {options}\n"
+            )
+        };
+        let table = |options: &str| {
+            [
+                line("/", "ext4", "rw"),
+                line("/proc", "proc", options),
+                line("/proc/sys/fs/binfmt_misc", "binfmt_misc", "rw,relatime"),
+                line("/proc/kcore", "tmpfs", "rw,size=0k"),
+                line("/mnt/proc", "proc", "rw,hidepid=invisible"),
+            ]
+            .concat()
+        };
+        for options in ["rw", "rw,hidepid=off", "rw,hidepid=0"] {
+            assert!(procfs::shows_every_process(&table(options)), "{options}");
+        }
+        for options in [
+            "rw,hidepid=invisible",
+            "rw,hidepid=2",
+            "rw,hidepid=ptraceable",
+            "rw,hidepid=4",
+            "rw,hidepid=noaccess",
+            "rw,hidepid=1",
+            "rw,gid=27,hidepid=invisible,subset=pid",
+        ] {
+            assert!(!procfs::shows_every_process(&table(options)), "{options}");
+        }
+        let stacked = [table("rw"), line("/proc", "proc", "rw,hidepid=invisible")].concat();
+        assert!(
+            !procfs::shows_every_process(&stacked),
+            "a hiding mount over it"
+        );
+        assert!(
+            !procfs::shows_every_process(&line("/", "ext4", "rw")),
+            "no /proc mount"
+        );
+        assert!(!procfs::shows_every_process(""), "no mount table");
+    }
+
+    /// A listing's row is gone only when the kernel says its process is (`ENOENT`, `ESRCH`):
+    /// `EPERM`, a `hidepid=1` mount's answer for another user's process, and every other error
+    /// leave a hole, so on such a mount no listing reads whole. NEGATIVE CONTROL: read a refused
+    /// permission as gone, and the listing with a hidden row reads whole.
+    #[cfg(unix)]
+    #[test]
+    fn a_row_the_kernel_will_not_show_leaves_the_listing_partial() {
+        use std::io::{Error, ErrorKind};
+        let member = "501 (sh) S 1 500 500 0 -1 4194368 63 0 0 0 0 0 0 0 20 0 1 0 51832760 0 0\n";
+        assert_eq!(
+            super::stat_read(Ok(member.to_owned())),
+            procfs::StatRead::Text(member.to_owned())
+        );
+        for (case, error, whole) in [
+            ("gone", Error::from(ErrorKind::NotFound), true),
+            (
+                "exited by its read",
+                Error::from_raw_os_error(libc::ESRCH),
+                true,
+            ),
+            (
+                "hidepid=1's refusal",
+                Error::from_raw_os_error(libc::EPERM),
+                false,
+            ),
+            (
+                "a refused open",
+                Error::from_raw_os_error(libc::EACCES),
+                false,
+            ),
+        ] {
+            let listed = procfs::group_of(
+                [
+                    (501, super::stat_read(Ok(member.to_owned()))),
+                    (9, super::stat_read(Err(error))),
+                ],
+                500,
+                true,
+            );
+            assert_eq!(listed.pids, [501], "{case}");
+            assert_eq!(listed.complete, whole, "{case}");
+        }
     }
 
     /// A `/proc` file whose command name holds no UTF-8 still reads: the kernel cuts a name at

@@ -93,49 +93,27 @@ pub(crate) fn atpkg_shim(script: &str) -> bool {
     shim_of(script).is_some()
 }
 
-/// `argv[0]` and `argv[1]` of `pid`.
+/// `argv[0]` and `argv[1]` of `pid` ([`aterm_uds::process::read_process_argv`]: none for another
+/// user's process, one gone, or a read the kernel cut short).
 pub(crate) fn argv_head_of(pid: i32) -> Option<(String, Option<String>)> {
     if pid <= 0 {
         return None;
     }
-    platform_argv_head(pid)
+    argv_head(&aterm_uds::process::read_process_argv(pid)?)
+}
+
+/// argv[0] where it is not empty, and argv[1] where it is there and not empty, each read as lossy UTF-8.
+fn argv_head(words: &[std::ffi::OsString]) -> Option<(String, Option<String>)> {
+    let text = |w: &std::ffi::OsString| w.to_string_lossy().into_owned();
+    let argv0 = words.first().filter(|w| !w.is_empty()).map(text)?;
+    let argv1 = words.get(1).filter(|w| !w.is_empty()).map(text);
+    Some((argv0, argv1))
 }
 
 /// The published program of `pid` ([`program_from_argv`], [`argv_head_of`]).
 pub(crate) fn program_of(pid: i32) -> Option<String> {
     let (argv0, argv1) = argv_head_of(pid)?;
     program_from_argv(&argv0, argv1.as_deref(), &atpkg_shim)
-}
-
-#[cfg(target_os = "macos")]
-fn platform_argv_head(pid: i32) -> Option<(String, Option<String>)> {
-    argv_head_from_procargs2(&aterm_uds::procargs::read(u32::try_from(pid).ok()?)?)
-}
-
-#[cfg(target_os = "linux")]
-fn platform_argv_head(pid: i32) -> Option<(String, Option<String>)> {
-    let bytes = aterm_uds::process::read_cmdline(u32::try_from(pid).ok()?)?;
-    let mut args = bytes.split(|b| *b == 0);
-    let first = args.next().filter(|a| !a.is_empty())?;
-    let second = args.next().filter(|a| !a.is_empty());
-    let text = |a: &[u8]| String::from_utf8_lossy(a).into_owned();
-    Some((text(first), second.map(text)))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn platform_argv_head(_pid: i32) -> Option<(String, Option<String>)> {
-    None
-}
-
-/// `argv[0]` and (when `argc > 1`) `argv[1]` out of a `KERN_PROCARGS2` buffer
-/// ([`aterm_uds::procargs::parse`]), each where it is not empty.
-#[cfg(any(target_os = "macos", test))]
-fn argv_head_from_procargs2(buf: &[u8]) -> Option<(String, Option<String>)> {
-    let args = aterm_uds::procargs::parse(buf)?;
-    let text = |a: &&[u8]| String::from_utf8_lossy(a).into_owned();
-    let argv0 = args.argv.first().filter(|a| !a.is_empty()).map(text)?;
-    let argv1 = args.argv.get(1).filter(|a| !a.is_empty()).map(text);
-    Some((argv0, argv1))
 }
 
 /// What the shell's exported PATH does with the agent programs ([`path_verdict`]).
@@ -1333,37 +1311,28 @@ mod tests {
     }
 
     #[test]
-    fn procargs2_layout_yields_argv1_after_argv0() {
-        let mut two = 2i32.to_ne_bytes().to_vec();
-        two.extend_from_slice(b"/Users//x/.local/share/claude/versions/2.1.280\0\0\0\0");
-        two.extend_from_slice(b"claude\0\0PATH=/bin\0");
+    fn the_head_is_argv0_and_a_nonempty_argv1() {
+        let head = |words: &[&str]| {
+            argv_head(
+                &words
+                    .iter()
+                    .map(std::ffi::OsString::from)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let owned = |a0: &str, a1: Option<&str>| Some((a0.to_string(), a1.map(str::to_string)));
         assert_eq!(
-            argv_head_from_procargs2(&two),
-            Some(("claude".to_string(), None)),
-            "argv[0], not the exec path; an empty argv[1] is none"
+            head(&["sh", "/x/codex", "--resume"]),
+            owned("sh", Some("/x/codex"))
         );
+        assert_eq!(head(&["claude"]), owned("claude", None));
         assert_eq!(
-            argv_head_from_procargs2(&0i32.to_ne_bytes()),
-            None,
-            "argc 0"
+            head(&["sh", ""]),
+            owned("sh", None),
+            "an empty argv[1] is none"
         );
-        let mut buf = 3i32.to_ne_bytes().to_vec();
-        buf.extend_from_slice(b"/bin/sh\0\0\0");
-        buf.extend_from_slice(b"/bin/sh\0/pkg/agents/claude\0--resume\0PATH=/bin\0");
-        assert_eq!(
-            argv_head_from_procargs2(&buf),
-            Some((
-                "/bin/sh".to_string(),
-                Some("/pkg/agents/claude".to_string())
-            ))
-        );
-        let mut one = 1i32.to_ne_bytes().to_vec();
-        one.extend_from_slice(b"/bin/zsh\0\0-zsh\0HOME=/x\0");
-        assert_eq!(
-            argv_head_from_procargs2(&one),
-            Some(("-zsh".to_string(), None)),
-            "argc 1: the environment is not argv[1]"
-        );
+        assert_eq!(head(&[]), None, "no argv");
+        assert_eq!(head(&["", "/x/codex"]), None, "an empty argv[0]");
     }
 
     /// A `KERN_PROCARGS2` buffer as the kernel lays one out: argc, the exec

@@ -3289,10 +3289,10 @@ pub const HOLD_PERSON_USAGE: &str = "ERR usage: origin=person is the window's ow
                                             Tab); hold <sid> on|off [reason=<pct>] \
                                             [origin=fleet|local]\n";
 
-/// The refusal an Owner-issued `hold` gets for a fleet-origin act.
+/// The refusal of a `hold` that is not its issuer's to make: an Owner naming or lifting the fleet hold, or a remote one no drive connection serves.
 pub const HOLD_DENIED: &str = "ERR denied: only the fleet sets or lifts a fleet hold\n";
 
-/// The answer to a `hold` that arrived while a seamless update was committing the session and waited its [`SessionFabric::fence_wait`] without the update either landing or standing down.
+/// The answer to a fenced verb (`hold`, `post`, `topic add|drop`, `inbox seen` with a verdict, …) that waited [`SessionFabric::fence_wait`] while a seamless update committed the session, and saw it neither land nor stand down.
 pub const HOLD_BUSY: &str = "ERR busy update-committing\n";
 
 #[cfg(any(test, debug_assertions))]
@@ -5127,7 +5127,7 @@ fn addressed_floor(inbox: &Inbox) -> Option<u64> {
 
 const POST_USAGE: &str = "ERR usage: post to=<@<sid>[@<node>]|<principal>|say[:<topic>]> \
                           kind=<ask|answer|task|report|note|ack|control> [re=<n>] [dl=<ms>] \
-                          [via=<p>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] \
+                          [via=<p,...>] [key=<token>] [--wait[=<ms>]] [--wait-ack[=<ms>]] \
                           ([--] <text> | len=<n> + <n> raw bytes)\n";
 
 const POST_LEN_USAGE: &str = "ERR usage: post len=<n> must be a byte count\n";
@@ -5490,8 +5490,8 @@ fn wait_is_futile() -> bool {
 
 /// `await inbox since=<id> [kinds=<k,...>] [topic=<t>] | await inbox re=<off> [since=<id>] [kinds=<k,...>]`.
 pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) -> String {
-    const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k,...>] [topic=<t>] \
-                         [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k,...>] \
+    const USAGE: &str = "ERR usage: await inbox since=<id> [kinds=<k|hold,...>] [topic=<t>] \
+                         [timeout=<ms>] | await inbox re=<off> [since=<id>] [kinds=<k|hold,...>] \
                          [timeout=<ms>]\n";
     let mut since: Option<u64> = None;
     let mut re: Option<u64> = None;

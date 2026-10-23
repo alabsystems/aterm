@@ -312,6 +312,35 @@ fn a_host_the_tree_pins_nothing_for_is_told_so() {
 }
 
 #[test]
+fn the_linux_lanes_image_is_pinned_for_apple_silicon_only() {
+    for (name, what) in [
+        ("ubuntu-root", "Ubuntu 24.04's pinned root image"),
+        ("ubuntu-kernel", "Ubuntu 24.04's pinned kernel"),
+    ] {
+        let row = tool(name);
+        assert_eq!(
+            row.refusal_on("macos-aarch64"),
+            format!(
+                "no {what} here: `targo --unverified verify provision --linux` fetches the pinned \
+                 20260926 into this user's cache (or {}=<path> names one)",
+                row.var()
+            )
+        );
+        let intel = row.refusal_on("macos-x86_64");
+        assert!(
+            intel.contains("aterm provides none for macos-x86_64")
+                && intel.contains("pins it for macos-aarch64 only"),
+            "{intel}"
+        );
+    }
+    assert_eq!(
+        pinned_version("ubuntu-root"),
+        pinned_version("ubuntu-kernel"),
+        "the root and its kernel are one release"
+    );
+}
+
+#[test]
 fn a_pin_lives_under_its_package() {
     let t = Path::new("/t");
     assert_eq!(

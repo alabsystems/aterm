@@ -1505,3 +1505,106 @@ fn a_misread_ends_the_episodes_and_the_clause() {
     assert_eq!((f.open.as_slice(), f.clause), (&[][..], None));
     assert_eq!(deck_cause(&s), None);
 }
+
+/// A lead kept from the last tick is the one built anew from the same reads
+/// and no other: every field tells. NEGATIVE CONTROL: each read moved alone
+/// reads as another lead.
+#[test]
+fn a_kept_lead_is_the_one_built_from_the_same_reads() {
+    let id = LeadIdentity {
+        pid: 387,
+        birth_ms: 2_000,
+        exe: "mds".into(),
+        voucher: Voucher::Apple,
+        signing_id: Some("com.apple.mds".into()),
+        team: None,
+    };
+    let unread = LeadIdentity {
+        exe: String::new(),
+        ..id.clone()
+    };
+    for read in [None, Some(&id), Some(&unread)] {
+        let lead = Lead::of(387, 2_000, Some(0), read);
+        assert!(lead.is(387, 2_000, Some(0), read), "{read:?}");
+        assert!(!lead.is(388, 2_000, Some(0), read), "{read:?}");
+        assert!(!lead.is(387, 2_001, Some(0), read), "{read:?}");
+        assert!(!lead.is(387, 2_000, Some(501), read), "{read:?}");
+    }
+    let lead = Lead::of(387, 2_000, Some(0), Some(&id));
+    for other in [
+        LeadIdentity {
+            exe: "mdx".into(),
+            ..id.clone()
+        },
+        unread.clone(),
+        LeadIdentity {
+            voucher: Voucher::AdHoc,
+            ..id.clone()
+        },
+        LeadIdentity {
+            signing_id: None,
+            ..id.clone()
+        },
+        LeadIdentity {
+            team: Some("ABCDE12345".into()),
+            ..id.clone()
+        },
+    ] {
+        assert!(!lead.is(387, 2_000, Some(0), Some(&other)), "{other:?}");
+        assert_ne!(lead, Lead::of(387, 2_000, Some(0), Some(&other)));
+    }
+    assert!(!lead.is(387, 2_000, Some(0), None));
+}
+
+/// Naming keeps last tick's lead only where it is this tick's: a lead whose
+/// identity was read since, or whose identity moved, is named anew.
+/// NEGATIVE CONTROL: with nothing moved, the lead is the one kept.
+#[test]
+fn a_coalitions_lead_is_named_anew_once_its_identity_moves() {
+    let read = CoalSample {
+        listed: 1,
+        newest: Some(307),
+        truncated: false,
+        rows: vec![CoalUsage {
+            id: 307,
+            tasks_started: 1,
+            ..CoalUsage::default()
+        }],
+    };
+    let procs = vec![crate::model::ProcSample {
+        pid: 387,
+        coalition: Some(307),
+        birth_ms: Some(2_000),
+        uid: Some(0),
+        ..crate::model::ProcSample::default()
+    }];
+    let mut names = IdMap::default();
+    let mut ids = IdMap::default();
+    let mut lead = |ids: &IdMap<(u32, i64), LeadIdentity>| {
+        let _ = name(&mut names, &read, &procs, 1, 501, &[], ids);
+        assert_eq!(names[&307].part, Part::Services);
+        names[&307].lead.clone().expect("a lead")
+    };
+    assert_eq!(lead(&ids).exe, None, "no identity read yet");
+    ids.insert(
+        (387, 2_000),
+        LeadIdentity {
+            pid: 387,
+            birth_ms: 2_000,
+            exe: "mds".into(),
+            voucher: Voucher::Apple,
+            ..LeadIdentity::default()
+        },
+    );
+    let named = lead(&ids);
+    assert_eq!(
+        (named.exe.as_deref(), named.voucher),
+        (Some("mds"), Voucher::Apple),
+        "its identity read since"
+    );
+    assert_eq!(lead(&ids), named, "nothing moved");
+    if let Some(id) = ids.get_mut(&(387, 2_000)) {
+        id.voucher = Voucher::AdHoc;
+    }
+    assert_eq!(lead(&ids).voucher, Voucher::AdHoc, "its identity moved");
+}

@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 
 use atpkg::extract::{Container, ExtractOptions, SymlinkPolicy};
 
-use super::{Host, Spawn, Stamp};
+use super::{Host, Refused, Spawn, Stamp};
 
 /// The prefix of every row's scratch under a cache root.
 pub const SCRATCH_PREFIX: &str = aterm_uds::host::TOOLING_SCRATCH;
 
-const UNPACKED_CAP: u64 = 2 << 30;
+/// The cap of an unpacked tree whose row names none of its own.
+pub(super) const UNPACKED_CAP: u64 = 2 << 30;
 
 /// A row's scratch, removed on drop unless a program run from it, unproven, retains it.
 pub(super) struct Scratch {
@@ -31,6 +32,23 @@ impl Scratch {
 
     pub(super) fn path(&self) -> &Path {
         self.dir.path()
+    }
+
+    /// A new, empty directory in the scratch named `name`, or `name-2`, `name-3`, … where
+    /// that is taken: each download of a row lands in a directory of its own.
+    fn fresh_numbered(&self, name: &str) -> Result<PathBuf, String> {
+        let mut n = 1;
+        loop {
+            let tried = if n == 1 {
+                name.to_string()
+            } else {
+                format!("{name}-{n}")
+            };
+            if std::fs::symlink_metadata(self.path().join(&tried)).is_err() {
+                return self.fresh(&tried);
+            }
+            n += 1;
+        }
     }
 
     /// A new, empty directory `name` in the scratch.
@@ -111,7 +129,7 @@ impl Drop for RetainedScratch {
     }
 }
 
-fn file_name(url: &str) -> String {
+pub(super) fn file_name(url: &str) -> String {
     let last = url.rsplit('/').next().unwrap_or_default();
     if last.is_empty()
         || last.starts_with('.')
@@ -126,7 +144,10 @@ fn file_name(url: &str) -> String {
 }
 
 /// Download `url` into a new empty directory of the scratch and hold it to its pin: the
-/// size, then the sha256. The path of the checked file.
+/// size, then the sha256. The path of the checked file. A fetch Ubuntu's primary host
+/// refused by redirecting it to its http-only archive is [`Refused::CouldNotRun`] in the
+/// words that name the pin bump ([`aterm_vz::pins::archived`]), never curl's protocol
+/// error alone.
 pub(super) fn fetch_checked(
     host: &dyn Host,
     scratch: &Scratch,
@@ -134,14 +155,18 @@ pub(super) fn fetch_checked(
     sha256: &str,
     bytes: u64,
     say: &mut dyn FnMut(&str),
-) -> Result<PathBuf, String> {
-    let dir = scratch.fresh("download")?;
+) -> Result<PathBuf, Refused> {
+    let dir = scratch.fresh_numbered("download")?;
     let file = dir.join(file_name(url));
     say(&format!(
         "downloading {url} ({:.1} MB)",
         bytes as f64 / 1_000_000.0
     ));
-    host.fetch(url, &file, bytes)?;
+    host.fetch(url, &file, bytes)
+        .map_err(|e| match aterm_vz::pins::archived(url, &e) {
+            Some(words) => Refused::CouldNotRun(words),
+            None => Refused::Failed(e),
+        })?;
     let got = std::fs::metadata(&file)
         .map_err(|e| format!("{url} left no file: {e}"))?
         .len();
@@ -149,14 +174,16 @@ pub(super) fn fetch_checked(
         return Err(format!(
             "{url} is {got} bytes, the pin is {bytes}: the archive changed under its version; \
              nothing was unpacked"
-        ));
+        )
+        .into());
     }
     let hash = crate::perf::arena::sha256_file(&file)?;
     if hash != sha256 {
         return Err(format!(
             "{url} hashes to {hash}, the pin is {sha256}: the archive changed under its version; \
              nothing was unpacked"
-        ));
+        )
+        .into());
     }
     Ok(file)
 }
@@ -175,14 +202,15 @@ pub(super) fn container_of(url: &str) -> Result<Container, String> {
 }
 
 /// Lay the checked `archive` into a new empty directory `name` of the scratch through
-/// atpkg's vetted extractor: each member's path held beneath it, links only within it,
-/// modes by `atpkg::extract::safe_mode` (0755 for a directory or anything executable,
-/// else 0644).
+/// atpkg's vetted extractor, holding no more than `cap` bytes: each member's path held
+/// beneath it, links only within it, modes by `atpkg::extract::safe_mode` (0755 for a
+/// directory or anything executable, else 0644).
 pub(super) fn unpack(
     scratch: &Scratch,
     archive: &Path,
     container: Container,
     strip: u32,
+    cap: u64,
     name: &str,
 ) -> Result<PathBuf, String> {
     let tree = scratch.fresh(name)?;
@@ -191,7 +219,7 @@ pub(super) fn unpack(
         symlinks: SymlinkPolicy::InRoot,
         allow_global_pax: false,
     };
-    atpkg::extract::extract_tree(archive, &tree, container, UNPACKED_CAP, opts)
+    atpkg::extract::extract_tree(archive, &tree, container, cap, opts)
         .map_err(|e| format!("{} did not unpack: {e}", archive.display()))?;
     Ok(tree)
 }
@@ -221,6 +249,14 @@ pub(super) fn plain_tar(
 
 /// The OS's tar (bsdtar on macOS), by absolute path.
 pub(super) const TAR: &str = aterm_uds::os_path!("tar");
+
+/// Make the regular file `path` read-only to everyone (0444): a pinned image or file that
+/// nothing writes.
+pub(super) fn read_only(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o444))
+        .map_err(|e| format!("could not make {} read-only: {e}", path.display()))
+}
 
 /// Whether `path` is a regular file with an execute bit.
 pub(super) fn is_executable(path: &Path) -> bool {

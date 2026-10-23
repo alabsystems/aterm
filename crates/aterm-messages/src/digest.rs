@@ -26,6 +26,9 @@ pub(crate) struct Entry {
     pub(crate) anchor_wall: u64,
     /// Posts folded into it that changed nothing it says.
     pub(crate) repeats: u32,
+    /// This entry's accepted confirmations, independent of its words and paint.
+    /// `u64::MAX` is exhausted: conditional settlement must refuse it.
+    pub(crate) confirmation: u64,
     /// When a family pass first failed to name it, until one does
     /// ([`crate::need::RESOLVE_AFTER`] later it ends `Resolved`).
     pub(crate) missed_at: Option<Instant>,
@@ -34,6 +37,11 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
+    /// A fresh accepted report invalidates every older observation of this entry.
+    pub(crate) const fn confirm(&mut self) {
+        self.confirmation = self.confirmation.saturating_add(1);
+    }
+
     /// The wall clock at `now`, from the anchor pair.
     pub(crate) fn wall_at(&self, now: Instant) -> u64 {
         let elapsed: Duration = now.saturating_duration_since(self.posted_at);

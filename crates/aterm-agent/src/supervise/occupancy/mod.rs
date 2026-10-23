@@ -18,6 +18,8 @@ pub mod said;
 pub mod templates;
 pub mod wake_atoms;
 pub mod wakes;
+#[cfg(any(test, debug_assertions))]
+mod wakes_environment;
 pub mod wakes_seen;
 
 pub use door::{
@@ -34,6 +36,8 @@ pub use wakes_seen::{WakeClaim, WakeDoor, WakeSeen, WakesSeen};
 
 #[cfg(any(test, debug_assertions))]
 pub use door_environment::occupancy_door_environment;
+#[cfg(any(test, debug_assertions))]
+pub use wakes_environment::wake_book_environment;
 
 /// THE NEGATIVE CONTROLS' FAULT POINTS.
 #[cfg(any(test, debug_assertions))]

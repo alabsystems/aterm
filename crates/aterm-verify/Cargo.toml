@@ -80,6 +80,10 @@ libc = { workspace = true }
 # requirement pwsh's Mach-Os meet.
 atpkg = { workspace = true }
 aterm-update-core = { workspace = true }
+# `verify provision --linux`: Ubuntu's pinned image files for the lane's own VM
+# (`aterm_vz::pins`), the one place a pin bump edits, and the words for a
+# release Ubuntu has moved to its http-only archive host.
+aterm-vz = { workspace = true }
 
 [dev-dependencies]
 # Tier-1 of `EndByProof` (tests/conformance_end_by_proof.rs): the model and the interpreter

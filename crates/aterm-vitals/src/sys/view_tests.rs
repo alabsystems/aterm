@@ -32,6 +32,7 @@ fn proc(pid: u32, ppid: u32, cpu_ms: Option<u64>, mib: u64, name: &str, uid: u32
         peak: Some((mib + 10) << 20),
         at_ns: None,
         coalition: None,
+        version: None,
         birth_ms: None,
     }
 }

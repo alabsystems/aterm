@@ -84,7 +84,7 @@ fn compile(arch: &str, body: &str, tag: &str) -> Result<(), String> {
 #[test]
 fn every_layout_row_matches_the_sdk_on_both_arches() {
     assert!(
-        jobs::darwin::SDK_ROWS.len() >= 60
+        jobs::darwin::SDK_ROWS.len() >= 66
             && kproc::SDK_ROWS.len() >= 15
             && identity::SDK_ROWS.len() >= 14
             && aterm_uds::holders::SDK_ROWS.len() >= 23,

@@ -3,9 +3,7 @@
 
 //! Busy CPU split over one matched window, by coalition.
 
-use std::collections::HashMap;
-
-use super::{CoalRow, CoalSample, CoalSplit, CoalUsage, Named, Part, Via};
+use super::{CoalRow, CoalSample, CoalSplit, CoalUsage, IdMap, Named, Part, Via};
 use crate::model::{Membership, ProcSample, Sample, Split, TabRoot, TabView};
 
 /// The longest window a split reads, ns.
@@ -23,11 +21,11 @@ pub struct CoalBase {
     /// The cores read.
     pub cores: usize,
     /// Each listed coalition's counters, by id.
-    pub coalitions: HashMap<u64, CoalUsage>,
+    pub coalitions: IdMap<u64, CoalUsage>,
     /// The highest id the kernel listed, answered or not, where the list was whole.
     pub newest: Option<u64>,
     /// Each process of the user's, by pid: its kernel start and CPU time.
-    pub procs: HashMap<u32, (Option<u64>, u64)>,
+    pub procs: IdMap<u32, (Option<u64>, u64)>,
     /// Whether the list or the sweep stopped short.
     pub truncated: bool,
     /// Whether the list stopped short.
@@ -83,9 +81,9 @@ pub struct SplitIn<'a> {
     /// Every tab, in the host's order.
     pub tabs: &'a [TabRoot],
     /// Each listed coalition's part and lead ([`super::name`]).
-    pub names: &'a HashMap<u64, Named>,
+    pub names: &'a IdMap<u64, Named>,
     /// Each coalition's live members this tick.
-    pub live: &'a HashMap<u64, u32>,
+    pub live: &'a IdMap<u64, u32>,
     /// Coalitions the kernel listed.
     pub listed: u32,
 }
@@ -104,7 +102,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
 
     let mut tabs = vec![0u64; i.tabs.len()];
     let mut own_ns = 0u64;
-    let mut moved: HashMap<u64, u64> = HashMap::new();
+    let mut moved: IdMap<u64, u64> = IdMap::default();
     for ((p, m), delegated) in i.procs.iter().zip(i.members).zip(i.delegated) {
         let (Some(ns), Some(&(start, before))) = (p.cpu_ns, i.base.procs.get(&p.pid)) else {
             continue;
@@ -126,7 +124,7 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         }
     }
 
-    let mut homes: HashMap<u64, Option<Vec<u64>>> = HashMap::new();
+    let mut homes: IdMap<u64, Option<Vec<u64>>> = IdMap::default();
     for (p, m) in i.procs.iter().zip(i.members) {
         let Some(c) = p.coalition else { continue };
         let key = m.tab.and_then(|t| i.tabs.get(t)).map(|t| t.tab);
@@ -201,7 +199,9 @@ pub fn split(i: &SplitIn) -> CoalSplit {
         window,
         aterm_mc + delegated_mc + others_mc + services_mc,
     );
-    rows.sort_by(|a, b| b.cpu_mc.cmp(&a.cpu_mc).then(a.id.cmp(&b.id)));
+    // Ids are unique, so the order is total and an unstable sort is the
+    // stable one's: it moves the ~650 rows (each a few hundred bytes) far less.
+    rows.sort_unstable_by(|a, b| b.cpu_mc.cmp(&a.cpu_mc).then(a.id.cmp(&b.id)));
     let unaccounted_mc = global_mc - (aterm_mc + delegated_mc + others_mc + services_mc);
     CoalSplit {
         via: Via::Coalitions,

@@ -3190,7 +3190,8 @@ impl App {
         self.focus_session_preferring(None, session)
     }
 
-    /// [`Self::focus_session_window`], in window `prefer` first where it shows `session`.
+    /// [`Self::focus_session_window`], in window `prefer` first where it shows `session`,
+    /// keeping its active tab when that tab already shows the session.
     pub(crate) fn focus_session_preferring(
         &mut self,
         prefer: Option<WindowId>,
@@ -3200,8 +3201,24 @@ impl App {
             .into_iter()
             .chain(self.windows.keys().copied())
             .find_map(|wid| {
-                self.terminal_view_location(wid, session)
-                    .map(|location| (wid, location.canonical_index, location.view))
+                self.windows
+                    .get(&wid)
+                    .and_then(|window| {
+                        let index = window.tab_set.active_index()?;
+                        let tab = window.tab_set.active()?;
+                        let view = tab.root.leaves().into_iter().find(|view| {
+                            self.view_store
+                                .get(*view)
+                                .copied()
+                                .and_then(crate::tab_model::View::terminal_session)
+                                == Some(session)
+                        })?;
+                        Some((wid, index, view))
+                    })
+                    .or_else(|| {
+                        self.terminal_view_location(wid, session)
+                            .map(|location| (wid, location.canonical_index, location.view))
+                    })
             });
         let Some((wid, index, view)) = found else {
             return false;
@@ -7135,6 +7152,33 @@ mod mixed_tab_tests {
         assert_eq!(app.pool.views(0), Some(2));
         assert_eq!(app.windows[&original].tab_set.len(), 2);
         assert!(app.closed_recovery.tabs.is_empty());
+        assert!(app.structural_invariants_ok());
+
+        let reopened = app.windows[&original].tab_set.active_id().unwrap();
+        let reopened_index = app.windows[&original].tab_set.active_index().unwrap();
+        app.move_tab(original, reopened_index, 1);
+        let first = app.windows[&original].tab_set.tabs()[0].id;
+        assert_eq!(app.windows[&original].tab_set.active_id(), Some(reopened));
+        assert_eq!(app.windows[&original].tab_set.active_index(), Some(1));
+        assert_ne!(reopened, first, "the reopened viewer is active");
+        for preferred in [Some(original), None] {
+            assert!(app.focus_session_preferring(preferred, 0));
+            assert_eq!(
+                app.windows[&original].tab_set.active_id(),
+                Some(reopened),
+                "focus keeps the active viewer, not its background twin"
+            );
+        }
+
+        let unrelated = app.next_session_id;
+        app.push_stub_tab(original, crate::stub_session(unrelated));
+        assert_eq!(app.focused_session_id(original), Some(unrelated));
+        assert!(app.focus_session_preferring(Some(original), 0));
+        assert_eq!(
+            app.windows[&original].tab_set.active_id(),
+            Some(first),
+            "without an active viewer, the first occurrence still wins"
+        );
         assert!(app.structural_invariants_ok());
     }
 

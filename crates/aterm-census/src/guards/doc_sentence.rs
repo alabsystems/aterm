@@ -63,24 +63,47 @@ fn doc_sentence(tree: &Tree<'_>, out: &mut Vec<Finding>) {
                 .find(|marker| line.starts_with(marker) && !line.starts_with("////"))
         };
         let body_of = |no: usize, own: &str| raw[no - 1].trim_start()[own.len()..].trim();
-        let (mut fenced, mut safety) = (false, false);
+        let (mut fenced, mut safety, mut just_opened) = (false, false, false);
+        let mut first_in_fence: Vec<&str> = Vec::new();
         let mut paragraph = String::new();
         for line in file.lines() {
             let code_free = line.text.trim().is_empty();
             let Some(own) = marker(line.no).filter(|_| code_free) else {
-                (fenced, safety) = (false, false);
+                (fenced, safety, just_opened) = (false, false, false);
+                first_in_fence.clear();
                 paragraph.clear();
                 continue;
             };
             let body = body_of(line.no, own);
+            let next = (marker(line.no + 1) == Some(own)).then(|| body_of(line.no + 1, own));
             safety = own == "//" && (safety || body.starts_with("SAFETY"));
             if body.starts_with("```") {
                 fenced = !fenced;
+                just_opened = fenced;
                 paragraph.clear();
+                if !fenced
+                    && let Some(next_body) = next.filter(|s| !s.is_empty())
+                    && first_in_fence
+                        .iter()
+                        .any(|first| first.starts_with(next_body))
+                {
+                    out.push(file.finding(
+                        DOC_SENTENCE.id,
+                        line.no + 1,
+                        format!("a closing code fence is followed by its own code: `{next_body}`"),
+                    ));
+                }
                 continue;
             }
-            let next = (marker(line.no + 1) == Some(own)).then(|| body_of(line.no + 1, own));
+            if just_opened {
+                first_in_fence.push(body);
+                just_opened = false;
+            }
             let carried = next.is_none() && continues_in_attribute(&raw[line.no..]);
+            if next.is_none() && !carried {
+                just_opened = false;
+                first_in_fence.clear();
+            }
             let ends = next.map_or(!carried, |next| !fenced && heading(next));
             let paragraph_ends = next.map_or(!carried, |next| {
                 next.is_empty()
@@ -312,7 +335,12 @@ mod tests {
                     // The layout:\n\
                     fn plain_colon() {}\n\
                     /// # Example:\n\
-                    fn heading_colon() {}\n";
+                    fn heading_colon() {}\n\
+                    /// ```\n\
+                    /// use aterm_x::f;\n\
+                    /// ```\n\
+                    /// use aterm_x::f;\n\
+                    fn echoed_fence() {}\n";
         let found = run(&DOC_SENTENCE, &[("crates/aterm-x/src/lib.rs", rust)]);
         assert_eq!(
             spots(&found),
@@ -326,6 +354,7 @@ mod tests {
                 "crates/aterm-x/src/lib.rs:54",
                 "crates/aterm-x/src/lib.rs:57",
                 "crates/aterm-x/src/lib.rs:63",
+                "crates/aterm-x/src/lib.rs:74",
             ]
         );
         assert_eq!(

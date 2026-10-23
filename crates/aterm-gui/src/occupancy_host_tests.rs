@@ -732,6 +732,143 @@ fn a_stale_board_reserves_no_slot() {
     }
 }
 
+/// A slot line's re-ask by the session holding its reservation (its write skipped) is granted
+/// against that reservation, kept as it was taken and with no second line drawn, though a build
+/// took the slot since; under `CountOwn` it is refused for its own reservation, and under
+/// `RenewOnAsk` the reservation is taken again from the re-ask.
+#[test]
+fn a_skipped_writes_reask_is_granted_against_its_reservation() {
+    let reask = |fault: Option<fault::Fault>| {
+        let mut j = Judged::default();
+        board_with(&mut j, NOW, 1, None);
+        assert_eq!(j.pace("a", RuleId::HoldRoom, NOW, NOW), PaceGrant::Granted);
+        board_with(&mut j, NOW + MIN_MS, 0, None);
+        let mut again = || j.pace("a", RuleId::HoldRoom, NOW, NOW + MIN_MS);
+        let grant = match fault {
+            Some(f) => fault::with(f, again),
+            None => again(),
+        };
+        (grant, j.pace.lines.len(), j.pace.reserved.clone())
+    };
+    let taken = vec![Reservation {
+        sid: "a".to_string(),
+        since_ms: NOW,
+        line: Some(Pool::Facts),
+    }];
+    assert_eq!(reask(None), (PaceGrant::Granted, 1, taken.clone()));
+    assert_eq!(
+        reask(Some(fault::Fault::CountOwn)).0,
+        PaceGrant::Reserved,
+        "counted against its own reservation, the holder waits"
+    );
+    let (grant, _, renewed) = reask(Some(fault::Fault::RenewOnAsk));
+    assert_eq!(grant, PaceGrant::Granted);
+    assert_ne!(
+        renewed, taken,
+        "the renewing re-ask takes the reservation again"
+    );
+}
+
+/// A typed wake line draws its own pool: granted with the facts pool spent, while a fact line
+/// at the same moment is held by the machine; the wake pool spent holds the next wake line.
+#[test]
+fn a_wake_line_under_a_spent_facts_pool_is_granted() {
+    let mut pace = Pace::default();
+    let ask = |sid: &'static str, pool| Ask {
+        sid,
+        slot: false,
+        hold_since_ms: NOW,
+        usable: 0,
+        pool,
+    };
+    for n in 0..MACHINE_LINES_PER_HOUR {
+        let at = NOW + i64::try_from(n).unwrap() * MIN_MS;
+        assert_eq!(pace.ask(&ask("f", Pool::Facts), at), PaceGrant::Granted);
+    }
+    let later = NOW + 10 * MIN_MS;
+    assert_eq!(pace.ask(&ask("f", Pool::Facts), later), PaceGrant::Machine);
+    for n in 0..WAKE_LINES_PER_HOUR {
+        let at = later + i64::try_from(n).unwrap() * 1_000;
+        assert_eq!(
+            pace.ask(&ask("w", Pool::Wake), at),
+            PaceGrant::Granted,
+            "{n}"
+        );
+    }
+    assert_eq!(
+        pace.ask(&ask("w", Pool::Wake), later + MIN_MS),
+        PaceGrant::Machine
+    );
+    assert_eq!(pace.lines.len(), MACHINE_LINES_PER_HOUR);
+    assert_eq!(pace.wake_lines.len(), WAKE_LINES_PER_HOUR);
+}
+
+/// An `await wake` answer's reservation takes the slot and no line, even with both pools spent,
+/// and a slot line asked after it waits for it; the same reservation through a line draws one.
+#[test]
+fn a_reserve_takes_no_line() {
+    let mut pace = Pace {
+        lines: vec![NOW; MACHINE_LINES_PER_HOUR],
+        wake_lines: vec![NOW; WAKE_LINES_PER_HOUR],
+        ..Pace::default()
+    };
+    assert_eq!(pace.reserve("a", NOW, 1, NOW), Reserve::Granted);
+    assert_eq!(pace.lines.len(), MACHINE_LINES_PER_HOUR);
+    assert_eq!(pace.wake_lines.len(), WAKE_LINES_PER_HOUR);
+    assert_eq!(pace.reserve("a", NOW, 1, NOW + 1_000), Reserve::Granted);
+    assert_eq!(pace.reserved.len(), 1);
+    assert_eq!(
+        pace.reserve("b", NOW - MIN_MS, 1, NOW + 2_000),
+        Reserve::Reserved
+    );
+    let mut pace = Pace::default();
+    let line = Ask {
+        sid: "a",
+        slot: true,
+        hold_since_ms: NOW,
+        usable: 1,
+        pool: Pool::Facts,
+    };
+    assert_eq!(pace.ask(&line, NOW), PaceGrant::Granted);
+    assert_eq!(pace.lines.len(), 1, "a line's reservation draws its line");
+}
+
+/// A session holding an `await wake` answer's reservation draws its first slot line from that
+/// line's pool, held by the machine while the pool is spent; its re-ask then draws none, and the
+/// reservation stands as the answer took it.
+#[test]
+fn an_answers_reservation_draws_its_holders_first_line() {
+    let line = |pool| Ask {
+        sid: "a",
+        slot: true,
+        hold_since_ms: NOW,
+        usable: 1,
+        pool,
+    };
+    let mut pace = Pace {
+        lines: vec![NOW; MACHINE_LINES_PER_HOUR],
+        ..Pace::default()
+    };
+    assert_eq!(pace.reserve("a", NOW, 1, NOW), Reserve::Granted);
+    assert_eq!(
+        pace.ask(&line(Pool::Facts), NOW + 1_000),
+        PaceGrant::Machine,
+        "the facts pool is spent"
+    );
+    assert_eq!(pace.ask(&line(Pool::Wake), NOW + 2_000), PaceGrant::Granted);
+    assert_eq!(pace.ask(&line(Pool::Wake), NOW + 3_000), PaceGrant::Granted);
+    assert_eq!(pace.wake_lines.len(), 1, "one line drawn, re-asked");
+    assert_eq!(pace.lines.len(), MACHINE_LINES_PER_HOUR);
+    assert_eq!(
+        pace.reserved,
+        [Reservation {
+            sid: "a".to_string(),
+            since_ms: NOW,
+            line: Some(Pool::Wake),
+        }]
+    );
+}
+
 /// Every build slot of three taken.
 const NONE_OF_THREE: SlotsView = SlotsView::Read {
     n: 3,

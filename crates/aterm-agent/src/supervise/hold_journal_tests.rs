@@ -146,10 +146,12 @@ impl Review for Attended {
     fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(true)
     }
-    fn say(&mut self, _line: &str) -> Result<(), String> {
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
         Ok(())
     }
     fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
         self.noted.push(line.to_string());
     }
     fn unattended(&self) -> bool {

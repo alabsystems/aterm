@@ -40,6 +40,13 @@ struct Ring {
     caret: (u16, u16),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct WakeLightKey {
+    rgb: u32,
+    fg: u32,
+    bg: u32,
+}
+
 /// The classic wake's animation state.
 #[derive(Default)]
 pub struct ClassicWake {
@@ -60,6 +67,8 @@ pub struct ClassicWake {
     spawned: Option<((u16, u16), (u16, u16))>,
     bed_scratch: BedScratch,
     air_runs: Vec<Vec<CometSample>>,
+    crown_ink_memo: std::cell::Cell<Option<(WakeLightKey, u32)>>,
+    veil_cap_memo: std::cell::Cell<Option<(WakeLightKey, u8)>>,
     /// Test-only: draw the mono face on a dark ground as additive light over the letters.
     #[cfg(test)]
     pub(crate) mono_unbedded: bool,
@@ -868,11 +877,26 @@ impl ClassicWake {
         } else {
             hsv2rgb(self.hue, 0.9, 1.0)
         };
-        let ground = LightGround::of(cfg);
+        #[cfg(not(test))]
+        let unsolved = false;
         #[cfg(test)]
-        let ground = LightGround {
-            unsolved: self.light_unsolved,
-            ..ground
+        let unsolved = self.light_unsolved;
+        let body_ink = if unsolved {
+            color & 0x00FF_FFFF
+        } else {
+            let key = WakeLightKey {
+                rgb: color,
+                fg: cfg.theme_fg,
+                bg: cfg.theme_bg,
+            };
+            match self.crown_ink_memo.get() {
+                Some((k, v)) if k == key => v,
+                _ => {
+                    let v = LightGround::of(cfg).body_ink(color);
+                    self.crown_ink_memo.set(Some((key, v)));
+                    v
+                }
+            }
         };
         let (cwf, chf) = (geom.cw as f32, geom.ch as f32);
         let reach = cwf * 0.5 + cfg.radius * chf * 0.9;
@@ -883,7 +907,7 @@ impl ClassicWake {
             geom.cell_center(cr, cc),
             (reach, reach),
             chf * 0.5,
-            ground.body_ink(color),
+            body_ink,
             peak,
             budget,
         );
@@ -936,13 +960,26 @@ impl ClassicWake {
         let (centre, radii, cap) = match on_grid {
             Some((r, c)) if !unbound => {
                 let (cw, ch) = (geom.cw as f32, chf_of(geom));
+                let key = WakeLightKey {
+                    rgb: veil,
+                    fg: cfg.theme_fg,
+                    bg: cfg.theme_bg,
+                };
+                let veil_cap = match self.veil_cap_memo.get() {
+                    Some((k, v)) if k == key => v,
+                    _ => {
+                        let v = CursorGlow::light_veil_cap(veil, cfg.theme_fg, cfg.theme_bg);
+                        self.veil_cap_memo.set(Some((key, v)));
+                        v
+                    }
+                };
                 (
                     geom.cell_center(r, c),
                     (
                         grow.min(CursorGlow::LIGHT_VEIL_REACH_CELLS * cw),
                         (grow * 0.85).min(0.5 * ch),
                     ),
-                    cap.min(CursorGlow::light_veil_cap(veil, cfg.theme_fg, cfg.theme_bg)),
+                    cap.min(veil_cap),
                 )
             }
             _ if unbound => (

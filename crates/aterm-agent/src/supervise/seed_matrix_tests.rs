@@ -226,13 +226,16 @@ impl Review for Journaled<'_> {
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
         self.record(line, None, None);
         Ok(())
     }
     fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
         self.record(line, None, None);
     }
     fn note_ended(&mut self, line: &str, ended: Option<i64>) {
+        crate::supervise::ledger::assert_marked(line);
         self.record(line, None, ended);
     }
     fn unattended(&self) -> bool {

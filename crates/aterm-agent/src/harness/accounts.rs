@@ -5130,6 +5130,54 @@ pub fn strike(state: &mut State, account: &str, sid: &str, why: &Strike, now: i6
     out
 }
 
+#[derive(Clone, Copy)]
+enum PinRefusal {
+    NotListed,
+    NotEnrolled,
+    SignedOut,
+}
+
+impl PinRefusal {
+    fn message(self, label: &str) -> String {
+        match self {
+            Self::NotListed => format!("`{}` is not in the roster", shown(label)),
+            Self::NotEnrolled => format!(
+                "`{label}` is not-enrolled: no login was made for it on this machine (its login \
+                 directory is missing or empty)"
+            ),
+            Self::SignedOut => format!("`{label}` is signed-out"),
+        }
+    }
+}
+
+fn pin_refusal(
+    state: &State,
+    roster: &Roster,
+    enrolled: &BTreeSet<String>,
+    label: &str,
+) -> Option<PinRefusal> {
+    let Some(row) = roster.row(label) else {
+        return Some(PinRefusal::NotListed);
+    };
+    if !is_enrolled(row, enrolled) {
+        return Some(PinRefusal::NotEnrolled);
+    }
+    state
+        .accounts
+        .get(label)
+        .is_some_and(|a| a.auth == Auth::SignedOut)
+        .then_some(PinRefusal::SignedOut)
+}
+
+/// What an explicit account selection saved under the store lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PinSelection {
+    /// The account is eligible and is now pinned.
+    Pinned,
+    /// The account needs sign-in; this exact selection is saved for its completion.
+    Renew(PinRequest),
+}
+
 /// Pins `label` as the active account (`accounts use <label>`) and clears its standing walls.
 /// # Errors
 ///
@@ -5142,21 +5190,8 @@ pub fn pin(
     label: &str,
     now: i64,
 ) -> Result<Event, String> {
-    let Some(row) = roster.row(label) else {
-        return Err(format!("`{}` is not in the roster", shown(label)));
-    };
-    if !is_enrolled(row, enrolled) {
-        return Err(format!(
-            "`{label}` is not-enrolled: no login was made for it on this machine (its login \
-             directory is missing or empty)"
-        ));
-    }
-    if state
-        .accounts
-        .get(label)
-        .is_some_and(|a| a.auth == Auth::SignedOut)
-    {
-        return Err(format!("`{label}` is signed-out"));
+    if let Some(why) = pin_refusal(state, roster, enrolled, label) {
+        return Err(why.message(label));
     }
     state.pending_pin = None;
     if let Some(record) = account_mut(state, label) {
@@ -5696,6 +5731,45 @@ impl Store {
             Ok(Vec::new())
         })?;
         Ok(request)
+    }
+
+    /// Pins an eligible account, or saves an explicit sign-in request for an unenrolled or
+    /// signed-out account. Eligibility uses the current login bindings under `accounts.lock`.
+    /// # Errors
+    /// An unknown label, a sign-in target without an email, unavailable entropy, or a bounded
+    /// state/login transaction refusal. A store error never becomes a sign-in request.
+    pub fn select_account(
+        &self,
+        file_roster: &Roster,
+        label: &str,
+        now: i64,
+    ) -> Result<PinSelection, String> {
+        let mut selected = PinSelection::Pinned;
+        self.transact_logins_within(&LOCK_LADDER, now, &mut None, |state, logins| {
+            let roster = bound(file_roster, logins);
+            let enrolled = enrolled(&roster);
+            match pin_refusal(state, &roster, &enrolled, label) {
+                None => pin(state, &roster, &enrolled, label, now).map(|event| vec![event]),
+                Some(why @ PinRefusal::NotListed) => Err(why.message(label)),
+                Some(PinRefusal::NotEnrolled | PinRefusal::SignedOut) => {
+                    if roster
+                        .row(label)
+                        .and_then(|row| row.email.as_ref())
+                        .is_none()
+                    {
+                        return Err(format!("`{label}` has no sign-in email"));
+                    }
+                    let nonce = aterm_uds::rand::hex_token::<16>()
+                        .map_err(|e| format!("account selection: {e}"))?;
+                    let request = PinRequest::new(label, nonce)
+                        .ok_or_else(|| "invalid account selection request".to_owned())?;
+                    state.pending_pin = Some(request.clone());
+                    selected = PinSelection::Renew(request);
+                    Ok(Vec::new())
+                }
+            }
+        })?;
+        Ok(selected)
     }
 
     /// Cancels this request after startup or login failure, preserving a newer choice.

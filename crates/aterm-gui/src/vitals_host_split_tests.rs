@@ -34,6 +34,8 @@ thread_local! {
     static RACES: Cell<Option<u32>> = const { Cell::new(None) };
     /// A pid whose pid version reads nothing.
     static UNVERSIONED: Cell<Option<u32>> = const { Cell::new(None) };
+    /// New processes so far at each pid, which its pid version moves by.
+    static REBORN: RefCell<HashMap<u32, i32>> = RefCell::new(HashMap::new());
     static READS: Cell<Reads> = const {
         Cell::new(Reads {
             coalitions: 0,
@@ -54,14 +56,15 @@ fn count(read: impl FnOnce(&mut Reads)) {
 
 /// The stand-in kernel: a process's image and signature change only by an
 /// exec, which moves its pid version, so a pid's version here moves with its
-/// row's name and signature, and with each exec ([`EXECS`]).
+/// row's name and signature, with each exec ([`EXECS`]) and with each new
+/// process at the pid ([`reborn`]).
 const STAND_IN: CoalProbe = CoalProbe {
     self_check: |_| Ok(1),
-    sweep: |opts| {
+    sweep: |opts, ids| {
         if opts.coalitions {
             count(|r| r.swept += 1);
         }
-        aterm_sysprobe::processes_with(opts)
+        aterm_sysprobe::processes_keeping(opts, ids)
     },
     coalitions: || {
         count(|r| r.coalitions += 1);
@@ -120,11 +123,14 @@ const STAND_IN: CoalProbe = CoalProbe {
         if UNVERSIONED.get() == Some(pid) {
             return None;
         }
+        let reborn = REBORN.with(|r| r.borrow().get(&pid).copied().unwrap_or(0));
         KERNEL.with(|k| {
             k.borrow().get(&pid).map(|(name, _, apple)| {
-                name.bytes().fold(EXECS.get() + i32::from(*apple), |v, b| {
-                    v.wrapping_mul(31).wrapping_add(i32::from(b))
-                })
+                name.bytes()
+                    .fold(EXECS.get() + i32::from(*apple), |v, b| {
+                        v.wrapping_mul(31).wrapping_add(i32::from(b))
+                    })
+                    .wrapping_add(reborn.wrapping_mul(1_000_003))
             })
         })
     },
@@ -138,6 +144,11 @@ const STAND_IN: CoalProbe = CoalProbe {
     },
     waketime_ms: || WAKE.get(),
 };
+
+/// A new process at `pid`: its pid version moves.
+fn reborn(pid: u32) {
+    REBORN.with(|r| *r.borrow_mut().entry(pid).or_default() += 1);
+}
 
 fn kernel(rows: &[(u32, &str, i64, bool)]) {
     KERNEL.with(|k| {
@@ -256,9 +267,20 @@ fn the_coalitions_are_read_on_split_ticks_only() {
     assert_eq!(reads(), (0, 0), "an unarmed pull");
     reader.read(&bars());
     assert_eq!(reads(), (1, 1), "the bars' first reading");
+    let kept = reader.split.coalition_ids.len();
+    assert_eq!(
+        kept > 0,
+        cfg!(target_os = "macos"),
+        "its coalitions kept: {kept}"
+    );
     just_read(&mut reader);
     reader.read(&bars());
     assert_eq!(reads(), (1, 1), "the bars' next, at once");
+    assert_eq!(
+        reader.split.coalition_ids.len(),
+        kept,
+        "a plain sweep leaves them"
+    );
     {
         let _armed = armed.arm();
         assert!(!reader.split_cold(), "the last split tick is fresh");
@@ -403,8 +425,9 @@ fn a_kernel_name_is_the_swept_one_whole_or_cut_by_one() {
 /// THE KERNEL'S READERS READ THIS PROCESS AS A SPLIT TICK TAKES IT (macOS,
 /// live, [`CoalProbe::KERNEL`]): the self-check passes and launchd reads as
 /// Apple's, so the lane is on and vouches; the sweep asked for coalitions
-/// reads this process's, the one the self-check named; its pid version and
-/// launchd's read, its own the same twice; and its birth reads
+/// reads this process's, the one the self-check named, and its pid version,
+/// and keeps the coalition under that version for the next sweep; its pid
+/// version and launchd's read, its own the same twice; and its birth reads
 /// the same in unix ms through its record, through the table and through
 /// its BSD info (`aterm_uds::process::read_process_birth`), under a name
 /// that is the sweep's for it, which the sweep holds cut (the test binary,
@@ -418,13 +441,27 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
     let split = SplitReader::new(kernel, gauge());
     assert_eq!((split.lane, split.vouches), (CoalLane::On, true));
     let coalition = (kernel.self_check)(me).expect("the self-check");
-    let sweep = (kernel.sweep)(aterm_sysprobe::SweepOpts { coalitions: true }).expect("a sweep");
+    let mut ids = aterm_sysprobe::coalitions::CoalitionIds::default();
+    let opts = aterm_sysprobe::SweepOpts { coalitions: true };
+    let sweep = (kernel.sweep)(opts, &mut ids).expect("a sweep");
     let row = sweep
         .procs
         .iter()
         .find(|p| p.pid == me)
         .expect("this process swept");
     assert_eq!(row.coalition, Some(coalition));
+    let swept_version = row.version.expect("its pid version, swept");
+    assert_eq!(
+        ids.kept(me),
+        Some((swept_version, coalition)),
+        "kept for the next"
+    );
+    let again = (kernel.sweep)(opts, &mut ids).expect("a second sweep");
+    let row_again = again.procs.iter().find(|p| p.pid == me).expect("swept");
+    assert_eq!(
+        (row_again.coalition, row_again.version),
+        (Some(coalition), Some(swept_version))
+    );
     let (name, ms) = (kernel.birth)(me).expect("this process's record");
     let bsd = aterm_uds::process::read_process_birth(i32::try_from(me).expect("a pid"))
         .expect("its BSD info");
@@ -444,6 +481,7 @@ fn the_kernels_readers_read_this_process_as_a_split_tick_takes_it() {
     assert!(!names_the_same(&launchd, &row.name), "{launchd:?}");
     let version = (kernel.version)(me).expect("this process's pid version");
     assert_eq!((kernel.version)(me), Some(version), "no exec between");
+    assert_eq!(version, swept_version, "the sweep's");
     assert!((kernel.version)(1).is_some(), "launchd's, another user's");
 }
 
@@ -482,14 +520,27 @@ fn after_a_long_gap_every_birth_and_identity_is_read_again() {
     }
     for born in [11_000, 12_000] {
         kernel(&[(1, "launchd", 1_000, true), (387, "mds", born, true)]);
+        reborn(387);
         let s = tick(&mut split, procs.clone());
         assert_eq!(births(&s), [Some(born), Some(1_000)], "no start: {born}");
     }
     let r = READS.take();
     assert_eq!(
         (r.births, r.identities),
-        (4, 2),
-        "a lead born anew is read again; launchd's is kept"
+        (2, 2),
+        "with no start, a birth is kept under its pid version: a lead born anew (a new \
+         version) is read again; launchd's is kept"
+    );
+    UNVERSIONED.set(Some(1));
+    for _ in 0..2 {
+        let s = tick(&mut split, procs.clone());
+        assert_eq!(births(&s), [Some(12_000), Some(1_000)]);
+    }
+    UNVERSIONED.set(None);
+    assert_eq!(
+        READS.take().births,
+        2,
+        "NEGATIVE CONTROL: with neither a start nor a version, read at each tick"
     );
 }
 
@@ -607,16 +658,68 @@ fn a_misread_turns_the_hosts_lane_off_for_good() {
 }
 
 #[test]
-fn a_swept_processs_coalition_reaches_the_model() {
+fn a_swept_processs_coalition_and_pid_version_reach_the_model() {
     let epoch = Instant::now();
-    let read = |coalition| aterm_sysprobe::ProcessReading {
+    let read = |coalition, version| aterm_sysprobe::ProcessReading {
         pid: 9,
         coalition,
+        version,
         ..aterm_sysprobe::ProcessReading::default()
     };
-    let p = proc_sample(&read(Some(7)), epoch);
-    assert_eq!((p.coalition, p.birth_ms), (Some(7), None));
-    assert_eq!(proc_sample(&read(None), epoch).coalition, None);
+    let p = proc_sample(&read(Some(7), Some(5)), epoch);
+    assert_eq!(
+        (p.coalition, p.version, p.birth_ms),
+        (Some(7), Some(5), None)
+    );
+    let p = proc_sample(&read(None, None), epoch);
+    assert_eq!((p.coalition, p.version), (None, None));
+}
+
+/// EACH LEAD'S PID VERSION REACHES THE SPLIT FROM THE SWEEP (macOS, live): over the kernel's
+/// sweep, this process leads its coalition, and its identity, read at the first split tick, is
+/// kept for the next, since the version the sweep read for it (through [`proc_sample`]) is the
+/// one read again after the identity. NEGATIVE CONTROL: with the sweep's versions taken away, it
+/// is read at each split tick.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_leads_pid_version_reaches_the_split_from_the_sweep() {
+    const LIVE: CoalProbe = CoalProbe {
+        version: aterm_sysprobe::pid_version,
+        ..STAND_IN
+    };
+    const NO_VERSION_SWEPT: CoalProbe = CoalProbe {
+        sweep: |opts, ids| {
+            let mut sweep = (LIVE.sweep)(opts, ids)?;
+            for p in &mut sweep.procs {
+                p.version = None;
+            }
+            Some(sweep)
+        },
+        ..LIVE
+    };
+    let me = std::process::id();
+    let name = aterm_sysprobe::processes()
+        .expect("a sweep")
+        .procs
+        .into_iter()
+        .find(|p| p.pid == me)
+        .expect("this process swept")
+        .name;
+    kernel(&[(me, &name, 5_000, false)]);
+    for (probe, identities, what) in [
+        (LIVE, 1, "read once, then kept under the swept version"),
+        (NO_VERSION_SWEPT, 2, "no version swept: read at each tick"),
+    ] {
+        let mut reader = Reader::new(Arc::default());
+        reader.split = SplitReader::new(probe, gauge());
+        READS.take();
+        for _ in 0..2 {
+            reader.split.last = None;
+            let _ = reader.read(&bars());
+        }
+        let r = READS.take();
+        assert_eq!((r.swept, r.identities), (2, identities), "{what}");
+    }
 }
 
 #[test]
@@ -688,7 +791,12 @@ fn tick(split: &mut SplitReader, procs: Vec<ProcSample>) -> Sample {
     tick_at(split, procs, Instant::now())
 }
 
-fn tick_at(split: &mut SplitReader, procs: Vec<ProcSample>, now: Instant) -> Sample {
+/// One split tick over `procs`, each process's pid version read as the
+/// sweep reads it.
+fn tick_at(split: &mut SplitReader, mut procs: Vec<ProcSample>, now: Instant) -> Sample {
+    for p in &mut procs {
+        p.version = (split.probe.version)(p.pid);
+    }
     let mut sample = Sample {
         procs: Some(procs),
         ..Sample::default()

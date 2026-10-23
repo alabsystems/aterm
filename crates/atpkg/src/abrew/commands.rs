@@ -122,7 +122,7 @@ pub(super) fn cmd_on(prefix: &Prefix) -> ExitCode {
             "abrew: on — `brew` in aterm sessions runs abrew (`brew --real …` for real Homebrew)"
         );
     } else {
-        println!("abrew: per-prefix on; [abrew] enabled=false still selects real Homebrew");
+        println!("abrew: on for this prefix, but [abrew] enabled=false still runs real Homebrew");
     }
     ExitCode::SUCCESS
 }
@@ -1796,7 +1796,7 @@ pub(super) fn cmd_doctor(prefix: &Prefix, rest: &[String]) -> ExitCode {
         ));
     }
     if stub::resolve_real_brew(prefix).is_none() {
-        note("no real Homebrew found; passthrough commands will fail (run: abrew bundle)".into());
+        note("no real Homebrew found; delegated commands will fail (run: abrew bundle)".into());
     }
     for sub in ["bin", "sbin", "lib", "Applications", "opt"] {
         if let Ok(entries) = std::fs::read_dir(prefix.root.join(sub)) {
@@ -1870,9 +1870,6 @@ pub(super) fn cmd_doctor(prefix: &Prefix, rest: &[String]) -> ExitCode {
         }
         ExitCode::SUCCESS
     } else {
-        if !quiet {
-            eprintln!("Please note that these warnings are just used to help abrew maintainers.");
-        }
         ExitCode::from(1)
     }
 }
@@ -2321,7 +2318,7 @@ pub(super) fn cmd_outdated(prefix: &Prefix, api: &Api, rest: &[String]) -> ExitC
         }
     }
     if has_flag(rest, "--json=v1", "") {
-        return failed("abrew: outdated --json=v1 is no longer supported; use --json=v2");
+        return failed("abrew: outdated --json=v1 is not supported; use --json=v2");
     }
     let json = has_flag(rest, "--json", "") || has_flag(rest, "--json=v2", "");
     let mut collected: [Vec<(String, String, String)>; 2] = [Vec::new(), Vec::new()];
@@ -3010,7 +3007,7 @@ fn prune_downloads(
 pub(super) fn cleanup_max_age(
     rest: &[String],
 ) -> Result<Option<Option<std::time::Duration>>, &'static str> {
-    const INVALID: &str = "cleanup --prune needs all or non-negative days whose seconds fit in u64";
+    const INVALID: &str = "cleanup --prune takes all or a whole number of days";
     let mut max_age = None;
     for value in rest.iter().filter_map(|a| a.strip_prefix("--prune=")) {
         let age = if value == "all" {
@@ -3306,9 +3303,7 @@ pub(super) fn cmd_link(
             Err(e) => return failed(&e),
         };
         if f.keg_only && !has_flag(rest, "--force", "-f") {
-            println!(
-                "{short} is keg-only; refreshing opt only (link --force overrides in real brew)"
-            );
+            println!("{short} is keg-only; refreshing its opt link only");
         }
         let keg = prefix.keg(short, &inst.version);
         if dry_run {

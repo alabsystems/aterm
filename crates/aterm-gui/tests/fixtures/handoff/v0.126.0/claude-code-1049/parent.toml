@@ -1,0 +1,64 @@
+# What the v0.126.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.126.0"
+producer_commit = "358c6c5f995a"
+outgoing_build = 1792785491
+park_carry_ceiling = "full"
+manifest = "seamless-7165-00000000000000000000000001000002.toml"
+nonce = "00000000000000000000000001000002"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "11fc07a4cdb13f179a38ead8630f2394abff99533845645f9e85ef718036bc63"
+layout_digest = "0008b7000254a1a609f76499dbd1250a2d39f17bdb4a22c87b72c38a951d972e"
+proof_target_build = 1792871891
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 3, 40000], [1, 5, 40001]]
+proof_count = 2
+proof_digest = "d80766ae4b8962a104af576366d30e968c3cf13e6d0d7c55f19080a63bf2a85a"
+ready_wire = "4153523100000002d80766ae4b8962a104af576366d30e968c3cf13e6d0d7c55f19080a63bf2a85a"
+commit_wire = "4153433100000002d80766ae4b8962a104af576366d30e968c3cf13e6d0d7c55f19080a63bf2a85a"
+files = ["seamless-7165-00000000000000000000000001000002.layout.toml", "seamless-7165-00000000000000000000000001000002.s0.altgrid", "seamless-7165-00000000000000000000000001000002.s0.ctl", "seamless-7165-00000000000000000000000001000002.s0.grid", "seamless-7165-00000000000000000000000001000002.s1.ctl", "seamless-7165-00000000000000000000000001000002.s1.grid", "seamless-7165-00000000000000000000000001000002.toml"]
+
+[[session]]
+local_id = 0
+rows = 30
+cols = 100
+history_lines = 0
+alt_grid = true
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 41000
+absolute_row_counter = 30
+alt_absolute_row_counter = 30
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 1
+rows = 30
+cols = 100
+history_lines = 91
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 40001
+absolute_row_counter = 121
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+

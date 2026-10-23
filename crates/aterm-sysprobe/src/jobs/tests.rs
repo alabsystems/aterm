@@ -163,6 +163,53 @@ fn a_socket_answer_names_tcp_state_peer_and_queue() {
     assert_eq!(darwin::socket(&b[..100]), None);
 }
 
+/// A `socket_fdinfo` of `kind`, its `soi_options` `options`, bound at `path`.
+fn socket_bytes(kind: i32, options: u16, path: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; darwin::SOCKET_SIZE];
+    put(&mut b, darwin::SOCKET_KIND_AT, &kind.to_ne_bytes());
+    put(&mut b, darwin::SOCKET_OPTIONS_AT, &options.to_ne_bytes());
+    put(&mut b, darwin::SOCKET_UN_PATH_AT, path);
+    b
+}
+
+#[test]
+fn a_unix_listener_is_read_from_its_socket_record() {
+    let path = b"/Users//u/f/bus.sock";
+    let listening = socket_bytes(darwin::SOCKINFO_UN, darwin::SO_ACCEPTCONN | 0x4, path);
+    assert_eq!(
+        darwin::unix_listener(&listening),
+        Some(Some(&path[..])),
+        "a listener, with another option set beside SO_ACCEPTCONN"
+    );
+    let accepted = socket_bytes(darwin::SOCKINFO_UN, 0x4, path);
+    assert_eq!(
+        darwin::unix_listener(&accepted),
+        Some(None),
+        "an accepted stream carries its listener's path and is no listener"
+    );
+    let tcp = socket_bytes(darwin::SOCKINFO_TCP, darwin::SO_ACCEPTCONN, path);
+    assert_eq!(darwin::unix_listener(&tcp), Some(None), "a TCP listener");
+    let unbound = socket_bytes(darwin::SOCKINFO_UN, darwin::SO_ACCEPTCONN, b"");
+    assert_eq!(darwin::unix_listener(&unbound), Some(None), "no bound path");
+    assert_eq!(
+        darwin::unix_listener(&listening[..darwin::SOCKET_SIZE - 1]),
+        None,
+        "a short answer"
+    );
+    let full = [b'p'; darwin::SUN_PATH_LEN];
+    let mut no_nul = socket_bytes(darwin::SOCKINFO_UN, darwin::SO_ACCEPTCONN, &full);
+    put(
+        &mut no_nul,
+        darwin::SOCKET_UN_PATH_AT + darwin::SUN_PATH_LEN,
+        b"tail",
+    );
+    assert_eq!(
+        darwin::unix_listener(&no_nul),
+        Some(Some(&full[..])),
+        "a path with no NUL ends at sun_path's length"
+    );
+}
+
 #[test]
 fn a_kqueue_answer_gives_its_sleep_and_its_knotes() {
     let mut b = [0u8; darwin::KQUEUE_SIZE];
@@ -355,6 +402,10 @@ fn the_program_check_judge_holds_only_an_old_lone_unstarted_thread() {
 const STAT: &str = "4711 (my (odd) cmd) S 4700 4711 4600 34817 4711 4194560 900 0 3 0 \
                     150 50 20 10 20 0 3 0 123456 0 0";
 
+/// Every field is read past a command name holding parentheses; a terminal the kernel prints
+/// negative (its `int`, the sign bit set by a pts minor of 2^19 or more) keeps its 32 bits, and
+/// one that is no number refuses the line. NEGATIVE CONTROL: read a terminal that does not fit a
+/// `u32` as 0, and the far terminal reads as none.
 #[test]
 fn a_stat_line_gives_every_field_past_any_command_name() {
     let s = linux::parse_stat(STAT).unwrap();
@@ -371,6 +422,19 @@ fn a_stat_line_gives_every_field_past_any_command_name() {
     assert_eq!((s.threads, s.start), (3, 123_456));
     let s = linux::parse_stat("9 (d) R 1 9 9 0 -1 0 0 0 0 0 1 2 0 0 20 0 1 0 7 0 0").unwrap();
     assert_eq!((s.tty_nr, s.tpgid), (0, 0));
+    let far = STAT.replacen(" 34817 ", " -2147448832 ", 1);
+    assert_eq!(
+        linux::parse_stat(&far).map(|s| s.tty_nr),
+        Some(0x8000_8800),
+        "pts 524288 (major 136)"
+    );
+    for tty in ["x", "4294967296", "-2147483649"] {
+        assert_eq!(
+            linux::parse_stat(&STAT.replacen(" 34817 ", &format!(" {tty} "), 1)),
+            None,
+            "terminal {tty}"
+        );
+    }
     assert_eq!(linux::parse_stat("9 (d) R 1"), None);
     assert_eq!(linux::parse_stat("garbage"), None);
 }
@@ -445,6 +509,35 @@ const NET_TCP: &str = "  sl  local_address rem_address   st tx_queue rx_queue tr
    0: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000   501        0 1111 1 0\n\
    1: 0100007F:C3A1 0A0200C0:1F90 01 00000000:00000000 00:00000000 00000000   501        0 2222 1 0\n\
    2: 0100007F:C3A2 0A0200C0:1F90 02 00000000:0000000";
+
+/// A `/proc/net/unix` as Linux 6.8 prints one: a listener, a stream it accepted at the same path,
+/// an abstract listener, an unbound socket, a listener whose path has a space, a listener whose
+/// path is no UTF-8, and a torn row.
+const NET_UNIX: &[u8] = b"\
+Num       RefCount Protocol Flags    Type St Inode Path\n\
+0000000000000000: 00000002 00000000 00010000 0001 01 41001 /run/user/1000/b.sock\n\
+0000000000000000: 00000003 00000000 00000000 0001 03 41002 /run/user/1000/b.sock\n\
+0000000000000000: 00000002 00000000 00010000 0001 01 41003 @/tmp/.X11-unix/X0\n\
+0000000000000000: 00000002 00000000 00000000 0002 01  4104\n\
+0000000000000000: 00000002 00000000 00010000 0001 01 41005 /tmp/a b.sock\n\
+0000000000000000: 00000002 00000000 00010000 0001 01 41007 /tmp/\xff.sock\n\
+0000000000000000: 00000002 00000000 00010000 0001 01 41006 /tmp/torn";
+
+#[test]
+fn listening_rows_of_proc_net_unix() {
+    assert_eq!(
+        linux::listening_unix(NET_UNIX),
+        [
+            (41001, &b"/run/user/1000/b.sock"[..]),
+            (41005, b"/tmp/a b.sock"),
+            (41007, b"/tmp/\xff.sock"),
+        ],
+        "listeners bound at a path, a stream accepted at that path left out"
+    );
+    assert!(linux::listening_unix(b"").is_empty());
+    let header = NET_UNIX.split(|b| *b == b'\n').next().unwrap();
+    assert!(linux::listening_unix(header).is_empty());
+}
 
 #[test]
 fn a_tcp_table_gives_state_peer_and_queue_and_skips_a_torn_row() {

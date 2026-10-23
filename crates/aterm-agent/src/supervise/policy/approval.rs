@@ -28,13 +28,13 @@ use crate::supervise::classify::{
 };
 
 /// Rule identifier for the read-only Bash classifier approval rule.
-pub const RULE_READ_ONLY: &str = "read-only@classify-v7";
+pub const RULE_READ_ONLY: &str = "read-only@classify-v8";
 /// [`RULE_READ_ONLY`]'s proof over a Bash box whose one note is Claude Code's no-rule note (`This command requires approval`), plus [`no_rule_clear`].
-pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v2";
+pub const RULE_NO_RULE_READ_ONLY: &str = "no-rule-read-only@v3";
 /// The rm circuit-breaker rule's id.
-pub const RULE_RM_BREAKER: &str = "rm-breaker@v6";
+pub const RULE_RM_BREAKER: &str = "rm-breaker@v7";
 /// The rm circuit breaker's too-many box ([`RmBreakerKind::TooManySubstitutions`]) over a command that names no rm.
-pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v7";
+pub const RULE_BREAKER_READ_ONLY: &str = "breaker-read-only@v8";
 /// The rm circuit breaker the safe rules could not prove, approved with a warning under `approve = "safe"` ([`rm_breaker_warn`]).
 pub const RULE_RM_BREAKER_WARN: &str = "rm-breaker-warn@v1";
 /// The Read-outside-cwd rule's id.

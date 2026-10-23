@@ -6971,11 +6971,11 @@ impl Bridge {
             self.endpoint_lane = 0;
             self.endpoint_build = None;
             if !header.starts_with("ERR unknown verb") {
-                eprintln!("aterm-link: aterm refused `hello` ({header}); reading it as lane 0");
+                eprintln!("aterm-link: aterm refused `hello` ({header})");
             }
             eprintln!(
-                "aterm-link: this aterm predates the lane handshake (lane 0); this bridge is \
-                 {own}, lane {}",
+                "aterm-link: treating aterm as lane 0 (no lane handshake); this bridge is {own}, \
+                 lane {}",
                 aterm_types::control_verbs::BRIDGE_LANE
             );
             return;

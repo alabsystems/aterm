@@ -736,3 +736,41 @@ fn a_session_shown_twice_counts_once() {
     d.publish(2, stuck(2));
     assert_eq!(d.pressing_session(1).map(|p| p.more), Some(1));
 }
+
+#[test]
+fn a_shared_need_uses_its_visible_tab_for_the_pill() {
+    for (request, act) in [
+        (decide(1), None),
+        (
+            Some(need(NeedSeverity::Stuck, StopCause::Frozen, 1)),
+            Some(PillAct::Restart),
+        ),
+        (
+            Some(need(NeedSeverity::Stuck, StopCause::Suspended, 1)),
+            Some(PillAct::Resume),
+        ),
+    ] {
+        let mut d = desk(vec![vec![1], vec![2], vec![1]]);
+        d.wins.get_mut(&1).unwrap().front_tab = 2;
+        d.restartable = vec![1];
+        d.publish(1, request);
+        let mut report = if act.is_some() { decide(2) } else { stuck(2) }.unwrap();
+        report.show_pill = false;
+        d.publish(2, Some(report));
+
+        let pill = d.view(1).pill.as_ref().expect("the direct request");
+        assert_eq!(pill.session, 1);
+        assert!(pill.label.is_empty(), "the focused session needs no label");
+        assert_eq!(pill.tab, None);
+        assert_eq!(pill.since, None, "the front tab has no age ticker");
+        assert_eq!(pill.act, act);
+        assert_eq!(pill.more, 1, "the other report counts once");
+
+        d.wins.get_mut(&1).unwrap().front_tab = 1;
+        drive::refresh_window(&mut d, 1);
+        let pill = d.view(1).pill.as_ref().expect("the background request");
+        assert_eq!(pill.tab, Some(1), "no visible copy: use its first tab");
+        assert!(pill.since.is_some());
+        assert_eq!(pill.act, None);
+    }
+}

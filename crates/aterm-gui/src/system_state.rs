@@ -809,9 +809,23 @@ impl NativeAppModel for SystemStateApp {
             inner,
             None,
         );
-        let label_w = (inner - 94.0).max(30.0);
+        let switch_w = crate::native_ui::switch_least_width().max(82.0);
+        let switch_under = inner - switch_w - 12.0 < 60.0;
+        let label_w = if switch_under {
+            inner
+        } else {
+            inner - switch_w - 12.0
+        };
         let names = Setting::ALL.map(|setting| wrap_lines(setting.label(), label_w, None));
-        let row_h = |lines: usize| (lines as f32 * 20.0 + 8.0).max(38.0);
+        let switch_h = if switch_under { 6.0 + 34.0 + 4.0 } else { 8.0 };
+        let line = line_pitch();
+        let title_lines = wrap_lines("System State", inner, None);
+        let title_h = if title_lines.len() > 1 {
+            title_lines.len() as f32 * line
+        } else {
+            40.0
+        };
+        let row_h = |lines: usize| (lines as f32 * line + switch_h).max(38.0);
         let results: Vec<String> = self
             .status
             .rows_for(Some(&reviewed_plan))
@@ -829,8 +843,8 @@ impl NativeAppModel for SystemStateApp {
             .windows(2)
             .map(|pair| row_h(pair[0].len()) + row_h(pair[1].len()))
             .fold(0.0, f32::max)
-            + 20.0;
-        let one_row = 38.0 + 20.0;
+            + line;
+        let one_row = row_h(1) + line;
         let fits = [
             (3, true, 3, two_rows),
             (2, true, 3, two_rows),
@@ -846,16 +860,16 @@ impl NativeAppModel for SystemStateApp {
             help_lines,
             wants,
         });
-        let room = |fit: &Fit, stacked: bool| {
+        let room = |fit: &Fit, rows: usize| {
             let optional = [vault_h + 6.0, restore_h + 6.0, 48.0 + 6.0];
             cx.viewport.height
                 - padding * 2.0
                 - optional[..fit.shown].iter().sum::<f32>()
-                - if fit.title { 40.0 + 6.0 } else { 0.0 }
-                - (fit.help_lines as f32 * 20.0 + 6.0)
+                - if fit.title { title_h + 6.0 } else { 0.0 }
+                - (fit.help_lines as f32 * line + 6.0)
                 - 6.0
                 - 2.0 * (34.0 + 6.0)
-                - if stacked { 80.0 } else { 36.0 }
+                - (rows as f32 * 44.0 - 8.0)
         };
         let label_fits = |label: &str, share: f32| {
             crate::native_ui::native_button_label_width(label)
@@ -864,35 +878,70 @@ impl NativeAppModel for SystemStateApp {
         };
         let counting = "Apply (30)";
         let one_row_share = (inner - 3.0 * 8.0) / 4.0;
-        let short_row_fits = ["Apply", "Cancel", "Check", "Restore"]
-            .iter()
-            .all(|label| label_fits(label, one_row_share));
-        let stacked_at = |fit: &Fit| compact && !(fit.shown < 2 && short_row_fits);
+        let grid_share = (inner - 8.0) / 2.0;
+        let shorts_fit = |share: f32| {
+            ["Apply", "Cancel", "Check", "Restore"]
+                .iter()
+                .all(|label| label_fits(label, share))
+        };
+        let short_row_fits = shorts_fit(one_row_share);
+        let grid_fits = shorts_fit(grid_share);
+        let rows_at = |fit: &Fit| {
+            if !compact || fit.shown < 2 && short_row_fits {
+                1
+            } else if grid_fits {
+                2
+            } else {
+                4
+            }
+        };
         let fit = fits
             .iter()
-            .find(|fit| room(fit, stacked_at(fit)) >= fit.wants)
+            .find(|fit| room(fit, rows_at(fit)) >= fit.wants)
             .unwrap_or(&fits[fits.len() - 1]);
         let shown = fit.shown;
-        let stacked = stacked_at(fit);
-        let share = if stacked {
-            (inner - 8.0) / 2.0
-        } else {
-            one_row_share
+        let button_rows = rows_at(fit);
+        let share = match button_rows {
+            1 => one_row_share,
+            2 => grid_share,
+            _ => inner,
         };
         let pending = self.pending() && !self.clock.interacted();
         let on_face = label_fits(counting, share)
-            && room(fit, stacked) + if stacked { 44.0 } else { 0.0 } >= 0.0;
-        let warning = pending.then_some(if on_face {
-            "Click to stop automatic Apply."
+            && room(fit, button_rows) + (button_rows - 1) as f32 * 44.0 >= 0.0;
+        let warnings: &[&str] = if on_face {
+            &[
+                "Click, type or scroll to stop automatic Apply.",
+                "Click or scroll to stop automatic Apply.",
+                "Click to stop automatic Apply.",
+                "Click to stop.",
+            ]
         } else {
-            "30 s to Apply. Click to stop."
-        });
-        let words = match (warning, &summary) {
+            &[
+                "30 s to Apply. Click, type or scroll to stop.",
+                "30 s to Apply. Click or scroll to stop.",
+                "30 s to Apply. Click to stop.",
+                "30 s. Click to stop.",
+            ]
+        };
+        let compose = |warning: Option<&str>| match (warning, &summary) {
             (Some(warning), Some(summary)) => format!("{warning} {summary}"),
             (Some(warning), None) => warning.to_owned(),
             (None, Some(summary)) => summary.clone(),
             (None, None) => "Choose your Mac settings, then Apply.".to_owned(),
         };
+        let warning = pending.then(|| {
+            warnings
+                .iter()
+                .copied()
+                .find(|warning| {
+                    wrapped_lines(&compose(Some(warning)), inner, Some(fit.help_lines))
+                        .join(" ")
+                        .starts_with(warning.trim_end_matches('.'))
+                })
+                .unwrap_or(warnings[warnings.len() - 1])
+        });
+        let words = compose(warning);
         let mut guidance = wrapped_lines(&words, inner, Some(fit.help_lines));
         if pending
             && !on_face
@@ -910,24 +959,28 @@ impl NativeAppModel for SystemStateApp {
             guidance,
             StyleRef::Secondary,
         );
-        let room = (room(fit, stacked) + fit.help_lines as f32 * 20.0 - help_h).max(34.0);
-        let rows_room = (room - 20.0).max(34.0);
-        let lines_in = |height: f32| ((height / 20.0).floor() as usize).max(1);
+        let rows_room = (room(fit, button_rows) - line).max(34.0);
+        let room = (room(fit, button_rows) + fit.help_lines as f32 * line - help_h).max(34.0);
+        let lines_in = |height: f32| ((height / line).floor() as usize).max(1);
         let mut rows = Vec::new();
         for (index, (setting, name)) in Setting::ALL.iter().zip(names).enumerate() {
             let key = format!("system-state/setting/{index}");
-            let whole = name.len() <= lines_in(rows_room - 8.0);
-            let name = fit_lines(name, label_w, lines_in(rows_room - 8.0));
+            let whole = name.len() <= lines_in(rows_room - switch_h);
+            let name = fit_lines(name, label_w, lines_in(rows_room - switch_h));
             let row_h = row_h(name.len());
             let (_, current_state, desired_state) =
                 self.setting_station_state(*setting, &reviewed_plan);
             let state_summary = format!("Current: {current_state} → Desired: {desired_state}");
+            let separator = crate::native_ui::FACT_SEPARATOR;
             let (label, _) = text_lines(
                 format!("{key}/label"),
                 if whole {
                     with_suffix(
                         name,
-                        &format!("{}{state_summary}", crate::native_ui::FACT_SEPARATOR),
+                        &[
+                            format!("{separator}{state_summary}"),
+                            format!("{separator}Current: {current_state}"),
+                        ],
                         label_w,
                     )
                 } else {
@@ -959,7 +1012,7 @@ impl NativeAppModel for SystemStateApp {
             )
             .layout(
                 Layout::default()
-                    .width(Length::Fixed(82.0))
+                    .width(Length::Fixed(switch_w))
                     .height(Length::Fixed(34.0)),
             );
             rows.push((
@@ -967,19 +1020,38 @@ impl NativeAppModel for SystemStateApp {
                     format!("{key}/row"),
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
-                .layout(Layout::row().gap(12.0).height(Length::Fixed(row_h)))
+                .layout(
+                    if switch_under {
+                        Layout::column().gap(6.0)
+                    } else {
+                        Layout::row().gap(12.0)
+                    }
+                    .height(Length::Fixed(row_h)),
+                )
                 .children(vec![label.paint_only_tree(), toggle]),
                 row_h,
             ));
         }
+        // A row past the page keeps its words unwrapped; its endless height ends the page.
+        let last_shown = start + lines_in(room);
         for (index, words) in results.iter().enumerate() {
-            rows.push(wrapped_text(
-                format!("system-state/status/{index}"),
-                words,
-                StyleRef::Secondary,
-                inner,
-                Some(lines_in(rows_room)),
-            ));
+            let key = format!("system-state/status/{index}");
+            rows.push(
+                if (start..=last_shown).contains(&(Setting::ALL.len() + index)) {
+                    wrapped_text(
+                        key,
+                        words,
+                        StyleRef::Secondary,
+                        inner,
+                        Some(lines_in(rows_room)),
+                    )
+                } else {
+                    (
+                        text_lines(key, vec![words.clone()], StyleRef::Secondary).0,
+                        f32::INFINITY,
+                    )
+                },
+            );
         }
         let page_end = |room| {
             let mut end = start;
@@ -995,18 +1067,23 @@ impl NativeAppModel for SystemStateApp {
         };
         let mut end = page_end(room);
         let scroll_caption = if start > 0 || end < total {
-            end = page_end(rows_room);
-            let range = format!("{}–{end} of {total}", start + 1);
-            let caption = format!("{range} · Scroll for more");
+            end = page_end((room - line).max(34.0));
+            let range = format!("{}–{end}", start + 1);
+            let captions = [
+                format!("{range} of {total} · Scroll for more"),
+                format!("{range} of {total}"),
+                format!("{range}/{total}"),
+                format!("{end}/{total}"),
+            ];
+            let caption = captions
+                .iter()
+                .find(|caption| line_fits(caption, inner))
+                .unwrap_or(&captions[captions.len() - 1]);
             Some(text(
                 "system-state/scroll-caption",
-                if line_fits(&caption, inner) {
-                    caption
-                } else {
-                    range
-                },
+                caption.clone(),
                 StyleRef::Secondary,
-                20.0,
+                line,
             ))
         } else {
             None
@@ -1046,7 +1123,12 @@ impl NativeAppModel for SystemStateApp {
         .map(|(name, label, widest, short)| {
             let key = format!("system-state/{name}");
             let mut spec = ButtonSpec::new(label);
-            if short != spec.label && !label_fits(widest, share) {
+            let short_face = if name == "apply" {
+                !on_face
+            } else {
+                !label_fits(widest, share)
+            };
+            if short != spec.label && short_face {
                 spec = spec.visual_label(short);
             }
             if name == "restore" {
@@ -1074,25 +1156,34 @@ impl NativeAppModel for SystemStateApp {
             )
         })
         .collect::<Vec<_>>();
-        let actions = if stacked {
+        let actions = if button_rows > 1 {
             let second = buttons.split_off(2);
+            let half = if button_rows == 2 {
+                Layout::row().gap(8.0).height(Length::Fixed(36.0))
+            } else {
+                Layout::column().gap(8.0).height(Length::Fixed(80.0))
+            };
             UiNode::new(
                 "system-state/actions",
                 UiContent::Group(GroupSpec::new("System State actions")),
             )
-            .layout(Layout::column().gap(8.0).height(Length::Fixed(80.0)))
+            .layout(
+                Layout::column()
+                    .gap(8.0)
+                    .height(Length::Fixed(button_rows as f32 * 44.0 - 8.0)),
+            )
             .children(vec![
                 UiNode::new(
                     "system-state/actions/main",
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
-                .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
+                .layout(half)
                 .children(buttons),
                 UiNode::new(
                     "system-state/actions/maintenance",
                     UiContent::Group(GroupSpec::unlabeled(SemanticRole::Group)),
                 )
-                .layout(Layout::row().gap(8.0).height(Length::Fixed(36.0)))
+                .layout(half)
                 .children(second),
             ])
         } else {
@@ -1140,12 +1231,11 @@ impl NativeAppModel for SystemStateApp {
             children.push(brand);
         }
         if fit.title {
-            children.push(text(
-                "system-state/title",
-                "System State",
-                StyleRef::Hero,
-                40.0,
-            ));
+            children.push(if title_lines.len() > 1 {
+                text_lines("system-state/title", title_lines, StyleRef::Hero).0
+            } else {
+                text("system-state/title", "System State", StyleRef::Hero, 40.0)
+            });
         }
         children.push(help);
         children.extend([
@@ -1415,6 +1505,11 @@ fn text(
     .layout(Layout::default().height(Length::Fixed(height)))
 }
 
+fn line_pitch() -> f32 {
+    let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Plain);
+    (px * 1.25).ceil().max(20.0)
+}
+
 fn line_fits(line: &str, width: f32) -> bool {
     use crate::native_ui::MAX_VISUAL_GRAPHEMES;
     (line.len() <= MAX_VISUAL_GRAPHEMES
@@ -1504,24 +1599,41 @@ fn wrap_lines(words: &str, width: f32, most: Option<usize>) -> Vec<String> {
 }
 
 fn elided(line: &str, width: f32) -> String {
+    let stop = |c: char| {
+        matches!(
+            c,
+            '.' | ',' | ';' | ':' | '·' | '—' | '–' | '→' | '…' | '。' | '、' | '，' | '；' | '：'
+        )
+    };
     let ends = grapheme_ends(line);
     let kept = most_fitting(ends.len(), |count| {
         line_fits(&format!("{}…", &line[..ends[count - 1]]), width)
     });
-    let stem = &line[..kept.checked_sub(1).map_or(0, |at| ends[at])];
-    let stem = match stem.rfind(char::is_whitespace) {
-        Some(space)
-            if stem.len() < line.len()
-                && !line[stem.len()..].starts_with(char::is_whitespace)
-                && !stem[..space].trim().is_empty() =>
-        {
-            &stem[..space]
-        }
-        _ => stem,
+    let cut = kept.checked_sub(1).map_or(0, |at| ends[at]);
+    let pieces = aterm_grapheme::pieces(line, aterm_grapheme::BreakKind::is_word_boundary);
+    let word_end = cut == line.len()
+        || line[cut..].starts_with(|c: char| {
+            c.is_whitespace()
+                || stop(c)
+                || matches!(
+                    c,
+                    ')' | ']' | '}' | '’' | '”' | '"' | '!' | '?' | '」' | '』' | '）'
+                )
+        })
+        || pieces
+            .iter()
+            .any(|piece| piece.at == cut || piece.at + piece.text.len() == cut);
+    let stem = if word_end {
+        &line[..cut]
+    } else {
+        pieces
+            .iter()
+            .map(|piece| piece.at + piece.text.len())
+            .take_while(|&end| end < cut)
+            .last()
+            .map_or(&line[..cut], |end| &line[..end])
     };
-    let trimmed = stem.trim_end_matches(|c: char| {
-        c.is_whitespace() || matches!(c, '.' | ',' | ';' | ':' | '·' | '—' | '–')
-    });
+    let trimmed = stem.trim_end_matches(|c: char| c.is_whitespace() || stop(c));
     format!(
         "{}…",
         if trimmed.is_empty() {
@@ -1542,25 +1654,13 @@ fn fit_lines(mut lines: Vec<String>, width: f32, limit: usize) -> Vec<String> {
     lines
 }
 
-fn with_suffix(mut lines: Vec<String>, suffix: &str, width: f32) -> Vec<String> {
-    let Some(last) = lines.last_mut() else {
-        return lines;
-    };
-    let whole = format!("{last}{suffix}");
-    if line_fits(&whole, width) {
-        *last = whole;
-        return lines;
-    }
-    let cut = |end: usize| format!("{last}{}…", suffix[..end].trim_end_matches([' ', '…']));
-    let ends = grapheme_ends(suffix);
-    let fitting = most_fitting(ends.len(), |count| line_fits(&cut(ends[count - 1]), width));
-    if let Some(&end) = fitting.checked_sub(1).and_then(|at| ends.get(at))
-        && !suffix[..end]
-            .trim_start_matches([' ', '·'])
-            .trim()
-            .is_empty()
+fn with_suffix(mut lines: Vec<String>, suffixes: &[String], width: f32) -> Vec<String> {
+    if let Some(last) = lines.last_mut()
+        && let Some(suffix) = suffixes
+            .iter()
+            .find(|suffix| line_fits(&format!("{last}{suffix}"), width))
     {
-        *last = cut(end);
+        last.push_str(suffix);
     }
     lines
 }
@@ -1589,11 +1689,12 @@ fn text_lines(
     style: StyleRef,
 ) -> (UiNode, f32) {
     let key = key.into();
-    let height = lines.len().max(1) as f32 * 20.0;
+    let pitch = line_pitch();
+    let height = lines.len().max(1) as f32 * pitch;
     let children = lines
         .into_iter()
         .enumerate()
-        .map(|(index, line)| text(format!("{key}/{index}"), line, style, 20.0))
+        .map(|(index, line)| text(format!("{key}/{index}"), line, style, pitch))
         .collect();
     (
         UiNode::new(
@@ -2471,13 +2572,26 @@ mod tests {
                     for scroll in 0..total {
                         let compiled = compile(app, scroll, page);
                         let at = format!("a {state} {width}×{height} page scrolled to {scroll}");
-                        let one_row = rect(&compiled, "system-state/actions/maintenance").is_none();
+                        let one_row = matches!(
+                            (
+                                rect(&compiled, "system-state/apply"),
+                                rect(&compiled, "system-state/check"),
+                            ),
+                            (Some(apply), Some(check)) if apply.y == check.y
+                        );
+                        let lift = if one_row {
+                            0
+                        } else if width < 182.0 {
+                            132
+                        } else {
+                            44
+                        };
                         assert!(
                             whole(&compiled, page, "system-state/help/0")
                                 || whole(&compiled, page, "system-state/summary/0"),
                             "the guidance in {at}"
                         );
-                        if width >= 182.0 && (height >= 216 || width >= 360.0 && height >= 172) {
+                        if height >= 172 + lift {
                             for key in ["system-state/url", "system-state/password"]
                                 .into_iter()
                                 .chain(buttons)
@@ -2492,7 +2606,13 @@ mod tests {
                                 "Apply's countdown in its name in {at}"
                             );
                         }
-                        if height >= 286 || height >= 238 && one_row {
+                        let switch_w = crate::native_ui::switch_least_width().max(82.0);
+                        let under = if width - 36.0 - switch_w < 60.0 {
+                            26
+                        } else {
+                            0
+                        };
+                        if height >= 230 + lift + under {
                             let key = if scroll < Setting::ALL.len() {
                                 format!("system-state/setting/{scroll}")
                             } else {
@@ -2725,7 +2845,18 @@ mod tests {
                 (seconds, app)
             })
         };
-        for (scale, widths) in [(1.0, 128..=720), (2.0, 128..=480)] {
+        let lanes: [(f32, Vec<u32>); 3] = [
+            (
+                1.0,
+                (128..=720).step_by(4).chain([760, 1000, 1400]).collect(),
+            ),
+            (1.5, (128..=720).step_by(12).chain([1000]).collect()),
+            (
+                2.0,
+                (128..=480).step_by(4).chain([720, 1000, 1400]).collect(),
+            ),
+        ];
+        for (scale, widths) in lanes {
             let _ = install_preferences(AppearancePreferences {
                 text_scale: scale,
                 ..AppearancePreferences::default()
@@ -2737,7 +2868,7 @@ mod tests {
                     "system-state/help"
                 };
                 let apps = offers(result);
-                for width in widths.clone().step_by(4) {
+                for &width in &widths {
                     for height in [120, 166, 172, 200, 216, 240, 274, 334, 500] {
                         let page = crate::native_ui::LogicalRect::new(
                             0.0,
@@ -2761,14 +2892,45 @@ mod tests {
                             let line = painted(&format!("{guidance}/0"));
                             assert!(whole(&compiled, page, &format!("{guidance}/0")), "{at}");
                             let face = painted("system-state/apply");
+                            if whole(&compiled, page, "system-state/apply") {
+                                let audit = compiled
+                                    .text_fit_audit_line(&UiKey::new("system-state/apply"))
+                                    .unwrap();
+                                let (_, room) = audit.split_once(" available=").unwrap();
+                                let room: f32 = room.split(' ').next().unwrap().parse().unwrap();
+                                if crate::native_ui::native_button_label_width("Apply (30)")
+                                    <= room + crate::native_ui::TEXT_FIT_SLACK
+                                {
+                                    assert!(
+                                        face.contains(&format!("({seconds})")),
+                                        "Apply's face {at}: {face:?}"
+                                    );
+                                }
+                            }
                             assert!(
                                 whole(&compiled, page, "system-state/apply")
                                     && face.contains(&format!("({seconds})"))
-                                    || line.starts_with(&format!("{seconds} s ")),
+                                    || line.starts_with(&format!("{seconds} s")),
                                 "the countdown {at}: {line:?}, Apply {face:?}"
                             );
-                            if scale == 1.0 && width >= 260 {
-                                assert!(line.contains("to stop"), "how to stop {at}: {line:?}");
+                            if line.starts_with(&format!("{seconds} s")) {
+                                assert!(!face.contains('('), "twice {at}: {line:?}, {face:?}");
+                            }
+                            let guided = (0..)
+                                .map(|line| painted(&format!("{guidance}/{line}")))
+                                .take_while(|line| !line.is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            let inner = width as f32 - 24.0;
+                            if line_fits("30 s. Click to stop.…", inner) {
+                                assert!(guided.contains("to stop"), "how to stop {at}: {guided:?}");
+                            }
+                            if line_fits("Click, type or scroll to stop automatic Apply.…", inner)
+                            {
+                                assert!(
+                                    guided.contains("Click, type or scroll to stop"),
+                                    "how to stop {at}: {guided:?}"
+                                );
                             }
                             let lines = (0..)
                                 .take_while(|line| {
@@ -2807,6 +2969,16 @@ mod tests {
 
     #[test]
     fn a_settings_name_is_never_cut() {
+        names_are_whole();
+    }
+
+    #[test]
+    fn a_settings_name_is_never_cut_in_the_ui_face() {
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        names_are_whole();
+    }
+
+    fn names_are_whole() {
         let plain = SystemStateApp::new(Plan::default());
         let mut checking = SystemStateApp::new(Plan::default());
         checking.publish(SetupStatus {
@@ -2820,7 +2992,7 @@ mod tests {
         });
         let off = SystemStateApp::new(Plan::from(aterm_types::macos_setup::Selection::none()));
         let squeeze = |words: &str| words.split_whitespace().collect::<String>();
-        for width in 150..=800 {
+        for width in 128..=800 {
             let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, 4_000.0);
             for app in [&plain, &checking, &off] {
                 let compiled = compile_view(app, 0, page);
@@ -2841,10 +3013,34 @@ mod tests {
                         squeeze(&words).starts_with(&squeeze(setting.label())),
                         "{words:?} at {width}"
                     );
-                    if width == 800 {
-                        assert!(words.contains("Current: "), "{words:?} at {width}");
-                    }
+                    let (_, current, desired) =
+                        app.setting_station_state(*setting, &app.reviewed_plan());
+                    let state = words.split_once(" · ").map_or("", |(_, state)| state);
+                    assert!(
+                        [
+                            String::new(),
+                            format!("Current: {current} → Desired: {desired}"),
+                            format!("Current: {current}"),
+                        ]
+                        .contains(&state.to_owned()),
+                        "{words:?} at {width}"
+                    );
                 }
+            }
+        }
+        let page = crate::native_ui::LogicalRect::new(0.0, 0.0, 1_400.0, 4_000.0);
+        for app in [&plain, &checking, &off] {
+            let compiled = compile_view(app, 0, page);
+            for index in 0..Setting::ALL.len() {
+                let words: String = (0..)
+                    .map_while(|line| {
+                        compiled.text_fit_audit_line(&UiKey::new(format!(
+                            "system-state/setting/{index}/label/{line}"
+                        )))
+                    })
+                    .map(|audit| painted(&audit).to_owned())
+                    .collect();
+                assert!(words.contains(" · Current: "), "{words:?}");
             }
         }
     }
@@ -2900,11 +3096,259 @@ mod tests {
                 !stem.ends_with(|c: char| ".,;:·".contains(c)),
                 "{cut:?} at {width}"
             );
+            if stem != line {
+                let rest = &line[stem.len()..];
+                let next = rest
+                    .find(|c: char| !(c.is_whitespace() || ".,;:·".contains(c)))
+                    .unwrap_or(rest.len());
+                let next = rest[next..]
+                    .find(char::is_whitespace)
+                    .map_or(line.len(), |end| stem.len() + next + end);
+                let longer = line[..next].trim_end_matches(|c: char| ".,;:·".contains(c));
+                assert!(
+                    !line_fits(&format!("{longer}…"), width as f32),
+                    "{cut:?} at {width}"
+                );
+            }
+        }
+        for width in (40..=300).step_by(2) {
+            let cut = elided("Setup: assembling… then more words", width as f32);
+            assert!(!cut.contains("……"), "{cut:?} at {width}");
+        }
+        let stem = "Check failed (Desktop";
+        let width = crate::native_ui::native_button_label_width(&format!("{stem}…")) + 1.0;
+        assert_eq!(
+            elided("Check failed (Desktop) twice", width),
+            format!("{stem}…")
+        );
+        let line = "設定を保存できませんでした。もう一度お試しください。";
+        for width in (20..=400).step_by(2) {
+            let cut = elided(line, width as f32);
+            let stem = cut.strip_suffix('…').unwrap();
+            assert!(line.starts_with(stem), "{cut:?} at {width}");
+            assert!(!stem.ends_with('。'), "{cut:?} at {width}");
+            assert!(
+                line_fits(&cut, width as f32) || stem.is_empty(),
+                "{cut:?} at {width}"
+            );
+            let rest = &line[stem.len()..];
+            let stops = rest
+                .chars()
+                .take_while(|&c| c == '。')
+                .map(char::len_utf8)
+                .sum::<usize>();
+            if let Some(next) = rest[stops..].chars().next() {
+                let longer = format!("{}{next}…", &line[..stem.len() + stops]);
+                assert!(!line_fits(&longer, width as f32), "{cut:?} at {width}");
+            }
+            if line_fits("設…", width as f32) {
+                assert!(!stem.is_empty(), "{cut:?} at {width}");
+            }
         }
         assert_eq!(
             wrap_lines("Sign out of Messages", 600.0, None),
             vec!["Sign out of Messages"]
         );
+    }
+
+    #[test]
+    fn a_page_shows_every_result_that_fits() {
+        let mut app = SystemStateApp::new(Plan::default());
+        app.publish(SetupStatus {
+            busy: false,
+            rows: (0..200)
+                .map(|at| SetupStatusRow {
+                    name: format!("Row {at}"),
+                    status: "applied".into(),
+                    detail: String::new(),
+                })
+                .collect(),
+            ..SetupStatus::default()
+        });
+        for height in [500.0, 900.0, 1_400.0] {
+            let page = crate::native_ui::LogicalRect::new(0.0, 0.0, 720.0, height);
+            for scroll in [Setting::ALL.len(), 100] {
+                let compiled = compile_view(&app, scroll, page);
+                let rect = |key: &str| {
+                    compiled
+                        .paint
+                        .iter()
+                        .find(|node| node.key.as_str() == key)
+                        .map(|node| node.rect)
+                        .unwrap()
+                };
+                let rows = compiled
+                    .semantic(&UiKey::new("system-state/rows"))
+                    .unwrap()
+                    .rect;
+                let caption = rect("system-state/scroll-caption");
+                assert!(
+                    rows.bottom() - caption.bottom() < 20.0,
+                    "{} under the caption at {height} scrolled to {scroll}",
+                    rows.bottom() - caption.bottom()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_button_face_is_never_cut() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let (send, _receive) = mpsc::channel();
+        let plain = SystemStateApp::new(Plan::default());
+        let mut offered = SystemStateApp::new(Plan::default());
+        offered.offer(Request::new(Plan::default(), send));
+        for scale in [1.0, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for width in (128..=720).step_by(4) {
+                let inner = width as f32 - 24.0;
+                let fits = ["Apply", "Cancel", "Check", "Restore"].iter().all(|label| {
+                    crate::native_ui::native_button_label_width(label)
+                        <= crate::native_ui::text_button_label_room(&ButtonSpec::new(*label), inner)
+                            + crate::native_ui::TEXT_FIT_SLACK
+                });
+                if !fits {
+                    continue;
+                }
+                let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, 900.0);
+                for app in [&plain, &offered] {
+                    let compiled = compile_view(app, 0, page);
+                    for key in ["apply", "cancel", "check", "restore"] {
+                        let audit = compiled
+                            .text_fit_audit_line(&UiKey::new(format!("system-state/{key}")))
+                            .unwrap();
+                        assert!(
+                            !audit.contains("overflow=true"),
+                            "{audit} at {width} and {scale}×"
+                        );
+                    }
+                }
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+    }
+
+    #[test]
+    fn a_switch_word_and_the_title_are_whole_at_every_text_size() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let on = SystemStateApp::new(Plan::default());
+        let off = SystemStateApp::new(Plan::from(aterm_types::macos_setup::Selection::none()));
+        for scale in [1.0, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for width in (128..=720).step_by(8) {
+                let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, 8_000.0);
+                for app in [&on, &off] {
+                    let compiled = compile_view(app, 0, page);
+                    for index in 0..Setting::ALL.len() {
+                        let audit = compiled
+                            .text_fit_audit_line(&UiKey::new(format!(
+                                "system-state/setting/{index}"
+                            )))
+                            .unwrap_or_else(|| panic!("row {index} at {width} and {scale}×"));
+                        assert!(
+                            !audit.contains("overflow=true"),
+                            "{audit} at {width} and {scale}×"
+                        );
+                    }
+                    assert!(
+                        whole(&compiled, page, "system-state/title"),
+                        "the title at {width} and {scale}×"
+                    );
+                }
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+    }
+
+    #[test]
+    fn a_scroll_caption_is_never_cut() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let app = SystemStateApp::new(Plan::default());
+        for scale in [1.0, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            for width in (128..=480).step_by(4) {
+                for height in [286, 334, 500, 742] {
+                    let page =
+                        crate::native_ui::LogicalRect::new(0.0, 0.0, width as f32, height as f32);
+                    for scroll in [0, 9] {
+                        let compiled = compile_view(&app, scroll, page);
+                        if let Some(audit) =
+                            compiled.text_fit_audit_line(&UiKey::new("system-state/scroll-caption"))
+                        {
+                            let caption = compiled
+                                .semantic(&UiKey::new("system-state/scroll-caption"))
+                                .unwrap();
+                            assert_eq!(
+                                painted(&audit),
+                                caption.label,
+                                "{audit} at {width}×{height} and {scale}×"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
+    }
+
+    #[test]
+    fn a_line_is_as_tall_as_its_type() {
+        use crate::native_appearance::{AppearancePreferences, install_preferences};
+        crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+        let (send, _receive) = mpsc::channel();
+        let mut offered = SystemStateApp::new(Plan::default());
+        offered.offer(Request::new(Plan::default(), send));
+        offered.publish(SetupStatus {
+            busy: false,
+            rows: vec![SetupStatusRow {
+                name: "Check".into(),
+                status: "error".into(),
+                detail: "extended diagnostic ".repeat(40),
+            }],
+            ..SetupStatus::default()
+        });
+        for scale in [1.0, 1.5, 2.0] {
+            let _ = install_preferences(AppearancePreferences {
+                text_scale: scale,
+                ..AppearancePreferences::default()
+            });
+            let (px, _) = crate::native_ui::text_paint_metrics(SemanticRole::Text, StyleRef::Plain);
+            for (width, height) in [(300.0, 500.0), (720.0, 900.0), (1_400.0, 1_000.0)] {
+                let page = crate::native_ui::LogicalRect::new(0.0, 0.0, width, height);
+                let compiled = compile_view(&offered, 0, page);
+                let mut lines = 0;
+                for node in &compiled.paint {
+                    let on_page = node.rect.y >= 0.0 && node.rect.bottom() <= height;
+                    if on_page
+                        && compiled
+                            .text_fit_audit_line(&node.key)
+                            .is_some_and(|audit| audit.contains("kind=text "))
+                    {
+                        lines += 1;
+                        assert!(
+                            node.rect.height >= px * 1.2,
+                            "{} is {} tall for {px} type at {width}×{height}",
+                            node.key.as_str(),
+                            node.rect.height
+                        );
+                    }
+                }
+                assert!(lines > 4, "{lines} lines at {width}×{height} and {scale}×");
+            }
+        }
+        let _ = install_preferences(AppearancePreferences::default());
     }
 
     #[test]

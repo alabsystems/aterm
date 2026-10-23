@@ -128,7 +128,7 @@ impl Kind {
                 "the request could not run: network, trust store, proxy, deadline or local I/O"
             }
             Kind::Unauthenticated => "no routed credential, an unusable token file, or a 401",
-            Kind::Forbidden => "GitHub refused the permission (403 or 451)",
+            Kind::Forbidden => "a 403 or 451 from GitHub, or agh's own permission check",
             Kind::NotFound => "confirmed absent: the parent is visible to this identity",
             Kind::NotVisible => "a 404 where the parent cannot be seen",
             Kind::Pending => "a wait timed out (the last state is on stdout)",
@@ -150,14 +150,14 @@ impl Kind {
         match self {
             Kind::Refused => "read why=; fix the config or run it as the person it needs",
             Kind::Usage => "agh help <verb>",
-            Kind::CouldNotRun => "retry later",
+            Kind::CouldNotRun => "retry later, once the cause why= names is gone",
             Kind::Unauthenticated => {
                 "a person provisions or rotates the credential (agh auth status)"
             }
-            Kind::Forbidden => "a person grants the permission named in sub=",
+            Kind::Forbidden => "a person grants what sub= and accepted= name",
             Kind::NotFound => "the thing does not exist",
             Kind::NotVisible => {
-                "never treat as absent; check tried= and the routing (agh whoami --for REPO)"
+                "never treat as absent; read the JSON line's tried, then run agh whoami --for REPO"
             }
             Kind::Pending => "wait longer or look",
             Kind::Conflict => "read sub=; never retry blindly",

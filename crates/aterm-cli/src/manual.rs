@@ -260,7 +260,7 @@ GOTCHAS
         name: "resource-run",
         tagline: "run a command with authenticated per-tab resource ownership",
         body: Some(
-            "aterm resource-run [--sock PATH] --session @self|@<sid> [--ai LABEL] --job LABEL -- PROGRAM [ARGS...]\n\n\
+            "aterm resource-run [--sock PATH] --session @self|@<sid>|@<local-id> [--ai WORD] --job LABEL -- PROGRAM [ARGS...]\n\n\
              Registers this wrapper's kernel PID/start identity with the authenticated target\n\
              before execing PROGRAM. Its PID, arguments, environment, cwd, descriptors and\n\
              process group persist; CPU and physical footprint are charged once to the\n\
@@ -481,8 +481,10 @@ Optional GitHub bootstrap (`~/.config/aterm/init.toml`):
   owner = "octocat"
   token_file = "~/.secrets/github-token" # 0600 file; optional token_key = "GH_TOKEN"
 
-It verifies the token, stores it in the login keychain with CLT git's `osxkeychain`
-helper, and clones `owner`'s repositories the token can reach into `~/<repo>`. A clean
+It verifies the token and stores it in the login keychain with CLT git's `osxkeychain`
+helper, unless git's own lookups already hand that token back for every repository (the
+secrets vault's helper does when `token_file` is its `~/.secrets/gh_access_token`): git's
+credential settings and the keychain are then left as they are. It clones `owner`'s repositories the token can reach into `~/<repo>`. A clean
 checkout behind GitHub's default branch is fast-forwarded from origin, running no
 hook; any other is left as it is, saying why. With no secrets vault configured,
 `init` first offers to join the ALab vault (`http://alab-secrets.local:7484/v1/alab`)

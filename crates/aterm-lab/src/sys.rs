@@ -220,77 +220,16 @@ fn local_tm(secs: i64) -> Tm {
     tm
 }
 
-/// BSD process record from `proc_pidinfo`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ProcRow {
-    pub pid: i32,
-    pub ppid: i32,
-    pub pgid: i32,
-    /// Controlling terminal device (`-1` when none).
-    pub tdev: i32,
-    pub tpgid: i32,
-    /// Command name (up to 16 bytes).
-    pub comm: String,
-    /// Process start time in seconds since the epoch.
-    pub start: i64,
-}
-
-/// Read the [`ProcRow`] of `pid`.
-#[must_use]
-pub fn proc_row(pid: i32) -> Option<ProcRow> {
-    // SAFETY: a zeroed `proc_bsdinfo` is a valid buffer for the kernel to fill.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
-    // SAFETY: `info` is valid for `size` bytes of writes.
-    let got =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    if got != size {
-        return None;
-    }
-    let i = |v: u32| i32::from_ne_bytes(v.to_ne_bytes());
-    let comm: Vec<u8> = info
-        .pbi_comm
-        .iter()
-        .take_while(|&&c| c != 0)
-        .map(|&c| u8::from_ne_bytes(c.to_ne_bytes()))
-        .collect();
-    Some(ProcRow {
-        pid: i(info.pbi_pid),
-        ppid: i(info.pbi_ppid),
-        pgid: i(info.pbi_pgid),
-        tdev: i(info.e_tdev),
-        tpgid: i(info.e_tpgid),
-        comm: String::from_utf8_lossy(&comm).into_owned(),
-        start: i64::try_from(info.pbi_start_tvsec).unwrap_or(0),
-    })
-}
-
-/// List all PIDs on the system (`proc_listallpids`).
-#[must_use]
-pub fn all_pids() -> Vec<i32> {
-    // SAFETY: a null buffer asks for the count only.
-    let need = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
-    let n = usize::try_from(need).unwrap_or(0) + 256;
-    let mut buf = vec![0 as libc::c_int; n];
-    let bytes = libc::c_int::try_from(buf.len() * std::mem::size_of::<libc::c_int>())
-        .unwrap_or(libc::c_int::MAX);
-    // SAFETY: `buf` is valid for `bytes` bytes of writes.
-    let got = unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast(), bytes) };
-    buf.truncate(usize::try_from(got).unwrap_or(0).min(n));
-    buf.retain(|&p| p > 0);
-    buf
-}
-
 unsafe extern "C" {
     fn devname(dev: libc::dev_t, kind: libc::mode_t) -> *const libc::c_char;
 }
 
 /// Terminal device name (`devname`) for `dev`, or `??` when none.
 #[must_use]
-pub fn tty_name(dev: i32) -> String {
-    if dev == -1 || dev == 0 {
+pub fn tty_name(dev: Option<i32>) -> String {
+    let Some(dev) = dev.filter(|d| *d != 0) else {
         return "??".into();
-    }
+    };
     // SAFETY: `devname` reads its two integer arguments and returns a static buffer or null.
     let p = unsafe { devname(dev, libc::S_IFCHR) };
     if p.is_null() {
@@ -930,12 +869,6 @@ unsafe extern "C" {
         flags: u32,
     ) -> libc::c_int;
     fn confstr(name: libc::c_int, buf: *mut libc::c_char, len: libc::size_t) -> libc::size_t;
-    fn proc_listpids(
-        kind: u32,
-        typeinfo: u32,
-        buffer: *mut libc::c_void,
-        buffersize: libc::c_int,
-    ) -> libc::c_int;
     fn sandbox_check(
         pid: libc::pid_t,
         operation: *const libc::c_char,
@@ -1781,7 +1714,6 @@ pub fn preference_policy(scope: &str, name: &str) -> io::Result<bool> {
 pub fn jail_pids(mark: &str) -> Result<Vec<i32>, String> {
     const FILTER_NONE: libc::c_int = 0;
     const FILTER_GLOBAL_NAME: libc::c_int = 2;
-    const PROC_UID_ONLY: u32 = 4;
     let m = CString::new(mark).map_err(|_| "jailpids: a NUL in the mark".to_string())?;
     let none = CString::new(format!("{mark}.none")).map_err(|_| "jailpids: a NUL in the mark")?;
     let op = c"mach-lookup";
@@ -1804,18 +1736,11 @@ pub fn jail_pids(mark: &str) -> Result<Vec<i32>, String> {
             "jailpids: sandbox_check gives no answer here (run outside any sandbox)".into(),
         );
     }
-    // SAFETY: a null buffer asks for the size only.
-    let need = unsafe { proc_listpids(PROC_UID_ONLY, getuid(), std::ptr::null_mut(), 0) };
-    let n = usize::try_from(need).unwrap_or(0) / std::mem::size_of::<libc::c_int>() + 256;
-    let mut buf = vec![0 as libc::c_int; n];
-    let bytes = libc::c_int::try_from(buf.len() * std::mem::size_of::<libc::c_int>())
-        .unwrap_or(libc::c_int::MAX);
-    // SAFETY: `buf` is valid for `bytes` bytes of writes.
-    let got = unsafe { proc_listpids(PROC_UID_ONLY, getuid(), buf.as_mut_ptr().cast(), bytes) };
-    let got = usize::try_from(got).unwrap_or(0) / std::mem::size_of::<libc::c_int>();
-    let mut out: Vec<i32> = buf[..got.min(buf.len())]
-        .iter()
-        .copied()
+    let listed = aterm_uds::holders::uid_pids()
+        .map_err(|e| format!("jailpids: the process list could not be read: {e}"))?;
+    let mut out: Vec<i32> = listed
+        .into_iter()
+        .filter_map(|pid| i32::try_from(pid).ok())
         .filter(|&pid| {
             pid > 1
                 && pid != me

@@ -1216,38 +1216,45 @@ impl ScanMemo {
         self.spare.truncate(self.gen_cap);
     }
 
+    #[cfg(test)]
     fn touch(&mut self, text: &str) -> bool {
+        self.touch_len(text).is_some()
+    }
+
+    fn touch_len(&mut self, text: &str) -> Option<usize> {
         #[cfg(test)]
         if self.bypass {
             self.misses += 1;
-            return false;
+            return None;
         }
-        if self.hot.contains_key(text) {
+        if let Some(m) = self.hot.get(text) {
             #[cfg(test)]
             {
                 self.hits += 1;
             }
-            return true;
+            return Some(m.len());
         }
         let Some((key, value)) = self.cold.remove_entry(text) else {
             #[cfg(test)]
             {
                 self.misses += 1;
             }
-            return false;
+            return None;
         };
         #[cfg(test)]
         {
             self.hits += 1;
         }
+        let len = value.len();
         self.install(key, value);
-        true
+        Some(len)
     }
 
     #[inline]
     fn matches(&self, text: &str) -> &[Match] {
-        debug_assert!(self.hot.contains_key(text), "touch() proved residency");
-        self.hot.get(text).map_or(&[][..], Vec::as_slice)
+        let m = self.hot.get(text);
+        debug_assert!(m.is_some(), "touch_len() proved residency");
+        m.map_or(&[][..], Vec::as_slice)
     }
 
     fn remember(&mut self, text: &str, matches: &[Match]) {
@@ -3534,12 +3541,15 @@ impl WordDecorations {
             self.scan_text.clear();
             let mut ink_first = u16::MAX;
             let mut ink_end = 0u16;
+            let mut occupied = false;
             for (c, cell) in row_cells.iter().enumerate() {
                 let col = c as u16;
                 let inked = if cell.wide {
                     ink_end == col
                 } else {
-                    cell.ch != ' ' && !cell.ch.is_whitespace()
+                    let non_ws = cell.ch != ' ' && !cell.ch.is_whitespace();
+                    occupied |= non_ws;
+                    non_ws
                 };
                 if inked {
                     ink_first = ink_first.min(col);
@@ -3555,13 +3565,12 @@ impl WordDecorations {
             } else {
                 (0, 0)
             };
-            let occupied = !self.scan_text.trim().is_empty();
             self.scan_row_occupied[r] = occupied;
             if !occupied || cutoff > 0 {
                 continue;
             }
-            let est = if self.scan_memo.touch(&self.scan_text) {
-                self.scan_memo.matches(&self.scan_text).len()
+            let est = if let Some(len) = self.scan_memo.touch_len(&self.scan_text) {
+                len
             } else {
                 lexicon.scan_into_with_scratch(
                     &self.scan_text,
@@ -3615,12 +3624,15 @@ impl WordDecorations {
         self.scan_colmap.clear();
         let mut ink_first = u16::MAX;
         let mut ink_end = 0u16;
+        let mut occupied = false;
         for (c, cell) in row_cells.iter().enumerate() {
             let col = c as u16;
             let inked = if cell.wide {
                 ink_end == col
             } else {
-                cell.ch != ' ' && !cell.ch.is_whitespace()
+                let non_ws = cell.ch != ' ' && !cell.ch.is_whitespace();
+                occupied |= non_ws;
+                non_ws
             };
             if inked {
                 ink_first = ink_first.min(col);
@@ -3640,7 +3652,6 @@ impl WordDecorations {
         } else {
             (0, 0)
         };
-        let occupied = !self.scan_text.trim().is_empty();
         if self.scan_row_occupied.len() <= r {
             self.scan_row_occupied.resize(r + 1, false);
         }
@@ -3648,8 +3659,8 @@ impl WordDecorations {
         if !occupied {
             return true;
         }
-        let hit = self.scan_memo.touch(&self.scan_text);
-        if !hit {
+        let hit_len = self.scan_memo.touch_len(&self.scan_text);
+        if hit_len.is_none() {
             lexicon.scan_into_with_scratch(
                 &self.scan_text,
                 opts,
@@ -3659,6 +3670,10 @@ impl WordDecorations {
             );
             self.scan_memo.remember(&self.scan_text, &self.scan_matches);
         }
+        if hit_len == Some(0) || (hit_len.is_none() && self.scan_matches.is_empty()) {
+            return true;
+        }
+        let hit = hit_len.is_some();
         let matches: &[Match] = if hit {
             self.scan_memo.matches(&self.scan_text)
         } else {
@@ -4323,7 +4338,7 @@ impl WordDecorations {
         let mut animals = 0usize;
 
         for (oi, occ) in self.occ.iter().enumerate() {
-            let ep = if occ.spec.graphic.is_some() || occ.spec.burst.is_some() {
+            let ep = if !occ.inert && (occ.spec.graphic.is_some() || occ.spec.burst.is_some()) {
                 self.persist.get(&occ.ident)
             } else {
                 None
@@ -4714,11 +4729,6 @@ impl WordDecorations {
                 }
             });
         for occ in &self.occ {
-            match occ.spec.burst.map(|b| b.kind) {
-                Some(BurstKind::SuperNova) => flags.has_super = true,
-                Some(BurstKind::Nova) => flags.has_nova = true,
-                _ => {}
-            }
             if occ.inert {
                 continue;
             }
@@ -4728,6 +4738,15 @@ impl WordDecorations {
             flags.has_bonk |= ep.bonk_pending;
             if ep.inert() {
                 continue;
+            }
+            if !ep.nova_done {
+                match occ.spec.burst.map(|b| b.kind) {
+                    Some(BurstKind::SuperNova) if ep.burst_roll => flags.has_super = true,
+                    Some(BurstKind::Nova) if ep.burst_roll || ep.nova_start.is_some() => {
+                        flags.has_nova = true;
+                    }
+                    _ => {}
+                }
             }
             if cfg.ink_enabled && occ.ink_cells > 0 && occ.spec.ink.is_some() {
                 ep.sweep_started = true;
@@ -6343,13 +6362,18 @@ fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
 const PAPER_GLOW_KEEP: f32 = 0.9;
 
 fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
-    let (lum_fg, lum_bg) = (relative_luminance(fg), relative_luminance(bg));
+    let table = crate::color_math::relative_luminance_table();
+    let (lum_fg, lum_bg) = (
+        crate::color_math::relative_luminance_with(table, fg),
+        crate::color_math::relative_luminance_with(table, bg),
+    );
     if lum_bg <= lum_fg || amp <= 0.0 {
         return 1.0;
     }
     let floor = PAPER_GLOW_KEEP * (lum_bg + 0.05) / (lum_fg + 0.05);
     let reads = |g: f32| {
-        let lum = relative_luminance(mix_rgb(fg, lit, g)).min(lum_bg);
+        let lum =
+            crate::color_math::relative_luminance_with(table, mix_rgb(fg, lit, g)).min(lum_bg);
         (lum_bg + 0.05) / (lum + 0.05) >= floor
     };
     if reads(amp) {
@@ -6425,13 +6449,26 @@ fn emit_ink(
             let cols = &base_cols[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let fgs = &base_fg[occ.ink_base..occ.ink_base + occ.ink_cells as usize];
             let bg = rgb3_to_u32(occ.ink_bg);
+            let mut memo: Option<([u8; 3], [u8; 3])> = None;
             for (&col, &fg_rgb) in cols.iter().zip(fgs) {
-                let fg = rgb3_to_u32(fg_rgb);
-                let lit = mix_rgb(fg, 0x00FF_FFFF, lift);
+                let color = match memo {
+                    Some((k, v)) if k == fg_rgb => v,
+                    _ => {
+                        let fg = rgb3_to_u32(fg_rgb);
+                        let lit = mix_rgb(fg, 0x00FF_FFFF, lift);
+                        let v = u32_to_rgb3(mix_rgb(
+                            fg,
+                            lit,
+                            glow * paper_glow_scale(fg, lit, bg, amp),
+                        ));
+                        memo = Some((fg_rgb, v));
+                        v
+                    }
+                };
                 let cell = InkCell {
                     row: occ.row,
                     col,
-                    color: u32_to_rgb3(mix_rgb(fg, lit, glow * paper_glow_scale(fg, lit, bg, amp))),
+                    color,
                 };
                 *fp = fold_ink(*fp, cell);
                 *fp ^= frame_term;

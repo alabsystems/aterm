@@ -108,7 +108,8 @@ pub(super) unsafe fn initialize(app: Id, mtm: MainThread) {
     });
 }
 
-/// Both arguments must be live `NSString`s.
+/// `-[NSString stringByAppendingString:]`, +0 autoreleased.
+///
 /// # Safety
 /// Both arguments must be live `NSString`s.
 unsafe fn append(a: Id, b: Id) -> Id {
@@ -125,7 +126,10 @@ fn nsstr(s: &str) -> Id {
     aterm_objc::ns_string(s).expect("Foundation to accept a menu title").autorelease()
 }
 
-/// `title` and any `key_equivalent.key` must be live `NSString`s.
+/// LOCAL PATCH (aterm): answers an owning [`Obj`] where it answered a
+/// `Retained<NSMenuItem>`, and takes the action as a bare [`Sel`] — [`Sel::NULL`]
+/// for "no action" — where it took `Option<Sel>`.
+///
 /// # Safety
 /// `title` and any `key_equivalent.key` must be live `NSString`s.
 unsafe fn menu_item(

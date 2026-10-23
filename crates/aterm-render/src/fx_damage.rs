@@ -34,8 +34,15 @@ impl RowBands {
         if y < top {
             return 0;
         }
-        let pitch = if self.cell_h > 1 { self.cell_h } else { 1 } as i128;
-        let q = (y - top) / pitch;
+        let pitch = if self.cell_h > 1 { self.cell_h } else { 1 };
+        let d = y - top;
+        // In u64 whenever it fits: one divide instruction, where i128's is a
+        // library call (a changed layer pays this twice per item).
+        let q = if d <= u64::MAX as i128 && pitch as u128 <= u64::MAX as u128 {
+            (d as u64 / pitch as u64) as i128
+        } else {
+            d / pitch as i128
+        };
         let r = if q > usize::MAX as i128 {
             usize::MAX
         } else {
@@ -88,11 +95,58 @@ fn window_rows(layer: &FxLayer, bands: RowBands) -> Option<(i128, i128)> {
     Some((i128::from(e.y0) + dy, i128::from(e.y1) + dy))
 }
 
-/// Mark the bands `layer` may write.
+/// Mark the bands `layer` may write: each item's rows (its bounds moved and
+/// clipped as the layer draws it), not their hull, so a layer whose items
+/// stand apart down the frame (the cursor's stars) marks the rows they stand
+/// on, as their quads did, and none between.
+///
+/// Every item's rows lie inside the hull's bands, so the walk stops once each
+/// of those is dirty: a changed layer whose old self already marked its bands
+/// (a card redrawn in place) costs no walk, and one whose items tile their hull
+/// (a card) stops at the first items that reach all of them. A hull of one band
+/// is marked whole: at worst that over-marks a band whose items the clip cut
+/// away, which damage allows.
 #[inline]
 fn mark_layer(dirty: &mut [bool], bands: RowBands, layer: &FxLayer) {
-    if let Some((y0, y1)) = window_rows(layer, bands) {
-        bands.mark_span(dirty, y0, y1);
+    let Some((y0, y1)) = window_rows(layer, bands) else {
+        return;
+    };
+    let rows = dirty.len();
+    if rows == 0 {
+        return;
+    }
+    let (lo, hi) = (bands.band_of(y0, rows), bands.band_of(y1 - 1, rows));
+    let mut open = dirty[lo..=hi].iter().filter(|d| !**d).count();
+    if open == 0 {
+        return;
+    }
+    if lo == hi {
+        dirty[lo] = true;
+        return;
+    }
+    let dy = match layer.space {
+        FxSpace::Window => 0,
+        FxSpace::Grid => bands.grid_top as i128,
+    };
+    for item in layer.content.items() {
+        let r = item
+            .bounds()
+            .translate(layer.offset.0, layer.offset.1)
+            .intersect(layer.clip);
+        if r.is_empty() {
+            continue;
+        }
+        let a = bands.band_of(i128::from(r.y0) + dy, rows);
+        let b = bands.band_of(i128::from(r.y1) - 1 + dy, rows);
+        for (i, d) in dirty.iter_mut().enumerate().take(b + 1).skip(a) {
+            if !*d {
+                *d = true;
+                open -= usize::from((lo..=hi).contains(&i));
+            }
+        }
+        if open == 0 {
+            return;
+        }
     }
 }
 
@@ -448,6 +502,87 @@ mod tests {
             marked(&dirty),
             vec![4, 5],
             "the k-th of an id pairs with the k-th"
+        );
+    }
+
+    /// The band of a row is i128's quotient on both sides of where the
+    /// distance below the grid stops fitting u64's one-instruction divide.
+    #[test]
+    fn a_band_is_the_same_on_either_side_of_u64() {
+        let bands = RowBands::new(3, 7);
+        let rows = usize::MAX;
+        let edge = i128::from(u64::MAX);
+        for d in [0, 6, 7, 700, edge - 1, edge, edge + 1, edge * 9] {
+            let q = d / 7;
+            let want = if q > (rows - 1) as i128 {
+                rows - 1
+            } else {
+                q as usize
+            };
+            assert_eq!(bands.band_of(3 + d, rows), want, "{d} px below the grid");
+        }
+    }
+
+    /// A changed layer marks the rows each of its items stands on, never the
+    /// rows between two items far apart (the hull would); its clip still cuts
+    /// an item, and a Grid layer still moves down by `grid_top`.
+    #[test]
+    fn a_changed_layer_marks_its_items_rows_not_their_hull() {
+        let bands = RowBands::new(0, 10);
+        let item = |y: i32| {
+            FxItem::Rect(FxRect {
+                x: 0,
+                y,
+                w: 4,
+                h: 3,
+                ink: 0,
+            })
+        };
+        let sky = |space| {
+            FxLayer::new(
+                7,
+                Arc::new(FxContent::new(
+                    vec![item(2), item(71)],
+                    vec![FxInk::add(0x0010_1010); 2],
+                )),
+                FxSlot::Glow,
+                space,
+                FxBlend::Exact,
+            )
+        };
+        let mut dirty = vec![false; 10];
+        mark_layer_changes(&mut dirty, bands, &[], &[sky(FxSpace::Window)]);
+        assert_eq!(marked(&dirty), vec![0, 7], "two stars, two rows");
+
+        let mut dirty = vec![false; 10];
+        dirty[1..7].fill(true);
+        mark_layer(&mut dirty, bands, &sky(FxSpace::Window));
+        assert_eq!(
+            marked(&dirty),
+            (0..8).collect::<Vec<_>>(),
+            "the walk stops only once the last open band is marked"
+        );
+
+        let mut cut = sky(FxSpace::Window);
+        cut.clip = PxRect::new(0, 60, 100, 100);
+        let mut dirty = vec![false; 10];
+        mark_layer_changes(&mut dirty, bands, &[], &[cut]);
+        assert_eq!(marked(&dirty), vec![7], "the clip cuts the item above it");
+
+        let low = RowBands::new(15, 10);
+        let mut dirty = vec![false; 10];
+        mark_layer_changes(&mut dirty, low, &[sky(FxSpace::Window)], &[]);
+        assert_eq!(
+            marked(&dirty),
+            vec![0, 5],
+            "a Window layer under a 15 px head"
+        );
+        let mut dirty = vec![false; 10];
+        mark_layer_changes(&mut dirty, low, &[sky(FxSpace::Grid)], &[]);
+        assert_eq!(
+            marked(&dirty),
+            vec![0, 7],
+            "a Grid layer sits grid_top lower"
         );
     }
 }

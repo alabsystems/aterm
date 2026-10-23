@@ -491,6 +491,7 @@ mod frame_key;
 mod frame_memo;
 pub(crate) use aterm_gui_tabs::front_content;
 mod harness_reach;
+mod icon_scene;
 mod image_payload_memo;
 mod inject_floor;
 mod input;

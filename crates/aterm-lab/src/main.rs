@@ -368,12 +368,13 @@ usage: targo --unverified lab <command> [tag] [args]
                                  (--keep-dumps: its scratch dumps too)
 
 Outside any lab (no jail, no stub):
-  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N]
+  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and hold it until
                                  Ctrl-C (--window: a real window; --image PNG: capture one settled frame, run --post, and
                                  end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins)
+                                 --scene band-icons draws procedural chrome icons beside H (debug/dev-seams build)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   slot-capture [--watch DUR [--dir DIR]]

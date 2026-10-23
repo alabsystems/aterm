@@ -27,8 +27,6 @@ mod sealed {
 /// struct Host;
 /// impl Origin for Host {}
 /// ```
-/// use aterm_provenance::{Provenance, Pty};
-/// // Control: the one origin, constructed the one way.
 pub trait Origin: sealed::Sealed + 'static + Copy {}
 
 /// PTY origin marker. Bytes from the shell — the primary adversary surface.

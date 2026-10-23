@@ -1679,11 +1679,12 @@ impl crate::exec::StageGroupEnd for SweepProbe {
 /// A real stage under verify's group custody: a shell that backgrounds this test binary as the
 /// survivor stand-in and exits once the survivor wrote its pid. At the stage's end the leader is
 /// exited and unreaped, the group is listed off the kernel, and the survivor, running from the
-/// roots, is ended through `end_proven` and the kernel's own reads; under roots it does not run
-/// from, it is named and left, and leaves on its own. Under a binary translator the kernel names
-/// the translator as the survivor's executable, so it runs from no root and the test says it is
-/// not run. NEGATIVE CONTROL: make `sweep_group`'s held conjunct `== Some(true)`, and the
-/// survivor is named, not ended.
+/// roots, is ended through `end_proven` and the kernel's own reads, and the group reads closed
+/// where a listing can be whole (on a `/proc` mounted with `hidepid` it never is); under roots
+/// it does not run from, it is named and left, and leaves on its own. Under a binary translator
+/// the kernel names the translator as the survivor's executable, so it runs from no root and the
+/// test says it is not run. NEGATIVE CONTROL: make `sweep_group`'s held conjunct
+/// `== Some(true)`, and the survivor is named, not ended.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
@@ -1759,7 +1760,11 @@ fn a_stage_survivor_running_from_the_roots_is_ended_at_its_stage_end() {
     let (report, pid, birth) = stage(dir.path(), roots);
     std::fs::write(dir.path().join("stop"), "").expect("stop");
     assert_eq!(report.ended, std::slice::from_ref(&word), "{report:?}");
-    assert!(report.closed(), "{report:?}");
+    assert_eq!(
+        report.closed(),
+        aterm_uds::process::group_listing_can_be_whole(),
+        "closed exactly where a listing can be whole: {report:?}"
+    );
     gone(pid, birth);
 
     let dir = aterm_tempfile::tempdir().expect("scratch");

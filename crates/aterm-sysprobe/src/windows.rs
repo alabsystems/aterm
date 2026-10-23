@@ -519,6 +519,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     peak_footprint: None,
                     read_at: None,
                     coalition: None,
+                    version: None,
                 },
                 i64_at(rec, offset_of!(ProcessInformation64, create_time)).unwrap_or(0),
             ));

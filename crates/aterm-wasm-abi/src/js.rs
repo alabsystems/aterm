@@ -76,7 +76,6 @@ impl FromAbi for JsObject {
 ///     pub struct HtmlCanvasElement = "HTMLCanvasElement";
 /// }
 /// ```
-/// aterm_wasm_abi::js_type!
 #[macro_export]
 macro_rules! js_type {
     ($(#[$meta:meta])* $vis:vis struct $name:ident = $ts:literal;) => {

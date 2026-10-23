@@ -6,13 +6,14 @@
 //! A timed mode ends at `ends` on the boot clock ([`Clocks::since_boot`]), which only a file of
 //! this boot is read against. `deadline` is that end on the wall clock as the save read it:
 //! builds before `ends` keep their deadline there, so they read a timed mode this build saves,
-//! and a file one of them wrote (no `ends`) is read against the wall clock as it reads now,
-//! never as more than its span away, until the mug that takes its mode saves it back with its
-//! `ends` ([`take`]). A mode saved in an earlier boot or an unparseable file restores to
-//! [`Mode::Off`].
+//! and the mug saves it again within a tick of a change of the date ([`refresh`]); a file one of
+//! them wrote (no `ends`) is read against the wall clock as it reads now, never as more than its
+//! span away, until the mug that takes its mode saves it back with its `ends` ([`take`]). A mode
+//! saved in an earlier boot or an unparseable file restores to [`Mode::Off`].
 
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use crate::model::{Clocks, Mode};
 
@@ -83,8 +84,18 @@ pub fn decode(text: &str, now: Clocks) -> Option<Saved> {
     parse(text, now).map(|(saved, _)| saved)
 }
 
-/// [`decode`], and whether the text keeps a timed mode on the wall clock alone (no `ends`).
-fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
+/// The keys of a state file's text, each as the last line naming it says.
+struct Fields<'a> {
+    mode: &'a str,
+    ends: Option<u64>,
+    deadline: Option<u64>,
+    span: Option<u64>,
+    boot: Option<u128>,
+}
+
+/// The [`Fields`] of `text`; `None` for a line that is not `key=value`, a number or a boot that
+/// does not parse, or no `mode`.
+fn fields(text: &str) -> Option<Fields<'_>> {
     let (mut mode, mut ends, mut deadline, mut span, mut boot) = (None, None, None, None, None);
     for line in text.lines() {
         let line = line.trim();
@@ -102,7 +113,25 @@ fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
             _ => {}
         }
     }
-    let mode = match mode? {
+    Some(Fields {
+        mode: mode?,
+        ends,
+        deadline,
+        span,
+        boot,
+    })
+}
+
+/// [`decode`], and whether the text keeps a timed mode on the wall clock alone (no `ends`).
+fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
+    let Fields {
+        mode,
+        ends,
+        deadline,
+        span,
+        boot,
+    } = fields(text)?;
+    let mode = match mode {
         "off" => Mode::Off,
         "forever" => Mode::Forever,
         "until" => {
@@ -120,6 +149,34 @@ fn parse(text: &str, now: Clocks) -> Option<(Saved, bool)> {
     };
     let wall_only = matches!(mode, Mode::Until { .. }) && ends.is_none();
     Some((Saved { mode, boot }, wall_only))
+}
+
+/// How far, in seconds, a file's wall-clock `deadline` may sit from where the wall clock now puts
+/// its end before [`refresh`] saves it again: more than the whole-second readings of the two
+/// clocks wander apart.
+pub const DRIFT_SECS: u64 = 5;
+
+/// Whether `text` holds `mode`, a timed mode of this boot (`boot`), saved before a change of the
+/// date: its `ends`, `span` and `boot` are the mode's, and its `deadline` is missing or more than
+/// [`DRIFT_SECS`] from where the wall clock at `now` puts that end.
+fn drifted(text: &str, mode: Mode, boot: Option<u128>, now: Clocks) -> bool {
+    let Mode::Until {
+        deadline: ends,
+        span,
+    } = mode
+    else {
+        return false;
+    };
+    fields(text).is_some_and(|fields| {
+        boot.is_some()
+            && fields.boot == boot
+            && fields.mode == "until"
+            && fields.ends == Some(ends)
+            && fields.span == Some(span)
+            && fields
+                .deadline
+                .is_none_or(|wall| wall.abs_diff(now.wall_at(ends)) > DRIFT_SECS)
+    })
 }
 
 /// Restores `saved` at `now` if its boot matches `boot_now` and its deadline has not passed.
@@ -166,12 +223,72 @@ fn read_text(path: &Path) -> Option<String> {
     Some(text)
 }
 
-/// Atomically writes `saved`, encoded at `now`, to `path` via a sibling temporary file.
+/// How long a save waits for another save's [`Held`] on its directory before it renames without
+/// it; a hold lasts a re-read and a rename.
+const HOLD_WAIT: Duration = Duration::from_secs(1);
+
+/// How often a save waiting for a [`Held`] tries it again.
+const HOLD_POLL: Duration = Duration::from_millis(1);
+
+/// A save's `flock` on the state file's directory, whose inode no rename of the file replaces:
+/// taken once the new text is flushed and held over the rename (and a [`save_over`]'s re-read
+/// before it), so no other save of this build renames between that re-read and the rename;
+/// dropping it lets go (`LOCK_UN`).
+struct Held(std::fs::File);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// The [`Held`] on `dir`, waited for up to `wait` while another description holds it; `None`
+/// once `wait` is up, or where the directory cannot be opened or locked (Windows' `File::open`
+/// opens no directory).
+fn hold(dir: &Path, wait: Duration) -> Option<Held> {
+    hold_with(dir, wait, || std::thread::sleep(HOLD_POLL))
+}
+
+/// [`hold`], with `pause` run between tries.
+fn hold_with(dir: &Path, wait: Duration, mut pause: impl FnMut()) -> Option<Held> {
+    let file = std::fs::File::open(dir).ok()?;
+    let until = Instant::now() + wait;
+    loop {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        let taken = file.try_lock();
+        match taken {
+            Ok(()) => return Some(Held(file)),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < until => pause(),
+            Err(_) => return None,
+        }
+    }
+}
+
+/// Atomically writes `saved`, encoded at `now`, to `path` via a sibling temporary file, renamed
+/// over it under the directory's [`Held`], or without it once [`HOLD_WAIT`] is up.
 ///
 /// # Errors
 ///
 /// The parent directory cannot be created, or the write or the rename fails.
 pub fn write(path: &Path, saved: &Saved, now: Clocks) -> io::Result<()> {
+    write_unless(path, saved, now, HOLD_WAIT, || {}, || false).map(drop)
+}
+
+/// [`write()`], unless `changed`, asked once the new text is flushed and the directory's
+/// [`Held`] (waited for up to `wait`) is taken, just before the rename, says the file is no
+/// longer the one to replace: whether it was written. `landing` runs between the flush and the
+/// hold.
+fn write_unless(
+    path: &Path,
+    saved: &Saved,
+    now: Clocks,
+    wait: Duration,
+    landing: impl FnOnce(),
+    changed: impl FnOnce() -> bool,
+) -> io::Result<bool> {
     use std::io::Write as _;
     let parent = path
         .parent()
@@ -195,9 +312,14 @@ pub fn write(path: &Path, saved: &Saved, now: Clocks) -> io::Result<()> {
         file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         file.write_all(encode(saved, now).as_bytes())?;
         aterm_durable::ordered(&file)?;
-        std::fs::rename(&tmp, path)
+        landing();
+        let _held = hold(parent, wait);
+        if changed() {
+            return Ok(false);
+        }
+        std::fs::rename(&tmp, path).map(|()| true)
     })();
-    if written.is_err() {
+    if !matches!(written, Ok(true)) {
         let _ = std::fs::remove_file(&tmp);
     }
     written
@@ -210,14 +332,51 @@ pub fn write(path: &Path, saved: &Saved, now: Clocks) -> io::Result<()> {
 ///
 /// As [`write()`].
 pub fn save(path: &Path, mode: Mode) -> io::Result<()> {
-    write(
-        path,
-        &Saved {
-            mode,
-            boot: crate::instance::boot_id(),
-        },
-        clocks().unwrap_or_default(),
-    )
+    save_at(path, mode, clocks().unwrap_or_default())
+}
+
+/// [`save`], encoded at `now`.
+///
+/// # Errors
+///
+/// As [`write()`].
+pub fn save_at(path: &Path, mode: Mode, now: Clocks) -> io::Result<()> {
+    write(path, &this_boots(mode), now)
+}
+
+/// `mode`, stamped with this boot.
+fn this_boots(mode: Mode) -> Saved {
+    Saved {
+        mode,
+        boot: crate::instance::boot_id(),
+    }
+}
+
+/// [`save_at`], unless the file at `path` no longer holds `was` once the new text is flushed:
+/// whether it was saved. A writer that changed the file since `was` was read keeps its change.
+/// The last read and the rename run under the directory's [`Held`], which every save of this
+/// build takes for its rename, so none lands between the two (but one that waited
+/// [`HOLD_WAIT`] for it in vain). A build before this one takes no hold: its rename landing
+/// there, in a re-read and a rename (about 0.1 ms on APFS), is still overwritten.
+///
+/// # Errors
+///
+/// As [`write()`].
+pub fn save_over(path: &Path, mode: Mode, was: &str, now: Clocks) -> io::Result<bool> {
+    save_over_with(path, mode, was, now, || {})
+}
+
+/// [`save_over`], with `landing` run where a writer's change would land unseen but for the read.
+fn save_over_with(
+    path: &Path,
+    mode: Mode,
+    was: &str,
+    now: Clocks,
+    landing: impl FnOnce(),
+) -> io::Result<bool> {
+    write_unless(path, &this_boots(mode), now, HOLD_WAIT, landing, || {
+        read_text(path).as_deref() != Some(was)
+    })
 }
 
 /// Loads and restores the mode at `now` from `path`.
@@ -226,20 +385,90 @@ pub fn load(path: &Path, now: Clocks) -> Mode {
     take(path, now).0
 }
 
-/// [`load`], and whether the file keeps a timed mode on the wall clock alone (a build before
-/// `ends` wrote it): every read of such a file reads it against the wall clock anew, so one
-/// after a change of the date reads a span longer or shorter than the mode restored now, until
-/// the mode is saved again.
+/// [`load`], and the text the mode was restored from when the file is one to save back, because
+/// every read of it restores it anew: a timed mode on the wall clock alone (a build before `ends`
+/// wrote it), which a read after a change of the date reads as a span longer or shorter than the
+/// mode restored now; or a mode of this boot the restore changed, a deadline more than its span
+/// away (a hand-edited or damaged file), which every read brings in to a full span, or one gone,
+/// which a build before `ends` reads as on again once the date is set back. Saved, either reads
+/// as the mode restored now.
 #[must_use]
-pub fn take(path: &Path, now: Clocks) -> (Mode, bool) {
-    let parsed = read_text(path).and_then(|text| parse(&text, now));
-    let wall_only = parsed.is_some_and(|(_, wall_only)| wall_only);
-    let mode = restore(
-        parsed.map(|(saved, _)| saved),
-        crate::instance::boot_id(),
-        now,
-    );
-    (mode, wall_only)
+pub fn take(path: &Path, now: Clocks) -> (Mode, Option<String>) {
+    let Some(text) = read_text(path) else {
+        return (Mode::Off, None);
+    };
+    let parsed = parse(&text, now);
+    let boot = crate::instance::boot_id();
+    let mode = restore(parsed.map(|(saved, _)| saved), boot, now);
+    let resave = parsed.is_some_and(|(saved, wall_only)| {
+        wall_only || (boot.is_some() && saved.boot == boot && saved.mode != mode)
+    });
+    (mode, resave.then_some(text))
+}
+
+/// How many times [`take_saving`] reads the file: each read after the first is of a writer's
+/// change that landed before the save-back of the one before.
+const TAKE_ROUNDS: usize = 3;
+
+/// [`take`], saving the mode back when the file is one to ([`save_over`]). A file a writer
+/// changed before the save-back is taken in turn, up to [`TAKE_ROUNDS`] reads; the mode of the
+/// last is answered unsaved when its writer changed the file once more, and the notification
+/// that writer posts brings the next take.
+///
+/// # Errors
+///
+/// As [`write()`].
+pub fn take_saving(path: &Path, now: Clocks) -> io::Result<Mode> {
+    take_saving_with(path, now, |_| {})
+}
+
+/// [`take_saving`], with `landing` run at each save-back as [`save_over_with`] runs it.
+fn take_saving_with(path: &Path, now: Clocks, mut landing: impl FnMut(&Path)) -> io::Result<Mode> {
+    let mut mode = Mode::Off;
+    for _ in 0..TAKE_ROUNDS {
+        let (taken, was) = take(path, now);
+        mode = taken;
+        let Some(was) = was else {
+            break;
+        };
+        if save_over_with(path, mode, &was, now, || landing(path))? {
+            break;
+        }
+    }
+    Ok(mode)
+}
+
+/// Saves `mode` again, encoded at `now`, when the file at `path` holds it as a timed mode saved
+/// before a change of the date ([`drifted`]), unless a writer changes it first ([`save_over`]):
+/// whether it was saved. A build before `ends` reads the end on the wall clock alone, so until
+/// then it reads as much more time left as the date was set back, or as off once set forward
+/// past the end. The file is read only for a timed mode.
+///
+/// # Errors
+///
+/// As [`write()`].
+pub fn refresh(path: &Path, mode: Mode, now: Clocks) -> io::Result<bool> {
+    refresh_with(path, mode, now, read_text, || {})
+}
+
+/// [`refresh`], reading the file with `read`, with `landing` run at the save as
+/// [`save_over_with`] runs it.
+fn refresh_with(
+    path: &Path,
+    mode: Mode,
+    now: Clocks,
+    read: impl FnOnce(&Path) -> Option<String>,
+    landing: impl FnOnce(),
+) -> io::Result<bool> {
+    if !matches!(mode, Mode::Until { .. }) {
+        return Ok(false);
+    }
+    match read(path) {
+        Some(text) if drifted(&text, mode, crate::instance::boot_id(), now) => {
+            save_over_with(path, mode, &text, now, landing)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[cfg(test)]
@@ -437,11 +666,11 @@ mod tests {
         assert!(saved.contains(&format!("\nends={}\n", NOW.since_boot + HOUR - 600)));
     }
 
-    /// Only a file with no `ends` is one to save back: read again once the date is set back a
-    /// day, it reads a full span where the mode restored now has an hour or nothing left, while
-    /// that mode saved reads the time it had.
+    /// A file with no `ends` is one to save back, whatever its boot: read again once the date is
+    /// set back a day, it reads a full span where the mode restored now has an hour or nothing
+    /// left, while that mode saved reads the time it had.
     #[test]
-    fn only_a_file_with_no_ends_is_one_to_save_back() {
+    fn a_file_with_no_ends_is_one_to_save_back() {
         let earlier = |deadline: u64| {
             format!(
                 "mode=until\ndeadline={deadline}\nspan={}\nboot={}\n",
@@ -479,9 +708,9 @@ mod tests {
         }
         let dir = aterm_tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("caffeine.state");
-        assert_eq!(take(&path, NOW), (Mode::Off, false), "no file");
+        assert_eq!(take(&path, NOW), (Mode::Off, None), "no file");
         std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("an earlier build's file");
-        assert!(take(&path, NOW).1);
+        assert_eq!(take(&path, NOW).1, Some(earlier(NOW.wall + HOUR)));
         write(
             &path,
             &Saved {
@@ -491,7 +720,195 @@ mod tests {
             NOW,
         )
         .expect("write");
-        assert!(!take(&path, NOW).1);
+        assert_eq!(take(&path, NOW).1, None);
+    }
+
+    /// A file of this boot whose restore changes its mode is one to save back: a deadline a day
+    /// away on a span of an hour comes in to the hour, and one gone is off. Saved, it reads the
+    /// time it had half an hour on, not the full hour each read would restore anew.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_restore_that_changes_this_boots_mode_is_saved_back() {
+        let this = crate::instance::boot_id().expect("this boot");
+        let file = |ends: u64, boot: u128| {
+            format!(
+                "mode=until\nends={ends}\nspan={HOUR}\ndeadline={}\nboot={}\n",
+                NOW.wall_at(ends),
+                boot_text(boot)
+            )
+        };
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caffeine.state");
+        let hour = Mode::chosen(crate::model::Choice::Hours1, NOW);
+        for (ends, boot, want, resaved) in [
+            (NOW.since_boot + DAY, this, hour, true),
+            (NOW.since_boot - 1, this, Mode::Off, true),
+            (NOW.since_boot + HOUR, this, hour, false),
+            (NOW.since_boot + DAY, this ^ 1, Mode::Off, false),
+        ] {
+            let text = file(ends, boot);
+            std::fs::write(&path, &text).expect("state file");
+            assert_eq!(
+                take(&path, NOW),
+                (want, resaved.then_some(text)),
+                "{ends} {boot:x}"
+            );
+        }
+        std::fs::write(&path, file(NOW.since_boot + DAY, this)).expect("state file");
+        assert_eq!(take_saving(&path, NOW).expect("saved back"), hour);
+        let later = NOW + HOUR / 2;
+        assert_eq!(load(&path, later).remaining(later), Some(HOUR / 2));
+        assert_eq!(take(&path, later).1, None, "saved once");
+    }
+
+    /// A writer whose change lands between the read and the save-back keeps it: the save-back
+    /// of an earlier build's 8 hours is dropped, and the writer's off is taken in its place. A
+    /// writer landing at every save-back ends the takes at the third, unsaved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_writers_change_landing_before_the_save_back_is_kept() {
+        let this = boot_text(crate::instance::boot_id().expect("this boot"));
+        let earlier = |deadline: u64| {
+            format!(
+                "mode=until\ndeadline={deadline}\nspan={}\nboot={this}\n",
+                8 * HOUR
+            )
+        };
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caffeine.state");
+        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("an earlier build's file");
+        let mut landed = 0;
+        let taken = take_saving_with(&path, NOW, |path| {
+            landed += 1;
+            save_at(path, Mode::Off, NOW).expect("the writer's off");
+        })
+        .expect("taken");
+        assert_eq!(taken, Mode::Off);
+        assert_eq!(landed, 1, "the writer's file needs no save-back");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("state"),
+            format!("mode=off\nboot={this}\n")
+        );
+        std::fs::write(&path, earlier(NOW.wall + HOUR)).expect("an earlier build's file");
+        let mut landed = 0;
+        let taken = take_saving_with(&path, NOW, |path| {
+            landed += 1;
+            std::fs::write(path, earlier(NOW.wall + HOUR - landed)).expect("another");
+        })
+        .expect("taken");
+        assert_eq!(landed, TAKE_ROUNDS as u64);
+        assert_eq!(taken.remaining(NOW), Some(HOUR - (landed - 1)));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("state"),
+            earlier(NOW.wall + HOUR - landed)
+        );
+    }
+
+    /// A save takes its directory's hold once its text is flushed and keeps it over its last read
+    /// and its rename, so no other save of this build lands between the two, and lets go once
+    /// saved. With the hold taken elsewhere, a save whose wait is up renames without it.
+    #[cfg(unix)]
+    #[test]
+    fn a_save_renames_under_its_directorys_hold() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caffeine.state");
+        let free = || hold(dir.path(), Duration::ZERO).is_some();
+        let forever = Saved {
+            mode: Mode::Forever,
+            boot: Some(BOOT),
+        };
+        let (mut at_landing, mut at_rename) = (false, true);
+        let written = write_unless(
+            &path,
+            &forever,
+            NOW,
+            HOLD_WAIT,
+            || at_landing = free(),
+            || {
+                at_rename = free();
+                false
+            },
+        );
+        assert!(written.expect("written"));
+        assert!(at_landing, "CONTROL: free before the hold");
+        assert!(!at_rename, "held over the last read and the rename");
+        assert!(free(), "let go once saved");
+        let off = Saved {
+            mode: Mode::Off,
+            ..forever
+        };
+        let elsewhere = hold(dir.path(), Duration::ZERO).expect("free");
+        let written = write_unless(&path, &off, NOW, Duration::ZERO, || {}, || false);
+        assert!(written.expect("written without it"));
+        drop(elsewhere);
+        assert_eq!(read(&path, NOW), Some(off));
+    }
+
+    /// A hold another description has is waited for while it lasts, and no longer than the wait.
+    #[cfg(unix)]
+    #[test]
+    fn a_hold_waits_for_its_holder_and_no_longer() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let mut elsewhere = Some(hold(dir.path(), Duration::ZERO).expect("free"));
+        let none = hold_with(dir.path(), Duration::ZERO, || {
+            panic!("a pause with no wait")
+        });
+        assert!(none.is_none(), "no wait");
+        let mut pauses = 0;
+        let held = hold_with(dir.path(), Duration::from_secs(60), || {
+            pauses += 1;
+            elsewhere = None;
+        });
+        assert!(held.is_some(), "taken once its holder let go");
+        assert_eq!(pauses, 1);
+        assert!(hold(dir.path(), Duration::ZERO).is_none(), "and held");
+    }
+
+    /// A refresh reads the file only for a timed mode: off, and on with no end, keep no end on
+    /// the wall clock.
+    #[test]
+    fn a_refresh_reads_the_file_only_for_a_timed_mode() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caffeine.state");
+        let hour = Mode::chosen(crate::model::Choice::Hours1, NOW);
+        for (mode, want) in [(Mode::Off, 0), (Mode::Forever, 0), (hour, 1)] {
+            save_at(&path, mode, NOW).expect("saved");
+            let mut reads = 0;
+            let read = |path: &Path| {
+                reads += 1;
+                read_text(path)
+            };
+            let saved = refresh_with(&path, mode, NOW, read, || {});
+            assert!(!saved.expect("refreshed"), "{mode:?}");
+            assert_eq!(reads, want, "{mode:?}");
+        }
+    }
+
+    /// A writer whose change lands before a refresh's save keeps it: the mode the mug holds,
+    /// saved before the date was set back a day, is not saved again over the writer's off.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_writers_change_landing_before_a_refresh_is_kept() {
+        let this = boot_text(crate::instance::boot_id().expect("this boot"));
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("caffeine.state");
+        let mode = Mode::chosen(crate::model::Choice::Hours8, NOW);
+        save_at(&path, mode, NOW).expect("the mug's save");
+        let back = Clocks {
+            since_boot: NOW.since_boot + 600,
+            wall: NOW.wall - DAY + 600,
+        };
+        let mut landed = 0;
+        let saved = refresh_with(&path, mode, back, read_text, || {
+            landed += 1;
+            save_at(&path, Mode::Off, back).expect("the writer's off");
+        });
+        assert!(!saved.expect("refreshed"));
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("state"),
+            format!("mode=off\nboot={this}\n")
+        );
+        assert_eq!(landed, 1);
     }
 
     /// The boot clock is the one that counts time asleep (`mach_continuous_time`), bracketed by

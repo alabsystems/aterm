@@ -43,12 +43,14 @@ pub struct ProcessReading {
     pub read_at: Option<std::time::Instant>,
     /// Its resource coalition's id (macOS), read only by a sweep asked for it ([`SweepOpts::coalitions`]); `None` otherwise, for a zombie, and off macOS.
     pub coalition: Option<u64>,
+    /// Its pid version (macOS `p_idversion`, [`pid_version`]), which a new process and each exec take anew, read with [`Self::coalition`]; `None` otherwise, for a zombie, and off macOS.
+    pub version: Option<i32>,
 }
 
 /// What a sweep reads beyond each process's row ([`processes_with`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SweepOpts {
-    /// Each process's resource coalition ([`ProcessReading::coalition`]): one more `proc_pidinfo` a process on macOS, nothing elsewhere.
+    /// Each process's resource coalition and pid version ([`ProcessReading::coalition`], [`ProcessReading::version`]): one more `proc_pidinfo` a process on macOS, two more for one whose coalition [`processes_keeping`]'s ids do not hold under that version, nothing elsewhere.
     pub coalitions: bool,
 }
 
@@ -70,7 +72,33 @@ pub fn processes() -> Option<Sweep> {
 /// Sweep every process, reading what `opts` asks for too; `None` where the platform has no reader.
 #[must_use]
 pub fn processes_with(opts: SweepOpts) -> Option<Sweep> {
-    imp::processes(opts)
+    processes_keeping(opts, &mut crate::coalitions::CoalitionIds::default())
+}
+
+/// [`processes_with`], each process's coalition taken from `ids` where they hold it under the
+/// process's pid version, else read and kept there; `ids` then holds the swept processes' alone.
+#[must_use]
+pub fn processes_keeping(
+    opts: SweepOpts,
+    ids: &mut crate::coalitions::CoalitionIds,
+) -> Option<Sweep> {
+    imp::processes(opts, ids)
+}
+
+/// `pid`'s pid version (`p_idversion`, `PROC_PIDUNIQIDENTIFIERINFO`, which any process may read
+/// of any other): a fork and each exec take a new one, so it moves where the pid, the kernel
+/// start and often the short name stay. `None` when the kernel does not say, and off macOS.
+#[must_use]
+pub fn pid_version(pid: u32) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        imp::pid_version(std::ffi::c_int::try_from(pid).ok().filter(|p| *p > 0)?)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// `/proc/<pid>/statm`'s resident pages (its second field).
@@ -173,6 +201,41 @@ pub(crate) mod imp {
         (n == size).then_some(info)
     }
 
+    /// `PROC_PIDUNIQIDENTIFIERINFO` (`sys/proc_info.h`).
+    const PROC_PIDUNIQIDENTIFIERINFO: c_int = 17;
+
+    /// `struct proc_uniqidentifierinfo` (56 bytes).
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct UniqIdentifierInfo {
+        uuid: [u8; 16],
+        uniqueid: u64,
+        puniqueid: u64,
+        idversion: i32,
+        orig_ppidversion: i32,
+        reserve2: u64,
+        reserve3: u64,
+    }
+    const _: () = assert!(std::mem::size_of::<UniqIdentifierInfo>() == 56);
+
+    /// `pid`'s `p_idversion` ([`super::pid_version`]).
+    pub(crate) fn pid_version(pid: c_int) -> Option<i32> {
+        // SAFETY: plain integers and bytes; all-zero is valid.
+        let mut info: UniqIdentifierInfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<UniqIdentifierInfo>() as c_int;
+        // SAFETY: `info` is `size` writable bytes of the flavor's layout.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDUNIQIDENTIFIERINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        (n == size).then_some(info.idversion)
+    }
+
     /// `pid`'s `RUSAGE_INFO_V4` (the user's own processes), or `None`.
     pub(crate) fn rusage(pid: c_int) -> Option<libc::rusage_info_v4> {
         // SAFETY: `rusage_info_v4` is plain integers; all-zero is valid.
@@ -188,7 +251,10 @@ pub(crate) mod imp {
         (rc == 0).then_some(info)
     }
 
-    pub(super) fn processes(opts: SweepOpts) -> Option<Sweep> {
+    pub(super) fn processes(
+        opts: SweepOpts,
+        ids: &mut crate::coalitions::CoalitionIds,
+    ) -> Option<Sweep> {
         // SAFETY: a null buffer asks for the count only.
         let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
         let count = usize::try_from(count).ok()?;
@@ -202,6 +268,9 @@ pub(crate) mod imp {
         pids.truncate(MAX_PROCESSES);
         let (numer, denom) = timebase();
         let mut procs = Vec::with_capacity(pids.len());
+        if opts.coalitions {
+            ids.begin_sweep();
+        }
         for pid in pids {
             if pid <= 0 {
                 continue;
@@ -229,10 +298,15 @@ pub(crate) mod imp {
                 }
                 continue;
             };
-            let coalition = opts
-                .coalitions
-                .then(|| crate::coalitions::coalition_of(pid as u32))
-                .flatten();
+            let (coalition, version) = if opts.coalitions {
+                ids.read(
+                    pid as u32,
+                    || pid_version(pid),
+                    || crate::coalitions::coalition_of(pid as u32),
+                )
+            } else {
+                (None, None)
+            };
             let after = rusage(pid);
             let usage = match (before, after) {
                 (Some(before), Some(after))
@@ -271,7 +345,11 @@ pub(crate) mod imp {
                 peak_footprint: usage.map(|u| u.ri_lifetime_max_phys_footprint),
                 read_at,
                 coalition,
+                version,
             });
+        }
+        if opts.coalitions {
+            ids.end_sweep();
         }
         Some(Sweep { procs, truncated })
     }
@@ -279,7 +357,10 @@ pub(crate) mod imp {
 
 #[cfg(target_os = "linux")]
 mod imp {
-    pub(super) fn processes(_opts: super::SweepOpts) -> Option<super::Sweep> {
+    pub(super) fn processes(
+        _opts: super::SweepOpts,
+        _ids: &mut crate::coalitions::CoalitionIds,
+    ) -> Option<super::Sweep> {
         // SAFETY: `sysconf` reads a constant.
         let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
         let hz = u64::try_from(hz).ok().filter(|h| *h > 0).unwrap_or(100);
@@ -292,7 +373,10 @@ mod imp {
 
 #[cfg(all(windows, target_pointer_width = "64"))]
 mod imp {
-    pub(super) fn processes(_opts: super::SweepOpts) -> Option<super::Sweep> {
+    pub(super) fn processes(
+        _opts: super::SweepOpts,
+        _ids: &mut crate::coalitions::CoalitionIds,
+    ) -> Option<super::Sweep> {
         crate::win::processes()
     }
 }
@@ -303,7 +387,10 @@ mod imp {
     all(windows, target_pointer_width = "64")
 )))]
 mod imp {
-    pub(super) fn processes(_opts: super::SweepOpts) -> Option<super::Sweep> {
+    pub(super) fn processes(
+        _opts: super::SweepOpts,
+        _ids: &mut crate::coalitions::CoalitionIds,
+    ) -> Option<super::Sweep> {
         None
     }
 }
@@ -475,7 +562,7 @@ mod tests {
         );
     }
 
-    /// A sweep asked for coalitions reads each process's, as the one-process reader does, another user's too (launchd's, root's); a plain sweep reads none.
+    /// A sweep asked for coalitions reads each process's, and its pid version, as the one-process readers do, another user's too (launchd's, root's); a plain sweep reads neither.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_sweep_reads_coalitions_only_when_asked() {
@@ -484,14 +571,140 @@ mod tests {
             let row = sweep.procs.iter().find(|p| p.pid == pid).expect("swept");
             let own = crate::coalitions::coalition_of(pid).expect("its coalition");
             assert_eq!(row.coalition, Some(own), "{pid}");
+            let version = pid_version(pid).expect("its pid version");
+            assert_eq!(row.version, Some(version), "{pid}");
+            // The same field as aterm-uds's flavor-17 reader reads it (no SDK header declares it).
+            let uds = aterm_uds::process::uniq_identifier(i32::try_from(pid).expect("a pid"))
+                .map(|i| i.p_idversion);
+            assert_eq!(uds, Some(version), "{pid}");
         }
         assert!(
             processes()
                 .expect("a sweep")
                 .procs
                 .iter()
-                .all(|p| p.coalition.is_none())
+                .all(|p| p.coalition.is_none() && p.version.is_none())
         );
+    }
+
+    /// The exec stand-in's stage: `before` execs this test binary again as `after` on a byte.
+    #[cfg(target_os = "macos")]
+    const EXEC_STAGE: &str = "ATERM_SYSPROBE_EXEC_STAGE";
+
+    /// [`exec_stand_in`], as `--exact` names it.
+    #[cfg(target_os = "macos")]
+    const EXEC_STAND_IN: &str = "procs::tests::exec_stand_in";
+
+    /// The hang detector for what must happen (a child's line).
+    #[cfg(target_os = "macos")]
+    const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "the child the exec test starts; alone it returns"]
+    fn exec_stand_in() {
+        use std::io::{Read as _, Write as _};
+        let Ok(stage) = std::env::var(EXEC_STAGE) else {
+            return;
+        };
+        println!("\n{stage}");
+        std::io::stdout().flush().expect("the stage's proof");
+        let mut byte = [0; 1];
+        match std::io::stdin().read(&mut byte) {
+            Ok(1) if stage == "before" => {
+                let failed =
+                    aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                        .args([
+                            "--exact",
+                            EXEC_STAND_IN,
+                            "--ignored",
+                            "--nocapture",
+                            "--test-threads=1",
+                        ])
+                        .env(EXEC_STAGE, "after")
+                        .exec();
+                panic!("the exec: {failed}");
+            }
+            _ => aterm_uds::process::kill_self_now(),
+        }
+    }
+
+    /// AN EXEC MOVES THE PID VERSION, SO A KEPT COALITION IS READ AGAIN (macOS, live): a child
+    /// that execs keeps its pid, its kernel start and its coalition (its new task inherits the
+    /// old one's) while its pid version moves, and the version is what [`processes_keeping`]
+    /// keeps a coalition under. NEGATIVE CONTROL: across two sweeps with no exec between, the
+    /// version stays and the coalition is kept.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_exec_moves_the_pid_version_and_keeps_the_coalition() {
+        use aterm_uds::spawnfd::Stdio;
+        use std::io::{BufRead as _, Write as _};
+        let mut child =
+            aterm_uds::spawnfd::command(std::env::current_exe().expect("the test binary"))
+                .args([
+                    "--exact",
+                    EXEC_STAND_IN,
+                    "--ignored",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(EXEC_STAGE, "before")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("the stand-in starts");
+        let out = child.stdout.take().expect("its stdout");
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let saw = |word: &str| loop {
+            match lines.recv_timeout(HANG) {
+                Ok(line) if line == word => break,
+                Ok(_) => {}
+                Err(e) => panic!("hang detector: the stand-in never wrote {word:?} ({e})"),
+            }
+        };
+        saw("before");
+        let pid = child.id();
+        let mut ids = crate::coalitions::CoalitionIds::default();
+        let mut row = || {
+            processes_keeping(SweepOpts { coalitions: true }, &mut ids)
+                .expect("a sweep")
+                .procs
+                .into_iter()
+                .find(|p| p.pid == pid)
+                .expect("the stand-in swept")
+        };
+        let first = row();
+        assert!(first.version.is_some(), "{first:?}");
+        assert_eq!(first.coalition, crate::coalitions::coalition_of(pid));
+        let again = row();
+        assert_eq!(
+            (again.version, again.coalition),
+            (first.version, first.coalition),
+            "no exec between"
+        );
+        let mut stdin = child.stdin.take().expect("its stdin");
+        stdin.write_all(b"x").expect("the byte that execs it");
+        saw("after");
+        let after = row();
+        assert_eq!(
+            (after.pid, after.start),
+            (first.pid, first.start),
+            "the same process"
+        );
+        assert_ne!(after.version, first.version, "an exec moved the version");
+        assert_eq!(
+            after.coalition, first.coalition,
+            "the new task's, inherited"
+        );
+        drop(stdin);
+        aterm_uds::deadline::kill_within(&mut child, HANG);
     }
 
     #[cfg(any(

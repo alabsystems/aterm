@@ -346,6 +346,108 @@ fn decode_base64_block(input: &str) -> Option<String> {
     (!out.is_empty()).then(|| String::from_utf8_lossy(&out).into_owned())
 }
 
+pub(super) fn encode_base64(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn decode_rfc2047_word(word: &str) -> Option<(String, &str)> {
+    let after_start = word.strip_prefix("=?")?;
+    let (_charset, after_cs) = after_start.split_once('?')?;
+    let (enc, after_enc) = after_cs.split_once('?')?;
+    let (payload, tail) = after_enc.split_once("?=")?;
+    let decoded = if enc.eq_ignore_ascii_case("b") {
+        decode_base64_block(payload)?
+    } else if enc.eq_ignore_ascii_case("q") {
+        decode_quoted_printable(&payload.replace('_', " "))
+    } else {
+        return None;
+    };
+    Some((decoded, tail))
+}
+
+fn is_encoded_word_separator(mut text: &str) -> bool {
+    while !text.is_empty() {
+        text = text.trim_start_matches([' ', '\t']);
+        if text.is_empty() {
+            return true;
+        }
+        // Accept LF-only folding as the header reader does, but require folding whitespace.
+        let Some(tail) = text
+            .strip_prefix("\r\n")
+            .or_else(|| text.strip_prefix('\n'))
+        else {
+            return false;
+        };
+        if !tail.starts_with(' ') && !tail.starts_with('\t') {
+            return false;
+        }
+        text = tail;
+    }
+    true
+}
+
+pub(super) fn decode_rfc2047_words(input: &str) -> String {
+    if !input.contains("=?") {
+        return input.to_owned();
+    }
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    let mut previous_decoded = false;
+    while let Some(start) = rest.find("=?") {
+        if let Some((decoded, tail)) = decode_rfc2047_word(&rest[start..]) {
+            let between = &rest[..start];
+            if !previous_decoded || !is_encoded_word_separator(between) {
+                out.push_str(between);
+            }
+            out.push_str(&decoded);
+            rest = tail;
+            previous_decoded = true;
+        } else {
+            out.push_str(&rest[..start + 2]);
+            rest = &rest[start + 2..];
+            previous_decoded = false;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+pub(super) fn extract_rfc5322_subject(raw_email: &str) -> Option<String> {
+    let (head, _) = raw_email
+        .split_once("\r\n\r\n")
+        .or_else(|| raw_email.split_once("\n\n"))?;
+    for line in unfold_rfc5322_headers(head) {
+        if let Some((k, v)) = line.split_once(':')
+            && k.trim().eq_ignore_ascii_case("subject")
+        {
+            let decoded = decode_rfc2047_words(v.trim());
+            if !decoded.trim().is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
 pub(super) fn decode_mime_base64_parts(raw_email: &str) -> String {
     let mut decoded_parts = String::new();
     let mut search = raw_email;
@@ -491,24 +593,69 @@ fn is_json_recipient_key(key_lower: &str) -> bool {
             | "recipient"
             | "delivered_to"
             | "delivered-to"
+            | "x-delivered-to"
+            | "x_delivered_to"
             | "x-original-to"
+            | "x_original_to"
+            | "original-recipient"
+            | "original_recipient"
             | "envelope-to"
+            | "envelope_to"
+            | "x-envelope-to"
+            | "x_envelope_to"
+            | "x-forwarded-to"
+            | "x_forwarded_to"
+            | "resent-to"
+            | "resent_to"
+            | "cc"
+            | "ccfull"
+            | "cc_full"
+            | "ccrecipients"
+            | "cc_recipients"
+            | "bcc"
+            | "bccfull"
+            | "bcc_full"
+            | "bccrecipients"
+            | "bcc_recipients"
             | "rcpt_to"
             | "rcpt-to"
     )
 }
 
-fn json_value_is_nonempty(val: &Value) -> bool {
+fn json_value_contains_email(val: &Value) -> bool {
     match val {
-        Value::Null => false,
-        Value::String(s) => !s.trim().is_empty(),
-        Value::Array(arr) => !arr.is_empty(),
-        Value::Object(map) => !map.is_empty(),
-        _ => true,
+        Value::String(s) => s.contains('@'),
+        Value::Array(arr) => arr.iter().any(json_value_contains_email),
+        Value::Object(map) => {
+            let has_split = map.keys().any(|k| {
+                matches!(
+                    k.to_ascii_lowercase().as_str(),
+                    "mailbox" | "local" | "localpart" | "local_part" | "user"
+                )
+            }) && map
+                .keys()
+                .any(|k| matches!(k.to_ascii_lowercase().as_str(), "domain" | "host"));
+            has_split || map.values().any(json_value_contains_email)
+        }
+        _ => false,
     }
 }
 
-fn check_json_recipients(obj: &aterm_json::Map, target: &str, depth: usize) -> (bool, bool) {
+fn json_value_is_nonempty(val: &Value) -> bool {
+    match val {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty() && json_value_contains_email(val),
+        Value::Array(arr) => !arr.is_empty() && json_value_contains_email(val),
+        Value::Object(map) => !map.is_empty() && json_value_contains_email(val),
+        _ => false,
+    }
+}
+
+pub(super) fn check_json_recipients(
+    obj: &aterm_json::Map,
+    target: &str,
+    depth: usize,
+) -> (bool, bool) {
     if depth > 6 {
         return (false, false);
     }
@@ -588,14 +735,18 @@ pub(super) fn email_matches_target(raw_email: &str, target: &str) -> bool {
     let mut saw_recipient_header = false;
     for line in unfold_rfc5322_headers(head) {
         if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            if key.eq_ignore_ascii_case("to")
-                || key.eq_ignore_ascii_case("delivered-to")
-                || key.eq_ignore_ascii_case("x-original-to")
-                || key.eq_ignore_ascii_case("envelope-to")
-            {
-                saw_recipient_header = true;
-                if contains_matching_email(v, target_trimmed) {
+            let key = k.trim().to_ascii_lowercase();
+            if is_json_recipient_key(&key) {
+                let decoded_v = decode_rfc2047_words(v);
+                if decoded_v.contains('@') {
+                    saw_recipient_header = true;
+                }
+                if contains_matching_email(&decoded_v, target_trimmed) {
+                    return true;
+                }
+            } else if key == "received" && v.to_ascii_lowercase().contains("for ") {
+                let decoded_v = decode_rfc2047_words(v);
+                if contains_matching_email(&decoded_v, target_trimmed) {
                     return true;
                 }
             }
@@ -683,6 +834,8 @@ fn json_headers_transfer_encoding(obj: &aterm_json::Map) -> (bool, bool) {
 }
 
 fn append_decoded_json_body_str(s: &str, is_b64: bool, is_qp: bool, extra_text: &mut String) {
+    let rfc2047_cow = decode_rfc2047_words(s);
+    let s = rfc2047_cow.as_str();
     if is_b64 && let Some(decoded) = decode_base64_block(s) {
         extra_text.push('\n');
         if is_quoted_printable_email(&decoded) {
@@ -918,9 +1071,8 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
     let mut ignored_otps = Vec::new();
     let mut is_json_with_body = false;
     if let Ok(doc) = aterm_json::from_str::<Value>(raw_email) {
-        let before_len = extra_text.len();
         extract_json_email_fields(&doc, &mut explicit_urls, &mut ignored_otps, &mut extra_text);
-        if doc.is_object() && !extra_text[before_len..].trim().is_empty() {
+        if doc.is_object() {
             is_json_with_body = true;
         }
     }
@@ -934,6 +1086,10 @@ pub fn extract_magic_links_from_email(raw_email: &str, target_email: Option<&str
     } else {
         raw_email.to_owned()
     };
+    if let Some(subj) = extract_rfc5322_subject(raw_email) {
+        extra_text.push('\n');
+        extra_text.push_str(&subj);
+    }
     let srcdoc_extra = extract_iframe_srcdoc_fragments(&format!("{qp_decoded}\n{extra_text}"));
     let combined = format!("{srcdoc_extra}\n{extra_text}\n{qp_decoded}");
     let decoded = decode_html_amp(&combined);
@@ -1247,34 +1403,132 @@ pub(super) fn loopback_http_exchange(
     parse_raw_http_response(&raw, cookies).ok_or("malformed HTTP response")
 }
 
+fn curl_config(options: &[(&'static str, &str)]) -> std::io::Result<String> {
+    if options
+        .iter()
+        .any(|(name, value)| name.contains('\0') || value.contains('\0'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "curl config contains a NUL",
+        ));
+    }
+    let mut text = String::new();
+    for (name, value) in options {
+        text.push_str(name);
+        text.push_str(" = \"");
+        for c in value.chars() {
+            match c {
+                '\\' => text.push_str("\\\\"),
+                '"' => text.push_str("\\\""),
+                '\n' => text.push_str("\\n"),
+                '\r' => text.push_str("\\r"),
+                '\t' => text.push_str("\\t"),
+                '\u{b}' => text.push_str("\\v"),
+                c => text.push(c),
+            }
+        }
+        text.push_str("\"\n");
+    }
+    Ok(text)
+}
+
+fn curl_command(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    options: &[(&'static str, &str)],
+) -> std::io::Result<(aterm_uds::spawnfd::Command, String)> {
+    use aterm_uds::spawnfd::Stdio;
+
+    let input = curl_config(options)?;
+    let mut cmd = aterm_uds::spawnfd::command(program);
+    cmd.args(args)
+        .args(["--config", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    Ok((cmd, input))
+}
+
+/// Pass fixed curl options containing credentials or URLs through stdin, preserving the
+/// caller's environment and flags. Callers put `--disable` first to suppress `.curlrc`.
+/// # Errors
+/// A config NUL, child or writer startup failure, failed pipe I/O or wait, or a writer panic.
+pub(super) fn curl_output(
+    args: &[&str],
+    options: &[(&'static str, &str)],
+) -> std::io::Result<std::process::Output> {
+    curl_output_with(aterm_uds::os_path!("curl"), args, options)
+}
+
+fn curl_output_with(
+    program: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    options: &[(&'static str, &str)],
+) -> std::io::Result<std::process::Output> {
+    let (mut cmd, input) = curl_command(program, args, options)?;
+    let mut child = cmd.spawn()?;
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(std::io::Error::other("curl config stdin is unavailable"));
+    };
+    std::thread::scope(|scope| {
+        let writer = std::thread::Builder::new()
+            .name("aterm-curl-config".into())
+            .spawn_scoped(scope, move || stdin.write_all(input.as_bytes()));
+        let writer = match writer {
+            Ok(writer) => writer,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        // Drain both output pipes while config is written, so a large form and a
+        // diagnostic cannot fill opposite pipes. Close stdin and join before returning.
+        let output = child.wait_with_output();
+        writer
+            .join()
+            .map_err(|_| std::io::Error::other("curl config writer panicked"))??;
+        output
+    })
+}
+
 fn https_curl_exchange(
     method: &str,
     url: &str,
     cookies: &mut BTreeMap<String, String>,
     form_body: Option<&str>,
 ) -> Result<HttpResponse, &'static str> {
-    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"));
-    cmd.args([
-        "--disable",
-        "--globoff",
-        "--proto",
-        "=https",
-        "-sS",
-        "-i",
-        "--max-time",
-        "15",
-        "-X",
-        method,
-    ]);
+    let cookie_hdr = cookies
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut options = vec![("url", url)];
     if !cookies.is_empty() {
-        let cookie_hdr: Vec<String> = cookies.iter().map(|(k, v)| format!("{k}={v}")).collect();
-        cmd.args(["-b", &cookie_hdr.join("; ")]);
+        options.push(("cookie", cookie_hdr.as_str()));
     }
     if let Some(body) = form_body {
-        cmd.args(["--data-raw", body]);
+        options.push(("data-raw", body));
     }
-    cmd.arg(url);
-    let out = cmd.output().map_err(|_| "failed running curl")?;
+    let out = curl_output(
+        &[
+            "--disable",
+            "--globoff",
+            "--proto",
+            "=https",
+            "-sS",
+            "-i",
+            "--max-time",
+            "15",
+            "-X",
+            method,
+        ],
+        &options,
+    )
+    .map_err(|_| "failed running curl")?;
     if !out.status.success() {
         return Err("HTTPS request failed");
     }

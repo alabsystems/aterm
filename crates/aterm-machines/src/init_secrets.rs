@@ -26,7 +26,7 @@ pub const PROMPT: &str =
     "Secrets vault URL or path (Enter keeps http://alab-secrets.local:7484/v1/alab, none skips): ";
 
 /// The prompt that asks for the vault's join password (hidden).
-pub const PASSWORD_PROMPT: &str = "Vault join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, another approves it by code; none skips): ";
+pub const PASSWORD_PROMPT: &str = "Vault join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, any other waits for approval by code; none skips): ";
 
 const SKIPPED: &str = "skipped at the prompt; aterm secrets join <url> joins a vault later";
 
@@ -62,11 +62,18 @@ fn patient_look(
         held(why);
     };
     let answer = look(patience, &told);
-    if was_held.get() && matches!(answer, Look::Unreached(_)) {
+    if was_held.get() && matches!(answer, Look::Unreached(_) | Look::Held(_)) {
         spent.store(true, Ordering::Relaxed);
     }
     answer
 }
+
+/// What an Offline row adds when the vault went unheard as macOS's Local Network gate leaves a
+/// connection ([`Look::Held`]); a quiet pass says nothing else, so the row is where a Don't
+/// Allow gets named.
+const LOCAL_NETWORK: &str = "if macOS asked whether this app may find devices on your local \
+     network and it was not allowed, turn it on in System Settings > Privacy & Security > Local \
+     Network";
 
 const UNCONFIGURED: &str =
     "no vault configured; run aterm init in a terminal, or aterm secrets join <url>";
@@ -1244,6 +1251,9 @@ impl Item for Vault {
             Look::Unreached(why) => Some(StoodAside::Offline(format!(
                 "the vault does not answer, so nothing was changed: {why}"
             ))),
+            Look::Held(why) => Some(StoodAside::Offline(format!(
+                "the vault does not answer, so nothing was changed: {why}; {LOCAL_NETWORK}"
+            ))),
             Look::NoVault(why) => Some(StoodAside::Offline(format!(
                 "no vault is there now, so nothing was changed: {why}"
             ))),
@@ -1336,7 +1346,7 @@ mod tests {
         syncs: Mutex<u32>,
         /// What `reachable` answers (`None`: the vault answers): nothing answered, or no
         /// vault there; and how many times it was asked.
-        unreachable: Mutex<Option<String>>,
+        unreachable: Mutex<Option<Look>>,
         absent: Mutex<Option<String>>,
         reached: Mutex<u32>,
         /// What this Mac's vault state and subscriber become while `reachable` is asked:
@@ -1471,8 +1481,8 @@ mod tests {
                 *self.statuses.lock().unwrap() = vec![Ok(status)].into();
                 *self.subscriber.lock().unwrap() = Some(Ok(state));
             }
-            if let Some(why) = self.unreachable.lock().unwrap().clone() {
-                return Look::Unreached(why);
+            if let Some(look) = self.unreachable.lock().unwrap().clone() {
+                return look;
             }
             match self.absent.lock().unwrap().clone() {
                 Some(why) => Look::NoVault(why),
@@ -1733,7 +1743,7 @@ mod tests {
         let none = Look::NoVault("a login page".into());
         assert_eq!(patient_look(&spent, &held, look(none.clone(), true)), none);
         assert!(!spent.load(Ordering::Relaxed));
-        let unheard = Look::Unreached("dns: no answer within 8000ms".into());
+        let unheard = Look::Held("dns: no answer within 8000ms".into());
         assert_eq!(
             patient_look(&spent, &held, look(unheard.clone(), true)),
             unheard
@@ -2661,10 +2671,10 @@ mod tests {
     fn an_unreachable_selected_vault_stands_aside_with_nothing_journaled_or_made() {
         let source = aterm_secrets::ALAB_DEFAULT_URL;
         let ops = Scripted::new(vec![Ok(unconfigured())]);
-        *ops.unreachable.lock().unwrap() = Some(
+        *ops.unreachable.lock().unwrap() = Some(Look::Held(
             "fetching http://alab-secrets.local:7484/v1/alab: No route to host (os error 65)"
                 .into(),
-        );
+        ));
         let mut held = Some(password());
         for attempt in 1..=5 {
             let row = setup_pass(&ops, source, &mut held, false);
@@ -2676,7 +2686,7 @@ mod tests {
             assert_eq!(
                 row.why.as_deref(),
                 Some(
-                    "the vault does not answer, so nothing was changed: fetching http://alab-secrets.local:7484/v1/alab: No route to host (os error 65)"
+                    "the vault does not answer, so nothing was changed: fetching http://alab-secrets.local:7484/v1/alab: No route to host (os error 65); if macOS asked whether this app may find devices on your local network and it was not allowed, turn it on in System Settings > Privacy & Security > Local Network"
                 )
             );
             assert!(ops.log().is_empty(), "{:?}", ops.log());
@@ -2686,7 +2696,8 @@ mod tests {
         }
         let pending = Scripted::new(vec![Ok(configured(Membership::Pending))]);
         pending.subscribed(Ok(installed_state()));
-        *pending.unreachable.lock().unwrap() = Some("No route to host (os error 65)".into());
+        *pending.unreachable.lock().unwrap() =
+            Some(Look::Held("No route to host (os error 65)".into()));
         let row = setup_pass(&pending, source, &mut None, false);
         assert_eq!(row.outcome, Outcome::Person, "{row:?}");
         assert_eq!(*pending.reached.lock().unwrap(), 0);
@@ -2809,12 +2820,22 @@ mod tests {
         let ops = Scripted::new(vec![Ok(configured(Membership::In { seq: 7, heard: 0 }))]);
         ops.subscribed(Ok(installed_state()));
         *ops.unwritten.lock().unwrap() = true;
-        *ops.unreachable.lock().unwrap() = Some("No route to host (os error 65)".into());
+        *ops.unreachable.lock().unwrap() = Some(Look::Unreached(
+            "fetching http://alab-secrets.local:7484/v1/alab: Connection refused (os error 61)"
+                .into(),
+        ));
         let row = setup_pass(&ops, source, &mut None, false);
         assert_eq!(row.outcome, Outcome::Blocked, "{row:?}");
         assert!(
             matches!(row.stood_aside, Some(StoodAside::Offline(_))),
             "{row:?}"
+        );
+        assert_eq!(
+            row.why.as_deref(),
+            Some(
+                "the vault does not answer, so nothing was changed: fetching http://alab-secrets.local:7484/v1/alab: Connection refused (os error 61)"
+            ),
+            "a refusal is no Local Network hold"
         );
         assert!(ops.log().is_empty(), "{:?}", ops.log());
         assert_eq!(*ops.reached.lock().unwrap(), 1);
@@ -3119,7 +3140,8 @@ mod tests {
         sys.answer(Some("https://who:typed@vault.example/v1/team"));
         sys.answer(None);
         let ops = Scripted::new(vec![Ok(unconfigured())]);
-        *ops.unreachable.lock().unwrap() = Some("vault.example: no such host".into());
+        *ops.unreachable.lock().unwrap() =
+            Some(Look::Unreached("vault.example: no such host".into()));
         *ops.outcome.lock().unwrap() = Some(Err(aterm_secrets::Error::new(
             "that URL is not usable: it needs a host, and no user:password@, spaces or control characters",
         )));
@@ -3135,7 +3157,8 @@ mod tests {
         sys.answer(None);
         sys.answer(None);
         let ops = Scripted::new(vec![Ok(unconfigured())]);
-        *ops.unreachable.lock().unwrap() = Some("alab-secrets.local: no such host".into());
+        *ops.unreachable.lock().unwrap() =
+            Some(Look::Unreached("alab-secrets.local: no such host".into()));
         let rows = run(&sys, &ops, Mode::Apply);
         assert_eq!(rows[0].outcome, Outcome::Blocked, "{rows:?}");
         assert_eq!(

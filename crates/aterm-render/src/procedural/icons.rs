@@ -66,8 +66,18 @@ struct Shape {
     top: f32,
     /// The ring family's half diameter ([`IconMetrics::disc`], never under three fifths of the capitals in whole pixels), which [`Self::mark_frame`] holds to `half`.
     ring: f32,
-    /// The half height an icon narrower than it is tall may keep in a cell of its own (`⤓`): the capitals' where the row allows, whatever the cell's width.
+    /// The half height an icon narrower than it is tall may keep in a cell of its own (`⤓`):
+    /// the capitals' where the row up to the ceiling allows, whatever the cell's width. Like
+    /// [`Self::flat`] it keeps none of the pixel and a half [`Self::half`] leaves under the
+    /// ceiling: its stem's round end stops at its half height.
     tall: f32,
+    /// The half height `⏸`'s and `!`'s bars span: the capitals' where the row up to the ceiling
+    /// allows, held to the room as [`Self::half`] is. `half` leaves a pixel and a half under the
+    /// ceiling, which the badges (their rings, the warning triangle, `↻`'s head) reach into past
+    /// their half height; a bar cut on whole rows ends at its half height, so where the tallest
+    /// letter stands that close over the capitals (on Menlo from 8 to 10 px `⏸` would be two to
+    /// four rows) the bars keep the share of the capitals they have on a roomier face.
+    flat: f32,
 }
 
 impl Shape {
@@ -140,7 +150,8 @@ impl Shape {
             bot: cy + half,
             top,
             ring,
-            tall: (cap * 0.5).min(cy - top - 1.5).max(half),
+            tall: (cap * 0.5).min(cy - top).max(half),
+            flat: (cap * 0.5).min(cy - top).min(room - 0.5).max(half),
         }
     }
 
@@ -321,8 +332,8 @@ impl Shape {
                     gap += 1.0;
                 }
                 let (y0, y1) = (
-                    (self.cy - 0.8 * self.half).round(),
-                    (self.cy + 0.8 * self.half).round(),
+                    (self.cy - 0.8 * self.flat).round(),
+                    (self.cy + 0.8 * self.flat).round(),
                 );
                 let (l0, r0) = (self.cx - gap * 0.5 - w, self.cx + gap * 0.5);
                 rect(px, py, l0, y0, l0 + w, y1).min(rect(px, py, r0, y0, r0 + w, y1))
@@ -345,8 +356,8 @@ impl Shape {
                 )
             }
             BandIcon::Alert => {
-                let bottom = self.bot.round();
-                let top = (self.cy - self.half).round();
+                let bottom = (self.cy + self.flat).round();
+                let top = (self.cy - self.flat).round();
                 let dh = t.max((self.half * 0.26).round());
                 let gap = (self.half * 0.2).round().max(1.0);
                 self.bar(px, py, top, bottom - dh - gap)
@@ -1090,6 +1101,113 @@ mod tests {
             crossed.len(),
             SMALL_FACES.len(),
             "control: the uncut ↻ crosses the tallest letter only on {crossed:?}"
+        );
+    }
+
+    /// The faces from 8 to 10 px (1x, regular) that [`SMALL_FACES`] leaves out, measured as it
+    /// is (`Renderer::icon_metrics`): `[cell w, cell h, baseline, cap, stem, head, disc]`. They
+    /// stand apart because that list's control counts on every row's uncut `↻` crossing the
+    /// tallest letter.
+    const SMALLEST_FACES: [(&str, [f32; 7]); 5] = [
+        ("SF Mono 8", [5.0, 9.0, 8.0, 6.0, 0.663, 1.0, 6.0]),
+        ("SF Mono 9", [6.0, 11.0, 9.0, 7.0, 0.745, 1.0, 6.0]),
+        ("SF Mono 10", [6.0, 12.0, 10.0, 8.0, 0.827, 1.0, 7.0]),
+        ("Menlo 8", [5.0, 9.0, 7.0, 6.0, 0.722, 0.0, 6.0]),
+        ("Menlo 9", [5.0, 10.0, 8.0, 7.0, 0.808, 0.0, 6.0]),
+    ];
+
+    /// On the small faces `⏸` and `!` between blanks are `[3cap/4, cap + 1]` rows and `⤓` is the
+    /// capitals' height (a row either way) standing on the baseline, spilled and in a cell of
+    /// its own, all under the tallest letter: none of them keeps the pixel and a half
+    /// [`Shape::half`] leaves under the ceiling. Control: drawn with that margin kept, they fall
+    /// short where the ceiling is the capitals' own top row (Menlo from 8 to 10 px), and `⏸` on
+    /// Andale Mono at 16 too.
+    #[test]
+    fn the_bars_and_the_land_arrow_keep_the_capitals_height_on_the_small_faces() {
+        let mut short = Vec::new();
+        for (name, [cw, ch, baseline, cap, stem, head, disc]) in
+            SMALLEST_FACES.into_iter().chain(SMALL_FACES)
+        {
+            let (cw, ch) = (cw as usize, ch as usize);
+            let m = IconMetrics {
+                baseline,
+                cap,
+                stem,
+                head,
+                disc,
+            };
+            let (ceiling, rows, base) = (head.max(1.0) as usize, cap as usize, baseline as usize);
+            let fits = |icon: BandIcon, (_, _, y0, y1): (usize, usize, usize, usize)| {
+                let (lo, hi) = if icon == BandIcon::ToBar {
+                    (rows - 1, rows + 1)
+                } else {
+                    (rows * 3 / 4, rows + 1)
+                };
+                y0 >= ceiling
+                    && (lo..=hi).contains(&(y1 - y0))
+                    && (icon != BandIcon::ToBar || y1 == base)
+            };
+            for icon in [BandIcon::Pause, BandIcon::Alert, BandIcon::ToBar] {
+                let spills: &[bool] = if icon == BandIcon::ToBar {
+                    &[true, false]
+                } else {
+                    &[true]
+                };
+                let mut fell = false;
+                for &spill in spills {
+                    let w = band_icon_width(cw, spill);
+                    let shape = Shape::fit(cw, ch, m, spill, icon);
+                    let kept = Shape {
+                        flat: shape.half,
+                        tall: (m.cap * 0.5)
+                            .min(shape.cy - shape.top - 1.5)
+                            .max(shape.half),
+                        ..shape
+                    };
+                    let draw = |fitted: &Shape| -> Vec<u8> {
+                        (0..w * ch)
+                            .map(|i| {
+                                let (px, py) = ((i % w) as f32 + 0.5, (i / w) as f32 + 0.5);
+                                let d = fitted.distance(icon, px, py).max(fitted.top - py);
+                                ((0.5 - d).clamp(0.0, 1.0) * 255.0).round() as u8
+                            })
+                            .collect()
+                    };
+                    let buf = band_icon_coverage(icon, cw, ch, m, spill);
+                    let at = format!("{name} spill {spill} {icon:?}");
+                    assert_eq!(
+                        draw(&shape),
+                        buf,
+                        "{at}: the control draws as the band does"
+                    );
+                    let (now, then) = (ink_box(&buf, w), ink_box(&draw(&kept), w));
+                    assert!(
+                        fits(icon, now),
+                        "{at}: ink box {now:?}, capitals {cap} rows tall on row {baseline}, the \
+                         tallest letter on row {head}"
+                    );
+                    fell |= !fits(icon, then);
+                }
+                if fell {
+                    short.push((name, icon));
+                }
+            }
+        }
+        assert_eq!(
+            short,
+            [
+                ("Menlo 8", BandIcon::Pause),
+                ("Menlo 8", BandIcon::Alert),
+                ("Menlo 8", BandIcon::ToBar),
+                ("Menlo 9", BandIcon::Pause),
+                ("Menlo 9", BandIcon::Alert),
+                ("Menlo 9", BandIcon::ToBar),
+                ("Andale Mono 16", BandIcon::Pause),
+                ("Menlo 10", BandIcon::Pause),
+                ("Menlo 10", BandIcon::Alert),
+                ("Menlo 10", BandIcon::ToBar),
+            ],
+            "control: drawn with the margin kept, these fall short"
         );
     }
 

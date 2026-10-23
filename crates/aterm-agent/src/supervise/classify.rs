@@ -2596,6 +2596,9 @@ enum First {
 struct Grammar {
     short: &'static [(char, Val)],
     long: &'static [(&'static str, &'static [Val])],
+    /// jq, rg and git log require whole long-option names. Prefix matching
+    /// would turn flags such as --slurp and --ignore into value options.
+    abbreviates: bool,
     first: First,
     operands_read: bool,
 }
@@ -2611,6 +2614,7 @@ const GREP: Grammar = Grammar {
         ("include-dir", &[Val::Text]),
         ("exclude-from", &[Val::Path]),
     ],
+    abbreviates: true,
     first: First::Pattern,
     operands_read: true,
 };
@@ -2632,6 +2636,7 @@ const RG: Grammar = Grammar {
         ("type-not", &[Val::Text]),
         ("ignore-file", &[Val::Path]),
     ],
+    abbreviates: false,
     first: First::Pattern,
     operands_read: true,
 };
@@ -2646,6 +2651,7 @@ const JQ: Grammar = Grammar {
         ("rawfile", &[Val::Text, Val::Path]),
         ("indent", &[Val::Text]),
     ],
+    abbreviates: false,
     first: First::Filter,
     operands_read: true,
 };
@@ -2667,6 +2673,7 @@ const AWK: Grammar = Grammar {
         ("assign", &[Val::Path]),
         ("field-separator", &[Val::Text]),
     ],
+    abbreviates: true,
     first: First::Program,
     operands_read: true,
 };
@@ -2674,6 +2681,7 @@ const AWK: Grammar = Grammar {
 const PGREP: Grammar = Grammar {
     short: &[('F', Val::Path)],
     long: &[("pidfile", &[Val::Path])],
+    abbreviates: true,
     first: First::Pattern,
     operands_read: true,
 };
@@ -2684,6 +2692,7 @@ const MEASURE: Grammar = Grammar {
         ("files0-from", &[Val::Path]),
         ("exclude-from", &[Val::Path]),
     ],
+    abbreviates: true,
     first: First::Operand,
     operands_read: false,
 };
@@ -2691,6 +2700,7 @@ const MEASURE: Grammar = Grammar {
 const GIT_GREP: Grammar = Grammar {
     short: &[('e', Val::Pattern), ('f', Val::PatternFile)],
     long: &[],
+    abbreviates: true,
     first: First::Pattern,
     operands_read: true,
 };
@@ -2703,6 +2713,7 @@ const GIT_LOG: Grammar = Grammar {
         ("committer", &[Val::Text]),
         ("grep-reflog", &[Val::Text]),
     ],
+    abbreviates: false,
     first: First::Operand,
     operands_read: true,
 };
@@ -2715,7 +2726,7 @@ fn option_values<'a>(g: &Grammar, a: &'a str) -> (Vec<Val>, Option<&'a str>) {
         let listed = g.long.iter().find(|(n, _)| *n == name).or_else(|| {
             g.long
                 .iter()
-                .find(|(n, _)| !name.is_empty() && n.starts_with(name))
+                .find(|(n, _)| g.abbreviates && !name.is_empty() && n.starts_with(name))
         });
         return match listed {
             Some((_, kinds)) => (kinds.to_vec(), glued),

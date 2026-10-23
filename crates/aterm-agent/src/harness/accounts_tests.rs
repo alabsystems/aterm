@@ -4669,6 +4669,75 @@ fn the_machine_id_is_minted_once_and_kept() {
 }
 
 #[test]
+fn account_selection_uses_current_bindings_and_never_turns_store_errors_into_sign_in() {
+    let dir = tmp("selection");
+    let store = Store::at(dir.path());
+    store.machine_id("0123456789abcdef").unwrap();
+    let login = dir.path().join("current-login");
+    std::fs::create_dir(&login).unwrap();
+    std::fs::write(login.join(".credentials.json"), "private fixture").unwrap();
+    let old_login = dir.path().join("missing-old-login");
+    let mut roster = roster(&[("work", Class::Dedicated, Some(old_login.to_str().unwrap()))]);
+    roster.rows[0].email = Some("work@example.test".into());
+    let logins = Logins {
+        labels: BTreeMap::from([(
+            "work".into(),
+            Binding {
+                dir: Some(login.to_str().unwrap().into()),
+                ..Binding::default()
+            },
+        )]),
+    };
+    store.save_logins(&logins).unwrap();
+    assert_eq!(
+        store.select_account(&roster, "work", NOW),
+        Ok(PinSelection::Pinned)
+    );
+    let pinned = store.load(NOW).unwrap().0;
+    assert_eq!(pinned.active.as_deref(), Some("work"));
+    assert!(pinned.pinned);
+    assert!(pinned.pending_pin.is_none());
+
+    store
+        .transact(NOW, &mut None, |state| {
+            Ok(note_auth(state, "work", Auth::SignedOut, NOW))
+        })
+        .unwrap();
+    let PinSelection::Renew(request) = store.select_account(&roster, "work", NOW).unwrap() else {
+        panic!("a signed-out account needs sign-in");
+    };
+    let requested = store.load(NOW).unwrap().0;
+    assert_eq!(requested.pending_pin.as_ref(), Some(&request));
+    assert!(store.select_account(&roster, "gone", NOW).is_err());
+    assert_eq!(store.load(NOW).unwrap().0, requested);
+
+    let logins_bytes = std::fs::read(store.logins_file()).unwrap();
+    std::fs::remove_file(store.logins_file()).unwrap();
+    std::fs::create_dir(store.logins_file()).unwrap();
+    assert!(store.select_account(&roster, "work", NOW).is_err());
+    assert_eq!(store.load(NOW).unwrap().0, requested);
+    assert!(store.logins_file().is_dir());
+    std::fs::remove_dir(store.logins_file()).unwrap();
+    std::fs::write(store.logins_file(), &logins_bytes).unwrap();
+
+    let lock = store.dir.join("accounts.lock");
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    assert!(store.select_account(&roster, "work", NOW).is_err());
+    assert_eq!(store.load(NOW).unwrap().0, requested);
+    assert_eq!(std::fs::read(store.logins_file()).unwrap(), logins_bytes);
+    std::fs::remove_dir(&lock).unwrap();
+
+    std::fs::remove_file(login.join(".credentials.json")).unwrap();
+    let PinSelection::Renew(unenrolled) = store.select_account(&roster, "work", NOW).unwrap()
+    else {
+        panic!("an empty current login needs sign-in");
+    };
+    assert_ne!(unenrolled, request);
+    assert_eq!(store.load(NOW).unwrap().0.pending_pin, Some(unenrolled));
+}
+
+#[test]
 fn a_name_put_in_place_after_its_open_reads_absent() {
     let dir = tmp("absent-at-open");
     let name = dir.path().join("machine");

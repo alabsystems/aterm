@@ -5,7 +5,8 @@
 
 use std::fmt::Write as _;
 
-use super::ledger::{Ledger, html_json_str, html_text, stamp, summary_rows, zone};
+use super::journal::Noted;
+use super::ledger::{Ledger, MarkKind, html_json_str, html_text, stamp, summary_rows, zone};
 
 /// The page.
 pub fn render_html(l: &Ledger) -> String {
@@ -78,10 +79,10 @@ pub fn render_html(l: &Ledger) -> String {
          every row is in the table below either way.</p></noscript>\n\
          <ul class=\"legend\">\n",
     );
-    for (cls, what) in LEGEND {
+    for (kind, cls, what) in legend() {
         let _ = writeln!(
             out,
-            "<li><span class=\"swatch {cls}\"></span>{}</li>",
+            "<li data-kind=\"{kind}\"><span class=\"swatch {cls}\"></span>{}</li>",
             html_text(what)
         );
     }
@@ -107,7 +108,7 @@ pub fn render_html(l: &Ledger) -> String {
                 None => "-".to_string(),
                 Some(t) => format!(
                     "{}{}",
-                    if l.aligned { "" } else { "~" },
+                    if l.guessed { "~" } else { "" },
                     stamp(t, l.tz_offset_s, dated)
                 ),
             }),
@@ -146,12 +147,14 @@ fn data_json(l: &Ledger, items: &[super::ledger::Item]) -> String {
         let num = |v: Option<i64>| v.map_or("null".to_string(), |v| v.to_string());
         let _ = write!(
             out,
-            "{{\"t\":{},\"end\":{},\"long\":{},\"lane\":{},\"kind\":{},\"what\":{},\"dur\":{}}}",
+            "{{\"t\":{},\"end\":{},\"long\":{},\"lane\":{},\"kind\":{},\"cls\":{},\"what\":{},\
+             \"dur\":{}}}",
             num(i.t),
             num(i.end),
             num(i.long_end),
             html_json_str(i.lane.name()),
             html_json_str(i.mark.name()),
+            html_json_str(swatch(i.mark)),
             html_json_str(&i.full),
             html_json_str(&i.dur)
         );
@@ -160,17 +163,188 @@ fn data_json(l: &Ledger, items: &[super::ledger::Item]) -> String {
     out
 }
 
-const LEGEND: &[(&str, &str)] = &[
-    ("turn", "manager: a turn typed into the worker"),
-    ("reply", "worker: the turn verb, from typing to settled"),
-    ("working", "worker: on to the EVENT that ended the reply"),
-    ("event", "watcher: an EVENT, APPROVED or DISMISSED line"),
-    ("warn", "watcher: a RECONNECT line"),
-    ("bad", "watcher: a limit notice, a TIMEOUT or an EXIT"),
-    ("mail", "fabric: a message to or from the worker"),
-];
+/// The legend: one row per mark ([`MarkKind::ALL`]), and the reply's `working` bar after
+/// the reply's own: the row's word, its swatch and what it marks.
+pub(super) fn legend() -> Vec<(&'static str, &'static str, &'static str)> {
+    let mut rows = Vec::with_capacity(MarkKind::ALL.len() + 1);
+    for m in MarkKind::ALL {
+        rows.push((m.name(), swatch(m), marks(m)));
+        if m == MarkKind::Reply {
+            rows.push((
+                "working",
+                "working",
+                "worker: on to the EVENT that ended the reply",
+            ));
+        }
+    }
+    rows
+}
 
-const STYLE: &str = r#"<style>
+/// The swatch class a mark is drawn in (a `.swatch.<class>` rule in [`STYLE`]).
+pub(super) const fn swatch(m: MarkKind) -> &'static str {
+    match m {
+        MarkKind::Turn => "turn",
+        MarkKind::Reply => "reply",
+        MarkKind::MailIn | MarkKind::MailOut => "mail",
+        MarkKind::Limited | MarkKind::LimitHandled | MarkKind::Timeout | MarkKind::Exit => "bad",
+        MarkKind::Reconnect | MarkKind::Escalated | MarkKind::Needs | MarkKind::Unverified => {
+            "warn"
+        }
+        MarkKind::Unread => "unread",
+        MarkKind::Noted(w) => noted_swatch(w),
+        MarkKind::Idle
+        | MarkKind::Question
+        | MarkKind::Prompt
+        | MarkKind::Survey
+        | MarkKind::Context
+        | MarkKind::Busy
+        | MarkKind::Approved
+        | MarkKind::Dismissed
+        | MarkKind::Mail
+        | MarkKind::Extend
+        | MarkKind::Cleared
+        | MarkKind::Continued
+        | MarkKind::Typed
+        | MarkKind::Restarted
+        | MarkKind::Waiting
+        | MarkKind::Skipped
+        | MarkKind::Unproven
+        | MarkKind::Dialog
+        | MarkKind::Declined
+        | MarkKind::Chose
+        | MarkKind::Exception
+        | MarkKind::Probed
+        | MarkKind::Reset
+        | MarkKind::Hold
+        | MarkKind::Occupancy
+        | MarkKind::Probe => "event",
+    }
+}
+
+/// The swatch of a [`Noted`] word's mark: `bad` where the loop could not act or the session
+/// stopped answering, `warn` where it says something the person may want to look at.
+const fn noted_swatch(w: Noted) -> &'static str {
+    match w {
+        Noted::Halted
+        | Noted::Refused
+        | Noted::RestartRefused
+        | Noted::Stalled
+        | Noted::Stuck
+        | Noted::Frozen
+        | Noted::Signalled => "bad",
+        Noted::Warn
+        | Noted::StallWarned
+        | Noted::Memory
+        | Noted::Abandoned
+        | Noted::Claim
+        | Noted::Watching => "warn",
+        Noted::Done
+        | Noted::Left
+        | Noted::Parked
+        | Noted::Unparked
+        | Noted::Unhalted
+        | Noted::Held
+        | Noted::HoldEnded
+        | Noted::Adopted
+        | Noted::Kept
+        | Noted::Claimed
+        | Noted::NotEscalated
+        | Noted::Task
+        | Noted::Fact
+        | Noted::Launch
+        | Noted::Host
+        | Noted::Deferred
+        | Noted::Thawed
+        | Noted::Note
+        | Noted::Sleep => "event",
+    }
+}
+
+/// What a [`Noted`] word's legend row says it marks.
+const fn noted_marks(w: Noted) -> &'static str {
+    match w {
+        Noted::Done => "watcher: a DONE line, the task's end the loop read",
+        Noted::Left => "watcher: a LEFT line, a turn left to the person",
+        Noted::Parked => "watcher: a PARKED line, hands off while Autopilot is off",
+        Noted::Unparked => "watcher: an UNPARKED line, Autopilot back on",
+        Noted::Halted => "watcher: a HALTED line, the session on hold: the loop waits",
+        Noted::Unhalted => "watcher: an UNHALTED line, the hold lifted",
+        Noted::Refused => "watcher: a REFUSED line, a request refused: the loop backs off",
+        Noted::Held => "watcher: a HELD line, hands off while a person or driver types",
+        Noted::HoldEnded => "watcher: a HOLD-ENDED line, a hold ended before the vendor's deny",
+        Noted::Adopted => "watcher: an ADOPTED line, a badge a previous loop left",
+        Noted::Kept => "watcher: a KEPT line, a badge kept for the next loop",
+        Noted::Watching => "watcher: a WATCHING line, another supervisor answers",
+        Noted::Claim => "watcher: a CLAIM line, no claim: the loop acts without one",
+        Noted::Claimed => "watcher: a CLAIMED line, the session's claim taken",
+        Noted::NotEscalated => "watcher: a NOT ESCALATED line, a notice already stands",
+        Noted::Warn => "watcher: a WARN line, a warning the loop says aloud",
+        Noted::Task => "watcher: a TASK line, the session's task mark",
+        Noted::Fact => "watcher: a FACT line, a fact for the agent's next prompt",
+        Noted::Launch => "watcher: a LAUNCH line, a box the person's own Enter launched",
+        Noted::Host => "watcher: a HOST line, a step of the window's harness",
+        Noted::Deferred => "watcher: a DEFERRED line, a restart put off",
+        Noted::Memory => "watcher: a MEMORY line, the agent over its memory measure",
+        Noted::Stalled => "watcher: a STALLED line, a stalled call told to the window",
+        Noted::Stuck => "watcher: a STUCK line, a screen no reader names",
+        Noted::Frozen => "watcher: a FROZEN line, the worker not reading its input",
+        Noted::Thawed => "watcher: a THAWED line, the worker reading again",
+        Noted::StallWarned => "watcher: a STALL-WARNED line, a stall the loop warned of",
+        Noted::Signalled => "watcher: a SIGNALLED line, a signal sent to a stalled worker",
+        Noted::RestartRefused => "watcher: a RESTART-REFUSED line, a restart the host refused",
+        Noted::Note => "watcher: a NOTE line, a reading the loop notes",
+        Noted::Sleep => "watcher: a SLEEP line, a sleep the loop could not count",
+        Noted::Abandoned => "watcher: an ABANDONED line, a survey left under typed text",
+    }
+}
+
+/// What a mark's legend row says it marks.
+const fn marks(m: MarkKind) -> &'static str {
+    match m {
+        MarkKind::Noted(w) => noted_marks(w),
+        MarkKind::Turn => "manager: a turn typed into the worker",
+        MarkKind::Reply => "worker: the turn verb, from typing to settled",
+        MarkKind::Idle => "watcher: an EVENT idle, the worker stopped on words",
+        MarkKind::Question => "watcher: an EVENT question, the worker asked",
+        MarkKind::Prompt => "watcher: an EVENT prompt, an approval box",
+        MarkKind::Limited => "watcher: an EVENT limited, a usage or rate limit notice",
+        MarkKind::Survey => "watcher: an EVENT survey, a rating survey",
+        MarkKind::Context => "watcher: an EVENT context or compacted",
+        MarkKind::Busy => "watcher: an EVENT busy",
+        MarkKind::Approved => "watcher: an APPROVED line, a box the loop approved",
+        MarkKind::Dismissed => "watcher: a DISMISSED line",
+        MarkKind::Reconnect => "watcher: a RECONNECT or RECONNECTED line",
+        MarkKind::Timeout => "watcher: a TIMEOUT line",
+        MarkKind::Exit => "watcher: an EXIT line",
+        MarkKind::Mail => "watcher: a MAIL line",
+        MarkKind::Extend => "watcher: an EXTEND line",
+        MarkKind::Escalated => "watcher: an ESCALATED line, an ask put on the person's screen",
+        MarkKind::Cleared => "watcher: a CLEARED line, a badge or an exception ended",
+        MarkKind::Continued => "watcher: a CONTINUED line, a carry-on the loop typed",
+        MarkKind::Typed => "watcher: a TYPED line",
+        MarkKind::Restarted => "watcher: a RESTARTED line",
+        MarkKind::Waiting => "watcher: a WAITING line",
+        MarkKind::Skipped => "watcher: a SKIPPED line",
+        MarkKind::Unverified => "watcher: an UNVERIFIED line, a submit not seen",
+        MarkKind::LimitHandled => "watcher: a LIMITED line, a limit notice the loop handled",
+        MarkKind::Unproven => "watcher: an UNPROVEN line",
+        MarkKind::Dialog => "watcher: a DIALOG line",
+        MarkKind::Declined => "watcher: a DECLINED line",
+        MarkKind::Chose => "watcher: a CHOSE line, a question the loop answered",
+        MarkKind::Exception => "watcher: an EXCEPTION line",
+        MarkKind::Probed => "watcher: a PROBED line",
+        MarkKind::Reset => "watcher: a RESET line",
+        MarkKind::Needs => "watcher: a NEEDS line, the worker's NEEDS YOU on the person's screen",
+        MarkKind::Hold => "watcher: a HOLD line",
+        MarkKind::Occupancy => "watcher: an OCCUPANCY line",
+        MarkKind::Probe => "watcher: a PROBE line",
+        MarkKind::MailIn => "fabric: a message from the worker",
+        MarkKind::MailOut => "fabric: a message to the worker",
+        MarkKind::Unread => "watcher: a line this reader does not know",
+    }
+}
+
+pub(super) const STYLE: &str = r#"<style>
 .viz-root {
   color-scheme: light;
   --surface-1: #fcfcfb;
@@ -269,6 +443,7 @@ ul.legend li { display: flex; align-items: center; gap: 6px; }
 .swatch.warn { background: var(--warning); border-radius: 50%; }
 .swatch.bad { background: var(--critical); border-radius: 50%; }
 .swatch.mail { background: var(--fabric); transform: rotate(45deg); }
+.swatch.unread { background: var(--text-muted); border-radius: 50%; }
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { text-align: left; vertical-align: top; padding: 4px 10px 4px 0;
@@ -284,7 +459,7 @@ tr.lane-fabric td:nth-child(2) { color: var(--fabric); }
 </style>
 "#;
 
-const SCRIPT: &str = r#"(function () {
+pub(super) const SCRIPT: &str = r#"(function () {
   var el = document.getElementById("ledger-data");
   var data = JSON.parse(el.textContent);
   var plot = document.getElementById("plot");
@@ -320,12 +495,13 @@ const SCRIPT: &str = r#"(function () {
     });
     node.addEventListener("mouseleave", function () { tip.hidden = true; });
   }
-  function colour(kind) {
-    if (kind === "limited" || kind === "end") { return "var(--critical)"; }
-    if (kind === "reconnect") { return "var(--warning)"; }
-    if (kind === "turn") { return "var(--manager)"; }
-    if (kind === "mail-in" || kind === "mail-out") { return "var(--fabric)"; }
-    if (kind === "reply") { return "var(--worker)"; }
+  function colour(cls) {
+    if (cls === "bad") { return "var(--critical)"; }
+    if (cls === "warn") { return "var(--warning)"; }
+    if (cls === "turn") { return "var(--manager)"; }
+    if (cls === "mail") { return "var(--fabric)"; }
+    if (cls === "reply") { return "var(--worker)"; }
+    if (cls === "unread") { return "var(--text-muted)"; }
     return "var(--watcher)";
   }
 
@@ -392,7 +568,7 @@ const SCRIPT: &str = r#"(function () {
         node = make("polygon", { points: (x(it.t) - 6) + "," + (mid + 5) + " " +
                                          (x(it.t) + 6) + "," + (mid + 5) + " " +
                                          x(it.t) + "," + (mid - 6),
-                                 fill: colour(it.kind), stroke: "var(--surface-1)",
+                                 fill: colour(it.cls), stroke: "var(--surface-1)",
                                  "stroke-width": 2 });
       } else if (it.kind === "mail-in" || it.kind === "mail-out") {
         node = make("rect", { x: x(it.t) - 5, y: mid - 5, width: 10, height: 10,
@@ -400,7 +576,7 @@ const SCRIPT: &str = r#"(function () {
                               fill: it.kind === "mail-in" ? "var(--fabric)" : "var(--surface-1)",
                               stroke: "var(--fabric)", "stroke-width": 2 });
       } else {
-        node = make("circle", { cx: x(it.t), cy: mid, r: 5, fill: colour(it.kind),
+        node = make("circle", { cx: x(it.t), cy: mid, r: 5, fill: colour(it.cls),
                                 stroke: "var(--surface-1)", "stroke-width": 2 });
       }
       tell(node, text);

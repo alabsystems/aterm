@@ -624,6 +624,67 @@ fn a_failed_answer_is_ready_again() {
 }
 
 #[test]
+fn an_answer_begins_on_a_ready_wake_and_is_heard_on_an_answered_one() {
+    let (mut book, ord, episode) = ready();
+    assert!(!book.heard(ord, T0 + 2), "never answered");
+    assert!(!book.told(ord, episode, WakeDoor::Await, T0 + 2));
+    assert_eq!(state(&book, ord), WakeState::Ready);
+    assert_eq!(
+        book.claim(ord, episode, WakeDoor::Break, T0 + 2),
+        WakeClaim::Granted
+    );
+    assert!(!book.heard(ord, T0 + 3), "a door's claim is no answer");
+    assert!(!book.answer_begin(ord, T0 + 3), "a door holds it");
+    assert!(matches!(state(&book, ord), WakeState::Claimed { .. }));
+    assert!(book.release(ord, episode));
+
+    assert!(book.answer_begin(ord, T0 + 4));
+    assert!(!book.heard(ord, T0 + 4), "its reply not written yet");
+    book.answer_done(ord, true, true, T0 + 5);
+    let answered = WakeState::Answered { at_ms: T0 + 5 };
+    assert!(!book.answer_begin(ord, T0 + 6), "answered once");
+    assert_eq!(state(&book, ord), answered);
+    assert!(book.heard(ord, T0 + 7));
+    assert_eq!(
+        state(&book, ord),
+        WakeState::Told {
+            door: WakeDoor::Await,
+            at_ms: T0 + 7
+        }
+    );
+}
+
+/// A claim a successor reconciles ends as its outcome says, whichever door held it (a restored
+/// record's `Await` claim too, which no live claim makes).
+#[test]
+fn a_reconciled_claim_ends_as_its_outcome_says() {
+    for door in [WakeDoor::Break, WakeDoor::Point, WakeDoor::Await] {
+        let claimed = || {
+            let (mut book, ord, episode) = ready();
+            book.wakes[0].state = WakeState::Claimed {
+                door,
+                at_ms: T0 + 2,
+            };
+            (book, ord, episode)
+        };
+        let (mut book, ord, episode) = claimed();
+        let typed = [(episode, SeedOutcome::Typed)];
+        assert_eq!(book.reconcile(&typed, T0 + 9), [(ord, Reconciled::Told)]);
+        assert_eq!(
+            state(&book, ord),
+            WakeState::Told {
+                door,
+                at_ms: T0 + 9
+            },
+            "{door:?}"
+        );
+        let (mut book, ord, _) = claimed();
+        assert_eq!(book.reconcile(&[], T0 + 9), [(ord, Reconciled::Released)]);
+        assert_eq!(state(&book, ord), WakeState::Ready, "{door:?}");
+    }
+}
+
+#[test]
 fn reconcile_with_a_typed_row_is_told() {
     let claimed = || {
         let (mut book, ord, episode) = ready();

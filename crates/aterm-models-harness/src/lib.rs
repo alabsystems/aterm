@@ -31,6 +31,7 @@ mod models_relaunch_prompt;
 mod models_supervise;
 mod models_supervise_accounts;
 mod models_supervise_tape;
+mod models_wakes;
 
 pub use models_agent_verdict::claude_idle_at_composer_model;
 pub use models_disk::{disk_await_liveness, disk_await_model, disk_reclaim_pass_model};
@@ -76,3 +77,4 @@ pub use models_supervise_accounts::{
 pub use models_supervise_tape::{
     supervise_replay_cursor_model, supervise_tape_recovery_model, supervisor_raised_latch_model,
 };
+pub use models_wakes::{wake_book_liveness, wake_book_model, wake_room_liveness, wake_room_model};

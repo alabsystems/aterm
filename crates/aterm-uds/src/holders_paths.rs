@@ -230,7 +230,7 @@ fn executable(pid: u32) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn parent_of(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let stat = crate::process::read_proc_text(Path::new(&format!("/proc/{pid}/stat"))).ok()?;
     let rest = stat.get(stat.rfind(')')? + 1..)?;
     rest.split_whitespace().nth(1)?.parse().ok()
 }

@@ -831,6 +831,24 @@ impl DeclaredWake {
         false
     }
 
+    fn unclaimed(&mut self) {
+        self.state = match self.answered_ms {
+            Some(at_ms) => WakeState::Answered { at_ms },
+            None => WakeState::Ready,
+        };
+    }
+
+    fn heard_at(&mut self, now_ms: i64) -> bool {
+        if !matches!(self.state, WakeState::Answered { .. }) {
+            return false;
+        }
+        self.state = WakeState::Told {
+            door: WakeDoor::Await,
+            at_ms: now_ms,
+        };
+        true
+    }
+
     fn seen(&self) -> WakeSeen {
         WakeSeen {
             ord: self.ord,
@@ -947,6 +965,14 @@ impl WakeBook {
     /// THE DECLARATION `req`, by `by` for `agent`, at `now_ms` in a zone `local_offset_s` from UTC.
     /// # Errors
     /// [`DeclareRefusal`].
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "DeclareOwn",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn declare(
         &mut self,
         req: WakeReq,
@@ -1010,6 +1036,14 @@ impl WakeBook {
     }
 
     /// AN EDGE ON SOURCE ATOM `atom` (its index in the condition) of wake `ord` at `now_ms`.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Edge",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn on_source(&mut self, ord: u16, atom: usize, now_ms: i64) -> Option<Change> {
         use super::fault::{Fault, armed};
         if armed(Fault::LevelOnly) {
@@ -1028,6 +1062,30 @@ impl WakeBook {
     }
 
     /// THE LOOK AT `now_ms`, every level read again by `levels`.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Edge",
+            project = "conformance_wakes::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Expire",
+            project = "conformance_wakes::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Unless",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn on_look(&mut self, levels: &dyn Levels, now_ms: i64) -> Vec<(u16, Change)> {
         let mut changed = Vec::new();
         for wake in &mut self.wakes {
@@ -1092,6 +1150,14 @@ impl WakeBook {
     }
 
     /// THE `await wake` ANSWER BEGINS for ready wake `ord`: `Answering` while the reply is written.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Answer",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn answer_begin(&mut self, ord: u16, now_ms: i64) -> bool {
         match self.get_mut(ord) {
             Some(wake) if wake.state == WakeState::Ready => {
@@ -1103,6 +1169,22 @@ impl WakeBook {
     }
 
     /// THE ANSWER'S WRITE ENDED, `ok` or not.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "WriteOk",
+            project = "conformance_wakes::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "WriteFails",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn answer_done(&mut self, ord: u16, ok: bool, hosted: bool, now_ms: i64) {
         use super::fault::{Fault, armed};
         let Some(wake) = self.get_mut(ord) else {
@@ -1127,21 +1209,28 @@ impl WakeBook {
     }
 
     /// THE ANSWER TO `ord` WAS HEARD (the loop saw a turn run after it): told by the answer.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Heard",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn heard(&mut self, ord: u16, now_ms: i64) -> bool {
-        match self.get_mut(ord) {
-            Some(wake) if matches!(wake.state, WakeState::Answered { .. }) => {
-                wake.state = WakeState::Told {
-                    door: WakeDoor::Await,
-                    at_ms: now_ms,
-                };
-                true
-            }
-            _ => false,
-        }
+        self.get_mut(ord).is_some_and(|wake| wake.heard_at(now_ms))
     }
 
     /// A LOOP'S DOOR CLAIMS wake `ord` of `episode` for its one write at `now_ms`.
     /// A time-only wake is `Gone` to a loop's door: only its await may answer it.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Claim",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn claim(&mut self, ord: u16, episode: u64, door: WakeDoor, now_ms: i64) -> WakeClaim {
         use super::fault::{Fault, armed};
         let Some(wake) = self.get_mut(ord).filter(|w| w.episode() == episode) else {
@@ -1180,13 +1269,18 @@ impl WakeBook {
     }
 
     /// THE LOOP RELEASES its claim on `ord` of `episode`, its line not typed: ready again.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Release",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn release(&mut self, ord: u16, episode: u64) -> bool {
         match self.get_mut(ord).filter(|w| w.episode() == episode) {
             Some(wake) if matches!(wake.state, WakeState::Claimed { .. }) => {
-                wake.state = match wake.answered_ms {
-                    Some(at_ms) => WakeState::Answered { at_ms },
-                    None => WakeState::Ready,
-                };
+                wake.unclaimed();
                 true
             }
             _ => false,
@@ -1194,26 +1288,40 @@ impl WakeBook {
     }
 
     /// `ord` of `episode` WAS TOLD through `door` at `now_ms`.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Write",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn told(&mut self, ord: u16, episode: u64, door: WakeDoor, now_ms: i64) -> bool {
-        if self.get(ord).is_none_or(|w| w.episode() != episode) {
+        let Some(wake) = self.get_mut(ord).filter(|w| w.episode() == episode) else {
+            return false;
+        };
+        if door == WakeDoor::Await {
+            return wake.heard_at(now_ms);
+        }
+        if !matches!(wake.state, WakeState::Claimed { door: d, .. } if d == door) {
             return false;
         }
-        if door == WakeDoor::Await {
-            return self.heard(ord, now_ms);
-        }
-        match self.get_mut(ord) {
-            Some(wake) if matches!(wake.state, WakeState::Claimed { door: d, .. } if d == door) => {
-                wake.state = WakeState::Told {
-                    door,
-                    at_ms: now_ms,
-                };
-                true
-            }
-            _ => false,
-        }
+        wake.state = WakeState::Told {
+            door,
+            at_ms: now_ms,
+        };
+        true
     }
 
     /// THE AGENT REMOVES `ord` (`wake rm #<n>`): gone from the book.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Rm",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn rm(&mut self, ord: u16) -> bool {
         let before = self.wakes.len();
         self.wakes.retain(|w| w.ord != ord);
@@ -1221,6 +1329,14 @@ impl WakeBook {
     }
 
     /// THE AGENT TOOK `ord` (`wake taken #<n>`): a wake still to be told, or told, is `Taken`.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Take",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn taken(&mut self, ord: u16) -> bool {
         match self.get_mut(ord) {
             Some(wake) if wake.state.live() || matches!(wake.state, WakeState::Told { .. }) => {
@@ -1244,34 +1360,45 @@ impl WakeBook {
     }
 
     /// A SUCCESSOR'S RECONCILE of the claims a loop's door held, from the ledger's fact rows.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Reconcile",
+            project = "conformance_wakes::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "CrashMidWrite",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn reconcile(
         &mut self,
         rows: &[(u64, SeedOutcome)],
         now_ms: i64,
     ) -> Vec<(u16, Reconciled)> {
-        let claims: Vec<(u16, u64, WakeDoor)> = self
-            .wakes
-            .iter()
-            .filter_map(|w| match w.state {
-                WakeState::Claimed { door, .. } => Some((w.ord, w.episode(), door)),
-                _ => None,
-            })
-            .collect();
-        claims
-            .into_iter()
-            .map(|(ord, episode, door)| {
-                let outcome = reconcile_claim(episode, rows);
-                match outcome {
-                    Reconciled::Told => {
-                        self.told(ord, episode, door, now_ms);
-                    }
-                    Reconciled::Released => {
-                        self.release(ord, episode);
-                    }
+        let mut outcomes = Vec::new();
+        for wake in &mut self.wakes {
+            let WakeState::Claimed { door, .. } = wake.state else {
+                continue;
+            };
+            let outcome = reconcile_claim(wake.episode(), rows);
+            match outcome {
+                Reconciled::Told => {
+                    wake.state = WakeState::Told {
+                        door,
+                        at_ms: now_ms,
+                    };
                 }
-                (ord, outcome)
-            })
-            .collect()
+                Reconciled::Released => wake.unclaimed(),
+            }
+            outcomes.push((wake.ord, outcome));
+        }
+        outcomes
     }
 
     /// THE BOOK AS A SUCCESSOR WINDOW READS IT BACK from a session record.
@@ -1428,6 +1555,22 @@ impl ParkBook {
     /// # Errors
     /// [`ParkRefusal::Busy`] while a park stands; [`ParkRefusal::NonePending`] for a book with no
     /// wake open.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "Park",
+            project = "conformance_wakes::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeBook",
+            action = "RefuseSecond",
+            project = "conformance_wakes::project"
+        )
+    )]
     pub fn park(&mut self, conn: u64, book: &WakeBook, now_ms: i64) -> Result<(), ParkRefusal> {
         use super::fault::{Fault, armed};
         if !self.parks.is_empty() && !armed(Fault::ParkSecond) {

@@ -216,7 +216,9 @@ pub(crate) fn message_row(
 }
 
 /// Every `messages` row the query selects, ascending by id, in [`message_row`]'s grammar.
-/// Open digest rows also carry `rev=<digest_revision>` for conditional settlement.
+/// Open digest rows also carry `rev=<confirmation>` for conditional settlement:
+/// an opaque entry-local observation, changed by every accepted positive report,
+/// even an identical repeat. It is independent of the digest's paint revision.
 #[must_use]
 pub fn message_rows(
     center: &MessageCenter,
@@ -239,7 +241,9 @@ pub fn message_rows(
                 now_words.actions = e.actions;
                 now_words.repeats = e.repeats;
                 let mut row = message_row(&now_words, None, None, now_unix_ms, enc);
-                let _ = write!(row, " rev={}", center.digest_revision());
+                if let Some(confirmation) = center.digest_confirmation(rec.id) {
+                    let _ = write!(row, " rev={confirmation}");
+                }
                 return row;
             }
             let glass = live.and_then(|_| center.glass_position(rec.id));
@@ -1018,7 +1022,7 @@ pub enum NoticeRequest {
         key: String,
         /// The observed open entry.
         id: MessageId,
-        /// The digest revision from its `messages` row.
+        /// The opaque confirmation from its `messages` row's `rev` field.
         revision: u64,
     },
     /// The owner is needed now: a standing ask.
@@ -1517,13 +1521,14 @@ fn apply_settle(
     revision: u64,
     now: Instant,
 ) -> Applied {
-    if center.digest_revision() != revision
+    if revision == u64::MAX
+        || center.digest_confirmation(id) != Some(revision)
         || center.digest_entry(id).is_none_or(|entry| entry.key != key)
     {
         return Applied::quiet("OK settled=- how=gone".to_string());
     }
     // The check and resolution share this exclusive center borrow. A dismissal,
-    // replacement or restatement cannot intervene, and no filing is forgotten.
+    // replacement, repeat or restatement cannot intervene, and no filing is forgotten.
     let ended = center.end_digest_key(key, Retired::Resolved(Outcome::Ok), None, now);
     Applied {
         reply: ended.map_or_else(

@@ -363,7 +363,7 @@ impl Verb {
             ],
             Verb::ResourceRun => &[
                 "Run a command with its CPU and memory charged to",
-                "a tab (--session @self --job LABEL [--ai LABEL]",
+                "a tab (--session @self --job LABEL [--ai WORD]",
                 "-- PROGRAM [ARGS...]).",
             ],
             Verb::Pkg => &["Install, update and verify the toolchain."],

@@ -10,45 +10,71 @@ use std::process::ExitCode;
 pub const USAGE: &str = "\
 aterm secrets: one credentials file for every machine (aterm help secrets).
 
-  aterm secrets [status]                 where this machine's vault is, what it holds, and
-                                         (an admin) whether the approver runs
-  aterm secrets join [<url>|<path>]      join a vault (Enter-equivalent: the ALab default)
-        [--name <host>] [--password-stdin] [--no-agent] [--no-wait]
+  aterm secrets [status]                 this machine's vault, join code, membership,
+                                         secrets, subscriber and server, and on an admin
+                                         whether the approver runs
+  aterm secrets join [<url>|<path>] [--name <host>] [--password-stdin]
+        [--no-agent] [--no-wait]         join a vault (neither: the ALab vault), waiting up
+                                         to 10 min for approval unless --no-wait, and
+                                         install the subscriber unless --no-agent
   aterm secrets sync                     fetch and apply the latest version now
-  aterm secrets watch                    the subscriber: apply every new version (launchd runs it)
+  aterm secrets watch                    the subscriber (agent on installs it): apply each
+                                         new version; on an admin of a <url> vault, also
+                                         the approver, which lets in a machine that types
+                                         the join password (any that asks, when open)
   aterm secrets ls                       the names this machine holds
   aterm secrets get <name>               print one value to stdout
 admin (a machine in [admins]):
   aterm secrets create <url>|<path> [--import <dir>] [--name <host>]
-        [--no-agent]                     (for a <url>, installs the subscriber too: its
-                                         approver lets in a machine that types the join
-                                         password)
-  aterm secrets edit                     the vault text in $EDITOR; saving publishes it
+        [--no-agent]                     a new vault with a join password, this machine its
+                                         first admin (--import: each file in <dir> goes into
+                                         [everyone]); for a <url>, also install the
+                                         subscriber where it does not run, unless --no-agent
+  aterm secrets edit                     the vault text in $VISUAL or $EDITOR (else vi);
+                                         saving publishes it
   aterm secrets set <name> [--for <host|code>...] [--file <path>]
         [--if-absent [--with <name> | --no-with]] [--fleet-reads-anchors]
-                                         (the value from stdin or the file; --with: filled
-                                         only where that if-absent entry is not the machine's own;
-                                         set again, an entry keeps its anchor unless --no-with)
+                                         the value from stdin or the file; --if-absent: only
+                                         where the machine has no file of its own; --with:
+                                         and only where that if-absent entry is not the
+                                         machine's own (set again, an entry keeps its anchor
+                                         unless --no-with); the vault's first anchored entry
+                                         needs --fleet-reads-anchors
   aterm secrets unset <name> [--for <host|code>...]
   aterm secrets password [show|set|new|open|off] [--no-agent]
-                                                   the join password a joining machine
-                                         types, or open: every machine that asks is let in
-                                         (for a <url>, by this Mac's subscriber, which set,
-                                         new and open install where it does not run; a
-                                         <path> has no join queue: approve each key)
-  aterm secrets requests                 machines asking to join
+                                         the join password: show (the default), set (typed
+                                         or piped), new (generated), open (none: every
+                                         machine that asks is let in), off (close the vault
+                                         or drop the password: machines wait for approval
+                                         by code); for a <url>, set, new and open also
+                                         install the subscriber where it does not run,
+                                         unless --no-agent
+  aterm secrets requests                 machines asking to join, with their codes
   aterm secrets approve <code>... | --all | <age1...> --name <host>
+                                         let in machines by the code each shows (--all:
+                                         every one, asked at a terminal), or a key by name
+                                         (how a machine joins a <path> vault)
   aterm secrets revoke <host|code> [--drop-sections]
+                                         let a machine go; a section that names only it
+                                         must be empty unless --drop-sections drops it too
   aterm secrets admins add|remove <host|code>   (remove also rotates the vault key)
   aterm secrets rotate-key               sign with a new vault key the current one endorses
 server and services:
   aterm secrets serve [--listen <addr:port>] [--advertise <name> | --no-advertise]
         [--pin <vault>=<key>] [--store <dir>] [--hold <1-60 secs>] [--no-keep-awake]
-                                         (on macOS, listening on every address at port 7484
-                                         as it does by default, it advertises the default
-                                         vault's name)
-  aterm secrets agent on|off|status [--program <path>]
-  aterm secrets server on|off|status [--program <path>] [serve flags]
+                                         serve vaults (defaults: 0.0.0.0:7484, the store
+                                         ~/.config/aterm/secrets/served, long-polls held
+                                         50 s). A vault the store lacks takes its first
+                                         version only from this machine, unless --pin names
+                                         the key that signs it (alab's is built in). On
+                                         macOS it keeps the Mac from idle sleep, and on
+                                         every address at port 7484 it advertises the
+                                         ALab vault's .local name
+  aterm secrets agent [on|off|status] [--program <path>]
+                                         the subscriber as a launchd or systemd user job
+                                         (--program: the aterm it runs, else this aterm)
+  aterm secrets server [on|off|status] [--program <path>] [serve flags]
+                                         serve as a launchd or systemd user job
 ";
 
 /// Run `aterm secrets`.
@@ -623,7 +649,7 @@ mod unix {
     use zeroize::Zeroize;
 
     /// What an open vault means, said where one is made or shown.
-    const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password and no code, and reads [everyone]'s entries, except by a key you let go; a machine that makes a new key asks as a new machine (aterm secrets password set closes it)";
+    const OPEN_VAULT: &str = "this vault is open: every machine that reaches its server and asks to join is let in within seconds, with no password or code, and reads [everyone]'s entries; a key you let go comes back only by its code, but a machine that makes a new key asks as a new machine (aterm secrets password set closes the vault)";
 
     /// What a vault at a path says where one served at a URL says whom its `[join]` lets in: a
     /// path has no join queue, so nothing lets a machine in by itself there.
@@ -638,7 +664,7 @@ mod unix {
     /// `code-only` line does not stop. Whether a server serves the file is not knowable here;
     /// one that does serves this version from its next request (`server::take_from_store`),
     /// and the open vault's queue then makes [`KEPT_OUT`]'s steps the ones to take.
-    const KEPT_OUT_AT_A_PATH: &str = "at a path no server serves, the key you let go, like any other, comes back only when an admin approves it (aterm secrets approve <age1…> --name <host>), so if the machine was lost or compromised, rotate what it could read. If aterm secrets serve serves this file, it serves this version from its next request, and the vault still lets in any new key that reaches it: if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
+    const KEPT_OUT_AT_A_PATH: &str = "at a path no server serves, the key you let go comes back only when an admin approves it (aterm secrets approve <age1…> --name <host>): if the machine was lost or compromised, rotate what it could read. If aterm secrets serve serves this file, it serves this version from its next request, and the open vault still lets in any new key that reaches it: if the machine was lost or compromised, close the vault now (aterm secrets password set), let go any machine in [machines] (aterm secrets edit) it may have joined as since, even under its old name, and only then rotate what it could read";
 
     /// What marks a request whose key a `code-only` line names, where requests are listed.
     const CODE_ONLY_MARK: &str =
@@ -1227,7 +1253,7 @@ mod unix {
         match &status.config {
             None => {
                 println!(
-                    "no vault configured: aterm secrets join [<url>|<path>] (Enter-equivalent: {})",
+                    "no vault configured: aterm secrets join [<url>|<path>] (neither: {})",
                     crate::ALAB_DEFAULT_URL
                 );
             }
@@ -1336,7 +1362,7 @@ mod unix {
                 Some(piped) => Some(piped.clone()),
                 None if !interactive => None,
                 None => ask_hidden(
-                    "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, another approves it by code): ",
+                    "Join password (an admin Mac shows it: aterm secrets password; Enter joins without one: an open vault lets this Mac in, any other waits for approval by code): ",
                 )
                 .filter(|typed| !typed.as_slice().trim_ascii().is_empty()),
             };
@@ -1622,7 +1648,7 @@ mod unix {
         let original = base.render();
         fsx::write_atomic(&file, original.as_slice(), 0o600)?;
         eprintln!(
-            "draft: {} (kept unless edit ends with it published or unchanged, so an interrupted edit leaves it)",
+            "draft: {} (kept unless the edit is published or leaves it unchanged)",
             file.display()
         );
         let mut reopened: Option<SecretBytes> = None;
@@ -1813,9 +1839,9 @@ mod unix {
         let done = client::admin_publish(paths, &admin, &doc)?;
         let gaps = match (fill.if_absent, anchor) {
             (false, _) => String::new(),
-            (true, None) => " (written only where no such file exists)".to_string(),
+            (true, None) => " (written only where the machine has no file of its own)".to_string(),
             (true, Some(anchor)) => format!(
-                " (written only where no such file exists and {anchor} is not the machine's own)"
+                " (written only where the machine has no file of its own and {anchor} is not the machine's own)"
             ),
         };
         Ok(published(

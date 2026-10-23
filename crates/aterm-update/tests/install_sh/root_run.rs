@@ -5,7 +5,7 @@
 
 use std::os::unix::fs::MetadataExt as _;
 
-use crate::support::{Lib, Scratch, install_sh, q, s, system_path};
+use crate::support::{Lib, Scratch, install_sh, q, read, s, system_path};
 
 #[test]
 fn a_root_run_acts_on_a_home_only_as_its_account() {
@@ -769,17 +769,59 @@ fn a_source_build_names_what_it_cannot_change_before_it_starts() {
     let tmp = scratch.join("tmp");
     let home = scratch.join("home");
     let mut lib = Lib::new();
-    lib.step("ROOT=\"$TMPDIR/co\"; mkdir -p \"$ROOT/target/release\" \"$HOME/.cargo/registry\"");
+    lib.step(
+        "ROOT=\"$TMPDIR/co\"; mkdir -p \"$ROOT/target.noindex/release/deps\" \
+         \"$ROOT/target.noindex/debug/deps\" \"$HOME/.cargo/registry/index\" \"$HOME/.cargo/bin\" \
+         \"$HOME/.cargo/git/db\" && \
+         ln -s target.noindex \"$ROOT/target\" && : >\"$HOME/.cargo/.package-cache\" && \
+         : >\"$HOME/.cargo/.crates.toml\" && ln -s /usr/bin \"$HOME/linked-cargo\"",
+    );
+    let not_me = "id() { if [ \"$1\" = -u ]; then echo 424242424; else command id \"$@\"; fi; }";
     let user = lib.call("id -un", &[]);
-    let clean = lib.call("source_build_preflight", &[]);
-    let stale = lib.call(
-        "( id() { if [ \"$1\" = -u ]; then echo 424242424; else command id \"$@\"; fi; }; \
-         source_build_preflight ) 2>&1",
+    let clean = lib.call("source_build_preflight", &["CARGO_RESOLVE_REASON"]);
+    let stale = lib.call(format!("( {not_me}; source_build_preflight )"), &[]);
+    let reason = lib.call(
+        format!("( {not_me}; source_build_preflight; echo \"$CARGO_RESOLVE_REASON\" )"),
         &[],
     );
+    // What the walk reads: each folder the build writes in, never the rest; git/
+    // only when Cargo.lock names a git source, or there is no Cargo.lock.
+    let locks = [
+        ("no Cargo.lock", "rm -f \"$ROOT/Cargo.lock\"", true),
+        (
+            "registry sources alone",
+            "printf 'source = \"registry+https://example.invalid/index\"\\n' >\"$ROOT/Cargo.lock\"",
+            false,
+        ),
+        (
+            "a git source",
+            "printf 'source = \"registry+https://example.invalid/index\"\\nsource = \"git+https://example.invalid/x#0\"\\n' \
+             >\"$ROOT/Cargo.lock\"",
+            true,
+        ),
+    ];
+    let walked: Vec<usize> = locks
+        .iter()
+        .map(|(_, lock, _)| {
+            lib.call(
+                format!(
+                    "( {not_me}; {lock}; rm -f \"$TMPDIR/walked\"; find() {{ if [ \"$2\" = -maxdepth ]; then \
+                     echo \"top $1\"; else echo \"tree $1\"; fi >>\"$TMPDIR/walked\"; command find \"$@\"; }}; \
+                     source_build_preflight; LC_ALL=C sort \"$TMPDIR/walked\" )"
+                ),
+                &[],
+            )
+        })
+        .collect();
     let elsewhere = lib.call(
-        "( id() { if [ \"$1\" = -u ]; then echo 424242424; else command id \"$@\"; fi; }; \
-         ROOT=/nonexistent; CARGO_HOME=/usr/bin; source_build_preflight )",
+        format!("( {not_me}; ROOT=/nonexistent; CARGO_HOME=/usr/bin; source_build_preflight )"),
+        &[],
+    );
+    // A link to a folder whose parent is not this account's names nothing.
+    let linked_elsewhere = lib.call(
+        format!(
+            "( {not_me}; ROOT=/nonexistent; CARGO_HOME=\"$HOME/linked-cargo\"; source_build_preflight )"
+        ),
         &[],
     );
     let as_root = lib.call(
@@ -787,21 +829,178 @@ fn a_source_build_names_what_it_cannot_change_before_it_starts() {
         &[],
     );
     let recs = lib.run(&scratch);
-    for i in [clean, elsewhere, as_root] {
+    for i in [clean, elsewhere, linked_elsewhere, as_root] {
         assert_eq!(recs[i].rc, 0, "call {i}: {}", recs[i].err);
     }
+    assert_eq!(recs[clean].var("CARGO_RESOLVE_REASON"), "");
     let (target, cargo) = (
-        s(&tmp.join("co/target")).to_string(),
+        s(&tmp.join("co/target.noindex")).to_string(),
         s(&home.join(".cargo")).to_string(),
     );
-    assert_eq!(recs[stale].rc, 1);
-    assert_eq!(
-        recs[stale].out.trim_end(),
-        format!(
-            "install.sh: the source build would fail: not yours, so cargo cannot change what is in \
-             {target} {cargo} (an install under sudo makes such folders root's) — give them back \
-             with: sudo chown -R {} {target} {cargo}",
+    assert_eq!(recs[stale].rc, 1, "{}", recs[stale].err);
+    let reason = &recs[reason].out;
+    assert!(
+        reason.contains(&format!(
+            "sudo chown -R {} {target} {cargo}",
             recs[user].out.trim()
-        )
+        )),
+        "{reason}"
     );
+    assert_eq!(
+        reason.matches(&target).count(),
+        2,
+        "the physical target dir, where the build writes and in the chown: {reason}"
+    );
+    assert_eq!(
+        reason.matches(s(&tmp.join("co/target"))).count(),
+        2,
+        "never the link: {reason}"
+    );
+    for ((label, _, git), i) in locks.iter().zip(walked) {
+        let mut want = vec![
+            format!("top {cargo}"),
+            format!("top {target}"),
+            format!("tree {cargo}/.package-cache"),
+        ];
+        if *git {
+            want.push(format!("tree {cargo}/git"));
+        }
+        want.push(format!("tree {cargo}/registry"));
+        want.push(format!("tree {target}/release"));
+        assert_eq!(recs[i].out.lines().collect::<Vec<_>>(), want, "{label}");
+    }
+}
+
+#[test]
+fn under_root_the_source_lane_runs_no_aterm_or_toolchain_another_account_can_change() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let mut lib = Lib::new();
+    lib.step(
+        "ROOT=\"$TMPDIR/co\"; mkdir -p \"$ROOT\" \"$TMPDIR/bin\" \"$TMPDIR/both\" \"$TMPDIR/cargo-only\" \
+         \"$TMPDIR/store/trust/1/bin\" \"$TMPDIR/cargo-home\" && \
+         printf '[toolchain]\\nchannel = \"trust\"\\n' >\"$ROOT/rust-toolchain.toml\" && \
+         for f in bin/aterm both/rustup both/cargo cargo-only/cargo store/trust/1/bin/targo; do \
+         printf '#!/bin/sh\\necho \"%s $*\" >>\"$TMPDIR/ran\"\\n' \"$f\" >\"$TMPDIR/$f\" && chmod 755 \"$TMPDIR/$f\"; \
+         done; export CARGO_HOME=\"$TMPDIR/cargo-home\"",
+    );
+    let find = |dirs: &str| {
+        format!(
+            "PATH=\"{dirs}:{}\" find_cargo_and_rustup \"$ROOT\"",
+            system_path()
+        )
+    };
+    let vars = ["CARGO_LANE", "CARGO_RESOLVE_REASON"];
+    let as_account = lib.call(find("$TMPDIR/bin:$TMPDIR/cargo-only"), &vars);
+    let ran_as_account = lib.call("cat \"$TMPDIR/ran\" && rm \"$TMPDIR/ran\"", &[]);
+    lib.step("id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }");
+    let rows = [
+        ("$TMPDIR/bin:$TMPDIR/both", "rustup", "both/rustup"),
+        (
+            "$TMPDIR/bin:$TMPDIR/cargo-only",
+            "rustup",
+            "cargo-only/cargo",
+        ),
+        (
+            "$TMPDIR/bin:$TMPDIR/store/trust/1/bin",
+            "store",
+            "store/trust/1/bin/targo",
+        ),
+    ];
+    let calls: Vec<usize> = rows
+        .iter()
+        .map(|(dirs, ..)| lib.call(find(dirs), &vars))
+        .collect();
+    let recs = lib.run(&scratch);
+    assert_eq!(
+        recs[ran_as_account].out,
+        "bin/aterm pkg which targo\ncargo-only/cargo --version",
+        "a run as the account asks the aterm and the cargo: {}",
+        recs[as_account].var("CARGO_RESOLVE_REASON")
+    );
+    for ((dirs, lane, refused), i) in rows.iter().zip(calls) {
+        let rec = &recs[i];
+        assert_eq!(rec.rc, 1, "{dirs}: {}", rec.err);
+        assert_eq!(rec.var("CARGO_LANE"), *lane, "{dirs}");
+        let reason = rec.var("CARGO_RESOLVE_REASON");
+        assert!(
+            reason.contains(&format!(" {} ", s(&tmp.join(refused)))),
+            "{dirs}: {reason}"
+        );
+    }
+    assert!(
+        !tmp.join("ran").exists(),
+        "root ran {}",
+        read(&tmp.join("ran"))
+    );
+}
+
+#[test]
+fn a_root_runs_bundle_gives_its_folders_group_write_alone() {
+    let scratch = Scratch::new();
+    let tmp = scratch.join("tmp");
+    let mut lib = Lib::new();
+    lib.step(
+        "chown() { :; }; mk() { mkdir -p \"$1/Contents/MacOS\" \"$1/Contents/Resources\" && \
+         printf '#!/bin/sh\\n' >\"$1/Contents/MacOS/aterm\" && chmod 775 \"$1/Contents/MacOS/aterm\" && \
+         : >\"$1/Contents/Info.plist\" && : >\"$1/Contents/Resources/r\" && \
+         chmod 664 \"$1/Contents/Resources/r\"; }; \
+         mkdir -p \"$TMPDIR/admin\" \"$TMPDIR/own\" && chmod 775 \"$TMPDIR/admin\" && chmod 755 \"$TMPDIR/own\" && \
+         mk \"$TMPDIR/admin/aterm.app.installing.x\" && mk \"$TMPDIR/own/aterm.app.installing.x\"",
+    );
+    let modes = |dest: &str| {
+        format!(
+            "own_bundle_as_root \"$TMPDIR/{dest}/aterm.app.installing.x\" \"$TMPDIR/{dest}\" && \
+             (cd \"$TMPDIR/{dest}/aterm.app.installing.x\" && find . -exec ls -nd {{}} + | \
+             awk '{{print $NF, substr($1, 1, 10)}}' | sort)"
+        )
+    };
+    let admin = lib.call(modes("admin"), &[]);
+    let own = lib.call(modes("own"), &[]);
+    // The bundle takes this account's group: a scratch dir under /private/tmp
+    // (root:wheel) would give it gid 0, which bundle_is_only lets write.
+    let only = lib.call(
+        "me=\"$(command id -u)\"; b=\"$TMPDIR/own/aterm.app.installing.x\"; \
+         chgrp -R \"$(command id -g)\" \"$b\" && bundle_is_only \"$me\" \"$b\" && \
+         chmod g+w \"$b/Contents/Info.plist\" && ! bundle_is_only \"$me\" \"$b\"",
+        &[],
+    );
+    let entries = lib.call(
+        "( ls_entry() { echo '-rwxrwxr-x 1 0 80 9 Apr 22 2024 /x'; }; ! root_entry /x ) && \
+         ( ls_entry() { echo '-rwxrwxr-x 1 0 0 9 Apr 22 2024 /x'; }; root_entry /x ) && \
+         ( ls_entry() { echo 'drwxrwxr-x 2 0 80 64 Apr 22 2024 /x'; }; root_entry /x ) && \
+         ( ls_entry() { echo '-rwxr-xr-x 1 0 80 9 Apr 22 2024 /x'; }; root_entry /x )",
+        &[],
+    );
+    let recs = lib.run(&scratch);
+    let tree = |dir: &str| {
+        [
+            format!(". {dir}"),
+            format!("./Contents {dir}"),
+            "./Contents/Info.plist -rw-r--r--".to_string(),
+            format!("./Contents/MacOS {dir}"),
+            "./Contents/MacOS/aterm -rwxr-xr-x".to_string(),
+            format!("./Contents/Resources {dir}"),
+            "./Contents/Resources/r -rw-r--r--".to_string(),
+        ]
+    };
+    assert_eq!(recs[admin].rc, 0, "{}", recs[admin].err);
+    assert_eq!(
+        recs[admin].out.lines().collect::<Vec<_>>(),
+        tree("drwxrwxr-x"),
+        "a folder its group can write: the bundle's folders, never its files"
+    );
+    assert_eq!(recs[own].rc, 0, "{}", recs[own].err);
+    assert_eq!(
+        recs[own].out.lines().collect::<Vec<_>>(),
+        tree("drwxr-xr-x")
+    );
+    let plist = tmp.join("own/aterm.app.installing.x/Contents/Info.plist");
+    let group = std::fs::metadata(&plist).expect("Info.plist").gid();
+    assert_eq!(
+        recs[only].rc,
+        if group == 0 { 1 } else { 0 },
+        "group write is admitted for root's group alone"
+    );
+    assert_eq!(recs[entries].rc, 0, "{}", recs[entries].err);
 }

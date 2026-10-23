@@ -1,0 +1,33 @@
+# claude-code 2.1.309 · MEASURED 2026-10-23, `aterm ctl text` of a private headless aterm (60x50, aterm 0.121.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a failed Bash call (exit 1) whose stdout is the words of 2.1.309's disk-full notice (its statfs form, dir /private/tmp/claude-502), printed by the command itself: the place and wrap Claude Code gives the notice it prefixes to a failed command's stdout, in a 60-column pane (`LAB_COLS=60 targo --unverified lab up`, `lab tool` with a heredoc command, `lab turn toolstart`, Yes on its box, then `lab capture`; the banner's scratch project path scrubbed to at.lab0)
+ ▐▛███▛█   Claude Code v2.1.309
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ toolstart
+
+⏺ Bash(cat <<'EOF'
+      Disk full: this computer's volume holding
+      /private/tmp/claude-502 (Claude Code's temporary
+      directory) has 3 MB free, so whatever this command
+      printe…)
+  ⎿  Error: Exit code 1
+     Disk full: this computer's volume holding
+     /private/tmp/claude-502 (Claude Code's temporary
+     directory) has 3 MB free, so whatever this command
+     printed was lost and its own writes may have failed
+     with "No space left on device". Free space on that
+     volume, or restart Claude Code with CLAUDE_CODE_TMPDIR
+     set to a directory on another one, then retry. If this
+     is the user's own computer, tell them before deleting
+     anything to make room.
+
+⏺ Tool call done.
+
+✻ Cogitated for 0s · done 4:29 AM
+
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents
+                                        ◐ medium · /effort

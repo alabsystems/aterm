@@ -2466,6 +2466,223 @@ fn a_screen_unmoved_since_the_write_is_waited_past_where_it_reads_as_another_tex
     assert_eq!(seq_waits(&t), 1, "escalated at once: {}", t.evidence());
 }
 
+/// AN ESCALATION ON AN UNMOVED SCREEN IS NEVER TYPED AGAIN ON IT, through the
+/// loop ([`Session::type_fenced`], [`Session::input_unread`]): at a weekly
+/// wall's reset the continuation is written over the wall's suggestion, and
+/// the worker draws nothing for 100 s. The echo's hang detector runs
+/// out and the text is escalated `typed, not submitted`. Waits then wake
+/// with nothing drawn ([`Mock::unmoved_wakes`]) on a frame the loop keys as
+/// a new point at the same seq ([`Mock::unmoved_rekeyed`]), and the loop
+/// decides that unmoved screen again (the wall's act still owed on it) and
+/// writes nothing: one write in all, each decision on that seq skipped. NEGATIVE CONTROL: once the screen moves (the text drawn),
+/// the next decision acts on it, an Enter fenced on that read.
+#[test]
+fn an_escalation_on_an_unmoved_screen_is_never_typed_again_through_the_loop() {
+    let mut shown = weekly_limited();
+    let caret = shown.iter().position(|row| row == "❯").expect("caret row");
+    shown[caret] = "❯ keep going, then merge when ready".to_string();
+    let said = shown
+        .iter()
+        .position(|row| row.starts_with("⏺ Running"))
+        .expect("said row");
+    let mut typed = shown.clone();
+    typed[caret] = "❯ keep going".to_string();
+    let mut m = Mock::new(vec![busy_screen(), shown, typed]);
+    m.cell_attrs = "dim";
+    m.cell_attrs_on.insert(2, "none");
+    m.cursor_row = Some(caret + 1);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
+    m.unmoved_after_send = Some(Duration::from_secs(100));
+    m.unmoved_wakes = 3;
+    m.unmoved_rekeyed = Some((said, "⏺ Running the A/B on the second build now."));
+    m.vanish_after = Some(400);
+    m.exit_when = Some(|m| {
+        m.requests
+            .iter()
+            .any(|r| r.starts_with("key ") && r.ends_with(" enter"))
+    });
+    let (dir, journal) = journal_file("unmoved-escalated");
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            human_grace_s: 0,
+            ..owners_policy()
+        },
+        journal: Some(journal.clone()),
+        ..resuming(&auto(30), None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_clock(AFTER_RESET, PDT);
+        s.set_turn_end_timing(quick_turn_end(&[Duration::from_millis(10)]));
+    });
+    let noted: Vec<String> = journal_records(&journal)
+        .0
+        .into_iter()
+        .map(|r| r.line)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    let t = Typed { m, lines };
+    let unmoved_seq = t
+        .sends()
+        .first()
+        .and_then(|s| s.split_whitespace().find_map(|w| w.strip_prefix("if-gen=")))
+        .map(str::to_string);
+    assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
+    assert!(
+        t.left_typed()
+            .is_some_and(|a| a.contains("a minute after it was written")),
+        "escalated as a hang: {}",
+        t.evidence()
+    );
+    let escalated = noted
+        .iter()
+        .find_map(|l| l.strip_prefix("ESCALATED seq="))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_string);
+    let held: Vec<&String> = noted
+        .iter()
+        .filter(|l| {
+            l.starts_with("SKIPPED ") && l.contains("the worker has not drawn the input it read")
+        })
+        .collect();
+    assert!(
+        !held.is_empty()
+            && held.iter().all(|l| escalated
+                .as_deref()
+                .is_some_and(|seq| l.starts_with(&format!("SKIPPED seq={seq} ")))),
+        "decided again on the unmoved screen (escalated at {escalated:?}, written at \
+         {unmoved_seq:?}), nothing written: {noted:#?}\n{}",
+        t.evidence()
+    );
+    assert_eq!(
+        t.enters().len(),
+        1,
+        "the screen moved: the next decision acts: {}",
+        t.evidence()
+    );
+    assert!(
+        t.enters()[0].contains("if=^❯\\x20keep\\x20going\\s*$"),
+        "its Enter fenced on the read that moved: {}",
+        t.evidence()
+    );
+}
+
+/// AN ECHO THAT HUNG ON A FRAME DRAWN AFTER THE WRITE IS NEVER TYPED AGAIN ON
+/// IT ([`Session::type_fenced`], [`Session::input_unread`]): at a weekly
+/// wall's reset the continuation is written over the wall's suggestion; the
+/// worker draws one frame after the write, the composer empty (the
+/// suggestion gone, the text not drawn), and then nothing for 100 s. Every
+/// read shows the text on its way, so the echo's hang detector escalates it
+/// `typed, not submitted` on that frame. Waits then wake on a frame the loop
+/// keys as a new point at that seq ([`Mock::unmoved_rekeyed`]), and the
+/// loop decides it again and writes nothing: one write in all, each
+/// decision on that seq skipped. NEGATIVE CONTROL: once the screen moves
+/// (the text drawn), the next decision acts on it, an Enter fenced on that
+/// read.
+#[test]
+fn an_echo_that_hung_on_a_frame_drawn_after_the_write_is_never_typed_again_on_it() {
+    let empty = weekly_limited();
+    let caret = empty.iter().position(|row| row == "❯").expect("caret row");
+    let said = empty
+        .iter()
+        .position(|row| row.starts_with("⏺ Running"))
+        .expect("said row");
+    let mut shown = empty.clone();
+    shown[caret] = "❯ keep going, then merge when ready".to_string();
+    let mut typed = empty.clone();
+    typed[caret] = "❯ keep going".to_string();
+    let mut m = Mock::new(vec![busy_screen(), shown, empty, typed]);
+    m.cell_attrs = "dim";
+    m.cell_attrs_on.insert(3, "none");
+    m.cursor_row = Some(caret + 1);
+    m.gen_fence = true;
+    m.sends_gen = true;
+    m.human_seq = Some(0);
+    m.help = FENCED_HELP.to_string();
+    m.unmoved_after_send = Some(Duration::from_secs(100));
+    m.unmoved_from_read = 1;
+    m.unmoved_wakes = 3;
+    m.unmoved_rekeyed = Some((said, "⏺ Running the A/B on the second build now."));
+    m.vanish_after = Some(400);
+    m.exit_when = Some(|m| {
+        m.requests
+            .iter()
+            .any(|r| r.starts_with("key ") && r.ends_with(" enter"))
+    });
+    let (dir, journal) = journal_file("hung-redrawn");
+    let opts = SuperviseOpts {
+        policy: SupervisorConfig {
+            human_grace_s: 0,
+            ..owners_policy()
+        },
+        journal: Some(journal.clone()),
+        ..resuming(&auto(30), None)
+    };
+    let (lines, _) = watch_lines_with(&mut m, &opts, |s| {
+        s.set_clock(AFTER_RESET, PDT);
+        s.set_turn_end_timing(quick_turn_end(&[Duration::from_millis(10)]));
+    });
+    let noted: Vec<String> = journal_records(&journal)
+        .0
+        .into_iter()
+        .map(|r| r.line)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    let t = Typed { m, lines };
+    let written = t
+        .sends()
+        .first()
+        .and_then(|s| {
+            s.split_whitespace()
+                .find_map(|w| w.strip_prefix("if-gen=1."))
+        })
+        .map(str::to_string);
+    let escalated = noted
+        .iter()
+        .find_map(|l| l.strip_prefix("ESCALATED seq="))
+        .and_then(|l| l.split_whitespace().next())
+        .map(str::to_string);
+    assert_eq!(t.sends().len(), 1, "written once: {}", t.evidence());
+    assert!(
+        t.left_typed()
+            .is_some_and(|a| a.contains("a minute after it was written")),
+        "escalated as a hang: {}",
+        t.evidence()
+    );
+    assert!(
+        escalated.is_some() && escalated != written,
+        "escalated on the frame drawn after the write (written at {written:?}, escalated at \
+         {escalated:?}): {noted:#?}"
+    );
+    let held: Vec<&String> = noted
+        .iter()
+        .filter(|l| {
+            l.starts_with("SKIPPED ") && l.contains("the worker has not drawn the input it read")
+        })
+        .collect();
+    assert!(
+        !held.is_empty()
+            && held.iter().all(|l| escalated
+                .as_deref()
+                .is_some_and(|seq| l.starts_with(&format!("SKIPPED seq={seq} ")))),
+        "decided again on that frame, nothing written: {noted:#?}\n{}",
+        t.evidence()
+    );
+    assert_eq!(
+        t.enters().len(),
+        1,
+        "the screen moved: the next decision acts: {}",
+        t.evidence()
+    );
+    assert!(
+        t.enters()[0].contains("if=^❯\\x20keep\\x20going\\s*$"),
+        "its Enter fenced on the read that moved: {}",
+        t.evidence()
+    );
+}
+
 fn muse_typed(text: &str) -> Vec<String> {
     use aterm_phase::muse::fixtures as u;
     let mut rows = aterm_phase::prompt::fixtures::screen(u::END_OF_TURN_1_4_10);
@@ -2888,6 +3105,110 @@ fn a_text_left_typed_on_a_screen_that_never_moved_is_never_typed_again_on_it() {
 }
 
 const HAND_HOLDER: &str = "aterm-harness@1";
+
+/// THE PROBE'S `/usage` IS JUDGED BY WHAT THE SCREEN SHOWS, its echo waited
+/// on as an act's is ([`Session::probe_type`], [`Session::await_echo`]): the
+/// worker draws nothing for 15 s after the probe's write, past the write's
+/// reaction wait, and the screen as the write found it says nothing of the
+/// echo; once `/usage` shows whole, its Enter goes, fenced on that read, and
+/// nothing is left typed. Drawn nothing for two minutes, the echo's hang
+/// detector runs out and `/usage` is left typed; the next act on that
+/// unmoved screen is held, and the probe's gate shuts on it
+/// (`pending-input`), so nothing is typed again over it. NEGATIVE CONTROL:
+/// the screen moved to another text after the write: left typed at once,
+/// nothing held.
+#[test]
+fn the_probes_usage_is_judged_by_what_the_screen_shows() {
+    use crate::supervise::policy::turn_end::ProbeGate;
+    let said = "Fixed the parser; the suite is green.";
+    let act = |tag: &str, unmoved: Option<Duration>, typed: &str| {
+        let (dir, ledger) = ledger_at(&format!("probe-echo-{tag}"));
+        let mut m = Mock::new(vec![
+            busy_screen(),
+            ended(said),
+            typed_in(said, typed),
+            busy_screen(),
+        ]);
+        m.screen_cols.insert(2, 2 + typed.chars().count());
+        m.gen_fence = true;
+        m.sends_gen = true;
+        m.human_seq = Some(0);
+        m.help = FENCED_HELP.to_string();
+        m.unmoved_after_send = unmoved;
+        let host = ProbeHost::probing(true);
+        let opts = SuperviseOpts {
+            idle_host: Some(Arc::clone(&host) as Arc<dyn IdleHost>),
+            ..hosted(60)
+        };
+        let mut s = virtual_session(&mut m, None);
+        s.set_approval_ledger(Some(ledger.clone()));
+        let point = s.await_turn(Duration::from_secs(60)).expect("the turn end");
+        let mut heard = Heard::default();
+        let typed = s.probe_type_seen(&point, &mut heard).expect("the probe");
+        let gate = s
+            .probe_gate_seen(&point, host.as_ref(), &opts)
+            .expect("the gates");
+        let held = s.input_unread(
+            point.screen.seq,
+            crate::supervise::policy::turn_end::RULE_USAGE_PROBE,
+            &mut heard,
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+        let sends = m.requests.iter().filter(|r| r.starts_with("send ")).count();
+        let enters: Vec<String> = m
+            .requests
+            .iter()
+            .filter(|r| r.starts_with("key ") && r.ends_with(" enter"))
+            .cloned()
+            .collect();
+        let evidence = format!("{typed:?} {gate:?}\n{:#?}\n{:#?}", heard.noted, m.requests);
+        (typed, gate, held, sends, enters, evidence)
+    };
+
+    let (typed, gate, held, sends, enters, evidence) =
+        act("slow", Some(Duration::from_secs(15)), "/usage");
+    assert_eq!(typed, None, "entered: {evidence}");
+    assert_eq!((sends, enters.len()), (1, 1), "{evidence}");
+    assert!(
+        enters[0].contains("if=^❯\\x20/usage\\s*$"),
+        "fenced on the read that showed it: {evidence}"
+    );
+    assert!(
+        !held && gate != Some(ProbeGate::PendingInput),
+        "nothing held back: {evidence}"
+    );
+
+    let (typed, gate, held, sends, enters, evidence) =
+        act("hung", Some(Duration::from_secs(120)), "/usage");
+    assert!(
+        typed
+            .as_ref()
+            .is_some_and(|(why, left)| *left && why.contains("a minute after it was written")),
+        "left typed as a hang: {evidence}"
+    );
+    assert_eq!((sends, enters.len()), (1, 0), "{evidence}");
+    assert_eq!(
+        gate,
+        Some(ProbeGate::PendingInput),
+        "the probe's gate shut on the unmoved screen: {evidence}"
+    );
+    assert!(held, "the next act on that screen is held: {evidence}");
+
+    // NEGATIVE CONTROL: the screen moved to another text.
+    let (typed, gate, held, _, enters, evidence) = act("other", None, "something else");
+    assert!(
+        typed.as_ref().is_some_and(
+            |(why, left)| *left && why.contains("the composer does not show it as written")
+        ),
+        "left typed at once: {evidence}"
+    );
+    assert!(enters.is_empty(), "{evidence}");
+    assert!(
+        !held && gate != Some(ProbeGate::PendingInput),
+        "nothing held: {evidence}"
+    );
+}
 
 #[test]
 fn the_windows_host_types_the_fenced_continuation_under_its_hand() {
@@ -19843,10 +20164,12 @@ impl Review for Heard {
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
         self.said.push(line.to_string());
         Ok(())
     }
     fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
         self.noted.push(line.to_string());
     }
     fn unattended(&self) -> bool {

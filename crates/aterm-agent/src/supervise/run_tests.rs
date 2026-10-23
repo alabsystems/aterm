@@ -238,6 +238,9 @@ struct Mock {
     person_after_send: usize,
     person_skipped: Vec<usize>,
     cell_attrs: &'static str,
+    /// The attributes a `cell` read answers while the script's screen `i` is the one last
+    /// served, in place of [`Self::cell_attrs`].
+    cell_attrs_on: BTreeMap<usize, &'static str>,
     cell_fg: &'static str,
     cell_unreadable: bool,
     cells: BTreeMap<(usize, usize), String>,
@@ -271,6 +274,19 @@ struct Mock {
     /// For this long after the first `send` on the run's clock, the screen does not move: every
     /// read serves the screen the write found at its seq, and an `await seq` sits until then.
     unmoved_after_send: Option<Duration>,
+    /// How many reads after the first `send` move on as scripted before the screen stands
+    /// ([`Self::unmoved_after_send`]): a frame drawn after the write that does not show it.
+    unmoved_from_read: usize,
+    /// How many `text` reads had been served when the first `send` arrived.
+    reads_at_send: Option<usize>,
+    /// While the screen stands unmoved ([`Self::unmoved_after_send`]) once the supervisor's
+    /// attention is set, this many `await seq` waits wake at once with nothing drawn: the loop
+    /// reads the screen again at the same seq.
+    unmoved_wakes: u32,
+    /// While the screen stands unmoved once the supervisor's attention is set, its row `.0`
+    /// reads as `.1` at the same content seq and generation: a frame the loop keys apart from
+    /// the point it handed over ([`point_key`]), the composer and every fence the same.
+    unmoved_rekeyed: Option<(usize, &'static str)>,
     /// Every `lease` request, on the run's clock: the request and when it arrived.
     lease_times: Vec<(String, Instant)>,
     /// A settle that latches says a seq one before the read after it (`OK idle <seq>`): the
@@ -788,6 +804,7 @@ impl Mock {
             person_after_send: 0,
             person_skipped: Vec::new(),
             cell_attrs: "dim",
+            cell_attrs_on: BTreeMap::new(),
             cell_fg: "d0d0d0",
             cell_unreadable: false,
             cells: BTreeMap::new(),
@@ -811,6 +828,10 @@ impl Mock {
             attention_at: None,
             idle_never_for: None,
             unmoved_after_send: None,
+            unmoved_wakes: 0,
+            unmoved_from_read: 0,
+            reads_at_send: None,
+            unmoved_rekeyed: None,
             lease_times: Vec::new(),
             idle_latch_behind: false,
             screen_gens: BTreeMap::new(),
@@ -1179,6 +1200,12 @@ impl Mock {
     }
     fn unmoved_for(&self) -> Option<Duration> {
         let (hold, sent) = self.unmoved_after_send.zip(self.first_send_at)?;
+        if self
+            .reads_at_send
+            .is_some_and(|at| self.read_times.len() < at + self.unmoved_from_read)
+        {
+            return None;
+        }
         hold.checked_sub(run_since(self.waits.as_deref(), sent))
             .filter(|left| !left.is_zero())
     }
@@ -1258,6 +1285,14 @@ impl Mock {
         } else {
             self.screens[i].clone()
         };
+        let mut shown = shown;
+        if let Some((row, text)) = self.unmoved_rekeyed
+            && self.attention_at.is_some()
+            && self.unmoved_for().is_some()
+            && let Some(at) = shown.get_mut(row)
+        {
+            *at = text.to_string();
+        }
         let rows: Vec<String> = shown[first..]
             .iter()
             .map(|r| format!("\"{}\"", r.replace('\\', "\\\\").replace('"', "\\\"")))
@@ -2243,6 +2278,13 @@ impl Mock {
                     .get(1)
                     .and_then(|n| n.parse::<u64>().ok())
                     .is_some_and(|n| n > self.seq);
+                if self.unmoved_wakes > 0
+                    && self.attention_at.is_some()
+                    && self.unmoved_for().is_some()
+                {
+                    self.unmoved_wakes -= 1;
+                    return Ok(ok("OK seq\n"));
+                }
                 if let Some(left) = self.unmoved_for() {
                     let asked = tail
                         .iter()
@@ -2496,6 +2538,7 @@ impl Mock {
                 self.keyed = true;
                 if self.first_send_at.is_none() {
                     self.first_send_at = Some(run_now(self.waits.as_deref()));
+                    self.reads_at_send = Some(self.read_times.len());
                 }
                 let body = tail
                     .iter()
@@ -2607,10 +2650,15 @@ impl Mock {
                 "{}\n",
                 self.measured_cell(tail).unwrap_or_default()
             ))),
-            "cell" => Ok(ok(&format!(
-                "OK %20 {} 111318 {}\n",
-                self.cell_fg, self.cell_attrs
-            ))),
+            "cell" => {
+                let shown = self.served.saturating_sub(1).min(self.screens.len() - 1);
+                let attrs = self
+                    .cell_attrs_on
+                    .get(&shown)
+                    .copied()
+                    .unwrap_or(self.cell_attrs);
+                Ok(ok(&format!("OK %20 {} 111318 {attrs}\n", self.cell_fg)))
+            }
             "meta" if tail.get(2) == Some(&"owner=needs") => {
                 self.needs_calls.push(tail.join(" "));
                 let r = self.needs_replies.pop_front().unwrap_or_else(|| ok("OK\n"));
@@ -3774,10 +3822,12 @@ impl Review for Noted {
     fn review(&mut self, _turn: &Turn) -> Result<bool, String> {
         Ok(false)
     }
-    fn say(&mut self, _line: &str) -> Result<(), String> {
+    fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
         Ok(())
     }
     fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
         self.0.push(line.to_string());
     }
     fn unattended(&self) -> bool {
@@ -3906,7 +3956,7 @@ impl Ctl for MarkFake {
 
 #[test]
 fn a_refused_act_mark_latches_the_rest_off() {
-    let first = "@s-1 mark - act word=approve rule=read-only.classify-v7";
+    let first = "@s-1 mark - act word=approve rule=read-only.classify-v8";
     for (err, latched) in [
         ("ERR unknown verb 'mark' (help lists them)", true),
         ("ERR usage: mark <node|-> <kind> [word=<w>] …", true),
@@ -3923,7 +3973,7 @@ fn a_refused_act_mark_latches_the_rest_off() {
         };
         let mut s = Session::new(&mut fake, Some("@s-1".to_string()));
         s.act_marks
-            .queue("act word=approve rule=read-only.classify-v7".to_string());
+            .queue("act word=approve rule=read-only.classify-v8".to_string());
         s.act_marks.queue("act word=escalate".to_string());
         s.send_act_marks();
         s.act_marks.queue("act word=deny rule=write.v1".to_string());
@@ -3975,7 +4025,7 @@ fn supervise_auto_approves_reads_guarded_and_hands_over_writes() {
             "@s-9 key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "@s-9 await seq 101 timeout 20000",
             "@s-9 text --json tail=40",
-            "@s-9 mark - act word=approve rule=read-only.classify-v7",
+            "@s-9 mark - act word=approve rule=read-only.classify-v8",
             "@s-9 await idle 500 timeout 1500",
             "@s-9 text --json tail=40",
             "@s-9 status",
@@ -4126,7 +4176,7 @@ fn the_same_box_is_never_pressed_twice_on_an_unchanged_screen() {
             "key if-human=7 if-gen=1.101 if=^\\x20{3}git\\x20log\\x20--oneline\\x20-5\\s*$ 1",
             "await seq 101 timeout 20000",
             "text --json tail=40",
-            "mark - act word=approve rule=read-only.classify-v7",
+            "mark - act word=approve rule=read-only.classify-v8",
         ],
         "{:?}",
         m.requests
@@ -5047,7 +5097,7 @@ fn nothing_happens_after_the_budget() {
     assert_eq!(m.requests.len(), 9, "nothing read after: {:?}", m.requests);
     assert_eq!(
         m.requests.last().map(String::as_str),
-        Some("mark - act word=approve rule=read-only.classify-v7")
+        Some("mark - act word=approve rule=read-only.classify-v8")
     );
 }
 

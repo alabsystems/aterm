@@ -5,11 +5,13 @@
 
 use crate::explain::WhySubject;
 
-/// The usage line every refusal of the grammar answers.
+/// The usage line a refused `sys` request answers; a stray word after `why` answers [`WHY_USAGE`].
 pub const USAGE: &str = "ERR usage: sys [overview|tab|aterm|global|jobs|cores|gpu|mem|disk|procs|why] \
                          [scope=pane|tab|window|aterm|global] [instances=all] [top=<1-64>] \
-                         [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]\n";
-/// The usage line a `why` with a subject it does not read answers.
+                         [depth=<1-8>] [fresh=<ms>] [since=<ep>.<seq>] [--json]; scope= on \
+                         jobs cores gpu mem disk procs, depth= on disk, instances=all on \
+                         overview aterm global cores gpu mem and procs scope=aterm\n";
+/// The usage line for a word after `why` that is not its one subject or an option.
 pub const WHY_USAGE: &str =
     "ERR usage: sys why [cpu|mem] [top=<1-64>] [fresh=<ms>] [since=<ep>.<seq>] [--json]\n";
 

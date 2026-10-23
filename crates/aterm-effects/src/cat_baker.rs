@@ -465,9 +465,11 @@ pub(crate) fn paint_dark_masked_disc(
             let dy = fy - cy;
             dy * dy
         });
-        if dy2.iter().all(|&d| d > rr) {
+        let dy2_min = dy2[0].min(dy2[1]).min(dy2[2]).min(dy2[3]);
+        if dy2_min > rr {
             continue;
         }
+        let dy2_max = dy2[0].max(dy2[3]);
         let row_base = (y as u32 * tile_w) as usize;
         for x in x0..x1 {
             let i = (row_base + x as usize) * 4;
@@ -478,6 +480,22 @@ pub(crate) fn paint_dark_masked_disc(
                     .get(i..i + 4)
                     .is_some_and(|p| p[3] == 255 && p[..3].iter().all(|&c| c < 96));
             if !dark_eye {
+                continue;
+            }
+            let dx0 = x as f32 + 0.125 - cx;
+            let dx3 = x as f32 + 0.875 - cx;
+            let dx2_min = if dx0 > 0.0 {
+                dx0 * dx0
+            } else if dx3 < 0.0 {
+                dx3 * dx3
+            } else {
+                0.015_625
+            };
+            if dx2_min + dy2_min > rr {
+                continue;
+            }
+            if (dx0 * dx0).max(dx3 * dx3) + dy2_max <= rr {
+                tile.over(x, y, col, alpha);
                 continue;
             }
             let dx2: [f32; 4] = std::array::from_fn(|sx| {
@@ -628,6 +646,43 @@ pub struct ResolvedFills {
     pub outline_underlay: Option<(f32, f32, f32)>,
 }
 
+#[derive(Clone, Copy)]
+struct CoatEyePair {
+    coat: (f32, f32, f32),
+    eye_ink: (f32, f32, f32),
+}
+
+type CoatEyeLut = [[[CoatEyePair; 2]; CONTEXT_ACCENTS.len()]; COAT_RAMP.len()];
+
+fn coat_eye_lut() -> &'static CoatEyeLut {
+    static LUT: std::sync::OnceLock<CoatEyeLut> = std::sync::OnceLock::new();
+    LUT.get_or_init(|| {
+        std::array::from_fn(|coat_idx| {
+            let coat_stop = COAT_RAMP[coat_idx];
+            std::array::from_fn(|accent_idx| {
+                let accent = CONTEXT_ACCENTS[accent_idx];
+                let base_coat = rgb(mix_rgb(coat_stop, accent, 0.12));
+                let dark_eye = rgb(mix_rgb(EYE_INK_DARK, accent, 0.06));
+                let pale_eye = rgb(mix_rgb(EYE_INK_PALE, accent, 0.06));
+                std::array::from_fn(|lift| {
+                    let coat = if lift != 0 {
+                        lift_coat_luminance(base_coat, COAT_MIN_LUM_DARK_BG)
+                    } else {
+                        base_coat
+                    };
+                    let eye_ink = if contrast_ratio(pale_eye, coat) > contrast_ratio(dark_eye, coat)
+                    {
+                        pale_eye
+                    } else {
+                        dark_eye
+                    };
+                    CoatEyePair { coat, eye_ink }
+                })
+            })
+        })
+    })
+}
+
 impl ResolvedFills {
     /// Resolve genome ramp indices into concrete colours (the cache key → fills step).
     #[inline]
@@ -644,9 +699,11 @@ impl ResolvedFills {
     #[inline]
     #[must_use]
     pub fn from_context(coat: u8, iris: u8, colors: CatColorKey) -> Self {
-        let accent = CONTEXT_ACCENTS[usize::from(colors.accent.min(12))];
-        let coat = COAT_RAMP[usize::from(coat).min(COAT_RAMP.len() - 1)];
-        let iris = EYE_RAMP[usize::from(iris).min(EYE_RAMP.len() - 1)];
+        let accent_idx = usize::from(colors.accent.min(12));
+        let coat_idx = usize::from(coat).min(COAT_RAMP.len() - 1);
+        let iris_idx = usize::from(iris).min(EYE_RAMP.len() - 1);
+        let accent = CONTEXT_ACCENTS[accent_idx];
+        let iris = EYE_RAMP[iris_idx];
         let outline_base = match colors.background {
             0 => OUTLINE_PALE,
             1 => 0x00FF_F2E8,
@@ -655,19 +712,8 @@ impl ResolvedFills {
             4 => EYE_INK_DARK,
             _ => OUTLINE_PALE,
         };
-        let coat = rgb(mix_rgb(coat, accent, 0.12));
-        let coat = if matches!(colors.background, 0 | 4) {
-            lift_coat_luminance(coat, COAT_MIN_LUM_DARK_BG)
-        } else {
-            coat
-        };
-        let dark_eye = rgb(mix_rgb(EYE_INK_DARK, accent, 0.06));
-        let pale_eye = rgb(mix_rgb(EYE_INK_PALE, accent, 0.06));
-        let eye_ink = if contrast_ratio(pale_eye, coat) > contrast_ratio(dark_eye, coat) {
-            pale_eye
-        } else {
-            dark_eye
-        };
+        let lift = usize::from(matches!(colors.background, 0 | 4));
+        let CoatEyePair { coat, eye_ink } = coat_eye_lut()[coat_idx][accent_idx][lift];
         Self {
             coat,
             iris: rgb(mix_rgb(iris, accent, 0.28)),
@@ -757,18 +803,21 @@ pub const fn resolve_layer(layer: &Layer, fills: &ResolvedFills) -> ((f32, f32, 
 fn resolve_glyph_layer(
     layer: &Layer,
     fills: &ResolvedFills,
-    coat_recolored: bool,
+    coat_lum: Option<f32>,
 ) -> ((f32, f32, f32), f32) {
     let resolved = resolve_layer(layer, fills);
-    if coat_recolored
+    if let Some(coat_lum) = coat_lum
         && layer.role == GlyphRole::Eye
         && layer.recolor == Recolor::Fixed
-        && contrast_ratio(resolved.0, fills.coat) < MIN_EYE_CONTRAST
     {
-        (fills.eye_ink, resolved.1)
-    } else {
-        resolved
+        let table = crate::color_math::relative_luminance_table();
+        let eye_lum = crate::color_math::relative_luminance_with(table, layer.fill);
+        let contrast = (eye_lum.max(coat_lum) + 0.05) / (eye_lum.min(coat_lum) + 0.05);
+        if contrast < MIN_EYE_CONTRAST {
+            return (fills.eye_ink, resolved.1);
+        }
     }
+    resolved
 }
 
 /// The mixed-background keyline under an outline layer.
@@ -1095,10 +1144,14 @@ fn paint_glyph(
     mask_scratch: &mut Option<Tile>,
 ) {
     let def = &GLYPHS[id as usize];
-    let coat_recolored = def
+    let coat_lum = def
         .layers
         .iter()
-        .any(|layer| layer.recolor == Recolor::Coat);
+        .any(|layer| layer.recolor == Recolor::Coat)
+        .then(|| {
+            let table = crate::color_math::relative_luminance_table();
+            crate::color_math::relative_luminance_with(table, packed_rgb(fills.coat))
+        });
     let eye_line = (!matches!(eyes, EyesFrame::Open))
         .then(|| {
             def.layers
@@ -1130,7 +1183,7 @@ fn paint_glyph(
             }
             _ => xform,
         };
-        let (col, alpha) = resolve_glyph_layer(layer, fills, coat_recolored);
+        let (col, alpha) = resolve_glyph_layer(layer, fills, coat_lum);
         if matches!(layer.role, GlyphRole::Outline | GlyphRole::Whisker) {
             paint_outline_halo(tile, layer, fills, alpha, lxform);
         }

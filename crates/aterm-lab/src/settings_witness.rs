@@ -16,7 +16,7 @@ pub const LOG: &str = "config-change.log";
 /// The hook's script in the run directory (the jail cannot write there).
 pub const SCRIPT: &str = "config-change.sh";
 
-/// How long an unanswered write stands before it is made again.
+/// The rewrite pace: an unanswered write is made again this long after it was made.
 pub const REWRITE_EVERY: Duration = Duration::from_secs(3);
 
 /// The hang detector: no re-read this long after the first write ends the wait.
@@ -146,7 +146,7 @@ pub(crate) fn until_reread(
     write()?;
     let base = seen();
     let mut writes = 1u32;
-    let mut next = wait.elapsed() + every;
+    let mut next = start + every;
     loop {
         let answered = seen() > base;
         let now = wait.elapsed();
@@ -166,7 +166,7 @@ pub(crate) fn until_reread(
         if now >= next {
             write()?;
             writes += 1;
-            next = wait.elapsed() + every;
+            next = now + every;
         } else {
             wait.pause()?;
         }
@@ -270,27 +270,34 @@ mod tests {
     #[test]
     fn a_line_from_before_the_write_ends_or_none_at_all_is_no_reread() {
         let made = u32::try_from(HANG.as_millis() / REWRITE_EVERY.as_millis()).unwrap();
-        for (what, bumps) in [("a line during the write", true), ("no line", false)] {
-            let lines = Cell::new(0usize);
-            let writes = Cell::new(0u32);
-            let wait = stepped();
-            let r = until_reread(
-                || {
-                    writes.set(writes.get() + 1);
-                    if bumps && writes.get() == 1 {
-                        lines.set(lines.get() + 1);
-                    }
-                    Ok(())
-                },
-                || lines.get(),
-                REWRITE_EVERY,
-                HANG,
-                &wait,
-            );
-            let e = r.expect_err(what);
-            assert!(e.msg.unwrap_or_default().contains("no re-read"), "{what}");
-            assert_eq!(wait.elapsed(), HANG, "{what}: the hang detector's moment");
-            assert_eq!(writes.get(), made, "{what}: one write every `every`");
+        let due: Vec<_> = (0..made).map(|k| REWRITE_EVERY * k).collect();
+        for (line, bumps) in [("a line during the write", true), ("no line", false)] {
+            for (took, slow) in [("no time", false), ("a step", true)] {
+                let what = format!("{line}, each write taking {took}");
+                let lines = Cell::new(0usize);
+                let wait = stepped();
+                let mut at = Vec::new();
+                let r = until_reread(
+                    || {
+                        at.push(wait.elapsed());
+                        if slow {
+                            wait.pause()?;
+                        }
+                        if bumps && at.len() == 1 {
+                            lines.set(lines.get() + 1);
+                        }
+                        Ok(())
+                    },
+                    || lines.get(),
+                    REWRITE_EVERY,
+                    HANG,
+                    &wait,
+                );
+                let e = r.expect_err(&what);
+                assert!(e.msg.unwrap_or_default().contains("no re-read"), "{what}");
+                assert_eq!(wait.elapsed(), HANG, "{what}: the hang detector's moment");
+                assert_eq!(at, due, "{what}: one write every `every`, from the first");
+            }
         }
     }
 

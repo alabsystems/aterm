@@ -108,6 +108,18 @@ pub const SOCKET_VFLAG_AT: usize = 288;
 pub const SOCKET_FADDR_AT: usize = 296;
 /// `… psi.soi_proto.pri_tcp.tcpsi_state`.
 pub const SOCKET_TCP_STATE_AT: usize = 344;
+/// `… psi.soi_options` (`short`): the socket's `SO_*` options.
+pub const SOCKET_OPTIONS_AT: usize = 188;
+/// `… psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path`: the path a unix-domain socket is bound at.
+pub const SOCKET_UN_PATH_AT: usize = 282;
+/// The length of `sun_path`.
+pub const SUN_PATH_LEN: usize = 104;
+/// `SOCKINFO_UN`: a unix-domain socket.
+pub const SOCKINFO_UN: i32 = 3;
+/// `SO_ACCEPTCONN`: the socket listens.
+pub const SO_ACCEPTCONN: u16 = 0x2;
+/// `PROX_FDTYPE_SOCKET`: a socket descriptor, as `PROC_PIDLISTFDS` types it.
+pub const PROX_FDTYPE_SOCKET: u32 = 2;
 
 /// `CTL_KERN`, `KERN_PROC`, `KERN_PROC_PID`: the sysctl name of one process's `kinfo_proc`.
 pub const KERN_PROC: i32 = 14;
@@ -276,6 +288,21 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
         "offsetof(struct socket_fdinfo, psi.soi_proto.pri_tcp.tcpsi_state)",
         SOCKET_TCP_STATE_AT as i64,
     ),
+    (
+        "offsetof(struct socket_fdinfo, psi.soi_options)",
+        SOCKET_OPTIONS_AT as i64,
+    ),
+    (
+        "offsetof(struct socket_fdinfo, psi.soi_proto.pri_un.unsi_addr.ua_sun.sun_path)",
+        SOCKET_UN_PATH_AT as i64,
+    ),
+    (
+        "sizeof(((struct sockaddr_un *)0)->sun_path)",
+        SUN_PATH_LEN as i64,
+    ),
+    ("SOCKINFO_UN", SOCKINFO_UN as i64),
+    ("SO_ACCEPTCONN", SO_ACCEPTCONN as i64),
+    ("PROX_FDTYPE_SOCKET", PROX_FDTYPE_SOCKET as i64),
     ("KERN_PROC", KERN_PROC as i64),
     ("KERN_PROC_PID", KERN_PROC_PID as i64),
     ("P_CONTROLT", P_CONTROLT as i64),
@@ -497,6 +524,26 @@ pub fn socket(b: &[u8]) -> Option<Option<TcpFd>> {
         local_port: port(SOCKET_LPORT_AT)?,
         queued_read: u64::from(u32_at(b, SOCKET_RCV_CC_AT)?),
     }))
+}
+
+/// Decode a `socket_fdinfo` as a unix-domain listener: `Some(Some(path))` for an `AF_UNIX` socket that
+/// listens (`SO_ACCEPTCONN`), with the path it is bound at up to its NUL (at most [`SUN_PATH_LEN`]
+/// bytes); `Some(None)` for any other socket, an unbound listener among them; `None` when `b` is
+/// shorter than the struct. A stream a listener accepted carries the listener's path too, so the
+/// path alone names no listener.
+#[must_use]
+pub fn unix_listener(b: &[u8]) -> Option<Option<&[u8]>> {
+    if b.len() < SOCKET_SIZE {
+        return None;
+    }
+    let listens = i32_at(b, SOCKET_KIND_AT)? == SOCKINFO_UN
+        && u16_at(b, SOCKET_OPTIONS_AT)? & SO_ACCEPTCONN != 0;
+    if !listens {
+        return Some(None);
+    }
+    let raw = b.get(SOCKET_UN_PATH_AT..SOCKET_UN_PATH_AT + SUN_PATH_LEN)?;
+    let end = raw.iter().position(|c| *c == 0).unwrap_or(raw.len());
+    Some(raw.get(..end).filter(|path| !path.is_empty()))
 }
 
 /// The fields of a `kinfo_proc` the probe reads.

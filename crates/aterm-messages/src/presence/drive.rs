@@ -251,7 +251,8 @@ pub fn next_need<V: Host>(
     Some(next)
 }
 
-/// Returns the most pressing session among `shown`.
+/// Returns the most pressing session among `shown`. A repeated session ranks
+/// by its first occurrence but uses its active-tab location when one exists.
 #[must_use]
 pub fn pressing<V: Host>(
     table: &Table<V>,
@@ -280,11 +281,17 @@ pub fn pressing<V: Host>(
                 s.tab,
             )
         })
-        .map(|(s, _)| Pressing {
-            session: s.session,
-            tab: s.tab,
-            front_tab: s.front_tab,
-            more,
+        .map(|(s, _)| {
+            let place = shown
+                .iter()
+                .find(|place| place.session == s.session && place.front_tab)
+                .unwrap_or(&s);
+            Pressing {
+                session: place.session,
+                tab: place.tab,
+                front_tab: place.front_tab,
+                more,
+            }
         })
 }
 

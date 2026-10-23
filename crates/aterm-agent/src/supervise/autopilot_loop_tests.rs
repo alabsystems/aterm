@@ -1165,10 +1165,12 @@ impl Review for Notes {
         Ok(true)
     }
     fn say(&mut self, line: &str) -> Result<(), String> {
+        crate::supervise::ledger::assert_marked(line);
         self.said.push(line.to_string());
         Ok(())
     }
     fn note(&mut self, line: &str) {
+        crate::supervise::ledger::assert_marked(line);
         self.noted.push(line.to_string());
     }
     fn unattended(&self) -> bool {

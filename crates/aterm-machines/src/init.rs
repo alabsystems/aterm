@@ -15,53 +15,63 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// The local setup's command-line help.
-pub const USAGE: &str = "aterm init [--plan | --check] [--json] [--develop | --no-develop]\n\
-                  [--only <item,...>]\n\
-    First restore what aterm lays for this account (the installed commands and\n\
-    their ~/.local/bin links, the shell integration, the reroute stubs, the\n\
-    rustup link, exec roots), as bare `aterm doctor` does, and install Apple's\n\
-    Command Line Tools when they are missing (base.clt: one sudo password prompt\n\
-    in this terminal); this part runs over SSH too. Then, at this Mac's console\n\
-    only,\n\
-    configure this macOS login: Caps Lock as Control, Natural scrolling off,\n\
-    no widgets, only aterm, System Settings and Safari pinned in the Dock,\n\
-    sign out of Messages and FaceTime, and keep rustup's offline docs (rust-docs,\n\
-    tens of thousands of pages Spotlight indexes) off this login: the minimal\n\
-    profile, and rust-docs removed from the toolchains rustup installed. On a\n\
-    develop machine (one `aterm init --develop` recorded) it then runs the develop\n\
-    items too. Applies and reads back each setting; safe to run again.\n\
-    Joins the secrets vault (aterm help secrets): the ALab vault when it answers\n\
-    on this network (asking only for its join password), else the one you name.\n\
-    Optional ~/.config/aterm/init.toml [github] config keeps its GitHub token in\n\
-    the login keychain, clones all accessible owned repositories into your home\n\
-    and fast-forwards each clean checkout that is behind; see aterm help init.\n\
-    Run as the logged-in user, without sudo. Account sign-out may need\n\
-    Accessibility and Automation permission for aterm in System Settings.\n\
-\n\
-    --plan    Report the changes without applying them.\n\
-    --check   Read only; exit nonzero if anything still needs attention.\n\
-    --json    Print the per-setting report as JSON.\n\
-    --develop Record this Mac as a develop machine ([develop] in init.toml)\n\
-              and converge base and develop only, no setting of this login: each\n\
-              recorded aterm checkout fetched and fast-forwarded when it is clean,\n\
-              on its default branch and has no commit of its own (else left as it\n\
-              is, saying why; never a reset, stash, push or hook), its\n\
-              vendor/astream submodule where that loses nothing, and, in a\n\
-              checkout it aligns, the test tools its tree pins (its own `targo\n\
-              --unverified --locked verify provision`). Run inside a checkout\n\
-              to record it; a linked worktree is not recorded.\n\
-    --no-develop  Remove the [develop] table; the tools stay as cache.\n\
-    --only    Run only the items named: a base id such as base.clt or\n\
-              base.shell.rc, a family such as shell or pkg, or base; workstation\n\
-              (this login's settings); a develop id such as develop.checkout or\n\
-              develop.checkout@~/aterm, a family (profile, checkout, tooling), or\n\
-              develop.\n\
-    --help    Show this help without inspecting or changing the Mac.\n\
-\n\
-    Exit: 0 done; 75 only what an install pass's store lock held back is left;\n\
-    77 only what waits for a permission you grant; 69 only what waits for the\n\
-    network; 1 anything else; 2 usage.\n";
+/// `aterm init` usage, printed by `--help` and after a usage error.
+pub const USAGE: &str = "\
+aterm init [--plan | --check] [--json] [--develop | --no-develop]
+           [--only <item,...>]
+    Set up this Mac for this account, applying and reading back each item;
+    safe to run again. Run as the logged-in user, without sudo.
+
+    First the base items, over SSH too: what bare `aterm doctor` restores (the
+    installed commands and their ~/.local/bin links, the shell integration, the
+    reroute stubs, the rustup link, exec roots), the AI CLI account roster
+    (when there is a fleet accounts source), and Apple's Command Line Tools
+    when missing (base.clt: one sudo password prompt in this terminal).
+
+    Then, at this Mac's console only, this login's settings: Caps Lock as
+    Control; natural scrolling off, trackpad scrolling on; desktop icons shown;
+    widgets hidden (Notification Center's only with Full Disk Access); a Dock of
+    only aterm, System Settings and Safari; Messages and FaceTime signed out
+    (which may need Accessibility and Automation permission for aterm); Rust
+    kept out of Spotlight (rustup's minimal profile, no rust-docs, build caches
+    in .noindex folders). It joins the secrets vault (aterm help secrets): the
+    ALab vault when it answers on this network (asking only its join password),
+    else the one you name. A [github] table in ~/.config/aterm/init.toml keeps
+    its token in the login keychain (unless git's own helpers, such as the
+    secrets vault's, already hand it back), clones the owner's repositories
+    into ~ and fast-forwards each clean checkout that is behind (aterm help
+    init).
+
+    Last, on a develop machine (one `aterm init --develop` recorded), the
+    develop items.
+
+    --plan    Report the changes without making them.
+    --check   Read only; exit nonzero if anything still needs attention.
+    --json    Print the per-item report as JSON.
+    --develop Record this Mac as a develop machine ([develop] in init.toml)
+              and run base and develop only. Each recorded aterm checkout is
+              fetched and fast-forwarded when it is clean, on its default
+              branch and has no commit of its own (else left as it is, saying
+              why; never a reset, stash, push or hook), with its vendor/astream
+              submodule where that loses nothing. In each checkout not left as
+              it is, init then runs the checkout's own `targo --unverified
+              --locked verify provision`. Run inside a checkout to record it (a
+              linked worktree is refused); elsewhere it records the [github]
+              owner's aterm checkouts in ~.
+    --no-develop  Remove the [develop] table and run base only; the tools stay
+              as cache.
+    --only    Run only the items named: a base id such as base.clt or
+              base.shell.rc, a family such as shell or pkg, or base;
+              workstation (every console-only step); a develop id such as
+              develop.checkout or develop.checkout@~/aterm, a family (profile,
+              checkout, tooling), or develop.
+    --help    Show this help without inspecting or changing the Mac.
+
+    Exit: 0 done; when only items that stood aside are left, 75 if one waits
+    on a lock (such as an install pass's store lock), else 77 if one waits on
+    a permission you grant, else 69 (the network, or an admin's approval); 1
+    anything else; 2 usage.
+";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum Action {
@@ -822,7 +832,7 @@ impl Guard {
         {
             Ok(())
         } else {
-            Err("workstation preferences changed after the recovery snapshot; run doctor --apply again".into())
+            Err("workstation preferences changed after the recovery snapshot; run `aterm doctor --apply` again".into())
         }
     }
 

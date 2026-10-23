@@ -158,6 +158,10 @@ const LINUX_UNAME: &str =
 
 const BARE_ATERM: &str = "#!/bin/sh\necho \"atpkg: ${3:-it} is not installed (fix: aterm pkg install ${3:-it})\" >&2\nexit 1\n";
 
+/// `id` for an account that owns none of the lab: `-u` names a uid no file has.
+const NOT_ME_ID: &str =
+    "#!/bin/sh\ncase \"${1:-}\" in -u) echo 424242424 ;; *) exec /usr/bin/id \"$@\" ;; esac\n";
+
 const REMEDIES: &[&str] = &[
     "aterm pkg install trust",
     "aterm pkg doctor",
@@ -253,6 +257,7 @@ impl Lab {
         );
         lay("atpkg-cli/aterm", FAKE_ATERM);
         lay("bare-aterm/aterm", BARE_ATERM);
+        lay("not-me/id", NOT_ME_ID);
         lay("atpkg-broken/store/trust/9193/bin/targo", STORE_TARGO);
         scratch.exe(
             "lab/atpkg-broken/bin/targo",
@@ -1252,6 +1257,140 @@ fn a_stock_pin_never_takes_the_store_lane() {
 }
 
 #[test]
+fn under_root_the_proof_runs_no_toolchain_file_another_account_can_change() {
+    let scratch = Scratch::new();
+    let lab = Lab::new(&scratch);
+    let root = s(&lab.checkout).to_string();
+    let theirs_cargo =
+        format!("#!/bin/sh\necho \"theirs $*\" >>\"${{SHIM_LOG:?}}\"\necho \"{PIN_VERSION}\"\n");
+    scratch.stand_in("lab/theirs/toolchain/bin/cargo", &theirs_cargo);
+    scratch.stand_in("lab/theirs/rustc", RUSTUP);
+    scratch.stand_in(
+        "lab/theirs/trustc",
+        "#!/bin/sh\necho \"theirs $*\" >>\"${SHIM_LOG:?}\"\n",
+    );
+    scratch.stand_in("lab/mixed-home/bin/rustup", RUSTUP);
+    symlink("rustup", &scratch.join("lab/mixed-home/bin/cargo"));
+    symlink(
+        "../../theirs/rustc",
+        &scratch.join("lab/mixed-home/bin/rustc"),
+    );
+    scratch.stand_in("lab/root-store/store/trust/7/bin/targo", STORE_TARGO);
+    symlink(
+        "../../../../../theirs/trustc",
+        &scratch.join("lab/root-store/store/trust/7/bin/trustc"),
+    );
+    // A pinned toolchain of root's whose own rustc, which rustup's rustc proxy
+    // runs, is theirs.
+    scratch.stand_in(
+        "lab/rootchain/bin/cargo",
+        &format!("#!/bin/sh\necho \"{PIN_VERSION}\"\n"),
+    );
+    scratch.stand_in(
+        "lab/theirs/pin-rustc",
+        "#!/bin/sh\necho \"theirs $*\" >>\"${SHIM_LOG:?}\"\n",
+    );
+    symlink(
+        "../../theirs/pin-rustc",
+        &scratch.join("lab/rootchain/bin/rustc"),
+    );
+    // Root, over a lab every file of which is root's but those under theirs/.
+    let mut lib = lab.lib();
+    lib.step(
+        "id() { if [ \"$1\" = -u ]; then echo 0; else command id \"$@\"; fi; }; \
+         ls_entry() { local last; for last; do :; done; case \"$last\" in */theirs/*) command ls \"$@\" ;; \
+         *) command ls \"$@\" | awk '{ $3 = 0; print }' ;; esac; }",
+    );
+    let own = format!(
+        "export FAKE_TOOLCHAIN_CARGO={}",
+        q(&lab.p("toolchain/bin/cargo"))
+    );
+    let pinned = format!(
+        "export FAKE_TOOLCHAIN_CARGO={}",
+        q(&lab.p("theirs/toolchain/bin/cargo"))
+    );
+    let pinned_rustc = format!(
+        "export FAKE_TOOLCHAIN_CARGO={}",
+        q(&lab.p("rootchain/bin/cargo"))
+    );
+    let shadow = lab.path(&["shadow"]);
+    let rows = [
+        (
+            "root's alone",
+            shadow.as_str(),
+            "cargo-home",
+            own.as_str(),
+            "",
+        ),
+        (
+            "the pin's cargo",
+            shadow.as_str(),
+            "cargo-home",
+            pinned.as_str(),
+            "theirs/toolchain/bin/cargo",
+        ),
+        (
+            "the rustc",
+            shadow.as_str(),
+            "mixed-home",
+            own.as_str(),
+            "mixed-home/bin/rustc",
+        ),
+        (
+            "the pin's own rustc",
+            shadow.as_str(),
+            "cargo-home",
+            pinned_rustc.as_str(),
+            "rootchain/bin/rustc",
+        ),
+    ];
+    let mut gates: Vec<Gate> = rows
+        .iter()
+        .map(|(_, path, home, setup, _)| gate(&mut lib, &lab, path, home, &root, setup, true))
+        .collect();
+    let store_path = lab.path(&["root-store/store/trust/7/bin"]);
+    gates.push(gate(
+        &mut lib,
+        &lab,
+        &store_path,
+        "nohome",
+        &root,
+        &own,
+        true,
+    ));
+    let recs = lib.run(&scratch);
+    let refused = rows
+        .iter()
+        .map(|(label, .., theirs)| (*label, *theirs))
+        .chain([("the store's trustc", "root-store/store/trust/7/bin/trustc")]);
+    for ((label, theirs), g) in refused.zip(&gates) {
+        let found = Found::from(&recs[g.find]);
+        assert!(found.ok, "{label}: {}", found.reason);
+        let proved = Proved::from(&recs[g.proof.expect("proved")]);
+        if theirs.is_empty() {
+            assert!(proved.ok, "{label}: {}", proved.reason);
+            continue;
+        }
+        assert!(!proved.ok, "{label}: root proved it");
+        assert!(
+            says(
+                &proved.reason,
+                &[
+                    "root does not run a toolchain another account can change, and ",
+                    lab.p(theirs).as_str(),
+                    " is one",
+                ],
+                &[] as &[&str]
+            ),
+            "{label}: {}",
+            proved.reason
+        );
+    }
+    let builds = lab.take_builds();
+    assert!(!builds.contains("theirs"), "root ran theirs: {builds}");
+}
+
+#[test]
 fn with_no_toolchain_in_reach_the_one_remedy_depends_on_an_aterm() {
     let scratch = Scratch::new();
     let lab = Lab::new(&scratch);
@@ -1486,6 +1625,10 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
     let lab = Lab::new(&scratch);
     let trust = checkout(&scratch, "trust-checkout", "trust");
     let stock = checkout(&scratch, "stock-checkout", "1.97.1");
+    let stale = checkout(&scratch, "stale-checkout", "trust");
+    std::fs::create_dir_all(stale.join("target/release")).expect("target/release");
+    let stale_target = s(&stale.join("target")).to_string();
+    let lab_cargo_home = lab.p("cargo-home");
     let ro = scratch.mkdir("ro");
     chmod(&ro, 0o555);
     let ro_store = format!("{}/store", s(&ro));
@@ -1601,6 +1744,24 @@ fn the_dry_run_plan_reports_the_source_build_as_the_run_would() {
             "cargo-home",
             vec![],
             pinned("cargo-home/bin/cargo"),
+        ),
+        row(
+            "a target dir and cargo home the build cannot write",
+            &stale,
+            &["not-me", "shadow"],
+            "cargo-home",
+            vec![],
+            Want::skip(
+                &[
+                    "building from source writes in",
+                    &stale_target,
+                    &lab_cargo_home,
+                    "sudo chown -R",
+                    &stale_target,
+                    &lab_cargo_home,
+                ],
+                &[],
+            ),
         ),
         row(
             "a keg rustup behind the shadow",

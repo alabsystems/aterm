@@ -258,10 +258,7 @@ impl Judged {
         let taken = board.taken_unix_ms;
         self.held
             .retain(|_, at| taken.saturating_sub(*at) <= whole_ms(HELD_KEEP));
-        let held = &self.held;
-        self.pace
-            .reserved
-            .retain(|r| held.get(&r.sid).is_none_or(|at| *at < r.since_ms));
+        self.pace.retire(&self.held);
         self.board = Some(board);
     }
 
@@ -528,6 +525,7 @@ impl Judged {
             slot,
             hold_since_ms,
             usable,
+            pool: Pool::Facts,
         };
         self.pace.ask(&ask, now_unix_ms)
     }
@@ -536,14 +534,50 @@ impl Judged {
 /// At most this many fact lines across the machine in any hour.
 pub(crate) const MACHINE_LINES_PER_HOUR: usize = 6;
 
+/// At most this many typed wake lines across the machine in any hour: a pool of their own, so a
+/// wake line never spends the facts pool and is never refused by it (`hold-room` keeps its
+/// lines).
+pub(crate) const WAKE_LINES_PER_HOUR: usize = 6;
+
 /// The machine pace's window, ms.
 const HOUR_MS: i64 = 60 * 60_000;
 
 /// A slot rule's line reserves one free build slot this long.
 pub(crate) const RESERVE_MS: i64 = 10 * 60_000;
 
+// A reservation lapses before its session's next line may go (every door's lines share the
+// session's pace), so a holder's re-ask granted against it is its drawn line asked again, never a
+// second line typed.
+const _: () = assert!(RESERVE_MS < rules::SESSION_PACE_MS);
+
 /// How long a hold refused for want of a slot stands first in line after its last ask.
 pub(crate) const ASK_KEEP_MS: i64 = aterm_agent::supervise::occupancy::reading::STALE_AFTER_MS;
+
+/// Which machine pool a line draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Pool {
+    /// A fact rule's line ([`MACHINE_LINES_PER_HOUR`]).
+    Facts,
+    /// A declared wake's typed line ([`WAKE_LINES_PER_HOUR`]).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the wake door's claim asks it; only the tests do yet"
+        )
+    )]
+    Wake,
+}
+
+impl Pool {
+    /// Its lines in any hour.
+    const fn per_hour(self) -> usize {
+        match self {
+            Pool::Facts => MACHINE_LINES_PER_HOUR,
+            Pool::Wake => WAKE_LINES_PER_HOUR,
+        }
+    }
+}
 
 /// One ask of the table.
 struct Ask<'a> {
@@ -554,6 +588,17 @@ struct Ask<'a> {
     hold_since_ms: i64,
     /// The build slots the board proves usable now.
     usable: u16,
+    /// The machine pool its line draws.
+    pool: Pool,
+}
+
+/// A slot reservation's answer ([`Pace::reserve`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reserve {
+    /// A slot is reserved for it: its own, re-asked (kept as it was taken), or one left free.
+    Granted,
+    /// No free slot is left for it: it waits, by its age.
+    Reserved,
 }
 
 /// A build slot reserved for a session's line.
@@ -562,6 +607,9 @@ struct Reservation {
     sid: String,
     /// When it was taken, unix ms.
     since_ms: i64,
+    /// The pool whose line its holder drew for it: `None` for an `await wake` answer's, which
+    /// drew none, so the holder's first line still draws one.
+    line: Option<Pool>,
 }
 
 /// A hold refused for want of a slot, waiting.
@@ -574,10 +622,12 @@ struct Waiting {
 }
 
 /// THE PACE AND RESERVATION TABLE.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Pace {
-    /// When each line of the last hour was granted, unix ms.
+    /// When each fact line of the last hour was granted, unix ms.
     lines: Vec<i64>,
+    /// When each typed wake line of the last hour was granted, unix ms.
+    wake_lines: Vec<i64>,
     /// The slots reserved, each for [`RESERVE_MS`] from its taking.
     reserved: Vec<Reservation>,
     /// The holds that asked for a slot and found none, by their age.
@@ -585,44 +635,385 @@ pub(crate) struct Pace {
 }
 
 impl Pace {
-    /// Answer `ask` at `now_ms` with the machine's pace and slot reservation taken together.
-    fn ask(&mut self, ask: &Ask<'_>, now_ms: i64) -> PaceGrant {
-        self.lines.retain(|at| now_ms.saturating_sub(*at) < HOUR_MS);
+    /// `pool`'s lines of the last hour at `now_ms`.
+    fn pool(&mut self, pool: Pool, now_ms: i64) -> &mut Vec<i64> {
+        let lines = match pool {
+            Pool::Facts => &mut self.lines,
+            Pool::Wake => &mut self.wake_lines,
+        };
+        lines.retain(|at| now_ms.saturating_sub(*at) < HOUR_MS);
+        lines
+    }
+
+    /// Forget the reservations past [`RESERVE_MS`] and the asks past [`ASK_KEEP_MS`] at `now_ms`.
+    fn age(&mut self, now_ms: i64) {
         self.reserved
             .retain(|r| now_ms.saturating_sub(r.since_ms) < RESERVE_MS);
         self.waiting
             .retain(|w| now_ms.saturating_sub(w.asked_ms) <= ASK_KEEP_MS);
-        if self.lines.len() >= MACHINE_LINES_PER_HOUR {
+    }
+
+    /// `sid`'s live reservation, against which its re-ask is granted, kept as it was taken.
+    fn holds(&mut self, sid: &str, now_ms: i64) -> Option<&mut Reservation> {
+        if fault::armed(fault::Fault::CountOwn) {
+            return None;
+        }
+        let own = self.reserved.iter_mut().find(|r| r.sid == sid)?;
+        if fault::armed(fault::Fault::RenewOnAsk) {
+            own.since_ms = now_ms;
+        }
+        Some(own)
+    }
+
+    /// Answer `ask` at `now_ms` with the machine's pace and slot reservation taken together. A
+    /// slot line's re-ask by a session holding the reservation its line drew from the same pool
+    /// (its write skipped, its loop asking again) is granted against that reservation: kept as it
+    /// was taken, and no second line drawn. Any other line draws its pool's hourly lines (an
+    /// `await wake` reservation's holder too, once), and a slot line takes its reservation
+    /// ([`Self::reserve`]).
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "ReserveA",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "ReserveB",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "ReserveC",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "RefuseA",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "RefuseB",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "RefuseC",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    fn ask(&mut self, ask: &Ask<'_>, now_ms: i64) -> PaceGrant {
+        self.age(now_ms);
+        if ask.slot
+            && self
+                .holds(ask.sid, now_ms)
+                .is_some_and(|own| own.line == Some(ask.pool))
+        {
+            return PaceGrant::Granted;
+        }
+        if self.pool(ask.pool, now_ms).len() >= ask.pool.per_hour() {
             return PaceGrant::Machine;
         }
-        if ask.slot {
-            let mine = (ask.hold_since_ms, ask.sid);
-            let others = self.reserved.iter().filter(|r| r.sid != ask.sid).count();
-            let older = self
-                .waiting
-                .iter()
-                .filter(|w| w.sid != ask.sid && (w.hold_since_ms, w.sid.as_str()) < mine)
-                .count();
-            if usize::from(ask.usable) <= others + older {
-                self.waiting.retain(|w| w.sid != ask.sid);
-                self.waiting.push(Waiting {
-                    sid: ask.sid.to_string(),
-                    hold_since_ms: ask.hold_since_ms,
-                    asked_ms: now_ms,
-                });
-                return PaceGrant::Reserved;
-            }
-            self.waiting.retain(|w| w.sid != ask.sid);
-            self.reserved.retain(|r| r.sid != ask.sid);
-            self.reserved.push(Reservation {
-                sid: ask.sid.to_string(),
-                since_ms: now_ms,
-            });
+        if ask.slot
+            && self.reserve(ask.sid, ask.hold_since_ms, ask.usable, now_ms) == Reserve::Reserved
+        {
+            return PaceGrant::Reserved;
         }
-        self.lines.push(now_ms);
+        self.pool(ask.pool, now_ms).push(now_ms);
+        if ask.slot
+            && let Some(own) = self.reserved.iter_mut().find(|r| r.sid == ask.sid)
+        {
+            own.line = Some(ask.pool);
+        }
         PaceGrant::Granted
     }
+
+    /// RESERVE A FREE BUILD SLOT for session `sid`, aged from `age_ms` (its open hold's start,
+    /// else its wake's ready since), with `usable` slots the board proves at `now_ms`: an `await
+    /// wake` answer whose need names slots takes one here, in every mode but off. Granted where
+    /// `sid`'s own live reservation stands (kept as it was taken), or where a slot is left once
+    /// the other sessions' reservations and the older holds waiting are counted; else it waits,
+    /// by its age. It never draws a line pool.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "ReserveA",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "ReserveB",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "ReserveC",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "RefuseA",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "RefuseB",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "RefuseC",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    pub(crate) fn reserve(&mut self, sid: &str, age_ms: i64, usable: u16, now_ms: i64) -> Reserve {
+        self.age(now_ms);
+        if self.holds(sid, now_ms).is_some() {
+            return Reserve::Granted;
+        }
+        let mine = (age_ms, sid);
+        let others = self
+            .reserved
+            .iter()
+            .filter(|r| r.sid != sid || fault::armed(fault::Fault::CountOwn))
+            .count();
+        let older = self
+            .waiting
+            .iter()
+            .filter(|w| w.sid != sid && (w.hold_since_ms, w.sid.as_str()) < mine)
+            .filter(|_| !fault::armed(fault::Fault::YoungestFirst))
+            .count();
+        self.waiting.retain(|w| w.sid != sid);
+        if usize::from(usable) <= others + older {
+            self.waiting.push(Waiting {
+                sid: sid.to_string(),
+                hold_since_ms: age_ms,
+                asked_ms: now_ms,
+            });
+            return Reserve::Reserved;
+        }
+        self.reserved.retain(|r| r.sid != sid);
+        self.reserved.push(Reservation {
+            sid: sid.to_string(),
+            since_ms: now_ms,
+            line: None,
+        });
+        Reserve::Granted
+    }
+
+    /// THE LAPSE of every reservation whose session's tab was seen holding a build slot since it
+    /// was taken (`held`: each session's last look so, unix ms): its build has the slot.
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "LapseA",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "LapseB",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    #[cfg_attr(
+        any(test, debug_assertions),
+        aterm_spec_anchor::refines(
+            machine = "WakeRoom",
+            action = "LapseC",
+            project = "occupancy_host::conformance::project"
+        )
+    )]
+    fn retire(&mut self, held: &BTreeMap<String, i64>) {
+        self.reserved
+            .retain(|r| held.get(&r.sid).is_none_or(|at| *at < r.since_ms));
+    }
 }
+
+/// THE NEGATIVE CONTROLS' FAULT POINTS in the pace ([`conformance`], the pace tests).
+#[cfg(test)]
+pub(crate) mod fault {
+    use std::cell::Cell;
+
+    /// A planted defect.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        /// A holder's re-ask renews its reservation from the ask.
+        RenewOnAsk,
+        /// A slot ask counts no older hold waiting.
+        YoungestFirst,
+        /// A holder's re-ask counts its own reservation against it.
+        CountOwn,
+    }
+
+    thread_local! {
+        static ARMED: Cell<Option<Fault>> = const { Cell::new(None) };
+    }
+
+    /// Run `f` with `fault` armed on this thread, disarmed after it even on unwind.
+    pub(crate) fn with<T>(fault: Fault, f: impl FnOnce() -> T) -> T {
+        struct Disarm;
+        impl Drop for Disarm {
+            fn drop(&mut self) {
+                ARMED.with(|a| a.set(None));
+            }
+        }
+        ARMED.with(|a| a.set(Some(fault)));
+        let _disarm = Disarm;
+        f()
+    }
+
+    /// Whether `fault` is armed on this thread.
+    pub(crate) fn armed(fault: Fault) -> bool {
+        ARMED.with(|a| a.get() == Some(fault))
+    }
+}
+
+#[cfg(not(test))]
+mod fault {
+    /// A planted defect: none is armed outside the tests.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        RenewOnAsk,
+        YoungestFirst,
+        CountOwn,
+    }
+
+    /// Never armed.
+    pub(crate) const fn armed(_: Fault) -> bool {
+        false
+    }
+}
+
+/// The steps of `WakeRoom` (`aterm_models_harness::wake_room_model`) that no function here
+/// performs: a session's line or answer coming due, its write or skip, a build taking the slot
+/// and a slot freeing, and the mutants. The reservation, the refusal and the lapse bind on
+/// [`Pace::ask`], [`Pace::reserve`] and [`Pace::retire`]. Proof and test builds only.
+#[cfg(any(test, debug_assertions))]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "ReadyA",
+    reason = "The loop's: a line or an answer that needs a slot comes due in session A."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "ReadyB",
+    reason = "The loop's: a line or an answer that needs a slot comes due in session B."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "ReadyC",
+    reason = "The loop's: a line or an answer that needs a slot comes due in session C."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "WriteA",
+    reason = "The loop's write of session A's granted line or answer; the table only reserved."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "WriteB",
+    reason = "The loop's write of session B's granted line or answer; the table only reserved."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "WriteC",
+    reason = "The loop's write of session C's granted line or answer; the table only reserved."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "SkipA",
+    reason = "The loop skips session A's granted write (a guard at the write): its re-ask is \
+              the next ReserveA."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "SkipB",
+    reason = "The loop skips session B's granted write: its re-ask is the next ReserveB."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "SkipC",
+    reason = "The loop skips session C's granted write: its re-ask is the next ReserveC."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "BuildTakes",
+    reason = "The world's: a build takes the free slot; the board's usable count says it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "SlotFrees",
+    reason = "The world's: a slot frees; the board's usable count says it."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "RenewWhileWaited",
+    reason = "Mutant: a reservation that never lapses while another hold waits."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "HerdTell",
+    reason = "Mutant: session B's ask counts no other session's reservation."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "YoungestFirst",
+    reason = "Mutant: session C's ask counts no older hold waiting (fault YoungestFirst)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "RenewOnAsk",
+    reason = "Mutant: a holder's re-ask renews its reservation (fault RenewOnAsk)."
+)]
+#[aterm_spec_anchor::spec_unmodeled(
+    machine = "WakeRoom",
+    action = "CountOwn",
+    reason = "Mutant: a holder's re-ask counts its own reservation and is refused (fault \
+              CountOwn)."
+)]
+#[allow(
+    dead_code,
+    reason = "carrier for the `spec_unmodeled` waivers above; nothing calls it. An allow, not an \
+              expect: rustc does not lint a fn the declarative anchors rebuild"
+)]
+fn wake_room_environment_waivers() {}
 
 /// The kernel's memory pressure as the supervisor names it; `None` unread.
 const fn memory_pressure(p: Pressure) -> Option<MemoryPressure> {
@@ -1158,3 +1549,7 @@ fn start_sampler() {
 #[cfg(test)]
 #[path = "occupancy_host_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "occupancy_host_conformance.rs"]
+mod conformance;

@@ -197,7 +197,7 @@ fn credential_ready(
 /// reaches git with nothing here to redo, and the keychain is neither written nor made git's
 /// only helper. A lookup git cannot run, or settings that ask for some repositories otherwise,
 /// is no answer: the keychain path then runs as before and reports its own failure.
-fn lookups_answer(sys: &dyn System, user: &User, token: &Secret) -> bool {
+pub(super) fn lookups_answer(sys: &dyn System, user: &User, token: &Secret) -> bool {
     let git = Git::keychain();
     git.fill_as_configured(sys, Some(user), GITHUB)
         .is_ok_and(|answer| answer.is_some_and(|got| got.bytes() == token.bytes()))

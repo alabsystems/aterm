@@ -16820,7 +16820,7 @@ fn maintain_accounts_live(step: UpkeepStep) {
     let upkept = upkeep_live(&home, &state, &roster, now, step);
     if let Upkept::Configured { renewal: true, .. } = upkept {
         aterm_log::info!(
-            "harness: accounts-upkeep renewal: a walled login's successor's sign-in started"
+            "harness: accounts-upkeep: a sign-in started or a saved account choice completed"
         );
     }
     let found = match upkept {
@@ -16842,7 +16842,7 @@ fn maintain_accounts_live(step: UpkeepStep) {
         Upkept::Unconfigured { fleet_file_ignored } => aterm_log::info!(
             "harness: accounts-upkeep=unconfigured{}: no fleet accounts source is configured \
              (`[fleet] accounts_source`, or a fleet-accounts.toml a sync handed its source \
-             wrote), so no roster is fetched and no sign-in is started",
+             wrote), so no roster is fetched and no automatic sign-in is started",
             if fleet_file_ignored {
                 " fleet-file=ignored"
             } else {

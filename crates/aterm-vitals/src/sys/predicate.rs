@@ -6,18 +6,24 @@
 use crate::jobs::{Class, JobRow, Verdict};
 use crate::model::{SlotsUnread, SlotsView, Snapshot, Throttle};
 
-/// The usage line.
-pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<dur>] [scope=tab|aterm] \
+/// The usage line a refused `await sys` answers.
+pub const USAGE: &str = "ERR usage: await sys <predicate> [for=<n>(ms|s|m|h)] [scope=tab|aterm] \
                          [timeout=<ms>]; \
-                         <predicate> := quiet [<term> …] | <term> [and <term> …]; \
-                         <term> := <metric><op><value> with <op> < <= > >= = != and <metric> \
-                         cpu cpu.l<n> aterm tab wait gpu mem swap decompress thrash tab.mem \
-                         aterm.mem throttle jobs.stuck jobs.quiet jobs.running load \
-                         cores_idle avail slots; or \
-                         (job|task)=<id> <verdict>[,…]|class=<class>[,…]; or \
-                         free>=<size>|free><size>|free>=room|disk=<ok|low|short|emergency>[,…] \
-                         (a size with its unit B KB MB GB TB KiB MiB GiB TiB; at most two, \
-                         with vol=<path>, alone)\n";
+                         <predicate> := quiet [<term> …] | <term> [and <term> …] \
+                         | <volume> [and <volume>] [vol=<absolute path, percent-encoded>]; \
+                         <term> := <metric><op><value> | (job|task)=<id> <verdict>[,…] \
+                         | (job|task)=<id> class=<class>[,…] (done is exited), \
+                         <op> one of < <= > >= = !=; \
+                         <metric> <value>: cpu <n>%|<n>c, cpu.l<n> cpu.<cluster> gpu <n>%, \
+                         aterm tab wait cores_idle <n>[c], load jobs.stuck jobs.quiet \
+                         jobs.running slots <n>, tab.mem aterm.mem avail <size>, \
+                         swap <size>[/s], decompress <n>[/s], mem normal|warn|critical, \
+                         throttle none|light|heavy|severe, thrash yes|no (= and != take a \
+                         comma list; thrash takes no other <op>); \
+                         <volume> := free>=<size|room> | free><size|room> \
+                         | disk=ok|low|short|emergency[,…], never with quiet, a <term>, for= or \
+                         scope=; \
+                         <size> := <n>(B|KB|MB|GB|TB|KiB|MiB|GiB|TiB), a whole <n> for free\n";
 
 /// The refusal of a predicate that mixes the volume wait with the machine's.
 pub const MIXED: &str = "ERR usage: await sys: free and disk= wait on their volume alone; \

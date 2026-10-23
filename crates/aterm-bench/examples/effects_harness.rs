@@ -5,7 +5,10 @@ use std::fmt::Write as _;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use aterm_core::render::{DecoBlend, DecoGlyph, FxSlot, InkCell, PxRect, WordDecoration};
+use aterm_core::render::{
+    DecoBlend, DecoGlyph, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRect, FxSlot, FxSpace,
+    InkCell, PxRect, WordDecoration,
+};
 use aterm_core::terminal::Terminal;
 use aterm_effects::cursor_glow::{CURSOR_WITNESS_ROWS, CursorGlow, Geom, GlowConfig, GlowStyle};
 use aterm_effects::harness_card::{
@@ -304,6 +307,8 @@ struct Sample {
     raster: Spent,
     fx_quads: u64,
     under_quads: u64,
+    dirty_rows: u64,
+    output_fingerprint: Option<u64>,
     arms: [Arm; WAYS.len()],
 }
 
@@ -598,6 +603,11 @@ impl Rig {
         black_box(&view);
         drop(view);
         let raster = watch.stop();
+        let dirty_rows = match win.cpu.last_damage() {
+            aterm_render::DamageOutcome::Full => ROWS as u64,
+            aterm_render::DamageOutcome::GateHit => 0,
+            _ => win.cpu.dirty_rows().iter().filter(|d| **d).count() as u64,
+        };
 
         let mut arms = [Arm::default(); WAYS.len()];
         for k in 0..WAYS.len() {
@@ -655,6 +665,8 @@ impl Rig {
             raster,
             fx_quads: fx_quads(input),
             under_quads: input.glow_under.len() as u64,
+            dirty_rows,
+            output_fingerprint: None,
             arms,
         }
     }
@@ -1063,6 +1075,80 @@ fn card_scenes(rig: &mut Rig, seed: u64) -> (Run, Run, Run) {
     (episode, flowing, rig.take_run(settled))
 }
 
+/// Two small items spanning eight row bands, recoloured each frame without moving their hull.
+/// Every measured frame follows an already drawn frame; verification runs outside the timers.
+fn sparse_fx_scene(rig: &mut Rig) -> Run {
+    let mut term = Terminal::new(ROWS as u16, COLS as u16);
+    let mut input = term.cell_frame(ROWS, COLS);
+    input.cursor_visible = false;
+    let layers: [FxLayer; 2] = std::array::from_fn(|phase| {
+        let items = [2, 9]
+            .map(|row| {
+                FxItem::Rect(FxRect {
+                    x: 4 * i32::from(rig.cw),
+                    y: row * i32::from(rig.ch) + 1,
+                    w: rig.cw,
+                    h: 3,
+                    ink: 0,
+                })
+            })
+            .to_vec();
+        FxLayer::new(
+            0x5350_4152_5345,
+            std::sync::Arc::new(FxContent::new(
+                items,
+                vec![FxInk::add([0x0020_4080, 0x0080_2040][phase]); 2],
+            )),
+            FxSlot::Glow,
+            FxSpace::Grid,
+            FxBlend::Exact,
+        )
+    });
+    let mut win = Win::new();
+    input.fx_layers = vec![layers[0].clone()];
+    rig.settle_window(&mut win, &mut input);
+    rig.refs.clear();
+    let mut samples = Vec::new();
+    let mut previous = None;
+    for step in 0..32 {
+        let watch = Stopwatch::start();
+        input.fx_layers[0] = layers[(step + 1) % 2].clone();
+        let emit = watch.stop();
+        let mut sample = rig.present(&mut win, &input, emit, 0);
+        #[cfg(target_os = "macos")]
+        if rig.clock == "metal" && !rig.gpu.metal_render_armed() {
+            fail("the sparse FX Metal presenter is no longer armed");
+        }
+        // An owned full render has no retained cache. Compare actual pixels, then retain a
+        // stable digest for the before/after runs; neither operation is in a measured timer.
+        let cached = rig
+            .cpu
+            .render_input_cached(&mut win.cpu, &input)
+            .pixels()
+            .to_vec();
+        let full = rig.cpu.render_input(&input);
+        if cached != full.pixels {
+            fail(format!(
+                "sparse fx frame {step}: cached pixels differ from a full render"
+            ));
+        }
+        let fingerprint = cached.iter().fold(0xcbf2_9ce4_8422_2325, |h, &p| {
+            (h ^ u64::from(p)).wrapping_mul(0x100_0000_01b3)
+        });
+        if previous == Some(fingerprint) || sample.dirty_rows == 0 {
+            fail("a recoloured sparse layer changed no pixels or marked no rows");
+        }
+        previous = Some(fingerprint);
+        sample.output_fingerprint = Some(fingerprint);
+        samples.push(sample);
+    }
+    let unchanged = rig.present(&mut win, &input, Spent::default(), 0);
+    if unchanged.dirty_rows != 0 {
+        fail("an unchanged sparse layer repainted rows");
+    }
+    rig.take_run(samples)
+}
+
 #[derive(Clone, Copy)]
 enum Script {
     Type { keys: usize, every: usize },
@@ -1342,6 +1428,7 @@ impl Scene {
             let mut v = self.pooled(f);
             r.num(format!("{s}_{what}_p50_us"), us(pct(&mut v, 50.0)));
             r.num(format!("{s}_{what}_p95_us"), us(pct(&mut v, 95.0)));
+            r.num(format!("{s}_{what}_p99_us"), us(pct(&mut v, 99.0)));
         }
         let mut present = self.pooled(|x| Some(ns(x.off().present_ns())));
         let present_p95 = pct(&mut present, 95.0).max(1.0);
@@ -1402,7 +1489,7 @@ impl Scene {
             format!("{s}_build_stage_pct"),
             100.0 * pct(&mut build_stage, 50.0) / present_p95,
         );
-        let counts: [(&str, Figure); 10] = [
+        let counts: [(&str, Figure); 11] = [
             ("passes", |x| Some(f64::from(x.off().shape.passes))),
             ("drop_passes", |x| Some(f64::from(x.drop().shape.passes))),
             ("split_passes", |x| Some(f64::from(x.split().shape.passes))),
@@ -1416,6 +1503,7 @@ impl Scene {
             ("instance_bytes", |x| Some(ns(x.off().shape.instance_bytes))),
             ("fx_quads", |x| Some(ns(x.fx_quads))),
             ("under_quads", |x| Some(ns(x.under_quads))),
+            ("dirty_rows", |x| Some(ns(x.dirty_rows))),
             ("fx_instances", |x| {
                 Some(f64::from(x.off().shape.fx_instances))
             }),
@@ -1427,6 +1515,25 @@ impl Scene {
             let mut v = self.pooled(f);
             r.int(format!("{s}_{what}_p50"), pct(&mut v, 50.0) as u64);
             r.int(format!("{s}_{what}_max"), pct(&mut v, 100.0) as u64);
+        }
+        let dirty = self.pooled(|x| Some(ns(x.dirty_rows)));
+        r.num(
+            format!("{s}_dirty_rows_mean"),
+            dirty.iter().sum::<f64>() / dirty.len().max(1) as f64,
+        );
+        let checked: Vec<u64> = self
+            .runs
+            .iter()
+            .flat_map(|r| &r.samples)
+            .filter_map(|sample| sample.output_fingerprint)
+            .collect();
+        if !checked.is_empty() {
+            r.int(format!("{s}_verified_frames"), checked.len() as u64);
+            let fingerprint = checked.iter().fold(0u64, |h, &p| h.rotate_left(7) ^ p);
+            r.text(
+                format!("{s}_output_fingerprint"),
+                &format!("{fingerprint:016x}"),
+            );
         }
         let rated: [(&str, Figure, RefFigure); 4] = [
             (
@@ -1578,6 +1685,12 @@ fn report_reference(r: &mut Report, scenes: &[Scene], clocked: bool, counted: bo
 }
 
 fn main() {
+    if std::env::args().skip(1).any(|a| a == "--help") {
+        println!(
+            "effects_harness [--light] [--wgpu] [--damage]\n  --damage: animated card scenes and recoloured sparse FX layers, with dirty rows and full-render pixel verification"
+        );
+        return;
+    }
     if !cfg!(any(debug_assertions, feature = "dev-seams")) {
         fail(NO_SEAM);
     }
@@ -1598,46 +1711,56 @@ fn main() {
         runs: Vec::new(),
         rate_emit,
     };
-    let mut scenes = [
+    let damage = std::env::args().skip(1).any(|a| a == "--damage");
+    let mut scenes = vec![
         scene("episode", true),
         scene("flowing", true),
         scene("settled", false),
-        scene("typing", true),
-        scene("scroll", true),
-        scene("bolt", true),
-        scene("comet", true),
-        scene("classic", true),
-        scene("meteor", true),
-        scene("flood", true),
     ];
+    if damage {
+        scenes.push(scene("fx_sparse", true));
+    } else {
+        scenes.extend([
+            scene("typing", true),
+            scene("scroll", true),
+            scene("bolt", true),
+            scene("comet", true),
+            scene("classic", true),
+            scene("meteor", true),
+            scene("flood", true),
+        ]);
+    }
     for run in 0..WARMUP + RUNS {
         let (episode, flowing, settled) = card_scenes(&mut rig, 0x00C0_FFEE + run as u64);
-        let typed = |keys| Script::Type {
-            keys,
-            every: KEY_TICKS,
-        };
-        let typing = typing_scene(&mut rig, GlowStyle::RainbowKitty, typed(TYPING_KEYS));
-        let scroll = scroll_scene(&mut rig);
-        let bolt = typing_scene(&mut rig, GlowStyle::Laser, typed(PRODUCER_KEYS));
-        let comet = typing_scene(&mut rig, GlowStyle::Comet, typed(PRODUCER_KEYS));
-        let classic = typing_scene(&mut rig, GlowStyle::Classic, typed(PRODUCER_KEYS));
-        let hops = Script::Hop {
-            hops: HOPS,
-            every: HOP_TICKS,
-        };
-        let meteor = typing_scene(&mut rig, GlowStyle::RainbowKitty, hops);
-        let flood = Script::Type {
-            keys: FLOOD_KEYS,
-            every: 1,
-        };
-        let flood = typing_scene(&mut rig, GlowStyle::RainbowKitty, flood);
-        at_the_ribbon_budget(&flood);
+        let mut runs = vec![episode, flowing, settled];
+        if damage {
+            runs.push(sparse_fx_scene(&mut rig));
+        } else {
+            let typed = |keys| Script::Type {
+                keys,
+                every: KEY_TICKS,
+            };
+            let typing = typing_scene(&mut rig, GlowStyle::RainbowKitty, typed(TYPING_KEYS));
+            let scroll = scroll_scene(&mut rig);
+            let bolt = typing_scene(&mut rig, GlowStyle::Laser, typed(PRODUCER_KEYS));
+            let comet = typing_scene(&mut rig, GlowStyle::Comet, typed(PRODUCER_KEYS));
+            let classic = typing_scene(&mut rig, GlowStyle::Classic, typed(PRODUCER_KEYS));
+            let hops = Script::Hop {
+                hops: HOPS,
+                every: HOP_TICKS,
+            };
+            let meteor = typing_scene(&mut rig, GlowStyle::RainbowKitty, hops);
+            let flood = Script::Type {
+                keys: FLOOD_KEYS,
+                every: 1,
+            };
+            let flood = typing_scene(&mut rig, GlowStyle::RainbowKitty, flood);
+            at_the_ribbon_budget(&flood);
+            runs.extend([typing, scroll, bolt, comet, classic, meteor, flood]);
+        }
         if run < WARMUP {
             continue;
         }
-        let runs = [
-            episode, flowing, settled, typing, scroll, bolt, comet, classic, meteor, flood,
-        ];
         for (scene, run) in scenes.iter_mut().zip(runs) {
             scene.runs.push(run);
         }

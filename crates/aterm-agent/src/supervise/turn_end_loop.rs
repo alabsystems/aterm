@@ -2938,6 +2938,9 @@ impl<C: Ctl> Session<'_, C> {
     /// INPUT THE WORKER HAS NOT READ STANDS BEFORE ANY ACT ([`Self::foreground_program`],
     /// [`Self::redecide_soon`], [`LaunchCall::Again`], [`UNDRAWN_INPUT_HANG`]).
     ///
+    /// A hung echo also holds acts on its last observed screen for
+    /// [`UNDRAWN_INPUT_HANG`], until the screen moves or the hold expires.
+    ///
     /// [`LaunchCall::Again`]: super::approval_loop::LaunchCall::Again
     pub(super) fn input_unread(&mut self, seq: u64, rule: &str, review: &mut dyn Review) -> bool {
         let now = self.fx.mono();
@@ -2949,26 +2952,26 @@ impl<C: Ctl> Session<'_, C> {
         let why = if let Some(word) = unread {
             self.input_unread_at = Some((seq, now));
             format!("the worker has not read the input written to it (input={word})")
+        } else if self.input_undrawn(seq, now) {
+            "the worker has not drawn the input it read (the screen has not moved since it was \
+             unread)"
+                .to_string()
         } else {
-            match self.input_unread_at {
-                Some((at, since))
-                    if at == seq && now.saturating_duration_since(since) < UNDRAWN_INPUT_HANG =>
-                {
-                    "the worker has not drawn the input it read (the screen has not moved \
-                     since it was unread)"
-                        .to_string()
-                }
-                _ => {
-                    self.input_unread_at = None;
-                    return false;
-                }
-            }
+            self.input_unread_at = None;
+            return false;
         };
         review.note(&format!(
             "SKIPPED seq={seq} rule={rule} {why}; nothing written"
         ));
         self.redecide_soon("the worker had not drawn the input written to it");
         true
+    }
+
+    /// Whether the existing unread-input hold still covers this screen.
+    fn input_undrawn(&self, seq: u64, now: Instant) -> bool {
+        self.input_unread_at.is_some_and(|(at, since)| {
+            at == seq && now.saturating_duration_since(since) < UNDRAWN_INPUT_HANG
+        })
     }
 
     /// Park or back off when the server refuses a write.
@@ -3258,7 +3261,7 @@ impl<C: Ctl> Session<'_, C> {
         let now = match self.await_echo(at, epoch, text, human, guarded)? {
             Echoed::Whole(now) => now,
             Echoed::Not(now, why) => {
-                if unmoved_since(&now, at, epoch) {
+                if why == ECHO_HUNG || unmoved_since(&now, at, epoch) {
                     self.input_unread_at = Some((now.seq, self.fx.mono()));
                 }
                 let turn = self.turn_of(now);
@@ -3642,6 +3645,9 @@ impl<C: Ctl> Session<'_, C> {
         if self.probe_off {
             return Ok(Some(ProbeGate::ProbesOff));
         }
+        if self.input_undrawn(point.screen.seq, self.fx.mono()) {
+            return Ok(Some(ProbeGate::PendingInput));
+        }
         if self.probe != UsageProbe::Idle {
             return Ok(Some(ProbeGate::PanelOwed));
         }
@@ -3907,6 +3913,10 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// Type and submit `/usage` using `if-human=` and `if-gen=` fenced `send` and `key` calls.
+    /// The write's echo is judged by [`Self::await_echo`], the continuation's rules: waited for
+    /// as a hang detector while each read shows it on its way, its Enter fenced on the read
+    /// that shows it whole. A text left on a screen that never moved holds every act on that
+    /// screen ([`Self::input_unread`]) and the next probe ([`ProbeGate::PendingInput`]).
     fn probe_type(&mut self, point: &Turn, review: &mut dyn Review) -> Result<ProbeTyped, Fail> {
         let seq = point.screen.seq;
         let rows = &point.screen.rows;
@@ -3996,21 +4006,31 @@ impl<C: Ctl> Session<'_, C> {
         }
         self.probe_owes(seq);
         let at = r.seq().unwrap_or(seq);
-        self.wait(&["seq", &at.to_string()], REACTION_WAIT)?;
-        self.wait(&["idle", SETTLE_MS], SETTLE_CAP)?;
-        let now = self.screen()?;
+        let epoch = ScreenGen::parse(&generation).map(|g| g.epoch);
+        let guarded = self.reader(rows).paste_guard();
+        let now = match self.await_echo(at, epoch, USAGE_COMMAND, human, guarded)? {
+            Echoed::Whole(now) => now,
+            Echoed::Not(now, why) => {
+                if why == ECHO_HUNG || unmoved_since(&now, at, epoch) {
+                    // Input the worker has not drawn: no act goes behind it on
+                    // this screen ([`Self::input_unread`]).
+                    self.input_unread_at = Some((now.seq, self.fx.mono()));
+                }
+                let miss = if why == ECHO_PERSON {
+                    ProbeMiss::Person
+                } else {
+                    ProbeMiss::NotWritten
+                };
+                return left(miss, why);
+            }
+        };
         let reader = self.reader(&now.rows);
-        let held = self.holds_probe_draft(&now) && reader.prompt(&now.rows).is_none();
-        let (true, Some(generation), Some(human), Some(caret)) = (
-            held,
+        let (Some(generation), Some(human), Some(caret)) = (
             now.generation.clone(),
             now.human_seq,
             caret_row(reader, &now.rows),
         ) else {
-            return left(
-                ProbeMiss::NotWritten,
-                "the composer does not show it as written",
-            );
+            return left(ProbeMiss::NotWritten, ECHO_OTHER);
         };
         let guard = super::super::policy::row_guard(&now.rows[caret]);
         let person = format!("if-human={human}");
@@ -4030,6 +4050,31 @@ impl<C: Ctl> Session<'_, C> {
             }
             Some(_) => left(ProbeMiss::NotWritten, "its Enter was not written"),
         }
+    }
+
+    /// [`Self::probe_type`] for a test: `None` where `/usage` was entered, else
+    /// why it was not and whether it was left typed.
+    #[cfg(test)]
+    pub(super) fn probe_type_seen(
+        &mut self,
+        point: &Turn,
+        review: &mut dyn Review,
+    ) -> Result<Option<(String, bool)>, Fail> {
+        Ok(match self.probe_type(point, review)? {
+            ProbeTyped::Entered { .. } => None,
+            ProbeTyped::Not { why, left, .. } => Some((why, left)),
+        })
+    }
+
+    /// [`Self::probe_gates`] for a test, at a point whose policy decided nothing.
+    #[cfg(test)]
+    pub(super) fn probe_gate_seen(
+        &mut self,
+        point: &Turn,
+        host: &dyn IdleHost,
+        opts: &SuperviseOpts,
+    ) -> Result<Option<ProbeGate>, Fail> {
+        self.probe_gates(point, &TurnEndAction::Nothing, host, opts)
     }
 
     /// Whether the probe's own `/usage` stands typed and unsent on `screen`.

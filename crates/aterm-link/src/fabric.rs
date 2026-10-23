@@ -749,15 +749,25 @@ fn ps_table() -> Vec<Proc> {
         .unwrap_or_default()
 }
 
-/// The process serving the broker at `sock`: `aterm link broker <sock> …` or `aterm-link broker <sock> …`.
-#[must_use]
-pub fn broker_pid(procs: &[Proc], sock: &str) -> Option<u32> {
-    procs.iter().find_map(|p| {
-        let words: Vec<&str> = p.cmd.split_whitespace().collect();
-        (0..words.len())
-            .any(|i| is_link_verb(&words, i, "broker") && words.get(i + 1) == Some(&sock))
-            .then_some(p.pid)
-    })
+/// The process serving the broker at `sock`: the one process of this user holding the listening
+/// socket bound there, by the socket's own record ([`aterm_uds::holders::scan_listener_holders`]),
+/// never by a command line that names the socket. `None` when no process holds it, two do, or the
+/// scan cannot run here.
+pub(crate) fn listener_pid(sock: &str) -> Option<u32> {
+    aterm_uds::holders::scan_listener_holders(Path::new(sock), &[])
+        .ok()
+        .as_ref()
+        .and_then(the_one_holder)
+}
+
+/// The holder a scan found, when it found exactly one. A table the scan could not read does not
+/// unseat it: Linux seals every non-dumpable process's table (an `ssh-agent`), so a scan that
+/// had to read every table would name no broker on most hosts, and a broker never seals its own.
+fn the_one_holder(scan: &aterm_uds::holders::HolderScan) -> Option<u32> {
+    match scan.holders.as_slice() {
+        [one] => Some(*one),
+        _ => None,
+    }
 }
 
 /// The launchd job label whose running pid is `pid`, from `launchctl list`'s `PID  Status  Label` rows.
@@ -800,7 +810,7 @@ pub struct BrokerView {
     pub attached: bool,
     /// Whether the broker refused the ring as LAPSED (astream's [`astream_broker::BrokerRefusal::is_expired`]): genuine grants whose `exp=` has passed, at the attach or on the head query.
     pub cap_expired: bool,
-    /// The pid serving it, from the process table.
+    /// The pid serving it: the one process of this user holding its listener ([`listener_pid`]).
     pub pid: Option<u32>,
     /// The launchd job running that pid (macOS).
     pub launchd: Option<String>,
@@ -864,40 +874,33 @@ impl BrokerView {
             .or_else(|| self.snapshot_now().and_then(|h| h.poisoned.as_deref()))
     }
 
-    /// Name the pid serving [`Self::endpoint`] in `procs`, and its launchd job.
-    pub(crate) fn locate(&mut self, procs: &[Proc]) {
-        self.locate_with(procs, launchd_label, replaced_build, |pid| {
+    /// Name the pid serving [`Self::endpoint`] ([`listener_pid`]), its launchd job, and what its own argv says it serves; no other process is read.
+    pub(crate) fn locate(&mut self) {
+        self.locate_with(listener_pid, launchd_label, replaced_build, |pid| {
             aterm_uds::process::read_process_argv(i32::try_from(pid).ok()?)
         });
     }
 
     fn locate_with(
         &mut self,
-        procs: &[Proc],
+        mut holder: impl FnMut(&str) -> Option<u32>,
         mut label: impl FnMut(u32) -> Option<String>,
         mut replaced: impl FnMut(u32, &str) -> Option<String>,
         mut argv: impl FnMut(u32) -> Option<Vec<std::ffi::OsString>>,
     ) {
-        self.pid = broker_pid(procs, &self.endpoint);
+        self.pid = holder(&self.endpoint);
         self.launchd = self.pid.and_then(&mut label);
-        let cmd = self
-            .pid
-            .and_then(|pid| procs.iter().find(|p| p.pid == pid))
-            .map(|p| p.cmd.as_str());
         let words = self.pid.and_then(&mut argv);
         let exe = words
             .as_ref()
             .and_then(|w| w.first())
-            .map(|w| w.to_string_lossy().into_owned())
-            .or_else(|| {
-                cmd.and_then(|c| c.split_whitespace().next())
-                    .map(str::to_string)
-            });
+            .map(|w| w.to_string_lossy().into_owned());
         self.replaced = self.pid.zip(exe).and_then(|(pid, exe)| replaced(pid, &exe));
+        let endpoint = aterm_uds::holders::SocketPath::of(Path::new(&self.endpoint));
         let parsed = words
             .as_deref()
             .and_then(crate::broker_args::BrokerArgs::from_invocation)
-            .filter(|parsed| parsed.serves_endpoint(&self.endpoint));
+            .filter(|parsed| parsed.serves(&endpoint));
         self.durability = parsed
             .as_ref()
             .and_then(crate::broker_args::BrokerArgs::serving_durability);
@@ -1001,13 +1004,13 @@ pub const POISONED_WARNING: &str = "says its log is POISONED";
 /// The words of the warning for a broker whose flushes have failed without poisoning its log, which `doctor` picks the disk's remedy by.
 pub const FLUSH_FAILED_WARNING: &str = "says a flush of its log failed";
 
-/// Reach the broker FOR REAL: connect, `Hello` (does a broker answer at all), the whole ring attached ([`transport::attach_ring`]), head query.
-pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<Conn>) {
+/// Name the broker's process ([`BrokerView::locate`]), read the health snapshot beside its log, and reach it ([`reach_broker`]).
+pub(crate) fn probe_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
     let mut view = BrokerView {
         endpoint: cfg.broker.clone(),
         ..BrokerView::default()
     };
-    view.locate(procs);
+    view.locate();
     view.snapshot = view
         .log
         .as_deref()
@@ -1015,6 +1018,21 @@ pub(crate) fn probe_broker(cfg: &Config, procs: &[Proc]) -> (BrokerView, Option<
             Ok(read) => read.map(Ok),
             Err(e) => Some(Err(e.to_string())),
         });
+    reach(cfg, view)
+}
+
+/// Reach the broker FOR REAL, naming no process: connect, `Hello` (does a broker answer at all), the whole ring attached ([`transport::attach_ring`]), head query.
+pub(crate) fn reach_broker(cfg: &Config) -> (BrokerView, Option<Conn>) {
+    reach(
+        cfg,
+        BrokerView {
+            endpoint: cfg.broker.clone(),
+            ..BrokerView::default()
+        },
+    )
+}
+
+fn reach(cfg: &Config, mut view: BrokerView) -> (BrokerView, Option<Conn>) {
     let started = Instant::now();
     let mut conn = match transport::connect(&cfg.broker, IO_TIMEOUT) {
         Ok((c, _)) => c,
@@ -1230,14 +1248,14 @@ pub fn doctor_summary(withheld: Option<&str>) -> DoctorSummary {
     summary_for(
         found.map(|found| found.map(|(_, command)| command)),
         withheld,
-        process_table,
+        |cfg| probe_broker(cfg).0,
     )
 }
 
 fn summary_for(
     found: Result<Option<Vec<String>>, String>,
     withheld: Option<&str>,
-    table: impl FnOnce() -> Vec<Proc>,
+    probe: impl FnOnce(&Config) -> BrokerView,
 ) -> DoctorSummary {
     let command = match found {
         Ok(Some(command)) => command,
@@ -1263,7 +1281,7 @@ fn summary_for(
         }
     };
     match (bridge_config(&command), withheld) {
-        (Ok(cfg), None) => summary_of(&probe_broker(&cfg, &table()).0),
+        (Ok(cfg), None) => summary_of(&probe(&cfg)),
         (Ok(_), Some(why)) => DoctorSummary {
             level: SummaryLevel::Note,
             unmeasured: true,
@@ -2218,7 +2236,7 @@ pub fn gather() -> Result<Report, Off> {
         })
         .collect();
 
-    let (broker, conn) = probe_broker(&cfg, &procs);
+    let (broker, conn) = probe_broker(&cfg);
     let program_in_target_dir = command
         .first()
         .is_some_and(|p| in_cargo_target_dir(Path::new(&resolve_program(p))));
@@ -4863,10 +4881,24 @@ mod tests {
 ";
         let procs = parse_ps(ps);
         assert_eq!(procs.len(), 7);
-        assert_eq!(broker_pid(&procs, "/Users//u/f/bus.sock"), Some(48078));
-        assert_eq!(broker_pid(&procs, "/tmp/other.sock"), Some(15678));
-        assert_eq!(broker_pid(&procs, "/Users//u/g/bus.sock"), Some(700));
-        assert_eq!(broker_pid(&procs, "/tmp/none.sock"), None);
+        assert_eq!(
+            procs[1],
+            Proc {
+                pid: 48078,
+                ppid: 1,
+                cmd: "/Users//u/.local/bin/aterm link broker /Users//u/f/bus.sock /Users//u/f/bus.log"
+                    .to_string()
+            }
+        );
+        assert_eq!(
+            (procs[6].pid, procs[6].ppid, procs[6].cmd.as_str()),
+            (
+                700,
+                1,
+                "/Users//u/Applications/aterm (dev).app/Contents/MacOS/aterm link broker /Users//u/g/bus.sock /Users//u/g/bus.log"
+            ),
+            "a command keeps its spaces"
+        );
         let launchctl =
             "PID\tStatus\tLabel\n-\t0\tcom.apple.x\n48078\t0\tsystems.alab.astream-broker\n";
         assert_eq!(
@@ -5191,7 +5223,7 @@ mod tests {
                     let _ = write_frame(&mut c, &reply);
                 }
             });
-            let (view, _) = probe_broker(&unix_config(&sock), &[]);
+            let (view, _) = reach_broker(&unix_config(&sock));
             (view, dir)
         };
         let (view, _dir) = probe_against(PROTO_VERSION + 1);
@@ -5254,14 +5286,14 @@ mod tests {
     }
 
     #[test]
-    fn a_withheld_fabric_row_says_why_and_reads_no_process_table() {
+    fn a_withheld_fabric_row_says_why_and_probes_nothing() {
         let absent = std::env::temp_dir().join(format!("atl-withheld-{}", std::process::id()));
         let bridge = words(&format!(
             "aterm link serve --fleet lab --broker {b} --cap-file /c --state {s}",
             b = absent.join("b.sock").display(),
             s = absent.join("state").display()
         ));
-        let unread = || -> Vec<Proc> { panic!("the process table was read while withheld") };
+        let unread = |_: &Config| -> BrokerView { panic!("the broker was probed while withheld") };
         let why = Some("the pool is full");
         let summary = summary_for(Ok(Some(bridge.clone())), why, unread);
         assert_eq!(summary.level, SummaryLevel::Note);
@@ -5278,11 +5310,11 @@ mod tests {
         );
 
         let read = std::cell::Cell::new(false);
-        let probed = summary_for(Ok(Some(bridge)), None, || {
+        let probed = summary_for(Ok(Some(bridge)), None, |cfg| {
             read.set(true);
-            Vec::new()
+            reach_broker(cfg).0
         });
-        assert!(read.get(), "CONTROL: nothing withheld reads the table");
+        assert!(read.get(), "CONTROL: nothing withheld probes the broker");
         assert!(probed.text.contains("does not answer"), "{}", probed.text);
     }
 
@@ -5294,7 +5326,7 @@ mod tests {
             .tempdir()
             .expect("scratch");
         let cfg = unix_config(&dir.path().join("bus.sock"));
-        let (view, _) = probe_broker(&cfg, &[]);
+        let (view, _) = reach_broker(&cfg);
         assert_eq!(view.last_word, None, "nothing was written");
         std::fs::write(
             dir.path().join("broker.err"),
@@ -5302,7 +5334,7 @@ mod tests {
              aterm link broker: open bus.log: record format v9: refused\n",
         )
         .expect("broker.err");
-        let (view, _) = probe_broker(&cfg, &[]);
+        let (view, _) = reach_broker(&cfg);
         assert!(!view.reachable);
         let mut r = healthy();
         r.broker = view;
@@ -5606,7 +5638,7 @@ mod tests {
                 format!("aterm link broker: open /r/bus.log: x — {line}\n"),
             )
             .expect("broker.err");
-            let (view, _) = probe_broker(&cfg, &[]);
+            let (view, _) = reach_broker(&cfg);
             assert!(!view.reachable && view.last_word.is_some(), "{view:?}");
             let mut r = healthy();
             r.broker = view;
@@ -5680,7 +5712,7 @@ mod tests {
                 })
                 .collect();
             std::fs::write(&cap, lines).expect("the cap file");
-            let (view, _) = probe_broker(&cfg, &[]);
+            let (view, _) = reach_broker(&cfg);
             let mut r = healthy();
             r.broker = view;
             r
@@ -5904,8 +5936,12 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut fixture = fixture.spawn().expect("spawn bash");
+        let expected = format!("aterm -c read x link broker {sock} a\\012b");
         let started = std::time::Instant::now();
-        while broker_pid(&process_table(), sock) != Some(fixture.id()) {
+        while !process_table()
+            .iter()
+            .any(|p| p.pid == fixture.id() && p.cmd == expected)
+        {
             assert!(
                 started.elapsed() < std::time::Duration::from_secs(60),
                 "bash's exec: not within 60s"
@@ -5958,11 +5994,12 @@ mod tests {
             compared.insert(row.pid);
         }
         assert!(compared.contains(&id) && compared.contains(&std::process::id()));
+        assert_eq!(a[&id].cmd, expected);
         assert_eq!(
-            a[&id].cmd,
-            format!("aterm -c read x link broker {sock} a\\012b")
+            oracle.iter().find(|p| p.pid == id).map(|p| p.cmd.as_str()),
+            Some(expected.as_str()),
+            "ps prints the fixture's row as the table does"
         );
-        assert_eq!(broker_pid(&oracle, sock), Some(id));
         assert!(
             compared.len() * 2 >= oracle.len(),
             "{} of {} rows compared",
@@ -6629,20 +6666,12 @@ mod running_argv_tests {
     use crate::durability::Durability;
     use std::ffi::OsString;
 
+    fn words(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(|word| OsString::from(*word)).collect()
+    }
+
     #[test]
     fn a_broker_report_uses_the_exact_argv_or_reports_an_unknown_tier() {
-        let command =
-            "/bin/aterm link broker /r/bus.sock --secret-file /r/name --durability relaxed";
-        let procs = vec![Proc {
-            pid: 71,
-            ppid: 1,
-            cmd: command.into(),
-        }];
-        let words = |args: &[&str]| {
-            args.iter()
-                .map(|word| OsString::from(*word))
-                .collect::<Vec<_>>()
-        };
         let exact = words(&[
             "/bin/aterm",
             "link",
@@ -6681,14 +6710,14 @@ mod running_argv_tests {
         for (argv, expected) in cases {
             let mut read = Vec::new();
             view.locate_with(
-                &procs,
+                |_| Some(71),
                 |pid| {
                     assert_eq!(pid, 71);
                     None
                 },
                 |pid, exe| {
                     assert_eq!(pid, 71);
-                    assert_eq!(exe, "/bin/aterm", "argv[0], else the line's first word");
+                    assert_eq!(exe, "/bin/aterm", "argv[0]");
                     None
                 },
                 |pid| {
@@ -6702,36 +6731,138 @@ mod running_argv_tests {
         }
     }
 
+    /// The broker is the process holding its listener: every other read is of the holder, and
+    /// none is made when nothing holds it.
+    #[test]
+    fn the_broker_is_the_process_holding_its_listener() {
+        let argv = words(&["/opt/aterm", "link", "broker", "/r/bus.sock", "/r/bus.log"]);
+        for (held, want) in [(Some(71), Some(71)), (None, None)] {
+            let mut view = BrokerView {
+                endpoint: "/r/bus.sock".into(),
+                ..BrokerView::default()
+            };
+            let mut sockets = Vec::new();
+            let asked = std::cell::RefCell::new(Vec::new());
+            view.locate_with(
+                |sock| {
+                    sockets.push(sock.to_string());
+                    held
+                },
+                |pid| {
+                    asked.borrow_mut().push(("label", pid));
+                    None
+                },
+                |pid, _| {
+                    asked.borrow_mut().push(("replaced", pid));
+                    None
+                },
+                |pid| {
+                    asked.borrow_mut().push(("argv", pid));
+                    Some(argv.clone())
+                },
+            );
+            assert_eq!(
+                sockets,
+                ["/r/bus.sock"],
+                "the holder is asked of the endpoint"
+            );
+            assert_eq!(view.pid, want, "held by {held:?}");
+            let wanted: Vec<(&str, u32)> = want
+                .map(|pid| vec![("label", pid), ("argv", pid), ("replaced", pid)])
+                .unwrap_or_default();
+            assert_eq!(asked.take(), wanted, "every other read is of the holder");
+            assert_eq!(view.log.is_some(), want.is_some());
+        }
+    }
+
+    /// The holder's own argv names the endpoint by the rule the listener scan names its bound
+    /// path by: its bytes, or the endpoint's canonical spelling, so a broker the scan finds
+    /// through another spelling of its folder is read whole, and one bound through a link that
+    /// the scan cannot find is not read either.
+    #[cfg(unix)]
+    #[test]
+    fn the_holders_socket_word_names_the_endpoint_as_its_listener_does() {
+        let dir = aterm_tempfile::tempdir().expect("scratch");
+        let base = dir.path().canonicalize().expect("its own spelling");
+        let (real, link) = (base.join("real"), base.join("link"));
+        std::fs::create_dir(&real).expect("the real folder");
+        std::os::unix::fs::symlink(&real, &link).expect("a link to it");
+        let at = |dir: &Path| dir.join("bus.sock").to_string_lossy().into_owned();
+        let served = |endpoint: String, word: String| {
+            let mut view = BrokerView {
+                endpoint,
+                ..BrokerView::default()
+            };
+            let log = format!("{word}.log");
+            let argv = words(&["/bin/aterm", "link", "broker", &word, &log]);
+            view.locate_with(|_| Some(71), |_| None, |_, _| None, |_| Some(argv.clone()));
+            view.log
+        };
+        assert_eq!(
+            served(at(&link), at(&real)),
+            Some(PathBuf::from(format!("{}.log", at(&real)))),
+            "the endpoint spelled through a link, the broker bound at its folder's own spelling"
+        );
+        assert!(served(at(&real), at(&real)).is_some(), "the same bytes");
+        assert_eq!(
+            served(at(&real), at(&link)),
+            None,
+            "a socket bound through a link is named by that spelling alone"
+        );
+    }
+
+    /// One holder is the broker; none, or two (a fork that kept the listener, a stale listener
+    /// beside a new one at its path), is no answer. A table the scan could not read leaves the
+    /// one holder it found the broker.
+    #[test]
+    fn one_holder_is_the_broker_and_two_are_none() {
+        let scan = |holders: &[u32]| aterm_uds::holders::HolderScan {
+            holders: holders.to_vec(),
+            scanned: 9,
+            ..aterm_uds::holders::HolderScan::default()
+        };
+        assert_eq!(the_one_holder(&scan(&[71])), Some(71));
+        assert_eq!(the_one_holder(&scan(&[])), None);
+        assert_eq!(the_one_holder(&scan(&[71, 72])), None);
+        let incomplete = aterm_uds::holders::HolderScan {
+            sealed: vec![80],
+            unreadable: vec![81],
+            ..scan(&[71])
+        };
+        assert_eq!(the_one_holder(&incomplete), Some(71));
+    }
+
+    /// The replaced-build check reads the holder's whole argv[0]; with no argv read it is not
+    /// made, for no other process's command line stands in for it.
     #[test]
     fn the_replaced_build_check_reads_the_whole_argv0() {
         let spaced = "/a b/aterm";
-        let procs = vec![Proc {
-            pid: 72,
-            ppid: 1,
-            cmd: format!("{spaced} link broker /r/bus.sock /r/bus.log --secret-file /r/s"),
-        }];
-        let argv: Vec<OsString> = [spaced, "link", "broker", "/r/bus.sock", "/r/bus.log"]
-            .iter()
-            .map(OsString::from)
-            .collect();
-        for (words, want) in [(Some(argv), spaced), (None, "/a"), (Some(Vec::new()), "/a")] {
+        let argv = words(&[spaced, "link", "broker", "/r/bus.sock", "/r/bus.log"]);
+        for (argv, want) in [
+            (Some(argv), Some(spaced)),
+            (None, None),
+            (Some(Vec::new()), None),
+        ] {
             let mut view = BrokerView {
                 endpoint: "/r/bus.sock".into(),
                 ..BrokerView::default()
             };
             let mut asked = Vec::new();
             view.locate_with(
-                &procs,
+                |_| Some(72),
                 |_| None,
                 |pid, exe| {
                     assert_eq!(pid, 72);
                     asked.push(exe.to_string());
                     Some(exe.to_string())
                 },
-                |_| words.clone(),
+                |_| argv.clone(),
             );
-            assert_eq!(asked, vec![want.to_string()]);
-            assert_eq!(view.replaced.as_deref(), Some(want));
+            assert_eq!(
+                asked,
+                want.into_iter().map(str::to_string).collect::<Vec<_>>()
+            );
+            assert_eq!(view.replaced.as_deref(), want);
         }
     }
 }

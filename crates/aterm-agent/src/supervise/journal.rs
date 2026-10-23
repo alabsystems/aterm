@@ -2,13 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! Supervisor decision journal ([`super::SuperviseOpts::journal`], [`JournalRecord::of_line`],
-//! [`NEEDS`]):
+//! [`NEEDS`]); a record's `kind` is one of [`Word::ALL`]'s names, or `other` for a line that
+//! begins with any other word (each a loop journals is one of [`Noted::ALL`]):
 //!
 //! ```text
 //! {"t":<unix ms>,"sid":"<sid>"|null,
 //!  "kind":"event|approved|declined|dismissed|reconnect|timeout|exit|mail|extend|escalated|
 //!          cleared|continued|typed|restarted|waiting|skipped|unverified|limited|unproven|
-//!          dialog|chose|exception|probed|reset|probe|needs|hold|occupancy",
+//!          dialog|chose|exception|probed|reset|probe|needs|hold|occupancy|other",
 //!  "phase":"idle|question|prompt|limited|survey|context|compacted|turn|idle-no-report|
 //!           <rule id>|resumed|still-limited|rebriefed|rebrief-failed|point|background|-",
 //!  "seq":<n>|null,"complete":0|1|null,"rows":<n>|null,"summary":"<the line's free-text tail>",
@@ -67,6 +68,308 @@ pub const AGAIN_RETRY: &str = "the retry hit the wall again";
 pub const AGAIN_ADOPTED: &str = "adopted from a previous watcher";
 /// The `again=<why>` of the turn-end policy's badge set again as an Autopilot Off park ends.
 pub const AGAIN_UNPARKED: &str = "set again after an off park";
+
+/// Every word a journaled line is read by: the [`JournalRecord::kind`] of a line that begins
+/// with it. A line that begins with any other word is `other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Word {
+    Event,
+    Dismissed,
+    Mail,
+    Approved,
+    Reconnect,
+    Timeout,
+    Exit,
+    Extend,
+    Escalated,
+    Cleared,
+    Continued,
+    Typed,
+    Restarted,
+    Waiting,
+    Skipped,
+    Unverified,
+    Limited,
+    Unproven,
+    Dialog,
+    Declined,
+    Chose,
+    Exception,
+    Probed,
+    Reset,
+    Needs,
+    Hold,
+    Occupancy,
+    Probe,
+}
+
+impl Word {
+    /// Every word, in declaration order.
+    pub const ALL: [Self; 28] = [
+        Self::Event,
+        Self::Dismissed,
+        Self::Mail,
+        Self::Approved,
+        Self::Reconnect,
+        Self::Timeout,
+        Self::Exit,
+        Self::Extend,
+        Self::Escalated,
+        Self::Cleared,
+        Self::Continued,
+        Self::Typed,
+        Self::Restarted,
+        Self::Waiting,
+        Self::Skipped,
+        Self::Unverified,
+        Self::Limited,
+        Self::Unproven,
+        Self::Dialog,
+        Self::Declined,
+        Self::Chose,
+        Self::Exception,
+        Self::Probed,
+        Self::Reset,
+        Self::Needs,
+        Self::Hold,
+        Self::Occupancy,
+        Self::Probe,
+    ];
+
+    /// The record's `kind`: the printed word lowercased (`RECONNECTED` is `reconnect`).
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Dismissed => "dismissed",
+            Self::Mail => "mail",
+            Self::Approved => "approved",
+            Self::Reconnect => "reconnect",
+            Self::Timeout => "timeout",
+            Self::Exit => "exit",
+            Self::Extend => "extend",
+            Self::Escalated => "escalated",
+            Self::Cleared => "cleared",
+            Self::Continued => "continued",
+            Self::Typed => "typed",
+            Self::Restarted => "restarted",
+            Self::Waiting => "waiting",
+            Self::Skipped => "skipped",
+            Self::Unverified => "unverified",
+            Self::Limited => "limited",
+            Self::Unproven => "unproven",
+            Self::Dialog => "dialog",
+            Self::Declined => "declined",
+            Self::Chose => "chose",
+            Self::Exception => "exception",
+            Self::Probed => "probed",
+            Self::Reset => "reset",
+            Self::Needs => "needs",
+            Self::Hold => "hold",
+            Self::Occupancy => "occupancy",
+            Self::Probe => "probe",
+        }
+    }
+
+    /// The word a line begins with as the loops print it ([`Self::printed`]; `RECONNECTED`
+    /// is [`Self::Reconnect`] too).
+    #[must_use]
+    pub fn of_printed(word: &str) -> Option<Self> {
+        match word {
+            "RECONNECTED" => Some(Self::Reconnect),
+            NEEDS => Some(Self::Needs),
+            _ => Self::ALL.into_iter().find(|w| w.is_printed(word)),
+        }
+    }
+
+    /// Whether `word` is [`Self::printed`], without building it.
+    fn is_printed(self, word: &str) -> bool {
+        let name = self.name();
+        name.len() == word.len()
+            && name
+                .bytes()
+                .zip(word.bytes())
+                .all(|(n, w)| n.to_ascii_uppercase() == w)
+    }
+
+    /// How a line that is read as this word begins: its name in capitals.
+    #[must_use]
+    pub fn printed(self) -> String {
+        self.name().to_ascii_uppercase()
+    }
+
+    /// The word whose [`Self::name`] a read record's `kind` is (`None`: `other`, or a word
+    /// this build does not know).
+    #[must_use]
+    pub fn of_kind(kind: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| w.name() == kind)
+    }
+}
+
+/// Every other word a loop journals a line with: its record's `kind` stays `other` (the
+/// readers of these lines read the line's first word, as every build wrote them), and a
+/// reader names it by [`Self::of_line`]. Together with [`Word`] it is every word a loop's
+/// journal holds (a test build refuses to journal any other, [`Journal::record`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Noted {
+    Done,
+    Left,
+    Parked,
+    Unparked,
+    Halted,
+    Unhalted,
+    Refused,
+    Held,
+    HoldEnded,
+    Adopted,
+    Kept,
+    Watching,
+    Claim,
+    Claimed,
+    NotEscalated,
+    Warn,
+    Task,
+    Fact,
+    Launch,
+    Host,
+    Deferred,
+    Memory,
+    Stalled,
+    Stuck,
+    Frozen,
+    Thawed,
+    StallWarned,
+    Signalled,
+    RestartRefused,
+    Note,
+    Sleep,
+    Abandoned,
+}
+
+impl Noted {
+    /// Every word, in declaration order.
+    pub const ALL: [Self; 32] = [
+        Self::Done,
+        Self::Left,
+        Self::Parked,
+        Self::Unparked,
+        Self::Halted,
+        Self::Unhalted,
+        Self::Refused,
+        Self::Held,
+        Self::HoldEnded,
+        Self::Adopted,
+        Self::Kept,
+        Self::Watching,
+        Self::Claim,
+        Self::Claimed,
+        Self::NotEscalated,
+        Self::Warn,
+        Self::Task,
+        Self::Fact,
+        Self::Launch,
+        Self::Host,
+        Self::Deferred,
+        Self::Memory,
+        Self::Stalled,
+        Self::Stuck,
+        Self::Frozen,
+        Self::Thawed,
+        Self::StallWarned,
+        Self::Signalled,
+        Self::RestartRefused,
+        Self::Note,
+        Self::Sleep,
+        Self::Abandoned,
+    ];
+
+    /// How a line of this word begins (`NOT ESCALATED` is two words).
+    #[must_use]
+    pub const fn printed(self) -> &'static str {
+        match self {
+            Self::Done => "DONE",
+            Self::Left => "LEFT",
+            Self::Parked => "PARKED",
+            Self::Unparked => "UNPARKED",
+            Self::Halted => "HALTED",
+            Self::Unhalted => "UNHALTED",
+            Self::Refused => "REFUSED",
+            Self::Held => "HELD",
+            Self::HoldEnded => "HOLD-ENDED",
+            Self::Adopted => ADOPTED,
+            Self::Kept => "KEPT",
+            Self::Watching => "WATCHING",
+            Self::Claim => "CLAIM",
+            Self::Claimed => "CLAIMED",
+            Self::NotEscalated => "NOT ESCALATED",
+            Self::Warn => "WARN",
+            Self::Task => "TASK",
+            Self::Fact => "FACT",
+            Self::Launch => "LAUNCH",
+            Self::Host => "HOST",
+            Self::Deferred => "DEFERRED",
+            Self::Memory => "MEMORY",
+            Self::Stalled => "STALLED",
+            Self::Stuck => "STUCK",
+            Self::Frozen => FROZEN,
+            Self::Thawed => "THAWED",
+            Self::StallWarned => "STALL-WARNED",
+            Self::Signalled => "SIGNALLED",
+            Self::RestartRefused => "RESTART-REFUSED",
+            Self::Note => "NOTE",
+            Self::Sleep => "SLEEP",
+            Self::Abandoned => "ABANDONED",
+        }
+    }
+
+    /// The word in lower case, a space as `-` (`not-escalated`): a reader's name for it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Left => "left",
+            Self::Parked => "parked",
+            Self::Unparked => "unparked",
+            Self::Halted => "halted",
+            Self::Unhalted => "unhalted",
+            Self::Refused => "refused",
+            Self::Held => "held",
+            Self::HoldEnded => "hold-ended",
+            Self::Adopted => "adopted",
+            Self::Kept => "kept",
+            Self::Watching => "watching",
+            Self::Claim => "claim",
+            Self::Claimed => "claimed",
+            Self::NotEscalated => "not-escalated",
+            Self::Warn => "warn",
+            Self::Task => "task",
+            Self::Fact => "fact",
+            Self::Launch => "launch",
+            Self::Host => "host",
+            Self::Deferred => "deferred",
+            Self::Memory => "memory",
+            Self::Stalled => "stalled",
+            Self::Stuck => "stuck",
+            Self::Frozen => "frozen",
+            Self::Thawed => "thawed",
+            Self::StallWarned => "stall-warned",
+            Self::Signalled => "signalled",
+            Self::RestartRefused => "restart-refused",
+            Self::Note => "note",
+            Self::Sleep => "sleep",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    /// The word `line` begins with: its [`Self::printed`] form, then a space or the end.
+    #[must_use]
+    pub fn of_line(line: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|w| {
+            line.strip_prefix(w.printed())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+        })
+    }
+}
 
 /// One journaled line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,15 +436,14 @@ impl JournalRecord {
             ended: None,
         };
         let (word, rest) = split_word(line);
+        let Some(word) = Word::of_printed(word) else {
+            rec.summary = line.to_string();
+            return rec;
+        };
+        rec.kind = word.name().to_string();
         let mut tail = rest;
         match word {
-            "EVENT" | "DISMISSED" => {
-                rec.kind = if word == "EVENT" {
-                    "event"
-                } else {
-                    "dismissed"
-                }
-                .to_string();
+            Word::Event | Word::Dismissed => {
                 let (phase, after) = split_word(rest);
                 rec.phase = phase.to_string();
                 tail = after;
@@ -163,30 +465,35 @@ impl JournalRecord {
                     tail = after;
                 }
             }
-            "MAIL" => rec.kind = "mail".to_string(),
-            "APPROVED" => {
-                rec.kind = "approved".to_string();
+            Word::Mail | Word::Reconnect | Word::Timeout | Word::Exit | Word::Extend => {}
+            Word::Approved => {
                 rec.phase = "prompt".to_string();
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
                     tail = after;
                 }
             }
-            "RECONNECT" | "RECONNECTED" => rec.kind = "reconnect".to_string(),
-            "TIMEOUT" => rec.kind = "timeout".to_string(),
-            "EXIT" => rec.kind = "exit".to_string(),
-            "EXTEND" => rec.kind = "extend".to_string(),
-            "ESCALATED" | "CLEARED" => {
-                rec.kind = word.to_ascii_lowercase();
+            Word::Escalated | Word::Cleared => {
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
                     tail = after;
                 }
             }
-            "CONTINUED" | "TYPED" | "RESTARTED" | "WAITING" | "SKIPPED" | "UNVERIFIED"
-            | "LIMITED" | "UNPROVEN" | "DIALOG" | "DECLINED" | "CHOSE" | "EXCEPTION" | "PROBED"
-            | "RESET" | NEEDS => {
-                rec.kind = word.to_ascii_lowercase();
+            Word::Continued
+            | Word::Typed
+            | Word::Restarted
+            | Word::Waiting
+            | Word::Skipped
+            | Word::Unverified
+            | Word::Limited
+            | Word::Unproven
+            | Word::Dialog
+            | Word::Declined
+            | Word::Chose
+            | Word::Exception
+            | Word::Probed
+            | Word::Reset
+            | Word::Needs => {
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
                     tail = after;
@@ -197,8 +504,7 @@ impl JournalRecord {
                     tail = after;
                 }
             }
-            "HOLD" => {
-                rec.kind = "hold".to_string();
+            Word::Hold => {
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
                     tail = after;
@@ -207,8 +513,7 @@ impl JournalRecord {
                 rec.phase = door.to_string();
                 tail = after;
             }
-            "OCCUPANCY" => {
-                rec.kind = "occupancy".to_string();
+            Word::Occupancy => {
                 if let Some((seq, after)) = take_num(rest, "seq") {
                     rec.seq = Some(seq);
                     tail = after;
@@ -217,8 +522,7 @@ impl JournalRecord {
                 rec.phase = measure.strip_prefix("rule=").unwrap_or(measure).to_string();
                 tail = after;
             }
-            "PROBE" => {
-                rec.kind = "probe".to_string();
+            Word::Probe => {
                 let (what, after) = split_word(rest);
                 rec.phase = what.to_string();
                 tail = after;
@@ -227,7 +531,6 @@ impl JournalRecord {
                     tail = after;
                 }
             }
-            _ => tail = line,
         }
         rec.summary = tail.to_string();
         rec
@@ -355,7 +658,9 @@ impl Journal {
         j
     }
 
-    /// Append the record of `line` (see [`JournalRecord::of_line`]), stamped `t_ms`.
+    /// Append the record of `line` (see [`JournalRecord::of_line`]), stamped `t_ms`. A test
+    /// build refuses a line the ledger would read `unread` (`ledger::assert_marked`): every
+    /// line a loop journals begins with a [`Word`] or a [`Noted`] word.
     pub fn record(&mut self, t_ms: i64, line: &str, warn: &mut dyn Write) -> Option<String> {
         self.record_marked(t_ms, line, None, warn)
     }
@@ -391,6 +696,8 @@ impl Journal {
         ended: Option<i64>,
         warn: &mut dyn Write,
     ) -> Option<String> {
+        #[cfg(test)]
+        super::ledger::assert_marked(line);
         self.path.as_ref()?;
         let mut rec = JournalRecord::of_line(t_ms, self.sid.as_deref(), line, None);
         rec.mark = mark;
@@ -706,6 +1013,34 @@ mod tests {
                 "{line}"
             );
         }
+    }
+
+    /// EVERY WORD IS READ BY ITS OWN NAME: each [`Word`] is the kind of a line that begins
+    /// with its printed form, and of nothing else; its name reads back to it; `RECONNECTED`
+    /// is `reconnect`; NEGATIVE CONTROL: a word in lower case, and a word no line is read by,
+    /// are `other`.
+    #[test]
+    fn every_word_is_read_by_its_own_name() {
+        let mut names: Vec<&str> = Word::ALL.iter().map(|w| w.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), Word::ALL.len(), "two words share a name");
+        for w in Word::ALL {
+            let printed = w.printed();
+            assert_eq!(Word::of_printed(&printed), Some(w), "{printed}");
+            assert_eq!(Word::of_kind(w.name()), Some(w), "{w:?}");
+            let r = JournalRecord::of_line(1, None, &format!("{printed} seq=1 x"), None);
+            assert_eq!(r.kind, w.name(), "{printed}");
+            assert_eq!(Word::of_printed(w.name()), None, "{w:?} in lower case");
+        }
+        assert_eq!(Word::Needs.printed(), NEEDS);
+        assert_eq!(Word::of_printed("RECONNECTED"), Some(Word::Reconnect));
+        for other in ["FROZEN", "ADOPTED", "PROBING", "", "Event"] {
+            assert_eq!(Word::of_printed(other), None, "{other}");
+            let r = JournalRecord::of_line(1, None, &format!("{other} seq=1 x"), None);
+            assert_eq!(r.kind, "other", "{other}");
+        }
+        assert_eq!(Word::of_kind("other"), None);
     }
 
     /// The JSON round-trips, escapes what it must, and prints `null` for what

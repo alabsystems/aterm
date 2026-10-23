@@ -3685,6 +3685,18 @@ pub mod fixtures {
         include_str!("fixtures/claude-2.1.309-tool-error-auto-mode.txt");
     pub const TOOL_PRESTART_PRINTED_2_1_309: &str =
         include_str!("fixtures/claude-2.1.309-tool-prestart-printed-exit0.txt");
+    pub const TOOL_DISK_FULL_60_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-disk-full-printed-60col.txt");
+    pub const TOOL_DISK_FULL_40_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-disk-full-printed-40col.txt");
+    pub const TOOL_PRESTART_PRINTED_EXIT1_60_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-prestart-printed-exit1-60col.txt");
+    pub const TOOL_PRESTART_PRINTED_EXIT1_40_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-prestart-printed-exit1-40col.txt");
+    pub const TOOL_PRESTART_PRINTED_EXIT1_179_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-prestart-printed-exit1-179col.txt");
+    pub const TOOL_PRESTART_PRINTED_EXIT0_179_2_1_309: &str =
+        include_str!("fixtures/claude-2.1.309-tool-prestart-printed-exit0-179col.txt");
     pub const PLAN_READY: &str = include_str!("fixtures/claude-2.1.282-plan-ready.txt");
     pub const PLAN_APPROVAL_60_2_1_300: &str =
         include_str!("fixtures/claude-2.1.300-plan-approval-60col.txt");

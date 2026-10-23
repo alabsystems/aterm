@@ -60,6 +60,8 @@ pub struct ProcSample {
     pub at_ns: Option<u64>,
     /// macOS resource coalition ID (read on split ticks only).
     pub coalition: Option<u64>,
+    /// macOS pid version (`p_idversion`), which a new process and each exec take anew (read on split ticks only).
+    pub version: Option<i32>,
     /// Process start time in Unix ms.
     pub birth_ms: Option<i64>,
 }

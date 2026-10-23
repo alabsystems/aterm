@@ -30,8 +30,7 @@ const PLAN_BYTES: usize = 12;
 const _: () = assert!(PLAN_BYTES == aterm_effects::aos_momentum::plan::PLAN_LEN);
 
 /// What `publish` answers when its ask reaches the main thread without an evaluated plan.
-pub(crate) const UNEVALUATED: &str =
-    "aos publish: no admitted plan came with the ask (the verb evaluates it first)";
+pub(crate) const UNEVALUATED: &str = "aos publish: no admitted plan came with the ask";
 
 /// The refusal every form gets where this build does not host.
 pub(crate) const NEEDS_DEBUG: &str = "aos needs a debug build";

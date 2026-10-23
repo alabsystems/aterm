@@ -70,7 +70,7 @@ pub(crate) fn parse(rest: &str, injection: bool) -> Result<Asked, String> {
     };
     if !injection {
         return Err(
-            "login-notice <code>|end|back needs a development build (dev-seams)".to_string(),
+            "login-notice <code>|disk|end|back needs a development build (dev-seams)".to_string(),
         );
     }
     Ok(asked)
@@ -167,7 +167,7 @@ impl crate::App {
     pub(crate) fn note_login_notice(&mut self, asked: &Asked) -> Result<String, String> {
         let sid = self
             .first_tab_sid()
-            .ok_or_else(|| "no tab holds a session".to_string())?;
+            .ok_or_else(|| "the first tab holds no session".to_string())?;
         for note in notes(asked, &sid) {
             self.note_harness_host(note);
         }

@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aterm_sysprobe::kproc;
+
 use crate::pyjson::{J, PY};
 
 /// The instance's `sandbox-exec` profile.
@@ -547,7 +549,33 @@ pub fn nanos() -> u128 {
 /// `ps [-A|-e] [-p PIDS] -o FIELD[=],…` from the kernel's process records.
 #[must_use]
 pub fn ps_main(args: &[String]) -> i32 {
-    let (mut fields, mut pids, mut every) = (Vec::new(), Vec::new(), false);
+    let (fields, rows) = match ps_rows(args, kproc::records, kproc::record) {
+        Ok(chosen) => chosen,
+        Err(why) => {
+            eprintln!("ps: {why}");
+            return 1;
+        }
+    };
+    let now = crate::util::now_secs();
+    let mut out = String::new();
+    for r in &rows {
+        out.push_str(&ps_line(r, &fields, now));
+        out.push('\n');
+    }
+    let _ = std::io::stdout().write_all(out.as_bytes());
+    i32::from(rows.is_empty())
+}
+
+/// The `-o` fields `args` ask for and the records they choose, as `ps` chooses them: every
+/// process (`all`) with `-A` or `-e` or with no `-p`, else each pid `-p` lists (`one`), pid 0
+/// never. A `-p` list holds pids split by commas and spaces; an empty one, or a word that is no
+/// pid, is refused.
+fn ps_rows(
+    args: &[String],
+    all: impl FnOnce() -> Option<Vec<kproc::Record>>,
+    one: impl FnMut(u32) -> Option<kproc::Record>,
+) -> Result<(Vec<String>, Vec<kproc::Record>), String> {
+    let (mut fields, mut pids, mut every) = (Vec::new(), None::<Vec<u32>>, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -560,45 +588,47 @@ pub fn ps_main(args: &[String]) -> i32 {
                     .filter(|f| !f.is_empty())
                     .map(|f| f.trim_end_matches('=').to_string()),
             ),
-            "-p" => pids.extend(
-                it.next()
-                    .map(String::as_str)
-                    .unwrap_or("")
-                    .split([',', ' '])
-                    .filter_map(|p| p.parse::<i32>().ok()),
-            ),
+            "-p" => {
+                let listed = pids.get_or_insert_with(Vec::new);
+                for piece in it.next().map(String::as_str).unwrap_or("").split(',') {
+                    if piece.trim().is_empty() {
+                        return Err("Invalid (zero-length) process id".to_string());
+                    }
+                    for word in piece.split_whitespace() {
+                        let pid = word
+                            .parse::<u32>()
+                            .map_err(|_| format!("Invalid process id: {word}"))?;
+                        listed.push(pid);
+                    }
+                }
+            }
             _ => {}
         }
     }
-    let rows: Vec<crate::sys::ProcRow> = if every || pids.is_empty() {
-        crate::sys::all_pids()
-            .into_iter()
-            .filter_map(crate::sys::proc_row)
-            .collect()
-    } else {
-        pids.into_iter().filter_map(crate::sys::proc_row).collect()
+    let rows = match pids.filter(|_| !every) {
+        Some(pids) => pids.into_iter().filter_map(one).collect(),
+        None => all().unwrap_or_default(),
     };
-    let now = crate::util::now_secs();
-    let mut out = String::new();
-    for p in &rows {
-        let cells: Vec<String> = fields
-            .iter()
-            .map(|f| match f.as_str() {
-                "pid" => p.pid.to_string(),
-                "ppid" => p.ppid.to_string(),
-                "pgid" => p.pgid.to_string(),
-                "tpgid" => p.tpgid.to_string(),
-                "tty" | "tt" => crate::sys::tty_name(p.tdev),
-                "lstart" => lstart(p.start),
-                "etime" => etime(now - p.start),
-                _ => p.comm.clone(),
-            })
-            .collect();
-        out.push_str(&cells.join(" "));
-        out.push('\n');
-    }
-    let _ = std::io::stdout().write_all(out.as_bytes());
-    i32::from(rows.is_empty())
+    Ok((fields, rows.into_iter().filter(|r| r.pid > 0).collect()))
+}
+
+/// One `ps -o` line for `r`, its `fields` in order, `etime` measured at `now` (unix seconds).
+fn ps_line(r: &kproc::Record, fields: &[String], now: i64) -> String {
+    let start = i64::try_from(r.start_s).unwrap_or(0);
+    fields
+        .iter()
+        .map(|f| match f.as_str() {
+            "pid" => r.pid.to_string(),
+            "ppid" => r.ppid.to_string(),
+            "pgid" => r.pgid.to_string(),
+            "tpgid" => r.tpgid.to_string(),
+            "tty" | "tt" => crate::sys::tty_name(r.tty),
+            "lstart" => lstart(start),
+            "etime" => etime(now - start),
+            _ => r.comm.clone(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `ps`'s `lstart`: `%a %b %e %H:%M:%S %Y` in local time (`TZ` honoured).
@@ -729,6 +759,74 @@ pub const MCP_ECHO_TOOL: &str = "lab_echo";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `ps -o` line is the kernel record's fields in the order asked, a process with no
+    /// terminal at `??` and its elapsed time from its start.
+    #[test]
+    fn a_ps_line_reads_the_kernel_record() {
+        let r = kproc::Record {
+            pid: 4242,
+            ppid: 1,
+            pgid: 4240,
+            tpgid: 0,
+            tty: None,
+            uid: 501,
+            comm: "zsh".to_string(),
+            start_s: 1_000,
+            start_us: 7,
+            zombie: false,
+        };
+        let fields: Vec<String> = ["pid", "ppid", "pgid", "tty", "etime", "comm"]
+            .iter()
+            .map(|f| (*f).to_string())
+            .collect();
+        assert_eq!(ps_line(&r, &fields, 1_065), "4242 1 4240 ?? 01:05 zsh");
+        assert_eq!(ps_line(&r, &["tpgid".to_string()], 1_065), "0");
+    }
+
+    /// `-p` chooses exactly the pids it lists, as `ps` does: pid 0 (`kernel_task`, which the
+    /// kernel's table does hold) is never a row, and a list that names no pid is refused rather
+    /// than read as no `-p` at all. Without `-p`, or with `-A`, every process is chosen.
+    #[test]
+    fn the_pid_list_chooses_exactly_its_pids() {
+        let record = |pid: u32| kproc::Record {
+            pid,
+            ppid: 1,
+            pgid: 0,
+            tpgid: 0,
+            tty: None,
+            uid: 501,
+            comm: format!("p{pid}"),
+            start_s: 1,
+            start_us: 0,
+            zombie: false,
+        };
+        let every = || Some(vec![record(0), record(1), record(7), record(8)]);
+        let chosen = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+            ps_rows(&args, every, |pid| Some(record(pid)))
+                .map(|(_, rows)| rows.iter().map(|r| r.pid).collect::<Vec<_>>())
+        };
+        assert_eq!(chosen(&["-p", "7,8", "-o", "pid="]), Ok(vec![7, 8]));
+        assert_eq!(chosen(&["-p", "7  8"]), Ok(vec![7, 8]), "spaces split too");
+        assert_eq!(chosen(&["-p", "7", "-p", "8"]), Ok(vec![7, 8]));
+        assert_eq!(chosen(&["-p", "0"]), Ok(vec![]), "pid 0 is no row");
+        assert_eq!(
+            chosen(&["-o", "pid="]),
+            Ok(vec![1, 7, 8]),
+            "no -p: every process"
+        );
+        assert_eq!(chosen(&["-A", "-p", "7"]), Ok(vec![1, 7, 8]));
+        for refused in ["", "-1", "abc", "7,,8"] {
+            assert!(chosen(&["-p", refused]).is_err(), "-p {refused:?}");
+        }
+        assert!(chosen(&["-p"]).is_err(), "-p with no list");
+        let (fields, _) = ps_rows(&["-o".to_string(), "pid=,ppid=".to_string()], every, |_| {
+            None
+        })
+        .expect("fields");
+        assert_eq!(fields, ["pid", "ppid"]);
+    }
 
     #[test]
     fn a_request_reads_its_last_user_text_and_a_trailing_tool_output() {

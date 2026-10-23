@@ -180,3 +180,116 @@ mod live {
         );
     }
 }
+
+/// A kept coalition id is read again only where its pid's version moved (an exec, or a new
+/// process at a reused pid), where the last read missed, or with no version; a pid a sweep did
+/// not ask about is dropped. NEGATIVE CONTROL: with the version unchanged, the kept id stands
+/// though the stand-in kernel's answer moved, so each read again here is the version's doing.
+#[test]
+fn a_kept_coalition_is_read_again_only_when_its_pid_version_moved() {
+    use std::cell::Cell;
+    let kernel = Cell::new(Some(307));
+    let reads = Cell::new(0);
+    let read = || {
+        reads.set(reads.get() + 1);
+        kernel.get()
+    };
+    let mut ids = CoalitionIds::default();
+    let mut sweep = |asks: &[(u32, Option<i32>)]| {
+        ids.begin_sweep();
+        let got: Vec<Option<u64>> = asks.iter().map(|&(pid, v)| ids.of(pid, v, read)).collect();
+        ids.end_sweep();
+        (got, ids.len())
+    };
+    assert_eq!(sweep(&[(387, Some(10))]), (vec![Some(307)], 1));
+    kernel.set(Some(491));
+    assert_eq!(
+        sweep(&[(387, Some(10))]),
+        (vec![Some(307)], 1),
+        "kept: no exec"
+    );
+    assert_eq!(reads.take(), 1);
+
+    assert_eq!(sweep(&[(387, Some(11))]), (vec![Some(491)], 1), "an exec");
+    assert_eq!(sweep(&[(387, Some(11))]), (vec![Some(491)], 1));
+    assert_eq!(reads.take(), 1, "read once after the exec, then kept");
+
+    kernel.set(Some(500));
+    assert_eq!(
+        sweep(&[(387, Some(40))]),
+        (vec![Some(500)], 1),
+        "a new process at the pid"
+    );
+    assert_eq!(
+        sweep(&[]),
+        (vec![], 0),
+        "a pid no sweep asked about is dropped"
+    );
+    assert_eq!(
+        sweep(&[(387, Some(40))]),
+        (vec![Some(500)], 1),
+        "and read again once back"
+    );
+    assert_eq!(reads.take(), 2);
+
+    kernel.set(None);
+    assert_eq!(
+        sweep(&[(9, Some(5))]),
+        (vec![None], 0),
+        "a miss is not kept"
+    );
+    kernel.set(Some(12));
+    assert_eq!(
+        sweep(&[(9, Some(5))]),
+        (vec![Some(12)], 1),
+        "and asked again"
+    );
+    assert_eq!(
+        sweep(&[(9, None)]),
+        (vec![Some(12)], 0),
+        "no version: read, not kept"
+    );
+    assert_eq!(sweep(&[(9, None)]), (vec![Some(12)], 0));
+    assert_eq!(reads.take(), 4);
+}
+
+/// A SWEEP KEEPS NO COALITION ITS PID'S VERSION MOVED ACROSS ([`CoalitionIds::read`]): where the
+/// version read after the coalition is not the one read before it (an exec, or a new process at
+/// the pid, between the reads), the read answers `None` and keeps nothing, so the next sweep reads
+/// the coalition again. NEGATIVE CONTROL: with the version the same across the read, the id is
+/// kept and the next sweep reads no coalition.
+#[test]
+fn a_coalition_read_its_pid_version_moved_across_is_not_kept() {
+    use std::cell::Cell;
+    let reads = Cell::new(0);
+    let coalition = || {
+        reads.set(reads.get() + 1);
+        Some(307)
+    };
+    let mut ids = CoalitionIds::default();
+    let mut sweep = |versions: &[i32]| {
+        let mut versions = versions.iter().copied();
+        ids.begin_sweep();
+        let got = ids.read(387, || versions.next(), coalition);
+        ids.end_sweep();
+        (got, ids.kept(387), versions.next())
+    };
+    assert_eq!(
+        sweep(&[10, 11]),
+        ((None, Some(10)), None, None),
+        "an exec between the reads: nothing kept"
+    );
+    assert_eq!(reads.take(), 1);
+    assert_eq!(
+        sweep(&[11, 11]),
+        ((Some(307), Some(11)), Some((11, 307)), None),
+        "read again, the version the same across it: kept"
+    );
+    assert_eq!(reads.take(), 1);
+    assert_eq!(
+        sweep(&[11, 11]),
+        ((Some(307), Some(11)), Some((11, 307)), Some(11)),
+        "kept: the version read once, the coalition not at all"
+    );
+    assert_eq!(reads.take(), 0);
+}

@@ -93,11 +93,11 @@ impl<'a, S: AsRef<OsStr>> BrokerArgs<'a, S> {
         Ok(out)
     }
 
-    /// Confirms that the first positional word is the broker's socket path.
-    pub fn serves_endpoint(&self, endpoint: &str) -> bool {
+    /// Whether the first positional word, the broker's socket path, names `endpoint`.
+    pub fn serves(&self, endpoint: &aterm_uds::holders::SocketPath) -> bool {
         self.words
             .first()
-            .is_some_and(|word| word.as_ref() == endpoint)
+            .is_some_and(|word| endpoint.names(word.as_ref().as_encoded_bytes()))
     }
 
     /// Pure serving syntax only; the secret's bytes remain the execution lane's check.
@@ -152,8 +152,9 @@ mod tests {
             parsed.serving_durability(),
             Some(crate::durability::default_for(true))
         );
-        assert!(parsed.serves_endpoint("socket"));
-        assert!(!parsed.serves_endpoint("relaxed"));
+        let at = |path: &str| aterm_uds::holders::SocketPath::of(std::path::Path::new(path));
+        assert!(parsed.serves(&at("socket")));
+        assert!(!parsed.serves(&at("relaxed")));
         let opaque = [
             "--secret-file",
             "--help",
@@ -203,7 +204,11 @@ mod tests {
         assert_eq!(parsed.lifeline_fd.copied(), Some("0"));
         assert_eq!(parsed.lifeline_at, Some(4), "its place among the words");
         assert_eq!(parsed.words, vec![&"/r/bus.sock", &"/r/bus.log"]);
-        assert!(parsed.serves_endpoint("/r/bus.sock"));
+        assert!(
+            parsed.serves(&aterm_uds::holders::SocketPath::of(std::path::Path::new(
+                "/r/bus.sock"
+            )))
+        );
         assert_eq!(
             parsed.serving_durability(),
             Some(crate::durability::default_for(true))

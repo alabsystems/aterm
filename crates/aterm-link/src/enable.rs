@@ -1817,13 +1817,18 @@ fn binary_has_link(p: &Paths) -> Result<(), String> {
 }
 
 /// Reach the broker for real, through the report's own probe.
-pub(crate) fn probe(
+pub(crate) fn probe(p: &Paths, node: &str) -> fabric::BrokerView {
+    reach_with(p, node, |cfg| fabric::probe_broker(cfg).0)
+}
+
+/// The report's probe through `reach`, or the view of a bridge command that does not parse.
+fn reach_with(
     p: &Paths,
     node: &str,
-    procs: impl FnOnce() -> Vec<fabric::Proc>,
+    reach: impl FnOnce(&crate::bridge::Config) -> fabric::BrokerView,
 ) -> fabric::BrokerView {
     match fabric::bridge_config(&p.bridge_command(node)) {
-        Ok(cfg) => fabric::probe_broker(&cfg, &procs()).0,
+        Ok(cfg) => reach(&cfg),
         Err(e) => fabric::BrokerView {
             endpoint: p.sock(),
             error: Some(e),
@@ -1833,14 +1838,33 @@ pub(crate) fn probe(
 }
 
 fn wait_for_broker(p: &Paths, node: &str) -> Result<fabric::BrokerView, String> {
+    poll_broker(
+        || poll_reach(p, node),
+        fabric::BrokerView::locate,
+        BIND_DEADLINE,
+    )
+}
+
+/// One poll of the wait: the report's probe naming no process ([`fabric::reach_broker`]).
+fn poll_reach(p: &Paths, node: &str) -> fabric::BrokerView {
+    reach_with(p, node, |cfg| fabric::reach_broker(cfg).0)
+}
+
+/// `reach` every 100 ms until a broker answers, then `name` its process once: the poll itself
+/// connects and names nothing, so no process table is scanned while nothing listens yet.
+fn poll_broker(
+    mut reach: impl FnMut() -> fabric::BrokerView,
+    name: impl FnOnce(&mut fabric::BrokerView),
+    deadline: Duration,
+) -> Result<fabric::BrokerView, String> {
     let started = Instant::now();
     loop {
-        let mut view = probe(p, node, Vec::new);
+        let mut view = reach();
         if view.read_ok() {
-            view.locate(&fabric::process_table());
+            name(&mut view);
             return Ok(view);
         }
-        if started.elapsed() > BIND_DEADLINE {
+        if started.elapsed() > deadline {
             return Err(view.error.unwrap_or_else(|| "no answer".to_string()));
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -2033,7 +2057,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
     let label = p.label();
     match service {
         Service::None => {
-            let view = probe(p, node, fabric::process_table);
+            let view = probe(p, node);
             let kept;
             let p = match view.durability {
                 Some(running) if !named && running != p.tier() => {
@@ -2090,7 +2114,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
                 LaunchdJob::Loaded(pid) => pid,
                 LaunchdJob::Absent => None,
             };
-            let view = probe(p, node, fabric::process_table);
+            let view = probe(p, node);
             let stale = not_current(p, &view);
             if same && running.is_some() && view.read_ok() && stale.is_none() {
                 out.already("plist", &plist.display().to_string());
@@ -2182,7 +2206,7 @@ fn broker_step(p: &Paths, node: &str, service: Service, named: bool, out: &mut O
             let text = p.unit_text();
             let same = std::fs::read(&unit).is_ok_and(|old| old == text.as_bytes());
             let running = systemd_main_pid(&label);
-            let view = probe(p, node, fabric::process_table);
+            let view = probe(p, node);
             if same && running.is_some() && view.read_ok() && not_current(p, &view).is_none() {
                 out.already(
                     "broker",
@@ -4032,6 +4056,80 @@ mod tests {
         aterm_types::fabric_command::split_line(line)
     }
 
+    /// The wait for a starting broker connects until one answers and names its process once,
+    /// after it answers: no poll that finds nothing names anything.
+    #[test]
+    fn the_wait_names_the_broker_once_it_answers() {
+        let answered = || fabric::BrokerView {
+            reachable: true,
+            attached: true,
+            head: Some(0),
+            ..fabric::BrokerView::default()
+        };
+        let polls = std::cell::Cell::new(0);
+        let named = std::cell::RefCell::new(Vec::new());
+        let view = poll_broker(
+            || {
+                polls.set(polls.get() + 1);
+                if polls.get() < 3 {
+                    fabric::BrokerView::default()
+                } else {
+                    answered()
+                }
+            },
+            |view: &mut fabric::BrokerView| {
+                named.borrow_mut().push(polls.get());
+                view.pid = Some(71);
+            },
+            Duration::from_secs(60),
+        )
+        .expect("an answer on the third poll");
+        assert_eq!(
+            named.take(),
+            [3],
+            "named once, after the poll that answered"
+        );
+        assert_eq!(view.pid, Some(71));
+        let silent = poll_broker(
+            || fabric::BrokerView {
+                error: Some("connect: refused".to_string()),
+                ..fabric::BrokerView::default()
+            },
+            |_: &mut fabric::BrokerView| panic!("a broker that never answered was named"),
+            Duration::ZERO,
+        );
+        assert_eq!(silent.err().as_deref(), Some("connect: refused"));
+    }
+
+    /// The wait's poll connects and names no process, though the listener scan finds this
+    /// process holding the socket it reached. The test reads the scan's holders rather than the
+    /// one broker it names: a child another test is spawning can hold a copy of the listener
+    /// until its exec closes it.
+    #[cfg(unix)]
+    #[test]
+    fn the_waits_poll_names_no_process() {
+        let dir = aterm_tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let p = paths_at(&dir.path().join("root"));
+        std::fs::create_dir(&p.root).expect("the root");
+        let listener = std::os::unix::net::UnixListener::bind(p.sock()).expect("bind");
+        let closer = std::thread::spawn(move || {
+            drop(listener.accept());
+            listener
+        });
+        let polled = poll_reach(&p, "n-a");
+        assert!(!polled.read_ok(), "{polled:?}");
+        assert_eq!(polled.pid, None, "the poll names nothing: {polled:?}");
+        let scan = aterm_uds::holders::scan_listener_holders(Path::new(&p.sock()), &[])
+            .expect("the listener scan");
+        assert!(
+            scan.holders.contains(&std::process::id()),
+            "the scan finds this process holding the listener the poll reached: {scan:?}"
+        );
+        drop(closer.join().expect("the closer"));
+    }
+
     #[test]
     fn running_bridge_sees_a_stale_one_and_a_bare_pid() {
         let inst = |fabric: Option<&str>, supervised, pids: Vec<u32>| fabric::InstanceView {
@@ -4378,12 +4476,12 @@ mod tests {
         assert!(!bare.plist_is_current(&strict.plist_text()));
         assert!(relaxed.plist_is_current(&relaxed.plist_text()));
         let sock = bare.sock();
-        let ps = fabric::Proc {
-            pid: 7,
-            ppid: 1,
-            cmd: argv.join(" "),
-        };
-        assert_eq!(fabric::broker_pid(&[ps], &sock), Some(7));
+        assert!(
+            crate::broker_args::BrokerArgs::from_invocation(&argv).is_some_and(|args| args.serves(
+                &aterm_uds::holders::SocketPath::of(std::path::Path::new(&sock))
+            )),
+            "the job's argv serves the broker socket: {argv:?}"
+        );
         assert_eq!(Durability::of_argv(&argv), Durability::Relaxed);
         assert!(unit_argv(&relaxed.unit_text()).is_some_and(|w| w == argv));
 

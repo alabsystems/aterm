@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Andrew Yates
+
+[package]
+name = "aterm-vz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Linux lane's own VM (docs/DESIGN-vz-guest-2026-10-23.md): Ubuntu's pinned image, the in-house gunzip of its kernel, and the base, baked and live disk layers made with APFS clones; the helper and the agent client join it in later slices"
+
+# The image and the disks (the design's slice V3). It loads no framework: the
+# helper that opens Virtualization.framework is V2's dev-only `[[bin]]`, and
+# it will `dlopen` the framework, so linking this library never loads it.
+[dependencies]
+# The image pins' provider rows (`host::TOOLS`' `ubuntu-root` and
+# `ubuntu-kernel`, placed by `verify provision --linux`) and their resolver;
+# `spawnfd::command` and its one-minute detector for `hdiutil`, and
+# `os_path!` for its absolute path; the host user's name and uid for the seed.
+aterm-uds = { workspace = true }
+# A volume's free bytes for the free-space floor at every bring-up
+# (`volumes::read_path`).
+aterm-sysprobe = { workspace = true }
+# The in-house gunzip of the pinned `vmlinuz` to the arm64 `Image`
+# (`inflate::stream::GzipReader`, which checks the CRC and the length).
+aterm-codec = { workspace = true }
+# The SHA-256 the gunzipped `Image` and the initrd are held to.
+aterm-digest = { workspace = true }
+# The seed's fingerprint: FNV-1a/64, as the guest plan's fingerprint is.
+aterm-hash = { workspace = true }
+# The seal and the live record finish their writes durably (`clippy.toml`
+# bans a bare `sync_all`).
+aterm-durable = { workspace = true }
+# The live record's reader (`Table`'s `FromStr`, no derive: the library's
+# graph holds no proc macro).
+aterm-toml = { workspace = true }
+# Scratch directories the kernel and the seed are laid in before their one
+# rename into place.
+aterm-tempfile = { workspace = true }
+# The record's clock (Unix seconds).
+aterm-time = { workspace = true }
+# The placed rows' `stamp.json`, which holds the base and the kernel to their pin
+# (`Value`, no derive).
+aterm-json = { workspace = true }
+
+[dev-dependencies]
+# The tooling cache's reclaim, which the tests hold to keeping a row the lane
+# reads at every bring-up (`build_cache::tooling::plan`).
+atpkg = { workspace = true }
+
+[lints]
+workspace = true

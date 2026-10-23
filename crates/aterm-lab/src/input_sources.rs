@@ -159,7 +159,7 @@ impl Record {
         let pid = i32::try_from(std::process::id()).unwrap_or(0);
         Record {
             pid,
-            start: crate::sys::proc_row(pid).map_or(0, |r| r.start),
+            start: start_s(pid).unwrap_or(0),
             selected,
             enabled: Vec::new(),
             prefs,
@@ -168,8 +168,13 @@ impl Record {
 
     /// Whether the run that wrote it still runs.
     fn live(&self) -> bool {
-        crate::sys::proc_row(self.pid).is_some_and(|r| r.start == self.start)
+        start_s(self.pid) == Some(self.start)
     }
+}
+
+/// When `pid` started, in unix seconds ([`aterm_uds::process::read_process_birth`]).
+fn start_s(pid: i32) -> Option<i64> {
+    aterm_uds::process::read_process_birth(pid).and_then(|b| i64::try_from(b.seconds).ok())
 }
 
 fn read(path: &Path) -> Result<Option<Record>, String> {

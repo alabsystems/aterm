@@ -49,6 +49,20 @@ pub enum Engine {
     Webkit,
 }
 
+/// What an unpacked row's pinned file is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Holds {
+    /// A program: held to its execute bit.
+    Program,
+    /// A disk image the Linux lane's VM clones (`aterm_vz::pins`): held to being a regular
+    /// file of its size, there and whenever the row is read in place, and made read-only
+    /// (0444), since nothing writes it.
+    Image {
+        /// Its size in bytes.
+        bytes: u64,
+    },
+}
+
 /// How a row is installed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Install {
@@ -62,6 +76,19 @@ pub enum Install {
         anchor: Anchor,
         /// Required files in the unpacked tree (e.g. license notices).
         keep: &'static [&'static str],
+        /// The most the tree may hold, in bytes: `None` is the shared cap, sized for the
+        /// tool rows; a row whose tree outgrows it names its own, by the same rule.
+        cap: Option<u64>,
+        /// What the pin's file (its tool row's `exe`) is.
+        holds: Holds,
+    },
+    /// Upstream files, no archive: each fetched for the host, held to its size and sha256,
+    /// kept read-only (0444) under its URL's last segment, and placed together; the row is
+    /// in place only while every file is there at its size. The tool row's `exe` names the
+    /// first.
+    Files {
+        /// The files, each for its host.
+        files: &'static [Archive],
     },
     /// Upstream source tarball built with Trust (`targo --unverified build --release --locked --no-default-features`).
     Build {
@@ -131,13 +158,37 @@ impl Row {
             _ => None,
         }
     }
+
+    /// The files an [`Install::Files`] row fetches for `platform`, in order (none for any
+    /// other row).
+    #[must_use]
+    pub fn files_for(&self, platform: &str) -> Vec<Archive> {
+        match self.install {
+            Install::Files { files } => files
+                .iter()
+                .filter(|f| f.platform == platform)
+                .copied()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// An [`aterm_vz::pins::File`] as the row's archive for the Linux lane's one host.
+const fn ubuntu(file: aterm_vz::pins::File) -> Archive {
+    Archive {
+        platform: aterm_vz::pins::PLATFORM,
+        url: file.url,
+        sha256: file.sha256,
+        bytes: file.bytes,
+    }
 }
 
 /// Microsoft's Apple Developer ID team signing the PowerShell archives.
 pub const MICROSOFT_TEAM: &str = "UBF8T346G9";
 
 /// Every row, in the order a run provides them.
-pub const ROWS: [Row; 9] = [
+pub const ROWS: [Row; 11] = [
     Row {
         name: "rustup",
         tool: Some("rustup"),
@@ -207,6 +258,8 @@ pub const ROWS: [Row; 9] = [
                 team: MICROSOFT_TEAM,
             },
             keep: &["LICENSE.txt", "ThirdPartyNotices.txt"],
+            cap: None,
+            holds: Holds::Program,
         },
     },
     Row {
@@ -230,6 +283,8 @@ pub const ROWS: [Row; 9] = [
             strip: 1,
             anchor: Anchor::Sha256,
             keep: &[],
+            cap: None,
+            holds: Holds::Program,
         },
     },
     Row {
@@ -268,6 +323,32 @@ pub const ROWS: [Row; 9] = [
             strip: 0,
             anchor: Anchor::Sha256,
             keep: &[],
+            cap: None,
+            holds: Holds::Program,
+        },
+    },
+    Row {
+        name: "ubuntu-root",
+        tool: Some("ubuntu-root"),
+        install: Install::Unpack {
+            archives: &[ubuntu(aterm_vz::pins::ROOT_ARCHIVE)],
+            strip: 0,
+            anchor: Anchor::Sha256,
+            keep: &[aterm_vz::pins::ROOT_MEMBER],
+            cap: Some(aterm_vz::pins::ROOT_CAP),
+            holds: Holds::Image {
+                bytes: aterm_vz::pins::ROOT_MEMBER_BYTES,
+            },
+        },
+    },
+    Row {
+        name: "ubuntu-kernel",
+        tool: Some("ubuntu-kernel"),
+        install: Install::Files {
+            files: &[
+                ubuntu(aterm_vz::pins::VMLINUZ),
+                ubuntu(aterm_vz::pins::INITRD),
+            ],
         },
     },
     Row {

@@ -7360,10 +7360,12 @@ impl PetBrain {
             rgb: None,
         }; PET_MOTES_MAX];
         let mut live_len = 0usize;
+        let mut max_live_end = f64::NEG_INFINITY;
         for m in self.motes.into_iter().flatten() {
             if matches!(m.kind, PetMoteKind::Note | PetMoteKind::Heart)
                 && m.note_geom(self.clock).is_some()
             {
+                max_live_end = max_live_end.max(m.born + f64::from(m.life.max(0.01)));
                 live[live_len] = m;
                 live_len += 1;
             }
@@ -7384,12 +7386,11 @@ impl PetBrain {
         let mut clear_of_them = None;
         for &(along, up) in &NOTE_LANES {
             let at = (col + dir * along * step, row - up);
-            if live.is_empty()
-                && max_dest <= grid_w
+            let safe_inside = max_dest <= grid_w
                 && max_dest <= grid_h
                 && ((at.0 - max_drift) * cell_w_f).floor() as i32 - max_half >= 0
-                && ((at.0 + max_drift) * cell_w_f).ceil() as i32 + max_half <= grid_w
-            {
+                && ((at.0 + max_drift) * cell_w_f).ceil() as i32 + max_half <= grid_w;
+            if live.is_empty() && safe_inside {
                 return at;
             }
             let born = Mote {
@@ -7406,25 +7407,31 @@ impl PetBrain {
             let mut inside = true;
             for k in 0..ticks {
                 let clock = self.clock + f64::from(k) / 60.0;
+                if safe_inside && clock >= max_live_end {
+                    break;
+                }
                 let Some((centre, scale)) = born.note_geom(clock) else {
                     break;
                 };
                 let Some(b) = mote_box_px(centre, scale, cell, grid) else {
                     continue;
                 };
-                let half = (i32::from(b.2) + 1) / 2;
-                let cx = (centre.0 * cell_w_f).round() as i32;
-                inside &= cx - half >= 0 && cx + half <= grid_w;
-                meets |= live.iter().any(|m| {
-                    m.note_geom(clock)
-                        .and_then(|(c, s)| mote_box_px(c, s, cell, grid))
-                        .is_some_and(|o| {
-                            b.0 < o.0 + i32::from(o.2)
-                                && o.0 < b.0 + i32::from(b.2)
-                                && b.1 < o.1 + i32::from(o.2)
-                                && o.1 < b.1 + i32::from(b.2)
-                        })
-                });
+                if !safe_inside {
+                    let half = (i32::from(b.2) + 1) / 2;
+                    let cx = (centre.0 * cell_w_f).round() as i32;
+                    inside &= cx - half >= 0 && cx + half <= grid_w;
+                }
+                meets |= clock < max_live_end
+                    && live.iter().any(|m| {
+                        m.note_geom(clock)
+                            .and_then(|(c, s)| mote_box_px(c, s, cell, grid))
+                            .is_some_and(|o| {
+                                b.0 < o.0 + i32::from(o.2)
+                                    && o.0 < b.0 + i32::from(b.2)
+                                    && b.1 < o.1 + i32::from(o.2)
+                                    && o.1 < b.1 + i32::from(b.2)
+                            })
+                    });
                 if meets || (!inside && (live.is_empty() || clear_of_them.is_some())) {
                     break;
                 }
@@ -7478,6 +7485,9 @@ impl PetBrain {
 
     fn resolve_motes(&mut self) -> [Option<PetMoteSprite>; PET_MOTES_MAX] {
         let mut out = [None; PET_MOTES_MAX];
+        if self.motes.iter().all(Option::is_none) {
+            return out;
+        }
         let clock = self.clock;
         for (i, slot) in out.iter_mut().enumerate() {
             let Some(m) = self.motes[i] else { continue };
@@ -7541,7 +7551,8 @@ impl PetBrain {
                 }
                 PetMoteKind::Note | PetMoteKind::Heart => {
                     let su = look_slice_age(look_slice(u, PURR_MOTE_STEPS), PURR_MOTE_STEPS);
-                    let ((col, row), scale) = m.note_geom(clock).expect("alive: checked above");
+                    let (col, row) = m.drift(u);
+                    let scale = note_scale(su);
                     PetMoteSprite {
                         kind: m.kind,
                         col,
@@ -7586,6 +7597,9 @@ impl PetBrain {
 
     fn resolve_departures(&mut self) -> [Option<PetDepartureSprite>; PET_DEPARTURES_MAX] {
         let mut out = [None; PET_DEPARTURES_MAX];
+        if self.departures.iter().all(Option::is_none) {
+            return out;
+        }
         for (i, slot) in out.iter_mut().enumerate() {
             let Some(d) = self.departures[i] else {
                 continue;

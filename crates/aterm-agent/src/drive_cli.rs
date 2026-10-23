@@ -87,7 +87,7 @@ struct SubArgs {
     out: Option<PathBuf>,
     /// `ledger --since`: Unix ms, from a time word.
     since_ms: Option<i64>,
-    /// `ledger --source anchor|log`: what places its times.
+    /// `ledger --source log|anchor`: what places its times (`anchor` is deprecated).
     source: Option<LedgerSource>,
     /// Positional words (the command text for `classify`, the answer for
     /// `answer`).
@@ -137,8 +137,8 @@ fn parse_sub(verb: &str, args: &[String]) -> Result<SubArgs, String> {
                 );
             }
             s if s == "--source" || s.starts_with("--source=") => {
-                ledgers("--source", "anchor or log")?;
-                let what = "anchor or log";
+                ledgers("--source", "log or anchor")?;
+                let what = "log (the default) or anchor (deprecated)";
                 let v = match s.strip_prefix("--source=") {
                     Some(v) => v.to_string(),
                     None => need("--source", what, it.next())?,
@@ -356,12 +356,7 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
             );
         }
     };
-    let lopts = LedgerOpts {
-        worker,
-        journal: sub.journal.clone(),
-        since_ms: sub.since_ms,
-        source: sub.source.unwrap_or_default(),
-    };
+    let lopts = ledger_opts(&sub, worker);
     let mut client = CtlClient::own_at(crate::own_exe()?, opts.socket.clone());
     let mut anchor = clock_anchor;
     let mut host = LedgerHost {
@@ -377,6 +372,17 @@ fn ledger_verb(opts: &Opts, args: &[String]) -> Result<Reply, String> {
             write_private(path, &text)?;
             Ok(Reply::text(format!("wrote {}\n", path.display())))
         }
+    }
+}
+
+/// What `ledger` reads for `worker`: the session log places its times unless
+/// `--source anchor` (deprecated) says otherwise.
+fn ledger_opts(sub: &SubArgs, worker: String) -> LedgerOpts {
+    LedgerOpts {
+        worker,
+        journal: sub.journal.clone(),
+        since_ms: sub.since_ms,
+        source: sub.source.unwrap_or_default(),
     }
 }
 
@@ -1180,6 +1186,22 @@ mod tests {
             let err = parse_sub("ledger", &args(&[gone])).expect_err(gone);
             assert!(err.contains(&format!("unknown option '{gone}'")), "{err}");
         }
+    }
+
+    /// `ledger` reads the session log unless `--source anchor` (deprecated) is named.
+    #[test]
+    fn the_ledger_reads_the_log_unless_told_otherwise() {
+        let source = |words: &[&str]| {
+            let sub = parse_sub("ledger", &args(words)).expect("parses");
+            ledger_opts(&sub, "@s-1".to_string()).source
+        };
+        assert_eq!(source(&["@s-1"]), LedgerSource::Log, "the default");
+        assert_eq!(source(&["@s-1", "--source", "log"]), LedgerSource::Log);
+        assert_eq!(
+            source(&["@s-1", "--source=anchor"]),
+            LedgerSource::Anchor,
+            "the deprecated path, by name"
+        );
     }
 
     #[test]

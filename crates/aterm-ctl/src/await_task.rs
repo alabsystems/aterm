@@ -24,8 +24,8 @@ pub(crate) const LEG_MAX: Duration = Duration::from_secs(600);
 /// What a leg's socket may take beyond the wait it asked for: the reply's own write.
 pub(crate) const LEG_SLACK: Duration = Duration::from_secs(30);
 
-const USAGE: &str = "ERR usage: aterm ctl [@<sel>] await task [@<sel>[:<rev>][,@<sel>...]] \
-                     [any|all] [since=<rev>] [timeout=<ms>]";
+const USAGE: &str = "ERR usage: aterm ctl [@<sel>] await task [@<sel>[:<rev>][,...]] [any|all] \
+                     [since=<rev>] [timeout=<ms>]";
 
 /// Whether `parts` (the request, `@self` expanded) is `[@<sel>] await task …`.
 pub(crate) fn is_await_task(parts: &[String]) -> bool {
@@ -494,7 +494,7 @@ fn run_group(
                 match policy.after_hangup(&group.sock, server, listener, until) {
                     redial::Hangup::Successor { path, pid } => {
                         let _ = stderr_line(&format!(
-                            "{} during the wait; waiting on its successor",
+                            "{} during the wait; still waiting",
                             redial::replaced_words(server.unwrap_or(0), pid, "")
                         ));
                         group.sock = path;
@@ -666,7 +666,7 @@ pub(crate) fn run_driven(
             io::ErrorKind::InvalidInput,
             format!(
                 "await task over the fleet names each worker by its sid (@s-…, as `aterm ctl \
-                 survey --host <h>` shows it): `@{}` names a session of this Mac",
+                 survey --host <h>` shows it); `@{}` is not one",
                 local.selector
             ),
         ));

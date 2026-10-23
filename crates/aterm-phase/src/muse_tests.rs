@@ -662,6 +662,58 @@ fn a_turn_ended_on_any_measured_tool_row_is_over_with_no_words() {
     }
 }
 
+/// Measured Muse 1.4.12 rows lose their expander at narrow widths. A checkmark
+/// and duration still identify the tool row; ordinary reply endings do not.
+#[test]
+fn a_shell_row_cut_to_a_narrow_pane_is_over_with_no_words() {
+    for (cols, text, row) in [
+        (
+            144,
+            TOOL_ROW_BASH_RAN_DESCRIBED,
+            "◆ Ran command · Count the README's lines · ✓ · 0.2s · ctrl+o",
+        ),
+        (
+            50,
+            TOOL_ROW_BASH_RAN_DESCRIBED_50,
+            "◆ Ran command · Count the REA… · ✓ · 0.1s · ctrl+o",
+        ),
+        (
+            40,
+            TOOL_ROW_BASH_RAN_DESCRIBED_40,
+            "◆ Ran command · Count the RE… · ✓ · 0.1s",
+        ),
+        (
+            30,
+            TOOL_ROW_BASH_RAN_DESCRIBED_30,
+            "◆ Ran · Count the … · ✓ · 0.2s",
+        ),
+    ] {
+        let rows = screen(text);
+        assert!(rows.iter().any(|r| r == row), "{cols}: the row measured");
+        if cols < 144 {
+            assert_eq!(row.chars().count(), cols, "cut to the pane's width");
+        }
+        assert_eq!(phase(&rows), (Phase::Idle, true), "{cols}");
+        assert_eq!(said_tail(&rows), None, "{cols}");
+        let r = muse(text);
+        assert_eq!(
+            (r.phase, r.phase_authoritative, r.said_tail, r.wall),
+            (Phase::Idle, true, None, None),
+            "{cols}"
+        );
+    }
+    let narrow = screen(TOOL_ROW_BASH_RAN_DESCRIBED_40);
+    for said in [
+        "Ran the suite · it took · 3s",
+        "Ran the tests · ✓",
+        "Ran the build · ✓ · fast",
+    ] {
+        let rows = edited(&narrow, "◆ Ran ", &format!("◆ {said}"));
+        assert_eq!(phase(&rows), (Phase::Idle, true), "{said}");
+        assert_eq!(said_tail(&rows).as_deref(), Some(said));
+    }
+}
+
 #[test]
 fn the_status_rows_first_frame_is_a_turn_running() {
     let rows = screen(BUSY_FIRST_FRAME);

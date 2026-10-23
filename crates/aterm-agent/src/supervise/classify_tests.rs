@@ -7,6 +7,31 @@ fn ro(cmd: &str) -> bool {
     classify_command(cmd).read_only
 }
 
+#[test]
+fn whole_long_option_names_keep_flags_from_hiding_file_operands() {
+    for (line, paths) in [
+        ("jq --slurp . a.json b.json", vec!["a.json", "b.json"]),
+        (
+            "jq -R --slurp . a ~/.ssh/id_rsa",
+            vec!["a", "~/.ssh/id_rsa"],
+        ),
+        ("rg --ignore token ~/.ssh/id_rsa", vec!["~/.ssh/id_rsa"]),
+        (
+            "rg --ignore ~/.ssh/id_rsa ordinary.txt",
+            vec!["ordinary.txt"],
+        ),
+        // Whole value options and the other grammars retain their meanings.
+        ("jq --slurpfile n f.json . a", vec!["f.json", "a"]),
+        ("rg --ignore-file .ignore x f", vec![".ignore", "f"]),
+        ("grep --incl '*.rs' x f", vec!["f"]),
+        ("grep --include '*.rs' x f", vec!["f"]),
+        ("git log --author alice -- file", vec!["file"]),
+        ("git log --auth alice -- file", vec!["alice", "file"]),
+    ] {
+        assert_eq!(path_operands(line).expect(line), paths, "{line}");
+    }
+}
+
 /// Real worker command lines, each with the verdict a person gave it.
 #[test]
 fn the_session_corpus_classifies_as_the_manager_did() {

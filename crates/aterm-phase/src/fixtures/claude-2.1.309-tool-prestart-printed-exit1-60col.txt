@@ -1,0 +1,33 @@
+# claude-code 2.1.309 · MEASURED 2026-10-23, `aterm ctl text` of a private headless aterm (60x50, aterm 0.121.0) running the real Claude Code, launched by path with a scratch `CLAUDE_CONFIG_DIR`, a fake `apiKeyHelper` key and `ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` (a local stub of the API, crates/aterm-lab) · a failed Bash call (exit 1) whose stdout is `Error: ` and the words of 2.1.309's pre-start disk-full notice (its ENOSPC form, dir /private/tmp/claude-502), printed by the command itself: the error result's word wrap of those words, five columns in, in a 60-column pane (the vendor's own notice is drawn on the `⎿` row, not under `Error: Exit code 1`) (`LAB_COLS=60 targo --unverified lab up`, `lab tool` with a heredoc command, `lab turn toolstart`, Yes on its box, then `lab capture`; the banner's scratch project path scrubbed to at.lab0)
+ ▐▛███▛█   Claude Code v2.1.309
+▝▜██████▀  Opus 5.5 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/at.lab0/proj
+
+
+❯ /clear
+
+❯ toolstart
+
+⏺ Bash(cat <<'EOF'
+      Error: The command was not started: this computer's
+      disk is full (ENOSPC) on the volume holding
+      /private/tmp/claude-502 (Claude Code's temporary dir…)
+  ⎿  Error: Exit code 1
+     Error: The command was not started: this computer's
+     disk is full (ENOSPC) on the volume holding
+     /private/tmp/claude-502 (Claude Code's temporary
+     directory), so the file that captures command output
+     could not be created there and nothing ran. Free space
+     on that volume, or restart Claude Code with
+     CLAUDE_CODE_TMPDIR set to a directory on another one,
+     then retry. If this is the user's own computer, tell
+     them before deleting anything to make room.
+
+⏺ Tool call done.
+
+✻ Churned for 0s · done 4:29 AM
+
+────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts    ◐ medium · /effort

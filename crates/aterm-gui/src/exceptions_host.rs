@@ -775,10 +775,9 @@ impl App {
                 command,
             } => {
                 let text = if restarted {
-                    "aterm ended the agent and has not brought it back yet; it is \
-                     still tried"
+                    "aterm ended the agent and has not brought it back yet; aterm still tries"
                 } else {
-                    "the agent exited and its relaunch keeps failing; it is still tried"
+                    "the agent exited and its relaunch keeps failing; aterm still tries"
                 };
                 self.record_message(message_reporters::relaunch_record(sid, &spot.place, text));
                 if command.is_none() && !restarted {

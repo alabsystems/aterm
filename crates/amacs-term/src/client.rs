@@ -15,46 +15,47 @@ use crate::decide::{self, Face, Handoff};
 /// Exit status when the server disappeared with no successor ([`aterm_ctl::EXIT_REPLACED`]).
 pub const EXIT_REPLACED: u8 = aterm_ctl::EXIT_REPLACED;
 
-/// One-line usage synopsis.
+/// The usage line printed after a usage error.
 pub const SYNOPSIS: &str = "usage: amacs [--wait | --no-wait] [-nw | --tty] [+LINE[:COL]] FILE...";
 
-/// Help text for `amacs --help` and `aterm edit --help`.
+/// Help text for `amacs --help`, `aterm edit --help` and `aterm amacs --help`.
 pub const HELP: &str = "\
 amacs - aterm's editor (`aterm edit` is the same command)
 
 USAGE:
     amacs [--wait | --no-wait] [-nw | --tty] [+LINE[:COL]] FILE...
 
-In a tab of an aterm window, each FILE opens in a fresh Editor tab beside this
-one, and amacs waits, printing nothing, until that tab is closed; then the next
-FILE opens. That makes it an $EDITOR for `git commit`, `crontab -e` and an
-agent's editor key: close the tab when you are done, and the file on disk is
-the answer. A FILE that does not exist yet is created by its first save.
+In an aterm tab, each FILE opens in a new Editor tab to the right of this one,
+and amacs waits, printing nothing, until that tab closes; then the next FILE
+opens. That makes it an $EDITOR for `git commit`, `crontab -e` or an agent's
+editor key: close the tab when done, and the file on disk is the answer. A
+FILE that does not exist yet is created by its first save.
 
 OPTIONS:
-    +LINE[:COL]   put the caret on LINE (and column COL) of the FILE after it
-    --wait        open the window view and wait even when stdin or stdout is
-                  not a terminal
-    --no-wait     open the window view and return at once
-    -nw, --tty    edit in this terminal instead of a window tab
+    +LINE[:COL]   put the caret on LINE (and column COL) of the next FILE
+    --wait        use the Editor tab and wait even when stdin or stdout is not
+                  a terminal
+    --no-wait     hand each FILE to an Editor tab and return at once
+    -nw, --tty    edit in this terminal instead of an Editor tab
     -h, --help    print this help
-    --            every argument after it is a FILE
+    --            every later argument is a FILE
 
-OUTSIDE A WINDOW (over ssh, in tmux or screen, with -nw, or when the window
-will not take a FILE), amacs edits in the terminal itself, with the same
-Emacs keys: C-x C-s saves, C-x C-c closes the file (asking first when it has
-unsaved changes), C-c C-c saves and closes, C-c C-k closes without saving,
-C-g cancels, C-z suspends. A save refuses when the file changed on disk since
-it was read: C-x C-s again overwrites it, M-x revert-buffer reloads it.
+IN THE TERMINAL (outside an aterm tab, over ssh, in tmux or screen, with -nw,
+or once the window refuses a FILE or cannot be reached), amacs edits in this
+terminal with Emacs keys: C-x C-s saves, C-x C-c closes the file (asking first
+when it has unsaved changes), C-c C-c saves and closes, C-c C-k closes without
+saving, C-g cancels, C-z suspends. A save refuses when the file changed on disk
+since it was read: C-x C-s again overwrites it, M-x revert-buffer reloads it.
 
 EXIT STATUS:
-    0    every file's view was closed
-    1    the window refused a file or did not answer, a file could not be
-         opened, or an edit was abandoned (C-c C-k)
-    2    a usage error, or no terminal (stdin or stdout is not a tty)
-         without --wait or --no-wait, or no terminal to edit in
+    0    every FILE was closed (with --no-wait: handed to the window)
+    1    a FILE could not be opened, the window did not answer or failed the
+         wait, the edit was abandoned (C-c C-k), or the terminal hung up
+    2    a usage error; in an aterm tab without -nw, stdin or stdout is not a
+         terminal and neither --wait nor --no-wait was given; or no terminal
+         to edit in
     75   the aterm serving the edit went away and no successor took the wait
-    130  interrupted (C-c): the view stays open in the window
+    130  interrupted (C-c) while waiting; the Editor tab stays open
 ";
 
 /// File to edit and its initial caret position.

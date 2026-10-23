@@ -21,6 +21,156 @@ const LOCAL_STATE: &str = r#"{
 const URL: &str = "https://claude.ai/oauth/authorize?login_hint=a%40example.com&state=s";
 
 #[test]
+fn curl_keeps_credential_options_and_urls_off_its_command_line() {
+    let args = [
+        "--disable",
+        "--globoff",
+        "--proto",
+        "=https",
+        "--max-time",
+        "10",
+    ];
+    let options = [
+        ("user", "fake-user:fake-password"),
+        ("header", "Authorization: Bearer fake-token"),
+        ("cookie", "session=fake-cookie"),
+        ("data-raw", "code=fake-code"),
+        ("url", "https://example.test/callback?code=fake-url-code"),
+    ];
+    let (cmd, _) = curl_command(aterm_uds::os_path!("curl"), &args, &options).unwrap();
+    let expected: Vec<&std::ffi::OsStr> = args
+        .iter()
+        .copied()
+        .chain(["--config", "-"])
+        .map(std::ffi::OsStr::new)
+        .collect();
+    assert_eq!(cmd.get_args().collect::<Vec<_>>(), expected);
+    for (_, value) in options {
+        assert!(!cmd.get_args().any(|arg| arg == std::ffi::OsStr::new(value)));
+    }
+    assert_eq!(
+        curl_command(
+            aterm_uds::os_path!("curl"),
+            &args,
+            &[("user", "bad\0value")]
+        )
+        .unwrap_err()
+        .kind(),
+        std::io::ErrorKind::InvalidInput
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn curl_reads_escaped_stdin_config_as_one_private_file_transfer() {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("aterm-curl-stdin-")
+        .tempdir()
+        .expect("private data directory");
+    let payload = dir.path().join("payload.txt");
+    let decoy = dir.path().join("decoy.txt");
+    std::fs::write(&payload, "one private payload\n").unwrap();
+    std::fs::write(&decoy, "a second transfer must not appear\n").unwrap();
+    let file_url = |path: &Path| {
+        format!(
+            "file://{}",
+            path.to_str()
+                .unwrap()
+                .split('/')
+                .map(percent_encode)
+                .collect::<Vec<_>>()
+                .join("/")
+        )
+    };
+    let url = file_url(&payload);
+    let injected = format!("fake\"\\\nurl = \"{}\"\r\n#\tend", file_url(&decoy));
+    let user = format!("fake-user:{injected}");
+    let header = format!("X-Synthetic: {injected}");
+    let cookie = format!("session={injected}");
+    let form = format!("synthetic={injected}");
+    let out = curl_output_with(
+        aterm_uds::os_path!("curl"),
+        &[
+            "--disable",
+            "--globoff",
+            "--proto",
+            "=file",
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+        ],
+        &[
+            ("user", &user),
+            ("header", &header),
+            ("cookie", &cookie),
+            ("data-raw", &form),
+            ("url", &url),
+        ],
+    )
+    .expect("installed curl consumed private config");
+    assert!(out.status.success(), "{:?}", out);
+    assert_eq!(out.stdout, b"one private payload\n");
+    assert_eq!(
+        std::fs::read(&decoy).unwrap(),
+        b"a second transfer must not appear\n"
+    );
+}
+
+#[test]
+fn encoded_word_spacing_preserves_plain_text_and_joins_only_encoded_neighbors() {
+    let first = "=?UTF-8?Q?A?=";
+    let second = "=?UTF-8?B?Qg==?=";
+    for separator in ["", " ", "  \t ", "\t", "\r\n\t", " \r\n \t", "\n "] {
+        assert_eq!(
+            decode_rfc2047_words(&format!("{first}{separator}{second}")),
+            "AB",
+            "{separator:?}"
+        );
+    }
+    for separator in ["\r", "\r\n", "\n", "\u{a0}", " text "] {
+        assert_eq!(
+            decode_rfc2047_words(&format!("{first}{separator}{second}")),
+            format!("A{separator}B"),
+            "{separator:?}"
+        );
+    }
+    for (encoded, expected) in [
+        ("plain text", "plain text"),
+        ("=?UTF-8?Q?Hello?= world", "Hello world"),
+        ("=?UTF-8?Q?Hello?=  world", "Hello  world"),
+        ("=?UTF-8?Q?Hello?=\tworld", "Hello\tworld"),
+        ("=?UTF-8?Q?Hello?= \t", "Hello \t"),
+        ("prefix =?UTF-8?Q?Hello?= suffix", "prefix Hello suffix"),
+        ("=?UTF-8?Q?A_?= \t=?UTF-8?Q?B?=", "A B"),
+        ("=?UTF-8?Q?A?=  =?UTF-8?X?B?=", "A  =?UTF-8?X?B?="),
+        ("=?UTF-8?Q?A?=\t=?unfinished", "A\t=?unfinished"),
+        ("=?UTF-8?X?A?=  =?UTF-8?Q?B?=", "=?UTF-8?X?A?=  B"),
+    ] {
+        assert_eq!(decode_rfc2047_words(encoded), expected, "{encoded:?}");
+    }
+
+    let mail = concat!(
+        "From: Anthropic <no-reply@claude.ai>\r\n",
+        "To: owner@example.test\r\n",
+        "Subject: =?UTF-8?Q?Your_Claude_verification_code_is_918?=  \t\r\n",
+        "\t=?UTF-8?B?NDcy?=\r\n\r\n"
+    );
+    assert_eq!(
+        extract_rfc5322_subject(mail).as_deref(),
+        Some("Your Claude verification code is 918472")
+    );
+    assert_eq!(
+        super::super::headless_oauth::extract_otps_from_email(mail, Some("owner@example.test")),
+        vec!["918472"]
+    );
+    assert!(
+        super::super::headless_oauth::extract_otps_from_email(mail, Some("other@example.test"))
+            .is_empty()
+    );
+}
+
+#[test]
 fn a_profile_is_found_by_its_display_name_and_only_when_it_is_one() {
     assert_eq!(
         profile_dir_of(LOCAL_STATE, "Claude m7-a").as_deref(),
@@ -791,6 +941,66 @@ fn mailbox_secret_files_require_complete_regular_contents() {
     assert_eq!(configured().as_deref(), Some("aliased-secret"));
     assert_eq!(std::fs::read_link(&secret).unwrap(), target);
     assert_eq!(std::fs::read(&target).unwrap(), b"aliased-secret\n");
+}
+
+#[test]
+fn flat_webmail_password_aliases_keep_the_requested_account() {
+    use super::super::headless_oauth::MailboxConfig;
+
+    let home = aterm_tempfile::tempdir().expect("private password alias home");
+    let secrets = home.path().join(".secrets");
+    std::fs::create_dir(&secrets).unwrap();
+    let secret = secrets.join("webmail-password");
+    std::fs::write(&secret, "file-secret\r\n").unwrap();
+
+    for (suffix, value, expected) in [
+        (
+            "_webmail_password_file",
+            "~/.secrets/webmail-password",
+            "file-secret",
+        ),
+        (
+            "-webmail-password-file",
+            "~/.secrets/webmail-password",
+            "file-secret",
+        ),
+        (
+            "_password_file",
+            "~/.secrets/webmail-password",
+            "file-secret",
+        ),
+        (
+            "-password-file",
+            "~/.secrets/webmail-password",
+            "file-secret",
+        ),
+        ("_pass_file", "~/.secrets/webmail-password", "file-secret"),
+        ("-pass-file", "~/.secrets/webmail-password", "file-secret"),
+        ("_webmail_password", "direct-secret", "direct-secret"),
+        ("-webmail-password", "direct-secret", "direct-secret"),
+        ("_password", "direct-secret", "direct-secret"),
+        ("-password", "direct-secret", "direct-secret"),
+        ("_pass", "direct-secret", "direct-secret"),
+        ("-pass", "direct-secret", "direct-secret"),
+    ] {
+        let mut cfg =
+            MailboxConfig::from_toml_str(&format!("m27{suffix} = '{value}'\n"), Some(home.path()))
+                .expect("parse flat per-account alias");
+        assert_eq!(
+            cfg.password_for(Some("m27")).as_deref(),
+            Some(expected),
+            "{suffix}"
+        );
+        assert_eq!(cfg.password_for(Some("m27_webmail")), None, "{suffix}");
+        assert_eq!(cfg.password_for(Some("m27-webmail")), None, "{suffix}");
+        assert_eq!(cfg.password_for(Some("m28")), None, "{suffix}");
+        cfg.alias_label_to_email(Some("m27"), Some("opaque@example.test"));
+        assert_eq!(
+            cfg.password_for(Some("opaque@example.test")).as_deref(),
+            Some(expected)
+        );
+    }
+    assert_eq!(std::fs::read(&secret).unwrap(), b"file-secret\r\n");
 }
 
 #[test]
@@ -2407,6 +2617,279 @@ m27_2_pass = "flat-m27-2-pw"
             ),
             vec!["528193".to_owned()]
         );
+
+        let mbox_file = tmp.path().join("inbox.mbox");
+        std::fs::write(
+            &mbox_file,
+            concat!(
+                "From no-reply@claude.ai Fri Oct 23 11:00:00 2026\n",
+                "To: <other@proton.me>\n\n",
+                "Your verification code: 333333\n\n",
+                "From no-reply@claude.ai Fri Oct 23 11:01:00 2026\n",
+                "To: <sol-m27@proton.me>\n\n",
+                "Your verification code: 111111\n\n",
+                "From no-reply@claude.ai Fri Oct 23 11:02:00 2026\n",
+                "To: <sol-m27@proton.me>\n\n",
+                "Your verification code: 908172\n",
+            ),
+        )
+        .expect("write mbox file");
+        let mbox_cfg = MailboxConfig::from_dir(&mbox_file);
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_config_for_credential(
+                &mbox_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_millis(50),
+            ),
+            Ok(MailboxCredential::Otp("908172".to_owned())),
+            "mbox file returns newest appended message for target recipient"
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&mbox_file)
+            .expect("open mbox for append")
+            .write_all(
+                b"\nFrom no-reply@claude.ai Fri Oct 23 11:03:00 2026\nTo: <sol-m27@proton.me>\n\nYour verification code: 432109\n",
+            )
+            .expect("append mbox message");
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_config_for_credential(
+                &mbox_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_millis(50),
+            ),
+            Ok(MailboxCredential::Otp("432109".to_owned())),
+            "appending a new message to an mbox file is picked up on subsequent polls"
+        );
+
+        let mpit_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mailpit mock");
+        let mpit_port = mpit_listener.local_addr().unwrap().port();
+        let mpit_thread = std::thread::spawn(move || {
+            for expected_path in ["/api/v1/messages", "/api/v1/message/mpit-42"] {
+                let Ok((mut stream, _)) = mpit_listener.accept() else {
+                    return;
+                };
+                let mut req_buf = [0u8; 4096];
+                let n = stream.read(&mut req_buf).unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&req_buf[..n]);
+                assert!(
+                    req_str.contains(expected_path),
+                    "expected {expected_path}, got: {req_str}"
+                );
+                let body = if expected_path == "/api/v1/messages" {
+                    r#"{"messages":[{"ID":"mpit-other","To":[{"Address":"other@proton.me"}],"Subject":"Sign in","Snippet":"Click below"},{"ID":"mpit-42","To":[{"Address":"sol-m27@proton.me"}],"Subject":"Sign in to Claude","Snippet":"Click the link below to sign in"}]}"#
+                } else {
+                    r#"{"ID":"mpit-42","To":[{"Address":"sol-m27@proton.me"}],"HTML":"<p><a href=\"https://claude.ai/magic-link?token=mpit_detail_ok&amp;state=s9\">Sign in</a></p>"}"#
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let mpit_cfg = MailboxConfig {
+            http_url: Some(format!("http://127.0.0.1:{mpit_port}/api/v1/messages")),
+            seen_file: Some(tmp.path().join("mpit.seen")),
+            ..MailboxConfig::default()
+        };
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_config_for_credential(
+                &mpit_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_secs(5),
+            ),
+            Ok(MailboxCredential::MagicLink(
+                "https://claude.ai/magic-link?token=mpit_detail_ok&state=s9".to_owned()
+            )),
+            "Mailpit summary list fetches /api/v1/message/<ID> detail when summary omits HTML body"
+        );
+        mpit_thread.join().expect("mailpit mock thread");
+
+        let rfc2047_q_eml = concat!(
+            "From: Anthropic <no-reply@claude.ai>\r\n",
+            "To: =?UTF-8?Q?Sol_M27?= <sol-m27@proton.me>\r\n",
+            "Subject: =?UTF-8?Q?Your_Claude_verification_code_is_814209?=\r\n\r\n",
+            "Enter the verification code shown in the subject line.\r\n"
+        );
+        assert_eq!(
+            super::super::headless_oauth::extract_otps_from_email(
+                rfc2047_q_eml,
+                Some("sol-m27@proton.me")
+            ),
+            vec!["814209".to_owned()],
+            "RFC 2047 Q-encoded Subject header OTP is decoded and extracted"
+        );
+        let rfc2047_b_eml = concat!(
+            "From: Anthropic <no-reply@claude.ai>\r\n",
+            "To: =?UTF-8?B?c29sLW0yN0Bwcm90b24ubWU=?=\r\n",
+            "Subject: =?UTF-8?B?OTA4MTcyIGlzIHlvdXIgQ2xhdWRlIHZlcmlmaWNhdGlvbiBjb2Rl?=\r\n\r\n",
+            "Sign in with the code in the subject.\r\n"
+        );
+        assert_eq!(
+            super::super::headless_oauth::extract_otps_from_email(
+                rfc2047_b_eml,
+                Some("sol-m27@proton.me")
+            ),
+            vec!["908172".to_owned()],
+            "RFC 2047 B-encoded To and Subject headers are decoded and extracted"
+        );
+
+        let basic_listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind basic auth mock");
+        let basic_port = basic_listener.local_addr().unwrap().port();
+        let basic_thread = std::thread::spawn(move || {
+            let Ok((mut stream, _)) = basic_listener.accept() else {
+                return;
+            };
+            let mut req_buf = [0u8; 4096];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(
+                req_str.contains("Authorization: Basic YWRtaW46c2VjcmV0"),
+                "expected Basic auth header for admin:secret, got: {req_str}"
+            );
+            assert!(
+                req_str.contains(&format!("Host: 127.0.0.1:{basic_port}\r\n")),
+                "Host header must strip embedded userinfo, got: {req_str}"
+            );
+            let body = r#"{"to":"sol-m27@proton.me","otp":"604821"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        });
+        let basic_cfg = MailboxConfig {
+            http_url: Some(format!(
+                "http://admin:secret@127.0.0.1:{basic_port}/api/v1/inbox"
+            )),
+            seen_file: Some(tmp.path().join("basic.seen")),
+            ..MailboxConfig::default()
+        };
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_config_for_credential(
+                &basic_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_secs(5),
+            ),
+            Ok(MailboxCredential::Otp("604821".to_owned())),
+            "loopback HTTP client sends Basic auth for embedded user:pass@127.0.0.1 URLs"
+        );
+        basic_thread.join().expect("basic auth mock thread");
+
+        let provider_cfg = MailboxConfig {
+            password: Some("pw".to_owned()),
+            ..MailboxConfig::default()
+        };
+        assert_eq!(
+            provider_cfg
+                .effective_imap_url(Some("sol@outlook.com"))
+                .as_deref(),
+            Some("imaps://outlook.office365.com:993/INBOX")
+        );
+        assert_eq!(
+            provider_cfg
+                .effective_webmail_url(Some("sol@outlook.com"))
+                .as_deref(),
+            Some("https://outlook.live.com/mail/0/inbox")
+        );
+        assert_eq!(
+            provider_cfg
+                .effective_imap_url(Some("sol@purelymail.com"))
+                .as_deref(),
+            Some("imaps://imap.purelymail.com:993/INBOX")
+        );
+        assert_eq!(
+            provider_cfg
+                .effective_webmail_url(Some("sol@tuta.com"))
+                .as_deref(),
+            Some("https://app.tuta.com/mail")
+        );
+
+        let oauth_js = super::super::headless_oauth::oauth_step_js(
+            Some("sol-m27@proton.me"),
+            Some("908172"),
+            false,
+            false,
+        );
+        assert!(oauth_js.contains(".find(visibleControl)"));
+        assert!(oauth_js.contains("el.focus()"));
+
+        let wm_js = super::super::headless_oauth::webmail_step_js(
+            (
+                Some("sol-m27@proton.me"),
+                Some("pw"),
+                Some("mpw"),
+                Some("123456"),
+            ),
+            (true, true, false, false),
+            0,
+        );
+        assert!(wm_js.contains(":not(#mailboxPassword):not([name='mailboxPassword'])"));
+        assert!(wm_js.contains("input[name='loginfmt']"));
+        assert!(wm_js.contains("input[name='otc']"));
+
+        let home_dir = tmp.path().join("home-fleet");
+        let secrets_dir = home_dir.join(".secrets");
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        std::fs::write(secrets_dir.join("m27_pw_file"), "file-pw-m27\n").expect("write pw file");
+        std::fs::write(secrets_dir.join("m27_mpw_file"), "file-mpw-m27\n").expect("write mpw file");
+        std::fs::write(secrets_dir.join("m27_totp_file"), "JBSWY3DPEHPK3PXP\n")
+            .expect("write totp file");
+        std::fs::write(
+            secrets_dir.join("ai-mailbox.toml"),
+            "m27_password_file = \"~/.secrets/m27_pw_file\"\n\
+             m27_mailbox_password_file = \"~/.secrets/m27_mpw_file\"\n\
+             m27_totp_secret_file = \"~/.secrets/m27_totp_file\"\n\n\
+             [work]\n\
+             email = \"custom-team@fastmail.com\"\n\
+             password = \"work-secret\"\n",
+        )
+        .expect("write ai-mailbox.toml");
+        std::fs::write(
+            secrets_dir.join("fleet-accounts.toml"),
+            "[[account]]\n\
+             label = \"m27\"\n\
+             machines = [\"m27\"]\n\
+             class = \"dedicated\"\n\
+             email = \"opaque-alias@proton.me\"\n",
+        )
+        .expect("write fleet-accounts.toml");
+        let discovered_fleet = super::super::headless_oauth::discover_mailbox_config_files(
+            Some(&home_dir),
+            None,
+            None,
+        )
+        .expect("discover fleet mailbox config");
+        assert_eq!(
+            discovered_fleet
+                .password_for(Some("opaque-alias@proton.me"))
+                .as_deref(),
+            Some("file-pw-m27")
+        );
+        assert_eq!(
+            discovered_fleet
+                .mailbox_password_for(Some("opaque-alias@proton.me"))
+                .as_deref(),
+            Some("file-mpw-m27")
+        );
+        assert_eq!(
+            discovered_fleet
+                .totp_secret_for(Some("opaque-alias@proton.me"))
+                .as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+        assert_eq!(
+            discovered_fleet
+                .password_for(Some("custom-team@fastmail.com"))
+                .as_deref(),
+            Some("work-secret")
+        );
     }
 }
 
@@ -2524,4 +3007,194 @@ fn recovered_callbacks_require_delivery_but_reached_callbacks_allow_duplicates()
             browser_thread.join().expect("callback browser fixture");
         }
     }
+}
+
+#[test]
+fn gmail_stub_ids_do_not_masquerade_as_otps_and_forwarded_headers_match_target() {
+    use super::super::headless_oauth::{
+        MailboxConfig, MailboxCredential, extract_otp_from_email,
+        poll_mailbox_config_for_credential,
+    };
+
+    let forwarded_raw = "To: team-alias@example.test\r\n\
+X-Forwarded-To: <sol-m27@proton.me>\r\n\
+Subject: Sign in to Claude\r\n\r\n\
+Your verification code is: 814209\r\n";
+    assert_eq!(
+        extract_otp_from_email(forwarded_raw, Some("sol-m27@proton.me")).as_deref(),
+        Some("814209"),
+        "X-Forwarded-To must match target even when To: names an alias"
+    );
+
+    let undisclosed_raw = "Received: from mail.anthropic.com by mx.proton.me for <sol-m27@proton.me>; Fri, 23 Oct 2026 12:00:00 +0000\r\n\
+To: undisclosed-recipients:;\r\n\
+Subject: Sign in to Claude\r\n\r\n\
+<a href=\"https://claude.com/cai/oauth/magic?token=undisclosed_ok\">Sign in</a>\r\n";
+    assert_eq!(
+        extract_magic_link_from_email(undisclosed_raw, Some("sol-m27@proton.me")).as_deref(),
+        Some("https://claude.com/cai/oauth/magic?token=undisclosed_ok"),
+        "To: undisclosed-recipients:; must not block matching Received: for <target>"
+    );
+
+    let orig_rcpt_raw = "To: catchall@example.test\r\n\
+Original-Recipient: rfc822;sol-m27@proton.me\r\n\
+Subject: Sign in\r\n\r\n\
+Verification code: 390174\r\n";
+    assert_eq!(
+        extract_otp_from_email(orig_rcpt_raw, Some("sol-m27@proton.me")).as_deref(),
+        Some("390174")
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock gmail api");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        for expected_path in [
+            "/gmail/v1/users/me/messages",
+            "/gmail/v1/users/me/messages/999888",
+            "/gmail/v1/users/me/messages/482910",
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut req_buf = [0u8; 2048];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(
+                req_str.starts_with(&format!("GET {expected_path} ")),
+                "unexpected request: {req_str}"
+            );
+            let body = match expected_path {
+                "/gmail/v1/users/me/messages" => {
+                    r#"{"messages":[{"id":"482910","threadId":"654321"},{"id":"999888","threadId":"777666"}]}"#
+                }
+                "/gmail/v1/users/me/messages/999888" => {
+                    r#"{"id":"999888","payload":{"headers":[{"name":"To","value":"other@proton.me"},{"name":"Subject","value":"Sign in"}],"body":{"data":"Verification code: 111222"}}}"#
+                }
+                _ => {
+                    r#"{"id":"482910","payload":{"headers":[{"name":"To","value":"sol-m27@proton.me"},{"name":"Subject","value":"Sign in to Claude"}],"body":{"data":"Your verification code is 741852"}}}"#
+                }
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let cfg = MailboxConfig {
+        http_url: Some(format!(
+            "http://127.0.0.1:{port}/gmail/v1/users/me/messages"
+        )),
+        ..MailboxConfig::default()
+    };
+    let cred =
+        poll_mailbox_config_for_credential(&cfg, Some("sol-m27@proton.me"), Duration::from_secs(5))
+            .expect("poll gmail stub list and detail");
+    assert_eq!(cred, MailboxCredential::Otp("741852".to_owned()));
+    server.join().unwrap();
+}
+
+#[test]
+fn mailpit_detail_loop_stops_after_200_and_secret_file_extensions_strip_cleanly() {
+    use super::super::headless_oauth::{
+        MailboxConfig, MailboxCredential, derive_account_label_from_email,
+        discover_mailbox_config_files, poll_mailbox_config_for_credential,
+    };
+
+    assert_eq!(
+        derive_account_label_from_email("sol.m27.2.claude@proton.me").as_deref(),
+        Some("m27-2"),
+        "trailing non-numeric words after slot digit must still derive m27-2"
+    );
+    assert_eq!(
+        derive_account_label_from_email("sol.m27.28.2.claude@proton.me").as_deref(),
+        Some("m27-m28-2")
+    );
+
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-secret-stems-")
+        .tempdir()
+        .expect("tempdir");
+    let secrets = tmp.path().join(".secrets");
+    std::fs::create_dir_all(&secrets).unwrap();
+    std::fs::write(
+        secrets.join("m27-2.toml"),
+        "password = \"pw-m27-2-toml\"\nmailbox_password = \"mpw-m27-2\"\n",
+    )
+    .unwrap();
+    std::fs::write(secrets.join("sun.m27.3.txt"), "pw-m27-3-txt\n").unwrap();
+
+    let cfg = discover_mailbox_config_files(Some(tmp.path()), None, None)
+        .expect("discover mailbox config from .toml/.txt secret files");
+    assert_eq!(
+        cfg.password_for(Some("sun.m27.2@proton.me")).as_deref(),
+        Some("pw-m27-2-toml")
+    );
+    assert_eq!(
+        cfg.mailbox_password_for(Some("sun.m27.2@proton.me"))
+            .as_deref(),
+        Some("mpw-m27-2")
+    );
+    assert_eq!(
+        cfg.password_for(Some("star.m27.3@proton.me")).as_deref(),
+        Some("pw-m27-3-txt")
+    );
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock mailpit");
+    let port = listener.local_addr().expect("addr").port();
+    let server = std::thread::spawn(move || {
+        // Newer message mpit-2 is a non-auth email; once /api/v1/message/mpit-2 returns 200 OK,
+        // the poller must NOT request /api/v1/messages/mpit-2 before moving to /api/v1/message/mpit-1.
+        for expected_path in [
+            "/api/v1/messages",
+            "/api/v1/message/mpit-2",
+            "/api/v1/message/mpit-1",
+        ] {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut req_buf = [0u8; 2048];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            let req_str = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(
+                req_str.starts_with(&format!("GET {expected_path} ")),
+                "unexpected request: {req_str}"
+            );
+            let body = match expected_path {
+                "/api/v1/messages" => {
+                    r#"{"messages":[{"ID":"mpit-1","To":[{"Address":"sol-m27@proton.me"}],"Subject":"Sign in to Claude"},{"ID":"mpit-2","To":[{"Address":"sol-m27@proton.me"}],"Subject":"Weekly digest"}]}"#
+                }
+                "/api/v1/message/mpit-2" => {
+                    r#"{"ID":"mpit-2","To":[{"Address":"sol-m27@proton.me"}],"Subject":"Weekly digest","Text":"Welcome to your weekly summary."}"#
+                }
+                _ => {
+                    r#"{"ID":"mpit-1","To":[{"Address":"sol-m27@proton.me"}],"Subject":"Sign in to Claude","HTML":"<a href=\"https://claude.com/cai/oauth/magic?token=mpit1_ok\">Sign in</a>"}"#
+                }
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            stream.flush().unwrap();
+        }
+    });
+
+    let mpit_cfg = MailboxConfig {
+        http_url: Some(format!("http://127.0.0.1:{port}/api/v1/messages")),
+        ..MailboxConfig::default()
+    };
+    let cred = poll_mailbox_config_for_credential(
+        &mpit_cfg,
+        Some("sol-m27@proton.me"),
+        Duration::from_secs(5),
+    )
+    .expect("poll mailpit with non-auth message ahead of auth message");
+    assert_eq!(
+        cred,
+        MailboxCredential::MagicLink(
+            "https://claude.com/cai/oauth/magic?token=mpit1_ok".to_owned()
+        )
+    );
+    server.join().unwrap();
 }

@@ -42,7 +42,8 @@ pub struct StatLine {
     pub pgrp: u32,
     /// The session.
     pub session: u32,
-    /// The controlling terminal's device, 0 for none.
+    /// The controlling terminal's device, 0 for none ([`parse_stat`] reads a negative one as
+    /// its 32 bits).
     pub tty_nr: u32,
     /// The terminal's foreground group, `-1` (here 0) for none.
     pub tpgid: u32,
@@ -72,6 +73,17 @@ impl StatLine {
     }
 }
 
+/// The controlling terminal's device from `stat`'s `tty_nr`: the kernel prints its encoded
+/// device as a C `int`, so a pts minor of 2^19 or more sets the sign bit and prints negative,
+/// the same 32 bits. A field that is neither an `int` nor a `u32` is no device, and the line is
+/// malformed: never read as no terminal.
+fn tty_device(field: &str) -> Option<u32> {
+    let t: i64 = field.parse().ok()?;
+    u32::try_from(t)
+        .ok()
+        .or_else(|| i32::try_from(t).ok().map(i32::cast_unsigned))
+}
+
 /// Parse a `/proc/<pid>/stat` line; `None` when it is malformed.
 #[must_use]
 pub fn parse_stat(text: &str) -> Option<StatLine> {
@@ -90,11 +102,7 @@ pub fn parse_stat(text: &str) -> Option<StatLine> {
         ppid: f.get(1)?.parse().ok()?,
         pgrp: f.get(2)?.parse().ok()?,
         session: f.get(3)?.parse().ok()?,
-        tty_nr: f
-            .get(4)?
-            .parse::<i64>()
-            .ok()
-            .map_or(0, |t| u32::try_from(t).unwrap_or(0)),
+        tty_nr: tty_device(f.get(4)?)?,
         tpgid: u32::try_from(tpgid).unwrap_or(0),
         flags: num(6)?,
         majflt: num(9)?,
@@ -217,6 +225,47 @@ pub fn parse_fd_link(target: &str) -> FdLink {
     } else {
         FdLink::Other
     }
+}
+
+/// `__SO_ACCEPTCON`: the Flags bit of a listening socket's `/proc/net/unix` row.
+pub const SO_ACCEPTCON: u32 = 0x1_0000;
+
+/// The next space-separated field of a `/proc/net/unix` row, past any spaces before it.
+fn net_unix_field<'a>(rest: &mut &'a [u8]) -> &'a [u8] {
+    let from = rest.iter().position(|b| *b != b' ').unwrap_or(rest.len());
+    let line = &rest[from..];
+    let end = line.iter().position(|b| *b == b' ').unwrap_or(line.len());
+    let (field, tail) = line.split_at(end);
+    *rest = tail;
+    field
+}
+
+/// The listening sockets of a `/proc/net/unix` table that are bound at a path, each `(inode,
+/// path)`: the rows whose Flags carry [`SO_ACCEPTCON`]. An abstract name (`@…`), an unbound
+/// socket and a row cut short at the read's end are left out; a path keeps every byte after the
+/// one space that follows the inode. The kernel prints every name in the namespace as raw bytes,
+/// so the table is read as bytes: a name that is no UTF-8 is a row like any other.
+#[must_use]
+pub fn listening_unix(net_unix: &[u8]) -> Vec<(u64, &[u8])> {
+    let whole = match net_unix.iter().rposition(|b| *b == b'\n') {
+        Some(e) => &net_unix[..e],
+        None => return Vec::new(),
+    };
+    whole
+        .split(|b| *b == b'\n')
+        .skip(1)
+        .filter_map(|line| {
+            let mut rest = line;
+            let mut field = || net_unix_field(&mut rest);
+            let (_slot, _refs, _protocol) = (field(), field(), field());
+            let flags = u32::from_str_radix(std::str::from_utf8(field()).ok()?, 16).ok()?;
+            let (_kind, _state) = (field(), field());
+            let inode = std::str::from_utf8(field()).ok()?.parse().ok()?;
+            let path = rest.strip_prefix(b" ")?;
+            (flags & SO_ACCEPTCON != 0 && !path.is_empty() && !path.starts_with(b"@"))
+                .then_some((inode, path))
+        })
+        .collect()
 }
 
 /// `/proc/<pid>/fdinfo/<n>`.

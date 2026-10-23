@@ -13,11 +13,44 @@ use aterm_types::Appearance;
 use aterm_types::scheme::MAX_USER_THEME_FILES;
 use aterm_types::scheme_install::InstallError;
 
-use crate::theme_cmd::{HELP, Outcome, ThemeListFormat, appearance_value, format_value};
+use crate::theme_cmd::{Outcome, ThemeListFormat, appearance_value, format_value};
+
+/// `aterm theme pack --help` and `aterm theme install --help`.
+pub(crate) const PACK_HELP: &str = "\
+aterm theme pack [<id>] [--appearance dark|light] [--format text|tsv] [--licences]
+
+  The community theme pack: themes from permissively licensed projects,
+  built into aterm and copied into the themes folder only when asked
+  (`install`, or Keep in Settings \u{25b8} Themes). With no id, list them with
+  each one's status in the themes folder: available, installed, modified,
+  or blocked (by a file whose name differs only in case). With an id or
+  display name, in any case, print that theme's file.
+
+  --appearance dark|light   Only the pack themes drawn for that appearance.
+  --format tsv              Tab-separated rows for scripts: a header row, one
+                            row per theme, then a `#collection` line naming
+                            the upstream repo and commit.
+  --licences                Print the attribution and licence notices of
+                            every palette aterm bundles.
+
+aterm theme install <id>... | --all [--replace]
+
+  Copy pack themes into the themes folder as <id>.conf, where Settings and
+  `theme = \"<id>\"` find them, and for one with a pair print the
+  `theme = \"dark:<dark>,light:<light>\"` value. A copy that differs from the
+  pack's is kept unless --replace; a file whose name differs only in case
+  blocks the install. An unknown id is a usage error before anything is
+  written; one that left the pack names its replacement.
+
+  --all       Every pack theme.
+  --replace   Overwrite a copy that differs from the pack's.
+
+Exit: 0 done, 1 an install failed, 2 a usage error.
+";
 
 fn help() -> Outcome {
     Outcome {
-        stdout: HELP.to_string(),
+        stdout: PACK_HELP.to_string(),
         ..Outcome::default()
     }
 }
@@ -211,8 +244,9 @@ pub(crate) fn pack(args: &[OsString], theme_dir: Option<&Path>) -> Outcome {
             let commit = collection.commit.get(..12).unwrap_or(collection.commit);
             let _ = writeln!(
                 out,
-                "\n{} themes from permissively licensed projects, via iTerm2-Color-Schemes @ {commit}.",
-                rows.len()
+                "\n{} themes from permissively licensed projects, via {} @ {commit}.",
+                rows.len(),
+                collection.repo
             );
             out.push_str(
                 "install: aterm theme install <id> (or --all) \u{b7} licences: aterm theme pack --licences\n",
@@ -369,7 +403,7 @@ pub(crate) fn install(args: &[OsString], theme_dir: Option<&Path>) -> Outcome {
             let _ = writeln!(
                 out.stderr,
                 "aterm theme install: warning: the themes folder holds {count} theme files; \
-                 aterm reads the first {MAX_USER_THEME_FILES} (aterm theme list says which)"
+                 aterm reads the first {MAX_USER_THEME_FILES} by name (aterm theme list shows them)"
             );
         }
     }

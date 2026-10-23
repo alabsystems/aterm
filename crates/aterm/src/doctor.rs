@@ -375,7 +375,7 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
                 &format!("doctor.selection.{token}"),
                 "doctor",
                 None,
-                format!("requested selector {token} produced no check result on this host"),
+                format!("--only {token} selected no row in this run"),
             ));
         }
     }

@@ -269,10 +269,10 @@ pub fn get(url: &str, after: Option<u64>, wait: Duration) -> crate::Result<Answe
 pub struct Unheard {
     /// What failed, as [`get`] says it.
     pub why: Error,
-    /// The lookup got no answer in time, or the host has no route: how macOS holds the
-    /// lookups and LAN connects of an app whose Local Network question nobody has answered
-    /// yet, so a try after the answer can succeed (a slow network and a host that sleeps
-    /// look the same).
+    /// A timeout (a lookup with no answer in time, or a connect or request past its deadline)
+    /// or no route to the host: how macOS holds the lookups and LAN connects of an app whose
+    /// Local Network question nobody has answered yet, so a try after the answer can succeed
+    /// (a slow network, a host that sleeps and a server that stalls look the same).
     pub held: bool,
 }
 

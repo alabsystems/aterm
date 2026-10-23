@@ -1086,18 +1086,6 @@ fn exited_observation(rc: libc::c_int, record: &[u8], size: usize) -> bool {
     u32::from(record[P_STAT]) == libc::SZOMB
 }
 
-#[cfg(target_os = "macos")]
-const PROC_UID_ONLY: u32 = 4;
-#[cfg(target_os = "macos")]
-unsafe extern "C" {
-    fn proc_listpids(
-        kind: u32,
-        typeinfo: u32,
-        buffer: *mut libc::c_void,
-        bytes: libc::c_int,
-    ) -> libc::c_int;
-}
-
 /// Scan for background processes or daemons escaped from `s_pid`'s startup window.
 #[cfg(target_os = "macos")]
 pub(crate) fn escape_scan(
@@ -1140,26 +1128,11 @@ fn shell_unknown(s_pid: i32, why: &str) -> Scan {
     Scan::Unknown
 }
 
+/// `uid`'s live pids ([`aterm_uds::holders::pids_of_uid`]), or `None` when they cannot all be listed.
 #[cfg(target_os = "macos")]
 fn uid_pids(uid: u32) -> Option<Vec<i32>> {
-    const PID_BYTES: usize = std::mem::size_of::<i32>();
-    const MAX_SCAN_PIDS: usize = 1 << 20;
-    // SAFETY: null asks for the required byte capacity only, filtered by uid.
-    let need = unsafe { proc_listpids(PROC_UID_ONLY, uid, std::ptr::null_mut(), 0) };
-    let room = usize::try_from(need)
-        .ok()
-        .filter(|n| *n > 0 && *n % PID_BYTES == 0)
-        .and_then(|n| (n / PID_BYTES).checked_add(64))
-        .filter(|n| *n <= MAX_SCAN_PIDS)?;
-    let mut pids = vec![0i32; room];
-    let bytes = libc::c_int::try_from(room * PID_BYTES).ok()?;
-    // SAFETY: `pids` provides `bytes` writable bytes of i32 slots.
-    let got = unsafe { proc_listpids(PROC_UID_ONLY, uid, pids.as_mut_ptr().cast(), bytes) };
-    let got = usize::try_from(got)
-        .ok()
-        .filter(|n| *n > 0 && *n % PID_BYTES == 0 && *n < bytes as usize)?;
-    pids.truncate(got / PID_BYTES);
-    Some(pids)
+    let pids = aterm_uds::holders::pids_of_uid(uid).ok()?;
+    pids.into_iter().map(|p| i32::try_from(p).ok()).collect()
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

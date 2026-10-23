@@ -1264,6 +1264,7 @@ impl Root {
                 peak_footprint: None,
                 read_at,
                 coalition: None,
+                version: None,
             });
         }
         Some(Sweep { procs, truncated })

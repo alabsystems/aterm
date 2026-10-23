@@ -3585,14 +3585,20 @@ impl CursorGlow {
     /// and leave the theme's text `fg` [`Self::LIGHT_VEIL_BAR`] over it on
     /// the page `bg` (or the theme's own contrast, if less: no veil).
     pub(crate) fn dark_veil_cap(veil: u32, fg: u32, bg: u32) -> u8 {
+        let table = crate::color_math::relative_luminance_table();
         let (fg, bg) = (fg & 0x00FF_FFFF, bg & 0x00FF_FFFF);
-        let bar = Self::LIGHT_VEIL_BAR.min(crate::color_math::contrast_ratio(fg, bg));
-        let lit = |a: u32| {
-            let ch =
-                |sh: u32| (((bg >> sh) & 0xff) + (((veil >> sh) & 0xff) * a + 127) / 255).min(255);
-            (ch(16) << 16) | (ch(8) << 8) | ch(0)
+        let lum_fg = crate::color_math::relative_luminance_with(table, fg);
+        let lum_bg = crate::color_math::relative_luminance_with(table, bg);
+        let contrast = |l: f32| (lum_fg.max(l) + 0.05) / (lum_fg.min(l) + 0.05);
+        let bar = Self::LIGHT_VEIL_BAR.min(contrast(lum_bg));
+        let (bg_r, bg_g, bg_b) = ((bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff);
+        let (v_r, v_g, v_b) = ((veil >> 16) & 0xff, (veil >> 8) & 0xff, veil & 0xff);
+        let holds = |a: u32| {
+            let r = (bg_r + (v_r * a + 127) / 255).min(255) as usize;
+            let g = (bg_g + (v_g * a + 127) / 255).min(255) as usize;
+            let b = (bg_b + (v_b * a + 127) / 255).min(255) as usize;
+            contrast(crate::color_math::relative_luminance_rgb(table, r, g, b)) >= bar
         };
-        let holds = |a: u32| crate::color_math::contrast_ratio(fg, lit(a)) >= bar;
         let (mut lo, mut hi) = (0u32, 255u32);
         if holds(hi) {
             return 255;

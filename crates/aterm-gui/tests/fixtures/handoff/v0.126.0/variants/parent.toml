@@ -1,0 +1,108 @@
+# What the v0.126.0 producer committed to for this desk. Written by the
+# release's own cut (seamless_fixture_generator_tests.rs); see ../../README.md.
+producer_version = "0.126.0"
+producer_commit = "358c6c5f995a"
+outgoing_build = 1792785491
+park_carry_ceiling = "full"
+manifest = "seamless-7165-00000000000000000000000001000019.toml"
+nonce = "00000000000000000000000001000019"
+dir_placeholder = "@HANDOFF_DIR@"
+screen_digest = "0e08a486970b91e261d63cc814543c9423f5d33ba09a575de72010de84e1d4f9"
+layout_digest = "17749055a7f6d4d9bf15cb158b4e7044e39cdca63739ee279f2c247af1d1ae89"
+proof_target_build = 1792871891
+proof_target_commit = "fedcba987654"
+proof_identities = [[0, 3, 40000], [1, 5, 40001], [2, 7, 40002], [3, 9, 40003]]
+proof_count = 4
+proof_digest = "f68a560f01cd3da7e90c78d5d8851dd05167f6c24a607cf17788707cdf85c53d"
+ready_wire = "4153523100000004f68a560f01cd3da7e90c78d5d8851dd05167f6c24a607cf17788707cdf85c53d"
+commit_wire = "4153433100000004f68a560f01cd3da7e90c78d5d8851dd05167f6c24a607cf17788707cdf85c53d"
+files = ["seamless-7165-00000000000000000000000001000019.layout.toml", "seamless-7165-00000000000000000000000001000019.s0.ctl", "seamless-7165-00000000000000000000000001000019.s0.grid", "seamless-7165-00000000000000000000000001000019.s1.ctl", "seamless-7165-00000000000000000000000001000019.s1.grid", "seamless-7165-00000000000000000000000001000019.s2.ctl", "seamless-7165-00000000000000000000000001000019.s2.grid", "seamless-7165-00000000000000000000000001000019.s3.ctl", "seamless-7165-00000000000000000000000001000019.s3.grid", "seamless-7165-00000000000000000000000001000019.toml"]
+
+[[session]]
+local_id = 0
+rows = 30
+cols = 100
+history_lines = 0
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 41000
+absolute_row_counter = 30
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 1
+rows = 30
+cols = 100
+history_lines = 0
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 41001
+absolute_row_counter = 30
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 2
+rows = 30
+cols = 100
+history_lines = 0
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 41002
+absolute_row_counter = 30
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+
+[[session]]
+local_id = 3
+rows = 30
+cols = 100
+history_lines = 0
+alt_grid = false
+control = true
+require_shell_integration_nonce = false
+history_take = 0
+history_lost = 0
+fg_holder = 41003
+absolute_row_counter = 30
+alt_absolute_row_counter = 0
+color = false
+shell_phase = 0
+shell_marks = 0
+shell_completed_seq = 0
+rung = "full"
+links_stripped = 0
+history_links_stripped = 0
+output_state = true
+

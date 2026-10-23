@@ -99,6 +99,9 @@ impl App {
                 ChromeStep::Wallpaper => self.splice_wallpaper(wid),
             }
         }
+        if let Some(window) = self.windows.get_mut(&wid) {
+            crate::icon_scene::apply(&mut window.input_scratch);
+        }
         Some(composed)
     }
 }

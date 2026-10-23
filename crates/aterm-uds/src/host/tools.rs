@@ -859,6 +859,42 @@ pub const TOOLS: &[Tool] = &[
         &["/opt/homebrew/bin/limactl", "/usr/local/bin/limactl"],
         "the Linux lane's VM (vz backend), for the Linux-only tests and the fish floor (row 25)",
     ),
+    missing(
+        workspace(
+            "ubuntu-root",
+            When::Linux,
+            Some(Pin {
+                package: "ubuntu-noble-root",
+                version: "20260926",
+                exe: "noble-server-cloudimg-arm64.img",
+                built: false,
+                hosts: &["macos-aarch64"],
+            }),
+            &[],
+            "not a program: Ubuntu 24.04's root file system, a whole raw ext4 disk the lane's own VM \
+             clones its disks from; held by aterm-vz's pins (docs/DESIGN-vz-guest-2026-10-23.md §3, \
+             row 25)",
+        ),
+        "Ubuntu 24.04's pinned root image",
+    ),
+    missing(
+        workspace(
+            "ubuntu-kernel",
+            When::Linux,
+            Some(Pin {
+                package: "ubuntu-noble-kernel",
+                version: "20260926",
+                exe: "ubuntu-24.04-server-cloudimg-arm64-vmlinuz-generic",
+                built: false,
+                hosts: &["macos-aarch64"],
+            }),
+            &[],
+            "not a program: the kernel and initrd of the same release, beside each other, which the \
+             lane's own VM boots from the host; held by aterm-vz's pins \
+             (docs/DESIGN-vz-guest-2026-10-23.md §3, row 25)",
+        ),
+        "Ubuntu 24.04's pinned kernel",
+    ),
     unprovided(
         "zstd",
         &["/opt/homebrew/bin/zstd", "/usr/local/bin/zstd"],

@@ -11,10 +11,9 @@ use crate::model::{Clocks, Mode};
 
 /// The usage text.
 pub const USAGE: &str = "\
-aterm caffeine — a coffee mug in the menu bar that keeps this Mac awake: a click
-fills it (no idle sleep of the system or the display) until the next click; a
-right click (or a Control-click) picks 1, 8 or 24 hours or forever, starts it at
-login, or quits.
+aterm caffeine — a menu-bar mug that keeps this Mac awake: a click fills it (no
+idle sleep of the system or the display) until the next click; a right click or
+Control-click picks 1, 8 or 24 hours or forever, Enable at Startup, or Quit.
 
 USAGE:
     aterm caffeine [start]
@@ -26,33 +25,37 @@ USAGE:
     aterm caffeine serve
     aterm caffeine bridge
 
-    start      Put the mug in the menu bar (its own launchd job, in this
-               login); nothing when it is there. The default.
-    on [span]  Request the span (forever by default; at most a year), and put
-               the mug in the menu bar. caffeine=requested acknowledges the
-               request; status reports the saved mode while a mug runs.
-    off        Stop keeping it awake (the mug stays, empty).
-    status     caffeine=on|off (saved mode with a live mug; known activation
-               refusals turn it off, not a fresh powerd assertion probe),
-               until=<unix seconds>|forever|-, menu=running (with pid=) or
-               stopped, and the running mug's job (else this build's):
-               startup=on|off|blocked|disabled, label=<launchd label>. These
-               fields do not confirm that a keep-awake activity is held.
+    start      Put the mug in the menu bar as a launchd job of this login
+               (caffeine=started), or name the one there (caffeine=running
+               pid=<n>). The default.
+    on [span]  Keep the Mac awake for the span (forever by default; at most a
+               year) and put the mug in the menu bar. caffeine=requested
+               until=… says the request is saved, not that the mug took it.
+    off        Stop keeping it awake; the mug stays, empty (caffeine=off).
+    status     caffeine=on|off (the saved mode while a mug runs; a mug whose
+               activity was refused saves off), until=<unix seconds>|forever|-,
+               menu=running and pid=<n>, or menu=stopped, then the running
+               mug's job (else this build's): startup=on|off|blocked|disabled
+               and label=<launchd label>. It reads what was saved;
+               `pmset -g assertions` shows whether the activity is held.
     startup    Say whether this build's mug starts at every login; `on` or `off`
                sets it (a plist in ~/Library/LaunchAgents; `off` also removes
-               that of a build that is gone). The running mug stays. `blocked`:
-               the plist is there, but aterm's switch under Background App
-               Activity (System Settings > General > Login Items & Extensions)
-               is off, so no login starts it; `on` fails until it is on.
-               `disabled`: launchd has the job disabled (`launchctl disable`),
-               so no login starts it; `on` lifts that.
-    quit       Turn off and take the mug out of the menu bar. `own`: only this
-               build's mug and its job; another build's is left as it is, on or off.
-    serve      Run the mug in this process (what its launchd job runs).
-    bridge     Keep the Mac awake while the mug restarts onto an update of
-               aterm, until the new mug does (what a restarting mug runs).
+               any whose build is gone) and leaves the running mug as it is.
+               `blocked`: aterm's switch under Background App Activity (System
+               Settings > General > Login Items & Extensions) is off, so no
+               login starts it, and `on` exits 1 until that switch is on.
+               `disabled`: launchd has the job disabled (`launchctl disable`);
+               `on` lifts that.
+    quit       Turn off and take the mug out of the menu bar (caffeine=quit, or
+               caffeine=stopped when none ran). `own`: only this build's mug and
+               job; another build's is left as it is, on or off.
+    serve      Run the mug in this process (what its launchd job runs). It
+               exits 0 even when it refuses, so launchd does not restart it.
+    bridge     Keep the Mac awake while the mug restarts onto an aterm update,
+               until the new mug takes over (what a restarting mug runs).
 
-A restart of the Mac starts it off. macOS only.
+A restart of the Mac turns it off. Exit status: 1 when a command fails, 2 for a
+refused command line. macOS only.
 ";
 
 /// One parsed `aterm caffeine` command line.

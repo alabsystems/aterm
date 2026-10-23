@@ -2,12 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm drive ledger`: multi-source timeline joining worker turn history, watcher journal, fabric mail, and reply row counts.
+//!
+//! The session log places every time by default ([`LedgerSource::Log`]): each turn by its
+//! record's `t=` joined by `ledger=`, each message by its `mail` mark joined by `inbox=`.
+//! [`LedgerSource::Anchor`] (`--source anchor`) is deprecated: it is kept until the release
+//! after the one that ships the log default, and removed then.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
-use super::journal::{JournalRecord, json_str, read_journal};
+use super::journal::{JournalRecord, Noted, Word, json_str, read_journal};
 use super::limit::{civil, days_from_civil};
 use super::report::{
     MARKER_CHARS, Mark, OffscreenError, PASTED, decimal, is_user_row, join, parse_offscreen,
@@ -90,20 +95,25 @@ pub struct LedgerOpts {
 /// Clock source used to place turns and mail on the wall clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LedgerSource {
-    /// Process-clock timestamps anchored via [`ClockAnchor`].
+    /// Session-log wall-clock timestamps joined by `ledger=` and `inbox=` (the default).
     #[default]
-    Anchor,
-    /// Session-log wall-clock timestamps joined by `ledger=` and `inbox=`.
     Log,
+    /// Process-clock timestamps anchored via [`ClockAnchor`]: deprecated, kept until the
+    /// release after the one that ships the log default, and removed then.
+    Anchor,
 }
 
+/// What the SOURCES clock row says of `--source anchor` whenever it is read.
+pub const ANCHOR_DEPRECATED: &str = "`--source anchor` is deprecated: kept until the release \
+                                     after the one that ships the log default, removed then";
+
 impl LedgerSource {
-    /// Parse `"anchor"` or `"log"`.
+    /// Parse `"log"` or `"anchor"`.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "anchor" => Some(Self::Anchor),
             "log" => Some(Self::Log),
+            "anchor" => Some(Self::Anchor),
             _ => None,
         }
     }
@@ -432,8 +442,13 @@ pub struct Ledger {
     /// instead of `0`.
     pub journal_unreadable: bool,
     pub mail: Vec<Mail>,
-    /// Whether the process-clock stamps are on the wall clock.
+    /// Whether the turns are placed on the wall clock (the session log read, or the deprecated
+    /// anchor found): the manager's latency is measured only then.
     pub aligned: bool,
+    /// Whether the times shown are guessed: only `--source anchor` with no anchor, which
+    /// places its times as if the newest record were now, each printed after a `~`. The log's
+    /// times, the journal's and the mail marks' are wall times, so the default never guesses.
+    pub guessed: bool,
 }
 
 /// One control request's reply, or the reason there is none.
@@ -481,7 +496,7 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         .and_then(|r| r.stdout.split_whitespace().nth(1).map(str::to_string));
     let from_log = opts.source == LedgerSource::Log;
     let worker_anchor = if from_log {
-        Err("the session log's own times are read instead (`--source log`)".to_string())
+        Err("the session log's own times are read instead".to_string())
     } else {
         (host.anchor)(&worker)
     };
@@ -491,24 +506,25 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         manager.as_deref().map(|m| (host.anchor)(m))
     };
     let mut aligned = worker_anchor.is_ok();
+    let guessed = !from_log && worker_anchor.is_err();
     sources.push(Source {
         name: "clock",
         ok: aligned || from_log,
         detail: match &worker_anchor {
-            _ if from_log => "the session log's own wall times (`--source log`): each turn by \
-                              its record's t= joined by ledger=, each message by its mail \
-                              mark's joined by inbox=; no clock anchor is read"
+            _ if from_log => "the session log's own wall times: each turn by its record's t= \
+                              joined by ledger=, each message by its mail mark's joined by \
+                              inbox=; no clock anchor is read"
                 .to_string(),
             Ok(a) => format!(
-                "instance {}'s clock started {} ({}); history, inbox and timeline times are \
-                 placed by it",
+                "{ANCHOR_DEPRECATED}; instance {}'s clock started {} ({}); history, inbox and \
+                 timeline times are placed by it",
                 a.pid,
                 stamp(a.epoch_ms, host.tz_offset_s, true),
                 a.how
             ),
             Err(e) => format!(
-                "not placed on the wall clock ({e}): worker and mail times are shown as if its \
-                 newest record were now, and no latency is measured"
+                "{ANCHOR_DEPRECATED}; not placed on the wall clock ({e}): worker and mail times \
+                 are shown as if its newest record were now, and no latency is measured"
             ),
         },
     });
@@ -552,10 +568,10 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
                     (false, lost) => format!(
                         "{} turn(s) from {at}{}{}{harness}",
                         hist.len(),
-                        if carried > 0 {
-                            format!(", {carried} carried from an earlier aterm (no time)")
-                        } else {
-                            String::new()
+                        match carried {
+                            0 => String::new(),
+                            _ if from_log => format!(", {carried} carried from an earlier aterm"),
+                            _ => format!(", {carried} carried from an earlier aterm (no time)"),
                         },
                         lost.map(|lost| format!("; {lost}")).unwrap_or_default()
                     ),
@@ -777,6 +793,7 @@ pub fn gather<C: Ctl>(ctl: &mut C, opts: &LedgerOpts, host: &mut LedgerHost<'_>)
         journal_unreadable,
         mail,
         aligned,
+        guessed,
     }
 }
 
@@ -1217,7 +1234,10 @@ impl Lane {
     }
 }
 
-/// Event kind used for HTML timeline markers.
+/// What a timeline item marks, for the HTML page's marks and legend: the manager's turns
+/// and the worker's replies, the watcher's lines (an `EVENT` by its phase, every other
+/// journal [`Word`] and [`Noted`] word by its own kind), the fabric's mail, and `unread` for a
+/// line this reader does not know.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MarkKind {
     Turn,
@@ -1228,50 +1248,226 @@ pub enum MarkKind {
     Limited,
     Survey,
     Context,
+    Busy,
     Approved,
     Dismissed,
     Reconnect,
-    End,
+    Timeout,
+    Exit,
+    Mail,
+    Extend,
+    Escalated,
+    Cleared,
+    Continued,
+    Typed,
+    Restarted,
+    Waiting,
+    Skipped,
+    Unverified,
+    LimitHandled,
+    Unproven,
+    Dialog,
+    Declined,
+    Chose,
+    Exception,
+    Probed,
+    Reset,
+    Needs,
+    Hold,
+    Occupancy,
+    Probe,
+    /// A line of a word the journal keeps as `other` ([`Noted`]).
+    Noted(Noted),
     MailIn,
     MailOut,
-    Other,
+    Unread,
 }
 
 impl MarkKind {
-    fn of_record(r: &JournalRecord) -> Self {
-        match (r.kind.as_str(), r.phase.as_str()) {
-            ("event", "idle" | "turn" | "idle-no-report" | "resumed") => MarkKind::Idle,
-            ("event", "question") => MarkKind::Question,
-            ("event", "prompt") => MarkKind::Prompt,
-            ("event", "limited" | "still-limited") => MarkKind::Limited,
-            ("event", "survey") => MarkKind::Survey,
-            ("event", "context" | "compacted") => MarkKind::Context,
-            ("approved", _) => MarkKind::Approved,
-            ("dismissed", _) => MarkKind::Dismissed,
-            ("reconnect", _) => MarkKind::Reconnect,
-            ("timeout" | "exit", _) => MarkKind::End,
-            _ => MarkKind::Other,
+    /// The marks before the [`Noted`] words', in the legend's order.
+    const READ: [Self; 36] = [
+        Self::Turn,
+        Self::Reply,
+        Self::Idle,
+        Self::Question,
+        Self::Prompt,
+        Self::Limited,
+        Self::Survey,
+        Self::Context,
+        Self::Busy,
+        Self::Approved,
+        Self::Dismissed,
+        Self::Reconnect,
+        Self::Timeout,
+        Self::Exit,
+        Self::Mail,
+        Self::Extend,
+        Self::Escalated,
+        Self::Cleared,
+        Self::Continued,
+        Self::Typed,
+        Self::Restarted,
+        Self::Waiting,
+        Self::Skipped,
+        Self::Unverified,
+        Self::LimitHandled,
+        Self::Unproven,
+        Self::Dialog,
+        Self::Declined,
+        Self::Chose,
+        Self::Exception,
+        Self::Probed,
+        Self::Reset,
+        Self::Needs,
+        Self::Hold,
+        Self::Occupancy,
+        Self::Probe,
+    ];
+
+    /// The marks after them.
+    const AFTER: [Self; 3] = [Self::MailIn, Self::MailOut, Self::Unread];
+
+    /// Every mark, in the legend's order: the read words', each [`Noted`] word's in
+    /// [`Noted::ALL`]'s order, then the mail's and `unread`.
+    pub const ALL: [Self; Self::READ.len() + Noted::ALL.len() + Self::AFTER.len()] = {
+        let mut all = [Self::Unread; Self::READ.len() + Noted::ALL.len() + Self::AFTER.len()];
+        let mut i = 0;
+        while i < Self::READ.len() {
+            all[i] = Self::READ[i];
+            i += 1;
+        }
+        let mut j = 0;
+        while j < Noted::ALL.len() {
+            all[i + j] = Self::Noted(Noted::ALL[j]);
+            j += 1;
+        }
+        let mut k = 0;
+        while k < Self::AFTER.len() {
+            all[i + j + k] = Self::AFTER[k];
+            k += 1;
+        }
+        all
+    };
+
+    /// The mark of a journal record: its word's own, an `EVENT` by its phase, a line kept as
+    /// `other` by its first word (a [`Noted`] word, or a [`Word`] an older build did not read
+    /// yet), `unread` for a kind, word or `EVENT` phase this reader does not know.
+    #[must_use]
+    pub fn of_record(r: &JournalRecord) -> Self {
+        if let Some(word) = Word::of_kind(&r.kind) {
+            return Self::of_word(word, &r.phase);
+        }
+        if r.kind != "other" {
+            return Self::Unread;
+        }
+        if let Some(w) = Noted::of_line(&r.line) {
+            return Self::Noted(w);
+        }
+        let now = JournalRecord::of_line(r.t, None, &r.line, None);
+        Word::of_kind(&now.kind).map_or(Self::Unread, |word| Self::of_word(word, &now.phase))
+    }
+
+    /// The mark of a line read as `word`, about `phase`.
+    fn of_word(word: Word, phase: &str) -> Self {
+        match word {
+            Word::Event => match phase {
+                "idle" | "turn" | "idle-no-report" | "resumed" => Self::Idle,
+                "question" => Self::Question,
+                "prompt" => Self::Prompt,
+                "limited" | "still-limited" => Self::Limited,
+                "survey" => Self::Survey,
+                "context" | "compacted" => Self::Context,
+                "busy" => Self::Busy,
+                _ => Self::Unread,
+            },
+            Word::Approved => Self::Approved,
+            Word::Dismissed => Self::Dismissed,
+            Word::Reconnect => Self::Reconnect,
+            Word::Timeout => Self::Timeout,
+            Word::Exit => Self::Exit,
+            Word::Mail => Self::Mail,
+            Word::Extend => Self::Extend,
+            Word::Escalated => Self::Escalated,
+            Word::Cleared => Self::Cleared,
+            Word::Continued => Self::Continued,
+            Word::Typed => Self::Typed,
+            Word::Restarted => Self::Restarted,
+            Word::Waiting => Self::Waiting,
+            Word::Skipped => Self::Skipped,
+            Word::Unverified => Self::Unverified,
+            Word::Limited => Self::LimitHandled,
+            Word::Unproven => Self::Unproven,
+            Word::Dialog => Self::Dialog,
+            Word::Declined => Self::Declined,
+            Word::Chose => Self::Chose,
+            Word::Exception => Self::Exception,
+            Word::Probed => Self::Probed,
+            Word::Reset => Self::Reset,
+            Word::Needs => Self::Needs,
+            Word::Hold => Self::Hold,
+            Word::Occupancy => Self::Occupancy,
+            Word::Probe => Self::Probe,
         }
     }
+
+    /// The mark's word in the page's data and legend.
+    #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
-            MarkKind::Turn => "turn",
-            MarkKind::Reply => "reply",
-            MarkKind::Idle => "idle",
-            MarkKind::Question => "question",
-            MarkKind::Prompt => "prompt",
-            MarkKind::Limited => "limited",
-            MarkKind::Survey => "survey",
-            MarkKind::Context => "context",
-            MarkKind::Approved => "approved",
-            MarkKind::Dismissed => "dismissed",
-            MarkKind::Reconnect => "reconnect",
-            MarkKind::End => "end",
-            MarkKind::MailIn => "mail-in",
-            MarkKind::MailOut => "mail-out",
-            MarkKind::Other => "other",
+            Self::Turn => "turn",
+            Self::Reply => "reply",
+            Self::Idle => "idle",
+            Self::Question => "question",
+            Self::Prompt => "prompt",
+            Self::Limited => "limited",
+            Self::Survey => "survey",
+            Self::Context => "context",
+            Self::Busy => "busy",
+            Self::Approved => "approved",
+            Self::Dismissed => "dismissed",
+            Self::Reconnect => "reconnect",
+            Self::Timeout => "timeout",
+            Self::Exit => "exit",
+            Self::Mail => "mail",
+            Self::Extend => "extend",
+            Self::Escalated => "escalated",
+            Self::Cleared => "cleared",
+            Self::Continued => "continued",
+            Self::Typed => "typed",
+            Self::Restarted => "restarted",
+            Self::Waiting => "waiting",
+            Self::Skipped => "skipped",
+            Self::Unverified => "unverified",
+            Self::LimitHandled => "limit-handled",
+            Self::Unproven => "unproven",
+            Self::Dialog => "dialog",
+            Self::Declined => "declined",
+            Self::Chose => "chose",
+            Self::Exception => "exception",
+            Self::Probed => "probed",
+            Self::Reset => "reset",
+            Self::Needs => "needs",
+            Self::Hold => "hold",
+            Self::Occupancy => "occupancy",
+            Self::Probe => "probe",
+            Self::Noted(w) => w.name(),
+            Self::MailIn => "mail-in",
+            Self::MailOut => "mail-out",
+            Self::Unread => "unread",
         }
     }
+}
+
+/// A test build's check of each line a loop journals ([`super::journal::Journal::record`]):
+/// the ledger marks it by a word of its own, never `unread`.
+#[cfg(test)]
+pub(crate) fn assert_marked(line: &str) {
+    let mark = MarkKind::of_record(&JournalRecord::of_line(0, None, line, None));
+    assert!(
+        mark != MarkKind::Unread,
+        "a loop journaled `{line}`, which the ledger reads `unread`: give its word a \
+         journal::Noted (or Word) entry, a legend text (ledger_html::marks) and a swatch"
+    );
 }
 
 /// Single formatted timeline row.
@@ -1392,13 +1588,14 @@ pub fn parse_since(s: &str, local_offset_s: i64) -> Option<i64> {
 }
 
 /// The time column: `HH:MM:SS`, with the date when the rows span more than
-/// one local day; `-` for none; `~` before a time the clock could not place.
+/// one local day; `-` for none; `~` before a time the clock could only guess
+/// ([`Ledger::guessed`]).
 fn time_cell(t: Option<i64>, l: &Ledger, dated: bool) -> String {
     match t {
         None => "-".to_string(),
         Some(t) => {
             let s = stamp(t, l.tz_offset_s, dated);
-            if l.aligned { s } else { format!("~{s}") }
+            if l.guessed { format!("~{s}") } else { s }
         }
     }
 }
@@ -1438,8 +1635,10 @@ pub fn summary_rows(l: &Ledger, s: &Summary) -> Vec<(&'static str, String)> {
     }
     let latency = if !l.journaled {
         nj.clone()
-    } else if !l.aligned {
+    } else if l.guessed {
         "- (the clock could not be placed)".to_string()
+    } else if !l.aligned {
+        "- (the session log could not be read)".to_string()
     } else {
         match (s.median_ms(), s.max_ms()) {
             (Some(med), Some(max)) => format!(
@@ -1524,7 +1723,7 @@ pub fn render_text(l: &Ledger) -> String {
         out.push_str("  nothing to show\n");
         return out;
     }
-    let tw = if dated { 20 } else { 9 } + usize::from(!l.aligned);
+    let tw = if dated { 20 } else { 9 } + usize::from(l.guessed);
     let _ = writeln!(
         out,
         "  {}  {}  {}  DURATION/LATENCY",

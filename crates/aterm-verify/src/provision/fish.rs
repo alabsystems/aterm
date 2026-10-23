@@ -109,7 +109,14 @@ pub(super) fn build(
     let scratch = Scratch::new(&machine.tooling, "fish")?;
     let tarball = place::fetch_checked(host, &scratch, &url, archive.sha256, archive.bytes, say)?;
     let plain = place::plain_tar(host, &scratch, &tarball)?;
-    let src = place::unpack(&scratch, &plain, atpkg::extract::Container::Tar, 1, "src")?;
+    let src = place::unpack(
+        &scratch,
+        &plain,
+        atpkg::extract::Container::Tar,
+        1,
+        place::UNPACKED_CAP,
+        "src",
+    )?;
     let manifest = src.join("Cargo.toml");
     for need in [&manifest, &src.join("Cargo.lock")] {
         if !need.is_file() {

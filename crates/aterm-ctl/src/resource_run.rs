@@ -7,7 +7,12 @@ use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-const USAGE: &str = "aterm resource-run [--sock PATH] --session @self|@<sid> [--ai LABEL] --job LABEL -- PROGRAM [ARGS...]";
+const USAGE: &str = "usage: aterm resource-run [--sock PATH] --session @self|@<sid>|@<local-id> [--ai WORD] --job LABEL -- PROGRAM [ARGS...]";
+
+const ABOUT: &str = "Registers this process with the session's aterm as job LABEL, then execs PROGRAM in its\n\
+                     place (same pid, descriptors and process group): its CPU and memory are charged to\n\
+                     that tab. --ai names the agent the job runs for (default: the tab's agent).\n\
+                     `aterm help resource-run` says more.";
 
 struct Args {
     sock: Option<String>,
@@ -75,7 +80,7 @@ fn run_registered_command(argv: Vec<OsString>) -> io::Result<ExitCode> {
         use std::io::Write;
         let stdout = io::stdout();
         let mut output = crate::StdoutSink::new(stdout.lock());
-        writeln!(output, "{USAGE}")?;
+        writeln!(output, "{USAGE}\n{ABOUT}")?;
         return Ok(ExitCode::SUCCESS);
     };
     let self_sid = std::env::var(crate::SELF_SID_ENV)

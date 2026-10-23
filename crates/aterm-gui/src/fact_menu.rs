@@ -1237,47 +1237,37 @@ impl App {
                     crate::harness_host::harness_state(),
                 ) {
                     let store = accounts::Store::at(&state_dir);
-                    let raw = accounts::Roster::load(&roster_path)
-                        .ok()
-                        .unwrap_or_default();
-                    let roster = store.bound(&raw, now).unwrap_or(raw);
-                    if let Some(row) = label.row(&roster).cloned() {
-                        let enrolled = accounts::enrolled(&roster);
-                        let is_enrolled = row.dir.is_none() || enrolled.contains(&row.label);
-                        let mut note = None;
-                        let pinned = is_enrolled
-                            && store
-                                .transact_within(&accounts::LOCK_LADDER, now, &mut note, |state| {
-                                    accounts::pin(state, &roster, &enrolled, &row.label, now)
-                                        .map(|ev| vec![ev])
-                                })
-                                .is_ok();
-                        if !pinned
-                            && row.email.is_some()
-                            && let (crate::harness_host::AccountsUpkeep::Live, Some(home)) = (
+                    if let Ok(roster) = accounts::Roster::load(&roster_path)
+                        && label.row(&roster).is_some()
+                    {
+                        if let Ok(accounts::PinSelection::Renew(request)) =
+                            store.select_account(&roster, label.as_str(), now)
+                        {
+                            if let (crate::harness_host::AccountsUpkeep::Live, Some(home)) = (
                                 crate::harness_host::live_accounts_upkeep(),
                                 aterm_primer::home_dir(),
-                            )
-                            && let Ok(request) = store.request_pin(&row.label, now)
-                        {
-                            let worker_request = request.clone();
-                            let started = std::thread::Builder::new()
+                            ) {
+                                let worker_request = request.clone();
+                                let started = std::thread::Builder::new()
                                 .name("aterm-acct-renew".to_string())
                                 .spawn(move || {
                                     let worker_store = accounts::Store::at(&state_dir);
-                                    let started = aterm_agent::harness::accounts_sync::auto_renew_account_by_label(
+                                    let dispatched = aterm_agent::harness::accounts_sync::auto_renew_account_by_label(
                                         &home,
                                         &state_dir,
                                         &roster_path,
                                         worker_request.clone(),
                                         now,
                                     );
-                                    if !started {
+                                    if dispatched == aterm_agent::harness::accounts_sync::RenewalDispatch::Failed {
                                         let now_done = aterm_agent::supervise::limit::unix_now().max(now);
                                         let _ = worker_store.cancel_pin_request(&worker_request, now_done);
                                     }
                                 });
-                            if started.is_err() {
+                                if started.is_err() {
+                                    let _ = store.cancel_pin_request(&request, now);
+                                }
+                            } else {
                                 let _ = store.cancel_pin_request(&request, now);
                             }
                         }

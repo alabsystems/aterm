@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! macOS kernel resource coalitions ([`coalition_of`], [`crate::procs::processes_with`],
-//! [`coalitions`], [`self_check`], [`decode_usage`], [`decode_list`]).
+//! macOS kernel resource coalitions ([`coalition_of`], [`CoalitionIds`],
+//! [`crate::procs::processes_keeping`], [`coalitions`], [`self_check`], [`decode_usage`],
+//! [`decode_list`]).
+
+use std::collections::HashMap;
 
 use crate::procs::ticks_to_ns;
 
@@ -76,6 +79,100 @@ pub fn coalitions() -> Option<CoalitionRead> {
 #[must_use]
 pub fn coalition_of(pid: u32) -> Option<u64> {
     imp::coalition_of(pid)
+}
+
+/// Each swept process's resource coalition id, kept by pid under the pid version it was read at
+/// ([`crate::procs::processes_keeping`]), so a sweep reads the coalition only of a process it has
+/// not read under its current version.
+///
+/// A kept id stays the process's own while its version stays: xnu adopts a task into its
+/// coalitions only where it makes the task (`task_create_internal`, for a fork, a spawn, or the
+/// new task an exec makes; `coalition_adopt_task_internal` refuses a task already in one of that
+/// type) and removes it only as the task ends, and nothing moves a live task; a fork or an exec
+/// gives the process a new pid version (`p_idversion`), as a reused pid's new process has.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoalitionIds {
+    /// Each pid's kept id: the version it was read under, the id, and the sweep that last asked.
+    kept: HashMap<u32, (i32, u64, u64)>,
+    /// The sweeps begun.
+    sweep: u64,
+}
+
+impl CoalitionIds {
+    /// Starts a sweep: [`Self::end_sweep`] then drops every pid this one does not ask about.
+    pub fn begin_sweep(&mut self) {
+        self.sweep = self.sweep.wrapping_add(1);
+    }
+
+    /// `pid`'s coalition at pid `version`: the id kept under that version, else `read`'s, kept
+    /// under it. A read that answers nothing, or with no version, is not kept.
+    pub fn of(
+        &mut self,
+        pid: u32,
+        version: Option<i32>,
+        read: impl FnOnce() -> Option<u64>,
+    ) -> Option<u64> {
+        let Some(version) = version else {
+            self.kept.remove(&pid);
+            return read();
+        };
+        if let Some(kept) = self.kept.get_mut(&pid).filter(|k| k.0 == version) {
+            kept.2 = self.sweep;
+            return Some(kept.1);
+        }
+        let read = read();
+        match read {
+            Some(id) => {
+                self.kept.insert(pid, (version, id, self.sweep));
+            }
+            None => {
+                self.kept.remove(&pid);
+            }
+        }
+        read
+    }
+
+    /// `pid`'s coalition and pid version as a sweep reads them: `version`'s read, then
+    /// [`Self::of`] under it, where `coalition`'s read is kept only if `version` reads the same
+    /// again after it (no exec, and no new process at the pid, between). A read the version
+    /// moved across answers `None` and keeps nothing.
+    pub fn read(
+        &mut self,
+        pid: u32,
+        mut version: impl FnMut() -> Option<i32>,
+        coalition: impl FnOnce() -> Option<u64>,
+    ) -> (Option<u64>, Option<i32>) {
+        let before = version();
+        let id = self.of(pid, before, || {
+            let id = coalition()?;
+            (version() == before).then_some(id)
+        });
+        (id, before)
+    }
+
+    /// Ends a sweep: drops every pid it did not ask about (one that ended, or a zombie).
+    pub fn end_sweep(&mut self) {
+        let sweep = self.sweep;
+        self.kept.retain(|_, k| k.2 == sweep);
+    }
+
+    /// `pid`'s kept id and the pid version it was read under.
+    #[must_use]
+    pub fn kept(&self, pid: u32) -> Option<(i32, u64)> {
+        self.kept.get(&pid).map(|&(version, id, _)| (version, id))
+    }
+
+    /// How many pids' ids are kept.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.kept.len()
+    }
+
+    /// Whether no pid's id is kept.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty()
+    }
 }
 
 /// Whether the lane reads right on this OS build for live process `pid`.

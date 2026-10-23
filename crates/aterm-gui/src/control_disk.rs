@@ -13,7 +13,7 @@ use aterm_vitals::sys::predicate::{DiskWord, VolumeTerm, VolumeWait};
 
 use crate::disk_board::{Board, PassSummary, Shelf, VolumeRow, Watch};
 
-/// A `vol=` this wait cannot read: not an absolute path once decoded.
+/// The reply to a `vol=` that is not an absolute path once decoded.
 pub(crate) const USAGE: &str = aterm_vitals::sys::predicate::USAGE;
 
 /// A beat this old, while the watch runs, is a stalled watch.
@@ -178,7 +178,8 @@ fn room_unknown(wait: &SysWait, row: &VolumeRow) -> bool {
 /// The reply to a wait on a volume whose room is not known.
 const ROOM_UNKNOWN: &str = "ERR unavailable free why=room-unknown\n";
 
-/// The reply to a demand where no disk watch runs (`[harness]` off): no pass would ever adopt it.
+/// The reply to a demand where no disk watch runs (the harness does not supervise here): no pass
+/// would adopt it.
 const NO_WATCH: &str = "ERR unavailable free why=no-watch\n";
 
 /// The largest free need of `wait` on `row`, if it has a `free` term.

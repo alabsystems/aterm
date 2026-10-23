@@ -519,11 +519,11 @@ COMMANDS
                          `REFUSED @sid <why>` (exit 2, nothing typed)
                          `NOT-SERVED @sid <why> (enters=<k>)` (exit 3)
     ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
-           [--source anchor|log]
+           [--source log|anchor]
                        @sid's run on one time axis, joined from its `history` (turns),
                        reply sizes (`offscreen`), the window's journal (`--journal FILE`:
                        `<state>/drive/<sid>.journal.jsonl`) and fabric mail (`@self`'s
-                       `inbox --peek --meta` and `timeline`). Prints SOURCES, SUMMARY and
+                       `inbox --peek --meta`). Prints SOURCES, SUMMARY and
                        a TIMELINE in `manager`, `worker`, `watcher` and `fabric` lanes as
                        text columns (default), Markdown tables (`md`) or one swimlane
                        HTML page (`html`). `--out PATH` writes it there (mode 0600) and
@@ -531,10 +531,15 @@ COMMANDS
                        focused tab's HTML page.
                        `--since TIME` keeps what happened from TIME on: Unix ms or
                        `YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]`.
-                       `--source anchor` (default) places turns by the instance's clock,
-                       anchored at its control socket's birth (`~` marks a time it could
-                       not place; turns carried from an earlier aterm have none);
-                       `--source log` places turns and mail by the session log's records.
+                       `--source log` (default) places turns and mail by the session
+                       log's own records: a turn by its record's time, joined by
+                       `ledger=`, a message by its `mail` mark, joined by `inbox=`; one
+                       the log no longer holds has no time, and is counted.
+                       `--source anchor` is deprecated, kept until the release after the
+                       one that ships the log default and removed then: it places turns
+                       and mail (`@self`'s `timeline`) by the instance's clock, anchored
+                       at its control socket's birth (`~` marks a time it could not
+                       place; turns carried from an earlier aterm have none).
                        No @sid: the one session `--journal` names.
     tape cat FILE [--text] [--salvage] | tape show FILE --decisions [--salvage]
     tape stats FILE [--salvage]

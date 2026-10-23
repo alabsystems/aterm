@@ -106,6 +106,172 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
     ))
 }
 
+/// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`,
+/// by each socket's own kernel record, never by a process's arguments: each socket descriptor's
+/// `PROC_PIDFDSOCKETINFO` ([`aterm_sysprobe::jobs::darwin::unix_listener`]). A bound path names
+/// `path` as [`SocketPath::names`] says. A table that cannot be read is `unreadable`.
+///
+/// # Errors
+/// The process listing failing.
+#[cfg(target_vendor = "apple")]
+pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    let target = SocketPath::of(path);
+    let mut scan = HolderScan::default();
+    for pid in uid_pids()? {
+        if skip.contains(&pid) {
+            continue;
+        }
+        scan.scanned += 1;
+        match listener_table(pid, &target) {
+            TableRead::Holds => scan.holders.push(pid),
+            TableRead::Clear | TableRead::Exited => {}
+            TableRead::Unreadable => scan.unreadable.push(pid),
+        }
+    }
+    Ok(scan)
+}
+
+/// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`,
+/// by each socket's own kernel record, never by a process's arguments: `/proc/net/unix`'s
+/// listening rows ([`aterm_sysprobe::jobs::linux::listening_unix`]) matched with each
+/// process's `/proc/<pid>/fd` links (`holders_procfs.rs`). A bound path names `path` as
+/// [`SocketPath::names`] says. A table only root reads is in [`HolderScan::sealed`].
+///
+/// # Errors
+/// `/proc/net/unix` or the process listing cannot be read, or the reads take longer than 10 s
+/// (`TimedOut`).
+#[cfg(target_os = "linux")]
+pub fn scan_listener_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    // SAFETY: `geteuid` is a side-effect-free getter.
+    let me = unsafe { libc::geteuid() };
+    let (path, skip) = (path.to_path_buf(), skip.to_vec());
+    procfs::within(procfs::SCAN_DEADLINE, move || {
+        let target = SocketPath::of(&path);
+        procfs::scan_listener_holders_in(
+            std::path::Path::new(procfs::PROC),
+            me,
+            |bound| target.names(bound),
+            &skip,
+        )
+    })
+}
+
+/// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`.
+///
+/// # Errors
+/// Always `Unsupported`.
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+pub fn scan_listener_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<HolderScan> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the listener scan reads libproc (macOS) or /proc (Linux)",
+    ))
+}
+
+/// A socket path, as a path a socket was bound at is compared with it ([`Self::names`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SocketPath {
+    /// The path's own bytes.
+    bytes: Vec<u8>,
+    /// For an absolute path whose folder resolves, its file name in that folder's canonical
+    /// spelling.
+    canonical: Option<Vec<u8>>,
+}
+
+impl SocketPath {
+    /// `path`, its folder resolved once here: only this path is ever resolved.
+    #[must_use]
+    pub fn of(path: &std::path::Path) -> Self {
+        let canonical = path
+            .file_name()
+            .zip(path.parent())
+            .filter(|_| path.is_absolute())
+            .and_then(|(name, parent)| Some(parent.canonicalize().ok()?.join(name)))
+            .map(|placed| placed.into_os_string().into_encoded_bytes());
+        Self {
+            bytes: path.as_os_str().as_encoded_bytes().to_vec(),
+            canonical,
+        }
+    }
+
+    /// Whether a socket bound at `bound` is bound at this path: `bound` is this path's bytes, or
+    /// its canonical spelling. `bound` is another process's choice, so it is compared and never
+    /// resolved (a folder there may be a hung mount or one only a person's consent opens); a
+    /// socket bound through a link is named by that spelling alone.
+    #[must_use]
+    pub fn names(&self, bound: &[u8]) -> bool {
+        bound == self.bytes || self.canonical.as_deref() == Some(bound)
+    }
+}
+
+/// What `pid`'s descriptor table says of a listener at `target`: each socket descriptor's record
+/// read and decoded, until one is a listener bound there.
+#[cfg(target_vendor = "apple")]
+fn listener_table(pid: u32, target: &SocketPath) -> TableRead {
+    use aterm_sysprobe::jobs::darwin;
+    let Ok(pid) = i32::try_from(pid) else {
+        return TableRead::Unreadable;
+    };
+    let fds = match list_fds(pid) {
+        Ok(fds) => fds,
+        Err(Failed::Exited) => return TableRead::Exited,
+        Err(Failed::Closed | Failed::Dead | Failed::Refused | Failed::Other) => {
+            return TableRead::Unreadable;
+        }
+    };
+    let mut unreadable = false;
+    for (fd, kind) in fds {
+        if kind != darwin::PROX_FDTYPE_SOCKET {
+            continue;
+        }
+        let read = socket_record(pid, fd).and_then(|record| {
+            darwin::unix_listener(&record)
+                .ok_or(Failed::Other)
+                .map(|bound| bound.is_some_and(|bound| target.names(bound)))
+        });
+        match read {
+            Ok(true) => return TableRead::Holds,
+            Ok(false) | Err(Failed::Closed | Failed::Dead) => {}
+            Err(Failed::Exited) => return TableRead::Exited,
+            Err(Failed::Refused | Failed::Other) => unreadable = true,
+        }
+    }
+    if unreadable {
+        TableRead::Unreadable
+    } else {
+        TableRead::Clear
+    }
+}
+
+/// `pid`'s descriptor `fd`'s `socket_fdinfo` (`PROC_PIDFDSOCKETINFO`), whole.
+#[cfg(target_vendor = "apple")]
+fn socket_record(
+    pid: i32,
+    fd: i32,
+) -> Result<[u8; aterm_sysprobe::jobs::darwin::SOCKET_SIZE], Failed> {
+    use aterm_sysprobe::jobs::darwin;
+    let mut buf = [0u8; darwin::SOCKET_SIZE];
+    let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
+    clear_errno();
+    // SAFETY: `buf` matches the structure size `PROC_PIDFDSOCKETINFO` writes.
+    let got = unsafe {
+        ffi::proc_pidfdinfo(
+            pid,
+            fd,
+            darwin::PROC_PIDFDSOCKETINFO,
+            buf.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if got <= 0 {
+        return Err(Failed::last());
+    }
+    if got != size {
+        return Err(Failed::Other);
+    }
+    Ok(buf)
+}
+
 /// One walk of this uid's processes except `skip`.
 #[cfg(target_vendor = "apple")]
 fn scan(wanted: &[u128], lookup: Lookup, skip: &[u32]) -> io::Result<Vec<HolderScan>> {
@@ -176,7 +342,7 @@ pub fn process_holds_rdev(pid: u32, rdev: u64) -> Option<bool> {
     }
 }
 
-/// What reading one process's descriptor table for one device found.
+/// What reading one process's descriptor table for one device or listener found.
 #[cfg(target_vendor = "apple")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TableRead {
@@ -196,7 +362,8 @@ enum TableRead {
 enum Failed {
     /// `ESRCH`: no such process.
     Exited,
-    /// `EBADF`, reading one descriptor.
+    /// `EBADF`, or `ENOTSOCK` reading a socket's record: the descriptor was closed, or its
+    /// number reused for another kind, since the listing.
     Closed,
     /// `ENOENT`, reading one descriptor or a working directory.
     Dead,
@@ -211,13 +378,14 @@ impl Failed {
     const ESRCH: i32 = 3;
     const EPERM: i32 = 1;
     const EBADF: i32 = 9;
+    const ENOTSOCK: i32 = 38;
     /// A descriptor's or a working directory's read's answer for a dead vnode.
     const ENOENT: i32 = 2;
 
     const fn of(errno: i32) -> Self {
         match errno {
             Self::ESRCH => Self::Exited,
-            Self::EBADF => Self::Closed,
+            Self::EBADF | Self::ENOTSOCK => Self::Closed,
             Self::ENOENT => Self::Dead,
             Self::EPERM => Self::Refused,
             _ => Self::Other,
@@ -556,26 +724,58 @@ fn errno() -> i32 {
     io::Error::last_os_error().raw_os_error().unwrap_or(0)
 }
 
-/// List every live process PID owned by this UID.
+/// List every live process PID owned by this UID ([`pids_of_uid`] of the effective uid).
 /// # Errors
 /// Returns an error if the process listing fails.
 #[cfg(target_vendor = "apple")]
 pub fn uid_pids() -> io::Result<Vec<u32>> {
     // SAFETY: `geteuid` is a side-effect-free getter.
-    let uid = unsafe { ffi::geteuid() };
+    pids_of_uid(unsafe { ffi::geteuid() })
+}
+
+/// List every live process PID owned by `uid` (`proc_listpids(PROC_UID_ONLY, uid)`). libproc
+/// answers 0 both for a uid with no process and for a failure, which alone sets `errno`.
+///
+/// # Errors
+///
+/// The listing failing, or filling its buffer at its cap of 1 Mi pids: a partial list proves no
+/// absence.
+#[cfg(target_vendor = "apple")]
+pub fn pids_of_uid(uid: u32) -> io::Result<Vec<u32>> {
+    listed_growing(|pids| {
+        let bytes = i32::try_from(std::mem::size_of_val(pids))
+            .map_err(|_| io::Error::other("pid list too large"))?;
+        clear_errno();
+        // SAFETY: `pids` has `bytes` writable bytes of `i32` slots.
+        let got = unsafe { ffi::proc_listpids(ffi::PROC_UID_ONLY, uid, pids.as_mut_ptr(), bytes) };
+        if got < 0 || (got == 0 && errno() != 0) {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(usize::try_from(got).unwrap_or(0) / std::mem::size_of::<i32>())
+    })
+}
+
+/// The most pids one listing holds: a listing that still fills this many slots is refused.
+#[cfg(any(target_vendor = "apple", test))]
+const MAX_LISTED_PIDS: usize = 1 << 20;
+
+/// The positive pids `fill` lists, into a buffer that grows fourfold from 1024 slots while the
+/// listing fills it; `fill` answers how many slots it wrote. A listing that fills
+/// [`MAX_LISTED_PIDS`] slots is refused, never cut short.
+#[cfg(any(target_vendor = "apple", test))]
+fn listed_growing(mut fill: impl FnMut(&mut [i32]) -> io::Result<usize>) -> io::Result<Vec<u32>> {
     let mut room = 1024usize;
     loop {
         let mut pids = vec![0i32; room];
-        let bytes = i32::try_from(room * 4).map_err(|_| io::Error::other("pid list too large"))?;
-        // SAFETY: `pids` has `bytes` writable bytes of `i32` slots.
-        let got = unsafe { ffi::proc_listpids(ffi::PROC_UID_ONLY, uid, pids.as_mut_ptr(), bytes) };
-        if got <= 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let n = usize::try_from(got).unwrap_or(0) / 4;
-        if n >= room && room < (1 << 20) {
+        let n = fill(&mut pids)?;
+        if n >= room && room < MAX_LISTED_PIDS {
             room *= 4;
             continue;
+        }
+        if n >= room {
+            return Err(io::Error::other(format!(
+                "the process listing filled all {room} slots"
+            )));
         }
         return Ok(pids
             .into_iter()
@@ -587,15 +787,24 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
 }
 
 /// List every live process PID owned by this UID: its effective uid, as macOS's
-/// `PROC_UID_ONLY` lists ([`ours_by_owner`]).
+/// `PROC_UID_ONLY` lists ([`pids_of_uid`]).
 ///
 /// # Errors
 /// Returns an error if `/proc` cannot be read.
 #[cfg(target_os = "linux")]
 pub fn uid_pids() -> io::Result<Vec<u32>> {
     // SAFETY: `geteuid` is a side-effect-free getter.
-    let me = unsafe { libc::geteuid() };
-    procfs::uid_pids_in(std::path::Path::new(procfs::PROC), me)
+    pids_of_uid(unsafe { libc::geteuid() })
+}
+
+/// List every live process PID whose effective uid is `uid` ([`ours_by_owner`]). Root's
+/// listing also holds every non-dumpable process, whose directory the kernel makes root's.
+///
+/// # Errors
+/// Returns an error if `/proc` cannot be read.
+#[cfg(target_os = "linux")]
+pub fn pids_of_uid(uid: u32) -> io::Result<Vec<u32>> {
+    procfs::uid_pids_in(std::path::Path::new(procfs::PROC), uid)
 }
 
 /// Whether the process whose `/proc/<pid>` directory `owner` owns runs as effective uid `me`.
@@ -1008,6 +1217,146 @@ mod hook {
         if let Some(f) = AFTER_LISTING.with(|h| h.borrow_mut().take()) {
             f(pid, fds);
         }
+    }
+}
+
+#[cfg(test)]
+mod listing_tests {
+    /// A listing that still fills its buffer at the cap is refused, never cut short; one that
+    /// leaves a slot free is read whole, a non-positive slot dropped.
+    #[test]
+    fn a_listing_that_fills_its_buffer_at_the_cap_is_refused() {
+        let mut rooms = Vec::new();
+        let full = super::listed_growing(|pids| {
+            rooms.push(pids.len());
+            pids.fill(7);
+            Ok(pids.len())
+        });
+        assert!(
+            full.is_err(),
+            "a listing cut at the cap: {:?}",
+            full.map(|p| p.len())
+        );
+        assert_eq!(rooms.last(), Some(&super::MAX_LISTED_PIDS), "{rooms:?}");
+        let mut asked = 0;
+        let grown = super::listed_growing(|pids| {
+            asked += 1;
+            let n = 1500.min(pids.len());
+            for (at, slot) in pids.iter_mut().take(n).enumerate() {
+                *slot = i32::try_from(at).expect("small");
+            }
+            Ok(n)
+        })
+        .expect("a listing with room to spare");
+        assert_eq!(asked, 2, "1024 slots filled, then 4096 with room");
+        assert_eq!(grown.len(), 1499, "pid 0 is no process");
+        assert!(super::listed_growing(|_| Err(std::io::Error::other("refused"))).is_err());
+    }
+
+    /// The effective uid, as the kernel names this process's owner.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    fn euid() -> u32 {
+        // SAFETY: `geteuid` is a side-effect-free getter.
+        unsafe { libc::geteuid() }
+    }
+
+    /// A uid's listing holds that uid's processes and no other's: this process is in its own
+    /// uid's list and not in root's, where launchd or init (pid 1) is.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn pids_of_uid_lists_the_uid_it_is_given() {
+        let me = std::process::id();
+        let mine = super::pids_of_uid(euid()).expect("this uid's processes");
+        assert!(mine.contains(&me), "this process in its own uid's list");
+        assert!(
+            super::uid_pids()
+                .expect("the own-uid listing")
+                .contains(&me),
+            "uid_pids is this uid's list"
+        );
+        if euid() != 0 {
+            let root = super::pids_of_uid(0).expect("root's processes");
+            assert!(root.contains(&1), "pid 1 is root's: {} pids", root.len());
+            assert!(!root.contains(&me), "this process is not root's");
+            assert!(!mine.contains(&1), "pid 1 is not this uid's");
+        }
+    }
+
+    /// A uid with no live process lists none: an answer, never an error.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn a_uid_with_no_process_lists_none() {
+        let unused = 2_000_000_011;
+        assert_eq!(
+            super::pids_of_uid(unused).map_err(|e| e.to_string()),
+            Ok(Vec::new())
+        );
+    }
+
+    /// The process holding a listener is found by the path that listener is bound at, read from
+    /// the socket's own record, and by a spelling of that path whose folder resolves to the bound
+    /// one. A path the listener's process bound is compared, never resolved: a listener bound
+    /// through a link is found by that spelling alone. A listener bound elsewhere, or closed, is
+    /// not found.
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    #[test]
+    fn this_process_holds_the_listener_it_bound() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+        let me = std::process::id();
+        let dir = aterm_tempfile::Builder::new()
+            .tempdir_in("/tmp")
+            .expect("a scratch folder short enough for sun_path");
+        let base = dir
+            .path()
+            .canonicalize()
+            .expect("the scratch folder's own spelling");
+        let (real, link) = (base.join("real"), base.join("link"));
+        std::fs::create_dir(&real).expect("the real folder");
+        std::os::unix::fs::symlink(&real, &link).expect("a link to it");
+        let (a, b, c) = (
+            real.join("a.sock"),
+            real.join("b.sock"),
+            link.join("c.sock"),
+        );
+        let l1 = UnixListener::bind(&a).expect("bind a");
+        let l2 = UnixListener::bind(&b).expect("bind b");
+        let l3 = UnixListener::bind(&c).expect("bind c through the link");
+        let client = UnixStream::connect(&a).expect("connect a");
+        let (accepted, _) = l1.accept().expect("accept");
+        let scan = |path: &std::path::Path| {
+            super::scan_listener_holders(path, &[]).expect("the listener scan")
+        };
+        let found = scan(&a);
+        assert!(found.holds(me), "{found:?}");
+        assert!(found.scanned > 0);
+        assert!(
+            scan(&link.join("a.sock")).holds(me),
+            "the same socket through a link to its folder"
+        );
+        assert!(scan(&b).holds(me), "the other listener");
+        assert!(
+            scan(&c).holds(me),
+            "a listener bound through a link, by that spelling"
+        );
+        assert!(
+            !scan(&real.join("c.sock")).holds(me),
+            "a listener bound through a link is not resolved to its folder's own spelling"
+        );
+        assert!(
+            !super::scan_listener_holders(&a, &[me])
+                .expect("the listener scan")
+                .holds(me),
+            "skip is honoured"
+        );
+        drop((client, accepted, l1));
+        std::fs::remove_file(&a).expect("unlink a");
+        let gone = scan(&a);
+        assert!(
+            !gone.holds(me),
+            "a closed listener is held by nobody, with another still listening here: {gone:?}"
+        );
+        assert!(scan(&b).holds(me), "the other listener still");
+        drop((l2, l3));
     }
 }
 
@@ -1635,5 +1984,21 @@ mod tests {
         assert_eq!(mine(), 1, "the mapping was no descriptor");
         drop(custody);
         assert_eq!(mine(), 0, "closed");
+    }
+
+    /// A descriptor that is no socket when its socket record is read (its number reused for a
+    /// file since the listing typed it a socket) holds no listener: it reads as closed, never as
+    /// a refusal that leaves its table unknown.
+    #[test]
+    fn a_socket_read_of_a_descriptor_that_is_no_socket_is_closed() {
+        use std::os::fd::AsRawFd as _;
+        let pid = i32::try_from(std::process::id()).expect("a pid");
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        assert_eq!(
+            super::socket_record(pid, file.as_raw_fd()).err(),
+            Some(super::Failed::Closed)
+        );
+        let (a, _b) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+        assert!(super::socket_record(pid, a.as_raw_fd()).is_ok(), "a socket");
     }
 }

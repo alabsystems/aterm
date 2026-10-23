@@ -3,7 +3,7 @@
 
 //! WHY: who uses the machine's CPU, read per resource coalition: the facts the cause engine and `sys why` read. RD is `docs/DESIGN-resource-details-2026-10-20.md`, SA `docs/DESIGN-system-awareness-2026-10-16.md`.
 
-use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Arc;
 
 use crate::model::{Membership, Sample, Snapshot, TabRoot};
@@ -24,6 +24,68 @@ pub use detect::{
 };
 pub use episodes::{ClauseHold, DeckCause, Episodes, OpenCause, deck_cause};
 pub use split::{CoalBase, SplitIn, WINDOW_MAX_NS, split};
+
+/// A map keyed by the kernel's integer ids (pids, coalition ids, a pid and
+/// its birth), hashed by [`IdHasher`].
+pub type IdMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<IdHasher>>;
+
+/// A set of the kernel's integer ids, hashed by [`IdHasher`].
+pub type IdSet<K> = std::collections::HashSet<K, BuildHasherDefault<IdHasher>>;
+
+/// The split's hasher for integer ids (FxHash's multiply-rotate, rustc's):
+/// a split tick hashes ids some ten thousand times (700 processes, 650
+/// coalitions), which std's SipHash made about half the split's own CPU
+/// (m22, 2026-10-23). The ids are the kernel's, which no process picks, so
+/// a keyed hash buys nothing here. Local, since this crate depends on
+/// nothing.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IdHasher(u64);
+
+impl IdHasher {
+    const K: u64 = 0xf135_7aea_2e62_a9c5;
+
+    fn add(&mut self, word: u64) {
+        self.0 = self.0.wrapping_add(word).wrapping_mul(Self::K);
+    }
+}
+
+impl Hasher for IdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        let (words, tail) = bytes.as_chunks::<8>();
+        for w in words {
+            self.add(u64::from_le_bytes(*w));
+        }
+        let mut last = [0u8; 8];
+        last[..tail.len()].copy_from_slice(tail);
+        self.add(u64::from_le_bytes(last) ^ ((tail.len() as u64) << 56));
+    }
+
+    fn write_u8(&mut self, n: u8) {
+        self.add(u64::from(n));
+    }
+
+    fn write_u16(&mut self, n: u16) {
+        self.add(u64::from(n));
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.add(u64::from(n));
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.add(n);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.add(n as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        // The multiply leaves the low bits, which pick the bucket, the
+        // weakest: rotate the strong high bits down (rustc-hash 2's finish).
+        self.0.rotate_left(26)
+    }
+}
 
 /// Whether the coalition lane reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -176,6 +238,49 @@ pub struct Lead {
 }
 
 impl Lead {
+    /// The lead `pid`, born at `birth_ms`, of user `uid`, with the identity
+    /// `id` read for it (none where the host read none).
+    fn of(pid: u32, birth_ms: i64, uid: Option<u32>, id: Option<&LeadIdentity>) -> Self {
+        let Some(id) = id else {
+            return Self {
+                pid,
+                birth_ms,
+                uid,
+                ..Self::default()
+            };
+        };
+        Self {
+            pid,
+            birth_ms,
+            uid,
+            exe: (!id.exe.is_empty()).then(|| id.exe.clone()),
+            voucher: id.voucher,
+            signing_id: id.signing_id.clone(),
+            team: id.team.clone(),
+        }
+    }
+
+    /// Whether this is [`Self::of`] the same arguments, field for field,
+    /// without copying a word.
+    fn is(&self, pid: u32, birth_ms: i64, uid: Option<u32>, id: Option<&LeadIdentity>) -> bool {
+        let Self {
+            pid: p,
+            birth_ms: b,
+            uid: u,
+            exe,
+            voucher,
+            signing_id,
+            team,
+        } = self;
+        let none = LeadIdentity::default();
+        let id = id.unwrap_or(&none);
+        (*p, *b, *u) == (pid, birth_ms, uid)
+            && exe.as_deref() == (!id.exe.is_empty()).then_some(id.exe.as_str())
+            && *voucher == id.voucher
+            && *signing_id == id.signing_id
+            && *team == id.team
+    }
+
     /// Its team id where it reads as one (ten capitals or digits): the only
     /// form `team=` and the lens's chip print.
     #[must_use]
@@ -471,7 +576,7 @@ impl Fault {
 /// Each coalition's lead among `members` (`(pid, coalition, birth_ms)`, every live process whose coalition and birth were read): its earliest-born member, ties to the lower pid, never pid 0.
 #[must_use]
 pub fn leads(members: &[(u32, u64, i64)]) -> Vec<(u64, u32)> {
-    let mut first: HashMap<u64, (i64, u32)> = HashMap::new();
+    let mut first: IdMap<u64, (i64, u32)> = IdMap::default();
     for &(pid, coalition, birth) in members.iter().filter(|m| m.0 != 0) {
         first
             .entry(coalition)
@@ -485,22 +590,22 @@ pub fn leads(members: &[(u32, u64, i64)]) -> Vec<(u64, u32)> {
 
 /// Name `read`'s coalitions in `names` from this tick's sweep `procs`: each one with a live member takes its part (aterm's for one holding this instance, `self_pid`, or a tab's shell, so a tab adopted from a predecessor counts; others for one holding a process of user `self_uid`; else services) and its lead, with the identity `identities` hold for that pid and birth.
 pub fn name(
-    names: &mut HashMap<u64, Named>,
+    names: &mut IdMap<u64, Named>,
     read: &CoalSample,
     procs: &[crate::model::ProcSample],
     self_pid: u32,
     self_uid: u32,
     tabs: &[TabRoot],
-    identities: &HashMap<(u32, i64), LeadIdentity>,
-) -> HashMap<u64, u32> {
-    let roots: HashSet<u32> = std::iter::once(self_pid)
+    identities: &IdMap<(u32, i64), LeadIdentity>,
+) -> IdMap<u64, u32> {
+    let roots: IdSet<u32> = std::iter::once(self_pid)
         .chain(tabs.iter().map(|t| t.shell_pid).filter(|p| *p != 0))
         .collect();
-    let listed: HashSet<u64> = read.rows.iter().map(|r| r.id).collect();
-    let mut live: HashMap<u64, u32> = HashMap::new();
-    let mut parts: HashMap<u64, Part> = HashMap::new();
+    let listed: IdSet<u64> = read.rows.iter().map(|r| r.id).collect();
+    let mut live: IdMap<u64, u32> = IdMap::default();
+    let mut parts: IdMap<u64, Part> = IdMap::default();
     let mut members = Vec::new();
-    let mut born: HashMap<u32, (i64, Option<u32>)> = HashMap::new();
+    let mut born: IdMap<u32, (i64, Option<u32>)> = IdMap::default();
     for p in procs {
         let Some(c) = p.coalition else { continue };
         *live.entry(c).or_default() += 1;
@@ -526,30 +631,18 @@ pub fn name(
             continue;
         };
         let (birth_ms, uid) = born[&pid];
-        let lead = identities.get(&(pid, birth_ms)).map_or(
-            Lead {
-                pid,
-                birth_ms,
-                uid,
-                ..Lead::default()
-            },
-            |id| Lead {
-                pid,
-                birth_ms,
-                uid,
-                exe: (!id.exe.is_empty()).then(|| id.exe.clone()),
-                voucher: id.voucher,
-                signing_id: id.signing_id.clone(),
-                team: id.team.clone(),
-            },
-        );
-        names.insert(
-            c,
-            Named {
-                part,
-                lead: Some(lead),
-            },
-        );
+        let id = identities.get(&(pid, birth_ms));
+        let named = names.entry(c).or_default();
+        named.part = part;
+        // The lead named last tick, where it is this one as read now, stays
+        // as it is: most leads do not move, and their words are not copied.
+        if !named
+            .lead
+            .as_ref()
+            .is_some_and(|l| l.is(pid, birth_ms, uid, id))
+        {
+            named.lead = Some(Lead::of(pid, birth_ms, uid, id));
+        }
     }
     for (c, part) in parts.into_iter().filter(|(c, _)| listed.contains(c)) {
         names.insert(c, Named { part, lead: None });
@@ -561,11 +654,11 @@ pub fn name(
 #[derive(Debug, Default)]
 pub(crate) struct WhyState {
     base: Option<CoalBase>,
-    names: HashMap<u64, Named>,
+    names: IdMap<u64, Named>,
     /// Each lead's last identity, by pid and birth, replaced by each host
     /// reading (including a current unknown). Kept while that process is
     /// swept, or while it leads a listed coalition on a truncated sweep.
-    identities: HashMap<(u32, i64), LeadIdentity>,
+    identities: IdMap<(u32, i64), LeadIdentity>,
     facts: Option<Arc<WhyFacts>>,
     episodes: Episodes,
     clause: ClauseHold,
@@ -661,21 +754,29 @@ impl WhyState {
         s: &Sample,
         attribution: Option<(&[Membership], &[Option<usize>])>,
     ) -> Option<WhyFacts> {
-        self.identities
-            .extend(s.leads.iter().map(|l| ((l.pid, l.birth_ms), l.clone())));
+        for l in &s.leads {
+            // An identity read as before is left in place: no copy of its words.
+            match self.identities.get_mut(&(l.pid, l.birth_ms)) {
+                Some(kept) if kept == l => {}
+                Some(kept) => kept.clone_from(l),
+                None => {
+                    self.identities.insert((l.pid, l.birth_ms), l.clone());
+                }
+            }
+        }
         let (Some(read), Some(procs), Some(uid)) =
             (s.coalitions.as_ref(), s.procs.as_deref(), s.self_uid)
         else {
             return None;
         };
-        let swept: HashMap<u32, Option<i64>> = procs.iter().map(|p| (p.pid, p.birth_ms)).collect();
-        let leading: HashSet<(u32, i64)> = if s.procs_truncated {
+        let swept: IdMap<u32, Option<i64>> = procs.iter().map(|p| (p.pid, p.birth_ms)).collect();
+        let leading: IdSet<(u32, i64)> = if s.procs_truncated {
             self.names
                 .values()
                 .filter_map(|n| n.lead.as_ref().map(|l| (l.pid, l.birth_ms)))
                 .collect()
         } else {
-            HashSet::new()
+            IdSet::default()
         };
         self.identities.retain(|key, _| match swept.get(&key.0) {
             Some(birth) => birth.is_none_or(|b| b == key.1),

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Linux's descriptor tables (`<proc>/<pid>/fd`), answering [`super::scan_file_holders`] and
-//! [`super::open_files`] from `/proc` in production or a scratch tree in tests.
+//! Linux's descriptor tables (`<proc>/<pid>/fd`), answering [`super::scan_file_holders`],
+//! [`super::scan_listener_holders`] (with `<proc>/net/unix`) and [`super::open_files`] from
+//! `/proc` in production or a scratch tree in tests.
 //!
 //! Two kinds of same-uid process have root-owned tables (`task_dump_owner` in `fs/proc/base.c`):
 //! zombies holding nothing ([`Table::Exited`]), and non-dumpable live processes such as
@@ -50,9 +51,10 @@ enum ProcessState {
 }
 
 /// The process's state (the letter after `stat`'s closing parenthesis) and, for a zombie or
-/// dead task, its thread count in `status`; `None` when either required read is unknown.
+/// dead task, its thread count in `status`; `None` when either required read is unknown. Both
+/// are read lossily ([`crate::process::read_proc_text`]): their command name is raw bytes.
 fn process_state(dir: &Path) -> Option<ProcessState> {
-    let stat = match std::fs::read_to_string(dir.join("stat")) {
+    let stat = match crate::process::read_proc_text(&dir.join("stat")) {
         Ok(stat) => stat,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Some(ProcessState::Reaped),
         Err(_) => return None,
@@ -63,7 +65,7 @@ fn process_state(dir: &Path) -> Option<ProcessState> {
         'R' | 'S' | 'D' | 'T' | 't' | 'W' | 'K' | 'P' | 'I' => return Some(ProcessState::Live),
         _ => return None,
     }
-    let threads = std::fs::read_to_string(dir.join("status"))
+    let threads = crate::process::read_proc_text(&dir.join("status"))
         .ok()
         .and_then(|status| {
             status
@@ -192,6 +194,80 @@ pub(super) fn scan_file_holders_in(
         }
         scan.scanned += 1;
         match holds(table(proc, pid), key) {
+            Read::Holds => scan.holders.push(pid),
+            Read::Clear => {}
+            Read::Sealed => scan.sealed.push(pid),
+            Read::Unreadable => scan.unreadable.push(pid),
+        }
+    }
+    Ok(scan)
+}
+
+/// Whether `table` holds one of the sockets `inodes`: an entry whose link names
+/// `socket:[<inode>]`, read from the link alone (no `stat`). An entry closed since the
+/// listing holds nothing; any other failure leaves it unknown.
+fn holds_socket(table: Table, inodes: &[u64]) -> Read {
+    use aterm_sysprobe::jobs::linux::{FdLink, parse_fd_link};
+    let fds = match table {
+        Table::Listed(fds) => fds,
+        Table::Exited => return Read::Clear,
+        Table::Sealed => return Read::Sealed,
+        Table::Unreadable(_) => return Read::Unreadable,
+    };
+    let mut unreadable = false;
+    for entry in fds {
+        let Ok(entry) = entry else {
+            unreadable = true;
+            continue;
+        };
+        match std::fs::read_link(entry.path()) {
+            Ok(link) => {
+                if let FdLink::Socket(inode) = parse_fd_link(&link.to_string_lossy())
+                    && inodes.contains(&inode)
+                {
+                    return Read::Holds;
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => unreadable = true,
+        }
+    }
+    if unreadable {
+        Read::Unreadable
+    } else {
+        Read::Clear
+    }
+}
+
+/// [`super::scan_listener_holders`] over `proc`: the listening sockets `<proc>/net/unix`
+/// lists at a path `names` accepts, and each process `me` owns but `skip` read for a
+/// descriptor on one of them. With no such listener no table is read.
+///
+/// # Errors
+///
+/// `<proc>/net/unix` or `proc` cannot be read.
+pub(super) fn scan_listener_holders_in(
+    proc: &Path,
+    me: u32,
+    names: impl Fn(&[u8]) -> bool,
+    skip: &[u32],
+) -> io::Result<HolderScan> {
+    let net_unix = std::fs::read(proc.join("net/unix"))?;
+    let inodes: Vec<u64> = aterm_sysprobe::jobs::linux::listening_unix(&net_unix)
+        .into_iter()
+        .filter(|(_, bound)| names(bound))
+        .map(|(inode, _)| inode)
+        .collect();
+    let mut scan = HolderScan::default();
+    for pid in uid_pids_in(proc, me)? {
+        if skip.contains(&pid) {
+            continue;
+        }
+        scan.scanned += 1;
+        if inodes.is_empty() {
+            continue;
+        }
+        match holds_socket(table(proc, pid), &inodes) {
             Read::Holds => scan.holders.push(pid),
             Read::Clear => {}
             Read::Sealed => scan.sealed.push(pid),
@@ -420,6 +496,85 @@ mod tests {
             uid_pids_in(&proc, me().wrapping_add(1)).unwrap().is_empty(),
             "another uid's"
         );
+    }
+
+    /// A table's life is read off `stat` and `status` whatever bytes the command name holds:
+    /// the kernel cuts a name at 15 bytes, in the middle of a letter if it falls there, and
+    /// `prctl(PR_SET_NAME)` sets any bytes. A refused table of a lone zombie so named is exited,
+    /// a live one's sealed, and a zombie leader's with other threads unknown. NEGATIVE CONTROL:
+    /// read the files with `read_to_string`, and the zombie's and the live table's are unknown.
+    #[test]
+    fn a_table_whose_command_name_is_not_utf8_is_judged_by_its_state() {
+        let sealed = roots_own();
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let proc = tmp.path().join("proc");
+        for (pid, state, threads) in [(301, 'Z', 1), (302, 'S', 1), (303, 'Z', 3)] {
+            process(&proc, pid, state, threads, None, &sealed);
+            let dir = proc.join(pid.to_string());
+            for name in ["stat", "status"] {
+                let mut text = std::fs::read(dir.join(name)).unwrap();
+                let at = text.iter().position(|&b| b == b'x' || b == b'a').unwrap();
+                text.splice(at..=at, [0xe3, 0x83]);
+                std::fs::write(dir.join(name), &text).unwrap();
+                assert!(
+                    std::fs::read_to_string(dir.join(name)).is_err(),
+                    "the fixture's {name} names no UTF-8"
+                );
+            }
+        }
+        assert!(matches!(table(&proc, 301), Table::Exited), "a lone zombie");
+        assert!(matches!(table(&proc, 302), Table::Sealed), "a live process");
+        assert!(
+            matches!(table(&proc, 303), Table::Unreadable(_)),
+            "a zombie leader whose other threads run"
+        );
+    }
+
+    /// A listener is held by the process whose table names its socket: a stream accepted at the
+    /// listener's path, another listener and a zombie hold nothing, and a sealed table is sealed.
+    /// The table is read as bytes, so another socket's name that is no UTF-8 is a row like any
+    /// other. A path no listener is bound at reads no table, and a missing `net/unix` is an error.
+    #[test]
+    fn a_listener_is_held_by_the_process_whose_table_names_its_socket() {
+        let sealed = roots_own();
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let proc = tmp.path().join("proc");
+        std::fs::create_dir_all(proc.join("net")).unwrap();
+        std::fs::write(
+            proc.join("net/unix"),
+            b"Num       RefCount Protocol Flags    Type St Inode Path\n\
+             0000000000000000: 00000002 00000000 00010000 0001 01 41001 /run/b.sock\n\
+             0000000000000000: 00000003 00000000 00000000 0001 03 41002 /run/b.sock\n\
+             0000000000000000: 00000002 00000000 00010000 0001 01 41004 /run/\xff.sock\n\
+             0000000000000000: 00000002 00000000 00010000 0001 01 41003 /run/other.sock\n",
+        )
+        .unwrap();
+        process(
+            &proc,
+            301,
+            'S',
+            1,
+            Some(&[(0, "/dev/null"), (7, "socket:[41001]")]),
+            &sealed,
+        );
+        process(&proc, 302, 'S', 1, Some(&[(4, "socket:[41002]")]), &sealed);
+        process(&proc, 303, 'S', 1, Some(&[(4, "socket:[41003]")]), &sealed);
+        process(&proc, 304, 'Z', 1, None, &sealed);
+        process(&proc, 305, 'S', 1, None, &sealed);
+        let at = |path: &'static [u8]| move |bound: &[u8]| bound == path;
+        let scan = super::scan_listener_holders_in(&proc, me(), at(b"/run/b.sock"), &[]).unwrap();
+        assert_eq!(scan.holders, [301], "{scan:?}");
+        assert_eq!(scan.sealed, [305], "{scan:?}");
+        assert!(scan.unreadable.is_empty(), "{scan:?}");
+        assert_eq!(scan.scanned, 5);
+        let none = super::scan_listener_holders_in(&proc, me(), at(b"/run/c.sock"), &[]).unwrap();
+        assert!(
+            none.holders.is_empty() && none.sealed.is_empty(),
+            "{none:?}"
+        );
+        assert_eq!(none.scanned, 5);
+        std::fs::remove_file(proc.join("net/unix")).unwrap();
+        assert!(super::scan_listener_holders_in(&proc, me(), at(b"/run/b.sock"), &[]).is_err());
     }
 
     /// Open files are the paths a table's links name in descriptor order without `stat`;

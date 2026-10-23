@@ -77,8 +77,16 @@ pub struct DropletFrame {
 /// The band of water-ramp positions whose colour keeps
 /// [`CARET_PAGE_MIN_CONTRAST`] against `ground`, as `(lo, hi)`.
 fn ramp_band_on(ground: u32) -> (f32, f32) {
+    let table = crate::color_math::relative_luminance_table();
+    let lum_g = crate::color_math::relative_luminance_with(table, ground);
     let meets = |t: f32| {
-        crate::color_math::contrast_ratio(water_ramp(t), ground) >= CARET_PAGE_MIN_CONTRAST
+        let lum_w = crate::color_math::relative_luminance_with(table, water_ramp(t));
+        let (hi, lo) = if lum_w > lum_g {
+            (lum_w, lum_g)
+        } else {
+            (lum_g, lum_w)
+        };
+        (hi + 0.05) / (lo + 0.05) >= CARET_PAGE_MIN_CONTRAST
     };
     let dark = aterm_render::theme_is_dark(ground);
     let far = if dark { 1.0 } else { 0.0 };

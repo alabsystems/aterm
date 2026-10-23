@@ -17,10 +17,10 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// The usage text.
+/// `aterm machines` usage, printed by `--help` and after a refused command line.
 pub const USAGE: &str = "\
-aterm machines — configure and manage a lab of Macs from this Mac, over SSH: no MDM and
-no Apple account (docs/DESIGN-machines-2026-10-16.md).
+aterm machines — configure and manage a lab of Macs from this Mac over SSH, with no MDM
+and no Apple account.
 
 USAGE:
     aterm machines [--controller <dir>] <verb> [args]
@@ -31,44 +31,47 @@ USAGE:
 SET UP
     init [--passphrase]       make this Mac the controller: machines.toml, the fleet SSH
                               key, the signing and recovery keys (no passphrase, so plan
-                              and apply sign unattended; --passphrase, then or later, has
-                              ssh-keygen ask one for each signing key)
+                              and apply sign unattended; --passphrase, now or later, has
+                              ssh-keygen ask one for the signing and recovery keys)
     scan [--wait <s>] [--subnet <cidr>]
                               Macs on the LAN: Bonjour's Remote Login, SFTP and Screen
                               Sharing advertisements, and port 22 across a subnet (a /22
                               at most)
-    enroll <address>… [--found] [--user <admin>] [--parallel N]
+    enroll [<address>…] [--found] [--user <admin>] [--parallel N]
     enroll <address> [--user <admin>] [--name <n>] [--fingerprint <fp>]
-                              install the agent on Macs (at a terminal: you type the
-                              admin's password once, for every Mac; it stays in memory
-                              and goes to each Mac's ssh and sudo through pipes);
-                              --found takes every Mac scan sees that is not enrolled
-                              (a Mac: it advertises macOS's SFTP or Screen Sharing
-                              beside Remote Login; never this Mac); the admin is the
-                              one the Macs enrolled before have, else your login name,
-                              unless --user names one (when the Macs refuse it, enroll
-                              asks the name once and tries the password already typed
-                              under it); a Mac enrolled already is nothing to do; a
-                              Mac's host key is trusted on first use unless
-                              --fingerprint checks it (one Mac); a Mac is named by
-                              the tag its Local hostname starts with (m10 of
-                              m10-MacBook-M4-Max-36GB-1TB), or by --name (one Mac)
+                              install the agent on Macs, at a terminal: you type the
+                              admin's password once for every Mac (held in memory and
+                              piped to each Mac's ssh and sudo); --found adds every Mac
+                              scan sees that is not enrolled (one advertising macOS's
+                              SFTP or Screen Sharing beside Remote Login, never this
+                              Mac); the admin is --user, else the one earlier Macs
+                              enrolled with, else your login name (when the Macs refuse
+                              a name --user did not give, enroll asks for the name once
+                              and retries the typed password); a host key is trusted on
+                              first use unless --fingerprint checks it; a Mac is named
+                              by the tag its Local hostname starts with (m10 of
+                              m10-MacBook-Pro-M4-Max-36GB-1TB), or by --name
     unenroll <host> [--unreachable]
                               remove the agent, the Mac's GitHub keys and its entry
-    rename <host> <new-name>  set or rename any host's canonical name in machines.toml
-                              (alias: name)
+                              (--unreachable: without contacting a Mac that no longer
+                              answers, so its agent stays on it)
+    rename <host> <new-name>  set or change a host's name in machines.toml, enrolled or
+                              not (alias: name)
 
 LOOK
     ls [--json]               the inventory
-    tabs [<host>…] [--json]   every accessible Mac's live aterm instances, tabs, stats and
-                              AI CLI status
+    tabs [<host>…] [--json]   aterm instances, tabs, vitals (CPU, GPU, RAM, disk, load,
+                              network RTT) and AI CLI status of the hosts named, else of
+                              this Mac, every enrolled Mac and each Mac Bonjour sees
     monitor [<host>…] [--open | --once | --watch] [--interval <s>] [--json]
-                              live continuous system monitoring (CPU, GPU, RAM, disk, load,
-                              network RTT, aterm sessions & AI CLIs); opens the native
-                              Fleet Monitor tab in aterm or streams in the terminal
-                              (aliases: top, watch)
+                              tabs, live: with aterm running it opens the Fleet Monitor
+                              tab, then prints tabs once (--open: the tab alone, or the
+                              print when no aterm answers; --once: the print alone);
+                              --watch reprints tabs every --interval seconds (default 2)
+                              until Ctrl-C; top and watch are monitor --watch
     status [<host>…] [--by-item] [--json]
                               each host's newest report, read from state/ alone
+                              (--by-item: each item's outcomes counted across hosts)
     outstanding               failures, refusals, person steps, deferred items, what an
                               apply left for a login or restart, hosts whose macOS
                               changed, hosts only --only runs reached, and unreached
@@ -81,22 +84,21 @@ CHANGE
                               naming no host plans them all); apply first upgrades an
                               agent that is not this aterm's build, and the default
                               baseline names each Mac for what it is
-                              (m10-MacBook-Pro-M4-Max-36GB-1TB); --only runs just those
-                              baseline tables (apply --all --only names renames the
-                              fleet), and status keeps the other tables' last results;
-                              a host held by an IP address that does not answer there
-                              is looked for at its Local hostname (lab-07.local), and
-                              moved there only when ssh answers under its pinned host
-                              key
+                              (m10-MacBook-Pro-M4-Max-36GB-1TB); --now relaunches or
+                              replaces a running app even while someone is at the Mac
+                              (else that waits for the Mac to be idle); --only runs
+                              just those baseline tables (apply --all --only names
+                              renames the fleet), and status keeps the other tables'
+                              last results
     attach <host> [<run>]     follow a run whose connection dropped
-    run <host>…|--all [--user <u>] -- <argv>
+    run <host>…|--all [--user <u>] [--parallel N] -- <argv>
                               run one program (no shell) as root, or as the account <u>
     github login              store the [github] machine user's token in the login
                               keychain (typed, not echoed) once GitHub signs it in as
                               that account with the admin:public_key scope
     github revoke <host>      delete the host's GitHub keys from the machine user; those
                               keys are never registered again (a key it makes anew is)
-    rekey <host>…|--all --signers <file> [--key <private key>]
+    rekey <host>…|--all --signers <file> [--key <private key>] [--parallel N]
                               replace the signers every host trusts with <file>, signed
                               with the signing key or <key> (the recovery key; its .pub
                               beside it, or in keys/); the controller's own copy follows
@@ -115,13 +117,18 @@ ON A HOST
                               run a baseline on this Mac directly (apply under sudo)
     agent <cmd>               the host agent, which the controller runs over SSH
 
+<host> is a host's name, uuid or address. --parallel N (1 to 64) reaches N hosts at once
+(default: [controller] parallel in machines.toml, else 8). A host held by an IP address
+that does not answer there is looked for at its Local hostname (lab-07.local), and moved
+there only when ssh answers under its pinned host key.
+
 Exit status: 0 nothing failed; 1 something failed (an unreadable inventory, a host that
 refused contact or a run); 2 nothing failed but some hosts could not be reached, or the
 command line was refused. `aterm machines help enroll` is the checklist for each Mac;
 `aterm help machines` has the manual.
 ";
 
-/// `aterm machines help enroll`: the visit to each Mac no software replaces (design §4.1).
+/// `aterm machines help enroll`: the visit to each Mac no software replaces.
 pub const ENROLL_CHECKLIST: &str = "\
 At each Mac, once (the visit no software replaces):
 
@@ -140,21 +147,21 @@ At each Mac, once (the visit no software replaces):
   4. From the controller:
        aterm machines enroll lab-07.local
        aterm machines apply lab-07
-     enroll logs in as the admin the Macs enrolled before have, else as your login name
-     on this Mac (--user <admin> names another), and installs aterm's helper (the
-     agent); apply installs aterm.app, whose switches step 5 flips, and the rest of the
-     baseline. Many Macs at once, the password typed once for all of them:
+     enroll logs in as the admin earlier Macs enrolled with, else as your login name on
+     this Mac (--user <admin> names another), and installs the agent; apply installs
+     aterm.app, whose switches step 5 flips, and the rest of the baseline. Many Macs at
+     once, the password typed once for all of them:
        aterm machines enroll --found        (every Mac scan sees, not yet enrolled)
        aterm machines enroll lab-07.local lab-08.local
-       aterm machines apply --all --only names
+       aterm machines apply --all
      Each Mac's ID (its host key fingerprint) is printed before the one password prompt.
      Trusted on first use, the password goes to whatever answers first (with --found,
      any machine on the LAN advertising a Mac's Remote Login): enroll on a LAN you
      control. When the Macs refuse the password and --user named none, enroll asks the
-     admin account's name once and tries the same password under it; a Mac that still
-     refuses is asked for once more, by name. Any other Mac that cannot be enrolled says
-     why on its own line, and the rest go on; running the same command again enrolls
-     the ones left (a Mac enrolled already is nothing to do).
+     admin account's name once and tries the same password under it; for each Mac that
+     still refuses, it asks for the password once more. A Mac that cannot be enrolled
+     says why on its own line and the rest go on; the same command again enrolls the
+     ones left (a Mac enrolled already is skipped).
   5. Then, while you are still at the Mac's keyboard:
        aterm machines person lab-07 --here
      It opens the Full Disk Access pane, then the Developer Tools pane, on that Mac's

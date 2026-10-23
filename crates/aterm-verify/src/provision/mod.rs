@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use aterm_uds::host::When;
 
 pub use place::SCRATCH_PREFIX;
-pub use rows::{Anchor, Archive, Engine, Install, MICROSOFT_TEAM, ROWS, Row, row};
+pub use rows::{Anchor, Archive, Engine, Holds, Install, MICROSOFT_TEAM, ROWS, Row, row};
 pub use stable::{FOREIGN_CELL_TARGETS, WasmClause, wasm_clause};
 
 /// System `curl` binary path.
@@ -168,6 +168,32 @@ pub enum State {
     Missing(String),
     /// Refused or failed, with nothing left behind.
     Failed(String),
+    /// A pinned file upstream no longer serves to this fetch (Ubuntu archived its release):
+    /// COULD NOT RUN, naming what changes that, with nothing left behind.
+    CouldNotRun(String),
+}
+
+/// Why a row was not placed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Refused {
+    /// It failed or was refused: [`State::Failed`].
+    Failed(String),
+    /// Upstream no longer serves a pinned file here: [`State::CouldNotRun`].
+    CouldNotRun(String),
+}
+
+impl From<String> for Refused {
+    fn from(why: String) -> Self {
+        Self::Failed(why)
+    }
+}
+
+impl From<Refused> for String {
+    fn from(refused: Refused) -> Self {
+        match refused {
+            Refused::Failed(why) | Refused::CouldNotRun(why) => why,
+        }
+    }
 }
 
 impl State {
@@ -200,17 +226,22 @@ pub fn usage() -> String {
     format!(
         "targo --unverified verify provision [ROW...] [--linux] [--record] [--check]
 
-Fetch or build the tools this checkout pins into this user's cache: each held to its
-sha256 (pwsh also to Microsoft's Developer ID), placed whole or not at all, beside a
-stamp.json. It reads the network.
+Fetch or build the tools this checkout pins into this user's cache, each placed whole
+or not at all beside a stamp.json; each download is held to a pinned sha256 (pwsh's
+also to Microsoft's Developer ID), and wasm-bindgen builds from crates.io. The rustup
+row instead has rustup add stable, its cross targets and the wasm32 pin to rustup's
+homes, first installing rustup from a pinned rustup-init where there is none. It
+reads the network.
 
-  (no ROW)    every row wanted always
-  --linux     and lima, the Linux lane's VM
+  (no ROW)    the rows every checkout needs
+  --linux     and the Linux lane's VM: lima, and Ubuntu's pinned image for its own VM
   --record    and wasm-bindgen, to re-record the wasm-glue goldens
   --check     say what is missing; fetch and change nothing
   ROW...      just these: {}
 
-Exit: 0 in place, 1 a row failed (--check: is missing), 2 usage, 3 nothing pinned here.
+Exit: 0 each row asked for and pinned here is in place, 1 a row failed (--check: is
+missing), 2 usage, 3 could not run (no $HOME, no row asked for is pinned here, or
+upstream no longer serves a pinned file).
 ",
         names.join(" ")
     )
@@ -266,9 +297,23 @@ pub fn select(opts: &Options) -> Vec<&'static Row> {
         .collect()
 }
 
-/// Whether `t.dir` holds the pinned program and a stamp that [`Target::admits`].
+/// Whether `t.dir` holds the pinned program, every file the row holds to a size at that
+/// size, and a stamp that [`Target::admits`].
 pub(crate) fn complete(t: &Target) -> bool {
-    t.dir.join(&t.exe).is_file() && place::read_stamp(&t.dir).is_some_and(|s| t.admits(&s))
+    t.dir.join(&t.exe).is_file()
+        && short(t).is_none()
+        && place::read_stamp(&t.dir).is_some_and(|s| t.admits(&s))
+}
+
+/// The first file of `t.sizes` that is not in `t.dir` as a regular file of its size.
+fn short(t: &Target) -> Option<&str> {
+    t.sizes
+        .iter()
+        .find(|(name, bytes)| {
+            !std::fs::symlink_metadata(t.dir.join(name))
+                .is_ok_and(|m| m.is_file() && m.len() == *bytes)
+        })
+        .map(|(name, _)| name.as_str())
 }
 
 /// Returns `engine`'s executable on `machine` when present with a matching pin stamp ([`complete`]).
@@ -281,7 +326,7 @@ pub(crate) fn placed_browser(engine: Engine, machine: &Machine) -> Option<PathBu
 fn target(row: &Row, machine: &Machine) -> Option<Target> {
     let (os, arch) = machine.os_arch();
     match row.install {
-        Install::Unpack { .. } | Install::Build { .. } | Install::Cargo => {
+        Install::Unpack { .. } | Install::Build { .. } | Install::Cargo | Install::Files { .. } => {
             let tool = row.tool_row()?;
             let pin = tool.pin?;
             if !pin.pinned_for(&machine.platform) {
@@ -289,13 +334,29 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
             }
             let sha256 = match row.install {
                 Install::Cargo => None,
-                _ => Some(row.archive_for(&machine.platform)?.sha256),
+                Install::Files { .. } => {
+                    let files = row.files_for(&machine.platform);
+                    (!files.is_empty()).then(|| files_digest(&files, pin.version))
+                }
+                _ => Some(row.archive_for(&machine.platform)?.sha256.to_string()),
             };
             let features = match row.install {
                 Install::Build { features, .. } => {
                     Some(features.iter().map(|f| (*f).to_string()).collect())
                 }
                 _ => None,
+            };
+            let sizes = match row.install {
+                Install::Unpack {
+                    holds: Holds::Image { bytes },
+                    ..
+                } => vec![(pin.exe.to_string(), bytes)],
+                Install::Files { .. } => row
+                    .files_for(&machine.platform)
+                    .iter()
+                    .map(|f| (place::file_name(&f.url_at(pin.version)), f.bytes))
+                    .collect(),
+                _ => Vec::new(),
             };
             Some(Target {
                 dir: tool.pinned_root(&machine.tooling)?,
@@ -304,6 +365,7 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
                 sha256,
                 platform: machine.platform.clone(),
                 features,
+                sizes,
             })
         }
         Install::Browser(engine) => {
@@ -312,9 +374,10 @@ fn target(row: &Row, machine: &Machine) -> Option<Target> {
                 dir: pin.dir,
                 exe: pin.binary.to_string_lossy().into_owned(),
                 version: pin.version,
-                sha256: Some(pin.sha256),
+                sha256: Some(pin.sha256.to_string()),
                 platform: machine.platform.clone(),
                 features: None,
+                sizes: Vec::new(),
             })
         }
         Install::Rustup { .. } => None,
@@ -326,9 +389,12 @@ pub(crate) struct Target {
     dir: PathBuf,
     exe: String,
     version: String,
-    sha256: Option<&'static str>,
+    sha256: Option<String>,
     platform: String,
     features: Option<Vec<String>>,
+    /// Files in `dir` the row is in place only with, each at its size: an image row's
+    /// image, every file of a files row.
+    sizes: Vec<(String, u64)>,
 }
 
 impl Target {
@@ -339,6 +405,7 @@ impl Target {
             && stamp.platform.as_deref() == Some(self.platform.as_str())
             && self
                 .sha256
+                .as_deref()
                 .is_none_or(|h| stamp.sha256.as_deref() == Some(h))
             && self
                 .features
@@ -358,7 +425,7 @@ impl Target {
             row: row.into(),
             version: self.version.clone(),
             url,
-            sha256: self.sha256.map(str::to_string),
+            sha256: self.sha256.clone(),
             anchor: anchor.into(),
             features: self.features.clone(),
             reports,
@@ -393,6 +460,13 @@ pub fn check(row: &Row, machine: &Machine, host: &dyn Host) -> State {
     };
     if complete(&t) {
         State::Present(t.dir.join(&t.exe))
+    } else if let Some(name) = short(&t).filter(|_| t.dir.join(&t.exe).is_file()) {
+        State::Missing(format!(
+            "{} {}: {} lacks {name} at its pinned size, which a run fetches again",
+            row.name,
+            t.version,
+            t.dir.display()
+        ))
     } else if t.dir.join(&t.exe).is_file() {
         State::Missing(format!(
             "{} {}: {} holds a copy without this pin's stamp for {}, which a run replaces",
@@ -425,22 +499,25 @@ pub fn provide(row: &Row, machine: &Machine, host: &dyn Host, say: &mut dyn FnMu
         return State::Present(exe);
     }
     let done = match row.install {
-        Install::Unpack {
-            strip,
-            anchor,
-            keep,
-            ..
-        } => {
+        Install::Unpack { .. } => {
             let archive = row
                 .archive_for(&machine.platform)
                 .expect("target() found it");
-            unpack_row(row, &archive, &t, strip, anchor, keep, machine, host, say)
+            unpack_row(row, &archive, &t, machine, host, say)
         }
+        Install::Files { .. } => files_row(
+            row,
+            &row.files_for(&machine.platform),
+            &t,
+            machine,
+            host,
+            say,
+        ),
         Install::Build { .. } => {
             let archive = row
                 .archive_for(&machine.platform)
                 .expect("target() found it");
-            fish::build(&archive, &t, machine, host, say)
+            fish::build(&archive, &t, machine, host, say).map_err(Refused::from)
         }
         Install::Cargo => return cargo_row(row, &t, machine, host, say),
         Install::Browser(engine) => return browser_row(engine, &t, machine, host, say),
@@ -448,7 +525,10 @@ pub fn provide(row: &Row, machine: &Machine, host: &dyn Host, say: &mut dyn FnMu
     };
     match done {
         Ok(exe) => State::Placed(exe),
-        Err(why) => State::Failed(format!("{} {}: {why}", row.name, t.version)),
+        Err(Refused::Failed(why)) => State::Failed(format!("{} {}: {why}", row.name, t.version)),
+        Err(Refused::CouldNotRun(why)) => {
+            State::CouldNotRun(format!("{} {}: {why}", row.name, t.version))
+        }
     }
 }
 
@@ -500,30 +580,65 @@ fn rustup_row(
     }
 }
 
-/// An unpacked row: fetch, check, unpack, hold the tree to `anchor`, keep `keep`, stamp, place.
-#[expect(clippy::too_many_arguments, reason = "one row's whole description")]
+/// An unpacked row: fetch, check, unpack under its cap, hold the tree to its anchor and its
+/// pinned file to what [`Holds`] says it is, keep its `keep` files, stamp, place.
 fn unpack_row(
     row: &Row,
     archive: &Archive,
     t: &Target,
-    strip: u32,
-    anchor: Anchor,
-    keep: &[&str],
     machine: &Machine,
     host: &dyn Host,
     say: &mut dyn FnMut(&str),
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, Refused> {
+    let Install::Unpack {
+        strip,
+        anchor,
+        keep,
+        cap,
+        holds,
+        ..
+    } = row.install
+    else {
+        unreachable!("provide() passes unpacked rows only")
+    };
     let url = archive.url_at(&t.version);
     let scratch = place::Scratch::new(&machine.tooling, row.name)?;
     let file = place::fetch_checked(host, &scratch, &url, archive.sha256, archive.bytes, say)?;
-    let tree = place::unpack(&scratch, &file, place::container_of(&url)?, strip, "tree")?;
+    let cap = cap.unwrap_or(place::UNPACKED_CAP);
+    let tree = place::unpack(
+        &scratch,
+        &file,
+        place::container_of(&url)?,
+        strip,
+        cap,
+        "tree",
+    )?;
     place::links_within(&tree)?;
-    if !place::is_executable(&tree.join(&t.exe)) {
-        return Err(format!("{url} holds no executable {}", t.exe));
+    let pinned = tree.join(&t.exe);
+    match holds {
+        Holds::Program if !place::is_executable(&pinned) => {
+            return Err(format!("{url} holds no executable {}", t.exe).into());
+        }
+        Holds::Program => {}
+        Holds::Image { bytes } => {
+            match std::fs::symlink_metadata(&pinned) {
+                Ok(m) if m.file_type().is_file() && m.len() == bytes => {}
+                Ok(m) if m.file_type().is_file() => {
+                    return Err(format!(
+                        "{url} holds {} of {} bytes, not the pinned image's {bytes}",
+                        t.exe,
+                        m.len()
+                    )
+                    .into());
+                }
+                _ => return Err(format!("{url} holds no image {} (a regular file)", t.exe).into()),
+            }
+            place::read_only(&pinned)?;
+        }
     }
     for name in keep {
         if !tree.join(name).is_file() {
-            return Err(format!("{url} holds no {name}, which the tree keeps"));
+            return Err(format!("{url} holds no {name}, which the tree keeps").into());
         }
     }
     let anchor_words = match anchor {
@@ -531,7 +646,7 @@ fn unpack_row(
         Anchor::DeveloperId { team } => {
             let machos = atpkg::macho::find_macho(&tree).map_err(|e| e.to_string())?;
             if machos.is_empty() {
-                return Err(format!("{url} holds no Mach-O to hold to team {team}"));
+                return Err(format!("{url} holds no Mach-O to hold to team {team}").into());
             }
             for macho in &machos {
                 let shown = macho
@@ -552,6 +667,55 @@ fn unpack_row(
         }
     };
     place::write_stamp(&tree, &t.stamp(row.name, Some(url), &anchor_words, None))?;
+    place::place(&scratch, &tree, &t.dir, &|| complete(t))?;
+    Ok(t.dir.join(&t.exe))
+}
+
+/// The stamp's `sha256` of a files row at `version`: the sha256 of its `SHA256SUMS`, one
+/// `<sha256> *<name>` line a file in row order, so a changed pin of any file is another
+/// row's stamp.
+fn files_digest(files: &[Archive], version: &str) -> String {
+    let mut sums = aterm_digest::Sha256::new();
+    for file in files {
+        sums.update(
+            format!(
+                "{} *{}\n",
+                file.sha256,
+                place::file_name(&file.url_at(version))
+            )
+            .as_bytes(),
+        );
+    }
+    sums.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A files row: fetch each file into a download directory of its own and hold it to its
+/// pin, lay it read-only under its name, stamp, and place them together.
+fn files_row(
+    row: &Row,
+    files: &[Archive],
+    t: &Target,
+    machine: &Machine,
+    host: &dyn Host,
+    say: &mut dyn FnMut(&str),
+) -> Result<PathBuf, Refused> {
+    let scratch = place::Scratch::new(&machine.tooling, row.name)?;
+    let tree = scratch.fresh("tree")?;
+    let mut urls = Vec::new();
+    for file in files {
+        let url = file.url_at(&t.version);
+        let got = place::fetch_checked(host, &scratch, &url, file.sha256, file.bytes, say)?;
+        let kept = tree.join(place::file_name(&url));
+        std::fs::rename(&got, &kept)
+            .map_err(|e| format!("could not lay {}: {e}", kept.display()))?;
+        place::read_only(&kept)?;
+        urls.push(url);
+    }
+    if !tree.join(&t.exe).is_file() {
+        return Err(format!("the row's files hold no {}", t.exe).into());
+    }
+    let url = urls.first().cloned();
+    place::write_stamp(&tree, &t.stamp(row.name, url, "sha256", None))?;
     place::place(&scratch, &tree, &t.dir, &|| complete(t))?;
     Ok(t.dir.join(&t.exe))
 }
@@ -700,6 +864,7 @@ pub fn line(row: &Row, state: &State) -> String {
         State::NotPinned(why) => format!("{} — not provided: {why}", row.name),
         State::Missing(why) => format!("MISSING — {why}"),
         State::Failed(why) => format!("FAIL — {why}"),
+        State::CouldNotRun(why) => format!("COULD NOT RUN — {why}"),
     }
 }
 
@@ -722,6 +887,10 @@ pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnM
         .iter()
         .filter(|s| matches!(s, State::Failed(_) | State::Missing(_)))
         .count();
+    let unserved = states
+        .iter()
+        .filter(|s| matches!(s, State::CouldNotRun(_)))
+        .count();
     let placed = states.iter().filter(|s| s.in_place()).count();
     if failed > 0 {
         say(&format!(
@@ -729,6 +898,12 @@ pub fn run(opts: &Options, machine: &Machine, host: &dyn Host, say: &mut dyn FnM
             rows.len()
         ));
         crate::exit::FAILED
+    } else if unserved > 0 {
+        say(&format!(
+            "COULD NOT RUN — {unserved} of {} rows pin a file upstream no longer serves here",
+            rows.len()
+        ));
+        crate::exit::COULD_NOT_RUN
     } else if placed == 0 {
         say(&format!(
             "COULD NOT RUN — none of the rows asked for is pinned for {}",

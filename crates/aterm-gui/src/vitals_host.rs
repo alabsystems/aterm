@@ -3,7 +3,7 @@
 
 //! The one probe thread that reads the machine for the stats Deck, and the loop's side of it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
@@ -16,7 +16,9 @@ use aterm_agent::harness::profile::{AccountKey, Bucket, PlanUsage};
 use aterm_sysprobe::jobs::RunState;
 use aterm_sysprobe::volumes::VolumeKey;
 use aterm_vitals::Peaks;
-use aterm_vitals::explain::{CoalLane, CoalSample, CoalUsage, LeadIdentity, TimelineSample};
+use aterm_vitals::explain::{
+    CoalLane, CoalSample, CoalUsage, IdMap, IdSet, LeadIdentity, TimelineSample,
+};
 use aterm_vitals::model::{
     AccountIx, ClusterSpec, CommitSample, DiskFacts, DiskLevel, GpuSample, Hog, LinkKind,
     LinkSample, MemCounters, MemSample, PlanFact, Pressure, ProcLimits, ProcSample, ProcState,
@@ -1066,10 +1068,15 @@ pub(crate) struct CoalProbe {
     /// The launch self-check, asked of this process
     /// ([`aterm_sysprobe::coalitions::self_check`]).
     pub(crate) self_check: fn(u32) -> Result<u64, &'static str>,
-    /// The process sweep, each process's coalition read in it where the
-    /// options ask ([`aterm_sysprobe::processes_with`]): the kernel's in
-    /// every arm, so a test's stand-in can count what a reading asks.
-    pub(crate) sweep: fn(aterm_sysprobe::SweepOpts) -> Option<aterm_sysprobe::Sweep>,
+    /// The process sweep, each process's coalition and pid version read in
+    /// it where the options ask, the coalition kept by pid under that
+    /// version in the ids passed ([`aterm_sysprobe::processes_keeping`]):
+    /// the kernel's in every arm, so a test's stand-in can count what a
+    /// reading asks.
+    pub(crate) sweep: fn(
+        aterm_sysprobe::SweepOpts,
+        &mut aterm_sysprobe::coalitions::CoalitionIds,
+    ) -> Option<aterm_sysprobe::Sweep>,
     /// Every coalition's counters ([`aterm_sysprobe::coalitions::coalitions`]).
     pub(crate) coalitions: fn() -> Option<aterm_sysprobe::coalitions::CoalitionRead>,
     /// A process's short name and birth, unix ms, from its kernel record
@@ -1081,8 +1088,9 @@ pub(crate) struct CoalProbe {
     pub(crate) births: fn() -> Option<Births>,
     /// A process's image and signature ([`aterm_sysprobe::identity::identity`]).
     pub(crate) identity: fn(u32) -> Option<aterm_sysprobe::identity::Identity>,
-    /// A process's pid version ([`pid_version`]), which an exec moves: what
-    /// a lead's identity is kept under between split ticks.
+    /// A process's pid version ([`aterm_sysprobe::pid_version`]), which an
+    /// exec moves: read again after a lead's identity, so a read an exec
+    /// raced is not kept (the sweep reads each process's first).
     pub(crate) version: fn(u32) -> Option<i32>,
     /// The machine's timeline ([`aterm_sysprobe::timeline::timeline`]).
     pub(crate) timeline: fn() -> Option<aterm_sysprobe::timeline::Timeline>,
@@ -1094,7 +1102,7 @@ impl CoalProbe {
     /// The kernel's readers.
     pub(crate) const KERNEL: Self = Self {
         self_check: aterm_sysprobe::coalitions::self_check,
-        sweep: aterm_sysprobe::processes_with,
+        sweep: aterm_sysprobe::processes_keeping,
         coalitions: aterm_sysprobe::coalitions::coalitions,
         birth: |pid| aterm_sysprobe::kproc::record(pid).and_then(name_and_birth),
         births: || {
@@ -1106,7 +1114,7 @@ impl CoalProbe {
             )
         },
         identity: aterm_sysprobe::identity::identity,
-        version: pid_version,
+        version: aterm_sysprobe::pid_version,
         timeline: aterm_sysprobe::timeline::timeline,
         waketime_ms: aterm_sysprobe::timeline::waketime_ms,
     };
@@ -1114,7 +1122,7 @@ impl CoalProbe {
     /// The inert arm: no OS lane, nothing read but the sweep.
     pub(crate) const INERT: Self = Self {
         self_check: |_| Err("unsupported"),
-        sweep: aterm_sysprobe::processes_with,
+        sweep: aterm_sysprobe::processes_keeping,
         coalitions: || None,
         birth: |_| None,
         births: || None,
@@ -1125,23 +1133,11 @@ impl CoalProbe {
     };
 }
 
-/// `pid`'s pid version (`p_idversion`, `PROC_PIDUNIQIDENTIFIERINFO`, which
-/// any process may read of any other): an exec moves it while the pid, the
-/// birth and often the short name stay. `None` off macOS.
-fn pid_version(pid: u32) -> Option<i32> {
-    #[cfg(target_vendor = "apple")]
-    {
-        aterm_uds::process::uniq_identifier(i32::try_from(pid).ok()?).map(|i| i.p_idversion)
-    }
-    #[cfg(not(target_vendor = "apple"))]
-    {
-        let _ = pid;
-        None
-    }
-}
-
-/// Threshold above which a split tick reads the whole process table for births.
-pub(crate) const BIRTHS_AT_ONCE: usize = 64;
+/// Threshold above which a split tick reads the whole process table for
+/// births: one process's record (`KERN_PROC_PID`) cost 6.4 µs of CPU and
+/// the table's ~700 records 83 µs (m22, 2026-10-23), so past about a dozen
+/// the table is cheaper.
+pub(crate) const BIRTHS_AT_ONCE: usize = 12;
 
 /// Each process's kernel `p_comm` and start (unix ms) by pid.
 pub(crate) type Births = HashMap<u32, (String, i64)>;
@@ -1163,10 +1159,13 @@ fn names_the_same(record: &str, swept: &str) -> bool {
             .is_some_and(|cut| String::from_utf8_lossy(cut) == swept)
 }
 
+/// A process's birth as read, under the name, kernel start and pid version
+/// it was read for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Birth {
     name: String,
     start: Option<u64>,
+    version: Option<i32>,
     ms: i64,
 }
 
@@ -1186,10 +1185,13 @@ pub(crate) struct SplitReader {
     vouches: bool,
     armed: &'static Arming,
     last: Option<Instant>,
-    births: HashMap<u32, Birth>,
+    births: IdMap<u32, Birth>,
     /// Each lead's identity by pid, kept while it leads and its birth and
     /// pid version stay ([`Self::identity`]).
-    idents: HashMap<u32, Ident>,
+    idents: IdMap<u32, Ident>,
+    /// Each swept process's coalition, kept by the sweep under its pid
+    /// version ([`aterm_sysprobe::processes_keeping`]).
+    pub(crate) coalition_ids: aterm_sysprobe::coalitions::CoalitionIds,
     wake_seen: Option<Option<i64>>,
     timeline: Option<TimelineSample>,
 }
@@ -1222,8 +1224,9 @@ impl SplitReader {
             vouches,
             armed,
             last: None,
-            births: HashMap::new(),
-            idents: HashMap::new(),
+            births: IdMap::default(),
+            idents: IdMap::default(),
+            coalition_ids: aterm_sysprobe::coalitions::CoalitionIds::default(),
             wake_seen: None,
             timeline: None,
         }
@@ -1257,7 +1260,7 @@ impl SplitReader {
             self.births.clear();
             self.idents.clear();
         }
-        let swept: HashSet<u32> = procs.iter().map(|p| p.pid).collect();
+        let swept: IdSet<u32> = procs.iter().map(|p| p.pid).collect();
         self.births.retain(|pid, _| swept.contains(pid));
         let mut unread = Vec::new();
         for (i, p) in procs.iter_mut().enumerate() {
@@ -1272,20 +1275,20 @@ impl SplitReader {
         for i in unread {
             procs[i].birth_ms = self.read_birth(&procs[i], table.as_ref());
         }
-        let born: HashMap<u32, i64> = procs
+        let born: IdMap<u32, (i64, Option<i32>)> = procs
             .iter()
-            .filter_map(|p| Some((p.pid, p.birth_ms?)))
+            .filter_map(|p| Some((p.pid, (p.birth_ms?, p.version))))
             .collect();
         let members: Vec<(u32, u64, i64)> = procs
             .iter()
             .filter_map(|p| Some((p.pid, p.coalition?, p.birth_ms?)))
             .collect();
-        let mut kept = HashMap::new();
+        let mut kept = IdMap::default();
         for (_, pid) in aterm_vitals::explain::leads(&members) {
-            let Some(&birth) = born.get(&pid) else {
+            let Some(&(birth, version)) = born.get(&pid) else {
                 continue;
             };
-            let id = self.identity(pid, birth, &mut kept);
+            let id = self.identity(pid, birth, version, &mut kept);
             sample
                 .leads
                 .push(lead_identity(pid, birth, id, self.vouches));
@@ -1296,18 +1299,19 @@ impl SplitReader {
         self.last = Some(now);
     }
 
-    /// Lead `pid`'s identity (born at `birth`), kept into `kept`: the one
-    /// read under its pid version now, read again only once an exec moved
-    /// that version or the birth moved. A read an exec raced (the version
-    /// moved across it) and a read that missed are unknown and kept for no
-    /// later tick; with no version read, it is read at every split tick.
+    /// Lead `pid`'s identity (born at `birth`, at pid `version` as this
+    /// tick's sweep read it), kept into `kept`: the one read under that
+    /// version, read again only once an exec moved the version or the birth
+    /// moved. A read an exec raced (the version moved across it) and a read
+    /// that missed are unknown and kept for no later tick; with no version
+    /// read, it is read at every split tick.
     fn identity(
         &mut self,
         pid: u32,
         birth: i64,
-        kept: &mut HashMap<u32, Ident>,
+        version: Option<i32>,
+        kept: &mut IdMap<u32, Ident>,
     ) -> aterm_sysprobe::identity::Identity {
-        let version = (self.probe.version)(pid);
         if let Some(k) = self
             .idents
             .remove(&pid)
@@ -1337,11 +1341,18 @@ impl SplitReader {
         }
     }
 
+    /// `p`'s kept birth: one read for the same name and kernel start, or,
+    /// for a process whose start the sweep cannot read (another user's), the
+    /// same name and pid version (a new process at the pid has a new one;
+    /// so does an exec, after which its birth is read again).
     fn known(&self, p: &ProcSample) -> Option<i64> {
-        let start = p.start?;
+        let same = |b: &Birth| match p.start {
+            Some(_) => b.start == p.start,
+            None => p.version.is_some() && b.version == p.version,
+        };
         self.births
             .get(&p.pid)
-            .filter(|b| b.name == p.name && b.start == Some(start))
+            .filter(|b| b.name == p.name && same(b))
             .map(|b| b.ms)
     }
 
@@ -1359,6 +1370,7 @@ impl SplitReader {
             Birth {
                 name: p.name.clone(),
                 start: p.start,
+                version: p.version,
                 ms,
             },
         );
@@ -1680,9 +1692,12 @@ impl Reader {
         let now = Instant::now();
         let split = self.split.due(req, now);
         let live_split = split && self.fixture.is_none();
-        let sweep = (self.split.probe.sweep)(aterm_sysprobe::SweepOpts {
-            coalitions: live_split,
-        });
+        let sweep = (self.split.probe.sweep)(
+            aterm_sysprobe::SweepOpts {
+                coalitions: live_split,
+            },
+            &mut self.split.coalition_ids,
+        );
         let coalitions = (live_split && sweep.is_some())
             .then(self.split.probe.coalitions)
             .flatten();
@@ -1869,6 +1884,7 @@ pub(crate) fn proc_sample(p: &aterm_sysprobe::ProcessReading, epoch: Instant) ->
             u64::try_from(t.saturating_duration_since(epoch).as_nanos()).unwrap_or(u64::MAX)
         }),
         coalition: p.coalition,
+        version: p.version,
         birth_ms: None,
     }
 }

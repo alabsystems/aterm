@@ -28,6 +28,7 @@ mod conformance_login_wall;
 mod conformance_occupancy;
 mod conformance_upgrade_models;
 mod conformance_usage_tap;
+mod conformance_wakes;
 mod supervise_conformance_account_rotation;
 mod supervise_conformance_credits_hold;
 mod supervise_conformance_cruise;

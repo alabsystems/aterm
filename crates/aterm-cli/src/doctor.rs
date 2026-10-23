@@ -43,7 +43,7 @@ const ROWS: [(&str, &str, &str, &str); 12] = [
         "privacy:",
         "base.privacy.fda",
         "privacy",
-        "Full Disk Access and macOS's check of each new program",
+        "Full Disk Access",
     ),
     (
         "debugger:",
@@ -80,7 +80,7 @@ const ROWS: [(&str, &str, &str, &str); 12] = [
         "instances:",
         "base.session.instances",
         "session",
-        "aterm instances no control socket reaches, and the other aterm programs",
+        "the aterm instances and other aterm programs running as you",
     ),
     (
         "fabric:",
@@ -98,7 +98,7 @@ const ROWS: [(&str, &str, &str, &str); 12] = [
         "exceptions:",
         "base.session.exceptions",
         "session",
-        "what needs a look but not now",
+        "open exceptions",
     ),
 ];
 

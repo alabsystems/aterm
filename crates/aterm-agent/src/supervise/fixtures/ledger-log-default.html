@@ -1,0 +1,158 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<title>aterm drive ledger — @s-work</title>
+<style>…</style>
+</head>
+<body class="viz-root">
+<main>
+<header>
+<h1>aterm drive ledger</h1>
+<p class="sub">worker <b>@s-work</b> · manager <b>@s-mgr</b> · read 2026-09-10 00:31:40 · times UTC+00:00</p>
+</header>
+<section class="tiles" aria-label="summary">
+<div class="tile"><div class="k">turns driven</div><div class="v">3 (2 settled, 1 timeout)</div></div>
+<div class="tile"><div class="k">worker busy</div><div class="v">9.5s in the turn verbs (sum of dur_ms) · 1m09s working over 3 turn(s) (turn start → the EVENT that ended it)</div></div>
+<div class="tile"><div class="k">manager latency</div><div class="v">median 1m05s · max 1m20s over 2 EVENT idle/question · 1 still waiting</div></div>
+<div class="tile"><div class="k">approvals</div><div class="v">1</div></div>
+<div class="tile"><div class="k">dismissals</div><div class="v">1</div></div>
+<div class="tile"><div class="k">context</div><div class="v">1 context · 1 compacted</div></div>
+<div class="tile"><div class="k">reconnects</div><div class="v">1</div></div>
+<div class="tile"><div class="k">mail</div><div class="v">1 in · 2 out</div></div>
+</section>
+<section aria-label="sources">
+<h2>Sources</h2>
+<ul class="sources">
+<li class="ok"><span class="name">clock</span><span>the session log&#39;s own wall times: each turn by its record&#39;s t= joined by ledger=, each message by its mail mark&#39;s joined by inbox=; no clock anchor is read</span></li>
+<li class="ok"><span class="name">history</span><span>3 turn(s) from @s-work</span></li>
+<li class="ok"><span class="name">log</span><span>@s-work log class=turn: 3 of 3 turn(s) placed by ledger= (1 by its close: the open was evicted); 1 closed turn(s) whose open was evicted name no ledger= (no `turn` exchange opened them, or an older aterm closed them): joined to nothing; the ring evicted 9 record(s) before this read</span></li>
+<li class="ok"><span class="name">offscreen</span><span>10 row(s) read from @s-work&#39;s archive (origin 7730): reply sizes for 3 of 3 turn(s)</span></li>
+<li class="ok"><span class="name">journal</span><span><journal>: 11 line(s) about @s-work, 1 about other sessions skipped, 1 unreadable line(s) skipped</span></li>
+<li class="ok"><span class="name">mail</span><span>@self (s-mgr): 1 message(s) from @s-work in the inbox; 2 post(s) to it in the log</span></li>
+</ul>
+</section>
+<section aria-label="swimlanes">
+<h2>Swimlanes</h2>
+<div class="controls">
+<button type="button" id="zoom-out">−</button><button type="button" id="zoom-fit">fit</button><button type="button" id="zoom-in">+</button><span class="hint">hover a mark for the whole line</span>
+</div>
+<div class="plot" id="plot"></div>
+<div class="tip" id="tip" hidden></div>
+<noscript><p class="hint">The swimlanes are drawn by the page's own script; every row is in the table below either way.</p></noscript>
+<ul class="legend">
+<li data-kind="turn"><span class="swatch turn"></span>manager: a turn typed into the worker</li>
+<li data-kind="reply"><span class="swatch reply"></span>worker: the turn verb, from typing to settled</li>
+<li data-kind="working"><span class="swatch working"></span>worker: on to the EVENT that ended the reply</li>
+<li data-kind="idle"><span class="swatch event"></span>watcher: an EVENT idle, the worker stopped on words</li>
+<li data-kind="question"><span class="swatch event"></span>watcher: an EVENT question, the worker asked</li>
+<li data-kind="prompt"><span class="swatch event"></span>watcher: an EVENT prompt, an approval box</li>
+<li data-kind="limited"><span class="swatch bad"></span>watcher: an EVENT limited, a usage or rate limit notice</li>
+<li data-kind="survey"><span class="swatch event"></span>watcher: an EVENT survey, a rating survey</li>
+<li data-kind="context"><span class="swatch event"></span>watcher: an EVENT context or compacted</li>
+<li data-kind="busy"><span class="swatch event"></span>watcher: an EVENT busy</li>
+<li data-kind="approved"><span class="swatch event"></span>watcher: an APPROVED line, a box the loop approved</li>
+<li data-kind="dismissed"><span class="swatch event"></span>watcher: a DISMISSED line</li>
+<li data-kind="reconnect"><span class="swatch warn"></span>watcher: a RECONNECT or RECONNECTED line</li>
+<li data-kind="timeout"><span class="swatch bad"></span>watcher: a TIMEOUT line</li>
+<li data-kind="exit"><span class="swatch bad"></span>watcher: an EXIT line</li>
+<li data-kind="mail"><span class="swatch event"></span>watcher: a MAIL line</li>
+<li data-kind="extend"><span class="swatch event"></span>watcher: an EXTEND line</li>
+<li data-kind="escalated"><span class="swatch warn"></span>watcher: an ESCALATED line, an ask put on the person&#39;s screen</li>
+<li data-kind="cleared"><span class="swatch event"></span>watcher: a CLEARED line, a badge or an exception ended</li>
+<li data-kind="continued"><span class="swatch event"></span>watcher: a CONTINUED line, a carry-on the loop typed</li>
+<li data-kind="typed"><span class="swatch event"></span>watcher: a TYPED line</li>
+<li data-kind="restarted"><span class="swatch event"></span>watcher: a RESTARTED line</li>
+<li data-kind="waiting"><span class="swatch event"></span>watcher: a WAITING line</li>
+<li data-kind="skipped"><span class="swatch event"></span>watcher: a SKIPPED line</li>
+<li data-kind="unverified"><span class="swatch warn"></span>watcher: an UNVERIFIED line, a submit not seen</li>
+<li data-kind="limit-handled"><span class="swatch bad"></span>watcher: a LIMITED line, a limit notice the loop handled</li>
+<li data-kind="unproven"><span class="swatch event"></span>watcher: an UNPROVEN line</li>
+<li data-kind="dialog"><span class="swatch event"></span>watcher: a DIALOG line</li>
+<li data-kind="declined"><span class="swatch event"></span>watcher: a DECLINED line</li>
+<li data-kind="chose"><span class="swatch event"></span>watcher: a CHOSE line, a question the loop answered</li>
+<li data-kind="exception"><span class="swatch event"></span>watcher: an EXCEPTION line</li>
+<li data-kind="probed"><span class="swatch event"></span>watcher: a PROBED line</li>
+<li data-kind="reset"><span class="swatch event"></span>watcher: a RESET line</li>
+<li data-kind="needs"><span class="swatch warn"></span>watcher: a NEEDS line, the worker&#39;s NEEDS YOU on the person&#39;s screen</li>
+<li data-kind="hold"><span class="swatch event"></span>watcher: a HOLD line</li>
+<li data-kind="occupancy"><span class="swatch event"></span>watcher: an OCCUPANCY line</li>
+<li data-kind="probe"><span class="swatch event"></span>watcher: a PROBE line</li>
+<li data-kind="done"><span class="swatch event"></span>watcher: a DONE line, the task&#39;s end the loop read</li>
+<li data-kind="left"><span class="swatch event"></span>watcher: a LEFT line, a turn left to the person</li>
+<li data-kind="parked"><span class="swatch event"></span>watcher: a PARKED line, hands off while Autopilot is off</li>
+<li data-kind="unparked"><span class="swatch event"></span>watcher: an UNPARKED line, Autopilot back on</li>
+<li data-kind="halted"><span class="swatch bad"></span>watcher: a HALTED line, the session on hold: the loop waits</li>
+<li data-kind="unhalted"><span class="swatch event"></span>watcher: an UNHALTED line, the hold lifted</li>
+<li data-kind="refused"><span class="swatch bad"></span>watcher: a REFUSED line, a request refused: the loop backs off</li>
+<li data-kind="held"><span class="swatch event"></span>watcher: a HELD line, hands off while a person or driver types</li>
+<li data-kind="hold-ended"><span class="swatch event"></span>watcher: a HOLD-ENDED line, a hold ended before the vendor&#39;s deny</li>
+<li data-kind="adopted"><span class="swatch event"></span>watcher: an ADOPTED line, a badge a previous loop left</li>
+<li data-kind="kept"><span class="swatch event"></span>watcher: a KEPT line, a badge kept for the next loop</li>
+<li data-kind="watching"><span class="swatch warn"></span>watcher: a WATCHING line, another supervisor answers</li>
+<li data-kind="claim"><span class="swatch warn"></span>watcher: a CLAIM line, no claim: the loop acts without one</li>
+<li data-kind="claimed"><span class="swatch event"></span>watcher: a CLAIMED line, the session&#39;s claim taken</li>
+<li data-kind="not-escalated"><span class="swatch event"></span>watcher: a NOT ESCALATED line, a notice already stands</li>
+<li data-kind="warn"><span class="swatch warn"></span>watcher: a WARN line, a warning the loop says aloud</li>
+<li data-kind="task"><span class="swatch event"></span>watcher: a TASK line, the session&#39;s task mark</li>
+<li data-kind="fact"><span class="swatch event"></span>watcher: a FACT line, a fact for the agent&#39;s next prompt</li>
+<li data-kind="launch"><span class="swatch event"></span>watcher: a LAUNCH line, a box the person&#39;s own Enter launched</li>
+<li data-kind="host"><span class="swatch event"></span>watcher: a HOST line, a step of the window&#39;s harness</li>
+<li data-kind="deferred"><span class="swatch event"></span>watcher: a DEFERRED line, a restart put off</li>
+<li data-kind="memory"><span class="swatch warn"></span>watcher: a MEMORY line, the agent over its memory measure</li>
+<li data-kind="stalled"><span class="swatch bad"></span>watcher: a STALLED line, a stalled call told to the window</li>
+<li data-kind="stuck"><span class="swatch bad"></span>watcher: a STUCK line, a screen no reader names</li>
+<li data-kind="frozen"><span class="swatch bad"></span>watcher: a FROZEN line, the worker not reading its input</li>
+<li data-kind="thawed"><span class="swatch event"></span>watcher: a THAWED line, the worker reading again</li>
+<li data-kind="stall-warned"><span class="swatch warn"></span>watcher: a STALL-WARNED line, a stall the loop warned of</li>
+<li data-kind="signalled"><span class="swatch bad"></span>watcher: a SIGNALLED line, a signal sent to a stalled worker</li>
+<li data-kind="restart-refused"><span class="swatch bad"></span>watcher: a RESTART-REFUSED line, a restart the host refused</li>
+<li data-kind="note"><span class="swatch event"></span>watcher: a NOTE line, a reading the loop notes</li>
+<li data-kind="sleep"><span class="swatch event"></span>watcher: a SLEEP line, a sleep the loop could not count</li>
+<li data-kind="abandoned"><span class="swatch warn"></span>watcher: an ABANDONED line, a survey left under typed text</li>
+<li data-kind="mail-in"><span class="swatch mail"></span>fabric: a message from the worker</li>
+<li data-kind="mail-out"><span class="swatch mail"></span>fabric: a message to the worker</li>
+<li data-kind="unread"><span class="swatch unread"></span>watcher: a line this reader does not know</li>
+</ul>
+</section>
+<section aria-label="timeline">
+<h2>Timeline</h2>
+<div class="scroll">
+<table>
+<thead><tr><th>time</th><th>lane</th><th>what</th><th>duration/latency</th></tr></thead>
+<tbody>
+<tr class="lane-fabric"><td class="t">00:26:45</td><td>fabric</td><td>mail out: task to the worker</td><td class="d">-</td></tr>
+<tr class="lane-manager"><td class="t">00:26:50</td><td>manager</td><td>turn 1 began: Go on the amended lever</td><td class="d">settled in 1.8s</td></tr>
+<tr class="lane-worker"><td class="t">00:26:50</td><td>worker</td><td>turn 1 — the worker&#39;s reply is 3 rows in the archive</td><td class="d">working 9s</td></tr>
+<tr class="lane-watcher"><td class="t">00:27:00</td><td>watcher</td><td>EVENT idle seq=5 complete=1 rows=689 ⏺ Done with the lever.</td><td class="d">answered in 1m20s</td></tr>
+<tr class="lane-watcher"><td class="t">00:27:10</td><td>watcher</td><td>APPROVED seq=6 git log --oneline -5</td><td class="d">-</td></tr>
+<tr class="lane-manager"><td class="t">00:28:20</td><td>manager</td><td>turn 2 began: Second turn, while you work</td><td class="d">timeout after 6.0s</td></tr>
+<tr class="lane-worker"><td class="t">00:28:20</td><td>worker</td><td>turn 2 — the worker&#39;s reply is 2 rows in the archive</td><td class="d">working 49s</td></tr>
+<tr class="lane-watcher"><td class="t">00:28:30</td><td>watcher</td><td>EVENT prompt seq=8 kind=bash classify=read-only command=ls -la</td><td class="d">-</td></tr>
+<tr class="lane-watcher"><td class="t">00:29:10</td><td>watcher</td><td>EVENT question seq=9 ⏺ Keep the harness or rewrite it?</td><td class="d">answered in 50s</td></tr>
+<tr class="lane-watcher"><td class="t">00:29:20</td><td>watcher</td><td>DISMISSED survey seq=10</td><td class="d">-</td></tr>
+<tr class="lane-watcher"><td class="t">00:29:30</td><td>watcher</td><td>EVENT context seq=11 9% until auto-compact</td><td class="d">-</td></tr>
+<tr class="lane-watcher"><td class="t">00:29:40</td><td>watcher</td><td>EVENT compacted seq=12</td><td class="d">-</td></tr>
+<tr class="lane-watcher"><td class="t">00:29:50</td><td>watcher</td><td>RECONNECT await seq 9 failed: server closed the connection</td><td class="d">-</td></tr>
+<tr class="lane-watcher"><td class="t">00:29:55</td><td>watcher</td><td>RECONNECTED after 1834 ms</td><td class="d">-</td></tr>
+<tr class="lane-manager"><td class="t">00:30:00</td><td>manager</td><td>turn 3 began: Third turn: stop and report</td><td class="d">settled in 1.7s</td></tr>
+<tr class="lane-worker"><td class="t">00:30:00</td><td>worker</td><td>turn 3 — the worker&#39;s reply is 4 rows in the archive</td><td class="d">working 9s</td></tr>
+<tr class="lane-fabric"><td class="t">00:30:05</td><td>fabric</td><td>mail in: report from the worker, 2009 B, trust=agent</td><td class="d">-</td></tr>
+<tr class="lane-fabric"><td class="t">00:30:09</td><td>fabric</td><td>mail out: task to the worker, not landed yet</td><td class="d">-</td></tr>
+<tr class="lane-watcher"><td class="t">00:30:10</td><td>watcher</td><td>EVENT idle seq=13 complete=0 rows=12 ⏺ Stopped at the gate.</td><td class="d">no turn since</td></tr>
+<tr class="lane-watcher"><td class="t">00:30:20</td><td>watcher</td><td>TIMEOUT</td><td class="d">-</td></tr>
+</tbody>
+</table>
+</div>
+</section>
+</main>
+<script type="application/json" id="ledger-data">
+{"t0":1789000005040,"t1":1789000220000,"tz":0,"aligned":true,"items":[{"t":1789000005040,"end":null,"long":null,"lane":"fabric","kind":"mail-out","cls":"mail","what":"mail out: task to the worker","dur":"-"},{"t":1789000010040,"end":null,"long":null,"lane":"manager","kind":"turn","cls":"turn","what":"turn 1 began: Go on the amended lever","dur":"settled in 1.8s"},{"t":1789000010040,"end":1789000011840,"long":1789000020000,"lane":"worker","kind":"reply","cls":"reply","what":"turn 1 — the worker's reply is 3 rows in the archive","dur":"working 9s"},{"t":1789000020000,"end":null,"long":null,"lane":"watcher","kind":"idle","cls":"event","what":"EVENT idle seq=5 complete=1 rows=689 ⏺ Done with the lever.","dur":"answered in 1m20s"},{"t":1789000030000,"end":null,"long":null,"lane":"watcher","kind":"approved","cls":"event","what":"APPROVED seq=6 git log --oneline -5","dur":"-"},{"t":1789000100040,"end":null,"long":null,"lane":"manager","kind":"turn","cls":"turn","what":"turn 2 began: Second turn, while you work","dur":"timeout after 6.0s"},{"t":1789000100040,"end":1789000106045,"long":1789000150000,"lane":"worker","kind":"reply","cls":"reply","what":"turn 2 — the worker's reply is 2 rows in the archive","dur":"working 49s"},{"t":1789000110000,"end":null,"long":null,"lane":"watcher","kind":"prompt","cls":"event","what":"EVENT prompt seq=8 kind=bash classify=read-only command=ls -la","dur":"-"},{"t":1789000150000,"end":null,"long":null,"lane":"watcher","kind":"question","cls":"event","what":"EVENT question seq=9 ⏺ Keep the harness or rewrite it?","dur":"answered in 50s"},{"t":1789000160000,"end":null,"long":null,"lane":"watcher","kind":"dismissed","cls":"event","what":"DISMISSED survey seq=10","dur":"-"},{"t":1789000170000,"end":null,"long":null,"lane":"watcher","kind":"context","cls":"event","what":"EVENT context seq=11 9% until auto-compact","dur":"-"},{"t":1789000180000,"end":null,"long":null,"lane":"watcher","kind":"context","cls":"event","what":"EVENT compacted seq=12","dur":"-"},{"t":1789000190000,"end":null,"long":null,"lane":"watcher","kind":"reconnect","cls":"warn","what":"RECONNECT await seq 9 failed: server closed the connection","dur":"-"},{"t":1789000195000,"end":null,"long":null,"lane":"watcher","kind":"reconnect","cls":"warn","what":"RECONNECTED after 1834 ms","dur":"-"},{"t":1789000200040,"end":null,"long":null,"lane":"manager","kind":"turn","cls":"turn","what":"turn 3 began: Third turn: stop and report","dur":"settled in 1.7s"},{"t":1789000200040,"end":1789000201790,"long":1789000210000,"lane":"worker","kind":"reply","cls":"reply","what":"turn 3 — the worker's reply is 4 rows in the archive","dur":"working 9s"},{"t":1789000205040,"end":null,"long":null,"lane":"fabric","kind":"mail-in","cls":"mail","what":"mail in: report from the worker, 2009 B, trust=agent","dur":"-"},{"t":1789000209040,"end":null,"long":null,"lane":"fabric","kind":"mail-out","cls":"mail","what":"mail out: task to the worker, not landed yet","dur":"-"},{"t":1789000210000,"end":null,"long":null,"lane":"watcher","kind":"idle","cls":"event","what":"EVENT idle seq=13 complete=0 rows=12 ⏺ Stopped at the gate.","dur":"no turn since"},{"t":1789000220000,"end":null,"long":null,"lane":"watcher","kind":"timeout","cls":"bad","what":"TIMEOUT","dur":"-"}]}
+</script>
+<script>
+…
+</script>
+</body>
+</html>
