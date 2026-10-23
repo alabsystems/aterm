@@ -19,8 +19,6 @@ pub trait Dimensions {
     /// Index for the last column.
     #[inline]
     #[must_use]
-    // Skip: a default method dispatching to `Self::columns()`; `Dimensions` is public and
-    // implemented downstream (aterm-grid's `Grid`), so the callee is unknowable here.
     #[cfg_attr(trust_verify, trust::skip)]
     fn last_column(&self) -> Column {
         Column(self.columns().saturating_sub(1))
@@ -29,10 +27,8 @@ pub trait Dimensions {
     /// Topmost line in history.
     #[inline]
     #[must_use]
-    // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn topmost_line(&self) -> Line {
-        // Clamp to i32::MAX before negating; `0 - n` with `n >= 0` cannot overflow.
         let clamped = i32::try_from(self.history_size()).unwrap_or(i32::MAX);
         Line(0i32.saturating_sub(clamped))
     }
@@ -40,24 +36,20 @@ pub trait Dimensions {
     /// Bottommost line in the viewport.
     #[inline]
     #[must_use]
-    // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn bottommost_line(&self) -> Line {
-        // Clamp to i32::MAX on extreme sizes.
         Line(i32::try_from(self.screen_lines().saturating_sub(1)).unwrap_or(i32::MAX))
     }
 
     /// Number of lines in scrollback history.
     #[inline]
     #[must_use]
-    // Skip: open-world dispatch, as `last_column`.
     #[cfg_attr(trust_verify, trust::skip)]
     fn history_size(&self) -> usize {
         self.total_lines().saturating_sub(self.screen_lines())
     }
 }
 
-/// `Dimensions` for `(lines, columns)` tuples, with no scrollback.
 impl Dimensions for (usize, usize) {
     #[inline]
     fn total_lines(&self) -> usize {
@@ -82,8 +74,6 @@ pub struct Line(pub i32);
 
 impl fmt::Display for Line {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Trust gate: `write!` needs a runtime-argument `format_args!` the native lowering
-        // cannot model; `to_string()` + `write_str` is byte-identical.
         f.write_str(&self.0.to_string())
     }
 }
@@ -179,7 +169,6 @@ pub struct Column(pub usize);
 
 impl fmt::Display for Column {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Trust gate: see `Display for Line`.
         f.write_str(&self.0.to_string())
     }
 }

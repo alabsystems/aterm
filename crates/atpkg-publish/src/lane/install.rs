@@ -683,7 +683,7 @@ fn run_tool(tool: &str, args: &[&str]) -> Result<std::process::Output> {
 }
 
 fn uid() -> Result<String> {
-    let out = run_tool("id", &["-u"])?;
+    let out = run_tool(aterm_uds::os_path!("id"), &["-u"])?;
     let uid = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if uid.is_empty() || !uid.bytes().all(|b| b.is_ascii_digit()) {
         return Err(Error::cannot_run("`id -u` named no uid"));
@@ -710,10 +710,10 @@ impl ServiceManager for Launchd {
         self.retire_vendor(&uid);
         for p in paths {
             let domain = format!("gui/{uid}/{}", units::LAUNCHD_LABEL);
-            let _ = run_tool("launchctl", &["bootout", &domain]);
+            let _ = run_tool(aterm_uds::os_path!("launchctl"), &["bootout", &domain]);
             let _ = std::fs::write(self.state_dir.join("alab.launchd.log"), b"");
             let out = run_tool(
-                "launchctl",
+                aterm_uds::os_path!("launchctl"),
                 &["bootstrap", &format!("gui/{uid}"), &p.display().to_string()],
             )?;
             if !out.status.success() {
@@ -723,7 +723,7 @@ impl ServiceManager for Launchd {
                     String::from_utf8_lossy(&out.stderr).trim()
                 )));
             }
-            let _ = run_tool("launchctl", &["enable", &domain]);
+            let _ = run_tool(aterm_uds::os_path!("launchctl"), &["enable", &domain]);
         }
         Ok(())
     }
@@ -731,7 +731,7 @@ impl ServiceManager for Launchd {
     fn disarm(&self, _kind: LaneKind) -> Result<()> {
         let uid = uid()?;
         let _ = run_tool(
-            "launchctl",
+            aterm_uds::os_path!("launchctl"),
             &["bootout", &format!("gui/{uid}/{}", units::LAUNCHD_LABEL)],
         );
         self.retire_vendor(&uid);
@@ -742,7 +742,7 @@ impl ServiceManager for Launchd {
 impl Launchd {
     fn retire_vendor(&self, uid: &str) {
         let _ = run_tool(
-            "launchctl",
+            aterm_uds::os_path!("launchctl"),
             &["bootout", &format!("gui/{uid}/{}", units::RETIRED_LABEL)],
         );
         let _ = std::fs::remove_file(

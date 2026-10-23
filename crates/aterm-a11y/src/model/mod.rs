@@ -3,41 +3,20 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Derived from accesskit 0.24.1 (MIT OR Apache-2.0, used under Apache-2.0)
-// src/lib.rs, and cut by the aterm project in 2026 to what aterm-gui builds
-// and its publisher reads: the roles and properties aterm sets (plus a
-// link's URL and a value's step, which the publisher serves), stored as
-// plain fields; one tree per window (a tree id names only the root tree);
-// no serialization.
+// src/lib.rs, modified by the aterm project in 2026.
 //
 // Derived from Chromium's accessibility abstraction.
 // Copyright 2018 The Chromium Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-CHROMIUM file.
 
-//! The accessibility model a window's tree is built from: [`Node`]s with a
-//! [`Role`], actions and properties, sent as [`TreeUpdate`]s, and the
-//! [`ActionRequest`]s an assistive technology sends back
-//! (docs/AUDIT-third-party-2026-10-15.md, unit a11y, A11Y.5b).
-//!
-//! Its names are AccessKit's, so code written against `accesskit` 0.24 reads
-//! the same against this module, and the semantics oracle
-//! (`tests/oracle/corpus.rs`) compiles against both. It is platform-neutral:
-//! the AT-SPI publisher (`crate::atspi`) reads it today, and a UIA provider
-//! or a richer NSAccessibility publisher could tomorrow.
-//!
-//! A node keeps only what some publisher reads or aterm-gui sets. A property
-//! aterm-gui needs next is added here with its setter, and to the semantics
-//! that read it (`crate::tree`, `crate::text`, `crate::atspi::semantics`),
-//! whose AccessKit originals read many more.
+//! Accessibility tree model: [`Node`]s, [`Role`]s, actions, properties, and [`TreeUpdate`]s.
 
 mod geometry;
 
 pub use geometry::{Affine, Point, Rect, Size, Vec2};
 
 /// What a node is.
-///
-/// The roles aterm-gui publishes, in AccessKit's order, and [`Role::Unknown`]
-/// for a node with none.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Role {
     #[default]
@@ -57,8 +36,7 @@ pub enum Role {
     AlertDialog,
     Application,
     Document,
-    /// A grid of cells read by row and column: the stats bars' core row
-    /// (one [`Role::Meter`] a core).
+    /// A grid of cells read by row and column.
     Grid,
     Group,
     Heading,
@@ -66,8 +44,7 @@ pub enum Role {
     /// One option of a [`Role::ListBox`].
     ListBoxOption,
     MenuItemRadio,
-    /// A read-only gauge of a value within a known range (a CPU, memory or
-    /// GPU level): never a control, never a task's progress.
+    /// A read-only gauge of a value within a known range.
     Meter,
     Navigation,
     ProgressIndicator,
@@ -232,8 +209,7 @@ impl std::fmt::Debug for NodeId {
     }
 }
 
-/// The identity of a [`Tree`]. A window has one tree, [`TreeId::ROOT`]
-/// (AccessKit's grafted subtrees are not carried).
+/// The identity of a [`Tree`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TreeId(u128);
 
@@ -253,17 +229,13 @@ pub struct TextPosition {
 /// A text selection; a caret when `anchor` equals `focus`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TextSelection {
-    /// Where the selection started; it stays as the selection grows or
-    /// shrinks.
+    /// Where the selection started.
     pub anchor: TextPosition,
     /// The selection's moving end, and the caret.
     pub focus: TextPosition,
 }
 
-/// One accessible object. A window's UI is a tree of these.
-///
-/// Getters are documented as if they were fields, and referred to as
-/// properties.
+/// One accessible object in a window's UI tree.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Node {
     role: Role,
@@ -407,9 +379,7 @@ impl Node {
         busy, is_busy, set_busy, clear_busy
     }
     flag! {
-        /// A node its scrolling container holds off screen: in the tree (a
-        /// reader can find it and scroll it into view) but not showing, and
-        /// no point on screen is its.
+        /// Whether this node is held off screen by its scrolling container.
         offscreen, is_offscreen, set_offscreen, clear_offscreen
     }
     flag! {
@@ -441,8 +411,7 @@ impl Node {
     }
 
     string_property! {
-        /// The label of a control that can have one. A [`Role::Label`]'s text
-        /// is its [`Node::value`], not this.
+        /// The label of a control that can have one.
         label, set_label, clear_label
     }
     string_property! {
@@ -456,15 +425,11 @@ impl Node {
     }
 
     copy_property! {
-        /// The bounding box of this node, in its coordinate space (which only
-        /// [`Node::transform`] changes).
+        /// The bounding box of this node in its coordinate space.
         bounds: Rect, bounds, set_bounds, clear_bounds
     }
 
-    /// A transform applied to every coordinate within this node and its
-    /// descendants, this node's bounds included; `None` for the identity.
-    /// The final coordinates are relative to the window, in physical pixels,
-    /// y down.
+    /// Transform applied to coordinates within this node and its descendants (`None` for identity).
     #[inline]
     pub fn transform(&self) -> Option<&Affine> {
         self.transform.as_deref()
@@ -495,10 +460,7 @@ impl Node {
         self.text_selection = None;
     }
 
-    /// For a text run, the length in UTF-8 bytes of each character, the
-    /// smallest unit of text that can be selected (so one may be several code
-    /// points); they sum to the run's [`Node::value`]. A run that ends a line
-    /// with a hard break holds it, CRLF or LF, as one character.
+    /// Length in UTF-8 bytes of each selectable character in a text run.
     #[inline]
     pub fn character_lengths(&self) -> &[u8] {
         &self.character_lengths
@@ -514,9 +476,7 @@ impl Node {
         self.character_lengths = Box::default();
     }
 
-    /// For a text run, the index of each character that starts a word,
-    /// sorted. A run whose first character starts a paragraph need not list
-    /// it.
+    /// Sorted character indices that start a word in a text run.
     #[inline]
     pub fn word_starts(&self) -> &[u8] {
         &self.word_starts
@@ -532,9 +492,7 @@ impl Node {
         self.word_starts = Box::default();
     }
 
-    /// For a text run, each character's position along
-    /// [`Node::text_direction`] within the node's bounds; as many as
-    /// [`Node::character_lengths`].
+    /// Each character's position along [`Node::text_direction`] within the node's bounds.
     #[inline]
     pub fn character_positions(&self) -> Option<&[f32]> {
         self.character_positions.as_deref()
@@ -550,8 +508,7 @@ impl Node {
         self.character_positions = None;
     }
 
-    /// For a text run, each character's advance along
-    /// [`Node::text_direction`]; as many as [`Node::character_lengths`].
+    /// Each character's advance along [`Node::text_direction`].
     #[inline]
     pub fn character_widths(&self) -> Option<&[f32]> {
         self.character_widths.as_deref()
@@ -571,8 +528,7 @@ impl Node {
         text_direction: TextDirection, text_direction, set_text_direction, clear_text_direction
     }
     copy_property! {
-        /// The owner and authorization captured by this publication. A platform
-        /// copies it into an action before queuing it, even if the node id is reused.
+        /// The owner and authorization captured by this publication.
         action_context: ActionContext, action_context, set_action_context, clear_action_context
     }
     copy_property! {
@@ -601,13 +557,11 @@ impl Node {
         live: Live, live, set_live, clear_live
     }
     copy_property! {
-        /// Whether this node is selected; `None` where selection does not
-        /// apply (so a reader does not announce "not selected").
+        /// Whether this node is selected (`None` where selection does not apply).
         selected: bool, is_selected, set_selected, clear_selected
     }
     copy_property! {
-        /// Whether this node is expanded; `None` where it neither expands
-        /// nor collapses.
+        /// Whether this node is expanded (`None` where it neither expands nor collapses).
         expanded: bool, is_expanded, set_expanded, clear_expanded
     }
 }
@@ -635,13 +589,6 @@ impl Tree {
 }
 
 /// An atomic change to a [`Tree`], from its previous state to its next.
-///
-/// An update lists only nodes that are new or changed; each replaces any
-/// node with its id, so an updated node carries every property again. A
-/// node is the root or a child of a node already in the tree or in the
-/// update. To add a child, update its parent's children too; to remove one
-/// and everything under it, update its parent without it and list none of
-/// them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TreeUpdate {
     /// The new and changed nodes, in any order.
@@ -695,7 +642,6 @@ pub enum ActionData {
 }
 
 /// Lossless context captured by a publication before its action is queued.
-/// A semantic node's slot does not identify its current owner or authorization.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ActionContext {
     domain: ActionDomain,
@@ -719,8 +665,7 @@ impl ActionContext {
         Self::native_review(owner, generation, 0)
     }
 
-    /// One native review within a live view. Replacing or consuming that review
-    /// retires its queued actions independently of ordinary presentation changes.
+    /// One native review within a live view.
     #[inline]
     pub const fn native_review(owner: u64, generation: u64, review_revision: u64) -> Self {
         Self {
@@ -790,23 +735,19 @@ pub struct ActionRequest {
 
 /// Turns a window's accessibility on.
 pub trait ActivationHandler {
-    /// The full tree, if it can be built now; otherwise `None`, and the full
-    /// tree follows through the platform adapter's update before the next
-    /// frame. Called again after any deactivation, and possibly without one.
+    /// Return the initial full tree if available now, or `None` to deliver it on the next update.
     fn request_initial_tree(&mut self) -> Option<TreeUpdate>;
 }
 
 /// Carries out what assistive technologies ask.
 pub trait ActionHandler {
-    /// Perform `request`, or do nothing if its action is not supported. It
-    /// may be queued and done later.
+    /// Perform `request`, or do nothing if its action is not supported.
     fn do_action(&mut self, request: ActionRequest);
 }
 
 /// Turns a window's accessibility off.
 pub trait DeactivationHandler {
-    /// Drop whatever can be rebuilt: the next activation asks for the full
-    /// tree again.
+    /// Drop cached accessibility state until the next activation.
     fn deactivate_accessibility(&mut self);
 }
 

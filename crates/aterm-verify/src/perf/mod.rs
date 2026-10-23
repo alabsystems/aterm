@@ -3,28 +3,6 @@
 
 //! `verify perf` — aterm's performance lanes, each runnable alone or in any
 //! combination:
-//!
-//! ```text
-//! targo --unverified verify perf [LANE...] [--record LANE...] [OPTIONS]
-//! targo --unverified verify perf --list
-//! ```
-//!
-//! Three kinds of lane. The FLOOR lanes ([`floors`], [`wasm`]) measure the
-//! engine headless and judge each metric against its committed baseline in
-//! `crates/aterm-verify/perf/golden/`; whatever they measured then meets the
-//! same-box trend ledger ([`trend`]), and a green run appends to it. A bare `verify
-//! perf` runs every floor lane. The ARENA lanes ([`arena`]) open real
-//! windows and take minutes; they run only when named, and what they measure
-//! has no floor, so they report MEASURED, never a pass. The MEASURED lanes
-//! ([`fabric`], [`aos`]) are headless but just as unjudgeable — their numbers
-//! are a disk's fsync, or a shared desk's scheduler, before they are aterm's —
-//! so they too run only when named and report MEASURED (fabric writing a
-//! ledger entry under `docs/measured/`, aos a summary and its JSON).
-//!
-//! `--no-windows` (the house switch for an agent sharing the owner's desktop)
-//! turns every lane that opens a window into a named skip and runs the rest.
-//!
-//! Nothing runs this automatically: it measures when someone asks it to.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -284,10 +262,8 @@ pub(crate) enum Status {
     Measured(String),
     /// It could not measure on this box: why, and what to do about it.
     Skip { why: String, fix: String },
-    /// A tool it needs, which a provider gives every develop machine, is
-    /// missing or did not start (docs/DESIGN-init-system-2026-10-20.md §8
-    /// rules 2 and 5): why, and the provider's remedy. Never a pass and never
-    /// a finding.
+    /// A required provisioned tool is missing or did not start: why, and the
+    /// provider's remedy.
     CouldNotRun { why: String, fix: String },
     /// A floor, fence or validation failed.
     Fail(Vec<String>),
@@ -688,9 +664,6 @@ pub(crate) fn parse(args: &[String]) -> Result<Cli, String> {
     {
         return Err("`compare` needs --baseline PATH and --candidate PATH".to_string());
     }
-    // ONE PATH, ONE WRITER: every lane that takes `--json-out` writes its own
-    // whole report to it, so a second such lane in the run would overwrite the
-    // first's and both would say they wrote it.
     if cli.options.contains_key("--json-out") {
         let writers: Vec<&str> = cli
             .lanes
@@ -778,10 +751,7 @@ fn list() -> String {
     s
 }
 
-/// The options lanes matching `reads` take: what one lane family's parser is
-/// handed. [`OPTIONS`] already says which lanes read each flag, so a parser
-/// sees only its own flags and can treat any other as a missing parser (an
-/// internal error) instead of keeping a list of the flags it skips.
+/// Filter `options` to those accepted by lanes matching `reads`.
 #[cfg(unix)]
 fn options_for(
     options: &BTreeMap<&'static str, String>,
@@ -835,8 +805,6 @@ fn main(args: &[String]) -> ExitCode {
         }
     };
     let no_windows = cli.options.contains_key("--no-windows");
-    // Before any lane starts a thread: an interrupted arena run retires the
-    // windows and scratch directories it made.
     #[cfg(unix)]
     if cli
         .lanes
@@ -901,22 +869,17 @@ fn main(args: &[String]) -> ExitCode {
         ran.push((*lane, run, started.elapsed().as_secs_f64()));
     }
 
-    // The trend meets whatever the floor lanes measured.
     let samples: Vec<TrendSample> = ran.iter().flat_map(|(_, r, _)| r.samples.clone()).collect();
     let mut trend_run = None;
     if !samples.is_empty() {
         let started = Instant::now();
         eprintln!("--- trend ---");
-        // Only the floor lanes measured these samples, so only they decide
-        // whether the run may write itself into the ledger.
         let floors: Vec<&LaneRun> = ran
             .iter()
             .filter(|(l, _, _)| l.kind() == Kind::Floor)
             .map(|(_, r, _)| r)
             .collect();
         let lanes_ok = floors.iter().all(|r| !r.failed());
-        // The trend lanes whose baselines this run rewrote, by the name their
-        // samples carry into the ledger.
         let recorded: Vec<&str> = floors
             .iter()
             .filter(|r| matches!(r.status, Status::Recorded(_)))
@@ -942,9 +905,7 @@ fn main(args: &[String]) -> ExitCode {
     }
 }
 
-/// The closing ladder: one line per lane, then the verdict, and its exit
-/// code: FAILED when a lane failed, else COULD NOT RUN when one could not
-/// run, else PASS. Pure (unit-tested).
+/// Format the per-lane summary and overall exit code.
 pub(crate) fn verdict(rows: &[(&str, &LaneRun, f64)]) -> (String, i32) {
     let mut s = String::from("== verify perf ==\n");
     let mut failed = Vec::new();
@@ -1047,9 +1008,7 @@ mod tests {
         let cli = parse(&args("search --record restore resize")).expect("parses");
         assert_eq!(cli.lanes, vec![Lane::Search, Lane::Restore, Lane::Resize]);
         assert_eq!(cli.record, vec![Lane::Restore, Lane::Resize]);
-        // A bare --record would rewrite nothing it names: refused.
         assert!(parse(&args("--record")).is_err());
-        // An arena lane has no baseline: named after --record, it just runs.
         let cli = parse(&args("--record restore start resize")).expect("parses");
         assert_eq!(cli.lanes, vec![Lane::Restore, Lane::Resize, Lane::Start]);
         assert_eq!(cli.record, vec![Lane::Restore, Lane::Resize]);
@@ -1084,10 +1043,8 @@ mod tests {
         assert_eq!(Lane::Fabric.kind(), Kind::Measured);
         assert!(!Lane::Fabric.opens_windows());
         assert!(!parse(&[]).expect("parses").lanes.contains(&Lane::Fabric));
-        // Its options need it named.
         let why = parse(&args("restore --burst 9")).unwrap_err();
         assert!(why.contains("--burst") && why.contains("fabric"), "{why}");
-        // Named after --record it just runs: it has no baseline to rewrite.
         let cli = parse(&args("--record restore fabric")).expect("parses");
         assert_eq!(cli.record, vec![Lane::Restore]);
         assert_eq!(cli.lanes, vec![Lane::Restore, Lane::Fabric]);
@@ -1104,13 +1061,10 @@ mod tests {
         assert_eq!(Lane::Aos.kind(), Kind::Measured);
         assert!(!Lane::Aos.opens_windows());
         assert!(!parse(&[]).expect("parses").lanes.contains(&Lane::Aos));
-        // It takes no other lane's options.
         let why = parse(&args("aos --burst 9")).unwrap_err();
         assert_eq!(why, "`--burst` is read only by fabric; name one of them");
-        // One JSON file, one writer.
         assert!(parse(&args("aos fabric --json-out /tmp/a.json")).is_err());
         assert!(parse(&args("aos fabric")).is_ok());
-        // Named after --record it just runs: it has no baseline to rewrite.
         let cli = parse(&args("--record restore aos")).expect("parses");
         assert_eq!(cli.record, vec![Lane::Restore]);
         assert_eq!(cli.lanes, vec![Lane::Restore, Lane::Aos]);
@@ -1126,8 +1080,6 @@ mod tests {
                 .count();
             assert_eq!(rows, 1, "{}:\n{listed}", lane.name());
         }
-        // One heading per kind, in the order the kinds run: every lane's row
-        // sits under the heading of its own kind.
         let mut kind_at = Vec::new();
         for line in listed.lines() {
             if !line.starts_with(' ') {
@@ -1165,13 +1117,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["relaxed"]
         );
-        // A flag the table gives only to the fabric lane never reaches the
-        // arena parser, which has no arm for it.
         assert!(
             arena::Args::from_options(&options_for(&cli.options, |l| l.kind() == Kind::Arena))
                 .is_ok()
         );
-        // Past what the bench takes: a usage error here, before any build.
         for line in [
             "fabric --burst 6000",
             "fabric --pingpong-rounds 0",
@@ -1182,7 +1131,6 @@ mod tests {
             let cli = parse(&args(line)).expect(line);
             assert!(lane_args(&cli).is_err(), "{line}");
         }
-        // The arm reaches the fabric parser, and only the fabric lane takes it.
         let cli = parse(&args("fabric --profile opt --no-windows")).expect("parses");
         let (_, fabric_args) = lane_args(&cli).expect("parses");
         assert_eq!(fabric_args.profile.name(), "opt");
@@ -1238,7 +1186,6 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("skip  wasm"), "{text}");
-        // A lane that measured without a floor never reads as judged.
         let (text, code) = verdict(&[("throughput", &pass, 1.0), ("compare", &measured, 60.0)]);
         assert_eq!(code, crate::exit::PASS);
         assert!(text.contains("meas  compare"), "{text}");
@@ -1253,15 +1200,12 @@ mod tests {
             text.contains("NOTHING JUDGED — compare (measured; no floor)"),
             "{text}"
         );
-        // A lane with no baseline judged nothing, so it is never "GREEN for
-        // what was judged".
         let (text, code) = verdict(&[("throughput", &partial, 1.0), ("wasm", &skip, 0.1)]);
         assert_eq!(code, crate::exit::PASS);
         assert!(
             text.contains("NOTHING JUDGED — throughput (no baseline), wasm (skipped)"),
             "{text}"
         );
-        // A held fence is a judgment even when the floors had no baseline.
         let mut fenced = LaneRun::not_judged("no baseline");
         fenced.fence_held("resize");
         let (text, _) = verdict(&[("resize", &fenced, 1.0)]);
@@ -1272,8 +1216,6 @@ mod tests {
         let (text, code) = verdict(&[("throughput", &pass, 1.0), ("search", &fail, 2.0)]);
         assert_eq!(code, crate::exit::FAILED);
         assert!(text.contains("FAILED — search"), "{text}");
-        // A lane missing a provided tool could not run: never GREEN, never
-        // a skip, and a failure beside it still fails the run.
         let unrun = LaneRun::could_not_run(
             "no pinned chrome-headless-shell",
             "targo --unverified verify provision",

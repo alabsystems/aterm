@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the native editor's mark/minibuffer lifecycle.
-//!
-//! The trace drives the genuine `EditorWorkspace` reducer over the shipping
-//! `DocumentStore`, projects its view/document state into the derived model, and
-//! checks each named transition. Independent corrupted projections prove that a
-//! collapsed active mark, a minibuffer-to-document input leak, a search caret
-//! past the document end, or a command prompt that edits the document cannot
-//! pass.
+//! Conformance for the native editor's mark and minibuffer lifecycle against
+//! [`native_editor_modal_model`].
 
 #![cfg(test)]
 
@@ -95,7 +89,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let model = native_editor_modal_model();
     let mut store = crate::test_document_store();
     let document = store.open("mem://editor-modal-conformance".into(), "abc".into());
-    // The model's `Cap` is the length of the document this trace opens.
     let cap = model
         .consts
         .iter()
@@ -134,8 +127,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let after_move = project(&model, &store, document, &view, facts);
     assert_transition(&model, &before_move, &after_move, "Move");
 
-    // Negative control: collapsing the active anchor to the new head is neither admitted nor
-    // invariant-safe.
     let mut collapsed_mark = after_move.clone();
     collapsed_mark.insert("anchor", after_move["caret"]);
     assert_eq!(admits(&model, &before_move, &collapsed_mark), None);
@@ -161,7 +152,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let command_typed = project(&model, &store, document, &view, facts);
     assert_transition(&model, &command_open, &command_typed, "MinibufferType");
 
-    // Negative control: query input advancing the canonical sequence is rejected.
     let mut leaked_input = command_typed.clone();
     leaked_input.insert("document_edits", command_typed["document_edits"] + 1);
     assert_eq!(admits(&model, &command_open, &leaked_input), None);
@@ -186,8 +176,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let search_typed = project(&model, &store, document, &view, facts);
     assert_transition(&model, &search_open, &search_typed, "MinibufferType");
 
-    // Negative control: an off-by-one search clamp parks the caret one past the
-    // document end, which neither the transition nor `CaretBounded` admits.
     let mut overrun = search_typed.clone();
     overrun.insert("caret", cap + 1);
     assert_eq!(admits(&model, &search_open, &overrun), None);
@@ -227,9 +215,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     let buffer_submitted = project(&model, &store, document, &view, facts);
     assert_transition(&model, &buffer_typed, &buffer_submitted, "Submit");
 
-    // A command's prompt (`kill-buffer`'s buffer name) holds the keys until
-    // it is answered or abandoned, and the document stays at the revision it
-    // opened at.
     let before_prompt = buffer_submitted;
     workspace
         .execute(&mut store, &mut view, EditorCommand::KillBuffer)
@@ -246,9 +231,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     assert_transition(&model, &prompt_open, &prompt_typed, "MinibufferType");
     assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "bc");
 
-    // Negative control (PromptEditsDoc): prompt typing committed through the
-    // authorized lane keeps the edit ledger balanced, so only the prompt law
-    // can refuse it, and the transition is not admitted.
     let mut prompt_leak = prompt_typed.clone();
     prompt_leak.insert("document_edits", prompt_typed["document_edits"] + 1);
     prompt_leak.insert("authorized_edits", prompt_typed["authorized_edits"] + 1);
@@ -286,8 +268,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     assert_transition(&model, &prompt_answered, &prompt_submitted, "SubmitPrompt");
     assert_eq!(store.snapshot(document).unwrap().text.as_ref(), "bc");
 
-    // The goto lifecycle on shipping code: in a two-line buffer the abstract zero-based
-    // target `1` equals the real byte of line 2, so acceptance is checked as a transition.
     let mut goto_store = crate::test_document_store();
     let goto_document = goto_store.open("mem://editor-goto-conformance".into(), "\nx".into());
     let mut goto_workspace = EditorWorkspace::new();
@@ -326,11 +306,6 @@ fn shipping_editor_mark_and_minibuffer_trace_conforms_with_negative_controls() {
     assert_eq!(goto_view.primary_selection().head, 1);
 }
 
-/// The PromptEditsDoc mutant (`Buggy=2`) is the defect the prompt law exists
-/// for: a prompt whose typing commits through the authorized lane keeps the
-/// edit ledger balanced, so `MinibufferCannotEditDocument` holds under it and
-/// only `PromptNeverEditsDocument` is broken. The committed model breaks
-/// neither.
 #[test]
 fn prompt_edits_doc_mutant_breaks_only_the_prompt_law() {
     use aterm_spec::interp::{violated_invariants, with_buggy};

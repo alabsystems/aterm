@@ -126,6 +126,7 @@ fn registered_session(local_id: u64, term: &Arc<Mutex<Terminal>>) -> SessionHand
         crash_journal: Default::default(),
         typed: Default::default(),
         bells: Default::default(),
+        screen_moves: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

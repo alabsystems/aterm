@@ -3,29 +3,20 @@
 
 //! The paint matrix: one row is a scene typed into a release `aterm`, captured,
 //! scanned ([`super::scan`]) and judged against what the row expects.
-//!
-//! This module is the pure half: the row's terms and [`judge`], which turns a
-//! scan plus the engine's own ledger into a verdict. [`super::paint_probe`]
-//! drives the take.
 
 use super::instance::{CouldNotRun, could_not_run};
 use super::scan::{ScanReport, StatusRow};
 use super::starvation::{Disposition, SchedReading, ShapeVerdict, Starvation};
 
 /// The ink floor on a take: dynamic saturated pixels across all its frames.
-/// One healthy frame never carries 150, so the floor gates the take; healthy
-/// takes sit ~10x above it.
 pub const MIN_INK: usize = 150;
-/// The hue floor: buckets across the take. Typed trails reach 8-11; an
-/// unfocused window without its typed wake collapses to one.
+/// The hue floor: buckets across the take.
 pub const MIN_HUES: usize = 4;
 /// The busiest single frame must carry a visible clump.
 pub const MIN_BEST_INK: usize = 5;
-/// Fewer frames than this decides nothing: a stalled recorder's take has zero
-/// ink for reasons unrelated to paint.
+/// Minimum frame count required for a take to decide anything.
 pub const MIN_FRAMES: usize = 5;
-/// The excused lead before a recorded band first reaches glass: ~3.5x the
-/// worst healthy lead (120-141 ms), inside the authored young phase.
+/// The excused lead before a recorded band first reaches glass.
 pub const MATURE_LEAD_MAX_US: i64 = 500_000;
 /// The take's wall-clock budget, against which a take racing it is disowned.
 pub const BUDGET_SECS: u64 = 180;
@@ -35,15 +26,13 @@ pub const BUDGET_SECS: u64 = 180;
 pub enum Scene {
     /// The main screen at a `/bin/sh` prompt, per-key echo.
     Prompt,
-    /// The fake-Claude TUI: alt screen, DEC-2026 bracketed repaints with the
-    /// caret hidden inside, a 150 ms spinner, per-key echo.
+    /// The fake-Claude TUI: alt screen, DEC-2026 bracketed repaints, a 150 ms spinner, per-key echo.
     FakeClaude,
     /// The fake-Claude TUI with nothing typed: the dark control.
     ColdSpinner,
     /// Alt screen, an ESC7/ESC8 token streamer above the typing row.
     Streamer,
-    /// Alt screen, an append-shaped stream walking a shown caret, nothing
-    /// typed: the shape only a keyboard licence keeps dark.
+    /// Alt screen, an append-shaped stream walking a shown caret, nothing typed.
     ColdStreamer,
 }
 
@@ -74,33 +63,26 @@ impl Scene {
 /// What a row expects of its take.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expect {
-    /// Effect ink: the floors, ribbon frames in a run, continuity, and no
-    /// driven mature claim over an unlit raster (covering at least two frames
-    /// on a paired take), and the compose-side witness.
+    /// Effect ink across the take.
     Ink,
     /// Zero effect ink in every frame (a style with no resident companion).
     Dark,
-    /// Zero trail, a resident companion allowed: the engine's quiet ledger on
-    /// every frame and no claimed ribbon.
+    /// Zero trail, a resident companion allowed.
     TrailDark,
-    /// The take fails the ink predicate: the control for a capture path with
-    /// an unavoidable cursor-cell artifact.
+    /// The take fails the ink predicate.
     Quiet,
-    /// Typed cursor/text pixels with the canonical off style: no ribbon, a
-    /// quiet ledger, no compose-side witness.
+    /// Typed cursor/text pixels with the canonical off style.
     EffectOff,
 }
 
 /// How the take is captured, and so what the instrument perturbs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Capture {
-    /// `ctl video`: the recording pins the window's motion focus, so it can
-    /// prove a focused recorded window paints, never the motion gate.
+    /// `ctl video`: the recording pins the window's motion focus.
     PinnedVideo,
     /// A burst of `ctl image` renders: no recording, focus as the app has it.
     UnpinnedFocused,
-    /// The burst with the window unfocused (`ctl focus out`): the arm that
-    /// can go red on the unfocused demotion.
+    /// The burst with the window unfocused (`ctl focus out`).
     UnpinnedUnfocused,
 }
 
@@ -119,8 +101,7 @@ pub enum Style {
     /// The key left absent: the shipped default (`rainbow kitty pet`).
     Default,
     Underline,
-    /// `"rainbow kitty flying"`: the companion-free style the trail rows pin,
-    /// and the only spelling that earns the flying head.
+    /// `"rainbow kitty flying"`: the companion-free style that earns the flying head.
     Flying,
     Tall,
     /// The canonical off spelling: the matched negative control.
@@ -141,9 +122,7 @@ impl Style {
         }
     }
 
-    /// The `style="…"` the engine must report, and the tokens that bind it to
-    /// what it resolved to: a spelling that silently resolves elsewhere is a
-    /// red row.
+    /// The `style="…"` the engine must report, and the tokens that bind it to what it resolved to.
     #[must_use]
     pub const fn binding(self) -> (&'static str, &'static [(&'static str, &'static str)]) {
         const TALL: &[(&str, &str)] = &[("resolved", "rainbow-kitty"), ("ribbon_look", "tall")];
@@ -185,8 +164,7 @@ impl Style {
 pub enum Companion {
     /// The resident pet: claimed and visibly whole from frame zero on.
     Pet,
-    /// The flying head: earned by a sustained run, then whole in three
-    /// isolated final stills.
+    /// The flying head: earned by a sustained run, then whole in three isolated final stills.
     Cat,
 }
 
@@ -271,8 +249,7 @@ impl PaintRow {
         }
     }
 
-    /// The recorded take's length: long enough for the keys (a lead, the
-    /// 120 ms cadence, a per-key allowance and a one-second tail), at least 5 s.
+    /// The recorded take's length, at least 5 s.
     #[must_use]
     pub fn record_secs(&self) -> u64 {
         let n = self.keys().len();
@@ -292,16 +269,13 @@ impl PaintRow {
 pub struct Ledger {
     /// One `trail status` row per frame (image bursts).
     pub rows: Option<Vec<StatusRow>>,
-    /// One row read after a recorded take: its counters are cumulative on a
-    /// fresh instance, so zero after the take is zero throughout it.
+    /// One row read after a recorded take.
     pub final_row: Option<StatusRow>,
     /// Effect ticks that composed the ribbon body's stream (`fx_under_frames`).
     pub fx_under_frames: u64,
 }
 
 impl Ledger {
-    /// Whether every row (or the final row) carries `key=value`; `false` with
-    /// no ledger at all.
     fn all(&self, key: &str, value: &str) -> bool {
         match (&self.rows, &self.final_row) {
             (Some(rows), _) => rows.iter().all(|r| r.value(key) == Some(value)),
@@ -330,8 +304,7 @@ impl Ledger {
         self.all("pet_active", "false") && self.all("cat_active", "false")
     }
 
-    /// Every row reports `style`, and an image burst paired a row with every
-    /// frame.
+    /// Every row reports `style`, and an image burst paired a row with every frame.
     #[must_use]
     pub fn style_bound(&self, style: Style, frames: usize) -> bool {
         match (&self.rows, &self.final_row) {
@@ -342,7 +315,6 @@ impl Ledger {
     }
 }
 
-/// Recorded-take continuity, or the image burst's frame-count gap.
 fn continuity_holds(row: &PaintRow, s: &ScanReport) -> Result<bool, CouldNotRun> {
     if s.driven.dark_us < 0 {
         if row.capture.is_video() {
@@ -353,14 +325,10 @@ fn continuity_holds(row: &PaintRow, s: &ScanReport) -> Result<bool, CouldNotRun>
         }
         return Ok(s.rainbow_gap <= 1);
     }
-    // One dark sampled frame is capture jitter; two is a regression.
     Ok(2 * s.driven.dark_us <= 3 * s.driven.nominal_dt_us
         && s.driven.mature_lead_us <= MATURE_LEAD_MAX_US)
 }
 
-/// The ink predicate, read in both directions (`Ink` and its negation
-/// `Quiet`). Its terms short-circuit in order, so a lost bracket matters only
-/// once the floors hold.
 fn ink_holds(row: &PaintRow, s: &ScanReport) -> Result<bool, CouldNotRun> {
     let floors = s.total_ink >= MIN_INK
         && s.union_hues >= MIN_HUES
@@ -370,8 +338,6 @@ fn ink_holds(row: &PaintRow, s: &ScanReport) -> Result<bool, CouldNotRun> {
     if !floors || !continuity_holds(row, s)? {
         return Ok(false);
     }
-    // No driven mature claim over an unlit raster, and the bound window
-    // traverses the arc.
     Ok(s.ribbon_dark == 0 && (s.ribbon_bound < 2 || s.ribbon_window_hues >= 4))
 }
 
@@ -388,8 +354,6 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
         ));
     }
     let pass = match row.expect {
-        // The coverage floor rides on this arm alone: negated, it would let
-        // the Quiet control pass for want of a ledger entry.
         Expect::Ink => {
             ink_holds(row, s)?
                 && (s.status_frames == 0 || s.ribbon_bound >= 2)
@@ -399,8 +363,6 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
         Expect::TrailDark => ledger.trail_quiet() && s.ribbon_claimed == 0 && s.ribbon_dark == 0,
         Expect::Quiet => !ink_holds(row, s)?,
         Expect::EffectOff => {
-            // On video the all-dark driven window must exceed the continuity
-            // bound, or the control has not shown a dead effect reading apart.
             let window_dark = !row.capture.is_video()
                 || (s.driven.dark_us >= 0
                     && s.driven.nominal_dt_us > 0
@@ -415,8 +377,6 @@ pub fn judge(row: &PaintRow, ledger: &Ledger, s: &ScanReport) -> Result<ShapeVer
         }
     };
     let style_ok = ledger.style_bound(row.style, s.frames);
-    // Companion semantics are an additional obligation, never a way to buy
-    // the rainbow verdict. One body per isolating frame, always.
     let companion_ok = match row.companion {
         None => true,
         Some(Companion::Pet) => {
@@ -456,12 +416,9 @@ pub struct PaintReport {
     pub wall_us: u64,
     /// How long the alt-screen scene took to switch past its launch.
     pub alt_wait_ms: u64,
-    /// The cadence the subject observed typed keys at (image takes): median
-    /// and worst gap between consecutive keys' first frames, from the frames'
-    /// own write times.
+    /// The cadence the subject observed typed keys at (image takes): median and worst gap.
     pub typed_gap_ms: Option<(u64, u64)>,
-    /// A video take's driven bracket on the recording's own clock, `lo:hi`
-    /// ms: with a kept take (`ATERM_PAINT_KEEP`) it re-scans the same window.
+    /// A video take's driven bracket on the recording's own clock, `lo:hi` ms.
     pub driven_ms: Option<(i64, i64)>,
     /// The scheduling band the subject ran in.
     pub band: super::instance::Band,

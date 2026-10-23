@@ -18,7 +18,7 @@ pub(crate) struct LaunchedSuccessor {
 }
 
 impl LaunchedSuccessor {
-    /// The launched instance's pid, as LaunchServices reported it: positive and never this process's own (`admit_launched_pid`, the only non-test constructor, refuses both).
+    /// The launched instance's positive PID as reported by LaunchServices.
     pub(crate) const fn pid(self) -> i32 {
         self.pid
     }
@@ -45,7 +45,7 @@ impl std::fmt::Display for TextFault {
     }
 }
 
-/// Every way a launch ([`begin_launch`], [`LaunchInFlight::wait`]) can fail to produce a successor; each is the caller's cue to keep the user's windows and fall back.
+/// Failure modes for [`begin_launch`] and [`LaunchInFlight::wait`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LaunchError {
     /// Not macOS.
@@ -56,11 +56,11 @@ pub(crate) enum LaunchError {
         path: String,
         fault: TextFault,
     },
-    /// LaunchServices resolves nothing relative to a working directory, and the caller's working directory is not the successor's anyway.
+    /// The bundle path is not absolute.
     BundlePathNotAbsolute(String),
-    /// Only a bundle gets an `application.<bundle-id>.<hex>` job of its own, which is the entire point of this lane; refusing early turns a wrong target into a typed refusal instead of an opaque LaunchServices status a whole deadline later.
+    /// The target path does not name a `.app` bundle.
     BundlePathNotAnAppBundle(String),
-    /// Nothing is at that path (or it is not a directory — every `.app` is one).
+    /// No directory exists at the bundle path.
     BundleMissing(String),
     Argument {
         index: usize,
@@ -95,13 +95,13 @@ pub(crate) enum LaunchError {
     /// Foundation refused to mint one of the objects the launch needs.
     #[cfg(target_os = "macos")]
     ForeignObject(&'static str),
-    /// LaunchServices reported an implausible pid — `NSRunningApplication` answers `-1` when it does not know one.
+    /// LaunchServices reported an implausible pid (`-1` when unknown).
     #[cfg(target_os = "macos")]
     PidUnknown(i32),
-    /// LaunchServices answered with an application that had ALREADY TERMINATED and whose pid it no longer knows (`-1`): the launched process ran and exited before it ever checked in (2026-09-29, measured on macOS 26.6.2 against an ad-hoc-signed stand-in bundle launched exactly as [`begin_launch`] launches).
+    /// LaunchServices answered with an application that had already terminated before check-in.
     #[cfg(target_os = "macos")]
     ExitedBeforeCheckIn,
-    /// The answer names this process: LaunchServices substituted the running instance, so no successor exists.
+    /// LaunchServices substituted the already-running instance.
     #[cfg(target_os = "macos")]
     SubstitutedRunningInstance(i32),
 }
@@ -182,7 +182,7 @@ struct LaunchRequest {
     environment: Vec<(String, String)>,
 }
 
-/// [`begin_launch`] then [`LaunchInFlight::wait`] for at most `budget`: the off-macOS test's pin of the validate-then-refuse contract.
+/// [`begin_launch`] then [`LaunchInFlight::wait`] for at most `budget`.
 #[cfg(all(test, not(target_os = "macos")))]
 pub(crate) fn launch_app_bundle(
     bundle: &Path,
@@ -194,7 +194,7 @@ pub(crate) fn launch_app_bundle(
     begin_launch_validated(&request, false)?.wait(budget)
 }
 
-/// Validate the request and hand it to LaunchServices, returning the in-flight handle at once so the caller can accept the successor's rendezvous dial while the answer is pending.
+/// Validate the request and hand it to LaunchServices, returning the in-flight handle at once.
 pub(crate) fn begin_launch(
     bundle: &Path,
     arguments: &[OsString],
@@ -211,17 +211,17 @@ pub(crate) fn begin_launch(
 pub(crate) enum OwnLaunchRecord {
     /// An entry carries this process's pid: Quit & Reopen, the menu bar and TCC find it.
     Named,
-    /// No entry carries it and one carries none (`-1`): the stale record an `execve` after a LaunchServices launch leaves ([`LaunchError::PidUnknown`]), which lasts the process's life, and which a launch-record renewal replaces with a fresh process (`launch_record_renewal`).
+    /// Stale LaunchServices record (`-1` PID) left after `execve`.
     Stale,
     /// Neither: no bundle identifier, or no entry without a pid to be this one.
     Unknown,
 }
 
-/// How long into a windowed launch [`own_launch_record`] is asked: the stale record formed within about a second of the `execve` in every measured run (2026-10-19), and the launch's own exec comes before the window.
+/// Delay into a windowed launch before querying [`own_launch_record`].
 #[cfg(target_os = "macos")]
 pub(crate) const OWN_LAUNCH_RECORD_SETTLE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Ask LaunchServices for every running instance of this bundle (`+[NSRunningApplication runningApplicationsWithBundleIdentifier:]`) and whether one carries this process's pid.
+/// Ask LaunchServices for every running instance of this bundle and whether one carries this process's pid.
 #[cfg(target_os = "macos")]
 pub(crate) fn own_launch_record() -> OwnLaunchRecord {
     use aterm_objc::{autoreleasepool, class, sel};
@@ -269,7 +269,6 @@ pub(crate) fn activate_running(pid: i32) -> bool {
     if crate::platform::Windowed::get().is_none() {
         return false;
     }
-    /// `NSApplicationActivateIgnoringOtherApps` (AppKit, `NSApplicationActivationOptions`).
     const ACTIVATE_IGNORING_OTHER_APPS: usize = 1 << 1;
     autoreleasepool(|_| {
         // SAFETY: class methods on immortal AppKit classes and instance methods on live objects: `runningApplicationWithProcessIdentifier:` answers nil or an autoreleased instance valid for this pool; `sharedApplication` is this process's own NSApplication (Commit runs on the main thread, where it exists); `respondsToSelector:` is a side-effect-free query; `yieldActivationToApplication:` and `activateWithOptions:` take the instance and a bitmask by value.
@@ -340,7 +339,7 @@ impl LaunchInFlight {
         }
     }
 
-    /// Has LaunchServices already answered that the launched process exited before it checked in ([`launch_answer_proves_exit`])? A peek, polled by the dial wait: it never takes the answer, so the corroboration after a dial ([`Self::wait`]) still reads it.
+    /// Whether LaunchServices already answered that the launched process exited before check-in.
     #[must_use]
     #[cfg(target_os = "macos")]
     pub(crate) fn exited_before_check_in(&self) -> bool {
@@ -355,8 +354,6 @@ impl LaunchInFlight {
     }
 }
 
-/// The pure half: everything that can be refused without asking the system
-/// anything (bar one filesystem stat, which is advisory).
 fn validate_request(
     bundle: &Path,
     arguments: &[OsString],
@@ -441,8 +438,6 @@ fn validate_request(
     })
 }
 
-/// What is wrong with an environment key, if anything. The faults are checked in order (empty,
-/// NUL, `=`) so the message names the most fundamental problem.
 fn env_key_fault(key: &str) -> Option<TextFault> {
     if key.is_empty() {
         Some(TextFault::Empty)
@@ -704,7 +699,7 @@ pub(crate) fn launch_answer_proves_exit(
     matches!(answer, Some(Err(LaunchError::ExitedBeforeCheckIn)))
 }
 
-/// The pid LaunchServices' answer names as the launched process: the one process the outgoing process may watch, before the dial, for a death LaunchServices will not report.
+/// The pid LaunchServices' answer names as the launched process.
 #[must_use]
 #[cfg(target_os = "macos")]
 pub(crate) fn launch_answer_names_pid(
@@ -726,8 +721,6 @@ struct LaunchSlot {
 
 #[cfg(target_os = "macos")]
 impl LaunchSlot {
-    /// Record the first answer and wake the waiter. Later answers are dropped: AppKit calls a
-    /// completion handler once, and a second call must never overwrite an answer already acted on.
     fn deliver(&self, answer: Result<LaunchedSuccessor, LaunchError>) {
         let mut slot = self.answer.lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_none() {
@@ -736,8 +729,6 @@ impl LaunchSlot {
         }
     }
 
-    /// Apply `read` to the answer in place, delivered or not, without taking it: the answer stays
-    /// for the one [`LaunchWatch::wait`] that consumes it.
     fn peek<T>(
         &self,
         read: impl FnOnce(Option<&Result<LaunchedSuccessor, LaunchError>>) -> T,
@@ -760,7 +751,7 @@ thread_local! {
 
 #[cfg(all(test, target_os = "macos"))]
 impl LaunchInFlight {
-    /// A launch whose LaunchServices answer is scripted: `Some(pid)` is delivered at once, `None` never answers — so the handoff's corroboration arms can be driven without LaunchServices.
+    /// A launch whose LaunchServices answer is scripted.
     pub(crate) fn scripted(answer: Option<i32>) -> Self {
         let watch = LaunchWatch::pending();
         if let Some(pid) = answer {
@@ -769,12 +760,12 @@ impl LaunchInFlight {
         Self { watch }
     }
 
-    /// Deliver `answer` as the completion block would — at once, or from another thread while the caller waits.
+    /// Deliver `answer` as the completion block would.
     pub(crate) fn answer_for_test(&self, answer: Result<LaunchedSuccessor, LaunchError>) {
         self.watch.slot.deliver(answer);
     }
 
-    /// The completion's own reading of an `NSRunningApplication` (`processIdentifier`, `isTerminated`), so a test can script LaunchServices with the answers it gives.
+    /// The completion's reading of an `NSRunningApplication` (`processIdentifier`, `isTerminated`).
     pub(crate) fn admitted_for_test(
         pid: i32,
         terminated: bool,
@@ -792,7 +783,6 @@ impl LaunchWatch {
         }
     }
 
-    /// Block until the launch is answered or `budget` is spent.
     fn wait(&self, budget: Duration) -> Result<LaunchedSuccessor, LaunchError> {
         let started = Instant::now();
         let mut slot = self.slot.answer.lock().unwrap_or_else(|p| p.into_inner());
@@ -831,8 +821,6 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    /// A real directory named `<something>.app`, which is all the pure
-    /// validation can ask of a bundle.
     fn scratch_bundle(name: &str) -> (aterm_tempfile::TempDir, PathBuf) {
         let root = aterm_tempfile::Builder::new()
             .prefix(&format!("aterm-launch-successor-{name}-"))
@@ -850,10 +838,6 @@ mod tests {
             .collect()
     }
 
-    /// A bundle path is refused before anything is launched: relative
-    /// (LaunchServices resolves nothing against our working directory), not a
-    /// `.app` (checked before the filesystem, so the message names the wrong
-    /// kind of target rather than a missing file), or absent.
     #[test]
     fn a_malformed_bundle_path_is_refused() {
         for (path, want) in [
@@ -878,8 +862,6 @@ mod tests {
         }
     }
 
-    /// The request carries exactly the caller's keys: the environment merges, so this module
-    /// never takes on keeping `PATH`/`HOME`/`XPC_*` alive.
     #[test]
     fn a_well_formed_request_carries_exactly_the_keys_it_was_given() {
         let (_root, bundle) = scratch_bundle("well-formed");
@@ -908,9 +890,6 @@ mod tests {
         );
     }
 
-    /// An environment no shell could carry is refused. A NUL in a VALUE is
-    /// the quiet one: every C-string consumer past `execve` would truncate
-    /// there.
     #[test]
     fn a_malformed_environment_is_refused() {
         let (_root, bundle) = scratch_bundle("bad-env");
@@ -1064,8 +1043,6 @@ mod tests {
             );
         }
 
-        /// No AppKit is touched for an impossible pid: activation at Commit is
-        /// aimed only at a corroborated candidate.
         #[test]
         fn activation_refuses_an_impossible_pid_without_touching_appkit() {
             assert!(!crate::app_launch_successor::activate_running(0));
@@ -1073,8 +1050,6 @@ mod tests {
             assert!(!crate::app_launch_successor::activate_running(1));
         }
 
-        /// A zero budget is a poll: it never parks, answers what is already delivered, and
-        /// reports `Timeout` at once otherwise.
         #[test]
         fn a_zero_budget_wait_is_a_poll_that_never_sleeps() {
             let parks = CONDVAR_PARKS.with(Cell::get);
@@ -1165,8 +1140,6 @@ mod tests {
             );
         }
 
-        /// Only an application LaunchServices already reports terminated, with no pid, reads as
-        /// death.
         #[test]
         fn only_a_terminated_application_with_no_pid_reads_as_death() {
             assert_eq!(
@@ -1207,8 +1180,6 @@ mod tests {
             }
         }
 
-        /// The pre-dial poll is a peek: the answer stays for the one `wait` that consumes it,
-        /// the corroboration after a dial.
         #[test]
         fn the_exit_peek_leaves_the_answer_for_the_corroboration() {
             let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(None);

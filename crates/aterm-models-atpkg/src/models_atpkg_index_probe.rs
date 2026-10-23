@@ -14,7 +14,6 @@ pub fn atpkg_index_probe_completion_cadence_model() -> Model {
             const Buggy = 0;
             const Interval = 6;
             const MaxAge = 7;
-            // 0 idle, 1 network in flight, 2 stamped and waiting, 3 next probe.
             var phase = 0;
             var start_age = 0;
             var stamp_age = 0;
@@ -59,7 +58,6 @@ pub fn atpkg_index_shared_handoff_model() -> Model {
             const Buggy = 0;
             const Interval = 6;
             var stamp_age = 0;
-            // 0 no stamp, 1 shared stamp live, 2 second host waiting, 3 expired and checked.
             var phase = 0;
             var local_wait = 0;
             var requests = 0;
@@ -97,12 +95,10 @@ pub fn atpkg_index_pending_park_model() -> Model {
     aterm_spec::ty_model! {
         AtpkgIndexPendingPark {
             const Buggy = 0;
-            // 0 idle, 1 running, 2 finished, 3 harvested, 4 illegal second worker.
             var phase = 0;
             var published = 0;
             var near_offered = 0;
             var late_near = 0;
-            // 0 no answer, 1 published, 2 missing.
             var answer = 0;
             var pass_generation = 0;
             var probe_generation = 0;
@@ -112,7 +108,6 @@ pub fn atpkg_index_pending_park_model() -> Model {
             var inline_vendor_get = 0;
             var bump = 0;
             var full_due = 0;
-            // 0 undecided, 1 bump, 2 full-pass deadline, 3 index, 4 vendor.
             var chosen = 0;
             var delivered = 0;
             var skipped_ready_index = 0;
@@ -261,11 +256,9 @@ pub fn atpkg_index_probe_cooldown_model() -> Model {
         AtpkgIndexProbeCooldown {
             const Buggy = 0;
             const MaxAge = 3;
-            // 0 unlocked, 1 lock held, 2 decided/written, 3 second owner.
             var phase = 0;
             var floor = 1;
             var stamp_floor = 0;
-            // 0 absent, 1 missing, 2 error, 3 published.
             var marker = 0;
             var ttl = 0;
             var age = 3;
@@ -360,7 +353,6 @@ pub fn atpkg_index_successor_selection_model() -> Model {
             var first = 0;
             var highest = 0;
             var uncertain = 0;
-            // 0 undecided, 1 missing, 2 deferred, 3/5 published (floor+1, floor+2).
             var chosen = 0;
 
             action ObserveMissing when (seen <= 1) {

@@ -142,7 +142,7 @@ pub(super) fn curl_get_with_status(url: &str, headers: &[&str]) -> Result<Vec<u8
         args.push(h);
     }
     args.extend(["--", url]);
-    let out = run_capture("curl", &args).map_err(GetError::other)?;
+    let out = run_capture(aterm_uds::os_path!("curl"), &args).map_err(GetError::other)?;
     parse_get_response(url, out.status.code(), out.stdout, &out.stderr)
 }
 
@@ -200,7 +200,7 @@ pub fn curl_to_file(url: &str, dest: &Path, headers: &[&str]) -> Result<(), Stri
         args.push(&header_cfg);
     }
     args.extend(["--url", url]);
-    let code = run_inherit("curl", &args);
+    let code = run_inherit(aterm_uds::os_path!("curl"), &args);
     if code != 0 {
         return Err(format!("abrew: download failed ({url}), curl exit {code}"));
     }

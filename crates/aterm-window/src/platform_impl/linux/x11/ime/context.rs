@@ -4,9 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/ime/context.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's XIM
-// declarations, where upstream used x11-dl's.)
-
 use std::ffi::CStr;
 use std::os::raw::c_short;
 use std::sync::Arc;
@@ -62,7 +59,6 @@ extern "C" fn preedit_done_callback(
 ) {
     let client_data = unsafe { &mut *(client_data as *mut ImeContextClientData) };
 
-    // Drop text buffer and reset cursor position on done.
     client_data.text = Vec::new();
     client_data.cursor_pos = 0;
 
@@ -98,7 +94,6 @@ extern "C" fn preedit_draw_callback(
         return;
     }
 
-    // NULL indicate text deletion
     let mut new_chars = if call_data.text.is_null() {
         Vec::new()
     } else {
@@ -197,16 +192,12 @@ struct ImeContextClientData {
     cursor_pos: usize,
 }
 
-// XXX: this struct doesn't destroy its XIC resource when dropped.
-// This is intentional, as it doesn't have enough information to know whether or not the context
-// still exists on the server. Since `ImeInner` has that awareness, destruction must be handled
-// through `ImeInner`.
+// This struct doesn't destroy its XIC resource when dropped because only `ImeInner` knows
+// whether the context still exists on the server.
 pub struct ImeContext {
     pub(crate) ic: ffi::XIC,
     pub(crate) ic_spot: ffi::XPoint,
     pub(crate) allowed: bool,
-    // Since the data is passed shared between X11 XIM callbacks, but couldn't be directly free
-    // from there we keep the pointer to automatically deallocate it.
     _client_data: Box<ImeContextClientData>,
 }
 
@@ -256,7 +247,6 @@ impl ImeContext {
             _client_data: unsafe { Box::from_raw(client_data) },
         };
 
-        // Set the spot location, if it's present.
         if let Some(ic_spot) = ic_spot {
             context.set_spot(xconn, ic_spot.x, ic_spot.y)
         }
@@ -364,11 +354,6 @@ impl ImeContext {
         self.allowed
     }
 
-    // Set the spot for preedit text. Setting spot isn't working with libX11 when preedit callbacks
-    // are being used. Certain IMEs do show selection window, but it's placed in bottom left of the
-    // window and couldn't be changed.
-    //
-    // For me see: https://bugs.freedesktop.org/show_bug.cgi?id=1580.
     pub(crate) fn set_spot(&mut self, xconn: &Arc<XConnection>, x: c_short, y: c_short) {
         if !self.is_allowed() || self.ic_spot.x == x && self.ic_spot.y == y {
             return;

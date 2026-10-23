@@ -2,26 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Derived from serde_derive 1.0.228 src/internals/attr.rs and
-// src/internals/name.rs, and modified by the aterm project in 2026: the
-// attributes are read with aterm-macro-support instead of syn, and only the
-// keys, positions and forms in docs/measured/third-party-2026-10-15/serde-attrs.tsv
-// are implemented. Every other key is an error that says so.
+// src/internals/name.rs, and modified by the aterm project in 2026.
 // See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
 
-//! This module handles parsing of `#[serde(...)]` attributes. The entrypoints
-//! are `attr::Container::from_ast`, `attr::Variant::from_ast`, and
-//! `attr::Field::from_ast`. Each returns an instance of the corresponding
-//! struct. Note that none of them return a Result. Unrecognized, malformed, or
-//! duplicated attributes result in an error but otherwise are ignored. The
-//! user will see errors simultaneously for all bad attributes in the crate
-//! rather than just the first.
-//!
-//! The set aterm writes (container: `default`, `deny_unknown_fields`,
-//! `rename_all`, `tag`, `transparent`, `untagged`; variant: `rename`; field:
-//! `alias`, `default`, `default = "..."`, `deserialize_with`, `flatten`,
-//! `rename`, `skip`, `skip_serializing_if`) is closed: a key upstream serde
-//! knows but this derive does not is refused by name, as is a known key in a
-//! position or form outside the set.
+//! This module handles parsing of `#[serde(...)]` attributes.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -384,24 +368,12 @@ pub struct Container {
 /// Styles of representing an enum.
 pub enum TagType {
     /// The default.
-    ///
-    /// ```json
-    /// {"variant1": {"key1": "value1", "key2": "value2"}}
-    /// ```
     External,
 
-    /// `#[serde(tag = "type")]`
-    ///
-    /// ```json
-    /// {"type": "variant1", "key1": "value1", "key2": "value2"}
-    /// ```
+    /// `#[serde(tag = "type")]`.
     Internal { tag: String },
 
-    /// `#[serde(untagged)]`
-    ///
-    /// ```json
-    /// {"key1": "value1", "key2": "value2"}
-    /// ```
+    /// `#[serde(untagged)]`.
     None,
 }
 
@@ -418,12 +390,10 @@ impl Container {
 
         for meta in serde_metas(cx, &item.attrs) {
             if meta.is("transparent") {
-                // #[serde(transparent)]
                 if expect_flag(cx, position, &meta) {
                     transparent.set_true(&meta);
                 }
             } else if meta.is("deny_unknown_fields") {
-                // #[serde(deny_unknown_fields)]
                 if expect_flag(cx, position, &meta) {
                     deny_unknown_fields.set_true(&meta);
                 }
@@ -447,7 +417,6 @@ impl Container {
                     }
                 }
             } else if meta.is("rename_all") {
-                // #[serde(rename_all = "foo")]
                 if let Some((value, span)) = get_lit_str(cx, position, &meta) {
                     match RenameRule::from_str(&value) {
                         Some(rule) => rename_all_rule.set(&meta, rule),
@@ -469,7 +438,6 @@ impl Container {
                     }
                 }
             } else if meta.is("untagged") {
-                // #[serde(untagged)]
                 if expect_flag(cx, position, &meta) {
                     match item.data {
                         Data::Enum(_) => untagged.set_true(&meta),
@@ -480,7 +448,6 @@ impl Container {
                     }
                 }
             } else if meta.is("tag") {
-                // #[serde(tag = "type")]
                 if let Some((value, _)) = get_lit_str(cx, position, &meta) {
                     match &item.data {
                         Data::Enum(_) | Data::Struct(Fields::Named(_)) => {
@@ -600,7 +567,7 @@ fn decide_tag(
     }
 }
 
-/// Represents variant attribute information
+/// Represents variant attribute information.
 pub struct Variant {
     name: MultiName,
 }
@@ -614,7 +581,6 @@ impl Variant {
 
         for meta in serde_metas(cx, &variant.attrs) {
             if meta.is("rename") {
-                // #[serde(rename = "foo")]
                 if let Some((value, span)) = get_lit_str(cx, position, &meta) {
                     let name = Name { value, span };
                     ser_name.set(&meta, name.clone());
@@ -652,7 +618,7 @@ impl Variant {
     }
 }
 
-/// Represents field attribute information
+/// Represents field attribute information.
 pub struct Field {
     name: MultiName,
     skip_serializing: bool,
@@ -713,7 +679,6 @@ impl Field {
 
         for meta in serde_metas(cx, &field.attrs) {
             if meta.is("rename") {
-                // #[serde(rename = "foo")]
                 if let Some((value, span)) = get_lit_str(cx, position, &meta) {
                     let name = Name { value, span };
                     ser_name.set(&meta, name.clone());
@@ -721,19 +686,16 @@ impl Field {
                     de_aliases.push(name);
                 }
             } else if meta.is("alias") {
-                // #[serde(alias = "foo")]
                 if let Some((value, span)) = get_lit_str(cx, position, &meta) {
                     de_aliases.push(Name { value, span });
                 }
             } else if meta.is("default") {
                 match meta.kind {
-                    // #[serde(default = "...")]
                     MetaKind::Value { .. } => {
                         if let Some(path) = parse_lit_into_expr_path(cx, position, &meta) {
                             default.set(&meta, Default::Path(path));
                         }
                     }
-                    // #[serde(default)]
                     MetaKind::Flag => default.set(&meta, Default::Default),
                     MetaKind::List(_) => unsupported_form(
                         cx,
@@ -743,22 +705,18 @@ impl Field {
                     ),
                 }
             } else if meta.is("skip") {
-                // #[serde(skip)]
                 if expect_flag(cx, position, &meta) {
                     skip.set_true(&meta);
                 }
             } else if meta.is("skip_serializing_if") {
-                // #[serde(skip_serializing_if = "...")]
                 if let Some(path) = parse_lit_into_expr_path(cx, position, &meta) {
                     skip_serializing_if.set(&meta, path);
                 }
             } else if meta.is("deserialize_with") {
-                // #[serde(deserialize_with = "...")]
                 if let Some(path) = parse_lit_into_expr_path(cx, position, &meta) {
                     deserialize_with.set(&meta, path);
                 }
             } else if meta.is("flatten") {
-                // #[serde(flatten)]
                 if expect_flag(cx, position, &meta) {
                     flatten.set_true(&meta);
                 }
@@ -769,9 +727,6 @@ impl Field {
 
         let skipped = skip.get();
 
-        // Is skip_deserializing, initialize the field to Default::default() unless a
-        // different default is specified by `#[serde(default = "...")]` on
-        // ourselves or our container (e.g. the struct we are in).
         if let Default::None = *container_default
             && skipped
         {
@@ -780,8 +735,6 @@ impl Field {
 
         let mut borrowed_lifetimes = BTreeMap::new();
         if is_implicitly_borrowed(ty) {
-            // Types &str and &[u8] are always implicitly borrowed. No need for
-            // a #[serde(borrow)].
             collect_lifetimes(ty, &mut borrowed_lifetimes);
         }
 
@@ -889,9 +842,6 @@ fn is_option(ty: &Ty, elem: fn(&Ty) -> bool) -> bool {
         }
 }
 
-// Whether the type looks like it might be `&T` where elem="T". This can have
-// false negatives and false positives (a `type str = ...` alias), as upstream's
-// does.
 fn is_reference(ty: &Ty, elem: fn(&Ty) -> bool) -> bool {
     match ungroup(ty) {
         Ty::Reference {
@@ -928,10 +878,6 @@ fn is_primitive_path(path: &TyPath, primitive: &str) -> bool {
         && matches!(path.segments[0].args, PathArgs::None)
 }
 
-// All lifetimes that this type could borrow from a Deserializer.
-//
-// For example a type `S<'a, 'b>` could borrow `'a` and `'b`. On the other hand
-// a type `for<'a> fn(&'a str)` could not borrow `'a` from the Deserializer.
 fn collect_lifetimes(ty: &Ty, out: &mut BTreeMap<String, Lifetime>) {
     match ty {
         Ty::Slice(elem) | Ty::Array(elem) | Ty::Ptr(elem) | Ty::Paren(elem) | Ty::Group(elem) => {

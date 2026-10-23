@@ -112,7 +112,6 @@ impl FgCutter {
         }
         self.parked = Some(filled);
         if fg <= 0 {
-            // no information (tcgetpgrp failed, no foreground group)
             return false;
         }
         if self.running <= 0 || fg == self.running {
@@ -569,12 +568,9 @@ fn darwin_group_has_stopped_member(pgid: i32) -> bool {
             buffersize: libc::c_int,
         ) -> libc::c_int;
     }
-    /// `SSTOP` from `<sys/proc.h>`. Pinned by
-    /// `foreground_handback_a_stopped_member_of_a_leaderless_group_is_seen`,
-    /// which stops a real process and reads it back.
+    /// `SSTOP` from `<sys/proc.h>`.
     const SSTOP: u32 = aterm_uds::process::BsdShortInfo::SSTOP;
-    /// A foreground job with more members than this is not one a terminal
-    /// runs; past it the listing is read as far as it goes.
+    /// Cap on members inspected for a single foreground job.
     const MAX_MEMBERS: usize = 4096;
     let mut capacity = 64_usize;
     let pids = loop {
@@ -781,7 +777,7 @@ mod tests {
         assert_eq!(c.finish(|| SHELL, 40), Some(FgEdge::group(0, JOB, SHELL)));
     }
 
-    /// An `exec` heard at a park (card engine §3.3).
+    /// An `exec` heard at a park.
     fn exec_of(pid: i32, pgid: i32, fg: i32) -> ProcSeen {
         ProcSeen { pid, pgid, fg }
     }

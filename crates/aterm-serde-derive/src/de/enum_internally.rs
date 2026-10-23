@@ -7,27 +7,6 @@
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
 //! Deserialization for internally tagged enums:
-//!
-//! ```
-//! # extern crate aterm_serde as serde;
-//! #[derive(aterm_serde_derive::Deserialize)]
-//! #[serde(tag = "kind")]
-//! enum Event {
-//!     Ready,
-//!     Data { value: u32 },
-//! }
-//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
-//! # assert_deserializable::<Event>();
-//! ```
-//! # extern crate aterm_serde as serde;
-//! #[derive(aterm_serde_derive::Deserialize)]
-//! #[serde(tag = "kind")]
-//! enum Event {
-//!     Ready,
-//!     Data { value: u32 },
-//! }
-//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
-//! # assert_deserializable::<Event>();
 
 use aterm_macro_support::q;
 use proc_macro::{Literal, TokenStream};
@@ -40,7 +19,7 @@ use crate::de::struct_;
 use crate::de::{Parameters, StructForm, effective_style, expr_is_missing, field_i};
 use crate::fragment::{Expr, Fragment, Match};
 
-/// Generates `Deserialize::deserialize` body for an `enum Enum {...}` with `#[serde(tag)]` attribute
+/// Generates `Deserialize::deserialize` body for an `enum Enum {...}` with `#[serde(tag)]` attribute.
 pub(super) fn deserialize(
     params: &Parameters,
     variants: &[Variant],
@@ -49,7 +28,6 @@ pub(super) fn deserialize(
 ) -> Fragment {
     let (variants_stmt, variant_visitor) = enum_::prepare_enum_variant_enum(variants);
 
-    // Match arms to extract a variant from a string
     let variant_arms: Vec<TokenStream> = variants
         .iter()
         .enumerate()
@@ -87,8 +65,6 @@ pub(super) fn deserialize(
     )
 }
 
-// Generates significant part of the visit_seq and visit_map bodies of visitors
-// for the variants of internally tagged enum.
 fn deserialize_internally_tagged_variant(
     params: &Parameters,
     variant: &Variant,
@@ -124,8 +100,6 @@ fn deserialize_internally_tagged_variant(
             cattrs,
             &StructForm::InternallyTagged(variant_ident),
         ),
-        // Refused when the attributes were read (`decide_tag`); a tuple
-        // variant in an internally tagged enum never reaches here.
         Style::Tuple => quote_expr!(
             "_serde::__private::Err(_serde::de::Error::custom(\"tuple variant in an internally tagged enum\"))"
         ),

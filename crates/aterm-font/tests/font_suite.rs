@@ -1,23 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The aterm-font integration files as modules of ONE test binary: each file
-//! stays at its own path and keeps its own `#[test]`s.
-//!
-//! `autotests = false` in `Cargo.toml`: a `tests/*.rs` file that is neither a
-//! `mod` line here nor a `[[test]]` of its own NEVER COMPILES.
-//!
-//! Run one file's tests with
-//! `targo --unverified test -p aterm-font --test font_suite -- <file>::`.
+//! Combined `aterm-font` integration test binary (`autotests = false` in `Cargo.toml`,
+//! so every `tests/*.rs` file must be a `mod` here or a standalone `[[test]]`).
 
-// The font oracle's std-only half (corpus format, digest, face table), shared
-// with aterm-render's recorder and replay.
 #[path = "../../aterm-render/tests/font_oracle/corpus.rs"]
 #[allow(dead_code)]
 mod corpus;
 
-// The hinting oracle's shared half (the answer format and aterm-render's
-// raster paths), over the corpus digest and aterm-render's rasterizer.
 #[cfg(any(feature = "hint", debug_assertions))]
 use corpus::Fnv;
 #[cfg(any(feature = "hint", debug_assertions))]

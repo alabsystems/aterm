@@ -1,18 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! REVIEWS ACROSS AIs (design §9). Batteries included ("reviews need
-//! to ship on and run for what's enabled … don't disable stuff"; "inherit the current parent
-//! agent's permissions"): the change in this directory goes to every AI CLI used on this
-//! machine but the asker, each in its one-shot mode with all its capabilities, in the
-//! repository, at the asking agent's own permission level (`permission.rs`), in parallel; the
-//! answers come back as text, sanitized and with credential-shaped tokens redacted, and stay
-//! readable for a day under `<state>/ai/reviews/<id>/`.
-//!
-//! A reviewer runs from the managed shim (never a PATH lookup), with the asker's environment
-//! less the outer agent's own variables (the tab rule), and `ATERM_AI_REVIEW=1`, so a reviewer
-//! can start no review. Its outcome counts for its CLI only when it ran on the default login
-//! the doctor reads.
+//! Reviews across AIs.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,8 +20,7 @@ use super::store::{Ended, How, Outcome, Store};
 /// The most of an answer kept.
 pub const ANSWER_MAX: usize = 256 * 1024;
 /// A kept JSON document: up to two encoded bytes per sanitized answer byte,
-/// for every reviewer, plus one answer's budget for metadata. The writer and
-/// reader share this bound, so a successful keep remains readable by `--show`.
+/// for every reviewer, plus one answer's budget for metadata.
 pub const KEPT_MAX_BYTES: usize = ANSWER_MAX * (2 * super::config::REVIEW_COUNT_MAX as usize + 1);
 /// How long a review's answers are kept.
 pub const KEEP_S: u64 = 24 * 3600;
@@ -131,8 +119,6 @@ pub fn request(asker: &str, words: Option<&str>, change: &Change, nonce: &str) -
     ));
     let held = change.held_back.len() + change.links.len();
     if held > 0 {
-        // Their number, never their names: a reviewer told where a secret lives can be
-        // talked into reading it.
         r.push_str(&format!(
             "{held} file(s) held back, not shown (their names look like secrets, or they are links)\n"
         ));
@@ -144,9 +130,7 @@ pub fn request(asker: &str, words: Option<&str>, change: &Change, nonce: &str) -
     r
 }
 
-/// A block of text from outside fit for a terminal: newlines and tabs kept (U+2028 and
-/// U+2029 become newlines); every other C0 control, DEL, C1 and the bidi overrides and
-/// isolates dropped; cut at `max` bytes on a character boundary.
+/// A block of text from outside fit for a terminal, cut at `max` bytes on a character boundary.
 #[must_use]
 pub fn sanitize_block(text: &str, max: usize) -> String {
     let mut out = String::with_capacity(text.len().min(max));
@@ -173,14 +157,12 @@ const fn token_char(c: char) -> bool {
 }
 
 /// Replaces credential-shaped tokens with `[redacted]`: Anthropic, OpenAI and GitHub keys,
-/// Google OAuth tokens, AWS key ids, JWTs and PEM private-key blocks. Answers how many.
+/// Google OAuth tokens, AWS key ids, JWTs and PEM private-key blocks.
 #[must_use]
 pub fn redact(text: &str) -> (String, usize) {
     let mut out = String::with_capacity(text.len());
     let mut count = 0;
     let mut rest = text;
-    // PEM private-key blocks first, whole, whatever separates their lines (a JSON string
-    // carries them as a literal `\n`).
     let mut unpem = String::new();
     while let Some(start) = rest.find("-----BEGIN ") {
         let after = start + "-----BEGIN ".len();
@@ -265,9 +247,7 @@ pub fn redact(text: &str) -> (String, usize) {
     (out, count)
 }
 
-/// Legacy completion markers an older primer may have taught a reviewer to
-/// emit. Strip them from review text so it cannot end the asking agent's turn.
-/// Current primers ask for ordinary-language reports without these markers.
+/// Legacy completion markers an older primer may have taught a reviewer to emit.
 pub const MARKERS: &[&str] = &["ATERM-TASK-DONE"];
 
 /// `text` without the lines that are only a [`MARKERS`] word.
@@ -280,10 +260,7 @@ pub fn strip_markers(text: &str) -> String {
     kept.join("\n").trim_end().to_string()
 }
 
-/// The environment a reviewer runs with: the asker's (`vars`), by the tab rule (the outer
-/// agent's own variables and every connection's credential overrides stay behind, so a nested CLI does
-/// not take itself for its parent), with the CLI's home variable as set, Claude's own login
-/// as accounts v2 bound it, and [`REVIEW_ENV`].
+/// The environment a reviewer runs with.
 #[must_use]
 pub fn reviewer_env(
     c: &Connector,
@@ -315,9 +292,6 @@ pub fn reviewer_env(
         env.retain(|(k, _)| k != name);
         env.push((name.to_string(), v));
     }
-    // Claude, on the default home: the machine's own login, as accounts v2 bound it (relaunch
-    // lines carry the same variable; an empty value is the default login). Under a home of
-    // its own the vendor keys the login by that home, so the variable is left unset.
     let default_home = c
         .home
         .var
@@ -336,12 +310,7 @@ pub fn reviewer_env(
 /// How many of a failed run's last lines are read for why it failed.
 pub const FAILURE_LINES: usize = 8;
 
-/// What a failed run said about why: its error output's last [`FAILURE_LINES`] non-empty
-/// lines after the request's closing fence (Codex echoes the request there), with any line
-/// the request itself holds dropped and, where the CLI marks its own failure lines
-/// ([`Connector::error_lead`]), only those; and, for a CLI that answers on stdout, its last
-/// three.
-/// The change under review, and an answer that quotes it, never decide a verdict.
+/// What a failed run said about why.
 #[must_use]
 pub fn failure_tail(c: &Connector, ran: &Ran, nonce: &str, request: &str) -> String {
     let fence = format!("CHANGE {nonce}>>>");
@@ -374,9 +343,7 @@ pub fn failure_tail(c: &Connector, ran: &Ran, nonce: &str, request: &str) -> Str
     said.join("\n").to_ascii_lowercase()
 }
 
-/// Reads one run's outcome. Only a run that exited non-zero is read for a lost login or a
-/// limit, and only through [`failure_tail`]: an answer that quotes "Please run /login" is
-/// an answer, and a change about logins is not a lost one.
+/// Reads one run's outcome.
 #[must_use]
 pub fn verdict_of(
     c: &Connector,
@@ -441,7 +408,6 @@ pub struct Host<'a> {
     pub now: &'a (dyn Fn() -> i64 + Sync),
 }
 
-/// One reviewer's run.
 fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) {
     let (change, asker, words, budget) = (ask.change, ask.asker, ask.words, ask.budget);
     let c = f.connector;
@@ -474,7 +440,6 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
         return (answer, None);
     };
     let cwd = change.root.clone();
-    // The asker's permission level, in this CLI's own flags.
     let level: Vec<String> = c
         .review
         .levels
@@ -539,8 +504,6 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
     answer.why = why;
     if verdict == Verdict::Served {
         let raw = raw.as_deref().unwrap_or_default();
-        // The captured answer is already bounded. Redact whole captured tokens before a
-        // display cut can leave a prefix too short for the redactor to recognize.
         let clean = sanitize_block(raw, raw.len());
         let (text, _) = redact(&strip_markers(&clean));
         answer.text = Some(sanitize_block(&text, ANSWER_MAX));
@@ -553,7 +516,6 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
             .map(str::trim)
             .find(|l| !l.is_empty())
     {
-        // What the CLI said last, as one sanitized, redacted line: why it failed.
         let clean = sanitize_block(last, last.len()).replace('\n', " ");
         let (said, _) = redact(&clean);
         let said = sanitize_block(&said, 200);
@@ -566,8 +528,6 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
     let outcome = match verdict {
         Verdict::Served => Some(Outcome::Worked),
         Verdict::Auth => Some(Outcome::Ended(Ended::ReviewAuth)),
-        // The limit's own reset is in the vendor's words and zone; a review waits out a
-        // conservative stretch before asking this CLI again.
         Verdict::Limit => Some(Outcome::Limited(Some(
             (h.now)().saturating_add(LIMIT_WAIT_S),
         ))),
@@ -577,8 +537,7 @@ fn run_one(h: &Host<'_>, f: &Facts, ask: &Ask<'_>) -> (Answer, Option<Outcome>) 
 }
 
 /// Who reviews, in order: `asked` (named with `--with`, or every reviewer with `--all`),
-/// else the configured reviewers but the asker. Each candidate is paired with why it is
-/// skipped, if it is.
+/// else the configured reviewers but the asker.
 #[must_use]
 pub fn candidates<'r>(
     reviewers: &[&'static Connector],
@@ -595,8 +554,6 @@ pub fn candidates<'r>(
         .filter_map(|c| rows.iter().find(|r| r.connector.id == c.id))
         .map(|row| {
             let skip = if let Some(until) = row.limited_until.filter(|t| *t > now) {
-                // A live limit skips it whatever its state (a Claude login due for renewal
-                // can be at its limit too).
                 Some(format!("usage limit until {}", super::state::when(until)))
             } else {
                 match row.state {
@@ -659,8 +616,6 @@ pub fn run_review(
             }
         }
     }
-    // Each wave asks as many as are still wanted; only a reviewer that could not
-    // authenticate, hit its limit or failed is replaced, never one that timed out.
     let mut want = ask.count;
     let mut next = 0;
     while want > 0 && next < queue.len() {
@@ -867,7 +822,6 @@ pub fn keep(store: &Store, id: &str, json: &str) -> std::io::Result<PathBuf> {
     }
     #[cfg(not(unix))]
     std::fs::DirBuilder::new().create(&dir)?;
-    // Ordered: a diagnostic kept a day, whose answers already went to the asker.
     crate::harness::upgrade_models::write_atomic_ordered(&dir.join("review.json"), json)?;
     Ok(dir)
 }

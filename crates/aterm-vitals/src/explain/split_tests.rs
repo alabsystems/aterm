@@ -11,12 +11,10 @@ use super::*;
 use crate::events::EventKind;
 use crate::model::{MemSample, Split, TabView, Vitals};
 
-/// The facts after reading `scene` through a fresh model.
 fn facts(scene: &Scene) -> Arc<WhyFacts> {
     facts_edited(scene, |_, _| {})
 }
 
-/// The same, with the window's two split ticks edited by `edit`.
 fn facts_edited(scene: &Scene, edit: impl FnOnce(&mut Sample, &mut Sample)) -> Arc<WhyFacts> {
     let mut v = Vitals::new();
     let [mut base, sweep, mut now] = scene.samples();
@@ -40,7 +38,6 @@ fn parts(tab: i64, aterm_rest: i64, others: i64, services: i64, unaccounted: i64
     }
 }
 
-/// `s`, `k` seconds on, its cores' ticks moved so it has a window.
 fn later(s: &Sample, k: u64) -> Sample {
     let mut s = s.clone();
     s.at_ns += k * 1_000_000_000;
@@ -60,8 +57,6 @@ fn row(f: &WhyFacts, id: u64) -> &CoalRow {
         .unwrap_or_else(|| panic!("no row for coalition {id}"))
 }
 
-/// RD's 10:32 moment: 3300 = 200 + 200 + 730 + 2170 + 0, every part over the
-/// one 5 s window ending 17:32:41.200Z, and the rows add up to the figure.
 #[test]
 fn the_1032_window_splits_into_its_five_parts() {
     let scene = spotlight_1032();
@@ -126,17 +121,11 @@ fn the_1032_window_splits_into_its_five_parts() {
         Part::Others,
         "siriactionsd runs as the user"
     );
-    // A caller in no tab: all of aterm is the rest.
     assert_eq!(f.split.parts(None), parts(0, 400, 730, 2170, 0));
-    // A sweep cut at its cap misses the oldest processes (the kernel lists
-    // the newest first): no start of userspace is read from it.
     let cut = facts_edited(&scene, |_, now| now.procs_truncated = true);
     assert_eq!(cut.userspace_ms, None);
 }
 
-/// Coalition 2 is listed and answers nothing: the split's count is the
-/// list's, not its rows' (that it never reads as a zero row is the reader's,
-/// `aterm-sysprobe`'s coalitions tests).
 #[test]
 fn a_listed_coalition_that_answers_nothing_is_counted_as_listed() {
     let f = facts(&spotlight_1032());
@@ -144,9 +133,6 @@ fn a_listed_coalition_that_answers_nothing_is_counted_as_listed() {
     assert_eq!(f.split.rows.len(), 8);
 }
 
-/// SA's 14:21 table: aterm is TWO coalitions, its own and the predecessor's
-/// that still holds the adopted tab 1. NEGATIVE CONTROL: with tab 1 not this
-/// instance's, its coalition is the user's other work.
 #[test]
 fn aterm_is_every_coalition_holding_it_or_a_tab_shell() {
     let scene = two_coalitions_1421();
@@ -169,8 +155,6 @@ fn aterm_is_every_coalition_holding_it_or_a_tab_shell() {
     assert_eq!(f.split.parts(Some(2)), parts(80, 5560, 4150, 180, 30));
 }
 
-/// A coalition whose last member exited inside the window keeps the part and
-/// the name it had; one never seen with a member is a service with no name.
 #[test]
 fn a_coalition_with_no_member_left_keeps_its_name_and_part() {
     let mut scene = spotlight_1032();
@@ -200,9 +184,6 @@ fn a_coalition_with_no_member_left_keeps_its_name_and_part() {
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 850, 2210, 0));
 }
 
-/// A coalition made inside the window (numbered above every one the base
-/// listed) counts from 0; one reaped inside it ran work no part holds, so
-/// the residual shows it, signed.
 #[test]
 fn a_coalition_made_or_reaped_inside_the_window() {
     let f = facts(&reaped_1032());
@@ -212,17 +193,12 @@ fn a_coalition_made_or_reaped_inside_the_window() {
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 1030, 2170, 250));
     assert!(f.split.exact);
 
-    // The cores' ticks behind the counters: a negative residual, kept.
     let mut behind = spotlight_1032();
     behind.busy_mc -= 50;
     let f = facts(&behind);
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 730, 2170, -50));
 }
 
-/// A tab's delegated job under a launcher outside aterm (`resource-run`
-/// under an app server): its member counts in the tab and leaves the
-/// launcher's part, once; read ahead of its launcher's counter, it takes no
-/// more than the launcher's own figure, so no part goes below 0.
 #[test]
 fn a_delegated_member_counts_once_in_its_tab_capped_at_its_launcher() {
     let job = |mc: u64, launcher_mc: u64| facts(&delegated_1032(mc, launcher_mc));
@@ -245,9 +221,6 @@ fn a_delegated_member_counts_once_in_its_tab_capped_at_its_launcher() {
         3900
     );
 
-    // Its tab closed: the member's work is aterm's own, in the rest, still
-    // once; aterm's own work is then of aterm's coalitions and the delegated
-    // work, past aterm's coalitions alone.
     let mut closed = delegated_1032(500, 100);
     closed.delegated[0].tab = None;
     let f = facts(&closed);
@@ -258,9 +231,6 @@ fn a_delegated_member_counts_once_in_its_tab_capped_at_its_launcher() {
     );
 }
 
-/// The tab's live figure read past aterm's coalition (the sweep read it after
-/// the coalition's counter): the rest of aterm is 0, never below, and the
-/// residual takes the 0.05, signed.
 #[test]
 fn a_tab_read_past_aterms_coalitions_leaves_the_residual_negative() {
     let f = facts(&tab_ahead_1032());
@@ -268,9 +238,6 @@ fn a_tab_read_past_aterms_coalitions_leaves_the_residual_negative() {
     assert_eq!(f.split.parts(Some(1)), parts(450, 0, 730, 2170, -50));
 }
 
-/// Hundreds of coalitions each run under a millicore on a calm Mac: each
-/// part is summed before it is rounded, so the residual holds none of their
-/// rounding. Ten services at 0.8 mc each read 1 apiece and 8 together.
 #[test]
 fn a_part_is_rounded_once_not_per_coalition() {
     let mut scene = spotlight_1032();
@@ -289,9 +256,6 @@ fn a_part_is_rounded_once_not_per_coalition() {
     assert_eq!(row(&f, 600).cpu_mc, 1, "a row is rounded on its own");
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 730, 2178, 0));
 
-    // Each part rounds half up, as the cores' figure does, so a window that
-    // balances leaves no residual: 2.0 mc busy, the user's 0.4 and a
-    // service's 1.6 (truncated, 0 and 1, the residual would read 1).
     let calm = Scene {
         busy_mc: 2,
         coalitions: Vec::new(),
@@ -316,9 +280,6 @@ fn a_part_is_rounded_once_not_per_coalition() {
     assert_eq!(f.split.parts(None), parts(0, 0, 0, 2, 0));
 }
 
-/// Every part is over the split's window: as a build starts, the tab reads
-/// its 1.00 over the 5 s window, never the 3.00 of the last 1 s sweep the
-/// Deck shows.
 #[test]
 fn the_tab_is_read_over_the_splits_window_not_the_last_sweeps() {
     let mut v = Vitals::new();
@@ -332,9 +293,6 @@ fn the_tab_is_read_over_the_splits_window_not_the_last_sweeps() {
     assert_eq!(f.split.parts(Some(1)), parts(1000, 200, 730, 2170, 0));
 }
 
-/// A delegated member in aterm's own coalition (a detached job a tab started
-/// keeps the coalition it was made in): aterm's counter already holds its
-/// work, so nothing moves and it counts once, in its tab.
 #[test]
 fn a_delegated_member_in_aterms_coalition_is_not_moved_again() {
     let f = facts(&delegated_in_aterm_1032(500));
@@ -344,8 +302,6 @@ fn a_delegated_member_in_aterms_coalition_is_not_moved_again() {
     assert_eq!(f.split.parts(Some(1)), parts(700, 200, 730, 2170, 0));
 }
 
-/// With the lane off the facts are the built split by subtraction, over the
-/// sweep's window, with the same parts.
 #[test]
 fn with_the_lane_off_the_split_is_the_built_one_by_subtraction() {
     for lane in [CoalLane::Unsupported, CoalLane::Off] {
@@ -389,9 +345,6 @@ fn with_the_lane_off_the_split_is_the_built_one_by_subtraction() {
     assert_eq!(CoalLane::On.word(), None);
 }
 
-/// A base older than a minute starts the next window and splits nothing; so
-/// does one over another count of cores. The reading that found it stale is
-/// the next window's base: a split tick 5 s after it has a window.
 #[test]
 fn a_base_older_than_a_minute_only_starts_the_next_window() {
     let next = |v: &mut Vitals, now: &Sample| {
@@ -418,8 +371,6 @@ fn a_base_older_than_a_minute_only_starts_the_next_window() {
     next(&mut v, &now);
 }
 
-/// By subtraction, aterm's own work is aterm's less its tabs', never below 0
-/// where the tabs' rounded figures pass aterm's.
 #[test]
 fn by_subtraction_aterms_own_work_is_never_below_zero() {
     let tab = |key: u64, cores: f32| {
@@ -441,13 +392,6 @@ fn by_subtraction_aterms_own_work_is_never_below_zero() {
     assert_eq!((s.aterm_mc, s.tabs.len(), s.own_mc), (300, 2, 0));
 }
 
-/// A footprint counts each compressed page at its full size, swapped out or
-/// not, so on a Mac under pressure the coalitions' sum passes physical
-/// memory: 19 GiB on a 16 GiB Mac keeps the lane on. A sum no such machine
-/// holds (a cycle count read from the footprint's slot) is a record the
-/// readers misread: the facts fall back to the split by subtraction and the
-/// lane is off for good, so the coalitions' lane event says so once, never
-/// again on the sane reads after it.
 #[test]
 fn a_footprint_no_memory_holds_turns_the_lane_off_for_good() {
     const GIB: u64 = 1 << 30;
@@ -486,7 +430,6 @@ fn a_footprint_no_memory_holds_turns_the_lane_off_for_good() {
     let busy = v.absorb(&now);
     assert_eq!(busy.why.as_ref().map(|f| f.lane), Some(CoalLane::On));
     assert_eq!(lane_events(&busy), 0, "the first facts seed the lane");
-    // Memory and swap together: 150 GiB is under 8 × 20 GiB.
     let edge = v.absorb(&later(&now, 1, 150 * GIB));
     assert_eq!(edge.why.as_ref().map(|f| f.lane), Some(CoalLane::On));
 
@@ -504,13 +447,6 @@ fn a_footprint_no_memory_holds_turns_the_lane_off_for_good() {
     assert_eq!(lane_events(&sane), 0, "no flapping");
 }
 
-/// The kernel numbers coalitions in order and never reuses an id, so only
-/// one listed above the base's newest was made inside the window. One the
-/// base did not read, one whose counter went back (a misread), and every new
-/// one after a base list that stopped short read 0 over the window, never a
-/// lifetime charged to one window: their work is the residual's, and the
-/// split is heuristic. So is one whose list or sweep stopped short at
-/// either end.
 #[test]
 fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     let drop_327 = facts_edited(&spotlight_1032(), |base, _| {
@@ -526,8 +462,6 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     );
     assert!(!drop_327.split.exact);
 
-    // The base's newest row unread, or every row: the list still says they
-    // were there, so none counts from 0.
     let drop_newest = facts_edited(&spotlight_1032(), |base, _| {
         if let Some(c) = base.coalitions.as_mut() {
             c.rows.retain(|r| r.id != 1342);
@@ -598,10 +532,6 @@ fn a_coalition_the_base_did_not_read_has_no_figure_over_the_window() {
     }
 }
 
-/// A tab's pid reused inside the window by a new process (a new kernel
-/// start) is not the process the base read; an unread start at either end
-/// cannot prove that identity either. The tab does not count it, and aterm's
-/// coalition, whose counter holds the work, keeps it in the rest.
 #[test]
 fn a_tab_pid_reused_inside_the_window_is_not_the_tabs_live_work() {
     let scene = spotlight_1032();
@@ -637,11 +567,6 @@ fn a_tab_pid_reused_inside_the_window_is_not_the_tabs_live_work() {
     }
 }
 
-/// The kernel lists the newest process first, so a coalition's first-swept
-/// member is seldom what settles its part: a later tab shell makes it
-/// aterm's, and a later process of the user's makes it others' though another
-/// user's helper was swept first. Pid 159, made after the pid space wrapped
-/// and swept first, never names aterm's coalition 1342 (RD §2.4).
 #[test]
 fn a_coalition_takes_its_part_from_every_member_in_the_kernels_order() {
     let late = 1_792_517_560_000;
@@ -660,10 +585,6 @@ fn a_coalition_takes_its_part_from_every_member_in_the_kernels_order() {
     assert_eq!(f.split.parts(Some(1)), parts(200, 200, 730, 2170, 0));
 }
 
-/// A lead read on an earlier tick keeps its identity while the same process
-/// is swept, though the host sent it only once: on a tick whose coalition
-/// answered nothing, whose lead's birth was not read, or that made no base;
-/// a new process under the pid (another birth) is not vouched for by it.
 #[test]
 fn a_lead_keeps_its_identity_while_the_same_process_leads() {
     let mut scene = spotlight_1032();
@@ -713,8 +634,6 @@ fn a_lead_keeps_its_identity_while_the_same_process_leads() {
     }
     mds(&v.absorb(&now).why.expect("a window's facts"));
 
-    // A sweep cut at its cap that missed the lead: it keeps its identity
-    // while it leads, for the next whole sweep that finds it.
     let mut v = Vitals::new();
     let [base, sweep, now] = scene.samples();
     let mut cut = now.clone();
@@ -741,8 +660,6 @@ fn a_lead_keeps_its_identity_while_the_same_process_leads() {
     let lead = row(&reborn, 307).lead.clone().expect("a lead");
     assert_eq!((lead.exe, lead.voucher), (None, Voucher::Unknown));
 
-    // A current failed identity read replaces a previous successful one,
-    // even when the pid and birth still match (a same-name exec can do so).
     let mut v = Vitals::new();
     let [base, sweep, now] = scene.samples();
     let mut unreadable = now.clone();
@@ -763,7 +680,6 @@ fn a_lead_keeps_its_identity_while_the_same_process_leads() {
     let recovered = later(&now, 5);
     mds(&v.absorb(&recovered).why.expect("a current identity"));
 
-    // Live members none of whose births were read: the part, and no name.
     let unborn = facts_edited(&scene, |base, now| {
         for p in [base, now]
             .into_iter()
@@ -777,7 +693,6 @@ fn a_lead_keeps_its_identity_while_the_same_process_leads() {
     assert_eq!((finder.part, finder.lead.as_ref()), (Part::Others, None));
 }
 
-/// A reading with no split tick carries the last facts.
 #[test]
 fn a_reading_between_split_ticks_carries_the_last_facts() {
     let mut v = Vitals::new();
@@ -794,10 +709,6 @@ fn a_reading_between_split_ticks_carries_the_last_facts() {
     assert!(Arc::ptr_eq(&facts, &carried));
 }
 
-/// A coalition is named by its earliest-born live member, never its lowest
-/// pid: pid 159, born at 12:16 after the pid space wrapped, never names
-/// aterm's coalition 1342, whose lead is aterm (pid 1187, born 10:31:55;
-/// RD §2.4). Ties go to the lower pid; pid 0 never leads.
 #[test]
 fn leads_are_the_earliest_born_never_the_lowest_pid() {
     let at = |h: i64, m: i64, s: i64| ((h * 60 + m) * 60 + s) * 1000;

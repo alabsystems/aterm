@@ -6,19 +6,13 @@
 
 use aterm_core::terminal::CursorStyle;
 
-// The per-frame snapshot types live in `aterm-core` so the engine can build them.
 pub use aterm_core::render::{
     CharFg, DecoBlend, DecoGlyph, FireHaloCell, FireMode, FirePatch, GlowBlend, GlowQuad, HaloMode,
     InkCell, RainHalo, RenderInput, SceneAtlas, SelectionClip, SpriteQuad, TrailCell,
     WordDecoration,
 };
 
-/// A row-major RGBA framebuffer packed as `0xTTRRGGBB`.
-///
-/// The top byte is *transmittance*, not alpha: `TT = 0` is opaque and
-/// `TT = 255` is fully transparent. Byte-oriented RGBA consumers therefore use
-/// `alpha = 255 - TT`; [`Frame::rgba_bytes`] and [`Frame::to_png`] perform that
-/// conversion.
+/// A row-major RGBA framebuffer packed as `0xTTRRGGBB` (`TT` is transmittance: `0` opaque, `255` transparent).
 #[derive(Clone, Debug)]
 pub struct Frame {
     pub width: usize,
@@ -41,8 +35,7 @@ impl Frame {
         out
     }
 
-    /// Encode the rendered screen as an RGBA PNG (`read_image`, ATERM_DESIGN §8): the
-    /// actual rendered pixels, not the engine's idea of the grid. Headless.
+    /// Encode the rendered screen as an RGBA PNG.
     #[must_use]
     pub fn to_png(&self) -> Vec<u8> {
         let mut out = Vec::new();
@@ -50,8 +43,6 @@ impl Frame {
             let mut enc = aterm_png::Encoder::new(&mut out, self.width as u32, self.height as u32);
             enc.set_color(aterm_png::ColorType::Rgba);
             enc.set_depth(aterm_png::BitDepth::Eight);
-            // Frame RGB is non-linear sRGB; the sRGB chunk says so, so wide-gamut
-            // viewers need not guess.
             enc.set_source_srgb(aterm_png::SrgbRenderingIntent::Perceptual);
             let mut w = enc.write_header().expect("png header");
             w.write_image_data(&self.rgba_bytes()).expect("png data");
@@ -60,21 +51,15 @@ impl Frame {
     }
 }
 
-/// A rendered frame's pixels, borrowed or owned: the return of
-/// [`Rasterizer::render_input_cached`]. Borrowing the renderer's cache leaves the
-/// frontend's surface copy as the only per-frame framebuffer copy; renderers with no
-/// borrowable cache (the GPU readback path) return `Owned`. The bytes match
-/// [`Rasterizer::render_input`] either way.
+/// A rendered frame's pixels, borrowed or owned, returned by [`Rasterizer::render_input_cached`].
 pub enum RenderView<'a> {
-    /// A borrow of the renderer's own framebuffer (no per-frame clone/alloc):
-    /// valid only until the renderer is next mutated.
+    /// A borrow of the renderer's own framebuffer, valid until the renderer is next mutated.
     Borrowed {
         width: usize,
         height: usize,
         pixels: &'a [u32],
     },
-    /// An owned frame (renderers without a borrowable cache, e.g. the GPU
-    /// readback path, and the default trait impl).
+    /// An owned frame.
     Owned(Frame),
 }
 
@@ -99,9 +84,7 @@ impl RenderView<'_> {
         }
     }
 
-    /// The packed `0xTTRRGGBB` pixels, row-major — borrowed in the `Borrowed`
-    /// case (no copy), borrowed from the owned `Frame` otherwise. `TT` is
-    /// transmittance (`0` opaque, `255` transparent), matching [`Frame`].
+    /// The packed `0xTTRRGGBB` pixels, row-major (`TT` is transmittance: `0` opaque, `255` transparent).
     #[must_use]
     #[inline]
     pub fn pixels(&self) -> &[u32] {
@@ -112,11 +95,7 @@ impl RenderView<'_> {
     }
 }
 
-/// The injected rasterizer interface, implemented by `aterm_render::Renderer` (CPU,
-/// headless) and `aterm_gpu::GpuRenderer`. A frontend depends on this trait, not on a
-/// concrete renderer. It never sees a `Terminal`: the engine produces the snapshot
-/// ([`aterm_core::terminal::Terminal::cell_frame_into`]) and a renderer consumes only
-/// [`RenderInput`].
+/// Rasterizer interface implemented by CPU (`aterm_render::Renderer`) and GPU (`aterm_gpu::GpuRenderer`) renderers.
 pub trait Rasterizer {
     /// Pixel size of one cell, `(width, height)`.
     fn cell_size(&self) -> (usize, usize);
@@ -124,24 +103,18 @@ pub trait Rasterizer {
     /// Render from a pre-extracted, owned snapshot — the lock-free frame path.
     fn render_input(&mut self, input: &RenderInput) -> Frame;
 
-    /// Render from a pre-extracted snapshot into a [`RenderView`], the per-frame
-    /// presentation path: a renderer with a persistent pixel cache (the CPU damage
-    /// cache) returns a borrow of it and skips the `Frame` clone. The default wraps
-    /// [`Self::render_input`]'s owned `Frame`; the bytes are identical either way.
+    /// Render from a pre-extracted snapshot into a borrowed or owned [`RenderView`].
     fn render_input_cached(&mut self, input: &RenderInput) -> RenderView<'_> {
         RenderView::Owned(self.render_input(input))
     }
 
-    /// Push the cursor blink phase (`on` = solid) into the renderer's own state;
-    /// applied at the next `render_input`. The frontend owns the blink clock.
+    /// Push the cursor blink phase (`on` = solid) into the renderer's state.
     fn set_cursor_blink_phase(&mut self, on: bool);
 
-    /// Override the rendered cursor style regardless of DECSCUSR (e.g.
-    /// `HollowBlock` while the window is unfocused); `None` clears the override.
+    /// Override the rendered cursor style regardless of DECSCUSR (`None` clears the override).
     fn set_cursor_style_override(&mut self, style: Option<CursorStyle>);
 }
 
-// The trait stays dyn-compatible: a frontend holds `Box<dyn Rasterizer>`.
 const _: Option<&dyn Rasterizer> = None;
 
 #[cfg(test)]

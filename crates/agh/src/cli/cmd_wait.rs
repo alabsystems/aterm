@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `agh release wait` (design §12): poll a release until every condition holds, with a
-//! heartbeat on stderr every 60 s of the client's clock.
+//! `agh release wait`: poll a release until every condition holds.
 
 use std::time::Duration;
 
@@ -16,19 +15,14 @@ use crate::wait::{
     Backoff, Condition, Poller, ReleaseCond, WaitEnd, WaitEvent, refuse_tag, release_condition,
 };
 
-/// A heartbeat field's value by the receipt's rule (`out::receipt_value`). The caller has
-/// redacted it.
 fn field(value: &str) -> String {
     let mut field = String::new();
     out::receipt_value(&mut field, value);
     field
 }
 
-/// A wait's bound when `--timeout` names none.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1800);
-/// How often a heartbeat is printed.
 const HEARTBEAT: Duration = Duration::from_secs(60);
-/// How long without an observation the wait is blind.
 const BLIND_LIMIT: Duration = Duration::from_secs(60);
 
 /// `agh release wait REPO TAG COND… [--include-drafts] [--timeout DUR]`.
@@ -38,11 +32,8 @@ const BLIND_LIMIT: Duration = Duration::from_secs(60);
 /// Usage for a bad condition; CouldNotRun when blind for 60 s; a condition's error when it can
 /// never hold. A timeout is the state on stdout and Pending (exit 8).
 pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
-    // Taken first: for a wait, --timeout bounds the whole wait, never each request.
     let timeout = ctx.timeout.take().unwrap_or(DEFAULT_TIMEOUT);
     if inv.global.no_probe {
-        // An unprobed 404 is NotVisible, which no later round can change, so every wait on a
-        // release that is not there yet would end at once (exit 7) instead of waiting.
         return Err(inv.usage(
             "release wait reads a 404 as no release only after the repository probe: drop \
              --no-probe",
@@ -54,8 +45,6 @@ pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let Some((tag, conds)) = rest.split_first() else {
         return Err(inv.usage("TAG is required"));
     };
-    // Usage before any request: no round could ever observe such a tag, so a wait would
-    // otherwise poll a path that never answers, or read its 404 as "no release".
     refuse_tag(tag, &slug)?;
     if conds.is_empty() {
         return Err(inv.usage("COND is required"));
@@ -86,8 +75,6 @@ pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     let fors = fors.join(",");
     let end = poller.run(&gh, &mut conditions, &mut |event| {
         if let WaitEvent::Heartbeat { elapsed, last } = event {
-            // `last` comes redacted and cut by the poller; each field is written by the
-            // receipt's rule, so no value can split a field or start a line of its own.
             let line = format!(
                 "agh: waiting verb=release.wait repo={} for={} elapsed={}s last={}",
                 field(&ctx.redactor.apply(&repo)),
@@ -133,8 +120,6 @@ pub(crate) fn release_wait(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
             Answer::FailedWith { value: last, error }
         }
         WaitEnd::Blind { last_error } => {
-            // Exit 3 (design §12), keeping what the last failure knew: its exchange, its
-            // identity, and any reset, Retry-After or rate snapshot it named.
             let mut error = Error::could_not_run(format!(
                 "no successful observation for {}s: {}",
                 BLIND_LIMIT.as_secs(),

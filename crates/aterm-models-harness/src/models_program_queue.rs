@@ -244,7 +244,6 @@ pub fn claude_footer_model_model() -> Model {
                     // The process's own statement, from the session it left.
                     if carry == 3 { 0 } else { runs }
                 } else if flag == 1 {
-                    // Buggy=1 after a clear: the flag stands in for a choice.
                     1
                 } else {
                     card

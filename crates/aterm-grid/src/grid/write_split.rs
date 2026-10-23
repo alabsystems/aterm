@@ -128,7 +128,7 @@ impl Grid {
         }
     }
 
-    /// Slow path for `advance_cursor_wrap`: handles DECDWL and DECLRMM margins.
+    /// Slow path for `advance_cursor_wrap`.
     #[inline(never)]
     fn advance_cursor_wrap_slow(&mut self) {
         let max_col = self.last_print_col(self.storage.cursor.row, self.storage.cursor.col);
@@ -408,9 +408,7 @@ impl Grid {
                         row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for i in 0..to_write {
                         let col = cursor_col + (i as u16) * 2;
-                        // SAFETY: (a) `col + 1 < end_col_run <= cells_len()`, checked above;
-                        // (b) `col = cursor_col + 2i` is a wide-cell boundary; (c) the writes are
-                        // sequential and disjoint, each covering `(col, col + 1)`.
+                        // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + i], colors, flags);
                         }
@@ -505,9 +503,7 @@ impl Grid {
                         row.fixup_wide_chars_in_range(cursor_col, (to_write as u16) * 2);
                     for j in 0..to_write {
                         let col = cursor_col + (j as u16) * 2;
-                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above;
-                        // (b) `col = cursor_col + 2j` is a wide-cell boundary; (c) the writes are
-                        // sequential and disjoint, each covering `(col, col + 1)`.
+                        // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, chars[pos + j], colors, flags);
                         }
@@ -614,9 +610,7 @@ impl Grid {
                         } else {
                             bmp_flags
                         };
-                        // SAFETY: (a) `col + 1 < end_col <= cells_len()`, checked above;
-                        // (b) `col = cursor_col + 2j` is a wide-cell boundary; (c) the writes are
-                        // sequential and disjoint, each covering `(col, col + 1)`.
+                        // SAFETY: `col + 1 < cells_len()` on a wide boundary; writes are disjoint.
                         unsafe {
                             row.write_wide_char_packed_no_fixup(col, c, bmp_colors, fl);
                         }
@@ -802,9 +796,6 @@ impl Grid {
 mod tests {
     use super::{Cell, CellFlags, Grid, PackedColors};
 
-    /// A wrap-tail blank that bisects the wide pair to its left gives the orphaned head and the
-    /// tail the BCE blank and its ring background, not a default colour or the dead glyph's
-    /// bytes.
     #[test]
     fn wide_wrap_tail_paints_the_bisected_orphan_with_the_bce_blank_and_its_ring() {
         let (rows, cols) = (3u16, 10u16);

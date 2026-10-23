@@ -6,8 +6,7 @@
 // src/platform_impl/unix.rs, and rewritten by the aterm project in 2026 over
 // the first-party AT-SPI publisher (aterm-a11y) for aterm's own event type.
 
-//! One real window's native accessibility adapter. Publisher callbacks only post
-//! typed events; the main loop owns the shared semantic tree and action routes.
+//! Native window accessibility adapter routing publisher callbacks to the main event loop.
 
 use aterm_a11y::model::{
     ActionHandler, ActionRequest, ActivationHandler, DeactivationHandler, TreeUpdate,
@@ -18,8 +17,7 @@ use aterm_window::window::{Window, WindowId};
 
 use crate::Wake;
 
-/// An accessibility event for the window `window_id`, delivered as
-/// [`Wake::Accessibility`].
+/// An accessibility event for `window_id`, delivered via [`Wake::Accessibility`].
 #[derive(Debug)]
 pub(crate) struct Event {
     pub(crate) window_id: WindowId,
@@ -36,7 +34,6 @@ pub(crate) enum WindowEvent {
     AccessibilityDeactivated,
 }
 
-/// The window's three handlers, each a post to the event loop.
 struct Handler {
     window_id: WindowId,
     proxy: EventLoopProxy<Wake>,
@@ -44,7 +41,6 @@ struct Handler {
 
 impl Handler {
     fn post(&self, window_event: WindowEvent) {
-        // A loop that has exited has no window left to tell.
         let _ = self.proxy.send_event(Wake::Accessibility(Event {
             window_id: self.window_id,
             window_event,

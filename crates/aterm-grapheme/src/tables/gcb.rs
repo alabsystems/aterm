@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//
-// Derived from the Unicode 16.0.0 Character Database on 2026-04-19 by `aterm build rust`, a
-// generator this repository never carried; maintained by hand since, so edit it here.
 
 //! Grapheme Break Property tables and break decision matrix.
-//!
-//! Implements UAX #29 extended grapheme cluster segmentation.
 
 /// Grapheme_Cluster_Break property values (UAX #29).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,8 +171,6 @@ static GCB_LEVEL1: [u16; 4352] = [
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
 ];
 
-/// Level 2: 106 unique blocks, 256 entries each, packed 2 per byte.
-/// Total: 13568 bytes (13.2 KB)
 static GCB_LEVEL2: [u8; 13568] = [
     // Block 0
     0x33, 0x33, 0x33, 0x33, 0x33, 0x32, 0x13, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33, 0x33,
@@ -1146,15 +1139,10 @@ pub(crate) fn gcb_class(c: char) -> GCB {
     if cp >= 0x110000 {
         return GCB::Other;
     }
-    // `get(..).unwrap_or(0)`: indices are in range for every valid `char` (cp <
-    // 0x110000 is guarded above), and 0 maps to GCB::Other, the match's own
-    // fallback, so the verifier needs no table-length bounds proof.
     let block_idx = GCB_LEVEL1.get((cp >> 8) as usize).copied().unwrap_or(0) as usize;
     let offset = (cp & 0xFF) as usize;
     let byte_idx = block_idx * 128 + offset / 2;
     let byte = GCB_LEVEL2.get(byte_idx).copied().unwrap_or(0);
-    // Constant shift amounts, so rustc emits no runtime shift-overflow assert
-    // (a panic boundary the verifier cannot model for `>> shift`).
     let raw = if offset % 2 == 0 {
         byte & 0x0F
     } else {
@@ -1182,85 +1170,62 @@ pub(crate) fn gcb_class(c: char) -> GCB {
     }
 }
 
-/// Grapheme cluster break decision table: BREAK[prev][next].
-///
-/// `true` = break between prev and next (start new cluster).
-/// `false` = no break (continue current cluster).
-///
-/// Note: GB11 (ZWJ+ExtPict) and GB12/13 (RI pairs) require stateful
-/// lookahead; the iterator implementation adds state bits on top of this table.
+/// Grapheme cluster break decision table (`BREAK[prev][next]`).
 pub(crate) static GRAPHEME_BREAK: [[bool; 15]; 15] = [
-    /*                    Other */
     [
         true, true, true, true, false, false, true, true, false, true, true, true, true, true, true,
     ],
-    /*                       CR */
     [
         true, true, false, true, true, true, true, true, true, true, true, true, true, true, true,
     ],
-    /*                       LF */
     [
         true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
     ],
-    /*                  Control */
     [
         true, true, true, true, true, true, true, true, true, true, true, true, true, true, true,
     ],
-    /*                   Extend */
     [
         true, true, true, true, false, false, true, true, false, true, true, true, true, true, true,
     ],
-    /*                      ZWJ */
     [
         true, true, true, true, false, false, true, true, false, true, true, true, true, true,
         false,
     ],
-    /*       Regional_Indicator */
     [
         true, true, true, true, false, false, false, true, false, true, true, true, true, true,
         true,
     ],
-    /*                  Prepend */
     [
         false, true, true, true, false, false, false, false, false, false, false, false, false,
         false, false,
     ],
-    /*              SpacingMark */
     [
         true, true, true, true, false, false, true, true, false, true, true, true, true, true, true,
     ],
-    /*                        L */
     [
         true, true, true, true, false, false, true, true, false, false, false, true, false, false,
         true,
     ],
-    /*                        V */
     [
         true, true, true, true, false, false, true, true, false, true, false, false, true, true,
         true,
     ],
-    /*                        T */
     [
         true, true, true, true, false, false, true, true, false, true, true, false, true, true,
         true,
     ],
-    /*                       LV */
     [
         true, true, true, true, false, false, true, true, false, true, false, false, true, true,
         true,
     ],
-    /*                      LVT */
     [
         true, true, true, true, false, false, true, true, false, true, true, false, true, true,
         true,
     ],
-    /*    Extended_Pictographic */
     [
         true, true, true, true, false, false, true, true, false, true, true, true, true, true, true,
     ],
 ];
-
-// Indic Conjunct Break (InCB) property -- used only by UAX #29 GB9c.
 
 /// InCB property values. `None` (default) is represented by absence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1272,7 +1237,6 @@ pub(crate) enum InCB {
     Consonant = 3,
 }
 
-/// InCB ranges: (start_inclusive, end_inclusive, value). 403 entries.
 static INCB_RANGES: [(u32, u32, u8); 403] = [
     (0x000300, 0x00036F, 1), // Extend
     (0x000483, 0x000489, 1), // Extend
@@ -1680,13 +1644,9 @@ static INCB_RANGES: [(u32, u32, u8); 403] = [
 ];
 
 /// Look up the Indic_Conjunct_Break property for a codepoint.
-///
-/// Returns `InCB::None` for codepoints without an assigned InCB class.
 #[inline]
 pub(crate) fn incb_class(c: char) -> InCB {
     let cp = c as u32;
-    // Early-out: INCB_RANGES spans [0x0300, 0xE01EF], so anything outside gives
-    // InCB::None without the binary search (the common ASCII/Latin case).
     if !(0x0300..=0xE01EF).contains(&cp) {
         return InCB::None;
     }
@@ -1699,9 +1659,6 @@ pub(crate) fn incb_class(c: char) -> InCB {
             core::cmp::Ordering::Equal
         }
     }) {
-        // `get(..).map_or(0, ..)`: binary_search's Ok(idx) is always in range,
-        // but that contract is invisible to the verifier; 0 maps to InCB::None —
-        // the same fallback the match already uses — so behavior is identical.
         Ok(idx) => match INCB_RANGES.get(idx).map_or(0, |r| r.2) {
             1 => InCB::Extend,
             2 => InCB::Linker,

@@ -105,6 +105,9 @@ pub mod stdout;
 pub mod sudo;
 /// A Cargo test binary's own per-user root, under which [`control_socket_dir`] and `aterm_types::dirs` answer in a test, so no test reaches the person's live socket, state, logs or config.
 pub mod test_binary;
+/// A zone's offset from UTC at an instant, read in this process: the local clock's by
+/// `localtime_r`, a named zone's from its TZif file, never `date +%z`. See [`zone`].
+pub mod zone;
 
 /// The per-user directory holding aterm's control socket and token, resolved identically for the server and every client.
 #[must_use]

@@ -71,7 +71,6 @@ fn world(label: &str) -> World {
     put_exe(&seal.join("bin/trustdoc"), &native("trustdoc"));
     std::fs::hard_link(seal.join("bin/trustdoc"), seal.join("bin/rustdoc")).expect("rustdoc");
     put_exe(&seal.join("bin/cargo"), &native("cargo"));
-    // Every tool the bundle shims is in its bin/, as a publishable seal's are.
     for tool in TRUST_EXPOSES {
         let bin = seal.join("bin").join(tool);
         if !bin.exists() {
@@ -81,8 +80,6 @@ fn world(label: &str) -> World {
     std::fs::create_dir_all(seal.join("libexec")).expect("libexec");
     let src = root.join("trust-src");
     fixture_checkout(&src, &[("README", b"trust\n")]);
-    // The pack reads the checkout's state with its own git, which reads this machine's
-    // global config: a person's global ignore file would hide the file that makes it dirty.
     git(&src, &["config", "core.excludesFile", "/dev/null"]);
     World {
         _tmp: tmp,
@@ -197,7 +194,6 @@ fn a_trust_bundle_ships_its_frozen_closure_and_one_inode_per_alias() {
             .is_symlink(),
         "the seal itself is never written"
     );
-    // Admission before anything is staged; relocation after the closure.
     let log = t.log();
     let first_vv = log
         .iter()
@@ -213,10 +209,6 @@ fn a_trust_bundle_ships_its_frozen_closure_and_one_inode_per_alias() {
 #[test]
 fn relative_output_paths_keep_the_staged_toolchain_reachable_from_the_hello_crate() {
     let w = world("bundle-relative-out");
-    // A path relative to this process's folder that reaches a private scratch
-    // folder (`..` up to the root, then the scratch's whole path): relative, as the
-    // packer must take it, and outside the checkout, which the Linux lane mounts
-    // read-only (a scratch made in "." was refused there).
     let scratch = aterm_tempfile::Builder::new()
         .prefix(".atpkg-relative-out-")
         .tempdir()
@@ -260,8 +252,6 @@ fn relative_output_paths_keep_the_staged_toolchain_reachable_from_the_hello_crat
         let mut t = tools();
         t.answer = Box::new(|run| {
             run.cwd.as_ref().map(|cwd| {
-                // Match child-process path resolution after its cwd changes: the
-                // staged tippy and its PATH must still name the actual toolchain.
                 let reachable = cwd.join(&run.program).is_file()
                     && run
                         .env_of("HOME")
@@ -484,7 +474,6 @@ fn the_one_compiler_step_links_a_copy_or_a_resigned_twin_and_refuses_two_program
         "not linked anyway"
     );
 
-    // The published shape: one program, each copy signed under its own name.
     let mut twins = tools();
     twins.same_unsigned = true;
     let signed = tree("signed", Some(b"one compiler\n signature rustc-uuid"));
@@ -830,7 +819,6 @@ fn trust_mc_proves_its_hello_against_the_trust_sysroot_its_compiler_came_from() 
     assert_eq!(compile.argv()[1], hs.display().to_string());
     assert_eq!(out.exposes, ["trust-mc-driver"]);
 
-    // Another commit than the packed compiler's: the hello would prove nothing.
     let t = FakeTools::new(SEAL_TRIPLE);
     t.version(
         &req.sysroot.join("bin/trust-mc-compiler"),
@@ -839,7 +827,6 @@ fn trust_mc_proves_its_hello_against_the_trust_sysroot_its_compiler_came_from() 
     let err = bundle::pack_bundle_with(&w.ctx, &req, &t).expect_err("another commit");
     assert!(err.to_string().contains("built from"), "{err}");
 
-    // A rustup toolchain is no hello sysroot.
     let rustup = w
         .root
         .join("fake/.rustup/toolchains/nightly-aarch64-unknown-linux-gnu");
@@ -853,7 +840,7 @@ fn trust_mc_proves_its_hello_against_the_trust_sysroot_its_compiler_came_from() 
 }
 
 /// A hello sysroot that is a store build is leased beside the packed sysroot for as long
-/// as the pack lives (A16): the hello runs its compiler, and gc must not reclaim it then.
+/// as the pack lives: the hello runs its compiler, and gc must not reclaim it then.
 #[test]
 fn a_store_built_hello_sysroot_is_leased_while_the_pack_lives() {
     let w = world("bundle-hello-lease");
@@ -882,7 +869,6 @@ fn a_store_built_hello_sysroot_that_cannot_be_leased_refuses_the_pack() {
     fixture_toolchain(&hs);
     std::fs::create_dir_all(hs.join("lib/rustlib")).expect("mkdir");
     req.hello.sysroot = Some(hs);
-    // The lease directory is a file, so no lease can be laid there.
     std::fs::write(w.ctx.pkg_prefix.join(atpkg::lease::DIR), b"").expect("plant");
     let tools = FakeTools::new(SEAL_TRIPLE);
     let Err(err) = bundle::admit(&w.ctx, &req, &tools) else {
@@ -948,7 +934,6 @@ fn skipping_trust_mcs_hello_keeps_its_admission_sysroot_in_either_flag_order() {
                 .any(|run| run.program == hs.join("bin/trustc"))
         );
 
-        // Disabling an execution probe never waives the compiler identity bind.
         t.version(
             &req.sysroot.join("bin/trust-mc-compiler"),
             &version_text("9999999999999999999999999999999999999999", SEAL_TRIPLE),

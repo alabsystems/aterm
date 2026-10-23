@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! TOML: table headers, keys, strings (multi-line ones open across lines),
-//! numbers and dates, booleans, comments and punctuation.
-//!
-//! A key is read where TOML puts one: at the start of a line outside any
-//! array, and after `{` or `,` inside an inline table. So the
-//! [`LexState`] carries the bracket nesting and, per depth, whether the
-//! bracket is an inline table's `{` or an array's `[`: the strings on the
-//! lines of a multi-line array are values, not keys.
+//! TOML syntax highlighter ([`LexState`]).
 
 use super::{Cursor, LexState, Mode, Spans, SyntaxClass, line_space};
 
@@ -23,8 +16,6 @@ pub(super) fn lex(state: LexState, line: &str, out: &mut Spans) -> LexState {
         Mode::Literal => multiline(&mut cur, 0, b'\'', out),
         _ => Mode::Code,
     };
-    // A line that finishes a string continues a value; any other line starts
-    // with a key, or a table header, unless it is inside an array.
     let mut expect_key = state.mode == Mode::Code && nesting.depth == 0;
     let mut line_start = expect_key;
     while mode == Mode::Code {
@@ -144,8 +135,7 @@ pub(super) fn lex(state: LexState, line: &str, out: &mut Spans) -> LexState {
     }
 }
 
-/// A table header, `[a.b]` or `[[a]]`, through its closing bracket; a quoted
-/// key inside it may hold a `]`.
+/// A table header, `[a.b]` or `[[a]]`, through its closing bracket.
 fn header(cur: &mut Cursor<'_>, out: &mut Spans) {
     let start = cur.pos();
     cur.bump();
@@ -166,8 +156,7 @@ fn header(cur: &mut Cursor<'_>, out: &mut Spans) {
     out.push(start, cur.pos(), SyntaxClass::Heading);
 }
 
-/// The rest of a one-line string after its opening `quote`: `"` takes
-/// escapes, `'` does not. An unclosed one ends with the line.
+/// The rest of a one-line string after its opening `quote`.
 fn single_line(cur: &mut Cursor<'_>, quote: u8) {
     while let Some(byte) = cur.peek() {
         cur.bump();
@@ -180,14 +169,12 @@ fn single_line(cur: &mut Cursor<'_>, quote: u8) {
     }
 }
 
-/// The rest of a `"""` or `'''` string from `start`, which may close on this
-/// line or carry on to the next.
+/// The rest of a `"""` or `'''` string from `start`.
 fn multiline(cur: &mut Cursor<'_>, start: usize, quote: u8, out: &mut Spans) -> Mode {
     let close: &[u8] = if quote == b'"' { b"\"\"\"" } else { b"'''" };
     while !cur.done() {
         if cur.looking_at(close) {
             cur.bump_n(3);
-            // Up to two more quotes belong to the string (`""""x"""""`).
             for _ in 0..2 {
                 cur.eat(quote);
             }
@@ -208,8 +195,7 @@ fn multiline(cur: &mut Cursor<'_>, start: usize, quote: u8, out: &mut Spans) -> 
     }
 }
 
-/// The open brackets: how deep, and which of them (one bit per depth below
-/// 32) are inline tables.
+/// The open brackets.
 struct Nesting {
     depth: u16,
     tables: u32,
@@ -247,9 +233,7 @@ impl Nesting {
 }
 
 trust_contract_fn! {
-    /// Whether `byte` belongs to a bare value: a number, a date or time, a
-    /// boolean (`-1_000`, `0x1F`, `6.02e+23`, `1979-05-27T07:32:00Z`,
-    /// `true`): an ASCII letter or digit, `_`, `+`, `-`, `.` or `:`.
+    /// Whether `byte` belongs to a bare value.
     #[expect(
         clippy::manual_range_contains,
         reason = "the comparisons are the clause the Clean theorem restates; `RangeInclusive::contains` is a call, which E6 refuses"
@@ -269,8 +253,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `toml-value-byte-set` (SPECS.md), kernel-checked against the compiled
-// body: the set is the clause, byte for byte.
 verify_island! {
     clean {
         theorem value_byte_is_exactly_the_value_set (byte : UInt8) :
@@ -285,8 +267,7 @@ verify_island! {
 }
 
 trust_contract_fn! {
-    /// Whether `byte` may appear in a bare TOML key: an ASCII letter or
-    /// digit, `_` or `-`. A quoted key may hold anything else.
+    /// Whether `byte` may appear in a bare TOML key.
     #[expect(
         clippy::manual_range_contains,
         reason = "the comparisons are the clause the Clean theorem restates; `RangeInclusive::contains` is a call, which E6 refuses"
@@ -304,8 +285,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `toml-bare-key-byte-set` (SPECS.md), kernel-checked against the
-// compiled body: the set is the clause, byte for byte.
 verify_island! {
     clean {
         theorem bare_key_byte_is_exactly_the_key_set (byte : UInt8) :

@@ -1,12 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
-//
-// The CFF adapters below are derived from read-fonts 0.43.2 src/ps/cs.rs
-// (`TransformSink`'s unscaled path, `NopFilterSink`) and skrifa 0.46.2
 // src/outline/mod.rs (`OutlineGlyphCollection`, `draw_unscaled`), Copyright
-// (c) 2019 Fontations Developers, MIT OR Apache-2.0 (see
-// ../../LICENSE-FONTATIONS), modified by the aterm project in 2026. The rest
-// of this file is aterm's.
+//
+// Fontations Developers, MIT OR Apache-2.0 (see ../../LICENSE-FONTATIONS), modified by aterm.
 
 //! The face as the hinter reads it: skrifa's outline collection and font attributes.
 
@@ -196,7 +192,6 @@ impl<'a> HintFont<'a> {
     }
 }
 
-/// 1/64 in 16.16 (read-fonts' `ONE_OVER_64`).
 const ONE_OVER_64: Fixed = Fixed::from_bits(0x400);
 
 #[derive(Copy, Clone)]
@@ -215,10 +210,6 @@ impl PendingElement {
     }
 }
 
-/// A CFF outline as FreeType loads it unscaled: each 16.16 coordinate taken
-/// to 1/64 and truncated to a font unit (read-fonts' `TransformSink`
-/// without a scale or `FontMatrix`), then degenerate moves and zero-length
-/// lines dropped (its `NopFilterSink`), into the hinter's point adapter.
 struct CffUnscaled<'a, 'b, T> {
     is_open: bool,
     start: Option<[i32; 2]>,
@@ -236,8 +227,6 @@ impl<'a, 'b, T: UnscaledOutlineSink> CffUnscaled<'a, 'b, T> {
         }
     }
 
-    /// FreeType's unscaled CFF coordinate: times 1/64 (rounded), then the
-    /// low 10 bits truncated, leaving whole font units.
     fn unit(v: f32) -> i32 {
         let fixed = Fixed::from_f64(f64::from(v));
         (fixed * ONE_OVER_64).to_bits() >> 10

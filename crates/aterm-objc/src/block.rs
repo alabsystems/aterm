@@ -2,60 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The Objective-C block ABI, over `_NSConcreteStackBlock`.
-//!
-//! # Alignment
-//!
-//! `malloc` promises only 16-byte alignment, so each constructor refuses an
-//! over-aligned closure at compile time:
-//!
-//! ```compile_fail
-//! #[repr(align(32))]
-//! struct Overaligned([u8; 32]);
-//! let capture = Overaligned([7; 32]);
-//! // SAFETY: the block is never invoked; the `const` assertion inside the
-//! // constructor rejects this before any of it is reachable.
-//! let _ = unsafe { aterm_objc::RcBlock::new0(move || { let _ = &capture; }) };
-//! ```
-//!
-//! A pointer-sized capture is fine:
-//!
-//! ```
-//! let capture = std::rc::Rc::new(7_i32);
-//! // SAFETY: the closure takes no arguments and returns `()`, which is the
-//! // prototype `new0` builds; it is never invoked here.
-//! let block = unsafe { aterm_objc::RcBlock::new0(move || { let _ = &capture; }) };
-//! assert!(block.is_some());
-//! ```
-//!
-//! # Arguments and return state their ABI
-//!
-//! A block's `invoke` is an ABI boundary like a send, so `RcBlock::newN`
-//! requires [`crate::Encode`] on each argument and the return type. An ObjC
-//! `BOOL` out-parameter spelled as a Rust `bool` pointer is refused:
-//!
-//! ```compile_fail
-//! # use aterm_objc::{Id, RcBlock};
-//! // `-[NSString enumerateLinesUsingBlock:]` takes `void (^)(NSString *, BOOL *)`.
-//! // On the x86_64 compat slice `BOOL` is `signed char`, so materialising the
-//! // byte the framework writes as a Rust `bool` is undefined behaviour.
-//! let _ = unsafe { RcBlock::new2(|_line: Id, _stop: *mut bool| {}) };
-//! ```
-//!
-//! So is a bare array return, whose x86-64 classification is unstated:
-//!
-//! ```compile_fail
-//! # use aterm_objc::RcBlock;
-//! let _ = unsafe { RcBlock::new0(|| [0_u8; 24]) };
-//! ```
-//!
-//! The `BOOL *` spelling that compiles is `*mut Bool` (encoded `^B` on arm64,
-//! `^c` on x86_64; see [`crate::encode`]):
-//!
-//! ```
-//! # use aterm_objc::{Bool, Id, RcBlock};
-//! let block = unsafe { RcBlock::new2(|_line: Id, _stop: *mut Bool| {}) };
-//! assert!(block.is_some());
-//! ```
 
 use std::ffi::c_void;
 use std::marker::PhantomData;
@@ -137,9 +83,7 @@ impl BlockPtr {
         }
     }
 
-    /// The block's `invoke` slot as `F`, or `None` for a nil block. `"C-unwind"`
-    /// for the reason every send is: a raise inside the framework's block
-    /// unwinds through this frame to the caller's containment.
+    /// The block's `invoke` slot as `F`, or `None` for a nil block.
     ///
     /// # Safety
     ///
@@ -222,8 +166,6 @@ macro_rules! block_ctor {
     ) => {
         impl RcBlock {
             $(#[$m])*
-            ///
-            ///
             /// # Safety
             /// The argument and return types must be exactly what the framework calls the block with.
             #[must_use]
@@ -332,7 +274,7 @@ block_ctor! {
     new2, invoke2, a0: A0, a1: A1
 }
 
-/// A BLOCK'S C PROTOTYPE, NAMED.
+/// A block's C prototype, named.
 pub trait BlockFn: Copy {
     type Args;
     type Ret;

@@ -1,25 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Count tests for the many-tab / many-session paths and the subscribe idle
-//! wake.
-//!
-//! Each test reads a `crate::work_counts` counter placed at the work site (N
-//! tabs x M panes staged through `push_stub_tab` + `split_active_stub_tab`; the
-//! digest through `DigestFixture`). Each also shows its counter moving on a
-//! control, so a zero is never a counter nobody increments.
+//! Count tests for the many-tab / many-session paths and the subscribe idle wake.
 
 use super::*;
 use crate::work_counts;
 use std::time::{Duration, Instant};
 
-/// The PTY reader's batch cadence under a flood — the rate the `Wake::Output`
-/// gates run at.
+/// The PTY reader's batch cadence under a flood — the rate the `Wake::Output` gates run at.
 const BURST_DT: Duration = Duration::from_micros(333);
 
-/// Window 0 split to `panes` panes,
-/// then `tabs - 1` more tabs appended, each split as it becomes active. Leaves
-/// the last tab active.
+/// Window 0 split to `panes` panes, then `tabs - 1` more tabs appended, each split as it becomes active.
 fn workspace(tabs: usize, panes: usize) -> App {
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
@@ -48,9 +39,7 @@ fn set_grid(app: &mut App, rows: u16, cols: u16) {
     ws.cols = cols;
 }
 
-/// The live-drag tick (`resize_panes_scoped(wid, true)`, run by `redraw_window`
-/// on every presented frame while `panes_stale` stands) lays out the active tab
-/// only.
+/// The live-drag tick (`resize_panes_scoped(wid, true)`) lays out the active tab only.
 #[test]
 fn a_live_drag_tick_lays_out_only_the_active_tab() {
     const TABS: usize = 8;
@@ -59,7 +48,6 @@ fn a_live_drag_tick_lays_out_only_the_active_tab() {
     app.resize_panes_scoped(wid, false);
     let _ = work_counts::take_plans_built();
 
-    // Control: an AllTabs settle lays out every tab — the counter counts.
     set_grid(&mut app, 30, 100);
     app.resize_panes_scoped(wid, false);
     assert_eq!(
@@ -68,7 +56,6 @@ fn a_live_drag_tick_lays_out_only_the_active_tab() {
         "a settle plans every tab"
     );
 
-    // The drag: a new grid, active-only ticks. One plan per tick.
     set_grid(&mut app, 32, 120);
     for _ in 0..16 {
         app.resize_panes_scoped(wid, true);
@@ -85,8 +72,7 @@ fn a_live_drag_tick_lays_out_only_the_active_tab() {
     );
 }
 
-/// A successful present's latency walk touches the visible panes' stamps only
-/// — O(active tab), never O(tabs x panes).
+/// A successful present's latency walk touches the visible panes' stamps only.
 #[test]
 fn the_present_walk_touches_only_the_visible_panes_stamps() {
     const PANES: usize = 4;
@@ -116,7 +102,6 @@ fn the_present_walk_touches_only_the_visible_panes_stamps() {
         8 * PANES,
         "a steady present touches exactly the visible panes' stamps"
     );
-    // One plan per present is built for the active tab only.
     assert_eq!(
         work_counts::take_plans_built(),
         8,
@@ -124,8 +109,7 @@ fn the_present_walk_touches_only_the_visible_panes_stamps() {
     );
 }
 
-/// Inside the observation interval the status sweep probes no session — the
-/// O(1) deadline gate answers before the pool fold.
+/// Inside the observation interval the status sweep probes no session.
 #[test]
 fn a_rate_limited_status_sweep_probes_no_session() {
     const SESSIONS: usize = 30;
@@ -160,8 +144,7 @@ fn a_rate_limited_status_sweep_probes_no_session() {
     );
 }
 
-/// In the steady state the title-drift gate is decided by the labeling window's
-/// epoch cache and walks no tab.
+/// In the steady state the title-drift gate is decided by the labeling window's epoch cache and walks no tab.
 #[test]
 fn a_steady_title_gate_walks_no_tab() {
     const TABS: usize = 30;
@@ -185,8 +168,6 @@ fn a_steady_title_gate_walks_no_tab() {
         "a steady flood must not walk the tab list"
     );
 
-    // Control: a window whose cache does not cover the session (it started
-    // labeling it after the last flush) walks the list to find out.
     app.windows
         .get_mut(&wid)
         .expect("fixture window")
@@ -201,10 +182,7 @@ fn a_steady_title_gate_walks_no_tab() {
     );
 }
 
-/// The subscribe idle wake: an `events` digest whose ledgers are saturated
-/// (1000 shell blocks, 512 turn records, and a timeline view whose log has
-/// evicted rows, per target) touches no retained record on a wake where
-/// nothing happened.
+/// An idle `events` digest wake with saturated ledgers touches no retained record.
 #[test]
 fn an_idle_events_wake_touches_no_retained_record() {
     use crate::subscribe::digest_fixture::DigestFixture;
@@ -230,8 +208,6 @@ fn an_idle_events_wake_touches_no_retained_record() {
         "an idle wake must not touch the retained ledgers"
     );
 
-    // Control: one real turn per target — the wake emits, and reaches the
-    // ledger by a seek (O(log n + new)), never a walk.
     f.land_turn();
     assert!(f.wake(true) > 0, "a wake after a real append emits");
     let touched = work_counts::take_retained_records_touched();
@@ -242,7 +218,6 @@ fn an_idle_events_wake_touches_no_retained_record() {
          {per_target_bound} per target)"
     );
 
-    // Control: one new timeline row per target, read from the view's newest row down.
     f.land_row();
     assert!(f.wake(true) > 0, "a wake after a new row emits");
     let touched = work_counts::take_retained_records_touched();
@@ -252,9 +227,7 @@ fn an_idle_events_wake_touches_no_retained_record() {
     );
 }
 
-/// A headless window drawn through the real redraw path: a scripted CPU
-/// surface takes the present (`crate::present::scripted`), so every frame
-/// below is `App::redraw_window` end to end, glass included.
+/// A headless window drawn through the real redraw path on a scripted CPU surface.
 #[cfg(debug_assertions)]
 fn presented_window() -> (App, WindowId, u64) {
     let mut app = App::headless_for_test();
@@ -282,8 +255,7 @@ fn presents(app: &App, wid: WindowId) -> usize {
     }
 }
 
-/// Cell geometries the renderer derived over `frames` presented frames of
-/// `wid`, each after `before` runs (a key's echo, or nothing).
+/// Cell geometries the renderer derived over `frames` presented frames of `wid`.
 #[cfg(debug_assertions)]
 fn derivations_over(
     app: &mut App,
@@ -299,24 +271,7 @@ fn derivations_over(
     work_counts::take_cell_geometry_derivations()
 }
 
-/// The cell box is derived once per change, never per frame: the window's
-/// cell size (`App::win_cell_size`, asked by the frame's layout, the cursor,
-/// the band, the cell-pixel sync and the composer's caret) is read
-/// from what the renderer kept for the window's px, so a frame at rest and a
-/// keystroke's frame derive nothing. Each derivation reads the face's
-/// metrics, and the macOS default primary (SF Mono, instantiated) parses
-/// the face for them.
-///
-/// Every real input of it derives exactly once and is then kept: a window
-/// whose scale changed (a move to another display, `on_scale_factor_changed`
-/// re-resolving its `MetricsView`), a config reload of the baseline (pushed
-/// onto the live renderer, which forgets), one that moves the cell box
-/// (`line_height`, a rebuild), and a font zoom (a new renderer at the new
-/// px). Each reads the new geometry (it is what the face derives now), never
-/// a kept one.
-///
-/// Negative controls: each change's first frame derives (the counter counts
-/// the frame's asks), and its answer is the new geometry.
+/// The cell box is derived once per change, never per frame.
 #[cfg(debug_assertions)]
 #[test]
 fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
@@ -336,9 +291,6 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
     });
     assert_eq!(keys, 0, "keystroke frames derive no cell box");
 
-    // Scale change: the window's metric record re-resolved at 2x (what
-    // `on_scale_factor_changed` does for an attached window). Its first frame
-    // derives the new px once; the frames after keep it.
     let px = app.windows[&wid].metrics.font_px;
     let before = app.win_cell_size(wid);
     app.windows
@@ -363,7 +315,6 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
         0,
         "kept at 2x"
     );
-    // Back on the first display: still kept, nothing derived.
     app.windows
         .get_mut(&wid)
         .expect("fixture window")
@@ -376,10 +327,6 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
     );
     assert_eq!(app.win_cell_size(wid), before, "the first display's box");
 
-    // Config reload of the baseline escape hatch (`adjust_baseline`),
-    // through the real admission path: a live push onto the renderer
-    // (`apply_render_knob`), no rebuild, so the renderer itself forgets what
-    // it kept. The reload and its first frame derive once between them.
     let scratch = aterm_tempfile::Builder::new()
         .prefix("aterm-cell-box-reload")
         .tempdir()
@@ -405,8 +352,6 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
         "kept after the baseline's reload"
     );
 
-    // Config reload that moves the cell box (`line_height`), through the
-    // real admission path: a rebuild, whose new renderer has kept nothing.
     apply_config_text(&mut app, dir, "line_height = 1.5\n");
     let _ = work_counts::take_cell_geometry_derivations();
     app.redraw_window(wid);
@@ -428,10 +373,6 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
         "kept after the reload"
     );
 
-    // Font zoom: the zoom's own transaction asks the outgoing renderer at
-    // the new px (`refresh_all_window_metrics` syncing the cell pixel size)
-    // before the rebuild replaces it, and the new renderer, which has kept
-    // nothing, derives on its first frame: once per renderer, then kept.
     let _ = work_counts::take_cell_geometry_derivations();
     app.set_font_size(app.font_size + 4.0);
     app.redraw_window(wid);
@@ -457,8 +398,7 @@ fn a_frame_derives_the_cell_box_only_when_an_input_changed() {
     );
 }
 
-/// Apply `text` as `aterm.toml` through the real admission path (the
-/// prepared generation a config watcher hands the App).
+/// Apply `text` as `aterm.toml` through the real admission path.
 #[cfg(debug_assertions)]
 fn apply_config_text(app: &mut App, dir: &std::path::Path, text: &str) {
     let path = dir.join("aterm.toml");

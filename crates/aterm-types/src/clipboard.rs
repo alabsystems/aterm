@@ -5,7 +5,6 @@
 //! Clipboard types for OSC 52.
 
 /// Clipboard selection target for OSC 52, one per character of the selection parameter.
-/// Most terminals support only 'c' and 'p'; every target named is set to the same content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClipboardSelection {
     /// System clipboard ('c')
@@ -25,8 +24,6 @@ impl ClipboardSelection {
     #[inline]
     #[must_use]
     pub const fn from_char(c: char) -> Option<Self> {
-        // Explicit digit arms, not `c as u8 - b'0'`: the Trust model checker refutes the
-        // guarded subtraction.
         match c {
             'c' => Some(ClipboardSelection::Clipboard),
             'p' => Some(ClipboardSelection::Primary),
@@ -54,8 +51,6 @@ impl ClipboardSelection {
             ClipboardSelection::Secondary => 'q',
             ClipboardSelection::Select => 's',
             ClipboardSelection::CutBuffer(n) => {
-                // Clamp by branch and a saturating add that cannot saturate: no panic path
-                // for the Trust model checker to refute.
                 let n = if n < 8 { n } else { 7 };
                 b'0'.saturating_add(n) as char
             }

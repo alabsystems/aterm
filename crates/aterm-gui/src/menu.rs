@@ -2,9 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Native macOS application menu bar (`NSApp.mainMenu`).
-//!
-//! [`install`] attaches the menu bar on the first OS window and routes item selections through
-//! [`Wake::MenuAction`](crate::Wake) with a [`MenuAction`].
 
 /// Pure arbitration behind AppKit's synchronous `applicationShouldTerminate:`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 /// Path to Apple's OpenSSH client.
-pub const SSH: &str = "/usr/bin/ssh";
+pub const SSH: &str = aterm_uds::os_path!("ssh");
 
 /// Controller report row when Local Network privacy may block LAN access.
 pub const LOCAL_NETWORK_ROW: &str = "controller: aterm has no Local Network access — System \

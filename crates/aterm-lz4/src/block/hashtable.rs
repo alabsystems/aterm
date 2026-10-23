@@ -51,9 +51,6 @@ pub struct HashTable4KU16 {
 impl HashTable4KU16 {
     #[inline]
     pub fn new() -> Self {
-        // Boxed array directly, not upstream's `vec![..].into_boxed_slice()
-        // .try_into()`: that `try_into` is a std absent callee the verifier
-        // cannot prove panic-free.
         let dict = alloc::boxed::Box::new([0; HASHTABLE_SIZE_4K]);
         Self { dict }
     }
@@ -61,15 +58,12 @@ impl HashTable4KU16 {
 impl HashTable for HashTable4KU16 {
     #[inline]
     fn get_at(&self, hash: usize) -> usize {
-        // `hash < 2^16`, so `hash >> 4 < 4096`; the `%` (a mask) states that
-        // across the trait boundary. Function-path `Deref::deref` avoids
-        // inlining Box's raw-pointer deref into this frame.
+        // `hash < 2^16`, so `% HASHTABLE_SIZE_4K` is a mask that bounds the index across the trait boundary.
         let dict: &[u16; HASHTABLE_SIZE_4K] = core::ops::Deref::deref(&self.dict);
         dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
     }
     #[inline]
     fn put_at(&mut self, hash: usize, val: usize) {
-        // Same `%` mask idiom as `get_at` above (identical on all real calls).
         self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] = val as u16;
     }
     #[inline]
@@ -85,7 +79,6 @@ pub struct HashTable4K {
 impl HashTable4K {
     #[inline]
     pub fn new() -> Self {
-        // See `HashTable4KU16::new`.
         let dict = alloc::boxed::Box::new([0; HASHTABLE_SIZE_4K]);
         Self { dict }
     }
@@ -93,14 +86,11 @@ impl HashTable4K {
 impl HashTable for HashTable4K {
     #[inline]
     fn get_at(&self, hash: usize) -> usize {
-        // `hash < 2^16` by construction; `% 4096` is a mask and identical on
-        // all real calls (see `HashTable4KU16::get_at`).
         let dict: &[u32; HASHTABLE_SIZE_4K] = core::ops::Deref::deref(&self.dict);
         dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] as usize
     }
     #[inline]
     fn put_at(&mut self, hash: usize, val: usize) {
-        // Same `%` mask idiom as `get_at` above (identical on all real calls).
         self.dict[(hash >> HASHTABLE_BIT_SHIFT_4K) % HASHTABLE_SIZE_4K] = val as u32;
     }
 }

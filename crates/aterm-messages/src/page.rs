@@ -628,8 +628,7 @@ pub fn tag_words(tag: &str) -> Cow<'_, str> {
     })
 }
 
-/// A script's own tag as a chip's words: capitalized like every chip beside it (`search`
-/// → `Search`), a two-letter tag an initialism (`ci` → `CI`).
+/// Formats a script's own tag as a chip's display words.
 fn script_tag_words(tag: &str) -> Cow<'_, str> {
     let mut chars = tag.chars();
     let words = match chars.next() {
@@ -660,9 +659,7 @@ pub(crate) fn span_words(ms: u64) -> String {
     }
 }
 
-/// Whether pressing `intent` from the page would still do the thing
-/// ([`MessageActionView::still_actionable`]): the facts are the host's, the rule is this
-/// match, and the press re-validates it.
+/// Whether pressing `intent` from the page is still actionable ([`MessageActionView::still_actionable`]).
 fn still_actionable(intent: &Intent, live: bool, host: &impl Host) -> bool {
     match intent {
         Intent::AgentUpgrade { tab, to, word } => host.upgrade_takes(tab, to, *word),
@@ -693,9 +690,7 @@ pub(crate) fn cut_off_mark(glyph: Glyph, severity: Severity, state: &str) -> Gly
     }
 }
 
-/// The LATER record that tells `rec`'s story on, when there is one: the
-/// record it was replaced by ([`Retired::Superseded`]), which stands for it on
-/// the page.
+/// The later record that superseded `rec` ([`Retired::Superseded`]), if any.
 fn told_on_by(log: &crate::log::MessageLog, rec: &LogRecord) -> Option<MessageId> {
     let Some(Retired::Superseded { by }) = rec.retired() else {
         return None;
@@ -704,9 +699,7 @@ fn told_on_by(log: &crate::log::MessageLog, rec: &LogRecord) -> Option<MessageId
     (rec.severity != Severity::Error || next.posted_severity == Severity::Error).then_some(*by)
 }
 
-/// Whether `intent` is a word for a tab whose upgrade this host does not have at all
-/// ([`Host::upgrade_stands`]): its session ended here or its move is over, so the word is
-/// moot.
+/// Whether `intent` targets a tab whose upgrade this host no longer tracks ([`Host::upgrade_stands`]).
 fn session_gone(intent: &Intent, host: &impl Host) -> bool {
     match intent {
         Intent::AgentUpgrade { tab, .. } => !host.upgrade_stands(tab),

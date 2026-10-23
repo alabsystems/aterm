@@ -4,14 +4,7 @@
 //! The one typography resolver, sibling of [`crate::resolved_colors`]:
 //! [`Config::resolved_typography`] picks the theme an appearance draws (by
 //! the same selection as the colours, [`Config::theme_selection`]) and works
-//! out which of the theme's type settings apply. [`ResolvedTypography::overlay`]
-//! fills exactly those into a view of the config, so every existing reader of a
-//! font key (`FontConfig`, `RenderKnobs`, `GlyphRasterKnobs`, `text_shaping`,
-//! the variation requests, the family request) keeps reading a `Config` and
-//! obeys `--font` > aterm.toml > theme > default without a change of its own.
-//!
-//! A theme preview (Settings Try, `ctl theme preview`, the palette) is colour
-//! only (DTP §9.3): this resolver ignores the preview candidate on purpose.
+//! out which of the theme's type settings apply.
 
 use std::borrow::Cow;
 
@@ -74,9 +67,7 @@ pub(crate) struct ResolvedTypography {
 }
 
 /// Whether `cfg` sets the typography key `key` itself (a whole value: an
-/// empty list or a blank family counts). A non-finite `line_height` or
-/// `font_size_scale` sets nothing: its resolver falls back as if it were
-/// absent, so a theme's value fills it and the source says so.
+/// empty list or a blank family counts).
 pub(crate) fn config_sets(cfg: &Config, key: ThemeKey) -> bool {
     match key {
         ThemeKey::FontFamily => cfg.font_family.is_some(),
@@ -97,8 +88,7 @@ pub(crate) fn config_sets(cfg: &Config, key: ThemeKey) -> bool {
 }
 
 /// A thousandths value as the `f32` aterm.toml would hold for the same
-/// decimal: the decimal's `f64`, narrowed. A theme's `1.15` and a config's
-/// `1.15` are then the same bits.
+/// decimal: the decimal's `f64`, narrowed.
 #[allow(
     clippy::cast_possible_truncation,
     reason = "the TOML f64 -> f32 narrowing, on purpose, so the bits match a config value"
@@ -109,8 +99,7 @@ pub(crate) fn milli_f32(milli: u16) -> f32 {
 
 impl Config {
     /// The typography `appearance` draws against `themes`, for the launch's
-    /// own `--font`. Ignores any theme preview on purpose: preview and Try are
-    /// colour-only (DTP §9.3).
+    /// own `--font`.
     pub(crate) fn resolved_typography(
         &self,
         appearance: Appearance,
@@ -179,7 +168,7 @@ impl ResolvedTypography {
 
     /// The config every font reader should see: `cfg` with the applied theme
     /// settings filled into the keys it leaves unset (flag > config > theme >
-    /// default). Borrowed, so byte-identical, when nothing applies.
+    /// default).
     pub(crate) fn overlay<'a>(&self, cfg: &'a Config) -> Cow<'a, Config> {
         let t = &self.applied;
         if t.is_empty() {
@@ -314,9 +303,6 @@ mod tests {
     }
 
     /// For every typography key: {theme sets, unset} × {config sets, unset}.
-    /// A config value wins, a theme fills, the default stays, and `origin`
-    /// and `shadowed` say which. Negative control: an overlay that writes the
-    /// theme unconditionally breaks the config-wins row.
     #[test]
     fn overlay_precedence_matrix() {
         let rows = THEME_KEYS
@@ -359,9 +345,6 @@ mod tests {
                         Vec::new()
                     };
                     assert_eq!(shadowed, expect, "{label}");
-                    // Negative control: an overlay that writes the theme's
-                    // value regardless of the config loses the config's
-                    // value in the config-wins row.
                     if theme_sets && config_sets {
                         let mut unconditional = config.clone();
                         let only_theme = ResolvedTypography {
@@ -412,15 +395,12 @@ mod tests {
             crate::effective_font_family_with(Some("Menlo"), view.font_family_request().as_deref()),
             Some("Menlo".to_string())
         );
-        // A display face is a layer over the font, never the font: the
-        // theme's family is still the font under `display_font`.
         let display = cfg("theme = \"Studio\"\ndisplay_font = \"pixel\"\n");
         let typo = display.resolved_typography_with_flag(Appearance::Dark, &themes, None);
         assert!(typo.shadowed.is_empty());
         let view = typo.overlay(&display);
         assert_eq!(view.font_family_request().as_deref(), Some("Berkeley Mono"));
         assert_eq!(view.display_faces_request(), ["pixel"]);
-        // Negative control: with neither, the theme's family is requested.
         let typo = config.resolved_typography_with_flag(Appearance::Dark, &themes, None);
         assert_eq!(
             typo.overlay(&config).font_family_request().as_deref(),
@@ -428,9 +408,9 @@ mod tests {
         );
     }
 
-    /// DTP §7: a theme with no typography leaves every font reader's input
+    /// A theme with no typography leaves every font reader's input
     /// untouched, across the flag, family and display rungs and every kind of
-    /// theme. Negative control: a theme `line_height` changes the knobs.
+    /// theme.
     #[test]
     fn empty_typography_is_byte_identical() {
         let empty_file = catalog("");
@@ -472,7 +452,6 @@ mod tests {
             assert_eq!(crate::scaled_font_px(px, 1000).to_bits(), px.to_bits());
             px += 0.5;
         }
-        // Negative control.
         let themed = catalog("line_height = 1.2");
         let config = cfg("theme = \"Studio\"\n");
         let view = config
@@ -559,7 +538,6 @@ mod tests {
     }
 
     /// A theme's `bold_is_bright` is a colour rung under the config's key.
-    /// Negative control: without the theme key the engine default stands.
     #[test]
     fn bold_is_bright_theme_rung() {
         let engine = aterm_core::config::TerminalConfig::default().bold_is_bright;
@@ -587,9 +565,8 @@ mod tests {
         );
     }
 
-    /// DTP §3.2's subset rule as a law: every theme key with an aterm.toml
-    /// spelling is a real config key (setting it changes the config), and
-    /// no typography key lacks one.
+    /// Every theme key with an aterm.toml spelling is a real config key
+    /// (setting it changes the config), and no typography key lacks one.
     #[test]
     fn config_subset_law() {
         for spec in &THEME_KEYS {
@@ -601,15 +578,10 @@ mod tests {
                 continue;
             }
             let value = match spec.value {
-                // aterm.toml's `palette_generate` is a tri-state word, not the
-                // theme file's flag.
                 aterm_types::scheme::ThemeValueType::Flag if key == "palette_generate" => {
                     "\"never\"".to_string()
                 }
-                aterm_types::scheme::ThemeValueType::Flag => {
-                    // Not the default, so the config visibly changes.
-                    "false".to_string()
-                }
+                aterm_types::scheme::ThemeValueType::Flag => "false".to_string(),
                 aterm_types::scheme::ThemeValueType::Milli { .. }
                 | aterm_types::scheme::ThemeValueType::Integer { .. } => spec.example.to_string(),
                 aterm_types::scheme::ThemeValueType::FontNameList
@@ -630,7 +602,6 @@ mod tests {
                 "{key} = {value} is not a config key"
             );
         }
-        // Negative control: a key aterm.toml does not have leaves the default.
         let unknown: Config = aterm_toml::from_str("no_such_theme_key = 1\n").unwrap_or_default();
         assert!(unknown == Config::default());
     }

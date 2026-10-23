@@ -56,8 +56,6 @@ pub(super) fn deserialize(
     let deserialized_fields: Vec<_> = fields
         .iter()
         .enumerate()
-        // Skip fields that shouldn't be deserialized or that were flattened,
-        // so they don't appear in the storage in their literal form
         .filter(|&(_, field)| !field.attrs.skip_deserializing() && !field.attrs.flatten())
         .map(|(i, field)| FieldWithAliases {
             ident: field_i(i),
@@ -68,8 +66,6 @@ pub(super) fn deserialize(
     let has_flatten = has_flatten(fields);
     let field_visitor = deserialize_field_identifier(&deserialized_fields, cattrs, has_flatten);
 
-    // untagged struct variants do not get a visit_seq method. The same applies to
-    // structs that only have a map representation.
     let visit_seq = match form {
         StructForm::Untagged(_) => None,
         _ if has_flatten => None,
@@ -221,14 +217,12 @@ fn deserialize_map(
     cattrs: &attr::Container,
     has_flatten: bool,
 ) -> Fragment {
-    // Create the field names for the fields.
     let fields_names: Vec<_> = fields
         .iter()
         .enumerate()
         .map(|(i, field)| (field, field_i(i)))
         .collect();
 
-    // Declare each field that will be deserialized.
     let let_values: Vec<TokenStream> = fields_names
         .iter()
         .filter(|&&(field, _)| !field.attrs.skip_deserializing() && !field.attrs.flatten())
@@ -242,7 +236,6 @@ fn deserialize_map(
         })
         .collect();
 
-    // Collect contents for flatten fields into a buffer
     let let_collect = if has_flatten {
         Some(q!(
             "let mut __collect = _serde::__private::Vec::<_serde::__private::Option<(
@@ -254,7 +247,6 @@ fn deserialize_map(
         None
     };
 
-    // Match arms to extract a value for a field.
     let value_arms: Vec<TokenStream> = fields_names
         .iter()
         .filter(|&&(field, _)| !field.attrs.skip_deserializing() && !field.attrs.flatten())
@@ -298,7 +290,6 @@ fn deserialize_map(
         })
         .collect();
 
-    // Visit ignored values to consume them
     let ignored_arm = if has_flatten {
         Some(q!(
             "__Field::__other(__name) => {
@@ -438,8 +429,6 @@ fn deserialize_map(
     )
 }
 
-/// Generates enum and its `Deserialize` implementation that represents each
-/// non-skipped field of the struct
 fn deserialize_field_identifier(
     deserialized_fields: &[FieldWithAliases],
     cattrs: &attr::Container,

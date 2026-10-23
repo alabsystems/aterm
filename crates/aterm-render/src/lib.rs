@@ -269,9 +269,10 @@ struct SharedFace {
     font: std::sync::Weak<crate::font::Font>,
 }
 
+// Every face some holder holds, and no other: each call prunes the rest
+// (`shared_faces_prune`), so the store needs no cap. A live face is never
+// evicted, or its next holder would read and parse a second copy.
 static SHARED_PARSED_FACES: std::sync::Mutex<Vec<SharedFace>> = std::sync::Mutex::new(Vec::new());
-
-const SHARED_PARSED_FACE_SLOTS: usize = 12;
 
 /// The parsed face for `bytes` at `index`, reusing a live parse of the identical bytes when one exists.
 pub fn shared_parsed_face(
@@ -328,9 +329,6 @@ fn shared_face_bytes(bytes: &[u8], index: u32) -> std::sync::Arc<[u8]> {
         return entry.bytes.clone();
     }
     let src: std::sync::Arc<[u8]> = std::sync::Arc::from(bytes);
-    if store.len() >= SHARED_PARSED_FACE_SLOTS {
-        store.remove(0);
-    }
     store.push(SharedFace {
         bytes: src.clone(),
         index,
@@ -384,9 +382,7 @@ fn shared_parsed_face_publish(
         return (entry.bytes.clone(), font);
     }
     let src = key();
-    if store.len() >= SHARED_PARSED_FACE_SLOTS {
-        store.remove(0);
-    }
+    shared_faces_prune(&mut store);
     store.push(SharedFace {
         bytes: src.clone(),
         index,
@@ -23692,6 +23688,32 @@ mod tests {
         );
     }
 
+    /// A face stays shared however many others are live (the store used to
+    /// evict the oldest past twelve, and that face's next holder read and
+    /// parsed a second copy), and the store keeps none nobody holds.
+    #[test]
+    fn a_live_face_is_never_evicted_from_the_shared_store() {
+        let tag = format!("shared-store test {:?}", std::thread::current().id());
+        let face = |i: usize| format!("{tag} face {i}").into_bytes();
+        let held: Vec<std::sync::Arc<[u8]>> =
+            (0..40).map(|i| shared_face_bytes(&face(i), 0)).collect();
+        for (i, bytes) in held.iter().enumerate() {
+            assert!(
+                std::sync::Arc::ptr_eq(&shared_face_bytes(&face(i), 0), bytes),
+                "face {i} of 40 live ones was evicted and copied"
+            );
+        }
+        drop(held);
+        let mut store = SHARED_PARSED_FACES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        shared_faces_prune(&mut store);
+        assert!(
+            !store.iter().any(|e| e.bytes.starts_with(tag.as_bytes())),
+            "a face nobody holds stayed in the store"
+        );
+    }
+
     #[test]
     fn format2_coverage_rejects_low_byte_alias_and_keeps_real_two_byte_mapping() {
         fn synthetic_format2_cmap(two_byte_key: bool) -> Vec<u8> {
@@ -27190,6 +27212,69 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// NO ICON INKS OVER THE FACE'S TALLEST LETTER on the faces a band is drawn in at 1x, 8 to
+    /// 16 px, regular and bold, spilled between blanks and in a cell of its own: every raster
+    /// [`band_icon_key`] names starts at or under the face's `head` row
+    /// ([`Renderer::icon_metrics`]) and never on the cell's top row. `↻`'s arrowhead stood over
+    /// its ring's top and inked row 0 on SF Mono at 13 px, Menlo at 11 (and at 12 and 14
+    /// bold), Courier New at 12 bold and Andale Mono at 11, against the row above. NEGATIVE
+    /// CONTROL: some icon starts on its ceiling row, so a row's overshoot would show.
+    #[test]
+    fn no_icon_inks_over_the_tallest_letter_on_a_real_face() {
+        let faces: &[Option<&str>] = if cfg!(target_os = "macos") {
+            &[
+                None,
+                Some("Menlo"),
+                Some("Courier New"),
+                Some("Andale Mono"),
+                Some("Monaco"),
+            ]
+        } else {
+            &[None]
+        };
+        let (mut measured, mut flush) = (0usize, 0usize);
+        for &face in faces {
+            for px in 8..=16 {
+                let mut r = Renderer::from_system_with_family(face, px as f32, Theme::default())
+                    .expect(NO_FONT);
+                if face
+                    .is_some_and(|name| !r.primary_source_path().is_some_and(|p| p.contains(name)))
+                {
+                    continue;
+                }
+                r.debug_block_on_lazy_fallbacks();
+                let (cw, ch) = r.cell_size();
+                for (bold, style) in [(false, StyleBits::REGULAR), (true, StyleBits::BOLD)] {
+                    let ceiling = r.icon_metrics(bold).head.max(1.0) as usize;
+                    for icon in BandIcon::ALL {
+                        for spill in [false, true] {
+                            let key = band_icon_key(icon, style, spill, r.px_q);
+                            let GlyphImage::Mono { width, bytes, .. } = r.glyph_image(key) else {
+                                panic!("{icon:?}: a Mono raster");
+                            };
+                            let y0 = bytes
+                                .chunks(*width)
+                                .position(|row| row.iter().any(|&c| c > 0));
+                            let y0 = y0.expect("the icon draws");
+                            assert!(
+                                y0 >= ceiling,
+                                "{face:?} {px} px ({cw}x{ch}) bold {bold} spill {spill} {icon:?}: \
+                                 ink on row {y0}, over row {ceiling}"
+                            );
+                            measured += 1;
+                            flush += usize::from(y0 == ceiling);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            measured >= 9 * 2 * BandIcon::ALL.len() * 2,
+            "{measured} rasters"
+        );
+        assert!(flush > 0, "control: no icon reaches its ceiling row");
     }
 
     #[test]

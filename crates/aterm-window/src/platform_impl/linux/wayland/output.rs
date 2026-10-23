@@ -3,7 +3,6 @@
 //
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/output.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
-
 //! Modified by the aterm project in 2026; see the repository NOTICE. (A monitor is a
 //! first-party `aterm_wayland::output::Output`, read as of its last `done`, where upstream read
 //! smithay-client-toolkit's `OutputData`: docs/AUDIT-third-party-2026-10-15.md, LW.7. Its
@@ -26,7 +25,6 @@ impl ActiveEventLoop {
 
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
-        // There's no primary monitor on Wayland.
         None
     }
 }
@@ -42,7 +40,6 @@ impl MonitorHandle {
         Self { output }
     }
 
-    /// The output as of its last `done` (its defaults before the first).
     fn info(&self) -> OutputInfo {
         self.output.info().unwrap_or_else(|| OutputInfo {
             global: self.output.global(),

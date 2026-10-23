@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! CAN (0x18) and SUB (0x1A) cancel a control string, which then delivers nothing (as in
-//! xterm): a program killed mid OSC 52, OSC 8, title, kitty graphics command or
-//! DECRQSS/XTGETTCAP query leaves a truncated string that the next CAN or SUB ends. Each
-//! case is fed whole, byte by byte and split at every byte, with ST as the negative control.
+//! CAN (0x18) and SUB (0x1A) control string cancellation tests.
 
 use aterm_core::terminal::{ClipboardAccess, Terminal};
 
-/// Whole, one byte at a time, and split once at every byte.
 fn chunkings(bytes: &[u8]) -> Vec<Vec<&[u8]>> {
     let mut all = vec![vec![bytes], bytes.chunks(1).collect()];
     all.extend((1..bytes.len()).map(|at| {
@@ -18,7 +14,6 @@ fn chunkings(bytes: &[u8]) -> Vec<Vec<&[u8]>> {
     all
 }
 
-/// A fresh terminal (clipboard writes authorized) fed `bytes` in `chunks`.
 fn fed(chunks: &[&[u8]]) -> Terminal {
     let mut term = Terminal::new(24, 80);
     term.authorize_clipboard_access(ClipboardAccess::Write);
@@ -28,7 +23,6 @@ fn fed(chunks: &[&[u8]]) -> Terminal {
     term
 }
 
-/// `body` wrapped as a string introduced by `intro` and ended by `end`.
 fn string(intro: &[u8], body: &[u8], end: &[u8]) -> Vec<u8> {
     [intro, body, end].concat()
 }
@@ -90,9 +84,6 @@ fn a_canceled_hyperlink_is_not_opened() {
     );
 }
 
-/// A canceled DECRQSS or XTGETTCAP query is not answered: the reply would
-/// reach whoever reads the PTY next (the shell, after a killed program) as
-/// typed input.
 #[test]
 fn a_canceled_query_is_not_answered() {
     let queries: [(&[u8], &[u8], &[u8]); 3] = [
@@ -114,9 +105,6 @@ fn a_canceled_query_is_not_answered() {
     }
 }
 
-/// A kitty graphics transmit-and-display whose APC is canceled draws nothing,
-/// and the canceled command leaves no budget or buffer behind: the complete
-/// command after it still draws.
 #[test]
 fn a_canceled_kitty_command_draws_nothing() {
     let raw = [255u8, 0, 0, 255].repeat(4); // 2x2 px RGBA
@@ -139,10 +127,6 @@ fn a_canceled_kitty_command_draws_nothing() {
     }
 }
 
-/// A canceled chunk ends the chunked kitty transfer it belonged to, whether
-/// it was the final chunk (`m=0`) or a continuation (`m=1`): the transfer
-/// draws nothing, and the next program's complete command is not taken as
-/// its continuation, so it draws. The same transfer ended by ST draws.
 #[test]
 fn a_canceled_chunk_ends_its_chunked_transfer() {
     let raw = [255u8, 0, 0, 255].repeat(4); // 2x2 px RGBA

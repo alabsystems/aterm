@@ -3,23 +3,7 @@
 
 //! Which listening socket a path names: the socket file its `bind` created (device and inode,
 //! plus its birth where the filesystem keeps one, so an inode number reissued at once is
-//! still told apart). Every bind makes a new one, except two files born in one tick of the
-//! filesystem's clock under one inode number: ext4 stamps births from the kernel's coarse
-//! clock and reissues a freed inode number at once, so a socket unlinked within a tick of its
-//! own bind and bound again reads as the same listener (measured on Linux 6.8 ext4: the inode
-//! number in 50 of 50 rebinds, the birth too in most; on tmpfs, where `$XDG_RUNTIME_DIR`
-//! puts the socket, neither).
-//!
-//! A pid alone does not name a server: aterm-gui's cold update lane closes its listener and
-//! every stream it accepted (`Endpoint::retire`) right before an `exec` that keeps the pid, and
-//! the new image binds the same path (if the `exec` returns, `Endpoint::reopen` renames a fresh
-//! socket over it). Both sides of a hang-up judge it by this identity: `aterm ctl`'s redial
-//! (whether the server it reached still answers) and aterm-gui's forward relay (whether the
-//! host behind a forward still serves where it was reached).
-//!
-//! The watchdog's rebind of a wedged listener (aterm-gui's `control_listener`) leaves every
-//! stream it accepted served; a stream that server then ends without saying its sessions
-//! exited is asked once more of that same process, never another aterm.
+//! still told apart).
 
 use std::path::Path;
 use std::time::SystemTime;
@@ -33,10 +17,7 @@ pub struct ListenerId {
     born: Option<SystemTime>,
 }
 
-/// The [`ListenerId`] of the socket `path` names now, a link followed. Read once a connection
-/// through `path` is up, it names the listener that accepted it, unless one was renamed over
-/// the path in between (which errs toward "the same listener"). `None` when nothing is there,
-/// it is not a socket, it cannot be read, or the platform names no socket file (all but Unix).
+/// The [`ListenerId`] of the socket `path` names now, a link followed.
 #[must_use]
 pub fn listener_at(path: impl AsRef<Path>) -> Option<ListenerId> {
     listener_read(path).ok().flatten()
@@ -62,7 +43,7 @@ pub fn listener_read(path: impl AsRef<Path>) -> std::io::Result<Option<ListenerI
 }
 
 /// Whether `path` still names the listener `then` was read from, read now (after whatever
-/// answered there answered). `true` when either reading is missing: the pid alone decides.
+/// answered there answered).
 #[must_use]
 pub fn still_names(path: impl AsRef<Path>, then: Option<ListenerId>) -> bool {
     then.is_none_or(|then| names_now(path, then) != Named::Another)
@@ -82,10 +63,7 @@ pub enum Named {
 }
 
 /// What `path` names now against `bound`, the listener a server read there right after its
-/// own bind: for a server that ends itself once it can no longer be reached where it listens
-/// (`aterm link broker`). Strict where [`still_names`] is lenient: a read that proves nothing
-/// there is [`Named::Nothing`], never the same listener, and one that fails otherwise is
-/// [`Named::Unread`], never nothing.
+/// own bind.
 #[must_use]
 pub fn names_now(path: impl AsRef<Path>, bound: ListenerId) -> Named {
     match listener_read(path) {
@@ -114,8 +92,6 @@ mod tests {
     use super::*;
 
     /// Set the access and modification times of what `path` names to `secs` (and 123 ns).
-    /// Darwin also moves the birth back to a time set here that is earlier; nothing moves it
-    /// forward.
     fn set_times(path: &Path, secs: i64) {
         let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path");
         let t = libc::timespec {
@@ -154,8 +130,6 @@ mod tests {
         assert!(still_names(&sock, Some(then)), "new times are no new bind");
 
         drop(first);
-        // The old file kept by a second name, so the next bind cannot be born in its tick
-        // under its inode number (the blind spot the module names, which ext4 meets here).
         std::fs::hard_link(&sock, dir.join("held")).expect("held");
         std::fs::remove_file(&sock).expect("unlink");
         assert!(still_names(&sock, Some(then)), "nothing there now");
@@ -168,8 +142,7 @@ mod tests {
 
     /// A server's own path read strictly ([`names_now`]): its listener, then nothing once the
     /// file is unlinked or a plain file stands there, then another once a second bind takes
-    /// the path. NEGATIVE CONTROL: the lenient reading, [`still_names`], calls the unlinked
-    /// path the same listener, so a server judging itself by it would serve on unreachable.
+    /// the path.
     #[test]
     fn a_server_reads_its_path_gone_or_taken() {
         let scratch = aterm_tempfile::Builder::new()
@@ -182,7 +155,6 @@ mod tests {
         let bound = listener_at(&sock).expect("a socket");
         assert_eq!(names_now(&sock, bound), Named::Same);
 
-        // The old file kept by a second name, as above: no rebind may reissue its inode.
         std::fs::hard_link(&sock, dir.join("held")).expect("held");
         std::fs::remove_file(&sock).expect("unlink");
         assert_eq!(names_now(&sock, bound), Named::Nothing, "unlinked");
@@ -201,9 +173,7 @@ mod tests {
 
     /// A read that fails otherwise than by the path's absence proves nothing: a socket whose
     /// directory has lost its search bit reads [`Named::Unread`], never gone, and its own
-    /// listener again once the bit is back. NEGATIVE CONTROL: an absent path beside it reads
-    /// [`Named::Nothing`], so a server that took the denied read for one would end while its
-    /// socket file stood there.
+    /// listener again once the bit is back.
     #[test]
     fn a_read_that_fails_is_no_answer() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -239,13 +209,10 @@ mod tests {
     /// socket renamed over the path (`Endpoint::reopen`) born in the same tick of a coarse
     /// clock (HFS+ keeps whole seconds) is another listener by its inode number, and the same
     /// inode number born at another time (ext4 reissues one at once) is another listener by
-    /// its birth. Darwin moves a birth back to an earlier time `utimes` sets, which stages both.
+    /// its birth.
     #[cfg(target_os = "macos")]
     #[test]
     fn an_inode_number_or_a_birth_alone_tells_listeners_apart() {
-        // A short prefix: the scratch's name ends in this process's count of temporary
-        // directories, and a socket path must fit `sun_path`'s 104 bytes however many
-        // the binary's other tests made first.
         let scratch = aterm_tempfile::Builder::new()
             .prefix("uds-l.")
             .tempdir()

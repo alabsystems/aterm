@@ -194,7 +194,7 @@ pub(super) fn plain_tar(
 }
 
 /// The OS's tar (bsdtar on macOS), by absolute path.
-pub(super) const TAR: &str = "/usr/bin/tar";
+pub(super) const TAR: &str = aterm_uds::os_path!("tar");
 
 /// Whether `path` is a regular file with an execute bit.
 pub(super) fn is_executable(path: &Path) -> bool {

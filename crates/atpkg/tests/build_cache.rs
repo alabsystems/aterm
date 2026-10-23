@@ -1,23 +1,13 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The build cache's two entry points, run for real (`atpkg::build_cache`), under a temp
-//! `HOME`.
-//!
-//! A build script that builds its own workspace (by `$CARGO`, and by `targo` through the
-//! shim) finishes under the shim: the setting is on the command line, not inherited —
-//! exported as `CARGO_BUILD_BUILD_DIR`, the nested build would wait on the outer build's
-//! lock forever. Needs real `targo` (the one building this test); no network.
-//!
-//! `atpkg __reroute cargo …` hands a cargo the setting only where the command builds and
-//! that cargo reads it.
+//! Integration tests for `atpkg::build_cache` under an isolated temp `HOME`.
 
 #![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// A wait for something that must happen: a hang detector, not a budget.
 const HANG: Duration = Duration::from_secs(60);
 
 const BUILD_RS: &str = r#"
@@ -136,9 +126,6 @@ fn a_build_script_building_its_own_workspace_finishes_under_the_shim() {
     );
 }
 
-/// An upstream `cargo` on PATH that answers `-vV` (after a rustup `+<toolchain>` too) as
-/// `release` (`trust` adds Trust's `trust:` line, on 1.99.0-dev) and prints its arguments
-/// otherwise; run once here, so the first exec's assessment is paid outside any bound.
 fn fake_cargo(dir: &Path, release: &str) -> PathBuf {
     let path = dir.join("cargo");
     let (release, trust) = match release {
@@ -202,8 +189,6 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
         format!("+1.97.1\n--config\n{config}\ntest\n")
     );
     assert_eq!(run("1.97.1", &["metadata"], &[]), "metadata\n");
-    // A target directory the caller chose keeps the intermediates in its own
-    // `build.noindex`.
     assert_eq!(
         run("1.97.1", &["build"], &[("CARGO_TARGET_DIR", "/t")]),
         "--config\nbuild.build-dir='/t/build.noindex'\nbuild\n"
@@ -213,8 +198,6 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
         "build\n"
     );
     assert_eq!(run("1.85.0", &["build"], &[]), "build\n");
-    // Trust's own cargo (targo): a bare verb, which Trust refuses, runs as typed;
-    // `--unverified` gets the setting.
     assert_eq!(run("trust", &["check"], &[]), "check\n");
     assert_eq!(
         run("trust", &["build", "--unverified"], &[]),

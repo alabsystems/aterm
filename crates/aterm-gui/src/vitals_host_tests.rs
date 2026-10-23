@@ -1514,12 +1514,24 @@ fn output_with_no_window_is_read_in_its_own_wake_and_arms_nothing() {
     assert_eq!(app.vitals.edge_at(t0), Some(t0 + JOBS_FLOOR));
 }
 
+/// A screen generation `seq` within epoch 0, for a feed that drew.
+#[cfg(target_os = "macos")]
+fn drawn(seq: u64) -> crate::control::ScreenGen {
+    crate::control::ScreenGen { epoch: 0, seq }
+}
+
 /// Session `0`'s program writes `bytes`, as its PTY reader feeds them.
 fn feed(app: &crate::App, bytes: &[u8]) {
-    let term = Arc::clone(&app.pool.get(0).expect("tab 0").term);
-    term.lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .process(bytes);
+    feed_tab(app, 0, bytes);
+}
+
+/// Session `tab`'s program writes `bytes`, as its PTY reader feeds them: the feed, then, under
+/// the same hold of the term lock, its count of a move ([`ScreenMoves::fed`]).
+fn feed_tab(app: &crate::App, tab: u64, bytes: &[u8]) {
+    let s = app.pool.get(tab).expect("the tab");
+    let mut t = s.term.lock().unwrap_or_else(PoisonError::into_inner);
+    t.process(bytes);
+    s.ctx.screen_moves.fed(crate::control::screen_gen(&t));
 }
 
 /// Muse Code 0.10's write at rest, every ~9 s (`subscribe … bytes`,
@@ -1573,19 +1585,62 @@ fn a_write_that_moves_no_cell_is_no_edge_and_arms_nothing() {
     assert!(read_req(&rx, "the owed reading").jobs_now);
 
     let later = t0 + 3 * JOBS_FLOOR;
-    let term = Arc::clone(&app.pool.get(0).expect("tab 0").term);
-    let held = term.lock().unwrap_or_else(PoisonError::into_inner);
-    assert_eq!(
-        app.vitals_output_kind(0, later),
-        OutputEdge::Edge,
-        "the screen unseen: moved"
-    );
-    drop(held);
     assert_eq!(
         app.vitals_output_kind(0, later),
         OutputEdge::Quiet,
-        "seen again, where it was"
+        "nothing fed since: where it was"
     );
+}
+
+/// A WRITE WHOSE WAKE MEETS THE TERM LOCK HELD IS JUDGED BY WHAT THE READER FED
+/// (`docs/measured/vitals-3-2026-10-22.md`, V1). The output wake reads the reader's count of
+/// moving feeds ([`ScreenMoves`]), never the term lock a control worker's `text` or `status`, or
+/// a watcher the same burst rang, may hold as the wake runs. Measured on main `166b5debe6` in the
+/// forever lab's 16 Muse Code tabs at rest with `text` read in a loop on each: the reads alone
+/// armed nothing (`v3b-muse`, the 42 s before a disk look's reading), because a parked tab's write
+/// goes to the park check. They lengthen a burst a disk look's reading began (the tty word lost,
+/// the tab unparked): on main that burst kept arming through the whole 99 s sample (`v3c-muse`,
+/// `system_vitals` 261 armed); with this rule it ended 19 s after its disk look, 52 armed, and the
+/// rest of the sample armed nothing (`v3a-muse`). Muse Code's colour reset and Gemini CLI's
+/// query, each met with the lock held inside
+/// another reading's floor, owe nothing and arm nothing. NEGATIVE CONTROL: a write that moved a
+/// cell, met with the lock held, is an edge owed at the floor. MUTANT caught: the wake reading
+/// the generation under `try_lock` and counting a held lock as moved.
+#[test]
+fn a_write_whose_wake_meets_the_term_lock_held_is_judged_by_what_the_reader_fed() {
+    static BOARD: JobsBoard = JobsBoard::new();
+    let mut app = crate::App::headless_for_test();
+    let rx = with_reader(&mut app, &BOARD);
+    let t0 = Instant::now();
+    land(&app, 1, Vec::new(), Demand::Idle);
+    app.on_vitals_wake();
+    app.service_vitals(t0);
+    feed(&app, b"$ ");
+    app.on_output_wake(0, t0);
+    assert_eq!(
+        asked(&rx),
+        1,
+        "the prompt moved the screen: read in its wake"
+    );
+    let term = Arc::clone(&app.pool.get(0).expect("tab 0").term);
+    for (n, bytes) in (1_u64..).zip([MUSE_RESET, GEMINI_QUERY, MUSE_RESET]) {
+        let at = t0 + Duration::from_millis(400 * n);
+        feed(&app, bytes);
+        let held = term.lock().unwrap_or_else(PoisonError::into_inner);
+        app.vitals_output_edge(0, at);
+        drop(held);
+        assert_eq!(asked(&rx), 0, "write {n} moved no cell: nothing read");
+        assert_eq!(app.vitals.edge_at(at), None, "write {n}: no edge owed");
+        assert_eq!(app.vitals_deadline(), None, "write {n}: nothing armed");
+    }
+    let at = t0 + Duration::from_millis(1_800);
+    feed(&app, b"x");
+    let held = term.lock().unwrap_or_else(PoisonError::into_inner);
+    app.vitals_output_edge(0, at);
+    drop(held);
+    assert_eq!(asked(&rx), 0, "a moved screen inside the floor: owed");
+    assert_eq!(app.vitals.edge_at(at), Some(t0 + JOBS_FLOOR));
+    assert!(app.vitals_deadline().is_some(), "armed for the floor");
 }
 
 /// IDLE WRITES OF TWO TABS INSIDE EACH OTHER'S FLOOR ASK NOTHING
@@ -1605,12 +1660,6 @@ fn idle_writes_of_two_tabs_inside_each_others_floor_ask_nothing() {
     land(&app, 1, Vec::new(), Demand::Idle);
     app.on_vitals_wake();
     app.service_vitals(t0);
-    let feed_tab = |app: &crate::App, tab: u64, bytes: &[u8]| {
-        let term = Arc::clone(&app.pool.get(tab).expect("the tab").term);
-        term.lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .process(bytes);
-    };
     feed_tab(&app, 0, b"$ ");
     app.on_output_wake(0, t0);
     assert_eq!(asked(&rx), 1, "tab 0's prompt: read at once");
@@ -2527,7 +2576,8 @@ fn a_terminal_word_holds_until_output_and_never_over_an_unread_key() {
 
     let mut job = JobAtRest::new(true);
     let sink = aterm_session::sink::SinkWriter::new(job.master());
-    let output = Arc::new(AtomicU64::new(5));
+    let output = Arc::new(ScreenMoves::default());
+    output.fed(drawn(5));
     let word = TtyWord::read(3, &sink, &output).expect("a terminal's word");
     assert_eq!((word.key, word.canonical, word.echo), (3, false, false));
     assert_eq!(
@@ -2535,7 +2585,7 @@ fn a_terminal_word_holds_until_output_and_never_over_an_unread_key() {
             .map(|(key, m)| (key, m.canonical, m.echo, m.stamped_ms)),
         Some((3, false, false, 40))
     );
-    output.store(6, Ordering::Release);
+    output.fed(drawn(6));
     assert_eq!(word.current(41), None, "output since the read: no word");
 
     // SAFETY: Writes one byte of a local buffer to this test's master.
@@ -2595,12 +2645,48 @@ fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
         "tab 0's word"
     );
     assert_eq!(read_wait(&req), (Some(WaitName::TtyRaw), Demand::Idle));
-    app.pool
-        .get(0)
-        .expect("tab 0")
-        .latest_output_activity_ns
-        .fetch_add(1, Ordering::AcqRel);
+    feed(&app, b"x");
     assert_eq!(read_wait(&req), (Some(WaitName::Unnamed), Demand::Fast));
+}
+
+/// A WRITE THAT MOVES NO CELL LEAVES THE WORD STANDING (`docs/measured/vitals-3-2026-10-22.md`,
+/// V1). Muse Code at rest writes its colour reset every ~9 s a tab; with 16 tabs under load, one
+/// landed between a reading's word and its tick at nearly every reading, voided that tab's word,
+/// named its wait `unnamed` and asked the next reading in 2 s (`Demand::Fast`). That kept
+/// `system_vitals` armed and firing for as long as the race kept being won: 52 arms and 6 fires in
+/// 20 s, nothing else moving, on this branch before the word followed the reader's moving feeds.
+/// The write moves `latest_output_activity_ns` as any read does, and the word stands.
+/// NEGATIVE CONTROL: a write that draws voids it. MUTANT caught: the word read against the output
+/// stamp again.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_write_that_moves_no_cell_leaves_the_word_standing() {
+    use aterm_vitals::jobs::WaitName;
+    static BOARD: JobsBoard = JobsBoard::new();
+    let job = JobAtRest::new(true);
+    let (app, _rx) = job.app(&BOARD);
+    feed(&app, b"$ ");
+    let req = app.vitals_request(Duration::ZERO, false);
+    assert_eq!(read_wait(&req), (Some(WaitName::TtyRaw), Demand::Idle));
+    for n in 1..=3 {
+        feed(&app, MUSE_RESET);
+        app.pool
+            .get(0)
+            .expect("tab 0")
+            .latest_output_activity_ns
+            .fetch_add(1, Ordering::AcqRel);
+        assert_eq!(
+            read_wait(&req),
+            (Some(WaitName::TtyRaw), Demand::Idle),
+            "reset {n}: the word stands, nothing asked"
+        );
+    }
+    feed(&app, b"x");
+    assert_eq!(
+        read_wait(&req),
+        (Some(WaitName::Unnamed), Demand::Fast),
+        "a write that drew: the word is void"
+    );
 }
 
 /// A KEY DRIVEN AFTER THE WORD WAS READ VOIDS IT (§11.5: the tty names need
@@ -2637,13 +2723,14 @@ fn a_key_driven_after_the_word_was_read_voids_it_for_a_pull() {
 fn the_word_takes_its_stamps_before_it_reads_the_terminal() {
     let job = JobAtRest::new(true);
     let sink = aterm_session::sink::SinkWriter::new(job.master());
-    let output = Arc::new(AtomicU64::new(5));
+    let output = Arc::new(ScreenMoves::default());
+    output.fed(drawn(5));
     let word = TtyWord::read_seamed(3, &sink, &output, || {
-        output.fetch_add(1, Ordering::AcqRel);
+        output.fed(drawn(6));
     })
     .expect("a terminal's word");
     assert_eq!(word.current(9), None, "output mid-read: unused");
-    output.fetch_add(1, Ordering::AcqRel);
+    output.fed(drawn(7));
     let word = TtyWord::read_seamed(3, &sink, &output, || {}).expect("a terminal's word");
     assert!(word.current(9).is_some(), "output before the read: its own");
 }

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Allocation gate for the CPU free-sprite compositor. This is its own test
-// binary because the process-global counting allocator must not instrument
-// unrelated renderer tests.
+
+//! Allocation gate for the CPU free-sprite compositor.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::hint::black_box;
@@ -102,8 +100,6 @@ fn sprite(x: i32, w: u16, h: u16, aw: u16, ah: u16, flip_x: bool) -> FreeSprite 
     }
 }
 
-/// 1:1 sprites (pets, motes, notes) allocate nothing even on their first stamp;
-/// scaled/flipped sprites may grow the resident column map once, then reuse it.
 #[test]
 fn active_free_sprites_do_not_allocate_per_frame() {
     let mut renderer = Renderer::from_bytes(embedded_font(), 16.0, Theme::default())
@@ -122,8 +118,6 @@ fn active_free_sprites_do_not_allocate_per_frame() {
         input
     };
 
-    // Prime every frame/cache container while keeping the x-map untouched: the
-    // zero-width sprite occupies the cached `free_sprites` Vec but stamps no texel.
     let dormant = make(sprite(2, 0, cell_h as u16, 8, 8, false));
     let one_to_one = make(sprite(
         2,
@@ -155,8 +149,6 @@ fn active_free_sprites_do_not_allocate_per_frame() {
         "a first active 1:1 pet/mote/note stamp must not allocate an x-map"
     );
 
-    // Exercise the general sampler too: the first scaled frame is allowed to
-    // grow the resident x-map; every later scaled, flipped, clipped move reuses it.
     let scaled_a = make(sprite(-7, 39, (2 * cell_h + 3) as u16, 13, 9, false));
     let scaled_b = make(sprite(9, 37, (2 * cell_h + 1) as u16, 13, 9, true));
     let _ = renderer.render_input_cached(&mut window, &scaled_a);

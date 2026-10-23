@@ -22,7 +22,7 @@ use crate::{
     Session, TabIndex, WindowId, WindowState, pane, seed_cell_px,
 };
 
-/// A screen's usable placement rectangle in logical points, top-left origin, y.
+/// A screen's usable placement rectangle in logical points (top-left origin, y-down).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct WorkAreaPts {
     pub(crate) x: f64,
@@ -364,7 +364,7 @@ impl App {
         self.window_theme_for_chrome()
     }
 
-    /// The theme the window's chrome painters (tab band strip tones, native pages' role palette).
+    /// The theme used by the window's chrome painters (tab band strip tones and native pages' role palette).
     pub(crate) fn chrome_palette_theme(&self) -> aterm_render::Theme {
         crate::native_appearance::resolve_chrome_palette(self.window_theme, self.theme)
     }
@@ -432,7 +432,7 @@ impl App {
         Some(wid)
     }
 
-    /// Install an already-spawned `session` as the sole tab of a fresh window `wid` and make it.
+    /// Install an already-spawned `session` as the sole tab of a fresh window `wid` and focus it.
     #[cfg(test)]
     pub(crate) fn install_window_state(
         &mut self,
@@ -444,7 +444,7 @@ impl App {
         self.install_window_state_with_parent(wid, session, rows, cols, None);
     }
 
-    /// `install_window_state` with an explicit registry lineage parent for the window's first.
+    /// `install_window_state` with an explicit registry lineage parent for the window's first session.
     pub(crate) fn install_window_state_with_parent(
         &mut self,
         wid: WindowId,
@@ -520,7 +520,7 @@ impl App {
         wid
     }
 
-    /// Full window creation IN the turn, the restore's (one window per restore slice).
+    /// Full window creation within the current turn (one window per restore slice).
     #[allow(
         clippy::too_many_arguments,
         reason = "the window's birth facts — cwd, the seamless adoptee, the connection \
@@ -744,7 +744,7 @@ impl App {
         }
     }
 
-    /// The size window `wid` is attached.
+    /// The size at which window `wid` is attached.
     pub(crate) fn attach_frame_px(
         &self,
         wid: WindowId,
@@ -1210,9 +1210,6 @@ impl App {
         let startup_before_surface_create = Instant::now();
         if self.backend.is_gpu() {
             let (w_px, h_px) = (raw_px.width, raw_px.height);
-            // On X11 the window's own presenter goes with it, which the GL arm
-            // posts through where a `GLXWindow` would stall the server
-            // (`present::x11::X11FrameSink`).
             #[cfg(target_os = "linux")]
             let surface_result = self
                 .backend
@@ -1560,7 +1557,6 @@ impl App {
             return CloseOutcome::Stay;
         }
         if !self.windows.contains_key(&wid) {
-            // Distinct branch.
             return CloseOutcome::Stay; // stale/unknown id → no-op
         }
         #[cfg(target_os = "macos")]
@@ -1703,7 +1699,7 @@ impl App {
         }
     }
 
-    /// Re-read the frame window `wid` must draw itself ([`crate::client_frame`]) from its OS window
+    /// Re-read the frame window `wid` must draw itself ([`crate::client_frame`]) from its OS window.
     #[cfg(target_os = "linux")]
     pub(crate) fn sync_client_frame(&mut self, wid: WindowId) -> bool {
         let Some(ws) = self.windows.get_mut(&wid) else {
@@ -1736,7 +1732,7 @@ impl App {
         crate::client_frame::strip_rows_with_header(configured, header)
     }
 
-    /// Re-resolve the strip's rows ([`Self::strip_rows_for`] of the live config) after window.
+    /// Re-resolve the strip's rows ([`Self::strip_rows_for`] of the live config) after a window frame change.
     #[cfg(any(test, target_os = "linux"))]
     pub(crate) fn sync_strip_header_row(&mut self, settling: WindowId) -> bool {
         self.strip_fall = None;
@@ -1879,9 +1875,6 @@ impl App {
             CloseConfirm::Programmatic => return true,
             CloseConfirm::WireRefuseBusy => {
                 if busy {
-                    // Every consumer of this channel clears it before its own action
-                    // (`apply_tab_cmd_in`, `invoke_menu_action_by_name`), so this
-                    // refusal is never reported against a later `tab` or `invoke`.
                     self.pending_action_refusal = Some(WIRE_CLOSE_REFUSED.to_string());
                 }
                 return !busy;
@@ -1889,9 +1882,6 @@ impl App {
             CloseConfirm::Interactive => {}
         }
         let Some(prompt) = self.destructive_prompt(wid, exits_app, busy, replay) else {
-            // Nothing worth interrupting for (macOS and Linux: app keeps running and nothing is
-            // busy; Windows: nothing is busy and at most one tab closes): the close needs no
-            // confirm.
             return true;
         };
         if cfg!(windows) {
@@ -2502,7 +2492,6 @@ impl App {
             return;
         }
         let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.clone()) else {
-            // Distinct branch.
             return; // headless / not yet attached: nothing to manipulate
         };
         match op {
@@ -2513,8 +2502,6 @@ impl App {
             W::ResizeWindowPixels { height, width } => {
                 #[cfg(target_os = "linux")]
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    // A driven resize owns the geometry from here: the launch
-                    // settle must not re-assert the attach grid over it.
                     ws.initial_frame_settle = None;
                 }
                 let _ =
@@ -2587,7 +2574,6 @@ impl App {
     pub(crate) fn sync_taskbar_progress(&self, wid: WindowId) {
         let hwnd = self.window_hwnd(wid);
         if hwnd == 0 {
-            // Distinct branch.
             return; // headless, or no OS window yet — nothing to reflect onto
         }
         let progress = self
@@ -2753,11 +2739,9 @@ pub(crate) mod taskbar {
         CACHE.with(|c| {
             let mut c = c.borrow_mut();
             if c.applied.get(&hwnd) == Some(&encoded) {
-                // Distinct branch.
                 return; // unchanged since the last frame — do not touch COM
             }
             let Some(obj) = c.object() else {
-                // Distinct branch.
                 return; // no taskbar interface available
             };
             // SAFETY: `obj` is a live `ITaskbarList3` created on this thread and `hwnd` a live
@@ -2774,7 +2758,7 @@ pub(crate) mod taskbar {
         });
     }
 
-    /// Show (`icon` non-zero, with its accessible `description`, NUL-terminated) or clear.
+    /// Show (`icon` non-zero, with its accessible NUL-terminated `description`) or clear the overlay icon.
     pub(crate) fn set_overlay_icon(hwnd: isize, icon: isize, description: &[u16]) -> bool {
         CACHE.with(|c| {
             let Some(obj) = c.borrow_mut().object() else {
@@ -4688,7 +4672,6 @@ mod close_confirm_tests {
         app.present_close_banner(b, busy_close_prompt(), CloseReplay::Window(b));
         assert_eq!(app.answer_close_banner(false), None);
         if cfg!(not(windows)) {
-            // Linux re-asks a window close only while a job runs.
             return;
         }
         let pending = app

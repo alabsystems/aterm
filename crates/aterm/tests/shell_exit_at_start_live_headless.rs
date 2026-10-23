@@ -1,23 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! An interactive shell that fails at start keeps its pane: an rc file that runs `exit 1`,
-//! or a shell whose dylib moved, would otherwise close its only pane, and with it the window
-//! and aterm, with nothing saying why. The pane stays with one line naming the shell and how
-//! it ended, and the instance keeps running.
-//!
-//! The real binary (`launch_isolation::aterm_executable`) under a scratch world
-//! (`support/launch_isolation.rs`), its shell a stub script given by `--shell`:
-//!
-//! * `exit 3` at start: the instance stays up, `text` shows `[zsh ended at start: exit 3]`,
-//!   and `ls` still lists the session;
-//! * a SIGKILL at start: `[fish ended at start: signal 9]`;
-//! * a shell that asks for the device attributes as it starts (as fish and powerlevel10k
-//!   do), reads aterm's answer, then exits 1: `[fish ended at start: exit 1]`, since aterm's
-//!   reply is not anyone's input;
-//! * NEGATIVE CONTROLS: `exit 0` at start, and `-e false`, still end the instance.
-//!
-//! Every wait is for its causal event; the ceiling is for a broken build.
+//! Headless tests for panes whose interactive shell exits at start.
 
 #![cfg(unix)]
 #![allow(
@@ -32,15 +16,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// The ceiling on any one wait: a debug binary booting on a loaded machine.
 const CEILING: Duration = Duration::from_secs(90);
 const POLL: Duration = Duration::from_millis(50);
 
-/// A stub shell called `name` under `root/bin` that runs `body`, already run once: the first
-/// exec of a file this process wrote waits on macOS's assessment of it (seconds with the
-/// assessor busy) and later execs do not, and an installed shell is not a fresh file either.
-/// The pre-run's status is not read: `exit 3` and `kill -KILL $$` end it as they will end
-/// the pane's.
 fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
     let dir = root.join("bin");
     std::fs::create_dir_all(&dir).expect("the stub's directory");
@@ -56,9 +34,6 @@ fn stub_shell(root: &Path, name: &str, body: &str) -> PathBuf {
     path
 }
 
-/// One `aterm ctl` call against `inst`, under the same scratch world; asked again
-/// while the instance has not yet accepted it or answers it busy
-/// ([`headless_boot::until_served`]).
 fn ctl(inst: &headless_boot::Instance, args: &[&str]) -> Output {
     headless_boot::until_served(|| {
         let mut cmd = Command::new(launch_isolation::aterm_executable());
@@ -71,8 +46,6 @@ fn ctl(inst: &headless_boot::Instance, args: &[&str]) -> Output {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let child = cmd.spawn().expect("spawn aterm ctl");
-        // Read until the client exits (`support/child_output.rs`: a sibling's
-        // spawn can hold its pipes open).
         child_output::wait_and_read(child, Instant::now() + CEILING)
             .unwrap_or_else(|| panic!("aterm ctl {args:?} did not exit in time"))
     })
@@ -82,9 +55,6 @@ fn stdout(out: &Output) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-/// Boot with `--shell <stub running body>` and wait for the pane to show
-/// `line`; then the instance must still be running, and `ls` must still list
-/// its one session.
 fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
     let mut inst = headless_boot::boot_with(
         prefix,
@@ -100,9 +70,6 @@ fn kept_with_line(prefix: &str, name: &str, body: &str, line: &str) {
         if text.contains(line) {
             break text;
         }
-        // The exit status says how it ended (a signal, or its own exit code): a
-        // failure on a loaded machine once left only the log's first three lines
-        // and no cause.
         let ended = inst.child.try_wait().expect("poll the instance");
         assert!(
             ended.is_none(),
@@ -147,10 +114,6 @@ fn a_shell_killed_at_start_keeps_its_pane_with_the_signal() {
     );
 }
 
-/// A shell that queried the terminal and got its answer before its rc
-/// failed: the reply aterm wrote does not count as someone using the shell.
-/// The stub reads the first byte of the reply before it exits, so the reply
-/// was written before the exit is judged.
 #[test]
 fn a_shell_that_queried_the_terminal_then_failed_keeps_its_pane() {
     kept_with_line(
@@ -162,9 +125,6 @@ fn a_shell_that_queried_the_terminal_then_failed_keeps_its_pane() {
     );
 }
 
-/// Launch a headless instance over a fresh scratch world with `extra` args and
-/// require it to end by itself, cleanly. No scratch base is COULD NOT RUN
-/// ([`headless_boot::scratch_root`]).
 fn ends_by_itself(prefix: &str, extra: impl FnOnce(&Path, &mut Command)) {
     let root = headless_boot::scratch_root(prefix);
     let log = root.join("gui.log");
@@ -198,8 +158,6 @@ fn ends_by_itself(prefix: &str, extra: impl FnOnce(&Path, &mut Command)) {
     assert!(status.success(), "a clean quit: {status}");
 }
 
-/// NEGATIVE CONTROL: a shell that exits 0 at start closes its pane, and the last pane ends
-/// the instance.
 #[test]
 fn a_shell_that_exits_0_at_start_ends_the_instance_as_before() {
     ends_by_itself("atsx0", |root, cmd| {
@@ -207,8 +165,6 @@ fn a_shell_that_exits_0_at_start_ends_the_instance_as_before() {
     });
 }
 
-/// NEGATIVE CONTROL: `-e false` keeps its documented close ("the window closes
-/// when it exits"), failure or not.
 #[test]
 fn an_exec_command_that_fails_at_once_ends_the_instance_as_before() {
     ends_by_itself("atsxe", |_, cmd| {

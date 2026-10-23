@@ -2,24 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! `cast drift` on the client.
-//!
-//! `aterm ctl [@<sid>] cast drift [max_runs=<k>] [rows=<n>] [seed=…]` asks the
-//! server first. A server that knows the verb answers `OK <n> verdict=…` and
-//! the rows. One that predates it answers the bare `cast` (`OK <nbytes>` and an
-//! asciicast body, no `verdict=`); then, when the binary links the engine
-//! ([`LocalVerbs`]), the client computes the same report from read-only verbs
-//! (`status`, `text`, `cursor`, `modes`, `cast`), so it is safe against a tab
-//! in use. Its header says `computed=client`.
-//!
-//! The offline form reads saved files and needs no socket:
-//! `aterm ctl cast drift --file <cast> [--screen <text>] [--until <t>] [k=v…]`; with no
-//! screen it compares the faithful replay with the stable one (`fidelity=-`).
-//!
-//! The analyzer is injected, not linked: this crate is the dependency-free
-//! client (workspace-only dependencies), and the `aterm` binary, which
-//! links the engine, passes a plain `fn` in
-//! ([`main_entry_with`](crate::main_entry_with)). The standalone dev
-//! `aterm-ctl` says by name that it cannot compute the report.
 
 use std::io::{self, BufReader, Read, Write};
 use std::process::ExitCode;
@@ -31,9 +13,7 @@ use super::{
     stderr_line, stdout_handle, stream_count,
 };
 
-/// Verbs this client answers in-process when its binary links the engine. The
-/// `aterm` binary passes them to [`main_entry_with`](crate::main_entry_with);
-/// the standalone `aterm-ctl` passes [`LocalVerbs::NONE`].
+/// Verbs this client answers in-process when its binary links the engine.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct LocalVerbs {
     /// The `cast drift` analyzer (`aterm_control::cast_drift` behind an adapter).
@@ -74,7 +54,7 @@ pub enum DriftCut {
 
 /// Which aterm made the recording, for the one engine behaviour the replays
 /// must match: the resize undo, under which a flap with no output between its
-/// halves moves nothing. An aterm without it shifts its screen on every flap.
+/// halves moves nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriftPeer {
     /// An aterm older than `cast drift` (the live fallback), and so older than
@@ -108,17 +88,13 @@ pub struct CastDriftJob<'a> {
 }
 
 /// How long the client lets the server's recorder catch up before it reads the
-/// screen. The server's own verb waits on its recording's watermark instead
-/// (`CastRecorder::snapshot_at`); over the wire there is none to wait on, so the
-/// client keeps the 60 ms settle that verb used before.
+/// screen.
 const SETTLE: Duration = Duration::from_millis(60);
 
 /// Consistent-cut attempts before the client proceeds with `cut=racy`.
 const CUT_ATTEMPTS: usize = 3;
 
 /// The request line `[@<selector> ]<verb>` — what its reply is framed by.
-/// `selector` is the session `cast drift`'s requests go to (`@<sid>` / `@.`),
-/// if any.
 fn request_line(selector: Option<&str>, verb: &str) -> String {
     let mut r = String::new();
     if let Some(sel) = selector {
@@ -159,8 +135,6 @@ struct Offline {
 }
 
 /// Split `cast drift`'s tail into the offline flags and the `k=v` arguments.
-/// `Ok(None)`: no flag at all (the live form). A flag without `--file`, an
-/// unknown flag, or a flag missing its value is a usage error.
 fn parse_offline(tail: &[String]) -> io::Result<Option<Offline>> {
     let mut file = None;
     let mut screen = None;
@@ -229,8 +203,7 @@ fn screen_rows(text: &str) -> Vec<String> {
 }
 
 /// The offline form, answered with no socket: `Ok(None)` when `parts` is not
-/// it (the caller goes on to the server). A `@<selector>` with the offline flags is a
-/// usage error: the files are the session.
+/// it (the caller goes on to the server).
 pub(crate) fn offline_entry(parts: &[String], local: &LocalVerbs) -> io::Result<Option<ExitCode>> {
     let (selector, rest) = match parts.first() {
         Some(s) if s.starts_with('@') => (Some(s), &parts[1..]),
@@ -328,7 +301,7 @@ enum Reply {
 }
 
 /// One request on its own connection, its reply read whole by the verb's
-/// framing. An `ERR` reply is an error naming the request ([`Refused`]).
+/// framing.
 fn fetch(
     path: &str,
     origin: TargetOrigin,
@@ -391,8 +364,7 @@ fn fetch(
 }
 
 /// The screen stamp a `status` line carries: its `seq=` and `hash=` values
-/// (parse by key). `None` when it carries neither, or either is `-` (no whole
-/// frame to stamp) — a cut against it cannot be shown quiescent.
+/// (parse by key).
 fn stamp(status: &str) -> Option<(String, String)> {
     let key = |k: &str| {
         status
@@ -451,8 +423,7 @@ struct Material {
 
 /// Read the session the way the server verb does, over the wire: stamp, settle,
 /// read the screen (`text`, `cursor`, `modes`) and the recording (`cast`),
-/// stamp again. An unmoved stamp is a quiescent cut; up to [`CUT_ATTEMPTS`]
-/// tries, then racy.
+/// stamp again.
 fn read_material(
     path: &str,
     origin: TargetOrigin,
@@ -506,18 +477,13 @@ enum Probe {
     Predates,
 }
 
-/// Send `request` (`[@<sid> ]cast drift …\n`) and read the answer. A report
-/// (`OK <n> verdict=…`) is printed header first; an `ERR` goes to stderr as in `exchange`;
-/// a lone byte count is an older server's bare cast, read and dropped.
+/// Send `request` (`[@<sid> ]cast drift …\n`) and read the answer.
 fn probe(
     path: &str,
     origin: TargetOrigin,
     request: &str,
     deadline: Option<Duration>,
 ) -> io::Result<Probe> {
-    // `exchange`'s connect phase ([`converse_served`]): an unaccepted connection is reported
-    // within seconds, and a busy listener's refusal as itself. The fallback's reads
-    // ([`fetch`]) run only once this connection proved the instance is serving.
     let served = converse_served(path, origin, deadline, |stream| {
         if let Some(code) = send_served(&stream, request.as_bytes())? {
             return Ok(Probe::Answered(code));
@@ -550,9 +516,6 @@ fn probe(
             out.flush()?;
             return Ok(Probe::Answered(ExitCode::SUCCESS));
         }
-        // A lone byte count is the bare cast an older server answers for any
-        // `cast <word>` but `frames`: consume it and let the caller compute the
-        // report.
         let n = match (tail.split_whitespace().count(), byte_count(tail)) {
             (1, Some(n)) => n,
             _ => return Err(malformed_header_error(status)),
@@ -600,8 +563,6 @@ fn live_with(
     if let Probe::Answered(code) = probe(path, origin, &request, deadline)? {
         return Ok(code);
     }
-    // This instance took the request: a read that finds it gone is the call's
-    // failure, never a stale entry to move past.
     let origin = origin.settled();
     let Some(analyze) = local.cast_drift else {
         return Err(no_analyzer_error(
@@ -739,8 +700,6 @@ mod tests {
         let listener = UnixListener::bind(&sock).expect("bind");
         let server = std::thread::spawn(move || {
             let mut seen = Vec::new();
-            // 1 probe + 6 reads for the first (quiescent) attempt, then the
-            // no-analyzer probe.
             for _ in 0..8 {
                 let (conn, _) = listener.accept().expect("accept");
                 let mut r = BufReader::new(conn.try_clone().expect("clone"));
@@ -828,7 +787,6 @@ mod tests {
             missing.to_string().contains("/nonexistent.cast"),
             "{missing}"
         );
-        // A readable file: the peer is unknown (a live fallback's peer is refused here).
         let dir = std::env::temp_dir().join(format!("aterm-ctl-offline-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let file = dir.join("saved.cast");

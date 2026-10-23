@@ -23,7 +23,6 @@ pub(crate) enum NativeWindow {
     Wayland { surface: *mut c_void },
 }
 
-/// The window-surface entry points.
 fn window_fns(egl: &EglBinding) -> Result<&'static EglWindowFns, String> {
     static FNS: std::sync::OnceLock<Result<EglWindowFns, String>> = std::sync::OnceLock::new();
     let egl = egl.egl;
@@ -40,7 +39,6 @@ fn window_fns(egl: &EglBinding) -> Result<&'static EglWindowFns, String> {
     .map_err(Clone::clone)
 }
 
-/// `libwayland-egl.so.1`'s three entry points.
 struct WaylandEgl {
     create: unsafe extern "C" fn(*mut c_void, c_int, c_int) -> *mut c_void,
     destroy: unsafe extern "C" fn(*mut c_void),
@@ -48,7 +46,6 @@ struct WaylandEgl {
 }
 
 impl WaylandEgl {
-    /// The process's `libwayland-egl`, opened on first use and never closed.
     fn get() -> Result<&'static WaylandEgl, String> {
         static LIB: std::sync::OnceLock<Result<WaylandEgl, String>> = std::sync::OnceLock::new();
         LIB.get_or_init(Self::open).as_ref().map_err(Clone::clone)
@@ -96,7 +93,6 @@ impl WaylandEgl {
     }
 }
 
-/// The window's half of a post.
 enum Post {
     /// An EGL window surface.
     Egl {
@@ -139,16 +135,12 @@ pub(crate) struct GlWindowSurface {
     _window: Box<dyn std::any::Any + Send + Sync>,
 }
 
-/// A scissor extent past any window's edge (an X11 window is at most 32767 pixels a side).
 const PAST: i32 = 1 << 15;
 
-/// The times a present posts again because its window's size moved between the ask and the swap.
 const REPOSTS: u32 = 2;
 
-/// The failed binds in a row at which a GLX window that bound before is taken as lost.
 const BIND_FAILURES_LOST: u32 = 3;
 
-/// Whether a GLX window's failed bind latches the device lost.
 const fn bind_failure_is_loss(in_a_row: u32, bound_before: bool, context_binds: bool) -> bool {
     !context_binds || !bound_before || in_a_row >= BIND_FAILURES_LOST
 }
@@ -162,7 +154,6 @@ impl std::fmt::Debug for GlWindowSurface {
     }
 }
 
-/// Every RGB888 GLES 3 window config of the display (at most 64).
 fn window_configs(shared: &GlShared, b: &EglBinding) -> Result<Vec<EGLConfig>, String> {
     let egl = b.egl;
     let attribs = [
@@ -197,7 +188,6 @@ fn window_configs(shared: &GlShared, b: &EglBinding) -> Result<Vec<EGLConfig>, S
     Ok(configs[..n].to_vec())
 }
 
-/// One attribute of `config`.
 fn config_attrib(b: &EglBinding, fns: &EglWindowFns, config: EGLConfig, attrib: EGLint) -> EGLint {
     let mut v = 0;
     // SAFETY: A config of this display and a live out-pointer.
@@ -207,7 +197,6 @@ fn config_attrib(b: &EglBinding, fns: &EglWindowFns, config: EGLConfig, attrib: 
     v
 }
 
-/// The configs to try for `native`.
 fn candidate_configs(
     shared: &GlShared,
     b: &EglBinding,
@@ -322,7 +311,6 @@ impl GlWindowSurface {
         })
     }
 
-    /// The EGL window surface for `native` on an EGL device.
     fn egl_post(shared: &GlShared, native: NativeWindow, w: u32, h: u32) -> Result<Post, String> {
         let b = shared
             .egl_binding()
@@ -561,7 +549,6 @@ impl GlWindowSurface {
         }
     }
 
-    /// The X11 window `xid`'s size as the server answers it now (a test's answer in its place).
     fn ask(&self, glx: &super::glx::GlxContext, xid: u64) -> (i32, i32) {
         #[cfg(test)]
         if let Some(size) = self.asked_once.take().or(self.asked_size) {
@@ -572,7 +559,6 @@ impl GlWindowSurface {
     }
 }
 
-/// Copy the stand-in.
 fn draw_standin(
     cur: &super::device::Current<'_>,
     srgb_views: bool,
@@ -668,8 +654,6 @@ impl Drop for GlWindowSurface {
     }
 }
 
-/// Whether a window on a GLX whose server's vendor is `vendor` is posted by readback
-/// ([`Post::Readback`], [`post_override`]).
 fn readback_wanted(vendor: &str, composited: bool, forced: Option<&str>) -> bool {
     match forced {
         Some("readback") => true,
@@ -696,12 +680,10 @@ pub(crate) fn readback_wanted_on(dev: &GlDevice) -> bool {
     readback_wanted(glx.server_vendor(), composited, post_override().as_deref())
 }
 
-/// The `ATERM_GL_POST=readback|window` development seam (trimmed).
 fn post_override() -> Option<String> {
     aterm_types::dev_seam!("ATERM_GL_POST").map(|v| v.to_string_lossy().trim().to_owned())
 }
 
-/// `sink`, once it attached.
 fn attached(mut sink: Box<dyn crate::FrameSink>) -> Option<Box<dyn crate::FrameSink>> {
     match sink.attach() {
         Ok(()) => Some(sink),
@@ -715,7 +697,6 @@ fn attached(mut sink: Box<dyn crate::FrameSink>) -> Option<Box<dyn crate::FrameS
     }
 }
 
-/// Read the rectangle `[x0, y0, x1, y1]`.
 fn read_standin(
     cur: &super::device::Current<'_>,
     fbo: ffi::GLuint,
@@ -767,7 +748,6 @@ fn read_standin(
     Ok(())
 }
 
-/// The `ATERM_GPU_PRESENT_MODE=fifo|immediate` development seam.
 fn present_interval_override() -> Option<i32> {
     let v = aterm_types::dev_seam!("ATERM_GPU_PRESENT_MODE")
         .map(|v| v.to_string_lossy().into_owned())?;

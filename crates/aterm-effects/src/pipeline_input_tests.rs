@@ -6,7 +6,6 @@
 use super::*;
 
 /// The three glow streams after the shipping pipeline hands them to the host.
-/// Equality includes every field, stream boundary and element order.
 #[derive(Debug, PartialEq, Eq)]
 struct GlowFrame<'a> {
     under: &'a [GlowQuad],
@@ -91,9 +90,6 @@ impl Host {
         self.pipeline.cursor.glow.in_flight_tally().credits
     }
 
-    /// The emitted streams, for tests; production keeps `Status::fp` as the cheap idle
-    /// sentinel. Summary counts cannot tell apart equal-sized frames with different geometry,
-    /// color or blend.
     fn glow_frame(&self) -> GlowFrame<'_> {
         GlowFrame::read(&self.input)
     }
@@ -101,8 +97,6 @@ impl Host {
 
 #[test]
 fn web_glyph_classes_reach_the_real_rainbow_renderer() {
-    // The web host probes only the caret row: present the blank row above through that
-    // probe first, then type beneath its observed sky.
     for (ch, class, shifted) in [
         (' ', TypedClass::Space, false),
         ('!', TypedClass::Bang, true),
@@ -122,7 +116,6 @@ fn web_glyph_classes_reach_the_real_rainbow_renderer() {
             host.term.process(b"\x1b[3;5H");
             host.present();
         }
-        // Exercise each class within an established, ink-bearing typed row.
         for prefix in "primer".chars() {
             for host in [&mut web, &mut explicit, &mut historical] {
                 host.note(prefix);
@@ -134,8 +127,6 @@ fn web_glyph_classes_reach_the_real_rainbow_renderer() {
         for _ in 0..16 {
             web.note(ch);
             let width = aterm_grapheme::char_width(ch) as u16;
-            // The web seam heats cadence on every committed key, so both engine-level hosts
-            // get the same heat and only the glyph class tells them apart.
             for host in [&mut explicit, &mut historical] {
                 let now = host.pipeline.now();
                 host.pipeline.cursor.cadence.on_keystroke(now);
@@ -168,8 +159,6 @@ fn web_glyph_classes_reach_the_real_rainbow_renderer() {
                 differs_from_unclassified |= web.glow_frame() != historical.glow_frame();
             }
         }
-        // Space rests the sky and hero classes earn stars, so these differ from the
-        // unclassified route.
         if matches!(
             class,
             TypedClass::Space | TypedClass::Bang | TypedClass::Capital
@@ -194,8 +183,6 @@ fn web_non_text_intents_preserve_or_retire_the_existing_credit_pool() {
         (PetInputKind::KillForward, 0),
     ] {
         let mut host = Host::new(Instant::now());
-        // Two writes in flight, one narrow and one wide: deleting the newest retires its
-        // two-cell credit and keeps the earlier key's; a line kill retires both.
         host.note('a');
         host.note('界');
         assert_eq!(host.credits(), 3);
@@ -205,7 +192,6 @@ fn web_non_text_intents_preserve_or_retire_the_existing_credit_pool() {
         assert_eq!(host.pipeline.pending_keys, 0, "no deferred typed replay");
         assert_eq!(host.pipeline.cursor_pet_console_input_seq(), seq + 1);
         assert_eq!(host.pipeline.cursor_pet_console_input_kind(), Some(kind));
-        // Cadence advancement must not quietly recreate credit for this key.
         host.pipeline.advance(16.0);
         assert_eq!(host.credits(), remaining, "after rAF: {kind:?}");
     }
@@ -238,7 +224,6 @@ fn web_delete_dispatch_reaches_erase_without_a_typed_replay() {
     assert_eq!(host.credits(), 0);
     assert_eq!(host.pipeline.pending_keys, 0);
 
-    // Negative control: a plain typed press for the same Backspace, through the real queue.
     host.pipeline.note_keystroke();
     host.pipeline.advance(16.0);
     assert_eq!(host.credits(), 1, "historical route mints false credit");
@@ -254,8 +239,6 @@ fn web_accepted_printables_conform_to_the_existing_input_credit_model() {
         let expected = model.successors("PressArmsLicense", &state);
         assert_eq!(expected.len(), 1);
         let mut projected = expected[0].clone();
-        // Bind the admission/budget portion of the existing model: no echo
-        // has arrived, so all accepted one-cell presses remain unpaid.
         projected.insert(
             "arms",
             i64::try_from(host.pipeline.cursor_pet_console_input_seq()).unwrap(),

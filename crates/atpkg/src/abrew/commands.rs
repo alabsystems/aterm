@@ -3381,22 +3381,10 @@ impl LongLister {
     }
 
     fn offset_at(&mut self, secs: i64) -> i64 {
-        *self.offsets.entry(secs).or_insert_with(|| {
-            let mut date = aterm_uds::spawnfd::command("/bin/date");
-            if cfg!(any(
-                target_os = "macos",
-                target_os = "freebsd",
-                target_os = "openbsd"
-            )) {
-                date.arg("-r").arg(secs.to_string());
-            } else {
-                date.arg("-d").arg(format!("@{secs}"));
-            }
-            let Ok(out) = date.arg("+%z").output() else {
-                return 0;
-            };
-            parse_zone_offset(&String::from_utf8_lossy(&out.stdout)).unwrap_or(0)
-        })
+        *self
+            .offsets
+            .entry(secs)
+            .or_insert_with(|| aterm_uds::zone::local_offset_at(secs).unwrap_or(0))
     }
 
     fn date(&mut self, mtime: i64) -> String {
@@ -3502,23 +3490,6 @@ fn mode_string(meta: &std::fs::Metadata) -> String {
         out.extend(chars);
     }
     out
-}
-
-#[cfg(unix)]
-fn parse_zone_offset(text: &str) -> Option<i64> {
-    let text = text.trim();
-    let (sign, digits) = match text.as_bytes().first()? {
-        b'+' => (1i64, &text[1..]),
-        b'-' => (-1i64, &text[1..]),
-        _ => return None,
-    };
-    if digits.len() < 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let hours: i64 = digits.get(..2)?.parse().ok()?;
-    let minutes: i64 = digits.get(2..4)?.parse().ok()?;
-    let seconds: i64 = digits.get(4..6).and_then(|s| s.parse().ok()).unwrap_or(0);
-    Some(sign * (hours * 3_600 + minutes * 60 + seconds))
 }
 
 fn list_json(prefix: &Prefix, rest: &[String]) -> ExitCode {
@@ -4442,7 +4413,7 @@ pub(super) fn cmd_log(prefix: &Prefix, rest: &[String]) -> ExitCode {
         for t in tap::list(prefix) {
             println!("==> tap {}", t.name());
             let _ = fetch::run_inherit(
-                "git",
+                aterm_uds::os_path!("git"),
                 &["-C", &t.path.to_string_lossy(), "log", "--oneline", "-5"],
             );
         }
@@ -5211,11 +5182,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn long_listing_dates_keep_each_instants_offset_and_handle_extreme_ages() {
-        assert_eq!(parse_zone_offset("+0530\n"), Some(19_800));
-        assert_eq!(parse_zone_offset("-0800"), Some(-28_800));
-        assert_eq!(parse_zone_offset("+0000"), Some(0));
-        assert_eq!(parse_zone_offset("UTC"), None);
-
         const NOW: i64 = 1_800_000_000;
         const OLD: i64 = NOW - 400 * 86_400;
         const BEFORE: i64 = 1_710_063_000;

@@ -160,21 +160,19 @@ fn a_processs_ids_start_and_age_are_the_ones_ps_prints() {
 /// up from every process that held still, over one read of the kernel's
 /// records, names the owner the walk over `ps -A -o pid=,ppid=,tty=,comm=`
 /// names; the fixtures — a stand-in leading a terminal this process opened,
-/// a `sleep` on the pty `script` opened, a child on no terminal — are always
-/// compared, live too, and so is the two-process opener read.
+/// a `sleep` on the pty another process ([`pty_host`]) opened, a child on no
+/// terminal — are always compared, live too, and so is the two-process opener
+/// read.
 #[test]
 fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     use aterm_sysprobe::kproc;
+    use std::ffi::OsStr;
     let me = std::process::id();
     let mut led = tty_agent(&[], None);
     let mut plain = parked().spawn().expect("spawn");
-    let mut script = Command::new("/usr/bin/script")
-        .args(["-q", "/dev/null", "/bin/sleep", "120"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+    let mut script = pty_host(&["/bin/sleep", "120"].map(OsStr::new))
         .spawn()
-        .expect("spawn script");
+        .expect("spawn the pty host");
     let start = Instant::now();
     let slept = loop {
         if let Some((pid, _, _)) = table()
@@ -185,10 +183,11 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
         }
         assert!(
             start.elapsed() < HANG,
-            "script's sleep: not within {HANG:?}"
+            "the pty host's sleep: not within {HANG:?}"
         );
         std::thread::yield_now();
     };
+    let host = ps_name(script.id()).expect("the host, as ps names it");
     let walk = |rows: &[kproc::Record]| -> BTreeMap<u32, Option<u32>> {
         let t: Vec<(u32, u32, String, String)> = rows
             .iter()
@@ -247,14 +246,16 @@ fn the_terminals_owner_and_opener_are_the_ones_ps_reads() {
     );
     assert_eq!(
         live[1].1.as_ref().map(|(o, n)| (*o, n.as_str())),
-        Some((script_id, "script"))
+        Some((script_id, host.as_str())),
+        "the pty's owner is the process that opened it, not this one"
     );
+    assert_ne!(script_id, me);
     assert_eq!(
         opened[0].0,
         live[0].1.clone().map(|(_, n)| n),
         "the same opener"
     );
-    assert_eq!(opened[1].0.as_deref(), Some("script"));
+    assert_eq!(opened[1].0.as_deref(), Some(host.as_str()));
     assert!(
         compared * 2 >= oracle.len(),
         "{compared} of {} rows compared",

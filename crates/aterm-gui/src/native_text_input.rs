@@ -2,19 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! Grapheme-safe native text-field state shared by Settings and document apps.
-//!
-//! IME preedit is transient and never mutates the committed value. A commit, paste,
-//! deletion, or replacement becomes one local undo frame. Selection is represented in
-//! canonical UTF-8 byte offsets but every public mutation clamps to grapheme boundaries.
 
 use std::ops::Range;
 
 use aterm_grapheme::GraphemeClusters;
 
 const HISTORY_LIMIT: usize = 100;
-/// A native field is deliberately small compared with a document buffer.  The
-/// cap bounds paste/IME history and every accessibility projection while still
-/// leaving ample room for long font fallback and search expressions.
+/// Maximum byte length of a native text input field.
 pub(crate) const MAX_TEXT_INPUT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,8 +41,7 @@ pub(crate) struct ImePreedit {
     pub(crate) selection: Option<Range<usize>>,
 }
 
-/// One immutable field projection consumed by paint and accessibility.
-/// Offsets address `text` in UTF-8 bytes and are always grapheme boundaries.
+/// Immutable field projection consumed by paint and accessibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TextInputProjection {
     pub(crate) text: String,
@@ -146,8 +139,7 @@ impl TextInputState {
         self.preedit = None;
     }
 
-    /// Caret one WORD left (⌥← / ⌥B). Mirrors [`Self::move_left`]'s
-    /// selection discipline exactly — only the step differs.
+    /// Move caret one word left (⌥← / ⌥B).
     pub(crate) fn move_word_left(&mut self, extend: bool) {
         let head = previous_word_boundary(&self.value, self.selection.head);
         if extend {
@@ -169,8 +161,7 @@ impl TextInputState {
         self.preedit = None;
     }
 
-    /// Caret to the start of the value (readline/macOS Ctrl-A); `extend` keeps
-    /// the anchor so Shift-variants grow the selection instead.
+    /// Move caret to the start of the value (Ctrl-A).
     pub(crate) fn move_to_start(&mut self, extend: bool) {
         if extend {
             self.selection.head = 0;
@@ -190,8 +181,7 @@ impl TextInputState {
         self.preedit = None;
     }
 
-    /// Readline Ctrl-K: delete from the caret (the selection start when a range
-    /// is active) to the end of the value, as one undo frame.
+    /// Delete from the caret (or selection start) to the end of the value as one undo frame (Ctrl-K).
     pub(crate) fn kill_to_end(&mut self) {
         let start = self.selection.range().start;
         self.selection = TextSelection {
@@ -201,8 +191,7 @@ impl TextInputState {
         self.replace_selection("");
     }
 
-    /// Readline Ctrl-U: delete from the start of the value to the caret (the
-    /// selection end when a range is active), as one undo frame.
+    /// Delete from the start of the value to the caret (or selection end) as one undo frame (Ctrl-U).
     pub(crate) fn kill_to_start(&mut self) {
         let end = self.selection.range().end;
         self.selection = TextSelection {
@@ -212,8 +201,7 @@ impl TextInputState {
         self.replace_selection("");
     }
 
-    /// Readline Ctrl-W: delete the whitespace-delimited word before the caret
-    /// (an active selection is deleted as-is), as one undo frame.
+    /// Delete the whitespace-delimited word before the caret (or active selection) as one undo frame (Ctrl-W).
     pub(crate) fn delete_word_backward(&mut self) {
         if self.selection.is_caret() {
             self.selection.anchor = previous_word_boundary(&self.value, self.selection.head);
@@ -275,16 +263,13 @@ impl TextInputState {
         true
     }
 
-    /// Paint projection with preedit inserted at the committed selection. Returned
-    /// preedit range can be underlined without making it part of the stored value.
+    /// Paint projection with preedit inserted at the committed selection.
     pub(crate) fn display_projection(&self) -> (String, Option<Range<usize>>) {
         let projection = self.projection();
         (projection.text, projection.preedit)
     }
 
-    /// Project committed text, marked text, selection, and caret exactly once.
-    /// During composition the IME-local selection becomes the visible selection;
-    /// the replaced committed range is not painted behind marked text.
+    /// Project committed text, marked text, selection, and caret.
     pub(crate) fn projection(&self) -> TextInputProjection {
         let Some(preedit) = &self.preedit else {
             return TextInputProjection {
@@ -347,8 +332,7 @@ impl TextInputState {
     }
 }
 
-/// Preserve winit's UTF-8 selection convention for every native composition.
-/// Invalid ranges remain absent; valid scalar boundaries clamp to graphemes.
+/// Clamp valid UTF-8 preedit selection ranges to grapheme boundaries.
 pub(crate) fn normalize_preedit_selection(
     text: &str,
     selection: Option<Range<usize>>,
@@ -400,10 +384,6 @@ fn previous_grapheme(text: &str, position: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// The byte offset where the whitespace-delimited word before `position`
-/// begins: skip the trailing whitespace run, then the word run (readline
-/// Ctrl-W semantics). Clamped to a grapheme boundary so the deletion can
-/// never split a cluster.
 fn previous_word_boundary(text: &str, position: usize) -> usize {
     let before = &text[..nearest_boundary(text, position)];
     let word_end = before.trim_end().len();
@@ -413,9 +393,6 @@ fn previous_word_boundary(text: &str, position: usize) -> usize {
     nearest_boundary(text, start)
 }
 
-/// Forward word boundary (⌥→ / ⌥F): skip leading whitespace and the following
-/// non-whitespace run to land at the end of the next word, clamped to a grapheme
-/// boundary.
 fn next_word_boundary(text: &str, position: usize) -> usize {
     let start = nearest_boundary(text, position);
     let after = &text[start..];
@@ -502,15 +479,12 @@ mod tests {
         let projection = input.projection();
         assert_eq!(projection.text, "ae\u{301}日b");
         assert_eq!(projection.preedit, Some(1..7));
-        // The platform range landed inside the combining cluster and is clamped
-        // back to the nearest complete grapheme.
         assert_eq!(projection.selection, TextSelection { anchor: 1, head: 4 });
     }
 
     #[test]
     fn readline_home_end_and_kills_edit_at_the_caret() {
         let mut input = TextInputState::new("alpha beta".into());
-        // Ctrl-A / Ctrl-E: caret to the ends; the Shift variants extend.
         input.move_to_start(false);
         assert_eq!(input.selection(), &TextSelection::caret(0));
         input.move_to_end(false);
@@ -518,7 +492,6 @@ mod tests {
         input.move_to_start(true);
         assert_eq!(input.selected_text(), "alpha beta");
 
-        // Ctrl-K: kill from the caret to the end — one undoable frame.
         input.set_selection(5, 5);
         input.kill_to_end();
         assert_eq!(input.value(), "alpha");
@@ -526,14 +499,11 @@ mod tests {
         assert!(input.undo());
         assert_eq!(input.value(), "alpha beta");
 
-        // Ctrl-U: kill from the start to the caret.
         input.set_selection(6, 6);
         input.kill_to_start();
         assert_eq!(input.value(), "beta");
         assert_eq!(input.selection(), &TextSelection::caret(0));
 
-        // Ctrl-K with the caret already at the end is a true no-op: no value
-        // change and no phantom undo frame.
         let mut idle = TextInputState::new("x".into());
         idle.move_to_end(false);
         idle.kill_to_end();
@@ -550,23 +520,19 @@ mod tests {
         assert_eq!(input.value(), "one ");
         input.delete_word_backward();
         assert_eq!(input.value(), "");
-        // Empty field: a further Ctrl-W is inert.
         input.delete_word_backward();
         assert_eq!(input.value(), "");
 
-        // A mid-word caret deletes only back to the word start.
         let mut input = TextInputState::new("hello world".into());
         input.set_selection(8, 8);
         input.delete_word_backward();
         assert_eq!(input.value(), "hello rld");
 
-        // An active selection deletes exactly the selection.
         let mut input = TextInputState::new("alpha beta".into());
         input.set_selection(2, 4);
         input.delete_word_backward();
         assert_eq!(input.value(), "ala beta");
 
-        // A cluster-heavy word is removed whole, never split.
         let mut input = TextInputState::new("cat 👩‍💻e\u{301}".into());
         input.delete_word_backward();
         assert_eq!(input.value(), "cat ");
@@ -583,7 +549,6 @@ mod tests {
         assert!(!input.value().ends_with('e'));
     }
 
-    /// Verify ⌥→ lands at the end of the next word and ⌥← round-trips to the start.
     #[test]
     fn alt_word_motion_walks_whole_words_and_round_trips() {
         let mut input = TextInputState::new("hello brave world".into());
@@ -602,7 +567,6 @@ mod tests {
             "⌥→ must cross to the end of 'brave'"
         );
 
-        // ROUND TRIP: back over the word we just crossed.
         input.move_word_left(false);
         assert_eq!(
             input.selection().head,
@@ -610,7 +574,6 @@ mod tests {
             "⌥← must land at the START of 'brave'"
         );
 
-        // Clamped at both ends — no panic, no runaway.
         input.set_selection(0, 0);
         input.move_word_left(false);
         assert_eq!(input.selection().head, 0, "⌥← at the start is inert");
@@ -619,7 +582,6 @@ mod tests {
         input.move_word_right(false);
         assert_eq!(input.selection().head, end, "⌥→ at the end is inert");
 
-        // `extend` grows the selection instead of collapsing it.
         input.set_selection(0, 0);
         input.move_word_right(true);
         assert!(

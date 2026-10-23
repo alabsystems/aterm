@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The in-terminal halves of the arena lanes: `aterm-verify --arena-inner <verb> …`,
-//! the program each terminal under test runs with `-e`. Everything arrives as
-//! argv (environment does not survive `open -na`, which is how ghostty is
-//! launched), and each half answers on the runner's report socket — the
-//! runner waits on that report, never on a file.
-//!
-//! * `drain <corpus> <report-sock>`: stamp, `cat` the corpus to the terminal,
-//!   report `drain <seconds>`.
-//! * `vte <vtebench> <benchmarks> <prefix> <max-secs> <report-sock>`: read the
-//!   grid the terminal gave (`stty size`), run vtebench into `<prefix>.dat`,
-//!   report `vte <rows> <cols>`.
+//! In-terminal `drain` and `vte` halves for the arena performance lanes.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -72,14 +62,14 @@ fn drain(corpus: &Path) -> Result<String, String> {
     Ok(format!("drain {secs:.6}"))
 }
 
-/// Run vtebench in this terminal; report the grid it ran at.
+/// Run vtebench in this terminal.
 fn vte(
     vtebench: &Path,
     benchmarks: &Path,
     prefix: &Path,
     max_secs: &str,
 ) -> Result<String, String> {
-    let size = command("stty")
+    let size = command(aterm_uds::os_path!("stty"))
         .arg("size")
         .stdin(Stdio::inherit())
         .output()
@@ -96,7 +86,6 @@ fn vte(
     if !status.success() {
         return Err(format!("vtebench exited {status}"));
     }
-    // vtebench writes its --dat in one pass at the very end, not atomically.
     std::fs::rename(&part, prefix.with_extension("dat"))
         .map_err(|e| format!("could not place the .dat: {e}"))?;
     Ok(format!("vte {grid}"))

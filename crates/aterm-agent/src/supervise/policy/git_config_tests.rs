@@ -19,7 +19,7 @@ impl Scratch {
 
 fn git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        Command::new("git")
+        Command::new(aterm_uds::os_path!("git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -709,7 +709,7 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     let empty = r.0.path().join("empty.cfg");
     std::fs::write(&empty, "").unwrap();
     let hidden = aterm_uds::deadline::output_until(
-        Command::new("git")
+        Command::new(aterm_uds::os_path!("git"))
             .args(["config", "--list"])
             .current_dir(r.0.path())
             .env("GIT_CONFIG", &empty),

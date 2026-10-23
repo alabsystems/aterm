@@ -3,8 +3,6 @@
 
 use super::{Wake, parse_seed_line};
 
-/// `net-starting:` raises its event from a single line: it arrives before the multi-GB
-/// download, not with the output after it. A quiet line raises nothing.
 #[test]
 fn a_streamed_start_marker_raises_the_started_wake() {
     let started = parse_seed_line(
@@ -25,12 +23,10 @@ fn a_streamed_start_marker_raises_the_started_wake() {
         }
         other => panic!("expected PkgSeedStarted, got {other:?}"),
     }
-    // The completion marker still resolves line-at-a-time…
     match parse_seed_line("atpkg: net-installed: claude, codex") {
         Some(Wake::PkgSeed { installed }) => assert_eq!(installed, ["claude", "codex"]),
         other => panic!("expected PkgSeed, got {other:?}"),
     }
-    // …and ordinary chatter raises nothing at all.
     assert!(parse_seed_line("atpkg: the store already holds the ALab toolset").is_none());
     assert!(
         parse_seed_line("atpkg: net-starting: ").is_none(),
@@ -38,8 +34,6 @@ fn a_streamed_start_marker_raises_the_started_wake() {
     );
 }
 
-/// The informational markers resolve line by line with or without the `atpkg: ` prefix,
-/// and an empty body raises nothing. A coherence group's abort is a terminal Warn row.
 #[test]
 fn the_abort_marker_parses_and_classifies() {
     let aborted = parse_seed_line(
@@ -73,7 +67,6 @@ fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
         Some(Wake::PkgMachineSettings(body)) => assert_eq!(body, machine),
         other => panic!("expected PkgMachineSettings, got {other:?}"),
     }
-    // A refusal, or a write that did not land (exit 0, said on stdout), is an answer.
     match parse_seed_line(&format!(
         "{}HOME is /tmp/x but this account's home is /Users//y",
         atpkg::cli::MACHINE_NOT_APPLIED_PREFIX
@@ -103,8 +96,6 @@ fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
         parse_seed_line("atpkg: claude: managed 2.1.280 — Anthropic latest").is_none(),
         "a plain state line is not a marker"
     );
-    // `machine-state:` is an event (`PkgMachineState`, the status's newest state), never a
-    // row, and never mistaken for the change marker sharing its prefix.
     match parse_seed_line(&format!(
         "atpkg: {}universal-control=disabled; policy=off; home=account",
         atpkg::cli::MACHINE_STATE_MARKER
@@ -117,8 +108,6 @@ fn the_r6_markers_raise_their_wakes_with_or_without_the_atpkg_prefix() {
     }
 }
 
-/// `appnotice` text is recorded: marker-shaped toolchain text as that marker, other
-/// text on the named lane; no row, reply `recorded`; a bad lane is refused.
 #[test]
 fn appnotice_text_is_recorded() {
     let mut app = super::App::headless_for_test();
@@ -165,7 +154,6 @@ fn appnotice_text_is_recorded() {
             && texts.contains(&"an operator's note"),
         "{texts:?}"
     );
-    // Harness notes are records, never rows.
     let before = app.messages.log().len();
     assert_eq!(
         app.take_app_notice("harness", "aterm harness acting \u{00b7} approving rm"),
@@ -181,8 +169,6 @@ fn appnotice_text_is_recorded() {
     assert!(app.take_app_notice("elsewhere", "x").is_err());
 }
 
-/// The marker prefixes are atpkg's constants; this exercises the wiring, network lane
-/// included.
 #[test]
 fn every_atpkg_marker_constant_has_a_wake_arm() {
     use super::parse_seed_line;
@@ -219,7 +205,6 @@ fn every_atpkg_marker_constant_has_a_wake_arm() {
              with no answer leaves its notice on screen forever"
         );
     }
-    // The network lane's arrival renders as an install.
     match parse_seed_line(&format!(
         "atpkg: {}ay, clean",
         atpkg::cli::NET_INSTALLED_MARKER
@@ -227,13 +212,9 @@ fn every_atpkg_marker_constant_has_a_wake_arm() {
         Some(Wake::PkgSeed { installed, .. }) => assert_eq!(installed, ["ay", "clean"]),
         other => panic!("expected PkgSeed for the network lane, got {other:?}"),
     }
-    // An empty tail is not an event.
     assert!(parse_seed_line(&format!("atpkg: {}", atpkg::cli::SEED_FAILED_MARKER)).is_none());
 }
 
-/// A `machine-settings:` line followed by its `machine-state:` record posts both, in
-/// order; a change with no record by EOF also posts `PkgMachineRecordMissing`; a
-/// record alone posts no fallback.
 #[test]
 fn a_machine_change_is_answered_by_the_records_behind_it_or_by_a_fallback() {
     let change = format!(
@@ -278,8 +259,6 @@ fn a_machine_change_is_answered_by_the_records_behind_it_or_by_a_fallback() {
     );
 }
 
-/// The store-lock wait line raises its own wake (prefix stripped, empty tail nothing)
-/// and is neither a start nor an answer.
 #[test]
 fn a_lock_wait_marker_is_neither_a_start_nor_an_answer() {
     use super::{PassVerdict, classify_pass_exit};
@@ -303,9 +282,6 @@ fn a_lock_wait_marker_is_neither_a_start_nor_an_answer() {
     }
     assert!(parse_seed_line(&format!("atpkg: {}", atpkg::cli::LOCK_WAITING_MARKER)).is_none());
     assert_eq!(atpkg::cli::LOCK_WAITING_MARKER, "lock-waiting: ");
-    // Through `read_seed_markers`: the wait sets neither `saw_start` nor `saw_terminal`,
-    // so "waited, then ran quietly" is the healthy verdict and "waited, timed out" is
-    // deferred.
     use super::read_seed_markers;
     let read = |stdout: &str| read_seed_markers(stdout.as_bytes(), |_| {});
     let seen = read(&format!("{line}\n"));
@@ -324,8 +300,6 @@ fn a_lock_wait_marker_is_neither_a_start_nor_an_answer() {
         PassVerdict::Busy,
         "waited, then timed out: deferred, never failed"
     );
-    // …and a timed-out wait that says so (`seed-busy:`, the same exit 75) is still
-    // deferred, never a pass that ran.
     let busy = read(&format!(
         "{line}\natpkg: {}another atpkg process holds the store lock\n",
         atpkg::cli::SEED_BUSY_MARKER
@@ -358,8 +332,6 @@ fn a_lock_wait_marker_is_neither_a_start_nor_an_answer() {
         classify_pass_exit(Some(1), answered.saw_start, answered.saw_terminal),
         PassVerdict::Answered
     );
-    // `lock-acquired:` likewise: its own wake, neither start nor answer, and the wait
-    // stays seen for the lane's exit bookkeeping.
     let acquired_line = format!(
         "atpkg: {}the other process finished \u{2014} running now",
         atpkg::cli::LOCK_ACQUIRED_MARKER

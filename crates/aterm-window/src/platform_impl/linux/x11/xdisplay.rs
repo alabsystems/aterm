@@ -4,12 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/xdisplay.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// LOCAL PATCH (aterm): the libraries, the XCB connection under Xlib's display and the resource
-// database are aterm-x11's, where upstream used x11-dl and x11rb. The server timestamp cache is
-// gone with the startup-notification flow. A broken connection ends the event loop, not the process
-// (`install_io_error_exit_handler`). With no XSETTINGS manager no window is watched (upstream
-// selected events on window 0). SYNC is initialised for the resize sync counters.
-
 use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::OsString;
@@ -80,8 +74,7 @@ pub struct XConnection {
 
     pub latest_error: Mutex<Option<XError>>,
     pub cursor_cache: Mutex<HashMap<CursorIcon, ffi::Cursor>>,
-    /// The last resource id admitted for a DND conversion. The display outlives event loops:
-    /// a later loop must not reuse a requestor an earlier source still names.
+    /// The last resource id admitted for a DND conversion.
     dnd_requestor_high: AtomicU32,
 
     /// How the cursors follow the resource database's theme and size (`follow_cursor_settings`).
@@ -438,7 +431,7 @@ pub enum ConnectionEnd {
 }
 
 impl ConnectionEnd {
-    /// The end of a connection whose libxcb `status` is this, whose Xlib has (`xlib_io_error`) or has not found it broken, and whose socket the loop's poll saw hang up or fail (`hung_up`); `None` while it holds. libxcb's word comes first: it is the one that read and wrote the socket.
+    /// The end of a connection whose libxcb `status` is this, whose Xlib has (`xlib_io_error`) or has not found it broken, and whose socket the loop's poll saw hang up or fail (`hung_up`); `None` while it holds.
     pub(crate) fn of(
         status: Result<(), aterm_x11::Error>,
         xlib_io_error: bool,
@@ -666,10 +659,7 @@ mod tests {
 
     use super::{socket_end, ConnectionEnd};
 
-    /// [`socket_end`] once a closed peer's close has reached `fd`. A child another test forks
-    /// while the peer is open holds a copy of it until its exec closes it (`SOCK_CLOEXEC`), and
-    /// only then does the close come here: one run in 40 of the crate's suite, beside
-    /// `gone_tests`' children, read the closed peer as live.
+    /// [`socket_end`] once a closed peer's close has reached `fd`.
     fn once_closed(fd: std::os::raw::c_int) -> std::io::Error {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {

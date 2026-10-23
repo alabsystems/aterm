@@ -276,9 +276,7 @@ impl Parser {
         }
     }
 
-    /// Read `input` inside an open tmux passthrough wrapper (`crate::tmux`)
-    /// up to and including its next ESC, or the ESC's follower when one is
-    /// pending, handing the state machine the payload unwrapped.
+    /// Read `input` inside an open tmux passthrough wrapper (`crate::tmux`).
     fn advance_unwrapping<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
         if self.tmux == TmuxPassthrough::Escape {
             let Some((&byte, rest)) = input.split_first() else {
@@ -288,9 +286,6 @@ impl Parser {
                 b'\\' => {
                     self.tmux = TmuxPassthrough::Off;
                     if self.dcs_st_pending {
-                        // The payload already supplied its ESC: finish that
-                        // pending string terminator without canceling it with
-                        // another ESC.
                         self.advance_plain(b"\\", sink);
                     } else if matches!(
                         self.state,
@@ -330,10 +325,7 @@ impl Parser {
         }
     }
 
-    /// The state machine over `input` as it arrived. Returns the rest
-    /// unread when a tmux passthrough wrapper opens (outside a wrapper only:
-    /// one opens no other), so [`Self::advance_fast`] reads it through the
-    /// wrapper; otherwise nothing.
+    /// The state machine over `input` as it arrived.
     fn advance_plain<'a, S: ActionSink>(&mut self, input: &'a [u8], sink: &mut S) -> &'a [u8] {
         let mut remaining = input;
         let wrapped = self.tmux.is_open();
@@ -454,8 +446,7 @@ impl Parser {
         self.process_byte_inner(byte, sink);
     }
 
-    /// Bulk fast paths for the three string states, extracted from
-    /// `advance_fast` (see the call site).
+    /// Bulk fast paths for the three string states.
     fn advance_string_states_bulk<'a, S: ActionSink>(
         &mut self,
         mut remaining: &'a [u8],
@@ -561,9 +552,7 @@ impl Parser {
         self.push_current_param(self.last_was_colon);
     }
 
-    /// Collect an intermediate byte (dropped past `MAX_INTERMEDIATES`). Not
-    /// named `collect`: Trust's unbounded-allocation recognizer would take it
-    /// for `Iterator::collect`.
+    /// Collect an intermediate byte (dropped past `MAX_INTERMEDIATES`).
     #[inline]
     fn collect_intermediate(&mut self, byte: u8) {
         if self.intermediates.len() < MAX_INTERMEDIATES {
@@ -589,8 +578,7 @@ impl Parser {
         }
     }
 
-    /// Split an OSC payload on `;` in one forward scan and dispatch it. Takes
-    /// `&[u8]`, not `&mut self`: it mutates no parser state.
+    /// Split an OSC payload on `;` in one forward scan and dispatch it.
     fn parse_and_dispatch_osc<S: ActionSink>(data: &[u8], sink: &mut S, bel_terminated: bool) {
         let Some(k) = data.iter().position(|&b| b == b';') else {
             let params: [&[u8]; 1] = [data];
@@ -700,7 +688,6 @@ impl Parser {
     #[inline]
     pub(crate) fn decode_multibyte_char(lead: u8, rem: &[u8]) -> Option<(char, usize)> {
         if lead >= 0xF0 {
-            // 4-byte: SMP characters (emoji, math symbols)
             if let &[c0, c1, c2, ..] = rem
                 && (c0 & 0xC0) == 0x80
                 && (c1 & 0xC0) == 0x80
@@ -711,17 +698,14 @@ impl Parser {
                     | (u32::from(c1 & 0x3F) << 6)
                     | u32::from(c2 & 0x3F);
                 if (0x10000..=0x0010_FFFF).contains(&cp) {
-                    // The range guard makes `from_u32` always `Some`.
                     char::from_u32(cp).map(|c| (c, 3))
                 } else {
-                    // Overlong, or past U+10FFFF
                     None
                 }
             } else {
                 None
             }
         } else if lead >= 0xE0 {
-            // 3-byte: BMP non-ASCII (CJK, Hangul, Greek, Cyrillic, etc.)
             if let &[c0, c1, ..] = rem
                 && (c0 & 0xC0) == 0x80
                 && (c1 & 0xC0) == 0x80
@@ -730,8 +714,6 @@ impl Parser {
                     | (u32::from(c0 & 0x3F) << 6)
                     | u32::from(c1 & 0x3F);
                 if cp >= 0x800 && !(0xD800..=0xDFFF).contains(&cp) {
-                    // Guards: >= 0x800 (not overlong), not a surrogate,
-                    // <= 0xFFFF (lead < 0xF0) — `from_u32` is always `Some`.
                     char::from_u32(cp).map(|c| (c, 2))
                 } else {
                     None
@@ -740,13 +722,11 @@ impl Parser {
                 None
             }
         } else {
-            // 2-byte: Latin extensions, IPA, etc. (U+0080-U+07FF)
             if let &[c0, ..] = rem
                 && (c0 & 0xC0) == 0x80
             {
                 let cp = (u32::from(lead & 0x1F) << 6) | u32::from(c0 & 0x3F);
                 if cp >= 0x80 {
-                    // 0x80..=0x7FF are all valid Unicode scalar values.
                     char::from_u32(cp).map(|c| (c, 1))
                 } else {
                     None

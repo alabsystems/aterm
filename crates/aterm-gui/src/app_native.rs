@@ -375,7 +375,7 @@ impl NativeUpdateReconcileTicket {
         self.request_sequence
     }
 
-    /// Test-only ticket for hand-built worker facts, so a conformance test can feed the real reducer the disk a failed candidate leaves behind.
+    /// Test-only ticket for hand-built worker facts.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn for_test(request_sequence: u64) -> Self {
@@ -417,7 +417,7 @@ pub(crate) struct NativeUpdateReconcileFacts {
     pub(crate) installable: Option<bool>,
 }
 
-/// One retire of a latched installed activation for a newer verified release (`App::request_activation_supersede`).
+/// One retire of a latched installed activation for a newer verified release.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActivationSupersedeJob {
     pub(crate) current_build: u64,
@@ -777,7 +777,7 @@ const SUPERSEDE_RETRY_AFTER: std::time::Duration = std::time::Duration::from_sec
 
 const SUPERSEDE_RETRY_CEILING: std::time::Duration = std::time::Duration::from_secs(2 * 60 * 60);
 
-/// The wait before a refused release is offered again after `refusals` consecutive refusals (1 = the first).
+/// The wait before a refused release is offered again after `refusals` consecutive refusals.
 pub(crate) fn supersede_retry_after(refusals: u32) -> std::time::Duration {
     let doublings = refusals.saturating_sub(1).min(8);
     SUPERSEDE_RETRY_AFTER
@@ -897,8 +897,7 @@ impl PhysicalFailureShape {
         }
     }
 
-    /// Did the successor image run and decide, or did something end a candidate that never got
-    /// that far?
+    /// Did the successor image run and decide, or did something end a candidate that never got that far?
     #[must_use]
     #[cfg(unix)]
     pub(crate) fn of_child_death(death: crate::ChildDeathEvidence) -> Self {
@@ -920,7 +919,7 @@ impl PhysicalFailureShape {
         }
     }
 
-    /// The shape of a failure booked from the cached pre-park verdict (`try_pending_native_auto_apply`).
+    /// The shape of a failure booked from the cached pre-park verdict.
     #[must_use]
     pub(crate) fn cached_refusal_shape(reason: Option<&str>) -> Self {
         match reason {
@@ -2617,7 +2616,7 @@ impl App {
         }
     }
 
-    /// Tell the active editor how many lines its viewport shows and invalidate its leaf; `Ok` when that changed.
+    /// Tell the active editor how many lines its viewport shows and invalidate its leaf.
     pub(crate) fn reconcile_active_editor_viewport(
         &mut self,
         wid: WindowId,
@@ -5223,7 +5222,7 @@ impl App {
         self.request_redraw_all_windows();
     }
 
-    /// The native config lane's own error (an observation that was not TOML, a failed pump, a dropped request).
+    /// The native config lane's own error.
     pub(crate) fn surface_native_config_lane_error(&mut self, message: String) {
         aterm_log::warn!("native config: {message}");
         self.post_message(crate::message_reporters::config_lane_error(&message));
@@ -5888,9 +5887,6 @@ impl App {
             },
         );
         if spawn.is_err() {
-            // Release the reservation via abort, never a fabricated report: a
-            // never-observed surface stays on "Reading package status…", and an
-            // observed one keeps its facts.
             let _ = self.native_packages_service.abort(sequence);
         }
         self.publish_native_packages_state();
@@ -5930,7 +5926,7 @@ impl App {
         self.publish_native_packages_state();
     }
 
-    /// Main-thread half of the packages worker protocol (the packages analogue of [`Self::finish_native_update_check`]).
+    /// Main-thread half of the packages worker protocol.
     pub(crate) fn finish_native_packages(
         &mut self,
         sequence: u64,
@@ -6320,14 +6316,9 @@ impl App {
     ) {
         let completion = self.native_updater_service.finish_check(ticket, status);
         if completion != CheckCompletion::Reduced {
-            // An old worker cannot redraw, notify, arm intent, or drain a newer
-            // deferred observation. Reducer-inert means presentation-inert too.
             return;
         }
         if self.native_updater_service.snapshot().staged.is_some() {
-            // The floor for disk observations: anything read before this instant
-            // predates the stage this check imported (see
-            // `reconcile_native_update_facts`).
             self.native_stage_imported_at = Some(std::time::Instant::now());
         }
         self.publish_native_update_state();
@@ -6336,8 +6327,6 @@ impl App {
             && !self.request_native_update_reconcile(purpose)
         {
             if purpose == NativeUpdateReconcilePurpose::ApplyControl {
-                // A control apply never vanishes silently: the same refusal the control
-                // entry path surfaces when facts cannot be collected.
                 self.refuse_control_apply_without_facts();
             } else {
                 aterm_log::debug!(
@@ -6473,10 +6462,6 @@ impl App {
 
     fn structural_latch_trial_room(&self, latch: crate::AutoApplyManualOnly) -> Option<bool> {
         if !latch.activation {
-            // The latched build's own trial has counted nothing (above). This is
-            // no answer for the RUNNING build's trial, which a deferred-on-a-
-            // verdict candidate can spend: that count is not this latch's, and
-            // the lane does not read it here.
             return Some(true);
         }
         self.native_installed_trial
@@ -6563,10 +6548,7 @@ impl App {
         }
         match structural_latch(facts) {
             StructuralLatchDecision::Hold => {
-                // A look its own deadline brought (the re-sample, now outranked
-                // by a release waiting out a refusal) must move that deadline or
-                // the deadline fold wakes on it forever; the release's retry is
-                // the next thing that can change anything.
+                // A look its own deadline brought (the re-sample, now outranked by a release waiting out a refusal) must move that deadline or the deadline fold wakes on it forever.
                 if facts.resample_due
                     && latch.retry_at.is_some_and(|at| now >= at)
                     && let Some(retry) = verdict.newer_retry
@@ -7168,7 +7150,7 @@ impl App {
     /// The close-preflight blocker for unsaved native-app (editor / Settings) work.
     pub(crate) const UNSAVED_NATIVE_WORK_BLOCKS_APPLY: &'static str =
         "Save or close the open editor to finish updating";
-    /// The update row's words when only unsaved Settings text holds the install ([`SETTINGS_DRAFTS_BLOCK`]).
+    /// The update row's words when only unsaved Settings text holds the install.
     pub(crate) const UNSAVED_SETTINGS_BLOCKS_APPLY: &'static str =
         "Save or close the unsaved Settings tabs to finish updating";
     /// The update row's words when an editor and Settings text both hold it.
@@ -7198,7 +7180,7 @@ impl App {
             && !self.kept_image_waits_for_terminal()
     }
 
-    /// The update row for a close-preflight refusal the person can clear (unsaved editor or Settings work, a failed document checkpoint).
+    /// The update row for a close-preflight refusal the person can clear.
     pub(crate) fn update_blocker_for_person(reasons: &[String]) -> Option<&'static str> {
         let editor = reasons.iter().any(|reason| {
             reason == Self::UNSAVED_NATIVE_WORK_BLOCKS_APPLY
@@ -7441,7 +7423,7 @@ impl App {
         }
     }
 
-    /// Whether a person's Install is held for the candidate's pre-park read ([`Self::run_held_person_apply`]).
+    /// Whether a person's Install is held for the candidate's pre-park read.
     #[must_use]
     pub(crate) const fn person_apply_is_held(&self) -> bool {
         #[cfg(unix)]
@@ -7454,7 +7436,7 @@ impl App {
         }
     }
 
-    /// Hold the automatic lane for an update check to confirm the stage's signer ([`crate::AutoApplyRosterWait`]).
+    /// Hold the automatic lane for an update check to confirm the stage's signer.
     #[cfg(unix)]
     pub(crate) fn hold_for_roster_confirmation(
         &mut self,
@@ -7513,7 +7495,7 @@ impl App {
         wait
     }
 
-    /// Whether an update check reported the stage at `build` at or after `since` ([`Self::roster_wait_check_reported`]).
+    /// Whether an update check reported the stage at `build` at or after `since`.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn roster_check_reported_since(
@@ -7636,7 +7618,7 @@ impl App {
         None
     }
 
-    /// Start a fresh pre-park read of the stage at `build` with `dmg_sha256` ([`Self::spawn_staged_handoff_preverification`]).
+    /// Start a fresh pre-park read of the stage at `build` with `dmg_sha256`.
     #[cfg(unix)]
     pub(crate) fn start_fresh_preverification(&mut self, build: u64, dmg_sha256: [u8; 32]) -> bool {
         let before = self
@@ -7731,8 +7713,6 @@ impl App {
         let now = std::time::Instant::now();
         let deadline_ready = now >= intent.retry_at;
         if deadline_ready {
-            // A capture refusal recorded beside a busy engine reads that session
-            // at the lane's next look, whatever the poll then decides.
             self.capture_refusal_take_baseline();
         }
         let phase = self.automatic_apply_phase(now);
@@ -7929,8 +7909,6 @@ impl App {
                     );
                 }
                 if announce && intent.attempts == 1 {
-                    // Already recorded above: announcement adds UI only, not a
-                    // second durable write for this same refused attempt.
                     self.react_to_update_apply_outcome("automatic", blocked, false);
                 }
                 if !cooling_down {
@@ -8256,9 +8234,7 @@ impl App {
                         );
                     }
                     DurableStageDisposition::Retired => {
-                        // The latch belongs to the exact retired artifact; kept, it could
-                        // suppress a replacement lower than the withdrawn stage but newer
-                        // than this process. A latch for other bytes survives.
+                        // The latch belongs to the exact retired artifact.
                         if let Some(retired) = current.as_ref()
                             && self.auto_apply_manual_only.is_some_and(|manual| {
                                 manual.build == retired.build
@@ -8398,7 +8374,7 @@ impl App {
         });
     }
 
-    /// The remedy of the environment block standing for `build`, or `None` when none stands ([`Self::auto_apply_environment_blocked`]).
+    /// The remedy of the environment block standing for `build`, or `None` when none stands.
     pub(crate) fn auto_apply_environment_remedy(
         &self,
         build: u64,
@@ -9456,8 +9432,6 @@ impl App {
             .native_updater_service
             .abort_apply(attempt, message.clone())
         {
-            // The `Rearmed` policy of `reconcile_returned_native_apply_with_facts`
-            // (the lane every completion takes), with no facts to reduce.
             return self.settle_rearmed_apply_failure(attempt, message, lane, None);
         }
         UpdateOutcome::Failed { message }
@@ -9604,8 +9578,7 @@ impl App {
         );
         match disposition {
             ReturnedApplyDisposition::Rearmed => {
-                // The stage is re-armed on disk; the facts are reduced once the
-                // lane's policy has published.
+                // The stage is re-armed on disk.
                 Some(self.settle_rearmed_apply_failure(&attempt, message, lane, Some(facts)))
             }
             ReturnedApplyDisposition::InstalledNeedsRelaunch { build } => {
@@ -9728,10 +9701,6 @@ impl App {
         blockers.extend(settings.blocker());
         blockers.extend(drafts.blockers());
         if self.document_journal_writes_in_flight() {
-            // A journal write on the worker now (any document's, a re-seat after
-            // a rolled-back update included) could land after the successor read
-            // its restore image or after Commit, so no update starts or commits
-            // over one.
             blockers.push("Wait: a draft journal write is in flight".to_string());
         }
         if self.document_journal_landed_while_parked() {
@@ -10047,7 +10016,6 @@ fn packages_child_failure(
         Ok(status) => Some(if said.is_empty() {
             format!("atpkg {} exited with {status}", verb.join(" "))
         } else {
-            // atpkg's last line names the cause and often the remedy.
             said.lines().last().unwrap_or(said).to_string()
         }),
         Err(error) => Some(format!(
@@ -10114,9 +10082,6 @@ fn read_machine_state(atpkg: &std::path::Path) -> Result<atpkg::machine::Machine
     )?;
     parse_machine_state_output(&String::from_utf8_lossy(&output.stdout)).ok_or_else(|| {
         if output.status.success() {
-            // The line prints after atpkg's platform check, so its absence means
-            // no state was measured, which the status must say, never "nothing to
-            // apply".
             "atpkg machine printed no state".to_string()
         } else {
             format!("atpkg machine exited with {}", output.status)

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Pack-time relocation (§10.1 "self-contained" bundle path).
+//! Pack-time relocation for self-contained bundles.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -23,7 +23,7 @@ pub fn is_machine_local(path: &str) -> bool {
 /// The load-command view of one native object, produced by a [`Backend`].
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ObjectRefs {
-    /// The object's own install-name / soname, if it declares one (dylibs/`.so`).
+    /// The object's own install-name or soname, if it declares one.
     pub id: Option<String>,
     /// Dependency references.
     pub needed: Vec<String>,
@@ -41,8 +41,8 @@ pub trait Backend {
     fn set_id_portable(&self, path: &Path, basename: &str) -> Result<(), String>;
     /// Repoint an absolute machine-local dependency to the portable form.
     fn repoint_dep(&self, path: &Path, from: &str, basename: &str) -> Result<(), String>;
-    /// Ensure the object searches `rel_origin` (an `@loader_path`/`$ORIGIN` relative dir)
-    /// and no machine-local rpath.
+    /// Ensure the object searches `rel_origin` (an `@loader_path`/`$ORIGIN` relative dir) and no
+    /// machine-local rpath.
     fn fix_rpaths(
         &self,
         path: &Path,
@@ -50,8 +50,8 @@ pub trait Backend {
         keep: &[String],
         drop: &[String],
     ) -> Result<(), String>;
-    /// Re-establish a valid code signature after a rewrite (macOS: mandatory on
-    /// arm64; Linux: no-op).
+    /// Re-establish a valid code signature after a rewrite (macOS: mandatory on arm64; Linux:
+    /// no-op).
     fn resign(&self, path: &Path, sign_id: Option<&str>) -> Result<(), String>;
     /// The relative-origin token for this platform (`@loader_path` / `$ORIGIN`).
     fn origin_token(&self) -> &'static str;
@@ -120,9 +120,9 @@ pub fn backend_for_host() -> Result<Box<dyn Backend>, String> {
 ///
 /// # Errors
 /// I/O, a missing relocation tool, a rewrite failure, or a library that would be vendored
-/// from a stock toolchain. Unresolved builder refs, including a library outside every donor
-/// root, and a failed rpath rewrite are returned in the [`Report`] so the caller decides
-/// hard fail or advisory.
+/// from a stock toolchain. Unresolved builder refs, including a library outside every donor root,
+/// and a failed rpath rewrite are returned in the [`Report`] so the caller decides hard fail or
+/// advisory.
 pub fn relocate_stage(
     stage: &Path,
     sign_id: Option<&str>,
@@ -304,8 +304,6 @@ pub fn relocate_with(
     Ok(report)
 }
 
-/// The canonical donor root `path` lies inside, if any. The path is canonicalized when
-/// it exists (a linker records `/var/…` where the root is `/private/var/…`).
 fn in_donor_root<'r>(path: &str, donor_roots: &'r [PathBuf]) -> Option<&'r PathBuf> {
     if donor_roots.is_empty() || !path.starts_with('/') {
         return None;
@@ -314,7 +312,6 @@ fn in_donor_root<'r>(path: &str, donor_roots: &'r [PathBuf]) -> Option<&'r PathB
     donor_roots.iter().find(|r| p.starts_with(r))
 }
 
-/// Write [`VENDORED_RECORD`] when anything was vendored.
 fn write_vendored_record(vendored: &Path, report: &Report) -> Result<(), String> {
     if report.vendored_from.is_empty() {
         return Ok(());
@@ -333,14 +330,12 @@ fn write_vendored_record(vendored: &Path, report: &Report) -> Result<(), String>
     std::fs::write(&dest, text).map_err(|e| format!("write {}: {e}", dest.display()))
 }
 
-/// Where [`vendor_file`] copies to, and what may be copied.
 struct VendorTo<'a> {
     dir: &'a Path,
     backend: &'a dyn Backend,
     donor_roots: &'a [PathBuf],
 }
 
-/// The refusal for a library that would be vendored out of a stock toolchain.
 fn stock_vendor_refusal(base: &str, src: &Path, place: &str) -> String {
     format!(
         "{base}: a stock toolchain library cannot be vendored — {} resolves into {place}. A \
@@ -350,13 +345,6 @@ fn stock_vendor_refusal(base: &str, src: &Path, place: &str) -> String {
     )
 }
 
-/// Copy `src` → `<to.dir>/<base>` once (from inside a donor root only, byte-identical
-/// before the re-sign, recorded), make its own id portable, and re-sign ad hoc. Returns
-/// whether a new file was vendored, so the caller chases its deps. Records an unresolved
-/// entry when the source is missing or outside every donor root.
-/// # Errors
-/// A stock toolchain's library (checked on the path as named and as resolved, before
-/// anything is read or written), or a copy that differs from its donor.
 fn vendor_file(
     src: &Path,
     to: &VendorTo<'_>,
@@ -434,13 +422,9 @@ fn hard_link_key(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
-/// Point every other name of `obj`'s hard-link group at `obj`'s new inode. Each alias is
-/// linked to a hidden sibling and renamed over, so it is never absent: a failure leaves it
-/// on its old bytes, and the error names it.
 fn relink_aliases(stage: &Path, obj: &Path, aliases: &[PathBuf]) -> Result<(), String> {
     for alias in aliases {
         if hard_link_key(obj).is_some() && hard_link_key(obj) == hard_link_key(alias) {
-            // the rewrite went through the inode: still one file
             continue;
         }
         let name = alias
@@ -471,7 +455,8 @@ fn basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// A relative path from a Mach-O/ELF file's directory to the vendored dir, prefixed with the platform origin token.
+/// A relative path from a Mach-O/ELF file's directory to the vendored dir, prefixed with the
+/// platform origin token.
 pub fn origin_relative(origin_token: &str, macho_dir: &Path, vendored: &Path) -> String {
     let rel = relative(macho_dir, vendored);
     let mut out = String::from(origin_token);
@@ -482,7 +467,6 @@ pub fn origin_relative(origin_token: &str, macho_dir: &Path, vendored: &Path) ->
     out
 }
 
-/// Relative path from `from` to `to` (both absolute, no symlink resolution).
 fn relative(from: &Path, to: &Path) -> PathBuf {
     let from: Vec<_> = from.components().collect();
     let to: Vec<_> = to.components().collect();
@@ -501,7 +485,6 @@ fn rel_display(stage: &Path, p: &Path) -> String {
     p.strip_prefix(stage).unwrap_or(p).display().to_string()
 }
 
-/// A `.dylib` (macOS) or `.so`/`.so.N` (Linux) file name.
 fn is_shared_lib_name(rel: &Path) -> bool {
     rel.file_name()
         .and_then(|n| n.to_str())
@@ -512,7 +495,8 @@ fn is_shared_lib_basename(name: &str) -> bool {
     name.ends_with(".dylib") || name.contains(".so.") || name.ends_with(".so")
 }
 
-/// Recursively collect regular files under `dir` (symlinks not followed), paths relative to `dir`, sorted.
+/// Recursively collect regular files under `dir` (symlinks not followed), paths relative to `dir`,
+/// sorted.
 pub fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -535,7 +519,8 @@ pub fn walk_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-/// Whether `path` is a native executable or shared object (Mach-O or ELF), the only files a dynamic-loader resolve check means anything for.
+/// Whether `path` is a native executable or shared object (Mach-O or ELF), the only files a
+/// dynamic-loader resolve check means anything for.
 #[must_use]
 pub fn is_native_object(path: &Path) -> bool {
     magic4(path).is_some_and(|m| macho::is_macho_magic(&m) || elf::is_elf_magic(&m))
@@ -749,7 +734,8 @@ pub mod elf {
             .collect()
     }
 
-    /// The `patchelf --set-rpath` value making an object search the vendored dir (relative, `$ORIGIN`-based) plus any portable rpaths it already had.
+    /// The `patchelf --set-rpath` value making an object search the vendored dir (relative,
+    /// `$ORIGIN`-based) plus any portable rpaths it already had.
     #[cfg(any(target_os = "linux", test))]
     pub fn combined_rpath(rel_origin: &str, keep: &[String]) -> String {
         let mut out: Vec<String> = vec![rel_origin.to_string()];
@@ -808,13 +794,9 @@ pub mod elf {
             Ok(ObjectRefs { id, needed, rpaths })
         }
         fn set_id_portable(&self, path: &Path, basename: &str) -> Result<(), String> {
-            // An ELF soname is a bare name (never machine-local); normalize to the
-            // basename so consumers resolve it by name via the vendored rpath.
             patchelf(&["--set-soname", basename], path)
         }
         fn repoint_dep(&self, path: &Path, from: &str, basename: &str) -> Result<(), String> {
-            // ELF DT_NEEDED is a soname, not an absolute path, so this only fires
-            // if a builder emitted an absolute NEEDED (rare) — normalize it.
             patchelf(&["--replace-needed", from, basename], path)
         }
         fn fix_rpaths(
@@ -828,7 +810,6 @@ pub mod elf {
             patchelf(&["--set-rpath", &value, "--force-rpath"], path)
         }
         fn resign(&self, _path: &Path, _sign_id: Option<&str>) -> Result<(), String> {
-            // ELF has no code signature; the Ed25519 tarball anchor covers integrity
             Ok(())
         }
         fn origin_token(&self) -> &'static str {

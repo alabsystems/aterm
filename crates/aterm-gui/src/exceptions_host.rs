@@ -19,8 +19,7 @@ use crate::harness_host::{AccountsSaid, HostNote, RelaunchSay};
 use crate::message_reporters;
 use crate::messages_host::wall_stamp_now;
 
-/// How long a rating survey the loop cannot close stands before it earns a digest line: an hour,
-/// the supervisor's named horizon, since the card blocks nothing the worker does.
+/// Delay before a stuck rating survey raises a digest entry.
 const SURVEY_ENTRY_AFTER: Duration = Horizon::SUPERVISOR_RESTARTS.duration();
 
 #[cfg(test)]
@@ -45,9 +44,7 @@ const SUPERVISOR_STEADY: Duration = Duration::from_secs(30 * 60);
 /// Settle window (`10m`) before the resume family hands its full state to the digest.
 pub(crate) const RESUME_SETTLE: Duration = Duration::from_secs(10 * 60);
 
-/// The `host_noted` marks that this process recorded a short volume, one per form of its line:
-/// the passes' ([`HostNote::DiskLow`]) and the one opened while cleanup is off by fault
-/// ([`HostNote::DiskLowCleanupOff`]).
+/// `host_noted` keys recording low-disk digest entries ([`HostNote::DiskLow`], [`HostNote::DiskLowCleanupOff`]).
 const DISK_NOTED: &str = "disk";
 const DISK_CLEANUP_OFF_NOTED: &str = "disk:cleanup-off";
 
@@ -56,10 +53,7 @@ const DISK_CLEANUP_OFF_NOTED: &str = "disk:cleanup-off";
 const USAGE_TAP_NOTED: &str = "usage-tap:";
 const USAGE_TAP_DAY: &str = "usage-tap-day:";
 
-/// When this process first looked at its exceptions, and whether it has since ended the
-/// supervisor lines an earlier process left open that nothing has told of
-/// ([`App::sweep_adopted_supervisor_lines`]): once per process, at the first sweep after the
-/// steady time (no wake of its own: the window sweeps at every event).
+/// First exception-sweep timestamp and whether adopted supervisor lines have been swept ([`App::sweep_adopted_supervisor_lines`]).
 static LOOKING_SINCE: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static ADOPTED_SWEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -83,8 +77,7 @@ pub(crate) struct NoticeStory {
     back: Option<String>,
     /// Wall-clock timestamp (unix ms) of the story's latest notice or ask end.
     pub(crate) last: u64,
-    /// The notices of this story the owner read (folded or dismissed) whose
-    /// rows a later notice replaced, by key, at the wall clock of the read.
+    /// Read (folded or dismissed) notice keys in this story mapped to their retirement timestamp (unix ms).
     read: std::collections::BTreeMap<String, u64>,
 }
 
@@ -182,9 +175,7 @@ impl App {
             self.sweep_adopted_supervisor_lines();
         }
         if !self.resume_swept {
-            // The API outage is a level family too, stated only as tabs
-            // enter and leave the wait: an entry an earlier process left open
-            // would stand for the 14-day expiry where no tab here ever waits.
+            // Sync API-outage level entries immediately so an adopted entry does not linger when no tab is waiting.
             if self.resume_looked.is_none() {
                 self.hand_api_outage();
             }
@@ -225,9 +216,7 @@ impl App {
             .min()
     }
 
-    /// A supervisor that failed past its budget is over once a run started after its latest
-    /// failure has outlived it by [`SUPERVISOR_STEADY`] past the pause: its line is withdrawn, or
-    /// never shown.
+    /// Settle supervisors that have run past [`SUPERVISOR_STEADY`] and raise due failure entries.
     fn settle_supervisors(&mut self, now: Instant) {
         if self.supervisor_failing.is_empty() {
             return;
@@ -316,13 +305,7 @@ impl App {
         }
     }
 
-    /// THE OWNER'S OCCUPANCY MODE IN FORCE, `mode` (the red-team's F14, R9): the policy the
-    /// window's loops run — the launch read's, then each the watcher posts
-    /// ([`App::adopt_harness_policy`], whose wake comes whether or not a config generation is
-    /// admitted). The board takes it ([`crate::occupancy_host::set_mode`]), and while it is
-    /// `prompt` (the root `[harness]` table's `occupancy = "prompt"`, the one grant) an Entry
-    /// says so — the harness types occupancy lines into the agents' sessions — cleared by a
-    /// policy that says otherwise. Raised and cleared here alone, never typed.
+    /// Update the active occupancy mode ([`crate::occupancy_host::set_mode`]) and raise or clear the `prompt` digest entry.
     pub(crate) fn note_occupancy_mode(&mut self, mode: aterm_agent::supervise::Occupancy) {
         use crate::message_reporters::{occupancy_prompt_entry, occupancy_prompt_key};
         crate::occupancy_host::set_mode(mode);
@@ -333,11 +316,7 @@ impl App {
         }
     }
 
-    /// WHAT TAB `sid`'S OCCUPANCY DOOR SAYS NOW ([`HostNote::OccupancySaid`]): the board keeps
-    /// it; a cap spent under `prompt` with the hold open raises the tab's `occupancy.hold`
-    /// Entry, and a word with nothing spent clears it. A word that spends what the last one
-    /// did posts the same Entry, which the store keeps as it stands (a duplicate, or one the
-    /// owner put away).
+    /// Record tab `sid`'s occupancy state ([`HostNote::OccupancySaid`]) and raise or clear its `occupancy.hold` entry.
     pub(crate) fn note_occupancy_said(
         &mut self,
         sid: &str,
@@ -587,10 +566,7 @@ impl App {
             HostNote::LimitOver { sid } => self.end_notice_story(&sid),
             HostNote::ResumeUnread { sid, agent, stall } => match stall {
                 Some(stall) => {
-                    // The second rung of the stall canary (90 minutes of
-                    // background work, 30 of a dialog). A record, once per
-                    // episode, and one log line, in the witness's words; the
-                    // digest waits for the third (3 h; an hour).
+                    // Record the second-rung stall canary once per episode; the digest entry waits for the third rung.
                     if self.host_noted.insert(format!("stalled:{sid}")) {
                         let spot = self.upgrade_spot(&sid);
                         let record = match stall {
@@ -780,15 +756,7 @@ impl App {
         }
     }
 
-    /// A tab's relaunch says something about itself ([`RelaunchSay`]): a record
-    /// for a relaunch that keeps failing — and, where no command is named for
-    /// the tab's mark, one line of the digest at once, save for the harness's
-    /// own restart, whose record's own row speaks
-    /// (`harness_host::failing_names_command`); else, for a
-    /// cause only a person clears, a line once it has gone on for an hour —
-    /// and for the owner's own limit; for an agent that cannot be brought
-    /// back, a record and, where no command can be named for the tab's mark,
-    /// one line of the digest.
+    /// Record and update digest entries for tab `sid`'s relaunch state ([`RelaunchSay`]).
     fn note_relaunch(&mut self, sid: &str, said: RelaunchSay) {
         let [blocked, gone, lost] = message_reporters::relaunch_keys(sid);
         let spot = self.upgrade_spot(sid);
@@ -908,10 +876,7 @@ impl App {
         );
     }
 
-    /// A tab's resume loop needs the owner now and nothing of the loop's says
-    /// so ([`message_reporters::resume_ask`]): its standing ask is posted —
-    /// the same words are a duplicate, new ones restate it in place — and
-    /// this process marks the tab as one it holds an ask for.
+    /// Post or restate tab `sid`'s standing resume ask ([`message_reporters::resume_ask`]) and track its notice story.
     fn raise_resume_ask(
         &mut self,
         sid: &str,
@@ -994,9 +959,7 @@ impl App {
         self.withdraw_resume_asks(sid, Some(&key));
     }
 
-    /// The row or record tab `sid`'s notices are told in now: the story this
-    /// process holds, else the newest ask of the tab an earlier process
-    /// carried here.
+    /// Current message ID heading tab `sid`'s notice story, falling back to any live ask adopted from an earlier process.
     fn notice_story_head(&self, sid: &str) -> Option<aterm_messages::MessageId> {
         if let Some(story) = self.resume_stories.get(sid) {
             return Some(story.head);
@@ -1014,12 +977,7 @@ impl App {
             .max()
     }
 
-    /// Tab `sid`'s lost login is back ([`HostNote::LoginBack`]): the story its
-    /// notices told ends fixed, as one row — a row still on the glass resolves
-    /// `Ok` in its declared fix words, a record whose row already left
-    /// (withdrawn as the agent went back to work, or read) is closed fixed in
-    /// them ([`aterm_messages::MessageCenter::fix_record`]) — and the next
-    /// loss is a story of its own, news even where the owner read this one.
+    /// Close tab `sid`'s login notice story as fixed ([`HostNote::LoginBack`]).
     fn close_notice_story(&mut self, sid: &str) {
         let Some(story) = self.resume_stories.remove(sid) else {
             return;
@@ -1042,12 +1000,7 @@ impl App {
         aterm_log::info!("harness @{sid}: the login is back; its notice reads fixed");
     }
 
-    /// Tab `sid`'s usage or model limit ended with no sign-in that took
-    /// ([`HostNote::LimitOver`]): the story its notices told ends UNFIXED —
-    /// its row, if one still stands, is the loop's to withdraw as its point
-    /// moves on, and its record keeps the words it ended in — so a login back
-    /// told later (a lost login's, an account move's) fixes nothing of it,
-    /// and the tab's next notice is a story of its own.
+    /// End tab `sid`'s notice story without marking its record fixed ([`HostNote::LimitOver`]).
     fn end_notice_story(&mut self, sid: &str) {
         if self.resume_stories.remove(sid).is_some() {
             aterm_log::info!("harness @{sid}: the limit ended by itself; its notice reads unfixed");
@@ -1075,9 +1028,7 @@ impl App {
         }
     }
 
-    /// The tab's ask is over (the loop's point no longer holds it, or the loop
-    /// ended): its row is withdrawn, claiming no outcome — the loop says the
-    /// point moved on, not that the owner's step was taken.
+    /// Withdraw tab `sid`'s live resume asks without claiming an outcome.
     fn end_resume_ask(&mut self, sid: &str) {
         let ended = self.host_noted.remove(&resume_asked_key(sid));
         self.withdraw_resume_asks(sid, None);
@@ -1086,8 +1037,7 @@ impl App {
         }
     }
 
-    /// Withdraw the asks an earlier process carried here that no loop of this one tells of, at the
-    /// resume family's settle ([`RESUME_SETTLE`]), as the digest's lines end then.
+    /// Withdraw adopted resume asks that no loop in this process holds once [`RESUME_SETTLE`] elapses.
     fn sweep_resume_asks(&mut self) {
         let held: Vec<String> = self
             .host_noted
@@ -1343,13 +1293,7 @@ impl App {
         filed
     }
 
-    /// The entry as a checked message, or `None` (and ONE `aterm.log` error
-    /// naming the key, said again only once its words have passed or its
-    /// fault has changed: a level family restates at every look) when its
-    /// words fail the rule: an owner is never shown words the rule refuses,
-    /// and the roster test
-    /// (`host_exceptions_tests::every_host_entry_passes_the_door_and_the_caps`)
-    /// fails in a test run first.
+    /// Validate `entry` against the message door rule, logging at most once per distinct fault.
     fn checked_entry(&mut self, entry: &Entry) -> Option<Message> {
         let key = entry.key();
         match entry.message() {
@@ -1423,9 +1367,7 @@ impl App {
     }
 }
 
-/// The 1-based line of `text` where `table` begins, for the editor the entry
-/// opens: its first header (`[table]`, `[table.sub]`, `[[table.sub]]`), or,
-/// above every header, its first key (`table.key = …`, `table = { … }`).
+/// Return the 1-based line number in `text` where `table` starts.
 fn table_line(text: &str, table: &str) -> Option<u32> {
     let names = |rest: &str, ends: &[char]| {
         rest.strip_prefix(table)
@@ -1498,9 +1440,7 @@ mod tests {
         crate::message_reporters::file_access_entry(&crate::consent_card::NeedWords::sample())
     }
 
-    /// The host's word that what a restore carries of a tab's agent moved owes
-    /// the crash journal a capture at once, inside the write interval, and
-    /// says nothing.
+    /// `HostNote::AgentPublished` schedules an immediate crash-journal capture without posting a digest entry.
     #[cfg(unix)]
     #[test]
     fn an_agent_publication_owes_the_crash_journal_a_capture() {
@@ -1538,10 +1478,7 @@ mod tests {
         app.crash_journal = crate::crash_journal::Lane::inert();
     }
 
-    /// The digest costs the terminal nothing (the Row Law, clause 1): post,
-    /// restate, family pass, clear, dismiss — the band's re-grid counter, the
-    /// committed row count and the window's chrome rows do not move once, in a
-    /// real `App` (presence owns no row to re-grid).
+    /// Posting, restating, clearing, and dismissing digest entries never re-grid the terminal band.
     #[test]
     fn a_digest_costs_no_regrid() {
         let mut app = App::headless_for_test();
@@ -1568,10 +1505,7 @@ mod tests {
         );
     }
 
-    /// A dismiss click never waits on a writer that does not answer: the
-    /// record's flush is bounded (law L5), so with the messages log's thread
-    /// wedged the owner's `Dismiss all` and the per-entry `Dismiss` still
-    /// file and return.
+    /// `Dismiss` and `Dismiss all` bound their log-flush wait so a wedged writer thread never stalls the UI.
     #[test]
     fn a_dismissal_returns_though_the_log_writer_never_answers() {
         let mut app = App::headless_for_test();
@@ -1733,9 +1667,7 @@ mod tests {
         );
     }
 
-    /// The digest's own clock: the upgrade's looks are sent only when its rows change, so an entry
-    /// its reporter stopped naming in one change still ends: `messages_deadline` tells the loop
-    /// when to come back and `settle_messages` ends it.
+    /// An omitted level-family entry resolves via `messages_deadline` and `settle_messages` without a second pass.
     #[test]
     fn an_entry_its_reporter_stopped_naming_ends_without_a_second_look() {
         use std::time::{Duration, Instant};
@@ -1756,9 +1688,7 @@ mod tests {
         );
     }
 
-    /// A wording fault never ends a fact: a pass that still names the key keeps the open entry in
-    /// the words it was shown in and starts no clock, so a settle past `RESOLVE_AFTER` leaves it
-    /// open.
+    /// A refused restatement keeps the existing entry open in its previous wording without starting a resolve timer.
     #[test]
     fn a_refused_restatement_leaves_its_entry_open() {
         use aterm_messages::need::RESOLVE_AFTER;
@@ -1797,9 +1727,7 @@ mod tests {
         assert!(app.messages.digest_deadline().is_some());
     }
 
-    /// The page and the wire read one digest: an open entry reads the same words in Settings and
-    /// in `aterm ctl messages need=later live`, the menu bar counts it, and plain `live` does not
-    /// list it.
+    /// Settings, `aterm ctl messages need=later live`, and the menu-bar status item read from the same digest.
     #[test]
     fn the_surfaces_read_one_digest() {
         let mut app = App::headless_for_test();
@@ -1829,10 +1757,7 @@ mod tests {
         );
     }
 
-    /// The page's own dismiss buttons: every open entry offers `Dismiss` (files
-    /// that one) and, with two or more open, the first offers `Dismiss all`;
-    /// each press is flushed to the log; a settled entry offers neither; a
-    /// stale press is `Gone`.
+    /// Settings page actions offer per-entry `Dismiss` and, when multiple entries are open, `Dismiss all` on the first entry.
     #[test]
     fn the_page_dismisses_one_entry_or_all_of_them() {
         use crate::native_app::MessageActOutcome;

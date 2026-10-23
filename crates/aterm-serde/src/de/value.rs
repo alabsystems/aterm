@@ -5,22 +5,15 @@
 // aterm project in 2026.
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! Building blocks for deserializing basic values using the `IntoDeserializer`
-//! trait.
+//! Building blocks for deserializing basic values using the `IntoDeserializer` trait.
 
 use crate::lib::*;
 
 use crate::de::{self, IntoDeserializer};
 use crate::ser;
 
-// aterm's own (`de/text_key.rs`): a map key read back from the text a
-// string-keyed format wrote it as.
 pub use crate::de::text_key::{KeyText, TextKeyDeserializer};
 
-////////////////////////////////////////////////////////////////////////////////
-
-// For structs that contain a PhantomData. We do not want the trait
-// bound `E: Clone` inferred by derive(Clone).
 macro_rules! impl_copy_clone {
     ($ty:ident $(<$lifetime:tt>)*) => {
         impl<$($lifetime,)* E> Copy for $ty<$($lifetime,)* E> {}
@@ -33,10 +26,7 @@ macro_rules! impl_copy_clone {
     };
 }
 
-////////////////////////////////////////////////////////////////////////////////
-
-/// A minimal representation of all possible errors that can occur using the
-/// `IntoDeserializer` trait.
+/// A minimal representation of all possible errors that can occur using the `IntoDeserializer` trait.
 #[derive(Clone, PartialEq)]
 pub struct Error {
     err: ErrorImpl,
@@ -185,8 +175,6 @@ impl<E> Debug for U32Deserializer<E> {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-
 /// A deserializer holding a `&str`.
 pub struct StrDeserializer<'a, E> {
     value: &'a str,
@@ -331,8 +319,6 @@ where
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////
-
 /// A deserializer holding a `MapAccess`.
 #[derive(Clone, Debug)]
 pub struct MapAccessDeserializer<A> {
@@ -407,8 +393,6 @@ where
         }
     }
 }
-
-////////////////////////////////////////////////////////////////////////////////
 
 mod private {
     use crate::lib::*;

@@ -31,11 +31,11 @@ use crate::state;
 #[link(name = "AppKit", kind = "framework")]
 unsafe extern "C" {}
 
-/// `NSApplicationActivationPolicyAccessory`: no Dock icon and no menu bar of its own.
+/// `NSApplicationActivationPolicyAccessory`.
 const ACTIVATION_POLICY_ACCESSORY: isize = 1;
 /// `NSEventTypeRightMouseUp`.
 const EVENT_TYPE_RIGHT_MOUSE_UP: usize = 4;
-/// `NSEventTypeApplicationDefined`: the event posted so `-run` sees its stop.
+/// `NSEventTypeApplicationDefined`.
 const EVENT_TYPE_APPLICATION_DEFINED: usize = 15;
 /// `NSEventModifierFlagControl`.
 const MODIFIER_FLAG_CONTROL: usize = 1 << 18;
@@ -43,16 +43,13 @@ const MODIFIER_FLAG_CONTROL: usize = 1 << 18;
 const CONTROL_STATE_ON: isize = 1;
 /// How often the mug looks again (the time left it shows, a deadline, the update watch).
 const TICK_SECS: u64 = 60;
-/// `NSTerminateCancel`: `-terminate:` ends nothing.
+/// `NSTerminateCancel`.
 const TERMINATE_CANCEL: usize = 0;
-/// `NSTerminateNow`: `-terminate:` ends the app at once.
+/// `NSTerminateNow`.
 const TERMINATE_NOW: usize = 1;
-/// `keyAEQuitReason`, `'why?'`: the attribute a quit Apple event names a logout, a restart or a
-/// shutdown by.
+/// `keyAEQuitReason`, `'why?'`.
 const KEY_QUIT_REASON: u32 = u32::from_be_bytes(*b"why?");
-/// The quit reasons that are the system's: `kAELogOut` (`logo`), `kAEReallyLogOut` (`rlgo`),
-/// `kAEShowRestartDialog` (`rrst`), `kAERestart` (`rest`), `kAEShowShutdownDialog` (`rsdn`),
-/// `kAEShutDown` (`shut`).
+/// The quit reasons that are the system's.
 const SYSTEM_REASONS: [[u8; 4]; 6] = [*b"logo", *b"rlgo", *b"rrst", *b"rest", *b"rsdn", *b"shut"];
 /// `NSWorkspaceDidWakeNotification`, spelled as its value (AppKit's symbol holds it).
 const DID_WAKE: &str = "NSWorkspaceDidWakeNotification";
@@ -64,8 +61,7 @@ const COMMON_MODES: &str = "kCFRunLoopCommonModes";
 enum Exit {
     /// Quit: exit 0, which ends the launchd job.
     Quit,
-    /// The origin's code changed: [`launchd::EXIT_RESTART`], which launchd answers by starting the
-    /// job again, from the new code.
+    /// The origin's code changed ([`launchd::EXIT_RESTART`]).
     Restart,
 }
 
@@ -87,8 +83,7 @@ enum Next {
     Stop(Exit),
 }
 
-/// The seconds to the next tick at `now` in `mode`: [`TICK_SECS`], or a second past a deadline
-/// closer than that, so the tick that turns the mug off comes just after it.
+/// The seconds to the next tick at `now` in `mode` ([`TICK_SECS`]).
 const fn next_tick_secs(mode: Mode, now: u64) -> u64 {
     match mode.remaining(now) {
         Some(left) if left < TICK_SECS => left + 1,
@@ -96,8 +91,7 @@ const fn next_tick_secs(mode: Mode, now: u64) -> u64 {
     }
 }
 
-/// What a click with the event `(type, modifier flags)` means; a click with no current event
-/// toggles.
+/// What a click with the event `(type, modifier flags)` means.
 fn click_of(event: Option<(usize, usize)>) -> Click {
     let (kind, flags) = event.unwrap_or((0, 0));
     menu::classify_click(
@@ -106,7 +100,7 @@ fn click_of(event: Option<(usize, usize)>) -> Click {
     )
 }
 
-/// An event as [`click_from`] tells one from another: its type, modifier flags and time.
+/// An event as [`click_from`] tells one from another.
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct EventKey {
     kind: usize,
@@ -114,8 +108,7 @@ struct EventKey {
     at: f64,
 }
 
-/// What a press of the button means when the app's current event is `event`, and `stale` is the one
-/// that was current when the last press was read or the menu last closed.
+/// What a press of the button means when the app's current event is `event`.
 fn click_from(event: Option<EventKey>, stale: Option<EventKey>) -> Click {
     let fresh = event.filter(|event| Some(*event) != stale);
     click_of(fresh.map(|event| (event.kind, event.flags)))
@@ -136,31 +129,26 @@ struct Mug {
     mode: Mode,
     /// The keep-awake activity, held while the mode is on.
     awake: Option<Awake>,
-    /// The one activity-acquisition door; tests can refuse without acquiring it.
+    /// The one activity-acquisition door.
     awake_begin: fn(&str) -> Option<Awake>,
-    /// Whether a replaced origin still has the `caffeine` verb ([`crate::code::serves_caffeine`]);
-    /// tests answer without running anything.
+    /// Whether a replaced origin still has the `caffeine` verb ([`crate::code::serves_caffeine`]).
     origin_serves: fn(&Path) -> Option<bool>,
-    /// Start a bridge that holds the Mac awake while the mug restarts, and say whether it does
-    /// ([`bridge::start`]); tests answer without starting one.
+    /// Start a bridge that holds the Mac awake while the mug restarts ([`bridge::start`]).
     bridge_start: fn() -> bool,
-    /// What decides whether a login loads the login plist besides the plist, and what lifts
-    /// launchd's disable ([`super::STARTUP_DOORS`]); tests answer without asking either.
+    /// Startup login-plist doors ([`super::STARTUP_DOORS`]).
     doors: StartupDoors,
-    /// Open System Settings at Login Items ([`login_items::open_settings`]); tests answer
-    /// without opening it.
+    /// Open System Settings at Login Items ([`login_items::open_settings`]).
     open_login_items: fn(),
-    /// The item in the menu bar; `None` before it is installed (and in tests).
+    /// The item in the menu bar.
     ui: Option<StatusUi>,
     /// The origin's code, watched when the mug restarts on an update.
     watch: Option<Watch>,
-    /// How the app ends, once that is decided; nothing else is handled after.
+    /// How the app ends, once that is decided.
     exit: Option<Exit>,
 }
 
 impl Mug {
-    /// Run `f` unless how the app ends is already decided (then nothing more is handled), and
-    /// record the end `f` decides.
+    /// Run `f` unless how the app ends is already decided.
     fn handled(&mut self, f: impl FnOnce(&mut Self) -> Next) -> Option<Next> {
         if self.exit.is_some() {
             return None;
@@ -172,10 +160,7 @@ impl Mug {
         Some(next)
     }
 
-    /// [`Mug::handled`] for what the person does (a click, a menu choice). While an update restart
-    /// is decided but not yet made (its stop waits for the open menu to close), a choice still
-    /// counts: the mode it saves is the one the restarted mug reads, and a Quit ends the job
-    /// instead (exit 0, the mode off), so the mug the person quit does not come back.
+    /// [`Mug::handled`] for what the person does (a click, a menu choice).
     fn chosen(&mut self, f: impl FnOnce(&mut Self) -> Next) -> Option<Next> {
         if self.exit != Some(Exit::Restart) {
             return self.handled(f);
@@ -186,8 +171,7 @@ impl Mug {
         None
     }
 
-    /// Publish this mug's mode. A failed write is logged; the caller stops the mug so status cannot
-    /// combine an old on file with its still-running pid.
+    /// Publish this mug's mode.
     fn save(&self) -> bool {
         let file = self.paths.state_file();
         match state::save(&file, self.mode) {
@@ -202,8 +186,7 @@ impl Mug {
         }
     }
 
-    /// Hold the activity while on and show its actual state. A refused begin settles to Off and
-    /// saves it; a later explicit choice may try again.
+    /// Hold the activity while on and show its actual state.
     fn apply(&mut self, now: u64) -> bool {
         if !self.mode.is_on(now) {
             self.awake = None;
@@ -225,8 +208,7 @@ impl Mug {
         true
     }
 
-    /// Apply `mode` and save the resulting state. A refusal has already saved Off; no writer
-    /// publishes the refused on mode afterward.
+    /// Apply `mode` and save the resulting state.
     fn set(&mut self, mode: Mode, now: u64) -> Next {
         let requested = mode.settled(now);
         self.mode = requested;
@@ -261,11 +243,7 @@ impl Mug {
         launchd::startup(&self.paths, &self.label, &self.doors)
     }
 
-    /// Turn Enable at Startup on or off: what the person asked for, the opposite of what the
-    /// menu showed them, however the login plist changed while the menu was open. On also
-    /// lifts launchd's disable of the job, and opens Login Items when its switch blocks the
-    /// plist (the switch outlives the plist, and only the person turns it on), whether or
-    /// not the write succeeded.
+    /// Turn Enable at Startup on or off.
     fn set_startup(&mut self, on: bool, now: u64) -> Next {
         if let Err(err) = launchd::set_startup(&self.paths, &self.label, &self.origin, on) {
             let verb = if on { "turn on" } else { "turn off" };
@@ -286,9 +264,7 @@ impl Mug {
         Next::Tick(next_tick_secs(self.mode, now))
     }
 
-    /// The tick, and a wake from sleep: a passed deadline turns the mug off (saved), the tooltip's
-    /// time left is brought up to date, and a replaced origin ends the app for launchd to start the
-    /// new build.
+    /// The tick, and a wake from sleep.
     fn tick(&mut self, now: u64, menu_open: bool) -> Next {
         let settled = self.mode.settled(now);
         if settled == self.mode {
@@ -304,9 +280,7 @@ impl Mug {
         Next::Tick(next_tick_secs(self.mode, now))
     }
 
-    /// The origin was replaced: end for launchd to start the new build, unless the new build has no
-    /// `caffeine` verb (a rollback past it), which would fail every start launchd made and be
-    /// started again.
+    /// The origin was replaced.
     fn restart_or_retire(&mut self) -> Next {
         if (self.origin_serves)(&self.origin) != Some(false) {
             return Next::Stop(Exit::Restart);
@@ -323,8 +297,7 @@ impl Mug {
         Next::Stop(Exit::Quit)
     }
 
-    /// Take the writer's mode. Accepted requests are not saved back; a refused activation publishes
-    /// Off through the same path as every other acquisition.
+    /// Take the writer's mode.
     fn reload(&mut self, now: u64) -> Next {
         self.mode = state::load(&self.paths.state_file(), now);
         if !self.apply(now) {
@@ -333,15 +306,14 @@ impl Mug {
         Next::Tick(next_tick_secs(self.mode, now))
     }
 
-    /// The first [`Mug::apply`] of the mode read at the start: the activity is this mug's now (or
-    /// the mode is off), so a bridge an update restart left lets go.
+    /// The first [`Mug::apply`] of the mode read at the start.
     fn begin(&mut self, now: u64) -> bool {
         let applied = self.apply(now);
         bridge::release(&self.paths);
         applied
     }
 
-    /// The app has stopped: off the bar, and the activity ended (Quit has turned it off already).
+    /// The app has stopped.
     fn leave(&mut self) -> Option<Exit> {
         self.ui = None;
         if self.exit == Some(Exit::Restart) && self.awake.is_some() && !(self.bridge_start)() {
@@ -359,26 +331,22 @@ impl Mug {
 
 /// The target's Rust state.
 struct TargetIvars {
-    /// A `RefCell` because AppKit messages the target through `&self`; every handler
-    /// `try_borrow_mut`s, so a nested delivery is dropped rather than a panic (which would abort
-    /// inside a declared method).
+    /// A `RefCell` because AppKit messages the target through `&self`.
     mug: RefCell<Mug>,
-    /// The app's current event when the last press was read or the menu last closed: one still
-    /// current at a press came with no press of its own ([`click_from`]).
+    /// Current event when the last press was read or menu closed ([`click_from`]).
     stale: Cell<Option<EventKey>>,
-    /// Whether the menu is open: its tracking loop is running in [`ui::pop_up`].
+    /// Whether the menu is open ([`ui::pop_up`]).
     tracking: Cell<bool>,
 }
 
 aterm_objc::declare_class! {
-    /// What the mug's button, its menu items, the ticks, the workspace's wake notification, the
-    /// state-file notification and, as the app's delegate, `-terminate:` send to.
+    /// What the mug's button.
     struct CaffeineTarget: NSObject {
         const NAME: &str = "ATermCaffeineTarget";
         type Ivars = TargetIvars;
         protocols: [NSObject];
 
-        /// The button was released: a left click toggles, a right or Control-click opens the menu.
+        /// The button was released.
         @sel(statusClicked:)
         fn status_clicked(&self, _sender: Id) {
             if MainThread::new().is_none() {
@@ -393,9 +361,7 @@ aterm_objc::declare_class! {
             }
         }
 
-        /// The button's [`ui::SHOW_MENU`] accessibility action. It answers YES at once and the menu
-        /// opens on the run loop's next turn: the menu's tracking loop holds the main thread until
-        /// the menu closes, and the client (VoiceOver) waits on the answer.
+        /// The button's [`ui::SHOW_MENU`] accessibility action.
         @sel(showMenuAction:)
         fn show_menu_action(&self, _action: Id) -> Bool {
             if MainThread::new().is_none() {
@@ -426,7 +392,7 @@ aterm_objc::declare_class! {
             }
         }
 
-        /// A menu item was chosen; its tag says which. An unknown tag does nothing.
+        /// A menu item was chosen.
         @sel(menuAction:)
         fn menu_action(&self, sender: Id) {
             if sender.is_null() || MainThread::new().is_none() {
@@ -457,8 +423,7 @@ aterm_objc::declare_class! {
             }
         }
 
-        /// `NSWorkspaceDidWakeNotification`: the run loop's clock stood still while the Mac slept,
-        /// so tick now rather than when the delayed one fires.
+        /// `NSWorkspaceDidWakeNotification`.
         @sel(workspaceDidWake:)
         fn workspace_did_wake(&self, _note: Id) {
             if MainThread::new().is_some() {
@@ -477,8 +442,7 @@ aterm_objc::declare_class! {
             }
         }
 
-        /// End `-run`: the delayed perform a [`Next::Stop`] scheduled, so it runs from the main run
-        /// loop after any menu tracking has ended.
+        /// End `-run`: the delayed perform a [`Next::Stop`] scheduled.
         @sel(stopRun:)
         fn stop_run(&self, _arg: Id) {
             if MainThread::new().is_some() {
@@ -486,11 +450,7 @@ aterm_objc::declare_class! {
             }
         }
 
-        /// As the app's delegate, what `-terminate:` asks first. A quit Apple event from outside
-        /// the menu (an AppleScript `quit`) is the person's ([`Self::quit_from_outside`]), answered
-        /// Cancel so `-run` ends at the stop it scheduled and the app leaves as Quit Caffeine
-        /// leaves it (exit 0, its copy with it); the event's sender hears "user canceled" (-128)
-        /// though the mug quits.
+        /// As the app's delegate, what `-terminate:` asks first ([`Self::quit_from_outside`]).
         @sel(applicationShouldTerminate:)
         fn application_should_terminate(&self, _app: Id) -> usize {
             if MainThread::new().is_none() || terminate_is_the_systems() {
@@ -502,8 +462,7 @@ aterm_objc::declare_class! {
 }
 
 impl CaffeineTarget {
-    /// Run `f` on the mug (unless the app is ending, or the mug is borrowed by a handler this one
-    /// is nested in), then arm the next tick or schedule the stop it asks for.
+    /// Run `f` on the mug.
     fn handle(&self, f: impl FnOnce(&mut Mug) -> Next) {
         let next = autoreleasepool(|_| self.ivars().mug.try_borrow_mut().ok()?.handled(f));
         self.follow(next);
@@ -515,8 +474,7 @@ impl CaffeineTarget {
         self.follow(next);
     }
 
-    /// A quit from outside the menu, taken as the person's: Quit Caffeine's, the mode saved off and
-    /// the stop scheduled.
+    /// A quit from outside the menu, taken as the person's.
     fn quit_from_outside(&self) -> bool {
         let now = now();
         self.handle_choice(|mug| mug.choose(MenuAction::Quit, now));
@@ -559,14 +517,11 @@ impl CaffeineTarget {
 }
 
 thread_local! {
-    /// The target a person's SIGTERM quits ([`quit_by_sigterm`]): set on the main thread while
-    /// `-run` runs.
+    /// The target a person's SIGTERM quits ([`quit_by_sigterm`]).
     static SIGTERMED: RefCell<Option<Retained<CaffeineTarget>>> = const { RefCell::new(None) };
 }
 
-/// A person's SIGTERM ([`term::watch`]'s thread hands it the sender's pid): the mug quits on the
-/// main thread as Quit Caffeine quits it, so launchd does not start it again; one that cannot take
-/// the quit ends as the signal's default action would have ended it.
+/// A person's SIGTERM ([`term::watch`]).
 fn quit_by_sigterm(sender: libc::pid_t) {
     aterm_objc::run_on_main(move |_| {
         let target = SIGTERMED.with_borrow(|target| target.as_ref().map(Retained::clone_retained));
@@ -582,20 +537,17 @@ fn quit_by_sigterm(sender: libc::pid_t) {
 
 /// The running application, which [`run`] made before any of this can be sent.
 fn shared_app() -> Id {
-    // SAFETY: `+sharedApplication` is `@16@0:8`; every caller is on the main thread, and the app
-    // it answers (+0) lives as long as the process.
+    // SAFETY: `+sharedApplication` is `@16@0:8`.
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }
 
-/// The app's current event: the one being dispatched, or else the last it took off the queue.
+/// The app's current event.
 fn current_event() -> Option<EventKey> {
     let app = shared_app();
     if app.is_null() {
         return None;
     }
-    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or
-    // nil; on that event `-type` and `-modifierFlags` are both `Q16@0:8` and `-timestamp`
-    // `d16@0:8`, read only.
+    // SAFETY: `-currentEvent` is `@16@0:8` on the live app and answers the event (+0) or nil.
     unsafe {
         let event = send_id(app, sel!(currentEvent));
         (!event.is_null()).then(|| EventKey {
@@ -606,17 +558,12 @@ fn current_event() -> Option<EventKey> {
     }
 }
 
-/// `-[NSAppleEventDescriptor attributeDescriptorForKeyword:]`, `@20@0:8I16`: no helper takes an
-/// `AEKeyword` (a 32-bit `FourCharCode`).
+/// `-[NSAppleEventDescriptor attributeDescriptorForKeyword:]`, `@20@0:8I16`.
 type AttributeFn = unsafe extern "C-unwind" fn(Id, Sel, u32) -> Id;
 
-/// Whether the `-terminate:` AppKit asks about is the system's: the quit Apple event being handled
-/// names a logout, a restart or a shutdown in its `keyAEQuitReason` ([`SYSTEM_REASONS`]).
+/// Whether the `-terminate:` AppKit asks about is the system's ([`SYSTEM_REASONS`]).
 fn terminate_is_the_systems() -> bool {
     // SAFETY: main-thread Foundation sends, inside `applicationShouldTerminate:`.
-    // `+sharedAppleEventManager` and `-currentAppleEvent` are `@16@0:8` and answer borrowed
-    // objects (the event nil outside one); `AttributeFn`'s prototype answers a borrowed
-    // descriptor or nil; `-enumCodeValue` is `I16@0:8`, an `OSType`.
     let reason = autoreleasepool(|_| unsafe {
         let manager = send_id(
             class(c"NSAppleEventManager").as_id(),
@@ -643,21 +590,17 @@ fn reason_is_the_systems(code: u32) -> bool {
         .any(|reason| u32::from_be_bytes(*reason) == code)
 }
 
-/// `+[NSObject cancelPreviousPerformRequestsWithTarget:selector:object:]`, `v40@0:8@16:24@32`: no
-/// helper has this shape.
+/// `+[NSObject cancelPreviousPerformRequestsWithTarget:selector:object:]`, `v40@0:8@16:24@32`.
 type CancelFn = unsafe extern "C-unwind" fn(Id, Sel, Id, Sel, Id);
 
-/// `-[NSObject performSelector:withObject:afterDelay:inModes:]`, `v48@0:8:16@24d32@40`: no helper
-/// has this shape.
+/// `-[NSObject performSelector:withObject:afterDelay:inModes:]`, `v48@0:8:16@24d32@40`.
 type PerformInModesFn = unsafe extern "C-unwind" fn(Id, Sel, Sel, Id, f64, Id);
 
 /// An `NSArray` holding [`COMMON_MODES`], retained.
 fn common_modes() -> Option<Obj> {
     let mode = aterm_objc::ns_string(COMMON_MODES)?;
     let modes = [mode.id()];
-    // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24`; it reads `count` live,
-    // non-nil objects (the string, alive for the call) and answers the array at +0, which
-    // `Obj::retain` retains for the caller.
+    // SAFETY: `+arrayWithObjects:count:` is `@32@0:8r^@16Q24`.
     unsafe {
         Obj::retain(send_id_idptr_usize(
             class(c"NSArray").as_id(),
@@ -668,19 +611,12 @@ fn common_modes() -> Option<Obj> {
     }
 }
 
-/// Tick `target` in `secs` seconds, in place of any tick already scheduled. A delayed perform on
-/// the main run loop's common modes, which `NSApplication` makes hold the menu's tracking mode: a
-/// tick runs while the menu is open too, so a deadline is kept then (a tick is safe there: no
-/// borrow is held across the pop-up, and a stop it decides still waits for the menu to close,
-/// [`schedule_stop`]; an update restart is not decided then, [`Mug::tick`]).
+/// Tick `target` in `secs` seconds ([`schedule_stop`], [`Mug::tick`]).
 fn arm_tick(target: Id, secs: u64) {
     autoreleasepool(|_| {
         let modes = common_modes();
         cancel_performs_of(target, sel!(tick:));
-        // SAFETY: main-thread sends on the live target. The perform is `PerformInModesFn`'s
-        // prototype, its modes array live across the send (the perform keeps its own copy), or
-        // `-performSelector:withObject:afterDelay:`, `v40@0:8:16@24d32`; `tick:` is a method
-        // the target declares.
+        // SAFETY: main-thread sends on the live target.
         unsafe {
             if let Some(modes) = &modes {
                 let perform: PerformInModesFn = aterm_objc::checked_msg();
@@ -705,8 +641,7 @@ fn arm_tick(target: Id, secs: u64) {
     });
 }
 
-/// Drop the delayed performs of `selector` (with a nil object) `target` has queued, in any mode;
-/// the others stay (a scheduled `stopRun:` too).
+/// Drop the delayed performs of `selector` (with a nil object) `target` has queued, in any mode.
 fn cancel_performs_of(target: Id, selector: Sel) {
     // SAFETY: a main-thread class send; `CancelFn`'s prototype, its target live.
     unsafe {
@@ -747,19 +682,13 @@ fn cancel_performs(target: Id) {
     }
 }
 
-/// `[NSApp stop:nil]`, and an application-defined event posted at the front of the queue:
-/// `-run` looks at its stop only after it has dispatched an event, and a delayed perform
-/// is not one.
+/// `[NSApp stop:nil]`, and an application-defined event posted at the front of the queue.
 fn stop_app() {
     let app = shared_app();
     if app.is_null() {
         return;
     }
-    // SAFETY: main-thread sends on the live app. `-stop:` is `v24@0:8@16` (the nil sender);
-    // `+otherEventWithType:location:modifierFlags:timestamp:windowNumber:context:subtype:
-    // data1:data2:` is `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64s72q76q84`, the helper's
-    // prototype, answering the event at +0, retained across `-postEvent:atStart:`
-    // (`v28@0:8@16B24`).
+    // SAFETY: main-thread sends on the live app.
     unsafe {
         send_v_id(app, sel!(stop:), Id::NIL);
         let raw = send_id_usize_point_usize_f64_isize_id_i16_isize_isize(
@@ -793,8 +722,7 @@ fn workspace_center() -> Id {
     }
 }
 
-/// Send `target` `workspaceDidWake:` when the Mac wakes; whether it was registered. The center
-/// holds `target` unretained: [`stop_observing_wake`] removes it before it goes.
+/// Send `target` `workspaceDidWake:` when the Mac wakes ([`stop_observing_wake`]).
 fn observe_wake(target: Id) -> bool {
     let center = workspace_center();
     let Some(name) = aterm_objc::ns_string(DID_WAKE) else {
@@ -803,8 +731,7 @@ fn observe_wake(target: Id) -> bool {
     if center.is_null() {
         return false;
     }
-    // SAFETY: `-addObserver:selector:name:object:` is `v48@0:8@16:24@32@40`; the selector
-    // is one the target declares; a nil object is "from any sender".
+    // SAFETY: `-addObserver:selector:name:object:` is `v48@0:8@16:24@32@40`.
     unsafe {
         send_v_id_sel_id_id(
             center,
@@ -827,8 +754,7 @@ fn stop_observing_wake(target: Id) {
     }
 }
 
-/// The one stderr line of a mug that will not run, and exit 0: launchd's KeepAlive starts the job
-/// again on any other status, only for it to refuse the same way.
+/// The one stderr line of a mug that will not run, and exit 0.
 fn refuse(paths: &Paths, why: &str) -> ExitCode {
     bridge::release(paths);
     eprintln!("aterm caffeine: {why}");
@@ -907,7 +833,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
     };
     let changed = {
         let target = target.clone_retained();
-        // SAFETY (in the hook): `stateChanged:` is `v@:@` on the live target it retains.
+        // SAFETY: `stateChanged:` is `v@:@` on the live target it retains.
         ChangedObserver::register(move || unsafe {
             send_v_id(target.as_id(), sel!(stateChanged:), Id::NIL);
         })
@@ -941,8 +867,7 @@ fn run_app(main: MainThread, mug: Mug) -> ExitCode {
     };
     let woke = observe_wake(target.as_id());
     arm_tick(target.as_id(), first_tick);
-    // SAFETY: `-setDelegate:` is `v24@0:8@16`; the app holds its delegate unretained, and the
-    // target outlives `-run`, after which it is taken back.
+    // SAFETY: `-setDelegate:` is `v24@0:8@16`.
     unsafe { send_v_id(app, sel!(setDelegate:), target.as_id()) };
     SIGTERMED.set(Some(target.clone_retained()));
     let sigterm = term::watch(quit_by_sigterm);
@@ -979,7 +904,6 @@ mod tests {
 
     const NOW: u64 = 1_790_000_000;
 
-    /// A mug that will not run lets a bridge an update restart left go, and exits 0.
     #[test]
     fn a_refusal_lets_a_left_bridge_go() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1035,9 +959,6 @@ mod tests {
         assert_eq!(click_of(None), Click::Toggle);
     }
 
-    /// A press that finds the app's current event still the one last read, or the one the
-    /// menu closed on, brought no event of its own (an accessibility press): it toggles,
-    /// whatever button made that event.
     #[test]
     fn a_press_finding_a_stale_event_toggles() {
         let right = |at: f64| EventKey {
@@ -1184,9 +1105,6 @@ mod tests {
         assert!(mug.awake.is_none());
     }
 
-    /// Once Quit or a restart is decided, nothing else is handled: a click, a choice, a tick
-    /// or a writer's change arriving before `-run` returns (the stop is a delayed perform)
-    /// neither changes the mode nor saves it, nor re-decides the exit.
     #[test]
     fn nothing_is_handled_once_the_end_is_decided() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1248,9 +1166,6 @@ mod tests {
         let mut mug = scratch_mug(dir.path());
         let file = mug.paths.state_file();
         state::save(&file, Mode::Forever).expect("save");
-        // A line `decode` skips and `encode` never writes: a save-back of the same mode
-        // would drop it, where it would rewrite a plain file byte for byte.
-        // NEGATIVE CONTROL: `reload` as `self.set(state::load(..), now)` fails here.
         let mut before = b"# a writer's line\n".to_vec();
         before.extend(std::fs::read(&file).expect("read"));
         std::fs::write(&file, &before).expect("write");
@@ -1260,8 +1175,6 @@ mod tests {
         assert_eq!(std::fs::read(&file).expect("read"), before);
     }
 
-    /// Enable at Startup flips the login plist under the mug's home (scratch here; nothing
-    /// is loaded into launchd), leaves the mode alone, and its checkmark follows the file.
     #[test]
     fn enable_at_startup_writes_and_removes_the_login_plist() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1302,9 +1215,6 @@ mod tests {
         assert!(!checked(&mug), "the control");
     }
 
-    /// With Login Items' switch off, no plist turns Enable at Startup on: turning it on writes
-    /// the plist and opens Login Items, and so does choosing its row then (unchecked, titled
-    /// for Login Items); turning it off opens nothing.
     #[test]
     fn a_blocked_enable_at_startup_opens_login_items() {
         thread_local! {
@@ -1331,8 +1241,7 @@ mod tests {
         let _ = mug.choose(MenuAction::ToggleStartup, NOW);
         assert!(plist.is_file(), "the plist stays");
         assert_eq!(OPENED.with(Cell::get), 2);
-        // The plist cannot be written again (a directory that refuses its owner): the one
-        // there is still blocked, and Login Items still opens.
+
         use std::os::unix::fs::PermissionsExt as _;
         let agents = plist.parent().expect("LaunchAgents").to_path_buf();
         std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o555)).expect("ro");
@@ -1345,9 +1254,6 @@ mod tests {
         assert_eq!(OPENED.with(Cell::get), 3, "off opens nothing");
     }
 
-    /// A job launchd has disabled reads unchecked, and turning Enable at Startup on lifts the
-    /// disable (`launchctl enable`, here a door that flips it), after which it reads on;
-    /// nothing opens Login Items for it.
     #[test]
     fn enable_at_startup_lifts_launchds_disable() {
         thread_local! {
@@ -1381,8 +1287,6 @@ mod tests {
         assert_eq!(LIFTED.with(Cell::get), 1, "nothing to lift once on");
     }
 
-    /// An update found while the menu is open waits for it to close; the ticks, and so the
-    /// deadline, do not.
     #[test]
     fn an_update_waits_for_the_menu_and_the_deadline_does_not() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1427,13 +1331,9 @@ mod tests {
     }
 
     thread_local! {
-        /// Whether the mug still held its own activity when the bridge was started: set by the
-        /// bridge stand-in of [`a_restart_holding_the_activity_hands_it_to_a_bridge_first`].
         static BRIDGED_WHILE_HELD: Cell<Option<bool>> = const { Cell::new(None) };
     }
 
-    /// An update restart while on starts a bridge before the mug lets go of its own activity,
-    /// so no moment passes with neither held; a restart while off, and a Quit, start none.
     #[test]
     fn a_restart_holding_the_activity_hands_it_to_a_bridge_first() {
         const REASON: &str = "aterm caffeine restart bridge test";
@@ -1474,8 +1374,6 @@ mod tests {
         assert!(!held());
     }
 
-    /// The new mug's first apply takes over from a bridge: on or off, the bridge's file goes,
-    /// once the mode read at the start is applied.
     #[test]
     fn the_first_apply_lets_a_restarts_bridge_go() {
         for mode in [Mode::Forever, Mode::Off] {
@@ -1507,8 +1405,6 @@ mod tests {
         assert_eq!(KEY_QUIT_REASON, 0x7768_793F);
     }
 
-    /// A rollback to a build without the verb: the job ends for good (exit 0, which launchd
-    /// does not restart) and takes its login item with it.
     #[test]
     fn a_replacement_without_the_verb_ends_the_job_and_its_login_item() {
         let dir = aterm_tempfile::tempdir().expect("tempdir");
@@ -1524,15 +1420,12 @@ mod tests {
         assert!(!launchd::startup_enabled(&mug.paths, &mug.label));
     }
 
-    /// The registered class is what the runtime reports: its name, its superclass, the
-    /// `NSObject` protocol, and every selector AppKit and the observers send it.
     #[test]
     fn the_registered_class_is_what_the_runtime_reports() {
         let cls = CaffeineTarget::class();
         assert!(!cls.is_null());
         assert_eq!(class(c"ATermCaffeineTarget"), cls);
-        // SAFETY: `cls` is the class this module registered: it and its superclass are live,
-        // immortal class objects; the queries are side-effect free.
+        // SAFETY: `cls` is the class this module registered: it and its superclass are live.
         unsafe {
             assert_eq!(class_name(cls), c"ATermCaffeineTarget");
             assert_eq!(class_name(aterm_objc::superclass_of(cls)), c"NSObject");
@@ -1574,13 +1467,10 @@ mod tests {
         }
     }
 
-    /// `ret@:args`, the offset-free encoding a prototype has.
     fn types(ret: &str, args: &[&str]) -> String {
         format!("{ret}@:{}", args.concat())
     }
 
-    /// Every prototype this file sends with, against what the runtime says the selector
-    /// takes on the class it is sent to (a class method's on the metaclass).
     #[test]
     fn every_send_here_has_the_prototype_the_runtime_reports() {
         use aterm_objc::{Bool, Encode};
@@ -1715,8 +1605,7 @@ mod tests {
         for (name, sel, class_method, want) in rows {
             let cls = class(name);
             assert!(!cls.is_null(), "{name:?}");
-            // SAFETY: `cls` is a live, registered class, and so is its metaclass; reading a
-            // method's encoding has no side effects.
+            // SAFETY: `cls` is a live, registered class, and so is its metaclass.
             let got = unsafe {
                 let cls = if *class_method {
                     aterm_objc::class_of(cls.as_id())

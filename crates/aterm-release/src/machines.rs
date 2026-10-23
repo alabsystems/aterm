@@ -151,7 +151,7 @@ pub(crate) fn roster_lineage_agrees(
 /// signature): a floor read never accepts more than the fleet would.
 fn anonymous_fetch(url: &str, cap: usize) -> std::result::Result<Vec<u8>, String> {
     let cap_s = cap.to_string();
-    let out = std::process::Command::new("curl")
+    let out = std::process::Command::new(aterm_uds::os_path!("curl"))
         .args([
             "-fsSL",
             "--proto",

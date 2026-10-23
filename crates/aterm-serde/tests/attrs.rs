@@ -1,13 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The `#[serde]` forms aterm's models write that the ported upstream files
-//! leave uncovered once their other-attribute tests are gone: container and
-//! field `default` (bare and `= "path"`), `skip_serializing_if`, every
-//! `rename_all` case aterm uses, `transparent`, `deserialize_with`, a
-//! `deny_unknown_fields` + `default` container, and a struct read from a
-//! sequence (aterm-json forwards `deserialize_struct` to `deserialize_any`).
-//! The set is docs/measured/third-party-2026-10-15/serde-attrs.tsv.
+//! Tests for the `#[serde]` attribute forms used by aterm models.
 
 use crate::support::{
     Token, assert_de_tokens, assert_de_tokens_error, assert_ser_tokens, assert_tokens,
@@ -53,7 +47,6 @@ fn field_default_bare_and_path_fill_missing_keys() {
 
 #[test]
 fn skip_serializing_if_drops_the_field_and_its_length_slot() {
-    // The `len` the struct announces counts only the fields written.
     assert_ser_tokens(
         &FieldDefaults {
             plain: 1,
@@ -153,8 +146,6 @@ fn a_missing_field_without_default_names_the_field() {
         a: u32,
         b: Option<u32>,
     }
-    // An absent `Option` field is `None` (`missing_field`); an absent plain
-    // field is the error.
     assert_de_tokens(
         &Needs { a: 1, b: None },
         &[
@@ -242,7 +233,6 @@ fn rename_all_cases_aterm_uses() {
             variant: "first_one",
         }],
     );
-    // A variant's own `rename` wins over the container's case.
     assert_tokens(
         &Snake::SecondOne,
         &[Token::UnitVariant {
@@ -318,8 +308,6 @@ fn transparent_is_the_inner_value() {
     );
 }
 
-/// A lenient reader in the shape aterm's restore code uses: any value that
-/// is not a `u32` reads as the default instead of failing the document.
 fn lenient_u32<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u32, D::Error> {
     struct Lenient;
     impl<'de> aterm_serde::de::Visitor<'de> for Lenient {
@@ -372,7 +360,6 @@ fn deserialize_with_runs_the_named_function() {
             Token::StructEnd,
         ],
     );
-    // `default` still covers an absent field read through `deserialize_with`.
     assert_de_tokens(
         &With {
             lenient: 0,

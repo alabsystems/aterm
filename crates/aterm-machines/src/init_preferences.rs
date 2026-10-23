@@ -19,11 +19,7 @@ const WINDOW_MANAGER: &str = "com.apple.WindowManager";
 const FINDER: &str = "com.apple.finder";
 const DOCK: &str = "com.apple.dock";
 const DST: &str = "HIDKeyboardModifierMappingDst";
-const HIDUTIL: &str = "/usr/bin/hidutil";
-/// The apps the Dock pins, in order, each at its path, with its bundle identifier and label.
-/// aterm's path is its usual one: [`dock_apps_available`] pins the copy this process runs
-/// from when aterm is in both `/Applications` and the account's `~/Applications`, else the
-/// one copy there is ([`aterm_candidates`]).
+const HIDUTIL: &str = aterm_uds::os_path!("hidutil");
 const DOCK_APPS: [(&str, &str, &str); 3] = [
     ("/Applications/aterm.app", "com.aterm.aterm", "aterm"),
     (
@@ -35,7 +31,6 @@ const DOCK_APPS: [(&str, &str, &str); 3] = [
 ];
 
 /// The preferred keyboard, widget and Dock settings for the resolved local user.
-///
 /// # Errors
 /// An absent or ambiguous user, or an invalid keyboard model.
 pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -43,7 +38,6 @@ pub fn items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
 }
 
 /// Build only the selected preferences, before reading any preference domain.
-///
 /// # Errors
 /// An absent or ambiguous user, or an invalid selected keyboard model.
 pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
@@ -77,10 +71,7 @@ pub fn selected_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
     Ok(items)
 }
 
-/// The setup row of the desktop item with `id` (`consumer.widgets.notification-center@alice`:
-/// the widgets row), for a caller that recorded the items a pass withheld
-/// ([`Item::withheld`]) and follows them up ([`withheld_items`]); an id an older aterm
-/// recorded is read through [`current_ids`] first.
+/// The setup row of the desktop item with `id` (`consumer.widgets.notification-center@alice`: the widgets row), for a caller that recorded the items a pass withheld ([`Item::withheld`]) and follows them up.
 #[must_use]
 pub fn setting_of(id: &str) -> Option<Setting> {
     let (name, _) = id.split_once('@')?;
@@ -89,11 +80,7 @@ pub fn setting_of(id: &str) -> Option<Setting> {
         .map(|(setting, _)| setting)
 }
 
-/// The items of this build that `id`, from a record an older aterm wrote, stands for. aterm
-/// 0.118.0 and older ran one widgets item, `init.widgets@<user>`, whose keys are now each a
-/// `[consumer] widgets` row's own item; `withheld` keeps only those a pass leaves for want of
-/// Full Disk Access (Notification Center's), the one key a record of withheld items could
-/// owe. Any other id stands for itself.
+/// The items of this build that `id`, from a record an older aterm wrote, stands for. aterm 0.118.0 and older ran one widgets item, `init.widgets@<user>`, whose keys are now each a `[consumer] widgets` row's own item.
 #[must_use]
 pub fn current_ids(id: &str, withheld: bool) -> Vec<String> {
     match id.split_once('@') {
@@ -109,13 +96,8 @@ pub fn current_ids(id: &str, withheld: bool) -> Vec<String> {
     }
 }
 
-/// The id, less `@<user>`, of the one widgets item aterm 0.118.0 and older ran
-/// ([`current_ids`]).
 const LEGACY_WIDGETS_ITEM: &str = "init.widgets";
 
-/// The desktop rows, each with its setup row, in run order: the `[consumer] widgets`
-/// catalog rows, one key each under the catalog's id (one key, one owner: machines design
-/// §5.1), then the desktop and the Dock.
 fn desktop() -> impl Iterator<Item = (Setting, DesktopKind)> {
     CATALOG
         .iter()
@@ -128,7 +110,6 @@ fn desktop() -> impl Iterator<Item = (Setting, DesktopKind)> {
 }
 
 /// The follow-up of a pass that left keys in another app's container alone ([`Item::withheld`]).
-///
 /// # Errors
 /// An absent or ambiguous user.
 pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item>>, String> {
@@ -155,7 +136,6 @@ pub fn withheld_items(ctx: &Ctx, selected: Selection) -> Result<Vec<Box<dyn Item
 }
 
 /// Apply Caps Lock as Control to attached HID services without replacing the persistent modifier preferences.
-///
 /// # Errors
 /// The setup did not resolve exactly one local user.
 pub fn attached_keyboard_items(ctx: &Ctx) -> Result<Vec<Box<dyn Item>>, String> {
@@ -236,8 +216,7 @@ impl AttachedKeyboard {
     }
 }
 
-/// Remove only Caps Lock's live mapping for a verifier's OFF stage, retaining every
-/// other mapping. Unknown or conflicting service state cannot authorize a write.
+/// Remove only Caps Lock's live mapping for a verifier's OFF stage, retaining every other mapping.
 pub(crate) fn clear_attached_caps_lock(
     sys: &dyn System,
     user: &User,
@@ -301,8 +280,6 @@ impl Item for AttachedKeyboard {
     }
 }
 
-/// Model matching may return several HID services. Do not copy a service's unrelated
-/// remaps over another service with a different map: refuse that ambiguous case.
 fn merged_mapping(maps: &[Vec<(i64, i64)>]) -> Result<Option<Vec<(i64, i64)>>, String> {
     if maps.is_empty() {
         return Err(
@@ -345,8 +322,6 @@ fn common_other_mappings(maps: &[Vec<(i64, i64)>]) -> Result<Vec<(i64, i64)>, St
     Ok(want)
 }
 
-/// `hidutil property --get` prints a table of RegistryIDs followed by Foundation's
-/// integer mapping arrays, or the array alone on older macOS versions.
 fn parse_hid_mappings(text: &str) -> Result<Vec<Vec<(i64, i64)>>, String> {
     let mut values = Vec::new();
     let mut current = String::new();
@@ -471,7 +446,6 @@ struct Reach {
 }
 
 impl Reach {
-    /// Every key the grant `full_disk_access` lets a pass reach.
     const fn all(full_disk_access: Option<bool>) -> Self {
         Self {
             full_disk_access,
@@ -479,16 +453,12 @@ impl Reach {
         }
     }
 
-    /// Whether the pass reads and writes `domain`'s keys.
     fn reaches(self, domain: &str) -> bool {
         defaults::withheld(domain, self.full_disk_access).is_none()
             && (!self.contained_only || defaults::contained(domain))
     }
 }
 
-/// The activation marker that records a `kind` item's write to `domain`: the family's own;
-/// for the widgets' Window Manager keys, [`crate::init_activation::WIDGETS_MARKER`]; for
-/// another app's container, [`crate::init_activation::CONTAINED_MARKER`].
 fn marker(kind: DesktopKind, domain: &str) -> &'static str {
     if defaults::contained(domain) {
         crate::init_activation::CONTAINED_MARKER
@@ -515,7 +485,6 @@ enum Wanted {
 }
 
 impl Wanted {
-    /// What a catalog row's `off` asks for.
     const fn of(lit: Lit) -> Self {
         match lit {
             Lit::NoWidgets => Self::NoWidgets,
@@ -525,7 +494,6 @@ impl Wanted {
 }
 
 impl DesktopKind {
-    /// The family's journal name, and the marker of its keys but the widgets' ([`marker`]).
     const fn family(self) -> &'static str {
         match self {
             Self::Widget(_) => "widgets",
@@ -534,7 +502,6 @@ impl DesktopKind {
         }
     }
 
-    /// The id of an item of this kind, less `@<user>`: a widgets row's is its catalog id.
     fn name(self) -> String {
         match self {
             Self::Widget(row) => row.id.to_owned(),
@@ -542,13 +509,10 @@ impl DesktopKind {
         }
     }
 
-    /// The id of `user`'s item of this kind.
     fn id(self, user: &User) -> String {
         format!("{}@{}", self.name(), user.name)
     }
 
-    /// The processes that read the keys `marker` records of those the family reaches, in
-    /// relaunch order: those of each domain they are in ([`crate::init_activation::readers`]).
     fn readers(self, reach: Reach, marker: &str) -> Vec<&'static str> {
         crate::init_activation::RELAUNCHED
             .into_iter()
@@ -560,9 +524,6 @@ impl DesktopKind {
             .collect()
     }
 
-    /// The keys of [`DesktopKind::keys`] a pass reads and writes ([`Reach::reaches`]): all
-    /// of them, less any in another app's container while the grant is not known held
-    /// ([`defaults::withheld`]); in a follow-up, those alone.
     fn reached(self, reach: Reach) -> Vec<Key> {
         self.keys()
             .into_iter()
@@ -570,7 +531,6 @@ impl DesktopKind {
             .collect()
     }
 
-    /// The keys the family reaches whose writes `marker` records.
     fn recorded(self, reach: Reach, marker: &str) -> Vec<Key> {
         self.reached(reach)
             .into_iter()
@@ -578,8 +538,6 @@ impl DesktopKind {
             .collect()
     }
 
-    /// The markers of the keys the family reaches, each once, in key order: a pass begins,
-    /// discharges and reports only these.
     fn markers(self, reach: Reach) -> Vec<&'static str> {
         let mut markers = Vec::new();
         for (domain, _, _) in self.reached(reach) {
@@ -591,7 +549,6 @@ impl DesktopKind {
         markers
     }
 
-    /// Why each domain of the family's keys the pass leaves alone is left alone, each once.
     fn withheld(self, full_disk_access: Option<bool>) -> Vec<String> {
         let mut why: Vec<String> = Vec::new();
         for (domain, _, _) in self.keys() {
@@ -604,9 +561,6 @@ impl DesktopKind {
         why
     }
 
-    /// Every key the family may write, in the order it reads them, and what each should
-    /// hold: what its item changes and what its activation waits to read the same, of those
-    /// a pass reaches ([`DesktopKind::reached`]). A widgets row's is its catalog row's key.
     fn keys(self) -> Vec<Key> {
         let keys: &[Key] = match self {
             Self::Widget(row) => return vec![(row.domain, row.key, Wanted::of(row.off))],
@@ -643,7 +597,6 @@ impl DesktopKind {
     }
 }
 
-/// A desktop key: its domain, its name, and what it should hold.
 type Key = (&'static str, &'static str, Wanted);
 
 #[derive(Debug)]
@@ -671,21 +624,14 @@ impl Desktop {
         Target::user(domain, key, &self.user)
     }
 
-    /// Which keys the pass reaches, which its activation holds for every family.
     fn reach(&self) -> Reach {
         self.activation.reach
     }
 
-    /// The pass's measured Full Disk Access.
     fn full_disk_access(&self) -> Option<bool> {
         self.reach().full_disk_access
     }
 
-    /// Whether an earlier write of the keys this pass reaches still awaits its readers'
-    /// relaunch: a marker of those keys is pending, or an older aterm's marker of every
-    /// widgets key ([`Desktop::legacy`]). A marker this pass found clear and another of its
-    /// items then began is the pass's own relaunch to make, not an earlier write
-    /// ([`DesktopActivation::earlier`]): the two Window Manager widgets rows share one.
     fn pending(&self, sys: &dyn System) -> Result<bool, String> {
         for marker in self
             .kind
@@ -700,20 +646,12 @@ impl Desktop {
         Ok(false)
     }
 
-    /// The marker an older aterm wrote before every widgets write, Notification Center's with
-    /// the Window Manager's ([`crate::init_activation::LEGACY_WIDGETS_MARKER`]), for a
-    /// widgets item of a Window Manager key in a pass that reaches it (not a follow-up,
-    /// which never relaunches the Dock): the first of them carries it.
     fn legacy(&self) -> Option<&'static str> {
         let wm = matches!(self.kind, DesktopKind::Widget(row) if !defaults::contained(row.domain));
         (wm && !self.reach().contained_only)
             .then_some(crate::init_activation::LEGACY_WIDGETS_MARKER)
     }
 
-    /// Carry what an older aterm's pending widgets marker owes to the two markers that now
-    /// record those writes, and drop it: the Dock's ([`crate::init_activation::WIDGETS_MARKER`])
-    /// and Notification Center's ([`crate::init_activation::CONTAINED_MARKER`]), each written
-    /// before the old one goes, so a pass that ends between them carries it again.
     fn carry_legacy(&self, sys: &dyn System) -> Result<(), String> {
         let Some(legacy) = self.legacy() else {
             return Ok(());
@@ -731,7 +669,6 @@ impl Desktop {
         crate::init_activation::finish(sys, &self.user, legacy)
     }
 
-    /// What the item reads as wanted: its title, and why any key it leaves alone is.
     fn summary(&self) -> String {
         let withheld = self.kind.withheld(self.full_disk_access());
         if withheld.is_empty() {
@@ -768,7 +705,6 @@ impl Desktop {
     }
 }
 
-/// `want`, unless `read` already holds it by `same`.
 fn unmet(
     read: &Read<PValue>,
     want: PValue,
@@ -798,7 +734,6 @@ struct DesktopActivation {
     seen: Mutex<Vec<(&'static str, bool)>>,
 }
 
-/// One relaunch a pass owes: a family, and the marker of the keys it wrote.
 type Obligation = (DesktopKind, &'static str);
 
 impl DesktopActivation {
@@ -811,10 +746,6 @@ impl DesktopActivation {
         }
     }
 
-    /// Whether `marker` holds a write of an earlier pass still awaiting its readers'
-    /// relaunch: pending now, and already when this pass first looked. One the pass found
-    /// clear and an item of it then began is this pass's to discharge, so another item
-    /// that shares it (the two Window Manager widgets rows) reads its own key alone.
     fn earlier(&self, sys: &dyn System, marker: &'static str) -> Result<bool, String> {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         match seen.iter().find(|(looked, _)| *looked == marker) {
@@ -828,15 +759,12 @@ impl DesktopActivation {
         }
     }
 
-    /// `marker` now carries what an older aterm's marker owed ([`Desktop::carry_legacy`]):
-    /// an earlier write, for every item that shares it.
     fn carried(&self, marker: &'static str) {
         let mut seen = self.seen.lock().unwrap_or_else(PoisonError::into_inner);
         seen.retain(|(looked, _)| *looked != marker);
         seen.push((marker, true));
     }
 
-    /// `kind`'s marker is written and its writes begin: this pass relaunches its readers.
     fn owe(&self, kind: DesktopKind) {
         let mut owed = self.owed.lock().unwrap_or_else(PoisonError::into_inner);
         if !owed.contains(&kind) {
@@ -844,8 +772,6 @@ impl DesktopActivation {
         }
     }
 
-    /// What this pass owes a relaunch for whose marker is still pending: of each family it
-    /// owes, each marker of the keys it reaches ([`DesktopKind::markers`]).
     fn obligations(&self, sys: &dyn System) -> Result<Vec<Obligation>, String> {
         let owed = self
             .owed
@@ -863,7 +789,6 @@ impl DesktopActivation {
         Ok(due)
     }
 
-    /// The processes that read the keys `due` records, each once, in relaunch order.
     fn consumers(&self, due: &[Obligation]) -> Vec<&'static str> {
         crate::init_activation::RELAUNCHED
             .into_iter()
@@ -874,9 +799,6 @@ impl DesktopActivation {
             .collect()
     }
 
-    /// What `process` reads of what `due` records, as it now holds it
-    /// ([`crate::init_activation::reading`]): `Err` while it is the Dock and has not yet
-    /// loaded the tiles it was handed.
     fn look(
         &self,
         sys: &dyn System,
@@ -893,7 +815,6 @@ impl DesktopActivation {
     }
 }
 
-/// `a`, `a and b`, `a, b and c`.
 fn listed(names: &[String]) -> String {
     match names {
         [] => String::new(),
@@ -940,9 +861,6 @@ impl Activation for DesktopActivation {
         )))
     }
 
-    /// Relaunch the readers of every marker owed, once each, and wait for each; then
-    /// clear each marker all of whose keys' readers are up, and name the items of the
-    /// others, each with why its readers are not.
     fn activate(&self, sys: &dyn System, _ctx: &Ctx) -> Result<Vec<(String, String)>, String> {
         let due = self.obligations(sys)?;
         let processes = self.consumers(&due);
@@ -1062,9 +980,6 @@ impl Item for Desktop {
         }
     }
 
-    /// Write the family's keys, after the durable marker of each key written ([`marker`]),
-    /// and of each already pending (an older aterm's widgets marker carried into them first,
-    /// [`Desktop::carry_legacy`]).
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.carry_legacy(sys)?;
         let changes = self.changes(sys)?;
@@ -1122,7 +1037,6 @@ fn field<'a>(value: &'a PValue, key: &str) -> Option<&'a PValue> {
     entries.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
-/// The pins of `apps` (each a path, a bundle identifier and a label), in order.
 fn dock_apps(apps: &[DockApp]) -> PValue {
     PValue::Array(
         apps.iter()
@@ -1149,9 +1063,6 @@ fn dock_apps(apps: &[DockApp]) -> PValue {
     )
 }
 
-/// `path` as the directory URL the Dock stores (`_CFURLStringType` 15): each byte outside
-/// RFC 3986's path characters percent-encoded, so [`dock_app_path`] reads back the same
-/// path whatever a home folder is named (`#`, `?`, `%`, a space, any non-ASCII letter).
 fn file_url(path: &str) -> String {
     let mut url = String::from("file://");
     for &byte in path.as_bytes() {
@@ -1165,12 +1076,8 @@ fn file_url(path: &str) -> String {
     url
 }
 
-/// One app the Dock pins: its path, bundle identifier and label.
 type DockApp = (String, &'static str, &'static str);
 
-/// Where the Dock looks for aterm, in order: `/Applications`, where `tools/install.sh` puts
-/// it, then the account's own `~/Applications`, where it goes when `/Applications` is not
-/// writable (a standard account). [`aterm_candidates`] puts the running copy first.
 fn aterm_paths(user: &User) -> [String; 2] {
     [
         DOCK_APPS[0].0.to_owned(),
@@ -1178,9 +1085,6 @@ fn aterm_paths(user: &User) -> [String; 2] {
     ]
 }
 
-/// [`aterm_paths`], the one this process runs from first ([`System::running_app`]): with
-/// aterm in both folders, the copy this account runs and its updater keeps current is the
-/// one its Dock opens, not another account's, which may be old.
 fn aterm_candidates(sys: &dyn System, user: &User) -> Vec<String> {
     let mut paths = aterm_paths(user).to_vec();
     let canonical = |path: &str| {
@@ -1197,9 +1101,6 @@ fn aterm_candidates(sys: &dyn System, user: &User) -> Vec<String> {
 }
 
 /// The [`DOCK_APPS`] as installed, aterm at the first of [`aterm_candidates`] that holds it.
-/// An asserted bundle identifier in Dock preferences does not establish an installed app,
-/// so each is read from its bundle.
-///
 /// # Errors
 /// An app is missing, unreadable, or another app: the Dock is left untouched.
 fn dock_apps_available(sys: &dyn System, user: &User) -> Result<Vec<DockApp>, String> {
@@ -1245,7 +1146,6 @@ fn dock_apps_available(sys: &dyn System, user: &User) -> Result<Vec<DockApp>, St
     Ok(apps)
 }
 
-/// Why an app the Dock would pin is not there to pin.
 enum Missing {
     /// Nothing is at its path.
     NotInstalled,
@@ -1253,7 +1153,6 @@ enum Missing {
     Other(String),
 }
 
-/// Whether `path` holds the app `bundle`, read as `user` from its bundle's Info.plist.
 fn installed_app(
     sys: &dyn System,
     user: &User,
@@ -1280,7 +1179,6 @@ fn installed_app(
     Ok(())
 }
 
-/// Dock adds bookmarks and GUIDs and changes URL escaping or trailing separators.
 fn same_apps(sys: &dyn System, now: &PValue, want: &PValue) -> bool {
     let (PValue::Array(now), PValue::Array(want)) = (now, want) else {
         return false;
@@ -1341,14 +1239,10 @@ mod tests {
     use crate::model::{Mode, Outcome};
     use crate::port::{Fake, Ran, Stat};
 
-    /// The marker of the widgets' Window Manager keys.
     const WIDGETS: &str = crate::init_activation::WIDGETS_MARKER;
 
-    /// Notification Center's preferences, in its app container.
     const NOTIFICATION_CENTER: &str = "com.apple.notificationcenterui";
 
-    /// A desktop item of its own pass, whose process holds Full Disk Access (the arm that
-    /// reaches Notification Center's container).
     fn desktop(who: &User, kind: DesktopKind) -> Desktop {
         Desktop::new(
             who,
@@ -1357,7 +1251,6 @@ mod tests {
         )
     }
 
-    /// The [`DOCK_APPS`] at their usual paths, aterm in `/Applications`.
     fn usual_dock_apps() -> Vec<DockApp> {
         DOCK_APPS
             .into_iter()
@@ -1371,7 +1264,6 @@ mod tests {
         }
     }
 
-    /// The app `bundle` at `path`, as `who` reads its Info.plist.
     fn installed_at(sys: &Fake, who: &User, path: &str, bundle: &str) {
         sys.stat_of(
             &format!("{path}/Contents"),
@@ -1564,10 +1456,6 @@ mod tests {
         ));
     }
 
-    /// An app the Dock pins beside aterm that is missing, or another app at its path, leaves
-    /// the Dock as it was and says which, on a Dock the row can read. Negative controls:
-    /// `installed_app` accepting any bundle identifier pins the impostor; skipping the
-    /// other apps' check in `dock_apps_available` pins the missing Safari.
     #[test]
     fn missing_or_wrong_installed_dock_apps_cannot_be_reported_configured() {
         let who = user("alice", 501);
@@ -1608,13 +1496,6 @@ mod tests {
         }
     }
 
-    /// aterm in the account's `~/Applications` (`tools/install.sh` on a standard account,
-    /// where `/Applications` is not writable) is the aterm the Dock pins, also when
-    /// `/Applications/aterm.app` is some other app; with aterm in both, the copy this process
-    /// runs from, else `/Applications`'s; with neither, the row says what each folder holds
-    /// and leaves the Dock alone. Negative controls: `aterm_paths` without the home entry
-    /// leaves the first two Unknown; `aterm_candidates` without the running copy's move pins
-    /// `/Applications` in the fourth.
     #[test]
     fn the_dock_pins_the_aterm_in_the_accounts_own_applications_folder() {
         let who = user("alice", 501);
@@ -1630,8 +1511,6 @@ mod tests {
             dock_apps(&apps)
         };
         let aterm = Some("com.aterm.aterm");
-        // (aterm at /Applications, aterm at ~/Applications, the running copy, the copy pinned
-        // or what the row says)
         for (usual, home, running, pinned) in [
             (None, aterm, None, Ok(own)),
             (Some("com.example.another-app"), aterm, None, Ok(own)),
@@ -1716,10 +1595,6 @@ mod tests {
         }
     }
 
-    /// A pin's URL reads back as the path it was made from, whatever the folder is named,
-    /// so the row converges for a home with `#`, `?`, `%`, spaces or non-ASCII letters.
-    /// Negative control: escaping only spaces (the old `dock_apps`) loses the `#` and `%`
-    /// homes.
     #[test]
     fn a_pin_reads_back_as_the_path_it_was_made_from() {
         for path in [
@@ -1744,12 +1619,6 @@ mod tests {
         );
     }
 
-    /// An `~/Applications` that is a link (to a folder on another volume) is matched by
-    /// where it leads, as [`System::running_app`] reads the running copy: the account's own
-    /// aterm is the running one and is pinned, and a pin spelled through the link's target
-    /// is the same app, so the row converges. Negative controls: comparing raw paths in
-    /// `aterm_candidates` pins `/Applications`; in `same_apps`, the target's pin reads as
-    /// drift.
     #[test]
     fn an_applications_folder_reached_through_a_link_still_pins_the_running_copy() {
         let who = user("alice", 501);
@@ -1894,18 +1763,12 @@ mod tests {
         }
     }
 
-    /// The tiles a Dock reads as it starts and writes back.
     const TILES: [&str; 3] = ["persistent-apps", "persistent-others", "recent-apps"];
 
-    /// The tiles a starting Dock read, each by its key.
     type Loaded = Vec<(&'static str, PValue)>;
 
-    /// A starting process's tiles and the sleeps left until its start is past.
     type Starting = Option<(Loaded, u32)>;
 
-    /// A desktop the [`Fake`] runs ([`Fake::simulate`]): `defaults` reads and writes one
-    /// store, and `pgrep`, `killall` and `sleep` act on its Dock, Finder and Notification
-    /// Center, each started again at once when it is killed, as launchd does.
     struct Desk {
         prefs: Vec<(String, String, PValue)>,
         /// Each running process, its pid, and, while it is starting, the tiles it read and
@@ -1941,8 +1804,6 @@ mod tests {
     }
 
     impl Desk {
-        /// A desktop before setup: other pins, a stack, a recent app, a widget, hidden
-        /// desktop icons; the Dock, Finder and Notification Center running, past their start.
         fn before() -> Self {
             Self {
                 prefs: vec![
@@ -2012,7 +1873,6 @@ mod tests {
             self.events.iter().filter(|e| *e == event).count()
         }
 
-        /// Each process still starting, by name and pid.
         fn starting(&self) -> Vec<(&'static str, u32)> {
             self.running
                 .iter()
@@ -2133,8 +1993,6 @@ mod tests {
             }
         }
 
-        /// A second passes: each starting Dock is a second further, and one past its start
-        /// writes its tiles back, each with a GUID.
         fn tick(&mut self) {
             let mut started = Vec::new();
             for (name, pid, starting) in &mut self.running {
@@ -2160,7 +2018,6 @@ mod tests {
         }
     }
 
-    /// `tiles` as a Dock rewrites them: each pin with a GUID.
     fn with_guids(tiles: PValue, guid: i64) -> PValue {
         let PValue::Array(pins) = tiles else {
             return tiles;
@@ -2180,13 +2037,10 @@ mod tests {
         )
     }
 
-    /// `desk`, run by a fake acting as `who`, with the Dock's three apps installed.
     fn desktop_of(who: &User, desk: Desk) -> (Fake, Arc<Mutex<Desk>>) {
         desktop_with(who, desk, true)
     }
 
-    /// `desk`, run by a fake acting as `who`, the Dock's three apps installed at their usual
-    /// paths or none of them (no aterm in either folder, as with only a dev build).
     fn desktop_with(who: &User, desk: Desk, dock_apps: bool) -> (Fake, Arc<Mutex<Desk>>) {
         let mut sys = Fake::root();
         sys.euid = who.uid;
@@ -2202,19 +2056,14 @@ mod tests {
         (sys, desk)
     }
 
-    /// The widget, desktop and Dock items of one pass, as setup selects them, run by a
-    /// process that holds Full Disk Access: the arm that reaches Notification Center.
     fn desktop_items(who: &User) -> Vec<Box<dyn Item>> {
         selected_desktop_items(who, &[Setting::Widgets, Setting::Desktop, Setting::Dock])
     }
 
-    /// The items of `settings` of one pass, as setup selects them, with Full Disk Access.
     fn selected_desktop_items(who: &User, settings: &[Setting]) -> Vec<Box<dyn Item>> {
         selected_desktop_items_at(who, Some(true), settings)
     }
 
-    /// The widget, desktop and Dock items of one pass whose process's Full Disk Access is
-    /// `full_disk_access`, as the pass measured it.
     fn desktop_items_at(who: &User, full_disk_access: Option<bool>) -> Vec<Box<dyn Item>> {
         selected_desktop_items_at(
             who,
@@ -2223,8 +2072,6 @@ mod tests {
         )
     }
 
-    /// The items of `settings` of one pass, as setup selects them, whose process's Full
-    /// Disk Access is `full_disk_access`.
     fn selected_desktop_items_at(
         who: &User,
         full_disk_access: Option<bool>,
@@ -2239,7 +2086,6 @@ mod tests {
         selected_items(&context, selected).unwrap()
     }
 
-    /// The pass's journal lines, each as its id and `to`.
     fn journaled(sys: &Fake) -> Vec<(String, String)> {
         String::from_utf8(sys.written(Fake::JOURNAL).unwrap())
             .unwrap()
@@ -2261,7 +2107,6 @@ mod tests {
             .collect()
     }
 
-    /// One pass of `items`, as doctor and init run them (through the snapshot guard).
     fn pass(sys: &Fake, items: Vec<Box<dyn Item>>, mode: Mode) -> crate::init::WorkstationRun {
         Workstation::of(items).run_recording(sys, mode).unwrap()
     }
@@ -2273,14 +2118,12 @@ mod tests {
             .collect()
     }
 
-    /// The widgets rows' ids: the `[consumer]` catalog's.
     const WIDGET_IDS: [&str; 3] = [
         "consumer.widgets.desktop@alice",
         "consumer.widgets.stage-manager@alice",
         NC_ID,
     ];
 
-    /// The widgets row of Notification Center's list, in its app container.
     const NC_ID: &str = "consumer.widgets.notification-center@alice";
 
     const DESKTOP_IDS: [&str; 5] = [
@@ -2291,13 +2134,6 @@ mod tests {
         "init.dock@alice",
     ];
 
-    /// Setup's widgets rows are the `[consumer] widgets` catalog's (design §9 A30): with
-    /// Full Disk Access, init's widget items carry the ids a fleet baseline's
-    /// `widgets = false` expands to for the same account, in the catalog's order, and each
-    /// plans its own row's key, so one key has one owner. A pass from a desktop that shows
-    /// a widget then reads Notification Center's list back cleared, keeping the field it
-    /// does not know. Negative control: init's ids spelled apart from the rows'
-    /// (`init.widgets.<key>@alice`) fail the first assertion.
     #[test]
     fn inits_widget_items_are_the_catalogs_rows_and_the_clear_reads_back() {
         let who = user("alice", 501);
@@ -2370,13 +2206,6 @@ mod tests {
         );
     }
 
-    /// The two Window Manager widgets rows share the Dock's marker: one whose key already
-    /// holds what it wants reads Ok beside the other's write, which begins that marker in
-    /// the same pass, so it is neither journaled nor reported as a change aterm made, and
-    /// the Dock relaunches once for both. A marker an earlier pass left still makes each
-    /// row that shares it report the relaunch it awaits. Negative control: a probe that
-    /// counts the pass's own marker as an earlier write reads the stage-manager row Changed
-    /// and journals it.
     #[test]
     fn a_widgets_row_already_set_reads_ok_beside_one_that_begins_the_shared_marker() {
         let who = user("alice", 501);
@@ -2442,14 +2271,6 @@ mod tests {
         assert!(!crate::init_activation::pending(&sys, &who, WIDGETS).unwrap());
     }
 
-    /// The owner's Mac, 2026-10-21 23:01 to 02:24: each unattended pass wrote the desktop
-    /// with no aterm the Dock could pin (then any not at `/Applications/aterm.app`; now none
-    /// in `/Applications` or `~/Applications`, as with only a dev build): its row reads
-    /// Unknown, saying why, and nothing of the Dock is backed up, written or owed, while the
-    /// widget and desktop rows still apply through the snapshot guard and relaunch each
-    /// reader once. A 2026-10-22 VM run of a dev build applied no Mac setting at all.
-    /// Negative control: `?` on an item's snapshot in `Workstation::preference_changes`
-    /// refuses the whole pass.
     #[test]
     fn a_dock_that_cannot_pin_aterm_leaves_the_other_desktop_rows_to_apply() {
         let who = user("alice", 501);
@@ -2501,7 +2322,6 @@ mod tests {
             "{:?}",
             desk.events
         );
-        // The person's own pins, which the relaunched Dock gave GUIDs as it loaded them.
         let Some(PValue::Array(pins)) = desk.read(DOCK, "persistent-apps") else {
             panic!("{:?}", desk.read(DOCK, "persistent-apps"));
         };
@@ -2517,8 +2337,6 @@ mod tests {
             desk.read(WINDOW_MANAGER, "StandardHideWidgets"),
             Some(&PValue::Bool(true))
         );
-        // The Dock process still relaunches once: it reads the widget and desktop keys
-        // (WindowManager runs in it), not because the Dock row wrote anything.
         assert_eq!(
             (
                 desk.count("kill Dock"),
@@ -2611,10 +2429,6 @@ mod tests {
         );
     }
 
-    /// A read-back is what the relaunched reader settled on, not what was written: a
-    /// managed Dock that shows its own pins once it is past its start reads back as not
-    /// changed (and is put back by the doctor), while the items whose readers kept what was
-    /// written read back changed.
     #[test]
     fn the_read_back_waits_until_the_relaunched_dock_is_past_its_start() {
         let who = user("alice", 501);
@@ -2666,8 +2480,6 @@ mod tests {
         assert!(desk.lock().unwrap().starting().is_empty());
     }
 
-    /// A pass that ends after its writes and before the relaunch (the process quit, the
-    /// Mac slept) leaves every family's marker.
     #[test]
     fn a_pass_that_ends_between_its_writes_and_the_relaunch_relaunches_on_the_next() {
         let who = user("alice", 501);
@@ -2718,13 +2530,6 @@ mod tests {
         }
     }
 
-    /// A relaunch that cannot be made (the GUI session lookup for the Dock failed) fails
-    /// every row the Dock reads, here all but Notification Center's widgets, and keeps the
-    /// written preferences and their markers, while the readers that could relaunch were
-    /// (each once) and were waited on, and the marker those alone discharge (Notification
-    /// Center's) is cleared, its row changed: a plan still plans the others, and the next
-    /// pass relaunches the Dock and the Finder once each, without writing again, and not
-    /// Notification Center, which already read its write.
     #[test]
     fn a_relaunch_that_fails_keeps_the_writes_pending_for_the_next_pass() {
         let who = user("alice", 501);
@@ -2798,12 +2603,6 @@ mod tests {
         );
     }
 
-    /// Each row settles alone: a reader that does not start again (Notification Center,
-    /// here never started again by launchd) fails the rows whose keys it reads and keeps
-    /// the marker of those keys (Notification Center's own), while the rows all of whose
-    /// readers are up are read back, verified, and cleared, as is the widgets' marker of the
-    /// Window Manager's keys, whose Dock is up; the doctor then rolls back only Notification
-    /// Center's widgets, and leaves the changes that took.
     #[test]
     fn a_reader_that_does_not_start_again_fails_only_the_families_whose_keys_it_reads() {
         let who = user("alice", 501);
@@ -2861,11 +2660,6 @@ mod tests {
         assert_eq!(desk.count("kill Dock"), 1, "{:?}", desk.events);
     }
 
-    /// A relaunch that cannot be made (Finder's `killall` fails, signalling nothing) fails
-    /// the family it reads, and the wait for the readers already relaunched goes on: the
-    /// Dock, slow to start, is past its start before the pass ends, so the doctor's
-    /// rollback of the desktop keys and its relaunch of their readers kill a Dock that is
-    /// up, which writes nothing back.
     #[test]
     fn a_relaunch_that_cannot_be_made_still_waits_for_the_readers_already_relaunched() {
         let who = user("alice", 501);
@@ -2917,9 +2711,6 @@ mod tests {
         ));
     }
 
-    /// A family is owed its relaunch from its first write: one whose write fails part way
-    /// has still made the writes before it, so its readers relaunch after them with the
-    /// pass's other families, its marker is cleared, and the relaunch's line names it.
     #[test]
     fn a_family_whose_write_fails_part_way_is_relaunched_for_what_it_wrote() {
         let who = user("alice", 501);
@@ -2968,16 +2759,10 @@ mod tests {
         assert!(relaunch.1.contains("init.dock@alice"), "{relaunch:?}");
     }
 
-    /// Whether `call` reads, writes, censuses or relaunches Notification Center or its
-    /// preferences.
     fn touches_notification_center(call: &str) -> bool {
         call.contains(NOTIFICATION_CENTER) || call.contains("NotificationCenter")
     }
 
-    /// A pass whose process holds no known Full Disk Access (refused, or not measured)
-    /// leaves Notification Center's container alone on every path: the snapshot, the
-    /// probe, the apply, the relaunch and its look, the plan and the read-back issue no
-    /// command that names it, and its widgets stay as they were.
     #[test]
     fn without_full_disk_access_a_pass_never_touches_notification_center_and_settles() {
         let who = user("alice", 501);
@@ -2992,8 +2777,6 @@ mod tests {
                 "{snapshot:?}"
             );
             let run = first.run_recording(&sys, Mode::Apply).unwrap();
-            // Notification Center's row reaches no key of its own, so it reads as wanted
-            // and is withheld; the Window Manager's widget rows change.
             assert_eq!(
                 outcomes(&run),
                 DESKTOP_IDS.map(|id| (
@@ -3106,8 +2889,6 @@ mod tests {
         assert_eq!(desk.lock().unwrap().count("kill NotificationCenter"), 1);
     }
 
-    /// Measured (macOS 27.0 VM, 2026-10-22): a process without Full Disk Access reads
-    /// Notification Center's container as an empty domain.
     #[test]
     fn a_pass_that_reaches_a_container_it_cannot_read_never_settles_and_one_that_waits_does() {
         let who = user("alice", 501);
@@ -3174,8 +2955,6 @@ mod tests {
         );
     }
 
-    /// The follow-up items of `settings` ([`withheld_items`]), run by a process whose Full
-    /// Disk Access is `full_disk_access`.
     fn follow_up_items(
         who: &User,
         full_disk_access: Option<bool>,
@@ -3190,9 +2969,6 @@ mod tests {
         withheld_items(&context, selected).unwrap()
     }
 
-    /// The whole sequence, item by item: a pass without Full Disk Access hides the desktop
-    /// and Stage Manager widgets, leaves Notification Center alone and says so (its run
-    /// names the row withheld); the person then turns the desktop widgets back on.
     #[test]
     fn a_follow_up_with_the_grant_clears_notification_center_alone_and_once() {
         let who = user("alice", 501);
@@ -3298,8 +3074,6 @@ mod tests {
         assert!(granted.withheld.is_empty());
     }
 
-    /// Notification Center's own marker: a pass with the grant that writes its widgets and
-    /// ends before the relaunch leaves it beside the widgets' marker.
     #[test]
     fn a_pass_without_the_grant_never_clears_what_notification_center_still_owes() {
         let who = user("alice", 501);
@@ -3420,8 +3194,6 @@ mod tests {
         assert_eq!(desk.lock().unwrap().count("kill NotificationCenter"), 0);
     }
 
-    /// An older aterm wrote one marker (`widgets.pending`) before every widgets write,
-    /// Notification Center's widget list with the Window Manager's keys.
     #[test]
     fn an_older_aterms_widgets_marker_relaunches_notification_center_once_with_the_grant() {
         let who = user("alice", 501);
@@ -3470,8 +3242,6 @@ mod tests {
                     "{:#?}",
                     &sys.calls()[calls..]
                 );
-                // The Window Manager's rows carry the marker; Notification Center's row
-                // relaunches its reader only for an older aterm's marker, with the grant.
                 let center = if legacy && granted.is_some() {
                     Outcome::Changed
                 } else {

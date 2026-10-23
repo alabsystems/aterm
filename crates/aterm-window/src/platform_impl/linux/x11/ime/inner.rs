@@ -80,11 +80,8 @@ impl ImeInner {
         }
     }
 
-    /// Whether the input method's server side is gone: the input method was destroyed, or the
-    /// display was lost (X11-GONE), which takes the input method and its contexts with it. Xlib's
-    /// `XDestroyIC` and `XCloseIM` on a lost display send to the input method server through a
-    /// connection with no output buffer, and libX11 dies of SIGSEGV in `XSendEvent` (seen on a
-    /// GNOME desk with IBus, 2026-10-22, where Xvfb with no input method never made a context).
+    /// Whether the input method's server side is gone (destroyed or display connection broken),
+    /// so `XDestroyIC` and `XCloseIM` do not call `XSendEvent` on a lost display.
     fn server_side_gone(&self) -> bool {
         self.is_destroyed || self.xconn.is_broken()
     }
@@ -113,11 +110,7 @@ impl ImeInner {
         Ok(!self.server_side_gone())
     }
 
-    /// Tell the event loop that every window's input context was replaced, as
-    /// `Ime::create_context` tells it of one it makes: `ImeEvent::Enabled` for a context that
-    /// takes compositions, `ImeEvent::Disabled` for one that does not or is gone (`gone`). A
-    /// composition open in a replaced context ended with it, and the input method that went
-    /// said nothing of it: the event loop ends it, and the application drops its preedit.
+    /// Emit `ImeEvent::Enabled` for active contexts and `ImeEvent::Disabled` when replaced or gone.
     pub(crate) fn announce_contexts(&self, gone: bool) {
         for (&window, context) in &self.contexts {
             let allowed = !gone && context.as_ref().is_some_and(ImeContext::is_allowed);

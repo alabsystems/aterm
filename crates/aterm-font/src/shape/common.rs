@@ -110,9 +110,7 @@ const fn new_tag_from_script(script: Script) -> Option<Tag> {
 #[inline]
 const fn old_tag_from_script(script: Script) -> Tag {
     match &script.0 {
-        // Katakana and Hiragana both map to `kana`.
         b"Hira" => Tag::from_bytes(b"kana"),
-        // Spaces at the end are kept, unlike ISO 15924.
         b"Laoo" => Tag::from_bytes(b"lao "),
         b"Yiii" => Tag::from_bytes(b"yi  "),
         b"Nkoo" => Tag::from_bytes(b"nko "),

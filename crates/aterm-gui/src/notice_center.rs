@@ -20,9 +20,7 @@ pub(crate) enum Center {
     Granted,
 }
 
-/// `UNNotificationDefaultActionIdentifier`: the owner clicked the notice
-/// itself (not a dismissal, which a delegate hears only for a category that
-/// asks for it, and aterm registers none).
+/// `UNNotificationDefaultActionIdentifier`: the owner clicked the notice itself.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) const DEFAULT_ACTION: &str = "com.apple.UNNotificationDefaultActionIdentifier";
 
@@ -36,7 +34,7 @@ pub(crate) const fn status_answer(status: isize) -> Center {
     }
 }
 
-/// THE SESSION A RESPONSE GOES TO.
+/// The session a response goes to.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn clicked_session(
     action: &str,
@@ -65,7 +63,7 @@ pub(crate) struct Notice<'a> {
     pub(crate) session: Option<u64>,
 }
 
-/// THE CENTER'S ARMS, injected at `App` construction like the consent probes (`consent_state::ConsentProbes`).
+/// The center's arms.
 #[derive(Clone, Copy)]
 pub(crate) struct NoticeCenter {
     /// What macOS has said ([`Center`]), read fresh: a bounded wait for the
@@ -146,7 +144,7 @@ impl NoticeCenter {
         (self.post)(notice)
     }
 
-    /// Ask macOS, if it has not been asked (the owner turned Notify Me on, or the first notice while it is on: `notify::way_for`), and call `then` once it has answered (or at once where nothing is asked).
+    /// Ask macOS, if it has not been asked, and call `then` once it has answered.
     pub(crate) fn ask(self, then: Box<dyn FnOnce() + Send>) {
         (self.ask)(then);
     }
@@ -180,7 +178,6 @@ const fn inert_adopt_clicks() {}
 
 #[cfg(all(target_os = "macos", test))]
 thread_local! {
-    /// How many times this thread's inert center was asked (test-only).
     static ASKS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
@@ -233,9 +230,6 @@ fn open_framework() -> bool {
     unsafe extern "C" {
         fn dlopen(path: *const c_char, mode: c_int) -> *mut c_void;
     }
-    /// `<dlfcn.h>` on Darwin: bind on first use, keep the framework's C
-    /// symbols out of the global namespace (its classes register with the
-    /// runtime regardless).
     const RTLD_LAZY: c_int = 0x1;
     const RTLD_LOCAL: c_int = 0x4;
     // SAFETY: a NUL-terminated path and a valid mode.
@@ -310,42 +304,26 @@ mod live {
     use super::clicks::NoticeDelegate;
     use super::{Center, Notice, abi};
 
-    /// What aterm asks to post: `UNAuthorizationOptionAlert`
-    /// (`UNUserNotificationCenter.h`: badge `1 << 0`, sound `1 << 1`, alert
-    /// `1 << 2`).
     const ASK_OPTIONS: usize = 1 << 2;
 
-    /// How long a read of the center's settings may take before the last
-    /// answer stands.
     const ANSWER_WAIT: Duration = Duration::from_secs(5);
 
-    /// The center, opened once per process ([`open_center`]): its address,
-    /// retained for the process, or `None` where there is none.
     static CENTER: OnceLock<Option<usize>> = OnceLock::new();
 
-    /// The last answer read, which stands while a fresh read times out.
     static LAST: Mutex<Option<Center>> = Mutex::new(None);
 
-    /// Whether this process is the center's delegate yet.
     static ADOPTED: AtomicBool = AtomicBool::new(false);
 
-    /// Each request's identifier is this process's and unique, so no notice
-    /// replaces another.
     static NEXT_REQUEST: AtomicU64 = AtomicU64::new(0);
 
     const fn at(addr: usize) -> Id {
         Id::from_ptr(std::ptr::with_exposed_provenance_mut(addr))
     }
 
-    /// The center, opening it on first use: not on the event loop, since
-    /// [`crate::signing_identity::running_bundle_id`] may read the signing
-    /// identity there.
     fn center() -> Option<Id> {
         (*CENTER.get_or_init(open_center)).map(at)
     }
 
-    /// Open the center where this process may: windowed, run from an app
-    /// bundle both aterm and Foundation can name, and the framework loads.
     fn open_center() -> Option<usize> {
         if crate::menu::process_is_headless()
             || crate::signing_identity::running_bundle_id().is_none()
@@ -634,9 +612,6 @@ mod clicks {
 
     use super::{INSTANCE_KEY, PID_KEY, SESSION_KEY, abi};
 
-    /// How a notice shows while aterm is the active app:
-    /// `UNNotificationPresentationOptionList | Banner` (`1 << 3`, `1 << 4`;
-    /// no sound, as aterm asks for none).
     const PRESENT_OPTIONS: usize = (1 << 3) | (1 << 4);
 
     aterm_objc::declare_class! {
@@ -646,8 +621,6 @@ mod clicks {
             type Ivars = ();
             protocols: [NSObject, UNUserNotificationCenterDelegate];
 
-            /// The owner answered a notice: go to its session if it was a
-            /// click on one of this process's, then tell the center.
             @sel(userNotificationCenter:didReceiveNotificationResponse:withCompletionHandler:)
             fn did_receive(&self, _center: Id, response: Id, done: BlockPtr) {
                 if let Some(session) = clicked(response) {
@@ -657,7 +630,6 @@ mod clicks {
                 unsafe { done.call::<abi::ResponseDone>(()) };
             }
 
-            /// A notice arrives while aterm is the active app: show it.
             @sel(userNotificationCenter:willPresentNotification:withCompletionHandler:)
             fn will_present(&self, _center: Id, _notification: Id, done: BlockPtr) {
                 // SAFETY: the handler is `abi::PresentDone`.
@@ -666,9 +638,6 @@ mod clicks {
         }
     }
 
-    /// The session a response goes to ([`super::clicked_session`]), read off
-    /// `response.actionIdentifier` and
-    /// `response.notification.request.content.userInfo`.
     fn clicked(response: Id) -> Option<u64> {
         if response.is_null() {
             return None;
@@ -697,9 +666,6 @@ mod clicks {
         })
     }
 
-    /// `info[key]` when it is a string (as the live arm's `user_info` writes
-    /// it).
-    ///
     /// # Safety
     /// `info` must be a live `NSDictionary`, or nil.
     unsafe fn string_for(info: Id, key: &str) -> Option<String> {
@@ -724,9 +690,6 @@ mod clicks {
 mod tests {
     use super::{Center, DEFAULT_ACTION, clicked_session, status_answer};
 
-    /// A CLICK GOES TO THE SESSION ITS NOTICE NAMES, and only a click on one
-    /// this process posted: the default action with this pid and a session
-    /// routes there.
     #[test]
     fn a_response_routes_to_the_session_its_notice_names() {
         let own = 4242;
@@ -770,9 +733,6 @@ mod tests {
         }
     }
 
-    /// macOS's authorization status, read: not determined is the ask
-    /// Notify Me makes, denied a refusal, and the three statuses macOS
-    /// delivers under each a grant.
     #[test]
     fn macos_answers_read_as_ask_refuse_or_grant() {
         assert_eq!(status_answer(0), Center::Unasked);
@@ -825,13 +785,9 @@ mod tests {
 
         use super::abi;
 
-        /// `-(id)`: `send_id`.
         type SendId = unsafe extern "C-unwind" fn(Id, Sel) -> Id;
-        /// `-(void)(id)`: `send_v_id`.
         type SendVoidId = unsafe extern "C-unwind" fn(Id, Sel, Id);
-        /// `-(NSInteger)`: `send_isize`.
         type SendIsize = unsafe extern "C-unwind" fn(Id, Sel) -> isize;
-        /// `+alloc`: `aterm_objc::send::alloc`.
         type Alloc = unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id;
 
         assert!(super::open_framework(), "UserNotifications did not load");
@@ -1029,7 +985,6 @@ mod tests {
                 symbol: *const std::ffi::c_char,
             ) -> *mut std::ffi::c_void;
         }
-        /// `<dlfcn.h>`'s `RTLD_DEFAULT`: every loaded image.
         const RTLD_DEFAULT: *mut std::ffi::c_void = -2_isize as *mut std::ffi::c_void;
         // SAFETY: a NUL-terminated symbol name; the answer is the address of an `NSString *const`, or null.
         let symbol = unsafe {
@@ -1171,8 +1126,6 @@ mod tests {
 
         use aterm_objc::{BlockPtr, Id, RcBlock, Sel, checked_msg, sel};
 
-        /// The delegate row's prototype (the prototype test holds the class's
-        /// encoding to the protocol's).
         type DidReceive = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, BlockPtr);
 
         let _ = delegate_class();
@@ -1244,9 +1197,7 @@ mod tests {
 
         use aterm_objc::{BlockPtr, Id, RcBlock, Sel, checked_msg, sel};
 
-        /// The delegate row's prototype.
         type WillPresent = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, BlockPtr);
-        /// `UNNotificationPresentationOptionList | Banner`.
         const LIST_AND_BANNER: usize = (1 << 3) | (1 << 4);
 
         let _ = delegate_class();

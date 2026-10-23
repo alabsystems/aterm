@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rustup toolchain seam management (`<rustup_home>/toolchains/<name>` -> `<prefix>/rustup/<name>`).
+//! Rustup toolchain seam management.
 
 use std::fmt;
 use std::io;
@@ -18,16 +18,15 @@ pub const DEFAULT_SEAM: &str = "trust";
 /// Store program a rustup seam points into.
 pub const SEAM_PROGRAM: &str = "trust";
 
-/// Fix printed whenever attach refuses an entry atpkg does not own ([`crate::toolchain::DETACH_FIX`]).
+/// Fix printed whenever attach refuses an entry atpkg does not own.
 pub use crate::toolchain::DETACH_FIX;
 
-/// The record-key prefix in `status.toml`'s `seams` list (`rustup:<name>`).
 const RECORD_PREFIX: &str = "rustup:";
 
 /// `seams` prefix for a refused re-assertion (`refused:rustup:<name>: <why>`).
 pub const REFUSED_PREFIX: &str = "refused:";
 
-/// `seams` prefix for a stale foreign link replaced by re-assertion (`replaced:rustup:<name>: <target>`).
+/// `seams` prefix for a stale foreign link replaced by re-assertion.
 pub const REPLACED_PREFIX: &str = "replaced:";
 
 /// `seams` prefix for a replacement in flight (`replacing:rustup:<name>: <target>`).
@@ -49,8 +48,6 @@ pub fn record_key(name: &str) -> String {
     k
 }
 
-/// A record key ([`record_key`]) as a person reads it: rustup `trust`, never
-/// `rustup:trust`.
 struct Head<'a>(&'a str);
 
 impl fmt::Display for Head<'_> {
@@ -130,15 +127,8 @@ pub const STOCK_NAMES: &[(&str, &str)] = &[
     ("rustdoc", "trustdoc"),
 ];
 
-/// The directories beside `bin/` a sysroot is read through, cloned into the view
-/// (file by file, not a directory symlink) so a tool run from it
-/// finds its own `lib/rustlib`, `libexec/` helpers and `share/` docs, and reports the
-/// view as its sysroot.
 const VIEW_DIRS: &[&str] = &["lib", "libexec", "share", "etc"];
 
-/// Mirror `src` at `dst`: directories created, regular files cloned
-/// ([`crate::clone::clone_file`]), symlinks recreated with the same target, anything else
-/// skipped.
 fn mirror_tree(layout: &Layout, src: &Path, dst: &Path) -> io::Result<()> {
     layout.ensure_dir(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -198,7 +188,6 @@ pub enum Deferred {
 }
 
 impl Deferred {
-    /// When the view is laid after all — the clause every line that names one ends on.
     const fn once(&self) -> &'static str {
         match self {
             Deferred::InUse(_) => "once that process has exited",
@@ -232,10 +221,6 @@ pub enum Depth {
     Deep,
 }
 
-/// What a view's `bin/` must hold for a build's `bin/` at `src_bin`, read with `lstat`
-/// only: every regular file under its own name, then each of [`STOCK_NAMES`] whose Trust
-/// tool is a regular file there, mapped to that tool over any separately signed copy the
-/// bundle ships under the stock name.
 struct BinPlan {
     /// Name in the view -> the store file it must be a clone of.
     entries: std::collections::BTreeMap<std::ffi::OsString, PathBuf>,
@@ -246,7 +231,6 @@ struct BinPlan {
 }
 
 impl BinPlan {
-    /// What [`refresh_view`] reports for `build` when this is its `bin/` plan.
     fn refreshed(self, build: PathBuf, changed: bool, deferred: Option<Deferred>) -> Refreshed {
         Refreshed {
             build,
@@ -286,12 +270,10 @@ fn bin_plan(src_bin: &Path) -> io::Result<BinPlan> {
     })
 }
 
-/// Lay a view's `bin/` at `dst_bin` (created here, empty) from the build's `bin/`: one clone
-/// per [`BinPlan`] entry, so each stock name is byte-identical to its Trust tool and a
-/// stock-name copy the bundle shipped is never cloned. Returns the plan it laid.
+/// Lay a view's `bin/` at `dst_bin` (created here, empty) from the build's `bin/`.
+///
 /// # Errors
-/// The build's `bin/` cannot be listed, or a clone cannot be made (the store on another
-/// volume: it refuses rather than byte-copy the toolchain).
+/// The build's `bin/` cannot be listed, or a clone cannot be made (the store on another volume: it refuses rather than byte-copy the toolchain).
 fn lay_bin(layout: &Layout, src_bin: &Path, dst_bin: &Path) -> io::Result<BinPlan> {
     let plan = bin_plan(src_bin)?;
     layout.ensure_dir(dst_bin)?;
@@ -451,7 +433,6 @@ fn dir_mismatch(build: &Path, view: &Path, dir: &str, depth: Depth) -> Option<Pa
     let src = build.join(dir);
     let at = view.join(dir);
     if !src.is_dir() {
-        // Not in this build: nothing may sit under the name either.
         return std::fs::symlink_metadata(&at).is_ok().then_some(at);
     }
     if !is_real_dir(&at) {
@@ -532,7 +513,6 @@ fn tree_mismatch(src: &Path, dst: &Path) -> Option<PathBuf> {
                 return Some(to);
             }
         } else {
-            // A socket or fifo: `mirror_tree` skips it, so the view holds nothing there.
             continue;
         }
         expected.insert(entry.file_name());
@@ -619,7 +599,6 @@ pub(crate) fn refresh_view_with(
     Ok(plan.refreshed(build, changed, None))
 }
 
-/// Put `staged` in the view at `at`, renaming what stood there aside to `old` and removing it.
 fn swap_in(staged: &Path, at: &Path, old: &Path) -> io::Result<()> {
     if std::fs::symlink_metadata(at).is_ok() {
         std::fs::rename(at, old)?;
@@ -630,8 +609,6 @@ fn swap_in(staged: &Path, at: &Path, old: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether the out-of-date view must be left this pass: a run holds a lease on it, a live
-/// process runs from under it (in either spelling), or the process table could not be read.
 fn relay_blocked(
     layout: &Layout,
     name: &str,
@@ -657,8 +634,6 @@ fn relay_blocked(
     }
 }
 
-/// Whether `name` is the scratch a view rebuild makes: `.<stem>.tmp-<pid>` or
-/// `.<stem>.old-<pid>`, `<stem>` being `bin` or one of [`VIEW_DIRS`] and `<pid>` ASCII digits.
 fn is_view_debris(name: &str) -> bool {
     let Some(rest) = name.strip_prefix('.') else {
         return false;
@@ -678,8 +653,6 @@ fn is_view_debris(name: &str) -> bool {
     !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Remove the staging debris a killed rebuild left in `view`: every [`is_view_debris`] entry,
-/// whatever its shape.
 fn sweep_view_debris(view: &Path) {
     let Ok(entries) = std::fs::read_dir(view) else {
         return;
@@ -866,9 +839,6 @@ fn refresh_linked_view(
     Ok(plan.refreshed(checkout.to_path_buf(), changed, None))
 }
 
-/// Whether two `bin/` directories present the same name -> file map, a file judged by its
-/// length, permission bits and modification time (a clone keeps all three, so a staged
-/// clone of what the live `bin/` already presents compares equal).
 fn same_bin(live: &Path, staged: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -946,8 +916,6 @@ fn inspect(path: &Path) -> io::Result<Entry> {
     }
 }
 
-/// Lexically fold `.` and `..` so two spellings of one path compare equal without
-/// touching the filesystem (a dangling target has nothing to canonicalize).
 fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in path.components() {
@@ -964,8 +932,6 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// A link's raw target made absolute (relative targets are relative to the link's
-/// directory) and normalized.
 fn absolute_target(raw: &Path, link: &Path) -> PathBuf {
     if raw.is_absolute() {
         return normalize(raw);
@@ -974,10 +940,6 @@ fn absolute_target(raw: &Path, link: &Path) -> PathBuf {
     normalize(&base.join(raw))
 }
 
-/// Whether an absolute target lies inside `<prefix>/rustup/` or `<prefix>/store/trust/`
-/// — the two trees a seam atpkg laid can name: lexically first, then by canonical path
-/// when both sides resolve (so a prefix reached through a symlinked ancestor still
-/// counts).
 fn resolves_into_prefix(layout: &Layout, abs: &Path) -> bool {
     [views_root(layout), owned_root(layout)].iter().any(|root| {
         let root = normalize(root);
@@ -991,9 +953,6 @@ fn resolves_into_prefix(layout: &Layout, abs: &Path) -> bool {
     })
 }
 
-/// Whether an absolute target is exactly the view for `name`, lexically only: a link into
-/// the store (`current`, or a numbered build) is atpkg's and gets re-pointed, so it must not
-/// read as already right.
 fn targets_view(layout: &Layout, name: &str, abs: &Path) -> bool {
     abs == normalize(&seam_target(layout, name))
 }
@@ -1256,8 +1215,6 @@ pub fn stale_against_store(layout: &Layout, sysroot: &Path) -> Option<Stale> {
     (its < store).then_some(Stale::Older { its, store })
 }
 
-/// The `commit-date:` a sysroot's compiler reports — `bin/trustc -vV`, else `bin/rustc
-/// -vV` (a stage2 from before the Trust names) — when it is a `YYYY-MM-DD` date.
 fn commit_date(sysroot: &Path) -> Option<String> {
     let bin = sysroot.join("bin");
     ["trustc", "rustc"].iter().find_map(|name| {
@@ -1288,8 +1245,6 @@ pub fn live_build_tree(sysroot: &Path) -> bool {
         || std::fs::canonicalize(sysroot).is_ok_and(|real| stage_shaped(&real))
 }
 
-/// [`live_build_tree`]'s lexical rule over one spelling: the last three components are
-/// `build`, a target triple or `host`, and `stage0`/`stage1`/`stage2`.
 fn stage_shaped(path: &Path) -> bool {
     let mut tail = path.components().rev().map(|c| match c {
         Component::Normal(s) => s.to_str(),
@@ -1305,9 +1260,6 @@ fn stage_shaped(path: &Path) -> bool {
         && (host == "host" || target_triple(host))
 }
 
-/// Whether `s` is spelled like a rustc target triple: three or more non-empty `-`-separated
-/// parts of ASCII letters, digits, `_` and `.` (`aarch64-apple-darwin`,
-/// `x86_64-unknown-linux-gnu`, `thumbv7em-none-eabihf`).
 fn target_triple(s: &str) -> bool {
     s.split('-').count() >= 3
         && s.split('-').all(|part| {
@@ -1329,12 +1281,6 @@ enum Heal {
     No,
 }
 
-/// Whether an unattended re-assertion re-points a foreign link. rust-analyzer, `cargo +trust`
-/// and every rustup proxy run whatever the entry names, so the narrowest always-wrong case
-/// heals by itself: `name` is [`DEFAULT_SEAM`] (`trust-dev` is by name the channel a person
-/// points at a tree they are building), the target is a live build tree
-/// ([`live_build_tree`]), and its compiler is older than the store's
-/// ([`stale_against_store`]).
 fn unattended_heal(layout: &Layout, name: &str, entry: &Path, target: &Path) -> Heal {
     // A target that is not UTF-8 could not be recorded as it is (`status.toml` is text), and
     // a way back recorded wrong is a hold that never matches: such a link is left.
@@ -1352,8 +1298,6 @@ fn unattended_heal(layout: &Layout, name: &str, entry: &Path, target: &Path) -> 
     Heal::Stale(stale)
 }
 
-/// Whether two absolute link targets name the same tree: equal as spelled, or the same real
-/// path when both resolve.
 fn same_tree(a: &Path, b: &Path) -> bool {
     a == b
         || matches!(
@@ -1362,9 +1306,6 @@ fn same_tree(a: &Path, b: &Path) -> bool {
         )
 }
 
-/// The way back from a replaced stale link, as the pass line and `doctor` print it: the
-/// `ln -sfn` that lays `from` again at `path`, each operand quoted by the shim's rule (a path
-/// can hold a space or a `'`).
 fn put_back_hint(from: &Path, path: &Path) -> String {
     format!(
         "to put it back: ln -sfn {} {} (no unattended pass re-points it again; `aterm pkg \
@@ -1374,8 +1315,6 @@ fn put_back_hint(from: &Path, path: &Path) -> String {
     )
 }
 
-/// [`REPLACED_PREFIX`] + `rustup:<name>` + `: ` — what the record for exactly `name`
-/// starts with (never `trust-dev`'s beside `trust`'s).
 fn replaced_prefix(name: &str) -> String {
     let mut k = String::from(REPLACED_PREFIX);
     k.push_str(&record_key(name));
@@ -1383,7 +1322,6 @@ fn replaced_prefix(name: &str) -> String {
     k
 }
 
-/// [`replaced_prefix`] for the replacement in flight ([`REPLACING_PREFIX`]).
 fn replacing_prefix(name: &str) -> String {
     let mut k = String::from(REPLACING_PREFIX);
     k.push_str(&record_key(name));
@@ -1401,8 +1339,6 @@ pub fn replaced_from(layout: &Layout, name: &str) -> Option<PathBuf> {
         .find_map(|k| k.strip_prefix(&prefix).map(PathBuf::from))
 }
 
-/// Record `from` as the replacement in flight at `name` ([`REPLACING_PREFIX`]); `None` drops
-/// it.
 fn set_replacing(layout: &Layout, name: &str, from: Option<&Path>) -> io::Result<()> {
     let prefix = replacing_prefix(name);
     let entry = from.map(|from| format!("{prefix}{}", from.to_string_lossy()));
@@ -1529,16 +1465,10 @@ pub(crate) fn attach(layout: &Layout, rustup_home: &Path, name: &str) -> Result<
     .map(|(attached, _)| attached)
 }
 
-/// A view `attach` found out of date and left as it stands ([`Refreshed::deferred`]):
-/// the build it was not re-laid onto, and why.
 type LeftView = (PathBuf, Deferred);
 
-/// How [`attach_reporting`] brings the view in line: [`refresh_view`] in every shipped
-/// call, a test's own refresh — an injected process table, a failed re-lay — in a test.
 type Refresh<'a> = &'a dyn Fn(&Layout, &str) -> io::Result<Refreshed>;
 
-/// `attach`, also answering whether the view was left behind ([`LeftView`]). The entry is
-/// laid, adopted or re-pointed either way: a view one pass stale still presents a compiler.
 fn attach_reporting(
     layout: &Layout,
     rustup_home: &Path,
@@ -1713,7 +1643,7 @@ fn attach_reporting(
 #[derive(Debug)]
 /// Single event from [`reassert`], [`repair`], or [`detach_recorded`].
 pub enum SeamEvent {
-    /// Attach that changed the filesystem ([`Attached::changed`]) or left an entry ([`Attached::LeftEntry`]).
+    /// Attach that changed the filesystem ([`Attached::changed`]) or left an entry.
     Attached(Attached),
     /// View left as-is ([`Deferred`]) during refresh.
     ViewLeft {
@@ -1870,7 +1800,6 @@ fn displaced_name(path: &Path, name: &str) -> PathBuf {
     path.with_file_name(file)
 }
 
-/// Remove the seam entry at `path` (a link) and prove it is gone.
 fn unlink_checked(path: &Path) -> io::Result<()> {
     crate::platform::remove_link(path);
     match std::fs::symlink_metadata(path) {
@@ -2006,7 +1935,6 @@ impl fmt::Display for SeamStatus {
     }
 }
 
-/// The `toolchains` dir a seam path sits in (its parent), for the no-rustup note.
 fn toolchains_dir_of(seam: &Path) -> &Path {
     seam.parent().unwrap_or(seam)
 }
@@ -2079,9 +2007,6 @@ pub fn attached_keys(layout: &Layout) -> Vec<String> {
         .collect()
 }
 
-/// Add `rustup:<name>` to `status.toml`'s `seams`. Idempotent. Seeded through
-/// [`crate::status::seed_for_rewrite`]: the save rewrites the whole record, whose `seams` list
-/// is what `uninstall --all` walks.
 fn record(layout: &Layout, name: &str) -> io::Result<()> {
     let key = record_key(name);
     let (replacing, replaced) = (replacing_prefix(name), replaced_prefix(name));
@@ -2105,8 +2030,6 @@ fn record(layout: &Layout, name: &str) -> io::Result<()> {
     crate::status::write(layout, &s)
 }
 
-/// Drop `rustup:<name>` and its `refused:`, `replaced:` and `replacing:` entries from
-/// `status.toml`'s `seams`, so no refusal or hold outlives the seam.
 fn unrecord(layout: &Layout, name: &str) -> io::Result<()> {
     let key = record_key(name);
     let refused = refusal_prefix(name);
@@ -2137,9 +2060,6 @@ pub fn refused_key(name: &str) -> String {
     k
 }
 
-/// [`refused_key`] with the `: ` that separates it from the reason — what an entry for
-/// exactly `name` starts with, and what an entry for a longer name (`trust-dev` beside
-/// `trust`) never does.
 fn refusal_prefix(name: &str) -> String {
     let mut k = refused_key(name);
     k.push_str(": ");
@@ -2164,8 +2084,6 @@ pub(crate) fn refusals(layout: &Layout) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Record that re-asserting `name` was refused with `why` (replacing any earlier
-/// refusal for the same name).
 fn record_refusal(layout: &Layout, name: &str, why: &str) -> io::Result<()> {
     let key = refused_key(name);
     let mut entry = key.clone();
@@ -2182,7 +2100,6 @@ fn record_refusal(layout: &Layout, name: &str, why: &str) -> io::Result<()> {
     crate::status::write(layout, &s)
 }
 
-/// Drop the recorded refusal for `name`, if any.
 fn clear_refusal(layout: &Layout, name: &str) -> io::Result<()> {
     let key = refusal_prefix(name);
     let Some(mut s) = crate::status::read(layout) else {
@@ -2225,9 +2142,6 @@ pub fn repair(layout: &Layout, rustup_home: &Path) -> Vec<SeamEvent> {
     )
 }
 
-/// [`reassert`] with the view's refresh injected ([`Refresh`]), and the process table the
-/// entry's in-use guard reads ([`Attached::LeftEntry`]), so what a pass records around a
-/// view or an entry it left behind — or a view it failed to lay — is provable from a test.
 fn reassert_with(
     layout: &Layout,
     rustup_home: &Path,
@@ -2337,8 +2251,6 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    /// A synthetic HOME-shaped tree: `prefix/` (the store) beside `rustup/`
-    /// (a fake `RUSTUP_HOME`).
     struct Fixture {
         #[cfg_attr(
             not(unix),
@@ -2369,8 +2281,6 @@ mod tests {
             }
         }
 
-        /// Lay `store/trust/<build>/` (Trust-named tools in `bin/` and no stock names, as the
-        /// distribution ships, and a `lib/`) and `store/trust/current -> <build>`.
         fn install_trust(&self, build: u64) -> PathBuf {
             let dir = self.layout.build_dir("trust", build);
             std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -2456,8 +2366,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    /// Whether the view file `at` is a clone of the store file `store` holding its bytes —
-    /// and not the store's own inode, which is what a hard link would be.
     fn cloned(store: &Path, at: &Path) -> bool {
         crate::clone::is_clone_of(store, at)
             && matches!(crate::clone::same_bytes(store, at), Ok(true))
@@ -3630,8 +3538,6 @@ mod tests {
         assert_eq!(back.programs["trust"].installed_build, Some(6808));
     }
 
-    /// An unreadable `status.toml` is kept aside as `status.toml.corrupt-<unix>` and healed,
-    /// and the seam is recorded on the healed record.
     #[test]
     fn recording_a_seam_heals_an_unreadable_record() {
         let prefix = crate::testdir::dir("atpkg-seam-unreadable-");
@@ -4198,7 +4104,6 @@ mod tests {
             return;
         }
 
-        /// Kills the probe however the test ends, so no stray outlives a failed assertion.
         struct Probe(aterm_uds::spawnfd::Child);
         impl Drop for Probe {
             fn drop(&mut self) {

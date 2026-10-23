@@ -4,10 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/common/xkb/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (libxkbcommon's entry points,
-// types and keysyms are first-party aterm-xkb's, read at run time, where upstream used xkbcommon-dl
-// and xkeysym.)
-
 use std::ops::Deref;
 use std::os::raw::c_char;
 use std::ptr::{self, NonNull};
@@ -53,7 +49,6 @@ pub enum Error {
 
 #[derive(Debug)]
 pub struct Context {
-    // NOTE: field order matters.
     #[cfg(x11_platform)]
     pub core_keyboard_id: i32,
     state: Option<XkbState>,
@@ -260,7 +255,6 @@ impl<'a, 'b> KeyEventResults<'a, 'b> {
 
         if let ComposeStatus::Accepted(compose_status::COMPOSING) = self.compose {
             let compose_state = self.context.compose_state2.as_mut().unwrap();
-            // Feed the dead keysym twice to obtain its non-combining character.
             compose_state.feed(self.keysym);
             if matches!(compose_state.feed(self.keysym), ComposeStatus::Accepted(_)) {
                 let text = compose_state.get_string(self.context.scratch_buffer);
@@ -376,7 +370,6 @@ impl Deref for XkbContext {
     }
 }
 
-/// Shared logic for constructing a string with `xkb_compose_state_get_utf8` and `xkb_state_key_get_utf8`.
 fn make_string_with<F>(scratch_buffer: &mut Vec<u8>, mut f: F) -> Option<SmolStr>
 where
     F: FnMut(*mut c_char, usize) -> i32,
@@ -459,7 +452,6 @@ mod tests {
         (text(event.text), text(text_ignoring_lock))
     }
 
-    /// Verifies that `text_ignoring_lock` preserves Shift's case without Caps Lock cancellation on Turkish Q.
     #[test]
     fn a_press_under_caps_lock_is_read_again_without_it() {
         let Some(mut tr) = turkish() else { return };

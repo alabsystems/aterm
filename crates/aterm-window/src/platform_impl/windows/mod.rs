@@ -2,12 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Derived from winit 0.30.13 src/platform_impl/windows/mod.rs,
-// modified by the aterm project in 2026 (see the repository NOTICE).
-
-// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Bridge public handle ids to windows-sys 0.61 using typed conversion helpers; drop the
-// unused physicalkey_to_scancode export; take `SmolStr` from `crate::keyboard`; add the
-// `recorded` key-message replay (tests and debug builds).
+// modified by Andrew Yates for the aterm project in 2026 (see the repository NOTICE).
 
 use crate::keyboard::SmolStr;
 use windows_sys::Win32::Foundation::HWND;
@@ -198,8 +193,6 @@ mod dpi;
 mod drop_handler;
 mod handle;
 
-// The public API's integer handles (`crate::platform::windows::HWND` …) meet
-// windows-sys's pointer handles here.
 pub(crate) use self::handle::{from_isize as handle_from_isize, to_isize as handle_to_isize};
 mod event_loop;
 mod icon;
@@ -208,7 +201,6 @@ mod keyboard;
 mod keyboard_layout;
 mod monitor;
 mod raw_input;
-// aterm: recorded key messages replayed through the key path (tests and debug builds).
 #[cfg(any(test, debug_assertions))]
 pub mod recorded;
 mod window;

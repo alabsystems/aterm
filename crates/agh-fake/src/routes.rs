@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 
 //! Fake GitHub route handlers, credential and rate headers, ETags, and fault injection.
 
@@ -1613,8 +1612,6 @@ fn cdn(state: &mut State, req: &Request) -> Answer {
     }
 }
 
-// --- writes ------------------------------------------------------------------------------
-
 /// GitHub's 422 for one field: `Validation Failed` and the one error naming it.
 fn invalid(resource: &str, field: &str, code: &str) -> Answer {
     Answer::json(
@@ -1665,8 +1662,7 @@ fn text_field(body: &Value, name: &str) -> Result<Option<String>, ()> {
 
 /// The api origin's writes: create (`POST /repos/{o}/{r}/releases`), edit (`PATCH
 /// …/releases/{id}`) and delete (`DELETE …/releases/{id}`) a release, and rename (`PATCH
-/// …/releases/assets/{id}`) and delete (`DELETE …/releases/assets/{id}`) an asset. Each needs
-/// a push login on a repository it can see (`unwritable`).
+/// …/releases/assets/{id}`) and delete (`DELETE …/releases/assets/{id}`) an asset.
 fn write(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     let path = req.path().to_string();
     let segs = segments(&path);
@@ -1750,8 +1746,7 @@ fn apply_make_latest(state: &mut State, index: usize, id: u64, make_latest: Opti
 }
 
 /// `POST /repos/{o}/{r}/releases`: a release of `tag_name` (a draft or published, a
-/// prerelease or not). A tag that already has a published release is GitHub's 422
-/// `already_exists`; several drafts may share one.
+/// prerelease or not).
 fn create_release(state: &mut State, req: &Request, index: usize) -> Answer {
     let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
         return Answer::error(400, "Problems parsing JSON");
@@ -1799,8 +1794,7 @@ fn create_release(state: &mut State, req: &Request, index: usize) -> Answer {
     }
 }
 
-/// `PATCH …/releases/{id}`: the fields the body names. Publishing a draft whose tag already
-/// has a published release is GitHub's 422 `already_exists`.
+/// `PATCH …/releases/{id}`: the fields the body names.
 fn edit_release(state: &mut State, req: &Request, index: usize, at: usize) -> Answer {
     let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
         return Answer::error(400, "Problems parsing JSON");
@@ -1854,8 +1848,7 @@ fn edit_release(state: &mut State, req: &Request, index: usize, at: usize) -> An
 }
 
 /// `PATCH …/releases/assets/{id}`: the asset's `name`, as the body names it, on whichever
-/// release of the repository holds it. A name another asset of that release holds is GitHub's
-/// 422 `already_exists`.
+/// release of the repository holds it.
 fn edit_asset(state: &mut State, req: &Request, index: usize, id: &str) -> Answer {
     let Ok(body) = aterm_json::from_slice::<Value>(&req.body) else {
         return Answer::error(400, "Problems parsing JSON");
@@ -1916,8 +1909,7 @@ fn delete_asset(state: &mut State, index: usize, id: &str) -> Answer {
 }
 
 /// The uploads origin: `POST /repos/{o}/{r}/releases/{id}/assets?name=…`, the request's body
-/// as a new asset of that name under the request's `Content-Type`. A name the release already
-/// holds is GitHub's 422 `already_exists`; a missing name or media type is a 422 too.
+/// as a new asset of that name under the request's `Content-Type`.
 fn upload(state: &mut State, req: &Request, ctx: &Ctx) -> Answer {
     let path = req.path().to_string();
     let segs = segments(&path);

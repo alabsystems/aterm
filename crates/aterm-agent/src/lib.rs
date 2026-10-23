@@ -1,8 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 //! aterm-agent: the agent interface layer — the window harness's supervisor
@@ -12,13 +10,6 @@
 //! they drive a host through: [`CtlClient`] (this build's own `ctl` verb, one
 //! process per request) and [`RelayClient`] (one persistent, authenticated
 //! connection).
-//!
-//! The floor against a self-driven feedback storm, a hard per-session rate
-//! limit on self-targeted input injection, lives in the control dispatch path
-//! (`aterm-gui::inject_floor`), because any raw control client can drive `@.`
-//! in a loop. Cross-session self-amplification is bounded by edges: no
-//! connection kind carries `DeriveLoop` (`aterm_session::edge::ConnectionKind::ops`),
-//! and an edge-scoped connection never forwards to another instance.
 #![cfg_attr(
     test,
     allow(
@@ -41,24 +32,18 @@ pub mod ai;
 pub mod drive_cli;
 /// The `aterm fleet` CLI, callable in-process.
 pub mod fleet_cli;
-/// `aterm fleet init|join|peers|allow|leave`: this machine's membership in a
-/// fleet.
+/// `aterm fleet init|join|peers|allow|leave`: this machine's membership in a fleet.
 #[cfg(unix)]
 mod fleet_member;
-/// `aterm ctl survey --fleet | --host`: the fleet's peers, read over its port
-/// (`aterm_ctl::LocalVerbs::fleet_survey`); `aterm ctl --host <h> …`: another
-/// Mac driven over it (`aterm_ctl::LocalVerbs::fleet_drive`).
+/// `aterm ctl survey --fleet | --host`: the fleet's peers, read over its port (`aterm_ctl::LocalVerbs::fleet_survey`); `aterm ctl --host <h> …`: another Mac driven over it (`aterm_ctl::LocalVerbs::fleet_drive`).
 #[cfg(unix)]
 pub use fleet_member::{drive_fleet, survey_fleet};
-/// The harness core: the pure readings behind the aterm wrapper (the usage
-/// view, the disk report, the footer) and the live upgrade and relaunch.
+/// The harness core: the pure readings behind the aterm wrapper (the usage view, the disk report, the footer) and the live upgrade and relaunch.
 pub mod harness;
-/// The launcher's half of `aterm --headless --ready-fd <n>`: wait on the
-/// instance's own word that its control socket listens.
+/// The launcher's half of `aterm --headless --ready-fd <n>`: wait on the instance's own word that its control socket listens.
 #[cfg(unix)]
 pub mod ready;
-/// The supervisor: read-only classification, prompt parsing, the worker's phase,
-/// and the loop the window's own host runs on every agent session.
+/// The supervisor: read-only classification, prompt parsing, the worker's phase, and the loop the window's own host runs on every agent session.
 pub mod supervise;
 
 /// The verb the one binary answers a control request on: `aterm ctl …`.
@@ -66,8 +51,7 @@ pub const CTL_VERB: &str = "ctl";
 
 /// This process's own executable, resolved through any argv0 alias link
 /// (`aterm-drive` -> `aterm`), for a control client run as `<it> ctl …`
-/// ([`CtlClient::own_at`]): the one binary answers `aterm ctl`. No sibling
-/// `aterm-ctl` and no `PATH` lookup: the client is always this build's own.
+/// ([`CtlClient::own_at`]): the one binary answers `aterm ctl`.
 ///
 /// # Errors
 /// The executable could not be read.
@@ -78,10 +62,7 @@ pub fn own_exe() -> Result<std::path::PathBuf, String> {
     Ok(resolved_exe(exe))
 }
 
-/// `exe` resolved through its links ([`own_exe`]). Where it no longer names a
-/// file (an update replaced the image under a long-running client, whose path
-/// then reads `… (deleted)`), Linux still reaches the running image as
-/// `/proc/self/exe`, which answers `ctl` as the front door.
+/// `exe` resolved through its links ([`own_exe`]).
 fn resolved_exe(exe: std::path::PathBuf) -> std::path::PathBuf {
     match std::fs::canonicalize(&exe) {
         Ok(path) => path,
@@ -101,9 +82,7 @@ pub struct CtlClient {
 }
 
 impl CtlClient {
-    /// Build a client. `ctl` is the path to a program that answers as
-    /// `aterm-ctl` does; `socket` is an explicit `--sock` path, or `None` for
-    /// the flagless resolution.
+    /// Build a client.
     pub fn new(ctl: impl Into<std::path::PathBuf>, socket: Option<String>) -> Self {
         Self {
             ctl: ctl.into(),
@@ -134,11 +113,8 @@ impl CtlClient {
 
     /// Run `aterm-ctl [--sock S] <args...>` and return the exit code with both
     /// streams, so the supervisor can tell a `124` timeout and an `ERR usage`
-    /// from a failure. `Err` only when the client could not be launched.
+    /// from a failure.
     pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
-        // `aterm-ctl` is a console image: `spawnfd::command` keeps a supervisor
-        // with no console (the window's harness host) from opening a visible
-        // console window per request on Windows.
         let mut cmd = aterm_uds::spawnfd::command(&self.ctl);
         cmd.args(&self.lead);
         if let Some(s) = &self.socket {
@@ -178,8 +154,7 @@ fn failure_words(reply: &supervise::CtlReply) -> String {
 const MAX_TEXT_LINES: usize = 200_000;
 /// Max bytes before a control-protocol line's LF, including an optional CR.
 const MAX_LINE_BYTES: usize = 1 << 20; // 1 MiB
-/// Max retained bytes in one counted reply. The individual row/count bounds
-/// alone allow a peer to make the client retain hundreds of gigabytes.
+/// Max retained bytes in one counted reply.
 const MAX_REPLY_BYTES: usize = 256 << 20; // 256 MiB
 
 #[inline]
@@ -217,12 +192,6 @@ fn reply_count(header: &str) -> std::io::Result<Option<usize>> {
 /// One persistent, authenticated control connection, the in-process twin of
 /// [`CtlClient`]: it speaks the raw control verbs directly, with the same verbs
 /// and framing `CtlClient` drives through `aterm-ctl`.
-///
-/// Generic over any `Read + Write` transport: a local `CtlStream`
-/// ([`connect_local`](RelayClient::connect_local),
-/// [`connect_local_beside`](RelayClient::connect_local_beside)), or an
-/// in-memory one in tests. The live upgrade and the supervisor's persistent
-/// transport ([`supervise::RelayCtl`]) ride it.
 pub struct RelayClient<S: Read + Write> {
     io: S,
     /// Sends only [`READ_VERBS`] ([`Self::reads_only`]): anything else is
@@ -232,16 +201,13 @@ pub struct RelayClient<S: Read + Write> {
     buf: Vec<u8>,
     /// The `OK` replies to `help <verb>` this connection has had
     /// ([`Self::help_counted`]): a verb's help is its server build's, fixed
-    /// for the connection's life. Bounded by [`HELP_MEMO_MAX`].
+    /// for the connection's life.
     help: Vec<(String, (String, String))>,
 }
 
 /// The verbs a read-only connection may send ([`RelayClient::reads_only`]):
 /// each observes, and none changes the session, its screen, its leases or its
-/// processes. `meta` only bare (its `set`/`unset` change the session's
-/// metadata), and `doc` only as `ls`, `read` and `log` (its `apply` and
-/// `save` change a document). Anything not named here is refused: an
-/// allowlist, so a verb added to the server is no read until it is named.
+/// processes.
 pub const READ_VERBS: &[&str] = &[
     "text", "screen", "line", "cell", "cursor", "modes", "blocks", "history", "status", "timeline",
     "metrics", "await", "who", "sessions", "help", "meta", "ls", "doc",
@@ -253,17 +219,11 @@ pub const READ_VERBS: &[&str] = &[
 fn is_read_request(line: &str) -> bool {
     let mut words = line.split_whitespace().skip_while(|w| w.starts_with('@'));
     match words.next() {
-        // The server's only read form is bare `meta`.
         Some("meta") => words.next().is_none(),
         Some("metrics") => {
-            // cmd_metrics accepts a summary or `percentiles`, optionally
-            // with either JSON marker anywhere. `reset` changes both the
-            // metrics and echo-RTT stores; no other form is admitted here.
             let mut command = words.filter(|w| !matches!(*w, "json" | "--json"));
             matches!(command.next(), None | Some("percentiles")) && command.next().is_none()
         }
-        // `doc ls`, `doc read` and `doc log` read documents; `doc apply` and
-        // `doc save` write them.
         Some("doc") => matches!(words.next(), Some("ls" | "read" | "log")),
         Some(verb) => READ_VERBS.contains(&verb),
         None => false,
@@ -275,8 +235,7 @@ fn is_read_request(line: &str) -> bool {
 const HELP_MEMO_MAX: usize = 16;
 
 impl<S: Read + Write> RelayClient<S> {
-    /// Wrap an already-connected, authenticated transport. For the local AUTH
-    /// handshake use [`connect_local`](RelayClient::connect_local).
+    /// Wrap an already-connected, authenticated transport.
     pub const fn new(io: S) -> Self {
         Self {
             io,
@@ -289,8 +248,7 @@ impl<S: Read + Write> RelayClient<S> {
     /// This connection, able to send the read verbs alone ([`READ_VERBS`]):
     /// every other request — an input verb, a signal, a lease, a `meta set`, a
     /// length-framed write — is refused before a byte is written
-    /// (`PermissionDenied`). What a look that must have no hands runs on: the
-    /// live upgrade's dry run and its watch (`harness::upgrade_drive`).
+    /// (`PermissionDenied`).
     #[inline]
     #[must_use]
     pub const fn reads_only(mut self) -> Self {
@@ -311,11 +269,7 @@ impl<S: Read + Write> RelayClient<S> {
     }
 
     /// `help <verb>` as [`Self::request_counted`] reads it, asked once per
-    /// connection: a connection speaks to one server build for its life. Only an
-    /// `OK` reply is kept; an `ERR` or I/O error is asked again. The live
-    /// upgrade's typed turn asks `help turn` whether the server takes its
-    /// `if-gen=` fence, and asking afresh would add a round trip inside the
-    /// window the fence guards.
+    /// connection: a connection speaks to one server build for its life.
     ///
     /// # Errors
     /// As [`Self::request_counted`].
@@ -330,11 +284,7 @@ impl<S: Read + Write> RelayClient<S> {
         Ok(reply)
     }
 
-    /// Read the first line of a reply. A forward's host-gone line
-    /// ([`aterm_types::control_verbs::host_gone_line`]) is no answer: the aterm
-    /// hosting the session went away and the connection closes, so it reads as
-    /// end of file (`UnexpectedEof`, naming the host) and every caller that
-    /// rides out a hang-up rides it out too. Body rows are not checked.
+    /// Read the first line of a reply.
     fn read_reply(&mut self) -> std::io::Result<String> {
         let line = self.read_line()?;
         match aterm_types::control_verbs::host_gone(&line) {
@@ -396,16 +346,13 @@ impl<S: Read + Write> RelayClient<S> {
     }
 
     /// The underlying transport, so a caller can take a second handle on the
-    /// connection (`try_clone` on a `CtlStream`). The harness uses it to shut
-    /// down a connection parked in an `await` from the thread that decided the
-    /// wait is over.
+    /// connection (`try_clone` on a `CtlStream`).
     pub const fn transport(&self) -> &S {
         &self.io
     }
 
     /// Send one control line and read one reply line (`OK …` or `ERR …`),
-    /// returned verbatim. The caller decides what the words mean; nothing is
-    /// interpreted here.
+    /// returned verbatim.
     ///
     /// # Errors
     /// I/O errors writing the request or reading the reply, and a request
@@ -416,9 +363,7 @@ impl<S: Read + Write> RelayClient<S> {
     }
 
     /// Send one control line and read a counted reply: the header, then the
-    /// `n` body lines when the header is `OK <n>` with a numeric `<n>`. A header
-    /// that is not counted (`OK schema=1 …`, `ERR …`) returns with an empty
-    /// body and no further read.
+    /// `n` body lines when the header is `OK <n>` with a numeric `<n>`.
     ///
     /// # Errors
     /// I/O errors, or a count/body past the client's own reply bounds.
@@ -431,8 +376,7 @@ impl<S: Read + Write> RelayClient<S> {
         Ok((header, self.read_body_lines(count, MAX_REPLY_BYTES)?))
     }
 
-    /// The shared collector for text and generic counted replies. Charge the
-    /// normalized trailing newline too, so even empty rows consume the bound.
+    /// The shared collector for text and generic counted replies.
     fn read_body_lines(&mut self, count: usize, max_bytes: usize) -> std::io::Result<String> {
         if count > MAX_TEXT_LINES {
             return Err(std::io::Error::new(
@@ -457,8 +401,7 @@ impl<S: Read + Write> RelayClient<S> {
 
     /// Send one control line and read a byte-framed reply: the header, then
     /// exactly `n` raw bytes when the header is `OK <n>` and `<n>` is a
-    /// number (`inbox get`, `cast`). A header that is not counted returns
-    /// with an empty body and no further read, as [`Self::request_counted`].
+    /// number (`inbox get`, `cast`).
     ///
     /// # Errors
     /// I/O errors, a body past the line bound, or a stream that ends inside
@@ -491,10 +434,7 @@ impl<S: Read + Write> RelayClient<S> {
     }
 
     /// Send one length-framed request — `<head> <len>\n` and then `payload` —
-    /// and read its one reply line, returned verbatim. This is the frame
-    /// `feed-bin` and `paste-bin` read: the payload reaches the PTY byte for
-    /// byte, where an inline `send <text>` has leading `id=`/`if=` tokens
-    /// parsed out of it and a trailing literal `\n` turned into CR.
+    /// and read its one reply line, returned verbatim.
     ///
     /// # Errors
     /// I/O errors, and a `head` carrying a line terminator.
@@ -520,7 +460,7 @@ impl<S: Read + Write> RelayClient<S> {
     }
 
     /// Read one line a server pushed on a connection that is already parked
-    /// on a stream (`subscribe`). Nothing is written.
+    /// on a stream (`subscribe`).
     ///
     /// # Errors
     /// I/O errors, and `UnexpectedEof` when the stream ends.
@@ -743,10 +683,7 @@ EXAMPLES
 #[cfg(test)]
 mod tests {
     use super::*;
-    // --- RelayClient (the persistent connection) ---
 
-    /// An in-memory transport for `RelayClient`: records everything written, and
-    /// hands back a canned sequence of server response bytes.
     struct RecordingTransport {
         sent: Vec<u8>,
         to_read: std::io::Cursor<Vec<u8>>,
@@ -870,9 +807,6 @@ mod tests {
         );
     }
 
-    /// A framed request carries its payload byte for byte after a header that
-    /// counts it, and reads one reply; a header with a line terminator is
-    /// refused before anything is written.
     #[test]
     fn relay_client_frames_a_payload_byte_for_byte() {
         let mut client = RelayClient::new(RecordingTransport::new(b"OK 9 bytes\n"));
@@ -890,9 +824,6 @@ mod tests {
         assert!(client.io.sent.is_empty());
     }
 
-    /// A forwarding aterm's last line, `ERR gone pid=<host> sock=<its socket>`,
-    /// is the same fact as a direct connection's EOF; every read sees it as the
-    /// connection closing, naming the host.
     #[test]
     fn relay_client_reads_the_host_gone_line_as_the_connection_closing() {
         let mut client = RelayClient::new(RecordingTransport::new(
@@ -903,13 +834,11 @@ mod tests {
             .expect_err("not an answer");
         assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{err}");
         assert!(err.to_string().contains("pid 4242"), "{err}");
-        // A refusal that only starts alike is still an answer.
         let mut client = RelayClient::new(RecordingTransport::new(b"ERR gone fishing\n"));
         assert_eq!(
             client.request_line("text").expect("an answer"),
             "ERR gone fishing"
         );
-        // Only where a reply begins: a screen row that reads alike is a row.
         let row = "ERR gone pid=4242 sock=/run/aterm/aterm-4242.sock";
         let mut client =
             RelayClient::new(RecordingTransport::new(format!("OK 1\n{row}\n").as_bytes()));
@@ -919,8 +848,6 @@ mod tests {
         );
     }
 
-    /// A failed `aterm-ctl` run is never an empty error: its stderr, else its
-    /// stdout line and exit code, else the exit code alone.
     #[test]
     fn a_silent_ctl_failure_still_says_something() {
         let reply = |code, stdout: &str, stderr: &str| supervise::CtlReply {
@@ -954,12 +881,6 @@ mod tests {
         assert_eq!(client.io.sent, b"help turn\nhelp turn\n");
     }
 
-    /// A read-only connection sends the read verbs as written (`text`, `status`,
-    /// `await`, a bare `meta`, and metric reads under either JSON spelling, with
-    /// or without a selector); an input verb, a signal, a lease, a `meta set`, a
-    /// metric reset, a verb it does not name and a length-framed write are each
-    /// refused with nothing written. Negative control: an ordinary connection
-    /// sends them.
     #[test]
     fn a_read_only_connection_refuses_every_mutating_subform() {
         let reads = [
@@ -989,8 +910,6 @@ mod tests {
             assert!(ro.request_line(read).is_ok(), "{read}");
         }
         let before = ro.io.sent.clone();
-        // Observe every case before the aggregate assertion, so the old
-        // transport guard demonstrates each reset spelling rather than only one.
         let refused: Vec<_> = mutations
             .iter()
             .map(|request| {
@@ -1008,10 +927,6 @@ mod tests {
         );
     }
 
-    /// `doc` is a read in its read forms alone: `ls`, `read` and `log` are
-    /// sent, aimed or not, and `apply`, `save`, an unknown form and the bare
-    /// verb write nothing. NEGATIVE CONTROL: an ordinary connection sends a
-    /// write form.
     #[test]
     fn a_read_only_connection_sends_doc_reads_alone() {
         let reads = [
@@ -1082,7 +997,6 @@ mod tests {
 
     /// [`CtlClient::own_at`] runs `<exe> ctl --sock <sock> <args>` in that
     /// order, and [`own_exe`] names a file that exists (this test binary).
-    /// Negative control: [`CtlClient::new`] puts nothing before `--sock`.
     #[cfg(unix)]
     #[test]
     fn the_own_client_runs_the_ctl_verb_first() {
@@ -1106,9 +1020,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The control client is THIS image, resolved through its links. An image
-    /// whose file is gone (replaced by an update under a long-running client)
-    /// is still reached on Linux as `/proc/self/exe`.
     #[test]
     fn the_ctl_client_is_this_image_even_once_its_file_is_replaced() {
         let me = std::env::current_exe().expect("the test binary");

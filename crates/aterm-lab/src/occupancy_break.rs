@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `occupancy-break-claude`: THE OCCUPANCY DOOR ON A REAL CLAUDE CODE (harness occupancy, slice 1;
-//! `docs/DESIGN-harness-occupancy-2026-10-20.md` §8). Under the owner's `occupancy = "prompt"` (the
-//! lab's scratch `aterm.toml`, the one place an agent may write it) and the nudge's wait cut to a
-//! minute ([`NUDGE_SEAM`](aterm_agent::supervise::occupancy::rules::NUDGE_SEAM), which only a build
-//! that reads seams reads), Claude Code is asked to start a background workflow of two `sleep 900`
-//! steps and wait on it. The scenario holds that, at the break it waits at:
-//!
-//! * the harness types exactly one `[aterm harness] … (rule wait-nudge@v1)` line, fenced (the
-//!   door books `typed` only after a fenced write; an unfenced read is `skipped why=unfenced`);
-//! * the workflow is still running after it;
-//! * the agent's `WAITING:` answer is read as the answer to ours (`hold declared`);
-//! * the journal, the ledger and Messages say so as §6 describes: a `fact-intent@v1` row before
-//!   the line's `fact-hold@v1` `typed` row, one episode, held at least the nudge's wait, no
-//!   `fact-would@v1` row; the journal's `hold open`, one `door=break typed`, then `hold declared`,
-//!   with no `hold closed` after; and the session's supervisor record of the line
-//!   (`harness.supervisor.<sid>`, the host's `inform`) ([`judge`]).
-//!
-//! The lab's stub plays the agent ([`script`]): the main thread calls `Workflow`, says it started,
-//! then answers the nudge with a `WAITING:` line; each workflow step's subagent, asked under
-//! [`STEP_MARK`], calls `Bash` `sleep 900` (Claude Code's Bash ends it at its 10 min ceiling, past
-//! the scenario's window) and says it slept. Recorded with `lab scn run occupancy-break-claude`;
-//! its run promotes into the tape corpus with `lab tape promote occupancy-break-claude-01`, which
-//! refuses a run the judge failed (its `error`).
+//! `occupancy-break-claude`: harness occupancy door scenario on a real Claude Code.
 
 use aterm_agent::supervise::facts::FactKind;
 use aterm_agent::supervise::occupancy::door::INTENT_RULE;
@@ -38,24 +16,19 @@ use crate::stop;
 /// The scenario's name (`lab scn run`; its runs `<name>-NN`, its corpus tape `<name>`).
 pub const NAME: &str = "occupancy-break-claude";
 
-/// Its `[harness]` lines, under the lab's root `[harness]` table: the owner's `prompt`, the
-/// shipped `cruise` (the nudge is cruise's alone), and a 5 s grace so the lab's own typing of the
-/// task is past before the minute's nudge is due.
+/// Its `[harness]` lines, under the lab's root `[harness]` table.
 pub const HARNESS_KEYS: &str = "occupancy = \"prompt\"\nautopilot = \"cruise\"\nhuman_grace_s = 5";
 
 /// The nudge's wait the seam sets, in seconds.
 pub const NUDGE_S: u32 = 60;
 
-/// The lab instance's own variables: the nudge's seam
-/// ([`NUDGE_SEAM`](aterm_agent::supervise::occupancy::rules::NUDGE_SEAM)) at [`NUDGE_S`].
+/// The lab instance's own variables.
 pub const INSTANCE_ENV: &str = "ATERM_OCCUPANCY_NUDGE_S=60";
 
-/// What a workflow step's subagent is asked under: its first message holds it, and the stub
-/// answers that conversation from the steps that name it (`when`), never the main thread's.
+/// What a workflow step's subagent is asked under.
 pub const STEP_MARK: &str = "occupancy-lab-step";
 
-/// The workflow the agent starts (the `Workflow` tool's `script`): two steps at once, each a
-/// subagent asked under [`STEP_MARK`] to sleep.
+/// The workflow the agent starts (the `Workflow` tool's `script`).
 pub const WORKFLOW: &str = "export const meta = { name: 'occupancy-lab', description: 'Two sleeps the occupancy lab waits on' }\n\
                             await parallel([1, 2].map((n) => () => agent(`occupancy-lab-step ${n}: run sleep 900 in Bash, then say slept.`)))\n";
 
@@ -70,23 +43,16 @@ pub const STARTED: &str = "Started the occupancy-lab workflow: its two sleep ste
 pub const WAITING: &str =
     "WAITING: the occupancy-lab workflow's two sleep 900 steps; they unblock no other step.";
 
-/// A step's last word.
 const SLEPT: &str = "slept";
 
-/// The `Bash` call's timeout: Claude Code's ceiling, 10 min.
 const BASH_TIMEOUT_MS: i64 = 600_000;
 
-/// Claude Code's box before a workflow runs, where a build asks it.
 const WORKFLOW_BOX: &str = aterm_phase::anchors::anchor_text("box.workflow");
 
-/// A hang detector for the workflow's wait to be drawn after the task is typed.
 const WAITS_WITHIN_S: f64 = 120.0;
 
-/// The nudge's hang detector past [`NUDGE_S`]: the door's look, a minute apart, and a minute
-/// more.
 const TYPED_PAST_S: f64 = 120.0;
 
-/// A hang detector for the agent's `WAITING:` answer to be read (the stub answers at once).
 const DECLARED_WITHIN_S: f64 = 60.0;
 
 /// The stub's tool script ([module docs](self)).
@@ -121,7 +87,6 @@ pub fn script() -> J {
     ])
 }
 
-/// The scratch settings' allow rules: the workflow and its sleeps run without a box.
 fn allowed() -> J {
     J::obj([(
         "permissions",
@@ -137,8 +102,7 @@ fn allowed() -> J {
     )])
 }
 
-/// Whether `rows` draw the agent waiting on a workflow of its own: the reader's background
-/// wait, a workflow's rule.
+/// Whether `rows` draw the agent waiting on a workflow of its own.
 #[must_use]
 pub fn workflow_waits(rows: &[String]) -> bool {
     matches!(
@@ -173,7 +137,6 @@ struct Row {
     reason: String,
 }
 
-/// The session `sid`'s rows of the ledger text `ledger`, oldest first.
 fn rows_of(ledger: &str, sid: &str) -> Vec<Row> {
     let want = sid.trim_start_matches('@');
     ledger
@@ -189,19 +152,15 @@ fn rows_of(ledger: &str, sid: &str) -> Vec<Row> {
         .collect()
 }
 
-/// The value of `key=` among `text`'s words.
 fn word<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     text.split(' ')
         .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
 }
 
-/// The key of the record a typed line leaves for session `sid` (the host's `inform`).
 fn record_key(sid: &str) -> String {
     format!("harness.supervisor.{}", sid.trim_start_matches('@'))
 }
 
-/// The decoded titles of the `messages` rows (`messages`, the wire's `message …` lines) keyed
-/// `key`, oldest first.
 fn titles_keyed(messages: &str, key: &str) -> Vec<String> {
     let field = |row: &str, name: &str| {
         row.split(' ')
@@ -216,8 +175,7 @@ fn titles_keyed(messages: &str, key: &str) -> Vec<String> {
         .collect()
 }
 
-/// THE SCENARIO'S VERDICT on `r` ([module docs](self)): each way the run fell short of it, in a
-/// line; none for a pass.
+/// THE SCENARIO'S VERDICT on `r` ([module docs](self)).
 #[must_use]
 pub fn judge(r: &Recording<'_>) -> Vec<String> {
     let mut fail = Vec::new();
@@ -281,8 +239,11 @@ pub fn judge(r: &Recording<'_>) -> Vec<String> {
             if intent_at > at {
                 fail.push("the intent row follows the typed row".to_string());
             }
-            episode = word(&row.reason, "episode");
-            if word(&intent.reason, "episode") != episode {
+            episode =
+                word(&row.reason, "episode").filter(|key| u64::from_str_radix(key, 16).is_ok());
+            if episode.is_none() {
+                fail.push("the typed row has no valid episode".to_string());
+            } else if word(&intent.reason, "episode") != episode {
                 fail.push("the intent and the typed row are two episodes".to_string());
             }
         }
@@ -338,10 +299,8 @@ pub fn judge(r: &Recording<'_>) -> Vec<String> {
     fail
 }
 
-/// THE RUN ([module docs](self)): the settings' allow rules and the stub's script, the task, the
-/// workflow's wait drawn (its box answered as a person would, where this build asks one, long
-/// before the minute's hold is due), the line typed and the answer read under hang detectors, and
-/// [`judge`]'s verdict in the summary (`occupancy_judged`; `error` where it failed).
+/// THE RUN ([module docs](self)).
+///
 /// # Errors
 /// Interrupted, or the lab refused the settings or the script.
 pub fn play(ctx: &mut Ctx) -> Result<(), ScnErr> {
@@ -376,7 +335,6 @@ pub fn play(ctx: &mut Ctx) -> Result<(), ScnErr> {
         return Ok(());
     };
     let typed_seen = ctx.journal().get(typed).map_or(0.0, |(seen, _)| *seen);
-    // The judge says whether it came: its own `error` stands for this wait's.
     let _ = journaled_after(ctx, typed + 1, " hold declared ", DECLARED_WITHIN_S)?;
     stop::sleep(std::time::Duration::from_secs(5))?;
     let journal: Vec<String> = ctx

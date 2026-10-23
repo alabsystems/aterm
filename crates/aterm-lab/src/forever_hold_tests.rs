@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The hold's wants (§12.3.7) over records and reads a run would
-//! keep, each beside the reads it must fail: a hold before the instruction,
-//! a clock or a count that is not the ledger's, another chain's leg, an
-//! open word no nudge named or one quoted, a hover pushed before the hold
-//! and never again, a hold said after the landing — and beside
-//! the reads a live run gave that they must not fail: a read standing from
-//! before the event it judges.
+//! Tests for the hold's verdicts over records and reads.
 
 use super::*;
 use crate::forever::surfaces::Window;
@@ -56,10 +50,7 @@ fn cx() -> Ctx<'static> {
     }
 }
 
-/// A Land chain's records: its work turn, Land's instruction at +10 s, its
-/// yield held, a nudge naming `named` at +70 s, the landing at +130 s
-/// (`landed`); its hold on `status` as a 3c build prints it, the hover and
-/// the state line saying `why`.
+/// A Land chain's records.
 fn seen(held: &str, why: &str, named: &str, landed: bool) -> Seen {
     let since = LAND_S.to_string();
     let mut s = Seen {
@@ -158,10 +149,7 @@ fn read_window(seen: &mut Seen, t: i64, hover: &str, state: &str) {
     let _ = seen.window.note(&glance, "s-c");
 }
 
-/// L1: no hold before the instruction, then its ledgered second and the
-/// nudges typed. NEGATIVE CONTROLS: a hold read before `land@v1`; a
-/// `land_since=` a minute off the ledger's; one nudge more than typed; a
-/// build that prints no such field.
+/// L1: no hold before the instruction, then its ledgered second and the nudges typed.
 #[test]
 fn a_hold_begins_at_the_instruction_and_counts_its_nudges() {
     let good = seen("repo", "1 untracked file", "x", false);
@@ -184,14 +172,7 @@ fn a_hold_begins_at_the_instruction_and_counts_its_nudges() {
     assert!(matches!(begins(&old, &cx()), Verdict::Fail(_)));
 }
 
-/// L4 and L8: each repository chain says its own count and no other leg, so
-/// each is the other's negative control. NEGATIVE CONTROLS: L4's reads
-/// judged as L8's; a second count beside L4's; another leg on `status`; the
-/// state line on the page without the count. And the page read only after
-/// the instruction: a row on the screen before it (its head, no hold yet)
-/// and off it after is off the screen, not a row that never said it (the
-/// live run's L6 on Claude Code; a judge reading the page standing at the
-/// instruction failed it).
+/// L4 and L8: each repository chain says its own count and no other leg, so each is the other's negative control.
 #[test]
 fn each_repository_chain_says_its_own_count_alone() {
     let l4 = seen("repo", "1 untracked file", "x", false);
@@ -214,7 +195,6 @@ fn each_repository_chain_says_its_own_count_alone() {
         "head=land-c: Window 2, tab 4\nstate=not landed yet: x",
     );
     assert!(matches!(legs(&unsaid, &cx(), L4), Verdict::Fail(_)));
-    // Off the page's screen the hover and `status` still say it.
     let mut off = l4.clone();
     off.window.page = vec![j(1_000, "-")];
     assert!(matches!(legs(&off, &cx(), L4), Verdict::Pass(_)));
@@ -228,8 +208,6 @@ fn each_repository_chain_says_its_own_count_alone() {
         "{:?}",
         legs(&scrolled, &cx(), L4)
     );
-    // Its row stays on screen with the old state, actually read again after
-    // the instruction. Deduplication must not turn it into an off-screen row.
     let mut stale = l4;
     stale.window = Window {
         label: "land-c".into(),
@@ -249,18 +227,11 @@ fn each_repository_chain_says_its_own_count_alone() {
     assert!(matches!(legs(&stale, &cx(), L4), Verdict::Pass(_)));
 }
 
-/// THE FIRST LOOK'S LINE (Claude Code 2.1.308's L4, 2026-10-22): the look
-/// that first saw the hold read the page at +128.0 s, its row saying it, and
-/// `status` at +128.1 s; the page's later reads drew the row with no state
-/// line. The line the first look read counts. NEGATIVE CONTROLS: a row drawn
-/// with no state line all through the hold fails, so does a state line on
-/// the screen that never says the leg, and so does a hold line read only
-/// before the land act.
+/// The line the first look read counts even when later reads draw the row with no state line.
 #[test]
 fn the_first_looks_state_line_counts_though_its_page_read_came_first() {
     let head = "head=land-c: Window 2, tab 4";
     let said = format!("{head}\nstate=not landed yet: 1 untracked file \u{b7} landing since 03:20");
-    // The row drawn with no state line from the hold's first `status` read on.
     let mut bare = seen("repo", "1 untracked file", "x", false);
     bare.window.page.truncate(2);
     bare.window.page.push(j(40_000, head));
@@ -269,7 +240,6 @@ fn the_first_looks_state_line_counts_though_its_page_read_came_first() {
         "{:?}",
         legs(&bare, &cx(), L4)
     );
-    // The hold's words read 100 ms before `status` first read the hold.
     let mut first = bare.clone();
     first.window.page.insert(2, j(39_900, &said));
     first.window.page_reads.push(T0 + 39_900);
@@ -279,8 +249,6 @@ fn the_first_looks_state_line_counts_though_its_page_read_came_first() {
         "{:?}",
         legs(&first, &cx(), L4)
     );
-    // NEGATIVE CONTROLS: the state line on the screen through the hold,
-    // never saying it; the hold's words read only before the land act.
     let mut unsaid = bare.clone();
     unsaid.window.page[2] = j(40_000, &format!("{head}\nstate=landing since 03:20"));
     assert!(
@@ -300,8 +268,6 @@ fn the_first_looks_state_line_counts_though_its_page_read_came_first() {
 }
 
 /// L6: the tall reply read whole, so its hold is its need alone.
-/// NEGATIVE CONTROL: a `cut` leg beside the need (a reply the loop could
-/// not read whole) fails it.
 #[test]
 fn l6_is_its_need_alone() {
     let good = seen("needs", "needs you", "x", false);
@@ -321,9 +287,7 @@ fn l6_is_its_need_alone() {
 
 /// L2: the hover and the state line name the words its nudge named, as it
 /// named them (a word with its own comma split alike on both), never in
-/// quotation marks. NEGATIVE CONTROLS: a word the nudge never named; the
-/// words quoted, as 3c's first cut said them (`“still open” in its
-/// report`).
+/// quotation marks.
 #[test]
 fn l2_names_the_words_its_nudge_named() {
     let named = "open work in its report: still open, approved, not landed";
@@ -350,9 +314,7 @@ fn l2_names_the_words_its_nudge_named() {
 
 /// A HOVER PUSHED BEFORE THE HOLD AND NEVER AGAIN is a stale push, failed:
 /// the strip still shows `driven by aterm (land)` ten seconds and more after
-/// `status` read the hold, while it stands. And not where the strip had no
-/// time to follow, nor where the hold was gone again by then. NEGATIVE
-/// CONTROL: the judge without the stale rule calls it unobserved.
+/// `status` read the hold, while it stands.
 #[test]
 fn a_hover_pushed_before_the_hold_and_never_again_fails() {
     let mut stale = seen("repo", "1 untracked file", "x", false);
@@ -362,7 +324,6 @@ fn a_hover_pushed_before_the_hold_and_never_again_fails() {
         "{:?}",
         legs(&stale, &cx(), L4)
     );
-    // The hold read, then down again within the slack: no stale push.
     let mut brief = stale.clone();
     brief.status.truncate(3);
     brief.status.push(st(45_000, "-", "0", &LAND_S.to_string()));
@@ -373,12 +334,7 @@ fn a_hover_pushed_before_the_hold_and_never_again_fails() {
     );
 }
 
-/// L5: at the landing the hold goes. NEGATIVE CONTROLS: a hold on `status`
-/// after the landing; the hover still saying it. And only what was read
-/// after the landing: the reads standing at it, taken before while the
-/// hold stood, are not its (the live run's L16 on Claude Code, whose next
-/// read came 2.5 s after the landing; a judge reading the read standing at
-/// the landing failed it).
+/// L5: at the landing the hold goes.
 #[test]
 fn the_hold_is_gone_at_the_landing() {
     let good = seen("needs", "needs you", "x", true);
@@ -444,8 +400,6 @@ fn the_hold_is_gone_at_the_landing() {
     };
     read_window(&mut unread, 120_000, clear_hover, clear_page);
     assert!(matches!(gone(&unread, &cx()), Verdict::Unobserved(_)));
-    // Neither an unrelated page nor a partial chrome table observed the
-    // judged surfaces. They cannot turn pre-event clearing into fresh proof.
     let partial = super::super::Glance::of(
         T0 + 140_000,
         "toolbar-tabs count=1 labels=[\"land-c\"]",
@@ -469,9 +423,7 @@ fn the_hold_is_gone_at_the_landing() {
 
 /// The hover is its tab's tooltip's who-drives line, read off the strip as
 /// it was last stamped where the line prints that (`pushed_tooltips=`, a
-/// debug build's), else as composed at the read. NEGATIVE CONTROLS: a tab
-/// with no tooltip reads `-`; the composed tooltip read where the pushed one
-/// differs reads the hold the strip never showed.
+/// debug build's), else as composed at the read.
 #[test]
 fn the_hover_is_read_off_the_strips_tooltip() {
     let stale = "toolbar-tabs count=1 selected=0 labels=[\"land-c\"] icons=[None] \

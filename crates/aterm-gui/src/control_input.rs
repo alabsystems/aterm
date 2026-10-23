@@ -242,7 +242,7 @@ fn named_key_from_token(body: &str) -> Option<aterm_types::keyboard::NamedKey> {
     })
 }
 
-/// PURE parser for `key <name> [mods=<list>] [type=<t>] [base=<c>]` -> an [`InputEvent::Key`].
+/// Parse `key <name> [mods=<list>] [type=<t>] [base=<c>]` into an [`InputEvent::Key`].
 pub(crate) fn parse_key(rest: &str) -> Option<InputEvent> {
     use aterm_types::keyboard::Key;
     let (mut mods, body) = take_mods(rest)?;
@@ -333,7 +333,7 @@ pub(crate) const KEY_USAGE: &str = "ERR usage: key [id=<epoch>:<producer>:<seq>]
                                     up down left right home end pageup pagedown f1..f35 \
                                     kp0..kp9; e.g. key ctrl+c, key y\n";
 
-/// The leading `k=v` options a `send`/`key`/`turn` line may carry, taken off the tail at the dispatch so every arm parses the tail without them.
+/// Leading `k=v` options stripped from a `send`/`key`/`turn` line before verb-specific parsing.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct LeadingInputOptions {
     /// The idempotency key's raw `<epoch>:<producer>:<seq>` value.
@@ -625,8 +625,7 @@ pub(crate) fn compile_guard(pattern: Option<&str>) -> Result<Option<Arc<dyn RowM
     }
 }
 
-/// The conditions a fenced write is held to, all checked under the same hold of the terminal lock the write is made under.
-/// A row fence (`guard`, `fp`) declines as moved on a DEC 2026 frame still unfinished ([`Terminal::frame_unfinished_at`]).
+/// Conditions checked under the terminal lock before a fenced write.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct InputFence<'a> {
     /// `if=<re>` — some visible row must match.
@@ -646,7 +645,6 @@ pub(crate) struct InputFence<'a> {
 }
 
 impl InputFence<'_> {
-    /// Whether a row condition is armed (`guard`, `fp`), which no unfinished frame decides.
     fn reads_rows(&self) -> bool {
         self.guard.is_some() || self.fp.is_some()
     }
@@ -1125,8 +1123,6 @@ pub(crate) fn parse_mouse(rest: &str) -> Result<InputEvent, String> {
         } else if let Some(b) = tok.strip_prefix("block=") {
             block = matches!(b, "1" | "true" | "yes" | "block");
         } else if let Some(l) = tok.strip_prefix("lines=") {
-            // A non-positive or non-numeric count is 1; clamped so one line cannot
-            // flood the PTY.
             wheel_lines = l.parse::<i32>().unwrap_or(1).clamp(1, MAX_WHEEL_LINES);
         } else if action.is_empty() {
             action = tok;
@@ -1309,7 +1305,6 @@ pub(crate) fn parse_tab(rest: &str) -> Option<TabAction> {
         Some("move") => {
             let (from, to) = (it.next()?, it.next()?);
             if it.next().is_some() {
-                // Distinct branch.
                 return None;
             }
             let from = from.parse::<usize>().ok()?;

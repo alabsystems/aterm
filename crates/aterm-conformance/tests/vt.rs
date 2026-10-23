@@ -1,18 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The VT suite: every engine-read conformance file in one test binary.
-//!
-//! These are pure feed-bytes → read-screen → assert cases (no environment,
-//! global allocator, panic hook, timing bound or shared file path), so they
-//! share one process and run concurrently. The files keep their paths, so
-//! `tests/<file>.rs:<line>` citations resolve. Run one file's cases with
-//! `targo --unverified test -p aterm-conformance --test vt -- <file>::`.
-//!
-//! The crate sets `autotests = false`, so a `tests/*.rs` file that is neither
-//! a `mod` here nor a `[[test]]` in Cargo.toml never compiles. A file needing
-//! its own process (a live binary, a timing window, a global) gets its own
-//! `[[test]]` with a one-line reason.
+//! Combined VT conformance test binary (`autotests = false` in `Cargo.toml`, so
+//! every `tests/*.rs` file must be a `mod` here or a standalone `[[test]]`).
 
 mod conformance;
 mod kitty_mouse;

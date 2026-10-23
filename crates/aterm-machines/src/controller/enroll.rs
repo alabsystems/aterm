@@ -17,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-const SSH: &str = "/usr/bin/ssh";
+const SSH: &str = aterm_uds::os_path!("ssh");
 
 /// OpenSSH's password method, tried first (one prompt per login).
 pub const PASSWORD_METHOD: &str = "password";

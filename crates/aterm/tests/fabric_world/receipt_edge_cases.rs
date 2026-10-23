@@ -458,7 +458,7 @@ fn x5_wait_ack_past_its_deadline_answers_expired() {
     w.wait_ready();
     let (a, b) = w.two_sessions();
     let answers: Vec<(String, bool)> = std::thread::scope(|scope| {
-        let posts: Vec<_> = [700u64, 1500]
+        let posts: Vec<_> = [300u64, 600]
             .into_iter()
             .enumerate()
             .map(|(i, dl)| {

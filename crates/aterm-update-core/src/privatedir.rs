@@ -20,8 +20,6 @@ fn our_uid() -> u32 {
 /// Create `dir` (and parents), force mode `0700`, then verify it is owned by us and not
 /// group/other-writable, refusing a foreign-owned or shared directory.
 #[cfg(unix)]
-// Skip: set_permissions/format on the 0700 dir; the mode and owner checks are what this fn
-// enforces.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     // Refuse a pre-existing symlink before create_dir_all or set_permissions can follow it.
@@ -33,9 +31,7 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
             format!("{}: update directory is a symlink; refusing", dir.display()),
         ));
     }
-    // Create missing ancestors as `0755 & ~umask` so open umasks (`002`) never leave them group-writable.
     aterm_types::fs_restricted::create_dir_all_unshared(dir, 0o700)?;
-    // Skip `chmod(2)` when already `0700` to avoid bumping `st_ctime` on APFS.
     if !std::fs::symlink_metadata(dir).is_ok_and(|m| m.mode() & 0o7777 == 0o700) {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
@@ -65,7 +61,6 @@ pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
 
 /// Windows variant: create `dir` and refuse a final component that is a symlink or junction.
 #[cfg(windows)]
-// Skip: format over the refusal messages; the reparse-point checks are what this fn enforces.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ensure_private_dir(dir: &Path) -> io::Result<()> {
     if let Ok(md) = std::fs::symlink_metadata(dir)

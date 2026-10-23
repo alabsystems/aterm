@@ -49,7 +49,7 @@ impl Metrics {
         }
     }
 
-    /// Open a new measurement window: every window ledger is zeroed by its generated reset, and the epoch moves to now.
+    /// Open a new measurement window.
     pub(crate) fn reset(&self) {
         self.window.gpu.sample_fx_totals();
         self.window.reset();
@@ -58,7 +58,7 @@ impl Metrics {
 }
 
 window_ledger! {
-    /// The measurement window, by ledger: every statistic that describes the time since the last `metrics reset`, which zeroes all of it.
+    /// The measurement window, by ledger.
     pub(crate) struct Window {
         pub(crate) present: PresentLedger,
         pub(crate) input: InputLedger,
@@ -77,10 +77,9 @@ window_ledger! {
     pub(crate) struct PresentLedger {
         /// Successful application presents (`frames`).
         pub(crate) frames: Counter,
-        /// Output→application-present-return on glass (`present_latency`): measured from the
-        /// first output still waiting to be shown, so time in which nothing presented is inside it.
+        /// Output→application-present-return on glass (`present_latency`).
         pub(crate) latency: Dist,
-        /// When the worst `latency` was booked (`now_ns`), and the gap since its window's previous present: see [`SchedLedger::wake_late`].
+        /// When the worst `latency` was booked (`now_ns`), and the gap since its window's previous present.
         pub(crate) latency_at: Last,
         pub(crate) latency_gap: Last,
         pub(crate) tainted: Dist,
@@ -99,14 +98,14 @@ window_ledger! {
         pub(crate) resize_present: Dist,
         pub(crate) reflow_stamp: Stamp,
         pub(crate) resize_reflow: Dist,
-        /// OFFSCREEN rasterizations (introspection `image`/`window`/`snapshot`): how many, and the last and worst cost, counted apart from real presents so a screenshot can never move the on-glass ledger (see [`record_offscreen_raster`]).
+        /// OFFSCREEN rasterizations (introspection `image`/`window`/`snapshot`).
         pub(crate) offscreen_rasters: Counter,
         pub(crate) offscreen: Peak,
     }
 }
 
 window_ledger! {
-    /// What input measures: the keystroke slices, the input legs the typing audit named as unmeasured, and the refusals of the input contract; and the main-thread costs `metrics percentiles` prints beside them (the menu-bar glance, a need publication, the transcript apply's holds).
+    /// What input measures: the keystroke slices, the input legs the typing audit named as unmeasured, and the refusals of the input contract.
     pub(crate) struct InputLedger {
         pub(crate) input: Dist,
         /// When the worst `input` slice was booked (`now_ns`).
@@ -114,18 +113,18 @@ window_ledger! {
         pub(crate) session_stamp: Stamp,
         /// Keystrokes a full edge ring could not hold (see [`INPUT_EDGE_RING`]).
         pub(crate) edges_dropped: Counter,
-        /// Of the slices in `input`, those a PREDICTION closed: the key's slice ended at the present that first painted its proven prediction, before its echo (the PREDICTIONS note on `input`).
+        /// Of the slices in `input`, those a PREDICTION closed.
         pub(crate) predicted: Counter,
-        /// Hardware-key arrival → completed PTY write (`key_write`): the UI-thread key→write component inside `input`, from the BACKDATED arrival (see the latency trace below `note_grid_committed`).
+        /// Hardware-key arrival → completed PTY write (`key_write`).
         pub(crate) key_write: Dist,
         /// The NSEvent-QUEUE RESIDENCE that `key_write` is BACKDATED by: how long each hardware key sat in the OS event queue before the loop dispatched it.
         pub(crate) key_queue: Dist,
         pub(crate) out_req: Dist,
         pub(crate) ime: Histogram,
         pub(crate) ime_cancelled: Counter,
-        /// Input REFUSED because its session's input queue was full: the program has stopped reading and the key (or paste) was refused — said once per session, `App::refuse_input` — instead of parking the event loop or queueing without bound (decided 2026-09-25).
+        /// Input REFUSED because its session's input queue was full: the program has stopped reading and the key (or paste) was refused.
         pub(crate) refused: Counter,
-        /// Terminal query REPLIES dropped at submission (`spawn::ReplyLane::submit`): the program floods queries it never reads the answers to, and the reply lane's byte budget or count cap is full.
+        /// Terminal query REPLIES dropped at submission (`spawn::ReplyLane::submit`).
         pub(crate) reply_dropped: Counter,
         pub(crate) status_glance: Histogram,
         pub(crate) status_glance_max: Max,
@@ -138,7 +137,7 @@ window_ledger! {
 }
 
 window_ledger! {
-    /// What a redraw pass measures before and around its present: the audit counters, frame extraction, the pre-present compose, the drawable and GPU parks, the drops and the terminal-mutex waits.
+    /// What a redraw pass measures before and around its present.
     pub(crate) struct RedrawLedger {
         /// Whole-redraw wall time (redraw entry → present done or failed).
         pub(crate) total: Peak,
@@ -152,18 +151,18 @@ window_ledger! {
         pub(crate) refill_cause: Tally<{ aterm_core::render::FullRefillCause::COUNT }>,
         pub(crate) pet_world_observations: Counter,
         pub(crate) pet_world_cells: Counter,
-        /// Cursor-effect ticks whose `glow_under` stream was non-empty: that stream is the rainbow ribbon body's own (with its jump zooms, and water's wake), so it reads 0 under the `off` style, whose momentum glow still lights `glow_add` — the witness a count of ANY quad could not be.
+        /// Cursor-effect ticks whose `glow_under` stream was non-empty: that stream is the rainbow ribbon body's own (with its jump zooms, and water's wake), so it reads 0 under the `off` style, whose momentum glow still lights `glow_add`.
         pub(crate) fx_under_frames: Counter,
-        /// Every effect stream's length in the latest present's final composed input, whoever produced it, on either renderer ([`FX_STREAMS`] order): card light shows here, not only the cursor tick's quads.
+        /// Every effect stream's length in the latest present's final composed input, whoever produced it, on either renderer ([`FX_STREAMS`] order).
         pub(crate) fx_streams: [Last; FX_STREAMS.len()] =
             [const { Last::new() }; FX_STREAMS.len()],
-        /// Redraw entry → the surface-acquire seam, including terminal grid extraction; observable even when every actual present is dropped.
+        /// Redraw entry → the surface-acquire seam, including terminal grid extraction.
         pub(crate) pre_present: Dist,
         pub(crate) pre_present_attempts: Counter,
         pub(crate) pre_present_total: Counter,
-        /// Swapchain-acquire (`nextDrawable`) WAIT — pure blocking on the compositor, not work, per attempt (refused ones included).
+        /// Swapchain-acquire (`nextDrawable`) WAIT.
         pub(crate) acquire_wait: Dist,
-        /// Drawable-acquire QUEUE: a drawable request admitted → the `aterm-drawable-acquire` worker SCHEDULED to start it, a different cause from `acquire_wait`, which starts its clock inside the worker around `nextDrawable` alone and is structurally blind to this leg.
+        /// Drawable-acquire QUEUE: a drawable request admitted → the `aterm-drawable-acquire` worker SCHEDULED to start it, a different cause from `acquire_wait`.
         pub(crate) acquire_queue: Dist,
         /// Armed-Metal GPU park: the UI thread blocked in `waitUntilCompleted` (see [`note_gpu_park`]).
         pub(crate) gpu_park: Peak,
@@ -171,7 +170,7 @@ window_ledger! {
         pub(crate) drops: Counter,
         pub(crate) drop_reason: LastLabel,
         pub(crate) drop_parked: LastFlag,
-        /// UI-thread TERMINAL-MUTEX wait, per acquiring site ([`TermWaitSite`]): the distribution and the worst.
+        /// UI-thread TERMINAL-MUTEX wait, per acquiring site ([`TermWaitSite`]).
         pub(crate) term_wait: [Histogram; TermWaitSite::COUNT] =
             [const { Histogram::new() }; TermWaitSite::COUNT],
         pub(crate) term_wait_max: [Max; TermWaitSite::COUNT] =
@@ -186,7 +185,7 @@ window_ledger! {
         pub(crate) latency: Dist,
         /// Drawables never shown.
         pub(crate) skipped: Counter,
-        /// Per-tag ledgers (`aterm_gpu::present_glass::PresentTag`): a shown frame is booked under its OWN tag, a skipped one under its ATTRIBUTION (`GlassReport::skip_attribution` — the lane that replaced it, or its own occlusion, or `spaced` when nothing replaced it and the compositor simply dropped it).
+        /// Per-tag ledgers (`aterm_gpu::present_glass::PresentTag`).
         pub(crate) shown_by: Tally<{ aterm_gpu::present_glass::PresentTag::COUNT }>,
         pub(crate) skipped_by: Tally<{ aterm_gpu::present_glass::PresentTag::COUNT }>,
     }
@@ -225,7 +224,7 @@ window_ledger! {
 }
 
 window_ledger! {
-    /// THE GPU REPAINT SCOPE (responsiveness audit item 5): the renderer's own cumulative counters, stored after every GPU present by the main thread, published since the last `metrics reset` so they are window stats like the rest of the line.
+    /// THE GPU REPAINT SCOPE (responsiveness audit item 5).
     pub(crate) struct GpuScopeLedger {
         /// Presents that took the scissored dirty-row path.
         pub(crate) scissor_taken: Baselined,
@@ -238,7 +237,7 @@ window_ledger! {
 window_ledger! {
     /// THE DEVICE'S OWN TIME, AND THE FRAME IT RAN.
     pub(crate) struct GpuLedger {
-        /// Device busy time per present: the sum of one frame's completed Metal command buffers' execution spans, or the union of its wgpu render passes' timestamp spans.
+        /// Device busy time per present.
         pub(crate) time: Dist,
         /// How many parts the latest `time` sample summed.
         pub(crate) time_parts: Last,
@@ -255,28 +254,28 @@ window_ledger! {
         /// CPU time building the latest frame's instances, and staging them.
         pub(crate) build: Last,
         pub(crate) stage: Last,
-        /// The pass-economy ablation the latest frame ran under (a dev seam), as its [`ablation_code`]: `off` in every shipped binary, so a reading that says otherwise names a build measuring itself.
+        /// The pass-economy ablation the latest frame ran under (a dev seam), as its [`ablation_code`].
         pub(crate) unorm_ablation: LastLabel,
-        /// The fx instances the arm staged in the latest frame, and the fx bytes it uploaded (instances, palette, atlas texels): both 0 for a frame whose fx the arm did not stage.
+        /// The fx instances the arm staged in the latest frame, and the fx bytes it uploaded (instances, palette, atlas texels).
         pub(crate) fx_instances: Last,
         pub(crate) fx_upload_bytes: Last,
-        /// The fx sprite items the latest frame refused, drawing nothing: those the frame art budget refuses, as every backend does, and on a device whose texture limit holds the fx atlas below 4096² those whose art the atlas could not hold. 0 on every frame within the budget.
+        /// The fx sprite items the latest frame refused, drawing nothing.
         pub(crate) fx_refused: Last,
-        /// aterm-core's fx layer seals and payload deep copies (`aterm_core::render::fx_layer_builds`, `fx_payload_copies`) since the reset: process totals that never restart, raised (never lowered) by [`GpuLedger::sample_fx_totals`] before the reset takes their base, so a seal before the reset never counts after it.
+        /// aterm-core's fx layer seals and payload deep copies (`aterm_core::render::fx_layer_builds`, `fx_payload_copies`) since the reset.
         pub(crate) fx_layer_builds: Baselined,
         pub(crate) fx_payload_copies: Baselined,
     }
 }
 
 window_ledger! {
-    /// THE CARD ENGINE'S PER-COMMAND COST (card engine §3.3, §8's fork loop): what the kernel exec edges cost the PTY readers and the UI thread, read off a live instance as counts per 1000 commands.
+    /// THE CARD ENGINE'S PER-COMMAND COST (card engine §3.3, §8's fork loop).
     pub(crate) struct CommandLedger {
         /// Process events the gathers drained (a fork, an exec, an exit each), and the gathers' time inside those drains.
         pub(crate) proc_events: Counter,
         pub(crate) proc_drain_ns: Counter,
         /// The process events that became foreground edges.
         pub(crate) exec_edges: Counter,
-        /// Readers on macOS whose watch could not be made (no kqueue: `EMFILE`), which run the byte-driven arm.
+        /// Readers on macOS whose watch could not be made (no kqueue: `EMFILE`).
         pub(crate) procwatch_fallbacks: Counter,
         /// Children past a watch's cap, seen only by sampling.
         pub(crate) procwatch_overflow: Counter,
@@ -294,7 +293,7 @@ window_ledger! {
     }
 }
 
-/// State that describes the process NOW rather than the measurement window: a gauge, a latch, an episode still in progress, a last-writer reading.
+/// State that describes the process NOW rather than the measurement window.
 pub(crate) struct Live {
     pub(crate) backend_gpu: AtomicBool,
     pub(crate) perf_reduced: AtomicBool,
@@ -349,13 +348,13 @@ const INPUT_SLICE_CAP_NS: u64 = 5_000_000_000;
 
 const RESIZE_SLICE_CAP_NS: u64 = 2_000_000_000;
 
-/// Monotonic nanoseconds since the process clock's anchor: the GUI entry ([`mark_process_start`]), or the first read when it came first ([`startup::Startup::clock_anchor`]).
+/// Monotonic nanoseconds since the process clock's anchor.
 pub(crate) fn now_ns() -> u64 {
     let start = startup::STARTUP.clock_anchor();
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
-/// How many frames this process has presented (the `metrics` verb's `frames`, zeroed by `metrics reset`): the present ordinal the card engine's dev timeline rows carry (`crate::holder_image::dev_tail`).
+/// How many frames this process has presented (the `metrics` verb's `frames`, zeroed by `metrics reset`).
 pub(crate) fn frames_presented() -> u64 {
     METRICS.window.present.frames.get_acquire()
 }
@@ -367,7 +366,7 @@ pub(crate) fn instant_at_us(stamp_us: u64) -> Option<Instant> {
         .checked_add(Duration::from_micros(stamp_us))
 }
 
-/// The [`now_us`] stamp of `at`, a reading taken earlier: [`instant_at_us`]'s forward, floored to the microsecond as [`now_us`] floors.
+/// The [`now_us`] stamp of `at`, a reading taken earlier.
 pub(crate) fn us_at(at: Instant) -> u64 {
     let start = startup::STARTUP.clock_anchor();
     u64::try_from(at.saturating_duration_since(start).as_micros()).unwrap_or(u64::MAX)
@@ -532,7 +531,7 @@ pub(crate) fn note_capture_episode(active: bool) {
 }
 
 label_enum! {
-    /// The UI-thread sites that BLOCK on a session's terminal mutex on the hot paths — the single-pane redraw's one hold per frame and the key press's consolidated scope.
+    /// The UI-thread sites that BLOCK on a session's terminal mutex on the hot paths.
     pub(crate) enum TermWaitSite {
         Redraw => "redraw",
         Press => "press",
@@ -556,20 +555,20 @@ pub(crate) fn note_acquire_wait(ns: u64) {
     let _ = METRICS.window.redraw.acquire_wait.record(ns);
 }
 
-/// Record one completed acquisition's queue span, from the same completion as [`note_acquire_wait`], so `n_acquire_queue` tracks `n_acquire`.
+/// Record one completed acquisition's queue span, from the same completion as [`note_acquire_wait`].
 pub(crate) fn note_acquire_queue(ns: u64) {
     let _ = METRICS.window.redraw.acquire_queue.record(ns);
 }
 
-/// Record one armed present's GPU park: the UI thread's wall time in `waitUntilCompleted` (no timeout) for earlier GPU work, i.e. the Submit-A pipelining wait before the frame's shared buffers may be rewritten plus the pending-ring drain past depth 3.
+/// Record one armed present's GPU park.
 pub(crate) fn note_gpu_park(ns: u64) {
     let _ = METRICS.window.redraw.gpu_park.record(ns);
 }
 
-/// A frame whose causal CPU work exceeds the ~30 fps (33.3 ms) budget below which interaction visibly stutters; `slow_frames` counts them.
+/// A frame whose causal CPU work exceeds the ~30 fps (33.3 ms) budget below which interaction visibly stutters.
 pub(crate) const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333;
 
-/// One window's present-side state, kept in its `WindowState` (UI thread only, so plain integers): the keys typed into it that still wait on its content present, the keys a native page in it took that still wait on the present of the page's answer, and when it last presented.
+/// One window's present-side state, kept in its `WindowState` (UI thread only, so plain integers).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowPresentState {
     pub(crate) pending_input: PendingInputStamp,
@@ -578,7 +577,7 @@ pub(crate) struct WindowPresentState {
     shown_through: Option<u64>,
 }
 
-/// The present-side state that belongs to the whole process, owned by the `App` (UI thread): the open slow-present episode, and the previous present of any window.
+/// The present-side state that belongs to the whole process, owned by the `App` (UI thread).
 #[derive(Debug, Default)]
 pub(crate) struct PresentObserver {
     episode: SlowEpisode,
@@ -891,7 +890,7 @@ impl PresentObserver {
     }
 }
 
-/// An offscreen rasterization (`image` / `window` / `snapshot` introspection): pixels built into a buffer that never reach glass.
+/// An offscreen rasterization (`image` / `window` / `snapshot` introspection).
 pub(crate) fn record_offscreen_raster(render_ns: u64) {
     METRICS.window.present.note_offscreen_raster(render_ns);
 }
@@ -1106,7 +1105,7 @@ pub(crate) fn note_ime_cancelled() {
     METRICS.window.input.ime_cancelled.inc();
 }
 
-/// Input was refused because its session's input queue is full: a key or paste (said once per session, `App::refuse_input`), or a mouse, wheel, focus or colour-scheme report (silently).
+/// Input was refused because its session's input queue is full.
 pub(crate) fn note_input_refused() {
     METRICS.window.input.refused.inc();
 }
@@ -1262,7 +1261,7 @@ impl InputLedger {
     }
 }
 
-/// How many unpresented keystrokes one window's [`PendingInputStamp`] holds: enough for a fast typist through a multi-second stall.
+/// How many unpresented keystrokes one window's [`PendingInputStamp`] holds.
 pub(crate) const INPUT_EDGE_RING: usize = 32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1272,7 +1271,7 @@ struct InputEdge {
     op: Option<u64>,
 }
 
-/// One window's pending input→present EDGES: every unpresented keystroke routed to that window, oldest first, up to [`INPUT_EDGE_RING`].
+/// One window's pending input→present EDGES.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PendingInputStamp {
     edges: [InputEdge; INPUT_EDGE_RING],
@@ -1299,7 +1298,7 @@ impl PendingInputStamp {
         true
     }
 
-    /// Tag the key just armed with the predictor's op it armed, or settle it as one that armed none (`None`): the press path, right after the predictor took the key.
+    /// Tag the key just armed with the predictor's op it armed, or settle it as one that armed none (`None`).
     pub(crate) fn tag_newest(&mut self, op: Option<u64>) {
         if self.fresh
             && let Some(edge) = self
@@ -1432,12 +1431,12 @@ impl Metrics {
     }
 }
 
-/// Stamp the arrival of a keystroke routed to ONE window (the `App::input_to_session` seam, hardware keys and controller `key` alike) into that window's [`PendingInputStamp`], so only that window's content present closes the slice.
+/// Stamp the arrival of a keystroke routed to ONE window (the `App::input_to_session` seam, hardware keys and controller `key` alike) into that window's [`PendingInputStamp`].
 pub(crate) fn note_window_input(pending: &mut PendingInputStamp) {
     METRICS.note_window_input(pending, now_ns());
 }
 
-/// The frame being drawn in this window shows the predictor's overlay whole and under its proof, through op `through` (`Predictor::shown_through`), or shows none (`None`; the render paths' `closes_input_through`): its present closes the slice of every key whose prediction it shows, before that key's echo, as a native page's present closes the keys its answer shows (the PREDICTIONS note on `InputLedger::input`), and counts it in `input_predicted`.
+/// The frame being drawn in this window shows the predictor's overlay whole and under its proof, through op `through` (`Predictor::shown_through`), or shows none (`None`; the render paths' `closes_input_through`).
 pub(crate) fn note_prediction_shown(
     window: &mut WindowPresentState,
     through: Option<u64>,
@@ -1504,12 +1503,12 @@ impl PendingNativeInputStamp {
     }
 }
 
-/// The arrival a keystroke a NATIVE page takes (Settings search, the editor) is timed from: read before the page's reducer runs, so the reducer and the compile it schedules are inside the slice.
+/// The arrival a keystroke a NATIVE page takes (Settings search, the editor) is timed from: read before the page's reducer runs.
 pub(crate) fn native_input_arrival() -> u64 {
     METRICS.input_arrival_ns(now_ns())
 }
 
-/// Arm a keystroke a native page took (`arrival_ns` from [`native_input_arrival`]) in its window's native ring ([`WindowPresentState::pending_native_input`]) when its dispatch moved the page from revision `before` to `after`; only a present that puts that revision's pixels on glass closes it ([`record_native_content_present`]).
+/// Arm a keystroke a native page took (`arrival_ns` from [`native_input_arrival`]) in its window's native ring ([`WindowPresentState::pending_native_input`]) when its dispatch moved the page from revision `before` to `after`.
 pub(crate) fn note_native_window_input(
     pending: &mut PendingNativeInputStamp,
     before: crate::app_native::NativeUiCompileStamp,
@@ -1521,7 +1520,7 @@ pub(crate) fn note_native_window_input(
     }
 }
 
-/// A present that put a native page's new pixels on glass: close THIS window's pending native keystrokes, every edge a sample, into the same input→present ledger (`input_*`) a terminal's echo books, when `presented` is the revision those keys produced.
+/// A present that put a native page's new pixels on glass.
 pub(crate) fn record_native_content_present(
     pending: &mut PendingNativeInputStamp,
     presented: crate::app_native::NativeUiCompileStamp,
@@ -1533,7 +1532,7 @@ pub(crate) fn record_native_content_present(
     METRICS.record_native_content_present(&mut taken.edges, now_ns());
 }
 
-/// Stamp the arrival of PTY-bound input that names a session but no window (a control `send`/`feed` to a background session, a controller host write), keeping the oldest unpresented arrival; any window's content present closes it.
+/// Stamp the arrival of PTY-bound input that names a session but no window (a control `send`/`feed` to a background session, a controller host write), keeping the oldest unpresented arrival.
 pub(crate) fn note_input() {
     let m = &METRICS;
     m.window
@@ -1550,7 +1549,7 @@ pub(crate) fn note_resize_arrival() {
     present.reflow_stamp.arm(now);
 }
 
-/// The engine just committed a new grid geometry (`apply_term_resize` reported a real change), closing the stale-grid slice a bounds change opened: from here the rows/cols on screen match the window.
+/// The engine just committed a new grid geometry (`apply_term_resize` reported a real change), closing the stale-grid slice a bounds change opened.
 pub(crate) fn note_grid_committed() {
     let present = &METRICS.window.present;
     let Some(stamp) = present.reflow_stamp.take() else {
@@ -1564,28 +1563,28 @@ pub(crate) fn note_grid_committed() {
 
 static LAT_TRACE_ON: OnceLock<bool> = OnceLock::new();
 
-/// Whether the latency stderr traces are armed: the per-key `KEYWRITE` line here and the per-present `output->present` line (`present_latency_ns_with_plan`).
+/// Whether the latency stderr traces are armed.
 pub(crate) fn latency_trace_on() -> bool {
     *LAT_TRACE_ON.get_or_init(|| aterm_types::dev_seam!("ATERM_TRACE_LATENCY").is_some())
 }
 
-/// Microsecond view of the metrics clock, the epoch of [`note_key_arrival_queued`], so `video` frame stamps and input stamps subtract validly.
+/// Microsecond view of the metrics clock, the epoch of [`note_key_arrival_queued`].
 #[must_use]
 pub(crate) fn now_us() -> u64 {
     now_ns() / 1000
 }
 
-/// Stamp the true arrival of a printable hardware keystroke (winit `KeyboardInput`, before encode/write), backdated by `queue_ns`, the NSEvent's time in the OS event queue (macOS and X11: `platform::current_event_queue_age_ns`; 0 elsewhere), so `key->write` and the inherited `input->present` include queueing a parked loop caused.
+/// Stamp the true arrival of a printable hardware keystroke (winit `KeyboardInput`, before encode/write), backdated by `queue_ns`, the NSEvent's time in the OS event queue (macOS and X11: `platform::current_event_queue_age_ns`; 0 elsewhere).
 pub(crate) fn note_key_arrival_queued(queue_ns: u64) {
     METRICS.note_key_arrival_queued(queue_ns);
 }
 
-/// Disarm the key-arrival stamp after a key's dispatch ends without a PTY write, so a later control `send` never inherits it through [`note_input`].
+/// Disarm the key-arrival stamp after a key's dispatch ends without a PTY write.
 pub(crate) fn clear_key_arrival() {
     METRICS.live.lat_key.store(0, Ordering::Relaxed);
 }
 
-/// The current key's true hardware arrival in ms (the backdated stamp [`note_key_arrival_queued`] wrote), as a peek; [`note_pty_write`] owns the consuming swap.
+/// The current key's true hardware arrival in ms (the backdated stamp [`note_key_arrival_queued`] wrote), as a peek.
 #[must_use]
 pub(crate) fn key_arrival_ms() -> Option<u32> {
     match METRICS.live.lat_key.load(Ordering::Relaxed) {
@@ -1642,7 +1641,7 @@ pub(crate) fn note_sync_release_end() {
     METRICS.window.sync.releases_end.inc();
 }
 
-/// An armed episode released by the safety-valve deadline: the app went silent (or the hold mis-paced) after `?2026h`.
+/// An armed episode released by the safety-valve deadline.
 pub(crate) fn note_sync_release_timeout() {
     METRICS.window.sync.releases_timeout.inc();
 }
@@ -1753,12 +1752,12 @@ pub(crate) fn note_redraw_early_out() {
     METRICS.window.redraw.early_outs.inc();
 }
 
-/// The presented-path frame extraction completed: which arm refilled the snapshot (`Scoped` keeps undamaged rows; `Full` is the fallback walk) and, on the full arm, which continuity clause refused.
+/// The presented-path frame extraction completed.
 pub(crate) fn note_frame_refill(refill: aterm_core::render::FrameRefill) {
     METRICS.window.redraw.note_refill(refill);
 }
 
-/// A presented frame reused the existing snapshot: the engine marked no damage and processed no bytes since it was filled.
+/// A presented frame reused the existing snapshot.
 pub(crate) fn note_frame_refill_skipped() {
     METRICS.window.redraw.refills_skipped.inc();
 }
@@ -1927,7 +1926,7 @@ impl Drop for SweepTimer {
     }
 }
 
-/// One cursor-effect tick's output: the `glow_add` quads, the `glow_under` quads and the trail cells it composed for the frame (see `Live::fx_*` and `RedrawLedger::fx_under_frames`).
+/// One cursor-effect tick's output.
 pub(crate) fn note_fx_composed(glow_quads: usize, under_quads: usize, trail_cells: usize) {
     METRICS.note_fx_composed(glow_quads, under_quads, trail_cells);
 }
@@ -1952,7 +1951,7 @@ static FX_STREAMS: [FxStream; 15] = [
     ("fx_layers", |i| i.fx_layers.len()),
 ];
 
-/// Book every effect stream's length off the final composed `input`, at the present seam ([`RedrawLedger::fx_streams`]): one relaxed store per stream per present.
+/// Book every effect stream's length off the final composed `input`, at the present seam ([`RedrawLedger::fx_streams`]).
 pub(crate) fn note_fx_streams(input: &aterm_render::RenderInput) {
     METRICS.window.redraw.note_fx_streams(input);
 }
@@ -2144,9 +2143,6 @@ impl Metrics {
             sched.stale_arm_heals.inc();
         }
         if heal.streak {
-            // Per owner, not one global counter, for the same reason as
-            // `deadline_arms_by_owner`: a heal that cannot name its producer
-            // sends the investigation to the wrong module.
             sched.streak_heals_by_owner.inc(owner.index());
         }
         let (owner, due, late) = match requested {
@@ -2572,8 +2568,6 @@ pub(crate) fn emit_summary(
     }
     emit_pty_census(ctx, s);
     if ctx.reads_process() {
-        // THE WARM SPARE (`crate::spare`): its state and age, its PTY, the
-        // learned gate, adoptions, misses, discards and budgets.
         crate::spare::emit_metrics(s);
     }
     emit_gpu(ctx, s);
@@ -2720,10 +2714,6 @@ pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink)
         );
     }
     if ctx.reads_process() {
-        // ECHO ROUND TRIP (audit item 5): the one slice on this line that is NOT
-        // aterm's own cost — bytes out to the PTY, first bytes back from the
-        // child. Emitted by `echo_rtt` itself so its percentiles can never be
-        // published apart from the counters that qualify them.
         crate::echo_rtt::emit_metrics(s);
     }
     emit_present_glass(ctx, s);

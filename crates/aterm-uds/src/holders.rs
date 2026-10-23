@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Same-UID process descriptor and path holder scans.
+//! Same-UID process descriptor and path holder scans: libproc on macOS, `/proc` on Linux
+//! (`holders_procfs.rs`).
 
 use std::io;
 
@@ -12,6 +13,9 @@ pub struct HolderScan {
     pub holders: Vec<u32>,
     /// Processes whose descriptor table could not be read.
     pub unreadable: Vec<u32>,
+    /// Linux processes whose descriptor table only root reads (non-dumpable, such as
+    /// `ssh-agent`): no holder, and not unreadable. macOS lists none.
+    pub sealed: Vec<u32>,
     /// Total processes scanned.
     pub scanned: usize,
 }
@@ -36,17 +40,11 @@ pub fn scan_rdev_holders(rdev: u64, skip: &[u32]) -> io::Result<HolderScan> {
 
 /// The `st_rdev` of the master of the PTY whose slave is `slave` (a process's controlling
 /// terminal, `e_tdev`), for a scan that asks whether a live process still holds that
-/// terminal's master. Darwin numbers a PTY's two ends with one minor, and every master's major
-/// is `/dev/ptmx`'s (measured on Darwin 27: master 15/4, slave `/dev/ttys004` 16/4, `/dev/ptmx`
-/// 15/n). `None` when `/dev/ptmx` cannot be read, and off macOS. A `slave` that is no PTY maps
-/// to a number no master or some unrelated master has, so a scan of it proves nothing for
-/// that terminal either way.
+/// terminal's master.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub fn pty_master_rdev(slave: u64) -> Option<u64> {
     use std::os::unix::fs::MetadataExt as _;
-    // Darwin's 32-bit `dev_t`: the major in the top 8 bits, the minor in the low 24.
-    // `MetadataExt` widens it with its sign, so only the low 32 bits are read.
     const DEV: u64 = 0xffff_ffff;
     const MINOR: u64 = 0x00ff_ffff;
     let ptmx = std::fs::metadata("/dev/ptmx").ok()?.rdev() & DEV;
@@ -93,17 +91,35 @@ pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<Hol
         .unwrap_or_default())
 }
 
+/// Scan live same-UID processes except `skip` for descriptors open on `path`: each
+/// `/proc/<pid>/fd/<n>`, `stat` through its link (`holders_procfs.rs`). A zombie holds
+/// nothing, and a table only root reads is in [`HolderScan::sealed`].
+///
+/// # Errors
+///
+/// `path` cannot be read, the process listing fails, or the reads take longer than 10 s
+/// (`TimedOut`: a hung mount).
+#[cfg(target_os = "linux")]
+pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = std::fs::metadata("/proc/self")?.uid();
+    let (path, skip) = (path.to_path_buf(), skip.to_vec());
+    procfs::within(procfs::SCAN_DEADLINE, move || {
+        procfs::scan_file_holders_in(std::path::Path::new(procfs::PROC), me, &path, &skip)
+    })
+}
+
 /// Scan live same-UID processes except `skip` for descriptors open on `path`.
 ///
 /// # Errors
 /// Always `Unsupported`.
 ///
 /// Returns `Unsupported` on platforms without a holder scan.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<HolderScan> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "the holder scan reads libproc (macOS)",
+        "the holder scan reads libproc (macOS) or /proc (Linux)",
     ))
 }
 
@@ -209,9 +225,7 @@ enum Failed {
     /// `ENOENT`, reading one descriptor or a working directory: its vnode is dead (revoked, or
     /// its volume force-unmounted) and names no file, device or path.
     Dead,
-    /// `EPERM`: the kernel will not tell this process. Reading one descriptor, it refuses
-    /// the vnode's metadata (a file in a protected folder, whose metadata only an entitled
-    /// reader such as `lsof` is given); otherwise unknown like [`Failed::Other`].
+    /// `EPERM`: the kernel will not tell this process.
     Refused,
     /// Anything else (`EACCES`, or a failure that set no `errno`).
     Other,
@@ -283,6 +297,9 @@ struct Lookup {
     size: usize,
     /// The scan's key of the vnode read.
     key: fn(&Vnode) -> u128,
+    /// Whether a descriptor refused for its vnode ([`refusal_is_the_vnodes`]) is known not
+    /// to be the one sought: the file a scan of one file has just read the metadata of.
+    vnode_refusal_clears: bool,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -294,6 +311,7 @@ impl Lookup {
         flavor: ffi::PROC_PIDFDVNODEPATHINFO,
         size: ffi::VNODE_PATH_SIZE,
         key: Vnode::rdev_key,
+        vnode_refusal_clears: false,
     };
     /// A file by its device and inode, read without the path
     /// (`PROC_PIDFDVNODEINFO`), which the match does not need.
@@ -301,7 +319,55 @@ impl Lookup {
         flavor: ffi::PROC_PIDFDVNODEINFO,
         size: ffi::VNODE_FD_SIZE,
         key: Vnode::file_key,
+        vnode_refusal_clears: true,
     };
+}
+
+/// Whether the kernel refused (`EPERM`) each descriptor of `pid` in `refused` for its vnode
+/// and not for the process: the table lists again, each descriptor of it still listed is
+/// refused again, and then another vnode descriptor of the table is described. Read so, the
+/// permission to inspect the process held before and after each refusal; what was refused is
+/// the vnode's metadata, which macOS keeps from any reader but an entitled one (a file in a
+/// protected folder: `lsof` holds the `com.apple.rootless.datavault.metadata` entitlement).
+/// MEASURED 2026-10-22 on the owner's Mac: 66 descriptors of 7 of this uid's 496 processes
+/// (Apple daemons: `routined`, `ScreenTimeAgent`, `dmd`, …) refused, with and without the
+/// path; all 7 refusals were shown to be the vnodes' so, and each refused file's own `stat`
+/// was refused too (2026-10-21).
+// Skip: bottoms out at the libproc FFI calls.
+#[cfg(target_vendor = "apple")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn refusal_is_the_vnodes(pid: i32, refused: &[i32], lookup: Lookup) -> bool {
+    refusal_shown(refused, list_fds(pid), |fd| vnode_of(pid, fd, lookup))
+}
+
+/// [`refusal_is_the_vnodes`]' decision over its reads: `relisted` the table's listing
+/// again, `describe` one descriptor's read. A listing refused, a refused descriptor now
+/// described (or exited, or failed otherwise), or no other vnode descriptor described each
+/// leaves the refusal the process's. A refused descriptor read as closed or dead, or no
+/// longer listed, holds nothing.
+#[cfg(target_vendor = "apple")]
+fn refusal_shown(
+    refused: &[i32],
+    relisted: Result<Vec<(i32, u32)>, Failed>,
+    mut describe: impl FnMut(i32) -> Result<Vnode, Failed>,
+) -> bool {
+    let Ok(fds) = relisted else {
+        return false;
+    };
+    let vnodes = || {
+        fds.iter()
+            .filter(|(_, kind)| *kind == ffi::PROX_FDTYPE_VNODE)
+            .map(|(fd, _)| *fd)
+    };
+    for fd in vnodes().filter(|fd| refused.contains(fd)) {
+        match describe(fd) {
+            Err(Failed::Refused | Failed::Closed | Failed::Dead) => {}
+            Ok(_) | Err(Failed::Exited | Failed::Other) => return false,
+        }
+    }
+    vnodes()
+        .filter(|fd| !refused.contains(fd))
+        .any(|fd| describe(fd).is_ok())
 }
 
 /// What `pid`'s descriptor table says of each key in `wanted`, in order, each vnode
@@ -323,17 +389,24 @@ fn read_table(pid: u32, wanted: &[u128], lookup: Lookup) -> Vec<TableRead> {
     };
     #[cfg(test)]
     hook::after_listing(pid, &fds);
-    read_listed_table(wanted, lookup, fds, |fd| vnode_of(pid, fd, lookup))
+    read_listed_table(
+        wanted,
+        lookup,
+        fds,
+        |fd| vnode_of(pid, fd, lookup),
+        |refused| refusal_is_the_vnodes(pid, refused, lookup),
+    )
 }
 
-/// Fold a listed table's vnode reads. Keeping the fold separate from libproc
-/// lets captured failures exercise the same positive/unknown decisions.
+/// Fold a listed table's vnode reads; `vnodes_refused` says whether its refused
+/// descriptors were refused for their vnodes ([`refusal_is_the_vnodes`]).
 #[cfg(target_vendor = "apple")]
 fn read_listed_table(
     wanted: &[u128],
     lookup: Lookup,
     fds: Vec<(i32, u32)>,
     mut read: impl FnMut(i32) -> Result<Vnode, Failed>,
+    vnodes_refused: impl FnOnce(&[i32]) -> bool,
 ) -> Vec<TableRead> {
     let every = |read| vec![read; wanted.len()];
     let mut wanted: Vec<(u128, usize)> = wanted.iter().copied().zip(0..).collect();
@@ -341,12 +414,15 @@ fn read_listed_table(
     let mut held = vec![false; wanted.len()];
     let mut found = 0;
     let mut unreadable = false;
+    let mut refused: Vec<i32> = Vec::new();
+    let mut described = false;
     for (fd, kind) in fds {
         if kind != ffi::PROX_FDTYPE_VNODE {
             continue;
         }
         match read(fd) {
             Ok(vnode) => {
+                described = true;
                 let r = (lookup.key)(&vnode);
                 let from = wanted.partition_point(|(w, _)| *w < r);
                 for (_, at) in wanted.iter().skip(from).take_while(|(w, _)| *w == r) {
@@ -363,8 +439,18 @@ fn read_listed_table(
             }
             Err(Failed::Exited) => return every(TableRead::Exited),
             Err(Failed::Closed | Failed::Dead) => {}
-            Err(Failed::Refused | Failed::Other) => unreadable = true,
+            // A refusal is unknown unless it is shown to be the vnode's.
+            Err(Failed::Refused) => refused.push(fd),
+            // Any other failure makes the verdict unknown for every key
+            // not found.
+            Err(Failed::Other) => unreadable = true,
         }
+    }
+    if !refused.is_empty()
+        && found < held.len()
+        && !(lookup.vnode_refusal_clears && described && vnodes_refused(&refused))
+    {
+        unreadable = true;
     }
     held.into_iter()
         .map(|held| match (held, unreadable) {
@@ -443,7 +529,6 @@ pub const SDK_ROWS: &[(&str, i64)] = &[
     ),
 ];
 
-// `process::kin` lists a process group through this `proc_listpids` too.
 #[cfg(target_vendor = "apple")]
 pub(crate) mod ffi {
     pub const PROC_UID_ONLY: u32 = 4;
@@ -562,13 +647,7 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
 pub fn uid_pids() -> io::Result<Vec<u32>> {
     use std::os::unix::fs::MetadataExt as _;
     let me = std::fs::metadata("/proc/self")?.uid();
-    Ok(std::fs::read_dir("/proc")?
-        .flatten()
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            (std::fs::metadata(entry.path()).ok()?.uid() == me).then_some(pid)
-        })
-        .collect())
+    procfs::uid_pids_in(std::path::Path::new(procfs::PROC), me)
 }
 
 /// List every live process PID owned by this user SID.
@@ -686,8 +765,7 @@ pub fn uid_pids() -> io::Result<Vec<u32>> {
     ))
 }
 
-/// `pid`'s descriptors, each `(fd, type)`. An empty table is an answer: libproc returns 0 for
-/// it and leaves `errno` clear, where any failure sets `errno`.
+/// `pid`'s descriptors, each `(fd, type)`.
 #[cfg(target_vendor = "apple")]
 fn list_fds(pid: i32) -> Result<Vec<(i32, u32)>, Failed> {
     clear_errno();
@@ -730,6 +808,10 @@ fn list_fds(pid: i32) -> Result<Vec<(i32, u32)>, Failed> {
 
 #[cfg(target_vendor = "apple")]
 fn vnode_of(pid: i32, fd: i32, lookup: Lookup) -> Result<Vnode, Failed> {
+    #[cfg(test)]
+    if hook::refuses(pid, fd) {
+        return Err(Failed::Refused);
+    }
     let mut buf = [0u8; ffi::VNODE_PATH_SIZE];
     let buf = buf.get_mut(..lookup.size).ok_or(Failed::Other)?;
     let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
@@ -833,6 +915,9 @@ pub fn pshm_sizes_of(_pid: u32) -> io::Result<Vec<u64>> {
 
 #[path = "holders_paths.rs"]
 mod paths;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[path = "holders_procfs.rs"]
+mod procfs;
 #[cfg(all(debug_assertions, target_vendor = "apple"))]
 pub use paths::a_force_detached_volume_is_no_working_directory;
 #[cfg(all(windows, any(test, debug_assertions)))]
@@ -857,9 +942,16 @@ mod hook {
     #[cfg(test)]
     type Hook = Box<dyn FnOnce(i32, &[(i32, u32)])>;
 
+    /// The pid whose reads [`refusing`] refuses, and each refused descriptor with the
+    /// reads of it left to refuse.
+    #[cfg(test)]
+    type Refusing = (i32, Vec<(i32, usize)>);
+
     thread_local! {
         #[cfg(test)]
         static AFTER_LISTING: RefCell<Option<Hook>> = const { RefCell::new(None) };
+        #[cfg(test)]
+        static REFUSING: RefCell<Option<Refusing>> = const { RefCell::new(None) };
         static DEAD_AS_UNKNOWN: Cell<bool> = const { Cell::new(false) };
         #[cfg(test)]
         static CWD_DEAD: Cell<Option<i32>> = const { Cell::new(None) };
@@ -895,6 +987,46 @@ mod hook {
         } else {
             failed
         }
+    }
+
+    /// Every read of a descriptor's vnode a refusal can be shown to be the vnode's of,
+    /// answered as the kernel answers one it keeps from this process.
+    #[cfg(test)]
+    pub const ALWAYS: usize = usize::MAX;
+
+    /// Run `f` with this thread's first `reads` reads of each of `fds` of `pid` (a vnode's
+    /// metadata, with or without its path) refused (`EPERM`), as the kernel refuses a file in
+    /// a protected folder ([`ALWAYS`]: every read), or a refusal that does not last (`1`).
+    #[cfg(test)]
+    pub fn refusing<R>(pid: u32, fds: &[i32], reads: usize, f: impl FnOnce() -> R) -> R {
+        let pid = i32::try_from(pid).expect("a pid");
+        let fds = fds.iter().map(|fd| (*fd, reads)).collect();
+        REFUSING.with(|r| *r.borrow_mut() = Some((pid, fds)));
+        let out = f();
+        REFUSING.with(|r| *r.borrow_mut() = None);
+        out
+    }
+
+    /// Whether this thread refuses this read of `pid`'s `fd` ([`refusing`]), counting it.
+    #[cfg(test)]
+    pub(super) fn refuses(pid: i32, fd: i32) -> bool {
+        REFUSING.with(|r| {
+            let mut r = r.borrow_mut();
+            let Some((refused_pid, fds)) = r.as_mut() else {
+                return false;
+            };
+            if *refused_pid != pid {
+                return false;
+            }
+            match fds.iter_mut().find(|(n, _)| *n == fd) {
+                Some((_, 0)) | None => false,
+                Some((_, ALWAYS)) => true,
+                Some((_, left)) => {
+                    *left -= 1;
+                    true
+                }
+            }
+        })
     }
 
     /// Run `f` once after the next descriptor listing on this thread.
@@ -1051,16 +1183,23 @@ mod tests {
             ino: 9,
             rdev: 11,
         };
+        let unasked = |_: &[i32]| -> bool { panic!("a refusal confirmed where none is asked") };
         for lookup in [super::Lookup::BY_FILE, super::Lookup::BY_RDEV] {
             let wanted = (lookup.key)(&vnode);
             let fds = || vec![(3, ffi::PROX_FDTYPE_VNODE)];
             assert_eq!(
-                super::read_listed_table(&[wanted], lookup, fds(), |_| Err(Failed::Refused)),
+                super::read_listed_table(
+                    &[wanted],
+                    lookup,
+                    fds(),
+                    |_| Err(Failed::Refused),
+                    unasked
+                ),
                 [super::TableRead::Unreadable],
                 "EPERM is unknown for every unconfirmed key"
             );
             assert_eq!(
-                super::read_listed_table(&[wanted], lookup, fds(), |_| Ok(vnode)),
+                super::read_listed_table(&[wanted], lookup, fds(), |_| Ok(vnode), unasked),
                 [super::TableRead::Holds],
                 "a positive match remains a positive match"
             );
@@ -1074,11 +1213,288 @@ mod tests {
                     } else {
                         Ok(vnode)
                     },
+                    |_| false,
                 ),
                 [super::TableRead::Holds, super::TableRead::Unreadable],
                 "a refusal obscures only keys not positively found"
             );
         }
+    }
+
+    /// A file's scan clears a descriptor the kernel refused for its vnode, not for the
+    /// process ([`super::refusal_is_the_vnodes`]): no vnode refused so is the file just
+    /// stat'd. NEGATIVE CONTROLS: a refusal not shown to be the vnode's, one in a table
+    /// with no descriptor described, and a device's scan all stay unknown.
+    #[test]
+    fn a_refusal_shown_to_be_the_vnodes_is_not_the_file() {
+        use super::{Failed, Lookup, TableRead};
+        const OTHER: super::Vnode = super::Vnode {
+            dev: 7,
+            ino: 9,
+            rdev: 11,
+        };
+        const SOUGHT: super::Vnode = super::Vnode {
+            ino: 10,
+            rdev: 12,
+            ..OTHER
+        };
+        let fds = || vec![(3, ffi::PROX_FDTYPE_VNODE), (4, ffi::PROX_FDTYPE_VNODE)];
+        let read: fn(i32) -> Result<super::Vnode, Failed> = |fd| {
+            if fd == 3 {
+                Err(Failed::Refused)
+            } else {
+                Ok(OTHER)
+            }
+        };
+        let fold = |lookup: Lookup, read: fn(i32) -> Result<super::Vnode, Failed>, shown| {
+            let asked = std::cell::Cell::new(None);
+            let answer = super::read_listed_table(
+                &[(lookup.key)(&SOUGHT)],
+                lookup,
+                fds(),
+                read,
+                |refused: &[i32]| {
+                    asked.set(Some(refused.to_vec()));
+                    shown
+                },
+            );
+            (answer, asked.take())
+        };
+        assert_eq!(
+            fold(Lookup::BY_FILE, read, true),
+            (vec![TableRead::Clear], Some(vec![3])),
+            "the vnode's refusal: not the file"
+        );
+        assert_eq!(
+            fold(Lookup::BY_FILE, read, false),
+            (vec![TableRead::Unreadable], Some(vec![3])),
+            "a refusal not shown to be the vnode's"
+        );
+        assert_eq!(
+            fold(Lookup::BY_FILE, |_| Err(Failed::Refused), true),
+            (vec![TableRead::Unreadable], None),
+            "no descriptor described: the process may have refused them all"
+        );
+        assert_eq!(
+            fold(Lookup::BY_RDEV, read, true),
+            (vec![TableRead::Unreadable], None),
+            "a device's scan keeps a refusal unknown"
+        );
+        let held: fn(i32) -> Result<super::Vnode, Failed> = |fd| {
+            if fd == 3 {
+                Err(Failed::Refused)
+            } else {
+                Ok(SOUGHT)
+            }
+        };
+        assert_eq!(
+            fold(Lookup::BY_FILE, held, false),
+            (vec![TableRead::Holds], None),
+            "found elsewhere: nothing to confirm"
+        );
+    }
+
+    /// [`super::refusal_shown`] CLEARS A REFUSAL ONLY WHEN EVERY READ SAYS IT IS THE VNODE'S:
+    /// the table listed again, each refused descriptor still listed refused again (or closed,
+    /// or dead, which hold nothing), and another vnode descriptor described. NEGATIVE
+    /// CONTROLS: the listing refused or gone, a refused descriptor now described, exited or
+    /// failed otherwise, and no other vnode descriptor described (refused, closed, or only a
+    /// pipe beside it) each leave the refusal the process's.
+    #[test]
+    fn a_refusal_is_the_vnodes_only_when_every_read_says_so() {
+        use super::{Failed, Vnode, refusal_shown};
+        const V: u32 = ffi::PROX_FDTYPE_VNODE;
+        const PIPE: u32 = 6;
+        const FILE: Vnode = Vnode {
+            dev: 1,
+            ino: 2,
+            rdev: 0,
+        };
+        let listed = || Ok(vec![(3, V), (4, V), (5, PIPE)]);
+        let reads = |three: Result<Vnode, Failed>, four: Result<Vnode, Failed>| {
+            move |fd: i32| match fd {
+                3 => three,
+                4 => four,
+                other => panic!("descriptor {other} is no vnode the table lists"),
+            }
+        };
+        for (refused, three, four, why) in [
+            (
+                &[3][..],
+                Err(Failed::Refused),
+                Ok(FILE),
+                "refused again, another described",
+            ),
+            (&[3], Err(Failed::Closed), Ok(FILE), "closed since"),
+            (&[3], Err(Failed::Dead), Ok(FILE), "dead since"),
+            (&[9], Ok(FILE), Err(Failed::Refused), "no longer listed"),
+        ] {
+            assert!(
+                refusal_shown(refused, listed(), reads(three, four)),
+                "{why}"
+            );
+        }
+        for failed in [Failed::Refused, Failed::Exited, Failed::Other] {
+            assert!(
+                !refusal_shown(&[3], Err(failed), reads(Ok(FILE), Ok(FILE))),
+                "the listing {failed:?}"
+            );
+        }
+        for (refused, three, four, why) in [
+            (&[3][..], Ok(FILE), Ok(FILE), "described now"),
+            (&[3], Err(Failed::Exited), Ok(FILE), "exited"),
+            (&[3], Err(Failed::Other), Ok(FILE), "failed otherwise"),
+            (
+                &[3],
+                Err(Failed::Refused),
+                Err(Failed::Refused),
+                "no other described",
+            ),
+            (
+                &[3],
+                Err(Failed::Refused),
+                Err(Failed::Closed),
+                "the other closed",
+            ),
+            (
+                &[3, 4],
+                Err(Failed::Refused),
+                Err(Failed::Refused),
+                "every vnode refused",
+            ),
+        ] {
+            assert!(
+                !refusal_shown(refused, listed(), reads(three, four)),
+                "{why}"
+            );
+        }
+        assert!(
+            !refusal_shown(
+                &[3],
+                Ok(vec![(3, V), (5, PIPE)]),
+                reads(Err(Failed::Refused), Ok(FILE))
+            ),
+            "only a pipe beside it"
+        );
+    }
+
+    /// The scan's key of the file at `path` ([`super::Vnode::file_key`]).
+    fn file_key(path: &std::path::Path) -> u128 {
+        let meta = std::fs::metadata(path).expect("stat");
+        super::Vnode {
+            dev: u32::try_from(meta.dev() & u64::from(u32::MAX)).expect("a Darwin dev_t"),
+            ino: meta.ino(),
+            rdev: 0,
+        }
+        .file_key()
+    }
+
+    /// A FILE'S SCAN CLEARS A REFUSAL ONLY ONCE LIBPROC SHOWS IT IS THE VNODE'S, over libproc's
+    /// own reads of a live child holding a file (descriptor 0) and `/dev/null` (1 and 2), with
+    /// the file's descriptor refused as the kernel refuses a file in a protected folder: refused
+    /// at every read, the table listed again and another descriptor described, it is not the
+    /// file sought, in one table's read, in the scan of every process and in the child's open
+    /// files (which then name `/dev/null` alone). NEGATIVE CONTROLS: a refusal that does not
+    /// last (the second read describes it), every vnode descriptor refused (nothing shows the
+    /// process may be read), the device scan, and a table refused to this uid (launchd's) all
+    /// stay unknown; with nothing refused the child's file is named.
+    #[test]
+    fn a_refusal_is_cleared_only_once_libproc_shows_it_is_the_vnodes() {
+        use super::{Lookup, TableRead};
+        use std::io::ErrorKind;
+        let tmp = aterm_tempfile::tempdir().expect("tempdir");
+        let (held, sought) = (tmp.path().join("held"), tmp.path().join("sought"));
+        std::fs::write(&held, b"held").expect("write");
+        std::fs::write(&sought, b"sought").expect("write");
+        let mut child = crate::spawnfd::command("/bin/sleep")
+            .arg("600")
+            .stdin(crate::spawnfd::Stdio::from(
+                std::fs::File::open(&held).expect("open"),
+            ))
+            .stdout(crate::spawnfd::Stdio::null())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn");
+        let pid = child.id();
+        let started = Instant::now();
+        while super::read_table(pid, &[file_key(&held)], Lookup::BY_FILE) != [TableRead::Holds] {
+            assert!(started.elapsed() < HANG, "the child never showed the file");
+            std::thread::yield_now();
+        }
+        let key = file_key(&sought);
+        let table = |fds: &[i32], reads: usize, key: u128, lookup: Lookup| {
+            hook::refusing(pid, fds, reads, || super::read_table(pid, &[key], lookup))
+        };
+        let file = Lookup::BY_FILE;
+        assert_eq!(
+            table(&[0], hook::ALWAYS, key, file),
+            [TableRead::Clear],
+            "the vnode's"
+        );
+        assert_eq!(
+            table(&[], hook::ALWAYS, key, file),
+            [TableRead::Clear],
+            "none refused"
+        );
+        assert_eq!(
+            table(&[0], 1, key, file),
+            [TableRead::Unreadable],
+            "it did not last"
+        );
+        assert_eq!(
+            table(&[0, 1, 2], hook::ALWAYS, key, file),
+            [TableRead::Unreadable],
+            "nothing described"
+        );
+        let unheld = u128::from(u32::MAX - 1);
+        assert_eq!(
+            table(&[0], hook::ALWAYS, unheld, Lookup::BY_RDEV),
+            [TableRead::Unreadable],
+            "a device's scan"
+        );
+        let scan = |reads| {
+            hook::refusing(pid, &[0], reads, || {
+                super::scan_file_holders(&sought, &[]).expect("scan")
+            })
+        };
+        let cleared = scan(hook::ALWAYS);
+        assert!(
+            !cleared.unreadable.contains(&pid) && !cleared.holds(pid),
+            "{cleared:?}"
+        );
+        let unknown = scan(1);
+        assert!(unknown.unreadable.contains(&pid), "{unknown:?}");
+        let files = |fds: &[i32], reads| {
+            hook::refusing(pid, fds, reads, || super::open_files(pid)).map_err(|e| e.kind())
+        };
+        let named = |p: &std::path::PathBuf| p.file_name() == Some(std::ffi::OsStr::new("held"));
+        let shown = files(&[0], hook::ALWAYS).expect("its open files");
+        assert!(
+            !shown.iter().any(named) && shown.iter().any(|p| p.as_os_str() == "/dev/null"),
+            "{shown:?}"
+        );
+        assert!(
+            files(&[], hook::ALWAYS)
+                .expect("unrefused")
+                .iter()
+                .any(named)
+        );
+        assert_eq!(
+            files(&[0], 1),
+            Err(ErrorKind::PermissionDenied),
+            "it did not last"
+        );
+        assert_eq!(
+            files(&[0, 1, 2], hook::ALWAYS),
+            Err(ErrorKind::PermissionDenied),
+            "nothing described"
+        );
+        assert!(
+            !super::refusal_is_the_vnodes(1, &[3], Lookup::BY_FILE),
+            "a table refused to this uid"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// A `sleep` whose stdin is `/dev/null`, once the kernel shows it holding the device, and

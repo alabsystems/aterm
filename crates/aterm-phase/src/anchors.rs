@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Vendor literal anchor tables and transcript/rollout key registries.
-//!
-//! [`anchor`] and [`anchor_text`] resolve Claude Code, [`CODEX_ANCHORS`], [`AGY_ANCHORS`],
-//! [`MUSE_ANCHORS`], [`GEMINI_ANCHORS`], [`TRANSCRIPT_KEYS`], and [`ROLLOUT_KEYS`] entries gated
-//! by [`Anchor::drawn_by`].
 
 /// How an anchor's text reaches the screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,8 +79,6 @@ pub const ANCHORS: &[Anchor] = &[
         "2.1.282",
     ),
     lit("box.reason_hook", "Hook ", "2.1.282"),
-    // Claude Code's `no-rule-match` note on a Bash box (2.1.308's bundle): no allow rule matched
-    // and its own checks did not clear the command (aterm-agent's `no-rule-read-only`).
     lit(
         "box.note_no_rule",
         "This command requires approval",
@@ -704,9 +698,6 @@ pub const ANCHORS: &[Anchor] = &[
         " (Claude Code's temporary directory)",
         "2.1.309",
     ),
-    // A command 2.1.309 did not start because it could not create the file
-    // that captures its output (`zy(`The command was not started: ${ki} on
-    // the volume holding …`)`, `ki` naming the code in parentheses).
     lit(
         "wall.disk_full.pre_start",
         "The command was not started: ",
@@ -722,9 +713,6 @@ pub const ANCHORS: &[Anchor] = &[
         "the user's disk quota is used up (",
         "2.1.309",
     ),
-    // The rest of that template: `${ki} on the volume holding ${dir} (Claude
-    // Code's temporary directory), so the file … nothing ran. ${e9}`, `e9`
-    // being the advice the bundle keeps in a variable of its own.
     lit(
         "wall.disk_full.pre_start_volume",
         " on the volume holding ",
@@ -742,9 +730,6 @@ pub const ANCHORS: &[Anchor] = &[
          before deleting anything to make room.",
         "2.1.309",
     ),
-    // A failed command's result opens `Exit code <n>` (the bundle's
-    // `[`Exit code ${e.code}`, …]`, read on 2.1.304, 2.1.308 and 2.1.309):
-    // the line the notice is drawn under.
     lit("wall.disk_full.tool_exit", "Exit code ", "2.1.304"),
     lit(
         "wall.disk_full.goal",
@@ -1285,10 +1270,6 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
         "workspace (/directory)",
         "0.46.0",
     ),
-    // The footer's last column head (its value under it: `Auto`, or the
-    // model the person chose), and the banner's login row
-    // (`UserIdentity`: `Authenticated with <authType> /auth`, or `Signed in
-    // with Google: <email> /auth`).
     lit("gemini.footer.model", "/model", "0.46.0"),
     lit("gemini.banner.auth", "Authenticated with ", "0.46.0"),
     lit("gemini.banner.google", "Signed in with Google", "0.46.0"),
@@ -1326,10 +1307,6 @@ pub const GEMINI_ANCHORS: &[Anchor] = &[
     hint("gemini.question.submit", "Enter to submit", "0.46.0"),
     lit("gemini.usage.title", "Usage limit reached for", "0.46.0"),
     lit("gemini.usage.retry", "Keep trying", "0.46.0"),
-    // The per-model bucket's dialog (bundle: `ProQuotaDialog`, a terminal
-    // quota on a model whose fallback is another): `Switch to <fallback>`
-    // (a template), over `Upgrade for higher limits` under the Google login,
-    // over `Stop` — no `Keep trying` on offer.
     composed("gemini.usage.switch", "Switch to ", "0.46.0"),
     lit(
         "gemini.usage.upgrade",
@@ -1676,9 +1653,6 @@ mod tests {
         assert!(!mark.exists(), "the build was never started");
     }
 
-    /// [`newer_than`] orders versions by number, part by part, never by
-    /// text: `2.1.300` is newer than `2.1.30` and `2.1.299`, a longer
-    /// version newer than its own prefix, a revision after its version.
     #[test]
     fn newer_than_orders_versions_by_number() {
         for (a, b) in [
@@ -1697,9 +1671,6 @@ mod tests {
         assert!("2.1.9" > "2.1.10" && !newer_than("2.1.9", "2.1.10"));
     }
 
-    /// The transcript's keys are their own table, read by [`anchor`] and
-    /// [`anchor_text`] like any other, and every one is a literal the
-    /// canary looks for.
     #[test]
     fn the_transcript_keys_are_literals_the_lookups_read() {
         for a in TRANSCRIPT_KEYS {
@@ -1723,11 +1694,6 @@ mod tests {
         assert_eq!(ids.len(), all, "an id is two anchors'");
     }
 
-    /// MUSE CODE'S VERSION IS READ WITH ITS REVISION: `muse --version` prints
-    /// `Muse Code 1.4.9 (1.4.9-R6297.1)` (measured), and the build is the
-    /// revision its anchors carry — read as the dotted `1.4.9` alone, every
-    /// anchor of the build it was measured on would be "newer than the build"
-    /// and owed by none.
     #[test]
     fn a_muse_version_is_read_with_its_revision() {
         assert_eq!(
@@ -1761,16 +1727,11 @@ mod tests {
         assert_eq!(version_in("Muse Code"), None);
     }
 
-    /// Where the lab's Codex rollouts are committed, reduced (`aterm-agent`'s
-    /// step testdata, session log 5G, 6D-3a): `<stem>.jsonl` and its legs,
-    /// `<stem>-<leg>.jsonl`, the stem [`rollout_reduction_stem`]'s.
     const ROLLOUTS: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../aterm-agent/src/harness/testdata/steps"
     );
 
-    /// The committed rollout reductions of `build`, joined, each checked to
-    /// open with the reducer's own line naming that build.
     fn committed_rollouts(build: &str) -> Vec<u8> {
         let stem = rollout_reduction_stem(build);
         let leg = format!("{stem}-");
@@ -1794,9 +1755,6 @@ mod tests {
         out
     }
 
-    /// every rollout key is a literal the committed rollout of
-    /// the build it names (`since`) shows, quoted — a JSON key or a closed
-    /// word — never a guess; and the lookups read it like any anchor.
     #[test]
     fn every_rollout_key_is_in_its_committed_rollout() {
         let quoted = |a: &Anchor| -> Vec<u8> { format!("\"{}\"", a.text).into_bytes() };
@@ -1846,17 +1804,10 @@ mod tests {
         assert!(committed_rollouts("9.9.999").is_empty());
     }
 
-    /// The codex-alab build the lab measured.
     const ALAB_BUILD: &str = "0.164.0-dev.12521+g3d3eb12d8";
 
-    /// The forever-port codex-alab build the lab measured (B5c), whose
-    /// rollouts spell every key of the steps they show as 0.163.0 did.
     const FOREVER_BUILD: &str = "0.164.0-dev.12672+g089291d37";
 
-    /// THE NAME RULE (6D-3a): a vendor build's reductions are
-    /// `codex-<build>`, an ALab build's `codex-alab-<release>`, its commit
-    /// left to the reducer's own line; each committed reduction is of the
-    /// build its own line names.
     #[test]
     fn a_rollout_reduction_is_named_by_its_build() {
         assert_eq!(rollout_reduction_stem("0.163.0"), "codex-0.163.0");
@@ -1894,9 +1845,6 @@ mod tests {
         );
     }
 
-    /// THE RESET'S TEMPLATES ARE ITS ANCHORS' WORDS, WHOLE: each is built
-    /// from the rows the readers match by, none is empty or another's, and
-    /// a text that spells them all holds every one.
     #[test]
     fn the_reset_templates_are_built_from_the_readers_rows() {
         type Templates = Vec<(&'static str, Vec<String>)>;
@@ -1978,13 +1926,6 @@ mod tests {
         assert_eq!(missing_templates(&bytes, &planted), ["planted"]);
     }
 
-    /// A MINIFIER'S NAME IN A TEMPLATE IS A SLOT: the limit names' switch
-    /// holds as 2.1.308 spells it (`s.add(a.givesBackWeekly…`) and as
-    /// 2.1.309 does (`i.givesBackWeekly`), and with any identifier there.
-    /// NEGATIVE CONTROLS: no identifier in a slot (a digit first, a call,
-    /// nothing), or a word of the switch reworded, is missing. MUTANT: the
-    /// slot read as its own char (the template matched byte for byte) holds
-    /// in neither build.
     #[test]
     fn a_minifiers_name_fills_a_templates_slot() {
         let templates = reset_templates();
@@ -2039,13 +1980,6 @@ mod tests {
         assert!(!holds(b"a.b", "c"));
     }
 
-    /// A TEMPLATE HOLDS WHEREVER ITS HEAD RECURS: the store bundle (2.1.308
-    /// and 2.1.309, `grep -F 'case"five_hour":'`) holds the limit names'
-    /// switch head ten times, the switch the ninth, the other nine heads
-    /// other switches over the same windows. Built that way, with names
-    /// the minifier could pick, the switch holds. NEGATIVE CONTROL: the
-    /// nine other heads alone hold no switch. MUTANT: a match tried only
-    /// where the head first occurs holds in neither build's shape.
     #[test]
     fn a_template_holds_past_its_heads_earlier_places() {
         let templates = reset_templates();
@@ -2081,17 +2015,12 @@ mod tests {
         );
     }
 
-    /// NO SLOT TOUCHES AN IDENTIFIER'S CHAR: JavaScript reads the longest
-    /// name, so a slot glued to a word could never be filled; such a
-    /// template is refused when it is matched, never silently missing.
-    /// MUTANT: the guard removed lets `x=` + slot + `abc;` through.
     #[test]
     #[should_panic(expected = "a slot touches an identifier's char")]
     fn a_slot_glued_to_a_word_is_refused() {
         holds(b"x=fooabc;", &format!("x={JS_NAME}abc;"));
     }
 
-    /// The guard's other side: a word glued before a slot.
     #[test]
     #[should_panic(expected = "a slot touches an identifier's char")]
     fn a_word_glued_before_a_slot_is_refused() {

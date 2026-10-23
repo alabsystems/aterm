@@ -4,8 +4,7 @@
 //
 // Derived from skrifa 0.46.2 src/outline/autohint/topo/edges.rs and modified by the
 // aterm project in 2026: the blue provenance hint plans record dropped; its
-// tests need fontations' test fonts and are not carried (the TF.1 hinting
-// corpus replays the whole hinter).
+// tests need fontations' test fonts and are not carried.
 // See ../../../LICENSE-FONTATIONS for the upstream license.
 
 //! Edge detection from outline segments, property assignment, and blue zone association.
@@ -35,15 +34,12 @@ pub(crate) fn compute_edges(
         } else {
             top_to_bottom_hinting
         };
-    // Ignore horizontal segments less than 1 pixel in length.
     let segment_length_threshold = if axis.dim == Dimension::Horizontal {
         fixed_div(64, y_scale)
     } else {
         0
     };
-    // Ignore segments with a width delta larger than 0.5 pixels.
     let segment_width_threshold = fixed_div(32, scale);
-    // Cap edge distance threshold at 0.25 pixels.
     let initial_threshold = metrics.width_metrics.edge_distance_threshold;
     const EDGE_DISTANCE_THRESHOLD_MAX: i32 = 64 / 4;
     let edge_distance_threshold = if group == ScriptGroup::Default {
@@ -62,14 +58,12 @@ pub(crate) fn compute_edges(
     for segment_ix in 0..axis.segments.len() {
         let segment = &axis.segments[segment_ix];
         if group == ScriptGroup::Default {
-            // Ignore segments that are too short, too wide or direction-less
             if (segment.height as i32) < segment_length_threshold
                 || (segment.delta as i32 > segment_width_threshold)
                 || segment.dir == Direction::None
             {
                 continue;
             }
-            // Ignore serif edges smaller than 1.5 pixels.
             if segment.serif_ix.is_some()
                 && (2 * segment.height as i32) < (3 * segment_length_threshold)
             {
@@ -87,8 +81,6 @@ pub(crate) fn compute_edges(
                     break;
                 }
                 if let Some(link) = segment.link(&axis.segments).copied() {
-                    // Check whether all linked segments of the candidate edge can form a single
-                    // edge.
                     let first_ix = edge.first_ix as usize;
                     let mut seg1 = &axis.segments[first_ix];
                     let mut dist2 = 0;
@@ -134,7 +126,6 @@ pub(crate) fn compute_edges(
         }
     }
     if group == ScriptGroup::Default {
-        // Associate directionless single-point segments with coinciding edges.
         for segment_ix in 0..axis.segments.len() {
             let segment = &axis.segments[segment_ix];
             if segment.dir != Direction::None {

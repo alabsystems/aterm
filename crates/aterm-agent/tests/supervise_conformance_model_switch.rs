@@ -7,25 +7,6 @@
 //! answer to a model limit (the fallback asked for until the host can make it, the
 //! continuation first at the reset, a return only at a named reset that was ahead
 //! when the switch was made) is the model's, state for state.
-//!
-//! The agent's own jobs (`JobsStart`, `JobsEnd`) are the host's word, invisible to the
-//! decider, so the walk plays the host: a relaunch asked for while `jobs = 1` is
-//! refused with `wait:changed` (the loop decides again and never calls `restarted`),
-//! one asked for with `jobs = 0` is made (`restarted(.., true, ..)`, as
-//! `restart_agent` records it). Time is the real clock moved a minute per tick with
-//! grace and jitter at zero. At every state the model's invariants hold, and:
-//!
-//! * at a wall on the bucket's model (`bucket = 1`, `on = 0`) the decider types the
-//!   continuation exactly where `Continue` is enabled, and asks the host for the
-//!   fallback exactly where `AskFallback` is;
-//! * on the fallback (`on = 1`) at an idle point it asks for the return
-//!   (`Restart::ModelBack`) exactly where the switch owes one and its reset has come
-//!   (the host permitting is the model's `Return`), and never otherwise;
-//! * on the bucket's model with no wall it asks for nothing.
-//!
-//! Negative controls: the `Buggy = 1` model (a return guessed a tick after an
-//! unscheduled switch) and a `ModelSwitch` seeded with a guessed half hour's
-//! `back_at` are each caught by the same comparison.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -192,8 +173,6 @@ fn expected(m: &Model, st: &State) -> Verdict {
             Verdict::Other
         }
     } else if st["on"] == 1 && st["back"] == 1 && st["clock"] >= cnst(m, "ResetAt") {
-        // The switch owes its return and the reset has come; whether the host
-        // can make it now is the model's `Return` guard (`jobs`), not the decider's.
         Verdict::Return
     } else {
         Verdict::Other
@@ -211,9 +190,6 @@ fn mirror(
     let now = real.now;
     match action {
         "JobsStart" | "JobsEnd" => {}
-        // The limit lifts: on the bucket's model the worker goes on by itself
-        // (the vendor's own resume, a person), so the wall's track ends; on
-        // the fallback nothing on the screen changes.
         "BucketLifts" => {
             if before["on"] == 0 {
                 let r = reading(m, after, real.appeared, Some(REAL_WORK));
@@ -238,7 +214,6 @@ fn mirror(
                 return false;
             }
             real.st.acted(&a, &r, now);
-            // The wall answers again: the same appearance, seen once more.
             let again = reading(m, after, real.appeared, Some(Duration::from_secs(3)));
             real.st.observe(&again, now);
         }
@@ -249,9 +224,6 @@ fn mirror(
             let TurnEndAction::Restart { why, .. } = &a else {
                 return false;
             };
-            // The host's word: refused while the agent's own jobs run (the
-            // loop decides again after its pause and records nothing), made
-            // when they do not.
             if before["jobs"] == 0 {
                 real.st.restarted(why, true, &r, now);
             }
@@ -267,16 +239,12 @@ fn mirror(
                 return false;
             }
             real.st.restarted(why, true, &r, now);
-            // Back on the bucket's model: a limit that still stands shows
-            // again at once.
             if after["bucket"] == 1 {
                 real.appeared = now;
                 let again = reading(m, after, now, Some(Duration::from_secs(3)));
                 real.st.observe(&again, now);
             }
         }
-        // The model's defects: the real side does nothing, and the comparison at
-        // the state reached is the negative control's disagreement.
         "GuessedReturn" | "GivesUp" | "ReturnBlocks" => {}
         other => panic!("an action this bind does not mirror: {other}"),
     }
@@ -303,8 +271,6 @@ fn walk(m: &Model, strict: bool) -> (usize, Vec<State>) {
                 assert!(m.check_invariant(inv.name, &st), "{} at {st:?}", inv.name);
             }
         }
-        // The decider is asked at every state, as the loop asks at each change
-        // that can move its answer (a tick, a screen, a host's word).
         let mut at = real.st.clone();
         let here = reading(m, &st, real.appeared, None);
         at.observe(&here, real.now);
@@ -353,7 +319,6 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
         off.len()
     );
 
-    // The guessed rule, on the real side: a switch with a guessed `back_at`.
     let cfg = SupervisorConfig::default();
     let t = Instant::now() + Duration::from_secs(3600);
     let mut st = TurnEndState::new(timing());
@@ -370,7 +335,6 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
         Verdict::Return,
         "the guessed half hour returns: {a:?}"
     );
-    // The committed switch of a limit that named no reset owes none.
     let mut committed = TurnEndState::new(timing());
     let wall = TurnEndReading {
         wall: Some(WallKind::ModelBucket { consent: false }),

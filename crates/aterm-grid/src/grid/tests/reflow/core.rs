@@ -15,7 +15,6 @@ fn reflow_shrink_preserves_cursor_position() {
     }
     grid.set_cursor(0, 7);
 
-    // Offset 7 ('H') lands on row 1, col 2.
     grid.resize(5, 5);
 
     assert_eq!(grid.cursor_row(), 1);
@@ -40,12 +39,10 @@ fn reflow_grow_preserves_cursor_position() {
 
     grid.resize(5, 12);
 
-    // Row 1 col 2 was logical offset 7; unwrapped to 12 cols it is row 0 col 7.
     assert_eq!(grid.cursor_row(), 0);
     assert_eq!(grid.cursor_col(), 7);
 }
 
-/// A cursor exactly at a chunk boundary is positioned correctly after reflow.
 #[test]
 fn reflow_cursor_at_chunk_boundary() {
     let mut grid = Grid::new(5, 10);
@@ -60,20 +57,16 @@ fn reflow_cursor_at_chunk_boundary() {
     assert_eq!(grid.row(0).unwrap().to_string(), "ABCDE");
     assert_eq!(grid.row(1).unwrap().to_string(), "FGHIJ");
 
-    // Offset 5 starts the second chunk: row 1, col 0.
     assert_eq!(grid.cursor_row(), 1);
     assert_eq!(grid.cursor_col(), 0);
 }
 
-/// A cursor at the last position of a wrapped line's first segment is
-/// positioned correctly after unwrap.
 #[test]
 fn reflow_cursor_at_wrapped_line_end() {
     let mut grid = Grid::new(5, 5);
     for c in "ABCDE".chars() {
         grid.write_char(c);
     }
-    // `is_wrapped` marks a row as the continuation of the previous one.
     grid.line_feed();
     grid.carriage_return();
     if let Some(row) = grid.row_mut(1) {
@@ -93,8 +86,6 @@ fn reflow_cursor_at_wrapped_line_end() {
     assert_eq!(grid.cursor_col(), 4);
 }
 
-/// A shrink wraps the long line onto a continuation row, and the grow back
-/// joins it again.
 #[test]
 fn reflow_round_trip() {
     let mut grid = Grid::new(5, 10);
@@ -114,7 +105,6 @@ fn reflow_round_trip() {
 
 #[test]
 fn reflow_without_reflow_flag() {
-    // `ReflowMode::Disabled` truncates instead of wrapping.
     let mut grid = Grid::new(5, 10);
     for c in "ABCDEFGHIJ".chars() {
         grid.write_char(c);
@@ -127,14 +117,12 @@ fn reflow_without_reflow_flag() {
 
 #[test]
 fn resize_with_reflow_noop_and_grow_preserve_logical_rows_after_scroll() {
-    // A no-op or grow resize keeps ring_head unless rows were linearized.
     let mut grid = Grid::with_scrollback(4, 8, 0);
     for row in 0..4 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Advance ring_head away from zero.
     grid.set_cursor(3, 0);
     grid.line_feed();
 
@@ -161,15 +149,12 @@ fn resize_with_reflow_noop_and_grow_preserve_logical_rows_after_scroll() {
 
 #[test]
 fn resize_with_reflow_grow_preserves_nonempty_bottom_row_after_scroll() {
-    // A grow appends new rows after all existing logical rows, even when
-    // ring_head != 0.
     let mut grid = Grid::with_scrollback(4, 8, 0);
     for row in 0..4 {
         grid.set_cursor(row, 0);
         grid.write_char((b'A' + row as u8) as char);
     }
 
-    // Advance ring_head, then make the bottom logical row non-empty.
     grid.set_cursor(3, 0);
     grid.line_feed();
     grid.set_cursor(3, 0);

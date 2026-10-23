@@ -184,7 +184,7 @@ const GIT_REDIRECTS: [&str; 8] = [
 ];
 
 fn git(root: &Path, args: &[&str], input: &[u8]) -> Option<Vec<u8>> {
-    let mut cmd = command("git");
+    let mut cmd = command(aterm_uds::os_path!("git"));
     cmd.arg("-C").arg(root).arg("--no-optional-locks");
     for key in GIT_REDIRECTS {
         cmd.env_remove(key);

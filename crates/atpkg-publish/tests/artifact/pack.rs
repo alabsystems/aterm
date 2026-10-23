@@ -224,8 +224,6 @@ fn a_signed_pack_is_one_the_client_verifies_and_extracts_to_its_signed_root() {
     assert_eq!(atpkg::tree_root(&x).expect("root"), row.tree_root);
     assert!(x.join("bin/ay").is_file());
 
-    // The driver: metadata through the resolved targo with no lane flag, the build with
-    // it, the target, the floor and the seal's own compiler.
     let meta = &t.runs_of("metadata")[0];
     assert_eq!(meta.program, w.bin.join("targo"));
     assert!(!meta.argv().contains(&"--unverified".to_string()));
@@ -305,10 +303,9 @@ fn a_bundle_only_program_and_a_declared_bin_that_did_not_build_are_refused() {
     assert!(err.to_string().contains("not built: ay-lsp"), "{err}");
 }
 
-/// A shell is never shimmed (design S13), so a pack exposing `fish` is refused: before
+/// A shell is never shimmed, so a pack exposing `fish` is refused: before
 /// anything is built when the declaration names it, before anything is staged when the
-/// name-token fallback picks it, and nothing is tarred or signed either way. The control is
-/// the same checkout and build declaring `ay` alone, which packs and the client verifies.
+/// name-token fallback picks it, and nothing is tarred or signed either way.
 #[test]
 fn a_pack_exposing_fish_is_refused_and_the_same_build_exposing_tools_packs() {
     let w = world("pack-fish");
@@ -566,17 +563,14 @@ fn an_upload_stages_a_prerelease_and_a_public_pack_is_immutable() {
             "pkg-ay-9.toml.sig"
         ]
     );
-    // A rerun converges onto the staging owner's own release.
     pack::pack_with(&w.ctx, &req, &t).expect("converged");
 
-    // Public with these very bytes: nothing to do.
     let public = Slug::new("alabsystems", "ay");
     let pkg = std::fs::read(&out.manifest).expect("pkg");
     w.host
         .put_asset(&public, "atpkg-ay-9", "pkg-ay-9.toml", pkg.clone());
     let again = pack::pack_with(&w.ctx, &req, &t).expect("already public");
     assert!(!again.uploaded);
-    // Public with other bytes: refused, staging untouched.
     w.host.put(
         &public,
         "atpkg-ay-9",
@@ -690,8 +684,6 @@ fn the_switch_is_read_from_the_trust_repo_the_context_names_start_and_finish() {
         "the refusal names why the receipt was required: {text}"
     );
 
-    // A dormant checkout elsewhere, named: the start of the pack and the re-check before
-    // the unproven row is signed both read it ($HOME/trust would read unknown at either).
     let mut ctx = w.ctx.clone();
     ctx.trust_repo = w.root.join("src/trust");
     trust_repo(&ctx.trust_repo, DORMANT_LEDGER);
@@ -756,7 +748,6 @@ fn an_out_whose_stage_holds_the_checkout_is_refused_and_the_checkout_survives() 
     let w = world("pack-out-holds-checkout");
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
     let mut req = w.request(X86_64_UNKNOWN_LINUX_GNU);
-    // The stage is <out>/ay — the checkout itself.
     req.out = w.root.clone();
     let err = pack::pack_with(&w.ctx, &req, &t).expect_err("would delete the checkout");
     assert!(err.to_string().contains("holds the checkout"), "{err}");

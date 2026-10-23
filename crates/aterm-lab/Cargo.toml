@@ -84,6 +84,10 @@ aterm-tempfile = { workspace = true }
 # (`atpkg::abrew::census`). Not a new edge in the build graph: aterm-agent
 # above already depends on it.
 atpkg = { workspace = true }
+# The Linux lane builds install.sh's static bootstrap verifier as the release
+# producer does (`pin::static_build_config`, `pin::asset_name`'s crate). A small
+# library whose dependencies are already in this graph.
+aterm-bootstrap-verify = { workspace = true }
 
 [dev-dependencies]
 # The tests' one-minute hang detector and the unclocked first exec of a script

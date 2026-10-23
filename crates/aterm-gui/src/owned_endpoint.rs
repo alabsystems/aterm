@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What this instance published on its control socket, and the one rule by which any exit removes it.
+//! Control-socket endpoint tracking and cleanup on exit.
 
 #[cfg(unix)]
 pub(crate) use imp::{
     arm_orderly_quit, die_of_quit_signal, hold_quit_for_exec, publish, rebound, release,
 };
 
-/// How long a headless instance's terminating signal waits for the orderly quit before the immediate path ends the process ([`arm_orderly_quit`]'s backstop): as generous as a cut lifeline's (`lifeline::SHUTDOWN_GRACE`), for a main thread that is not coming back rather than a slow one.
+/// How long a headless instance's terminating signal waits ([`arm_orderly_quit`]).
 #[cfg(unix)]
 pub(crate) const QUIT_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 
@@ -26,9 +26,7 @@ mod imp {
     /// One file this instance published, by path and identity.
     pub(super) struct Owned {
         path: CString,
-        /// Device and inode as `MetadataExt` widens them. The inode moves when this
-        /// instance renames another of its own files over the path
-        /// ([`Owned::follow`]); the device cannot, since a rename never crosses one.
+        /// Device and inode as `MetadataExt` widens them ([`Owned::follow`]).
         dev: u64,
         ino: AtomicU64,
     }
@@ -45,7 +43,7 @@ mod imp {
             })
         }
 
-        /// Record `current` in place of `previous` (both `(device, inode)`) after this instance renamed its own file over the published one; only while the record still names `previous`.
+        /// Record `current` in place of `previous`.
         pub(super) fn follow(&self, previous: (u64, u64), current: (u64, u64)) -> bool {
             previous.0 == self.dev
                 && current.0 == self.dev
@@ -61,9 +59,7 @@ mod imp {
             reason = "dev_t and ino_t are narrower than u64 on some targets; widened as std widens them"
         )]
         pub(super) fn remove_if_still_ours(&self) -> bool {
-            // SAFETY: `stat` is POD, so zeroed is valid, and `lstat` writes it;
-            // `self.path` is a live NUL-terminated string. `lstat`/`unlink` are
-            // async-signal-safe.
+            // SAFETY: `stat` is POD, so zeroed is valid, and `lstat` writes it.
             unsafe {
                 let mut now: libc::stat = std::mem::zeroed();
                 if libc::lstat(self.path.as_ptr(), &mut now) != 0
@@ -87,9 +83,7 @@ mod imp {
         /// Unlink the alias iff it still points where this instance pointed it.
         pub(super) fn remove_if_still_ours(&self) -> bool {
             let mut buf = [0u8; 1024];
-            // SAFETY: `buf` is a live, writable stack buffer of the passed length;
-            // `readlink` returns the byte count (no NUL), bounds-checked below.
-            // `readlink`/`unlink` are async-signal-safe.
+            // SAFETY: `buf` is a live, writable stack buffer of the passed length.
             unsafe {
                 let n = libc::readlink(self.link.as_ptr(), buf.as_mut_ptr().cast(), buf.len());
                 let Ok(n) = usize::try_from(n) else {
@@ -105,7 +99,7 @@ mod imp {
 
     /// Everything the handler removes.
     pub(super) struct Published {
-        /// The process that published them: a child forked between `fork` and `exec` inherits the handler and must not take its parent's socket.
+        /// The process that published them.
         pub(super) pid: libc::pid_t,
         pub(super) socket: Option<Owned>,
         pub(super) token: Option<Owned>,
@@ -135,14 +129,14 @@ mod imp {
             }
         }
 
-        /// [`Owned::follow`] for the socket: a rebind at its path.
+        /// [`Owned::follow`] for the socket.
         pub(super) fn rebound(&self, previous: (u64, u64), current: (u64, u64)) -> bool {
             self.socket
                 .as_ref()
                 .is_some_and(|socket| socket.follow(previous, current))
         }
 
-        /// Remove every file still this instance's, when called in the process that published them.
+        /// Remove every file still this instance's.
         pub(super) fn remove(&self) {
             // SAFETY: `getpid` takes nothing and is async-signal-safe.
             if unsafe { libc::getpid() } != self.pid {
@@ -159,30 +153,26 @@ mod imp {
 
     static PUBLISHED: OnceLock<Published> = OnceLock::new();
 
-    /// The write end of the orderly quit's pipe ([`arm_orderly_quit`]); `-1` while
-    /// unarmed.
+    /// The write end of the orderly quit's pipe ([`arm_orderly_quit`]).
     static QUIT_PIPE: AtomicI32 = AtomicI32::new(-1);
 
-    /// The process that armed the orderly quit ([`arm_orderly_quit`]); `0` while
-    /// unarmed.
+    /// The process that armed the orderly quit ([`arm_orderly_quit`]).
     static ARMED_PID: AtomicI32 = AtomicI32::new(0);
 
-    /// The terminating signal handed to the orderly quit; `0` until one is, and
-    /// [`EXEC_IN_FLIGHT`] while a cold `exec` holds the claim ([`hold_quit_for_exec`]).
+    /// Terminating signal handed to the orderly quit ([`EXEC_IN_FLIGHT`], [`hold_quit_for_exec`]).
     static QUIT_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
-    /// [`QUIT_SIGNAL`] while a cold `exec` is in flight: no signal's number, so the
-    /// handler's claim ([`claim_quit`]) fails and it takes the immediate path.
+    /// [`QUIT_SIGNAL`] while a cold `exec` is in flight ([`claim_quit`]).
     const EXEC_IN_FLIGHT: libc::c_int = -1;
 
-    /// The handler's claim on the orderly quit: `sig` goes into `state` only while nothing is there — not after a first signal, not while a cold `exec` holds it.
+    /// The handler's claim on the orderly quit.
     pub(super) fn claim_quit(state: &AtomicI32, sig: libc::c_int) -> bool {
         state
             .compare_exchange(0, sig, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    /// The claim a cold `exec` holds ([`hold_for_exec`]) while it is in flight; given back when dropped, which is when the `exec` returned (it failed) and this process carries on.
+    /// The claim a cold `exec` holds ([`hold_for_exec`]) while it is in flight.
     pub(crate) struct ExecHold<'a>(&'a AtomicI32);
 
     impl Drop for ExecHold<'_> {
@@ -201,7 +191,7 @@ mod imp {
             .map(|_| ExecHold(state))
     }
 
-    /// THE COLD UPDATE'S `exec` TAKES THE ORDERLY QUIT'S CLAIM FIRST ([`super`]): `None` when a terminating signal already asked for the quit, and the caller then does not `exec` (the event loop runs that quit next); else the hold, kept until the `exec` returns, under which a signal ends the process at once.
+    /// THE COLD UPDATE'S `exec` TAKES THE ORDERLY QUIT'S CLAIM FIRST ([`super`]).
     pub(crate) fn hold_quit_for_exec() -> Option<ExecHold<'static>> {
         hold_for_exec(&QUIT_SIGNAL)
     }
@@ -217,7 +207,7 @@ mod imp {
                 reason = "a signal number is under 64"
             )]
             let byte = [sig as u8];
-            // SAFETY: `write(2)` of one byte from a live stack buffer to the pipe's write end, which is never closed; async-signal-safe.
+            // SAFETY: `write(2)` of one byte from a live stack buffer to the pipe's write end.
             if unsafe { libc::write(fd, byte.as_ptr().cast(), 1) } == 1 {
                 return;
             }
@@ -225,13 +215,12 @@ mod imp {
         die_now(sig);
     }
 
-    /// The immediate path: remove what is still ours, restore `sig`'s default
-    /// action and re-raise it.
+    /// The immediate path.
     fn die_now(sig: libc::c_int) {
         if let Some(published) = PUBLISHED.get() {
             published.remove();
         }
-        // SAFETY: a zeroed `sigaction` with `SIG_DFL` restores the default action; `sigaction`/`raise` are async-signal-safe.
+        // SAFETY: a zeroed `sigaction` with `SIG_DFL` restores the default action.
         unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = libc::SIG_DFL;
@@ -244,7 +233,7 @@ mod imp {
         }
     }
 
-    /// ARM THE ORDERLY QUIT ([`super`]), in a headless instance once its event loop can be asked: a thread waits on the pipe the handler writes, logs the signal, and calls `quit` with its number (the caller posts the quit to the loop), and the handlers are installed now, whether or not a control socket is ever published.
+    /// ARM THE ORDERLY QUIT ([`super`]), in a headless instance once its event loop can be asked.
     pub(crate) fn arm_orderly_quit(
         quit: impl FnOnce(libc::c_int) + Send + 'static,
     ) -> std::io::Result<()> {
@@ -295,7 +284,7 @@ mod imp {
         }
     }
 
-    /// At the end of a quit: when a terminating signal asked for it ([`arm_orderly_quit`]), die of that signal now, its default action restored, so the parent reads the status a signal gives — the crash marker removed first, as the `atexit` handler a signal death skips would have; else return, and the caller exits as it would.
+    /// At the end of a quit: when a terminating signal asked for it ([`arm_orderly_quit`]).
     pub(crate) fn die_of_quit_signal() {
         let sig = QUIT_SIGNAL.load(Ordering::Acquire);
         if sig > 0 {
@@ -304,14 +293,14 @@ mod imp {
         }
     }
 
-    /// The graceful exit's removal ([`super`]): what [`publish`] recorded, by the rule the signal handler uses.
+    /// The graceful exit's removal ([`super`]) ([`publish`]).
     pub(crate) fn release(_plan: &crate::control_auth::SocketPlan) {
         if let Some(published) = PUBLISHED.get() {
             published.remove();
         }
     }
 
-    /// This instance rebound its control socket at the published path: `previous` was replaced by `current`, a socket it bound itself (`control_listener::rebind_socket`), both `(device, inode)`.
+    /// This instance rebound its control socket at the published path.
     pub(crate) fn rebound(previous: (u64, u64), current: (u64, u64)) -> bool {
         PUBLISHED
             .get()
@@ -326,14 +315,10 @@ mod imp {
         install_exit_handlers();
     }
 
-    /// [`on_exit_signal`] for each of [`EXIT_SIGNALS`] whose disposition is still the
-    /// default: an ignored one stays ignored, and one already this handler (the
-    /// orderly quit's arm ran first) is left as it is.
+    /// [`on_exit_signal`] for each of [`EXIT_SIGNALS`] whose disposition is still the default.
     fn install_exit_handlers() {
         for sig in EXIT_SIGNALS {
-            // SAFETY: both `sigaction` structs are zeroed POD; the first call only
-            // reads the disposition, the second installs a valid `extern "C"` handler
-            // with an empty mask. Runs at arm time, outside signal context.
+            // SAFETY: both `sigaction` structs are zeroed POD.
             unsafe {
                 let mut old: libc::sigaction = std::mem::zeroed();
                 if libc::sigaction(sig, std::ptr::null(), &mut old) != 0
@@ -351,17 +336,17 @@ mod imp {
     }
 }
 
-/// Nothing to record off Unix: no terminating signal to hook, and no file identity read.
+/// Nothing to record off Unix.
 #[cfg(not(unix))]
 pub(crate) fn publish(_plan: &crate::control_auth::SocketPlan) {
     // The endpoint is a named file the next instance's stale sweep reclaims.
 }
 
-/// Off Unix no terminating signal quits the instance: nothing to die of.
+/// Off Unix no terminating signal quits the instance.
 #[cfg(not(unix))]
 pub(crate) fn die_of_quit_signal() {}
 
-/// The graceful exit's removal off Unix: by path ([`crate::control_auth::cleanup_socket`]).
+/// The graceful exit's removal off Unix ([`crate::control_auth::cleanup_socket`]).
 #[cfg(not(unix))]
 pub(crate) fn release(plan: &crate::control_auth::SocketPlan) {
     crate::control_auth::cleanup_socket(plan);
@@ -373,9 +358,6 @@ mod tests {
 
     use super::imp::{Owned, Published, claim_quit, hold_for_exec};
 
-    /// The handler's removal removes the published socket, token and alias. Negative
-    /// controls: a socket another listener rebound, a token replaced by rename, and an
-    /// alias a newer instance repointed all stay.
     #[test]
     fn a_terminating_signal_removes_only_what_this_instance_still_owns() {
         let scratch = crate::test_scratch::short_dir("the own test's socket");
@@ -426,8 +408,6 @@ mod tests {
         );
     }
 
-    /// A rebind at the same path renames a fresh socket over the published one, and
-    /// the exit removes the fresh one.
     #[test]
     fn the_exit_removes_the_socket_a_rebind_put_at_the_same_path() {
         use crate::control_listener::{rebind_socket, socket_file_id};
@@ -457,9 +437,6 @@ mod tests {
         assert!(sock.exists(), "another instance's socket at the path stays");
     }
 
-    /// With no record (nothing published by this process), the loop's exit
-    /// ([`super::release`]) deletes nothing by path: another instance's socket and
-    /// token at the same explicit path stay.
     #[test]
     fn the_graceful_exit_removes_nothing_it_did_not_record() {
         let scratch = crate::test_scratch::short_dir("the grace test's socket");
@@ -479,10 +456,6 @@ mod tests {
         assert!(!sock.exists() && !token.exists());
     }
 
-    /// A COLD `exec` AND A TERMINATING SIGNAL NEVER BOTH WIN THE ONE CLAIM: a quit a
-    /// signal claimed refuses the `exec` (the new image would drop that quit, and the
-    /// instance would carry on under the new build), and a signal while an `exec` holds
-    /// the claim is refused the orderly path (its handler ends the process at once).
     #[test]
     fn a_cold_exec_and_a_quit_signal_never_both_take_the_claim() {
         use std::sync::atomic::{AtomicI32, Ordering};

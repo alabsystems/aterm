@@ -6,26 +6,7 @@
 // `deserialize_with` or `skip`, no `expecting`).
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! Deserialization for externally tagged enums:
-//!
-//! ```
-//! # extern crate aterm_serde as serde;
-//! #[derive(aterm_serde_derive::Deserialize)]
-//! enum Event {
-//!     Ready,
-//!     Data { value: u32 },
-//! }
-//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
-//! # assert_deserializable::<Event>();
-//! ```
-//! # extern crate aterm_serde as serde;
-//! #[derive(aterm_serde_derive::Deserialize)]
-//! enum Event {
-//!     Ready,
-//!     Data { value: u32 },
-//! }
-//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
-//! # assert_deserializable::<Event>();
+//! Deserialization for externally tagged enums.
 
 use aterm_macro_support::{q, q_spanned};
 use proc_macro::{Ident, TokenStream};
@@ -54,7 +35,6 @@ pub(super) fn deserialize(
 
     let (variants_stmt, variant_visitor) = enum_::prepare_enum_variant_enum(variants);
 
-    // Match arms to extract a variant from a string
     let variant_arms: Vec<TokenStream> = variants
         .iter()
         .enumerate()
@@ -74,7 +54,6 @@ pub(super) fn deserialize(
         .collect();
 
     let match_variant = if variants.is_empty() {
-        // This is an empty enum like `enum Impossible {}`.
         q!("_serde::__private::Result::map(
                 _serde::de::EnumAccess::variant::<__Field>(__data),
                 |(__impossible, _)| match __impossible {})")

@@ -32,9 +32,6 @@ pub const MAX_NOVA_QUADS_PER: usize = 512;
 pub const MAX_ACTIVE_NOVAS: usize = 3;
 /// §6.3 cap: the decoration producers' backstop on the shared `nova_add` channel (`word_decorations` funds every classic nova and supernova under `MAX_NOVA_QUADS.saturating_sub(nova.len())`).
 pub const MAX_NOVA_QUADS: usize = 1536;
-/// Crown worst case: 4 tapered spike chords + 2 core-beam chords, each band
-/// shorter than a cell so ≤ 2 row-split quads per chord; the ≤ 12 crown term of
-/// the `Q ≤ 392` bound.
 const CROWN_QUADS: usize = 12;
 /// §6.1 Singularity darkening-ring cell cap (Over-blend `RingArc` wdecos).
 pub const MAX_RING_ARC_CELLS: usize = 20;
@@ -133,9 +130,6 @@ pub struct NovaCounts {
     pub ray_samples: usize,
 }
 
-/// A budgeted, grid-clamped, row-band-splitting [`GlowQuad`] sink (the
-/// `effect_util::push_fx_rect` idiom) with the quad budget enforced at the
-/// single push point, so truncation order is emission order.
 struct QuadSink<'a> {
     out: &'a mut Vec<GlowQuad>,
     grid_w: i32,
@@ -276,8 +270,6 @@ pub fn emit_nova(t_ms: u64, env: &NovaEnv, budget: usize, out: &mut Vec<GlowQuad
     counts
 }
 
-/// The ring: exactly-30-band chord slabs over the annulus plus the chromatic
-/// fringe (a second ring at `R + chroma`, fringe tint, 0.55 coverage).
 fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     let thick = env.feats.ring_thick;
     let chroma = env.feats.chroma;
@@ -316,7 +308,6 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
                 continue;
             }
             if wi < 0.5 {
-                // The band crosses the cap: the two chords merge into one.
                 sink.chord(cxf - wo, cxf + wo, y0, y1, color, cov);
             } else {
                 sink.chord(cxf - wo, cxf - wi, y0, y1, color, cov);
@@ -326,10 +317,6 @@ fn emit_ring(sink: &mut QuadSink<'_>, env: &NovaEnv, r: f32, fade: f32) {
     }
 }
 
-/// Rays: 5–8 genome rays (Quasar: 2 vertical jets at double length), each
-/// stepped at exactly [`RAY_SAMPLES`] (jets: [`JET_SAMPLES`]) samples along its
-/// major axis (sample `j` spans `[round(Lm·j/N), round(Lm·(j+1)/N))`), with
-/// `comet_beam`'s 2.5→1 px taper folded into per-sample coverage/width.
 fn emit_rays(
     sink: &mut QuadSink<'_>,
     env: &NovaEnv,
@@ -341,7 +328,6 @@ fn emit_rays(
     let q = (t_ms - FLASH_END_MS) as f32 / (RING_END_MS - FLASH_END_MS) as f32;
     let mut e = ease_out(q);
     if singularity {
-        // time-reversed radii: rays retract inward
         e = 1.0 - e;
     }
     let (nrays, samples, len_scale) = if quasar {
@@ -420,10 +406,6 @@ fn emit_rays(
     emitted_samples
 }
 
-/// The crown: a white-hot 4-point star glint over the word centre: a hot
-/// horizontal core beam crossed by a tapering vertical spike, with radial
-/// falloff and white heat folded into per-band coverage/width/tint, ≤ 3×3
-/// cells, envelope `sin(π·e/120)` (one rise and fall).
 fn emit_crown(sink: &mut QuadSink<'_>, env: &NovaEnv, t_ms: u64) {
     let e = (t_ms.saturating_sub(DIP_MS)) as f32 / (FLASH_END_MS - DIP_MS) as f32;
     let envl = (std::f32::consts::PI * e.clamp(0.0, 1.0)).sin();
@@ -595,10 +577,8 @@ pub fn crossing_ms(dist: f32, r_max: f32, singularity: bool) -> Option<u64> {
         return None;
     }
     let q = if singularity {
-        // R(q) = r_max·(1 − ease(q)) falls to `dist`: (1−q)² = d/r_max.
         1.0 - (dist / r_max).sqrt()
     } else {
-        // R(q) = r_max·ease(q) grows to `dist`: (1−q)² = 1 − d/r_max.
         1.0 - (1.0 - dist / r_max).sqrt()
     };
     Some(
@@ -656,7 +636,6 @@ pub fn pulse_color(anchor: u32, fringe: u32, amp: f32) -> u32 {
 #[inline]
 pub const fn ember_pair(pair: (u32, u32), magic: Option<NovaMagic>) -> (u32, u32) {
     if matches!(magic, Some(NovaMagic::Singularity)) {
-        // dim violet
         return (0x002A_2040, 0x005A_48A8);
     }
     const fn dim(c: u32, f: f32) -> u32 {
@@ -673,8 +652,6 @@ mod tests {
     use super::*;
     use crate::genome::nova_features;
 
-    /// A genome-max feature set (radius 2.2 rows, 8 rays, max chroma/thickness)
-    /// found by scanning gkeys — the §6.3 worst-case shape.
     fn worst_feats() -> NovaFeatures {
         let mut best: Option<NovaFeatures> = None;
         for g in 0..(1u64 << 15) {
@@ -707,13 +684,6 @@ mod tests {
         }
     }
 
-    /// Budget invariance at ch ∈ {14, 20, 40, 56} with the genome-max features:
-    ///
-    ///   * band count == 30,
-    ///   * 15 ray samples per ray (all 8 rays' samples emit ≥ 1 quad),
-    ///   * total quads ≤ 392 at every 10 ms step to 1400 ms,
-    ///   * the caps never bind: the 512-capped emission equals the unbounded
-    ///     one, and 3 active novas × 392 ≤ 1536 (checked at compile time).
     #[test]
     fn nova_budget_geometry_invariant() {
         for ch in [14i32, 20, 40, 56] {
@@ -779,8 +749,6 @@ mod tests {
         const { assert!(MAX_ACTIVE_NOVAS * 392 <= MAX_NOVA_QUADS) };
     }
 
-    /// Spend-order truncation: under a binding cap the ring is never gapped,
-    /// rays lose their outer slices, and the crown drops first, whole.
     #[test]
     fn spend_order_truncation_ring_first_crown_drops() {
         let env = env_at(20, None);
@@ -815,8 +783,6 @@ mod tests {
         assert!(crown_capped.is_empty());
     }
 
-    /// Coupling determinism and the crossing inverse: same inputs give the same
-    /// crossing frame, monotone in distance, and inverted for the Singularity.
     #[test]
     fn coupling_crossing_is_deterministic_and_monotone() {
         let rm = 44.0f32;
@@ -852,10 +818,6 @@ mod tests {
         assert!(pulse_env(450, 300).is_none());
     }
 
-    /// |ΔL| ≤ 5% for every (ink anchor, nova palette) pair over the deployed
-    /// colour space: every class base anchor and palette endpoint, under every
-    /// 4-bit hue-nudge code, toward every palette fringe, for the paired tone
-    /// and for the ≤ 0.35-amplitude mix applied; plus a saturated-red check.
     #[test]
     fn delta_l_bound_over_palette_table() {
         use crate::color_math::{hue_nudge, relative_luminance};
@@ -891,8 +853,6 @@ mod tests {
         }
     }
 
-    /// Singularity: the ring contracts, and the darkening ring emits ≤ 20
-    /// per-cell Over RingArc wdecos following it inward.
     #[test]
     fn singularity_contracts_and_darkens() {
         let env = env_at(20, Some(NovaMagic::Singularity));

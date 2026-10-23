@@ -101,9 +101,7 @@ pub fn peer_pid_of_fd(fd: std::os::fd::RawFd) -> io::Result<u32> {
     scm::peer_pid_of_fd(fd)
 }
 
-/// The two ABIs this file mirrors field-for-field. Everything outside `abi` is
-/// platform-independent: the cmsg walk, the ownership discipline, the
-/// validation.
+/// The two ABIs this file mirrors field-for-field.
 #[cfg(any(
     target_vendor = "apple",
     all(
@@ -365,8 +363,7 @@ mod scm {
         fn fcntl(fd: RawFd, cmd: i32, ...) -> i32;
     }
 
-    /// `fcntl(2)`'s descriptor-flag setter and the one flag there is. Same
-    /// numbers on every supported Unix, so they are not per-ABI.
+    /// `fcntl(2)`'s descriptor-flag setter and the one flag there is.
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
 
@@ -978,7 +975,7 @@ mod scm {
             );
         }
 
-        /// The helper. Ordinary runs return at once.
+        /// The helper.
         #[test]
         fn zz_helper_entry() {
             let Some(mode) = std::env::var_os(HELPER_ENV) else {

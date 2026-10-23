@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Escape-sequence policy corpus tests. Every table is `deny_unknown_fields`:
-//! an unknown key refuses the whole policy rather than being ignored.
+//! Escape-sequence policy serde corpus tests.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;
@@ -36,8 +35,6 @@ refill_per_second = 512
 per_sequence_max = 1024
 "#;
 
-/// `BASE` with each `(from, to)` applied; `from` must occur exactly once, so
-/// a mutation can never silently leave the document as it was.
 fn mutate(edits: &[(&str, &str)]) -> String {
     let mut doc = BASE.to_string();
     for (from, to) in edits {
@@ -66,7 +63,6 @@ fn policy_documents_answer_as_recorded() {
     corpus.record("base", read(BASE));
 
     let cases: &[(&str, &[(&str, &str)])] = &[
-        // Unknown keys, at every level: each table refuses them.
         (
             "unknown-key/root",
             &[("profile = ", "colour = 1\nprofile = ")],
@@ -93,7 +89,6 @@ fn policy_documents_answer_as_recorded() {
             )],
         ),
         ("unknown-key/case", &[("schema_version", "Schema_Version")]),
-        // Missing keys: required ones refuse, defaulted ones fill in.
         (
             "missing-key/schema-version",
             &[("schema_version = 1\n", "")],
@@ -130,7 +125,6 @@ fn policy_documents_answer_as_recorded() {
             "missing-key/rate-defaulted",
             &[("per_sequence_max = 1024\n", "")],
         ),
-        // Wrong types.
         (
             "wrong-type/schema-string",
             &[("schema_version = 1", "schema_version = \"1\"")],
@@ -167,7 +161,6 @@ fn policy_documents_answer_as_recorded() {
                 "profile = \"Standard\"\nrules = \"none\"\n",
             )],
         ),
-        // A table where a value belongs, and the other way about.
         (
             "array-for-table/defaults",
             &[(
@@ -193,7 +186,6 @@ fn policy_documents_answer_as_recorded() {
                 "[rules.extra]\nsequence = \"CSI t\"",
             )],
         ),
-        // Integers at and past each width.
         (
             "int/capacity-u32-max",
             &[("capacity_bytes = 4096", "capacity_bytes = 4294967295")],
@@ -228,7 +220,6 @@ fn policy_documents_answer_as_recorded() {
             "int/refill-underscore",
             &[("refill_per_second = 512", "refill_per_second = 5_12")],
         ),
-        // Signed zero and the non-finite floats.
         (
             "zero/negative-int",
             &[("per_sequence_max = 1024", "per_sequence_max = -0")],
@@ -249,7 +240,6 @@ fn policy_documents_answer_as_recorded() {
             "float/negative-inf",
             &[("refill_per_second = 512", "refill_per_second = -inf")],
         ),
-        // Enum spellings: rename_all is exact, never case-folded.
         (
             "enum/unknown-response",
             &[("response = \"drop\"", "response = \"explode\"")],
@@ -271,7 +261,6 @@ fn policy_documents_answer_as_recorded() {
             &[("origin_min = \"Host\"", "origin_min = \"NetworkUntrusted\"")],
         ),
         ("enum/empty", &[("response = \"drop\"", "response = \"\"")]),
-        // Strings the model keeps verbatim.
         (
             "string/unicode",
             &[(
@@ -283,7 +272,6 @@ fn policy_documents_answer_as_recorded() {
             "string/empty-rate-limit",
             &[("rate_limit = \"clipboard-write\"", "rate_limit = \"\"")],
         ),
-        // The document itself.
         (
             "toml/duplicate-key",
             &[(

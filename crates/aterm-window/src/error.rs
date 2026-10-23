@@ -4,15 +4,10 @@
 // Derived from winit 0.30.13 src/error.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (Added
-// `EventLoopError::DisplayLost`: a display server that died under the loop is told apart from
-// every other way a run fails.)
-
 use std::{error, fmt};
 
 use crate::platform_impl;
 
-// TODO: Rename
 /// An error that may be generated when requesting Winit state
 #[derive(Debug)]
 pub enum ExternalError {
@@ -49,11 +44,8 @@ pub enum EventLoopError {
     RecreationAttempt,
     /// Application has exit with an error status.
     ExitFailure(i32),
-    /// The connection to the display server died under the loop: its transport ended (end of
-    /// file, `ECONNRESET`, `EPIPE`, or a hang-up or error on its socket), as a Wayland compositor
-    /// or an X server that crashed, was killed or restarted ends it. The error says how. Only
-    /// that ends a run with this variant: a failure of the loop's own (a protocol error, a
-    /// connection the client library closed, a failed `poll`) is one of the others.
+    /// The connection to the display server died under the loop (`EOF`, `ECONNRESET`, `EPIPE`, or
+    /// socket hang-up/error).
     DisplayLost(std::io::Error),
 }
 

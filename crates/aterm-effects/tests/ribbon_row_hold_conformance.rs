@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The real ribbon's row clocks conform to `aterm-spec`'s
-//! `ribbon_row_hold_model`: a gesture renews only its own row's cohort.
+//! Conformance tests for `ribbon_row_hold_model`: a gesture renews only its own row's cohort.
 
 use std::time::{Duration, Instant};
 
@@ -61,8 +60,6 @@ fn typed(cells: u16) -> Event {
 
 fn seed(now: Instant, cfg: &Config) -> Ribbon {
     let mut ribbon = Ribbon::new();
-    // The two cohorts already exist. No navigation/abandon, so an accidental
-    // global renewal cannot hide behind the abandoned-cohort exclusion.
     for row in [2, 3] {
         ribbon.on_event(&typed(4), now, &context(now, cfg, (row, 6)));
     }
@@ -82,8 +79,6 @@ fn typing_and_erase_renew_only_their_own_row_and_conform() {
     let cfg = config();
     let base = Instant::now();
     let model = ribbon_row_hold_model();
-    // Either row can own the hand. The final gesture returns to the first
-    // row, a positive control against a policy that simply freezes old rows.
     for first_owner in [0u16, 1] {
         let mut ribbon = seed(base, &cfg);
         let mut state = model.init_state();
@@ -102,7 +97,6 @@ fn typing_and_erase_renew_only_their_own_row_and_conform() {
             };
             ribbon.on_event(&event, now, &context(now, &cfg, (row, col)));
 
-            // Clock fields come from the real cohorts, not model execution.
             state.insert("prior0", before["clock0"]);
             state.insert("prior1", before["clock1"]);
             state.insert("owner", i64::from(owner));
@@ -120,8 +114,6 @@ fn typing_and_erase_renew_only_their_own_row_and_conform() {
             assert!(model.check_invariant("OnlyOwnerRenews", &state));
             assert!(model.check_invariant("OwnerKeepsItsLease", &state));
 
-            // Negative control: a global hold (the key renews the other row
-            // too) fails both the trace relation and the invariant.
             let mut global_hold = state.clone();
             global_hold.insert(if owner == 0 { "clock1" } else { "clock0" }, stamp);
             assert!(!model.successors(action, &before).contains(&global_hold));

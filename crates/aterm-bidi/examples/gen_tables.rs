@@ -9,7 +9,6 @@ use std::process::ExitCode;
 const USAGE: &str = "usage: gen_tables tables <DerivedBidiClass.txt> <BidiBrackets.txt>\n       \
                      gen_tables subset <BidiTest.txt> <BidiCharacterTest.txt>";
 
-/// Every `Bidi_Class` long name the UCD writes, with its abbreviation (the `BidiClass` variant).
 const NAMES: &[(&str, &str)] = &[
     ("Left_To_Right", "L"),
     ("Right_To_Left", "R"),
@@ -36,14 +35,12 @@ const NAMES: &[(&str, &str)] = &[
     ("Pop_Directional_Isolate", "PDI"),
 ];
 
-/// The generator the tables' seal line names (`aterm_census::seal`).
 const GENERATOR: &str = "aterm-bidi's `gen_tables` example";
 
 const LICENCE_HEADER: &str = "// Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 ";
 
-/// What follows the seal line.
 const HEADER: &str = "//
 // GENERATED — do not edit by hand. Regenerate with
 //     targo --unverified run -p aterm-bidi --example gen_tables -- tables <DerivedBidiClass.txt> <BidiBrackets.txt>
@@ -55,7 +52,6 @@ use crate::BidiClass::*;
 
 ";
 
-/// One past the last code point.
 const CODE_SPACE: usize = 0x11_0000;
 
 fn main() -> ExitCode {
@@ -83,7 +79,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// The file at `path`, or the reason it cannot be read.
 fn read(path: &str) -> Result<String, String> {
     std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))
 }
@@ -92,7 +87,6 @@ fn write(path: &Path, text: &str) -> Result<(), String> {
     std::fs::write(path, text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// A `XXXX` or `XXXX..YYYY` code point field.
 fn span(field: &str) -> Result<(usize, usize), String> {
     let hex = |s: &str| usize::from_str_radix(s, 16).map_err(|e| format!("`{s}`: {e}"));
     match field.split_once("..") {
@@ -101,7 +95,6 @@ fn span(field: &str) -> Result<(usize, usize), String> {
     }
 }
 
-/// The abbreviation of a long `Bidi_Class` name.
 fn abbreviation(long: &str) -> Result<&'static str, String> {
     NAMES
         .iter()
@@ -110,7 +103,6 @@ fn abbreviation(long: &str) -> Result<&'static str, String> {
         .ok_or_else(|| format!("`{long}` is no Bidi_Class name"))
 }
 
-/// The UCD version `DerivedBidiClass-<version>.txt` names in its header.
 fn ucd_version(text: &str) -> Result<&str, String> {
     let missing = || "no `DerivedBidiClass-<version>.txt` in the header".to_string();
     let at = text.find("DerivedBidiClass-").ok_or_else(missing)? + "DerivedBidiClass-".len();
@@ -124,12 +116,10 @@ fn ucd_version(text: &str) -> Result<&str, String> {
     }
 }
 
-/// `line` without its `#` comment, trimmed.
 fn data(line: &str) -> &str {
     line.split('#').next().unwrap_or("").trim()
 }
 
-/// `src/tables.rs` from `DerivedBidiClass.txt` and `BidiBrackets.txt`.
 fn tables(
     derived: &Result<String, String>,
     brackets: &Result<String, String>,
@@ -217,7 +207,6 @@ fn tables(
     Ok(out)
 }
 
-/// The `;`-separated fields of a data line, trimmed: exactly `N` of them.
 fn fields<const N: usize>(line: &str) -> Result<[&str; N], String> {
     let parts: Vec<&str> = line.split(';').map(str::trim).collect();
     parts
@@ -225,7 +214,6 @@ fn fields<const N: usize>(line: &str) -> Result<[&str; N], String> {
         .map_err(|parts: Vec<&str>| format!("`{line}` has {} fields, not {N}", parts.len()))
 }
 
-/// `BidiCharacterTest-subset.txt`.
 fn cut_character_test(text: &Result<String, String>) -> Result<String, String> {
     let lines: Vec<&str> = text.as_deref()?.lines().collect();
     let marker = lines
@@ -243,7 +231,6 @@ fn cut_character_test(text: &Result<String, String>) -> Result<String, String> {
     Ok(out.join("\n") + "\n")
 }
 
-/// `BidiTest-subset.txt`.
 fn cut_bidi_test(text: &Result<String, String>) -> Result<String, String> {
     let mut out: Vec<&str> = Vec::new();
     let mut seen = 0usize;

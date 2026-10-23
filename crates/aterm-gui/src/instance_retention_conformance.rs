@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for exact-instance capture-namespace retention.
-//!
-//! Every lease-state × PID-liveness input is passed to the genuine shipping
-//! decision function, then independently projected onto the drift-free model.
-//! A destructive held-lease mutant is rejected so the binding cannot pass
-//! merely because the `Decide` guard is enabled.
 
 #![cfg(test)]
 
@@ -156,8 +151,6 @@ fn real_instance_sweep_decision_conforms_for_entire_lease_pid_matrix() {
         "matrix must include both retention outcomes"
     );
 
-    // Negative control: removing a held lease must be rejected by the same
-    // enabled guard and fail its named invariant.
     let held = project_before(&model, Held, false);
     assert!(model.action_enabled(DECIDE_ACTION, &held));
     let destructive = project_after(&held, Remove);
@@ -180,8 +173,6 @@ fn real_instance_sweep_decision_conforms_for_entire_lease_pid_matrix() {
     );
     assert!(!model.check_invariant("HeldNeverRemoved", &destructive));
 
-    // Negative control: keeping a lease-less namespace whose PID is dead (the
-    // `Missing if !pid_alive => Remove` arm folded into Keep) leaks it forever.
     let legacy_dead = project_before(&model, Missing, false);
     assert_eq!(decide_instance_namespace_sweep(Missing, false), Remove);
     let leaked = project_after(&legacy_dead, Keep);

@@ -12,7 +12,7 @@ use aterm_containment::consent::{self, Claimants, Retired};
 use crate::doctor::{Level, Row};
 
 /// The trash tool macOS 15 and later ship.
-pub const TRASH_TOOL: &str = "/usr/bin/trash";
+pub const TRASH_TOOL: &str = aterm_uds::os_path!("trash");
 
 /// How long one move may take.
 const TRASH_CEILING: Duration = Duration::from_secs(120);

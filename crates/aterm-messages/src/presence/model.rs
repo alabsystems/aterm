@@ -247,8 +247,7 @@ pub struct NeedFact {
     pub key: (u8, u64),
     /// Its words, one clipped line, without the tab's label.
     pub what: String,
-    /// Whether to display a tab-bar pill for this need. A worker's reported
-    /// need stays available in its hover and menus without a persistent pill.
+    /// Whether to display a tab-bar pill for this need.
     pub show_pill: bool,
 }
 
@@ -665,8 +664,6 @@ impl<V: Host> Slot<V> {
                                 && told.starts == starts
                                 && began_in(told.began, opened) =>
                         {
-                            // The program's own end already told this turn
-                            // (and counted it where it was news).
                             let _ = self.pair_end(told, true);
                         }
                         _ => {

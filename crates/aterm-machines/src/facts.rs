@@ -2,23 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! What the agent learns about its host before any item runs (design §4.2, §9).
-//!
-//! Every fact comes from one of macOS's own tools (or one `lstat`/`open`), through the
-//! [`System`] port. A fact a tool would not give is left empty (`""`, `0`, `None`, an empty
-//! list): the report then says "unknown" rather than a guess. The controller treats an
-//! empty `uuid` as a host it cannot bind an envelope to.
-//!
-//! The parsers are separate functions over the tools' text, so the fixtures in the tests
-//! are the tools' real answers, captured in a macOS 27.0 VM and on a 27.0.1 laptop.
 
 use crate::hardware;
 use crate::model::{Form, HostFacts, Keyboard, User};
 use crate::port::{Cmd, Ran, System};
 use std::path::{Path, PathBuf};
 
-/// The system TCC database. Opening it for reading is the measurement of Remote Login's
-/// "Allow full disk access for remote users" (design §1.7): without the switch the open
-/// fails with `EPERM`, even for root.
+/// The system TCC database.
 pub const SYSTEM_TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
 /// `hidutil list`'s matching dictionary for keyboards (Generic Desktop page, Keyboard usage).
@@ -40,8 +30,6 @@ pub fn gather(sys: &dyn System) -> HostFacts {
 }
 
 /// Gather the host's facts, listing `cache_dir` for `cached`.
-///
-/// A fact that cannot be read is left empty rather than guessed.
 #[must_use]
 pub fn gather_with_cache(sys: &dyn System, cache_dir: &Path) -> HostFacts {
     let accounts = run(sys, &dscl(["-list", "/Users", "UniqueID"]))
@@ -67,8 +55,6 @@ pub fn gather_with_cache(sys: &dyn System, cache_dir: &Path) -> HostFacts {
         .filter(Ran::success)
         .and_then(|r| hardware::internal_disk(&r.out()))
         .unwrap_or_default();
-    // This process's own open of the system TCC database: over SSH, Remote Login's switch;
-    // for any process, its own Full Disk Access.
     let tcc_open = remote_full_disk_access(sys);
     HostFacts {
         computer_name: scutil_get(sys, "ComputerName"),
@@ -138,21 +124,12 @@ pub fn user(sys: &dyn System, name: &str) -> Result<User, String> {
 }
 
 /// The keyboards in `hidutil list --matching '{"PrimaryUsagePage":1,"PrimaryUsage":6}'`.
-///
-/// Only the `Services:` section is read (it is what the HID system routes keys through,
-/// and the only place a VM's built-in keyboard appears); text with no section headers is
-/// read as one services table. Each row's columns are cut at the header's column starts,
-/// because `Transport` and `Product` may hold spaces. Ids are hex (`0x5ac`); a model seen
-/// twice (one keyboard on two services) is listed once, built in if any row says so.
 #[must_use]
 pub fn parse_hidutil_keyboards(text: &str) -> Vec<Keyboard> {
     hidutil_keyboards_from(text, false).unwrap_or_default()
 }
 
-/// A service census used to establish every local keyboard obligation. Unlike
-/// the best-effort facts projection, unknown headers or nonempty unparsed rows
-/// cannot establish an empty or partial census. A genuinely empty Services
-/// section is valid, including when it has no table header.
+/// A service census used to establish every local keyboard obligation.
 pub(crate) fn parse_hidutil_keyboards_complete(text: &str) -> Result<Vec<Keyboard>, String> {
     hidutil_keyboards_from(text, true)
 }
@@ -212,7 +189,6 @@ fn hidutil_keyboards_from(text: &str, complete: bool) -> Result<Vec<Keyboard>, S
             }
             continue;
         };
-        // Built-In is the last column; its last word is its value whatever the alignment.
         let builtin = if complete {
             match trimmed.split_whitespace().last() {
                 Some("1") => true,
@@ -263,10 +239,6 @@ pub fn parse_dscl_list(text: &str) -> Vec<(String, i64)> {
 }
 
 /// The attributes of one `dscl . -read <record> <attr>…` answer, in its order.
-///
-/// A value is on the attribute's line (`UniqueID: 501`) or, when it holds a space, on the
-/// indented lines below it (`RealName:` then ` Managed via Tart`), joined by newlines.
-/// `No such key: <attr>` lines are skipped, so a missing attribute is simply absent.
 #[must_use]
 pub fn parse_dscl_read(text: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
@@ -387,16 +359,10 @@ fn remote_full_disk_access(sys: &dyn System) -> Option<bool> {
 }
 
 /// What `console_user` holds when `/dev/console` could not be read: someone may be at the
-/// Mac. Parenthesized, so it is no account name (`user` refuses it) and matches no user.
+/// Mac.
 pub const CONSOLE_UNKNOWN: &str = "(unknown)";
 
 /// The owner of `/dev/console` by name; none at the login window (root owns it there).
-///
-/// `None` is a measurement ("nobody at the console", which lets a run disrupt, design
-/// §5.3), so a console this cannot name is never `None`: an unreadable `/dev/console` is
-/// [`CONSOLE_UNKNOWN`], and an owner the account list does not name is `(uid <n>)`. Neither
-/// is an account name, so nothing resolves them as a user, and a disruption check reads
-/// someone at the Mac.
 fn console_user(sys: &dyn System, accounts: &[(String, i64)]) -> Option<String> {
     let Ok(stat) = sys.stat(Path::new("/dev/console")) else {
         return Some(CONSOLE_UNKNOWN.to_owned());
@@ -412,8 +378,7 @@ fn console_user(sys: &dyn System, accounts: &[(String, i64)]) -> Option<String> 
     )
 }
 
-/// The people's accounts (uid ≥ 501, no `_` service prefix), each resolved. Empty when the
-/// `admin` group cannot be read: an admin bit would otherwise be a guess.
+/// The people's accounts (uid ≥ 501, no `_` service prefix), each resolved.
 fn people(sys: &dyn System, accounts: &[(String, i64)]) -> Vec<User> {
     let Ok(admins) = admin_members(sys) else {
         return Vec::new();
@@ -554,8 +519,6 @@ fn parse_hex(text: &str) -> Option<u32> {
 
 /// Gather live system telemetry ([`crate::protocol::HostVitals`]) from non-privileged OS
 /// readers (`sysctl`, `vm_stat`, `df -k /`, `ioreg -r -d 1 -c IOAccelerator`).
-///
-/// Returns `None` when no vitals tool answered (such as in a minimal fake test fixture).
 #[must_use]
 pub fn gather_vitals(sys: &dyn System, facts: &HostFacts) -> Option<crate::protocol::HostVitals> {
     let cpu_cores = line(sys, &Cmd::new("/usr/sbin/sysctl").args(["-n", "hw.ncpu"]))
@@ -812,9 +775,6 @@ mod tests {
     use super::*;
     use crate::port::{Fake, Stat};
 
-    /// `hidutil list --matching '{"PrimaryUsagePage":1,"PrimaryUsage":6}'` in the macOS 27.0
-    /// VM: a built-in virtual keyboard only in Services, and a USB one in both sections.
-    /// Each line ends `\n\` so its trailing padding survives byte for byte.
     const VM_HIDUTIL: &str = "Services:\n\
 VendorID ProductID LocationID UsagePage Usage RegistryID       Transport                     Class                    Product              UserClass               Built-In \n\
 0x5ac    0x1       0x0        1         6     0x7c485324000001 AppleVirtualPlatformHIDBridge (null)                   Virtual Keyboard     (null)                  1        \n\
@@ -826,7 +786,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport Class       
 \n\
 ";
 
-    /// The same command on an Apple silicon MacBook Pro (macOS 27.0.1).
     const LAPTOP_HIDUTIL: &str = "Services:\n\
 VendorID ProductID LocationID UsagePage Usage RegistryID  Transport Class                         Product                            UserClass Built-In \n\
 0x0      0x0       0xe9       1         6     0x100000b63 FIFO      AppleHIDKeyboardEventDriverV2 Apple Internal Keyboard / Trackpad (null)    1        \n\
@@ -837,8 +796,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport Class       
 \n\
 ";
 
-    /// `ioreg -rd1 -c IOPlatformExpertDevice` in the VM (the lines the parser reads, and
-    /// the binary ones around them).
     const VM_IOREG: &str = r##"+-o VMA2MACOSAP  <class IOPlatformExpertDevice, id 0x10000012f, registered, matched, active, busy 0 (9281 ms), retain 28>
     {
       "#address-cells" = <02000000>
@@ -852,7 +809,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport Class       
     }
 "##;
 
-    /// `dscl . -list /Users UniqueID` in the VM (the service accounts trimmed to a few).
     const VM_DSCL_LIST: &str = "_amavisd                 83
 _analyticsd              263
 _oahd                    441
@@ -863,17 +819,14 @@ nobody                   -2
 root                     0
 ";
 
-    /// `dscl . -read /Users//admin UniqueID PrimaryGroupID NFSHomeDirectory UserShell`.
     const VM_DSCL_ADMIN: &str = "NFSHomeDirectory: /Users//admin
 PrimaryGroupID: 20
 UniqueID: 501
 UserShell: /bin/zsh
 ";
 
-    /// `dscl . -read /Groups/admin GroupMembership` in the VM.
     const VM_ADMIN_GROUP: &str = "GroupMembership: root _mbsetupuser admin\n";
 
-    /// `ioreg -r -d 1 -k HIDIdleTime -c IOHIDSystem` in the VM (abridged to its first keys).
     const VM_IDLE: &str = r#"+-o IOHIDSystem  <class IOHIDSystem, id 0x1000001a2, registered, matched, active, busy 0 (1268 ms), retain 12>
     {
       "IOClass" = "IOHIDSystem"
@@ -1006,7 +959,6 @@ UserShell: /bin/zsh
 
     #[test]
     fn the_laptops_hardware_comes_from_sysctl_and_ioreg_never_the_slow_tools() {
-        // The MacBook Air's own answers (Mac17,4, macOS 27.0.1).
         let sys = Fake::root();
         sys.on("/usr/sbin/sysctl -n hw.model", Ran::ok("Mac17,4\n"))
             .on(
@@ -1027,8 +979,6 @@ UserShell: /bin/zsh
             crate::hardware::describe(&f).unwrap().spaced(),
             "MacBook Air M5 32GB 4TB"
         );
-        // system_profiler and diskutil take 40 to 210 ms each; the facts are read on every
-        // hello. And not df: the startup container is not the Mac's disk.
         assert!(
             !sys.calls().iter().any(|c| c.contains("system_profiler")
                 || c.contains("diskutil")
@@ -1040,7 +990,6 @@ UserShell: /bin/zsh
 
     #[test]
     fn a_fact_no_tool_answered_stays_empty_rather_than_guessed() {
-        // Nothing scripted: every run fails, every file is missing.
         let f = gather_with_cache(&Fake::root(), Path::new("/c"));
         assert_eq!(f.uuid, "");
         assert_eq!(f.computer_name, "");
@@ -1051,14 +1000,12 @@ UserShell: /bin/zsh
         assert_eq!(f.boot_time, 0);
         assert_eq!(f.idle_secs, None);
         assert_eq!(f.remote_full_disk_access, None);
-        // Not "nobody at the console" (None), which would let a run disrupt someone.
         assert_eq!(f.console_user.as_deref(), Some(CONSOLE_UNKNOWN));
         assert!(f.users.is_empty() && f.keyboards.is_empty() && f.cached.is_empty());
     }
 
     #[test]
     fn a_console_owner_no_account_names_is_someone_never_nobody_and_never_a_user() {
-        // The VM's console (uid 501), with the account list unanswered.
         let sys = Fake::root();
         sys.stat_of(
             "/dev/console",
@@ -1174,7 +1121,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
 
     #[test]
     fn dscl_values_on_continuation_lines_and_missing_keys_are_read_as_dscl_prints_them() {
-        // `dscl . -read /Users//admin RealName NoSuchKey` in the VM.
         let attrs = parse_dscl_read("No such key: NoSuchKey\nRealName:\n Managed via Tart\n");
         assert_eq!(attrs, vec![("RealName".into(), "Managed via Tart".into())]);
         let attrs = parse_dscl_read(VM_DSCL_ADMIN);
@@ -1205,7 +1151,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
             user(&sys, "nosuchuser").unwrap_err(),
             "no account nosuchuser"
         );
-        // No admin group answer: the account cannot be resolved honestly.
         let err = user(&Fake::root(), "admin").unwrap_err();
         assert!(err.contains("/Groups/admin"), "{err}");
     }
@@ -1246,7 +1191,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
 
     #[test]
     fn a_laptop_is_known_by_its_internal_battery_and_a_desktop_by_its_absence() {
-        // `pmset -g batt` on the MacBook Pro, and in the desktop-form VM.
         let laptop = "Now drawing from 'AC Power'\n -InternalBattery-0 (id=36044899)\t80%; AC attached; not charging present: true\n";
         let sys = Fake::root();
         sys.on("/usr/bin/pmset -g batt", Ran::ok(laptop));
@@ -1270,8 +1214,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
         assert_eq!(filevault(&sys), None);
     }
 
-    /// A port whose system TCC database open fails with `errno`: the one answer the fake
-    /// cannot give by itself.
     struct TccRefuses {
         inner: Fake,
         errno: i32,
@@ -1344,7 +1286,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
 
     #[test]
     fn remote_full_disk_access_is_off_only_when_tcc_refuses_the_open() {
-        // VM, from a root LaunchDaemon (no SSH FDA): `head: …/TCC.db: Operation not permitted`.
         let refused = TccRefuses {
             inner: Fake::root(),
             errno: libc::EPERM,
@@ -1355,14 +1296,9 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
             errno: libc::EIO,
         };
         assert_eq!(remote_full_disk_access(&other), None);
-        // A missing database is not a measurement either.
         assert_eq!(remote_full_disk_access(&Fake::root()), None);
     }
 
-    /// The agent's job (root, from the SSH session that started it) answers its own Full
-    /// Disk Access from its own open of the system TCC database, never aterm's; a runner
-    /// that measured this process (`aterm init`, the doctor) gives its answer instead.
-    /// Negative control: filling it from the runner alone leaves the agent's grant `None`.
     #[test]
     fn this_process_s_full_disk_access_is_the_runners_measurement_else_its_own_open() {
         assert_eq!(
@@ -1411,8 +1347,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
 
     #[test]
     fn the_live_keyboard_list_parses_where_hidutil_answers() {
-        // Read-only: `hidutil list` changes nothing. Where it is absent or refuses, the
-        // test ends COULD NOT RUN.
         let ran = match crate::port::Live::new().run(&hidutil_keyboards()) {
             Ok(ran) if ran.success() => ran,
             Ok(ran) => aterm_uds::host::could_not_run(format!(
@@ -1429,7 +1363,6 @@ VendorID ProductID LocationID UsagePage Usage RegistryID  Transport            C
             .filter(|l| l.starts_with("0x"))
             .count();
         let parsed = parse_hidutil_keyboards(&text);
-        // Every services row is a keyboard, listed once per model.
         assert_eq!(parsed.is_empty(), rows == 0, "{text}");
         assert!(parsed.len() <= rows, "{text}");
     }

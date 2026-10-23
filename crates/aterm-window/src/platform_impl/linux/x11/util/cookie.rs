@@ -4,9 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/cookie.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (aterm-x11's Xlib
-// declarations, where upstream used x11-dl's.)
-
 use std::ffi::c_int;
 use std::sync::Arc;
 
@@ -14,9 +11,7 @@ use super::ffi::{self, XEvent, XGenericEventCookie};
 
 use crate::platform_impl::x11::XConnection;
 
-/// XEvents of type GenericEvent store their actual data in an XGenericEventCookie data structure.
-/// This is a wrapper to extract the cookie from a GenericEvent XEvent and release the cookie data
-/// once it has been processed
+/// Wrapper that extracts and releases `XGenericEventCookie` data from a `GenericEvent`.
 pub struct GenericEventCookie {
     cookie: XGenericEventCookie,
     xconn: Arc<XConnection>,

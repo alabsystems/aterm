@@ -707,7 +707,7 @@ fn git_facts(
 fn probe_git_facts(dir: &Path) -> [String; 3] {
     let git = |args: &[&str]| {
         arena::stdout_of(
-            aterm_uds::spawnfd::command("git")
+            aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
                 .args(args)
                 .current_dir(dir),
         )
@@ -856,13 +856,15 @@ fn ledger_paths(dir: &Path, date: &str) -> (PathBuf, PathBuf) {
 
 /// `sysctl -n vm.loadavg`'s three averages (`1.0 2.0 3.0`), or `unavailable`.
 fn load_average() -> String {
-    arena::stdout_of(aterm_uds::spawnfd::command("sysctl").args(["-n", "vm.loadavg"]))
-        .map(|s| {
-            s.trim_matches(|c| c == '{' || c == '}' || c == ' ')
-                .to_string()
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unavailable".to_string())
+    arena::stdout_of(
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl")).args(["-n", "vm.loadavg"]),
+    )
+    .map(|s| {
+        s.trim_matches(|c| c == '{' || c == '}' || c == ' ')
+            .to_string()
+    })
+    .filter(|s| !s.is_empty())
+    .unwrap_or_else(|| "unavailable".to_string())
 }
 
 /// The cores a load average is read against: logical CPUs and, where the OS
@@ -871,7 +873,8 @@ fn cpus() -> String {
     let logical = std::thread::available_parallelism()
         .map_or_else(|_| "?".to_string(), |n| n.get().to_string());
     match arena::stdout_of(
-        aterm_uds::spawnfd::command("sysctl").args(["-n", "hw.perflevel0.physicalcpu"]),
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("sysctl"))
+            .args(["-n", "hw.perflevel0.physicalcpu"]),
     )
     .filter(|s| !s.is_empty())
     {

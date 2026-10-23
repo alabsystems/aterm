@@ -1,14 +1,10 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
 use crate::extra::CellCoord;
 
-/// The ASCII blast leaves the grid exactly as the same bytes written one at a
-/// time through `write_char_wrap` do: every cell, every row's wrap flag, the
-/// cursor and the deferred wrap — from the origin or mid-row, stopping short
-/// of, exactly at or past the line end, wrapping, and scrolling at the bottom.
+/// `write_ascii_blast` matches per-character `write_char_wrap` across row boundaries and scrolling.
 #[test]
 fn write_ascii_blast_matches_per_char_writes() {
     #[expect(clippy::type_complexity, reason = "a test's case table")]
@@ -58,12 +54,7 @@ fn screen_rows(grid: &Grid) -> Vec<String> {
         .collect()
 }
 
-/// ECH clears the extras of the cells it blanks, ICH shifts extras right with
-/// their cells (the inserted blanks carry none), DCH drops the deleted cells'
-/// extras and shifts the rest left. The fixtures attach extras through
-/// `cell_extra_mut`, which sets the cell's HAS_EXTRAS claim as every engine
-/// path does: an entry under a cell without it is an orphan these operations
-/// drop (`Grid::drop_unclaimed_extras`).
+/// ECH clears erased cells' extras, ICH shifts extras right, and DCH shifts remaining extras left.
 #[test]
 fn char_ops_carry_extras_with_their_cells() {
     type Op = fn(&mut Grid, u16);

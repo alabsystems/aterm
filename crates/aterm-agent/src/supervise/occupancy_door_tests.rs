@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE OCCUPANCY DOOR IN THE LOOP (`run/occupancy_loop.rs`'s `occupancy_break`).
+//! Occupancy door tests for supervisor loop breaks.
 
 use std::sync::atomic::AtomicUsize;
 
@@ -57,8 +57,6 @@ impl IdleHost for Board {
     }
 }
 
-/// A board on which every one of `hold-room`'s machine terms holds, a build slot of this
-/// session's held a minute before it was taken.
 fn room() -> OccupancyReading {
     OccupancyReading {
         taken_ms: T0,
@@ -73,8 +71,6 @@ fn room() -> OccupancyReading {
     }
 }
 
-/// The `fact-would@v1` rows of the ledger at `path`: each `(rule, held_ms)`, every one `waiting`
-/// with no command (nothing follows it, nothing was typed).
 fn would_rows(path: &Path) -> Vec<(String, i64)> {
     std::fs::read_to_string(path)
         .unwrap_or_default()
@@ -101,7 +97,6 @@ fn would_rows(path: &Path) -> Vec<(String, i64)> {
         .collect()
 }
 
-/// A rule's `OCCUPANCY` records in `noted`: `(seq, rule, verdict's word)`.
 fn verdicts(noted: &[String]) -> Vec<(u64, String, String)> {
     noted
         .iter()
@@ -121,8 +116,6 @@ fn verdicts(noted: &[String]) -> Vec<(u64, String, String)> {
 const NUDGE: &str = "wait-nudge@v1";
 const ROOM: &str = "hold-room@v1";
 
-/// The break with usage credits carrying the session: Claude Code's lasting notice drawn
-/// right-aligned on the mode row (`aterm_phase::credits`, measured on 2.1.300).
 fn credits_break() -> Vec<String> {
     let mut r = break_screen();
     let mode = r.last_mut().expect("the mode row");
@@ -130,8 +123,6 @@ fn credits_break() -> Vec<String> {
     r
 }
 
-/// A break in a session nobody asked anything: the launch card with no message under it, and
-/// the person's own dev server left running in a shell.
 fn taskless_break() -> Vec<String> {
     let mut r = rows(&[
         " ▐▛███▛█   Claude Code v2.1.300",
@@ -149,8 +140,6 @@ fn taskless_break() -> Vec<String> {
     r
 }
 
-/// What a day of breaks gave: the journal's lines, the would-be rows, the requests the session
-/// made and the board's asks.
 struct Day {
     noted: Vec<String>,
     would: Vec<(String, i64)>,
@@ -162,9 +151,6 @@ struct Day {
     ledger: String,
 }
 
-/// A held session's day: one break, read at each of `at_s` (seconds from its start, the read's
-/// seq its place from 1), on the board `board` where `hosted`, under `policy`, unattended unless
-/// `attended`; `before` runs ahead of each read with the read's seq.
 fn day(
     tag: &str,
     hosted: bool,
@@ -243,15 +229,12 @@ fn day_on(
     }
 }
 
-/// Every `step_s` seconds from `from_s` to `to_s`, both included.
 fn every(from_s: i64, to_s: i64, step_s: usize) -> Vec<i64> {
     (from_s..=to_s).step_by(step_s).collect()
 }
 
 fn nothing_before(_: &mut Session<'_, Mock>, _: u64) {}
 
-/// T-OBS, THE F1 DAY UNDER OBSERVE: a session held six hours on its own background work, read
-/// every five minutes, on a board with room from the start.
 #[test]
 fn the_f1_day_under_observe_books_what_would_go_and_types_nothing() {
     let reads = every(0, 6 * 3600, 300);
@@ -319,11 +302,6 @@ fn the_f1_day_under_observe_books_what_would_go_and_types_nothing() {
     );
 }
 
-/// THE DOOR TELLS ITS HOST ONCE A CHANGE (design §6, `IdleHost::occupancy_said`): the F1 day
-/// under `observe`, read every five minutes, tells the host the hold, each would-be line and
-/// the ready proxy as they change, never the same twice running, and far fewer times than it
-/// reads; what it asks the server is what `off` asks. NEGATIVE CONTROL: under `off` nothing is
-/// told.
 #[test]
 fn the_door_tells_its_host_once_a_change() {
     let reads = every(0, 6 * 3600, 300);
@@ -373,7 +351,6 @@ fn the_door_tells_its_host_once_a_change() {
         "{:#?}",
         d.said
     );
-    // The ready proxy: told once the hold passed hold-room's two hours on a board with room.
     let first_ready = d.said.iter().position(|s| s.ready).expect("ready told");
     let at_ready = &d.said[first_ready];
     assert!(
@@ -402,11 +379,6 @@ fn the_door_tells_its_host_once_a_change() {
     );
 }
 
-/// THE DOOR RUNS ON HOSTED, UNATTENDED LOOPS UNDER A POLICY WHOSE OCCUPANCY IS NOT OFF ALONE (F2):
-/// the same 40 minutes that would nudge under observe book and say nothing with no host, with a
-/// person attending, with no policy, or under `off`. Under `prompt` the due line goes to the
-/// write instead of a would-be row (`occupancy_write_tests.rs`): here the host's `status` names
-/// no person's stamp, which the write reads as someone, so nothing is typed.
 #[test]
 fn the_door_is_open_on_hosted_unattended_loops_only() {
     let reads = every(0, 40 * 60, 300);
@@ -454,9 +426,6 @@ fn the_door_is_open_on_hosted_unattended_loops_only() {
     }
 }
 
-/// THE BOARD IS ASKED AT MOST ONCE A LOOK (F9): a break read every ten seconds for ten minutes
-/// from two hours in, on a board whose machine terms never hold (so `hold-room` stays wanting),
-/// asks it once a minute.
 #[test]
 fn the_board_is_asked_at_most_once_a_look() {
     let no_room = OccupancyReading {
@@ -525,7 +494,6 @@ fn the_board_is_asked_at_most_once_a_look() {
                 } else if missing_clock {
                     s.clock_marks = None;
                 } else if mark_ahead {
-                    // A newer mark must not subtract time or panic.
                     s.clock_marks = Some((s.fx.mono() + Duration::from_millis(1), at_ms + 1));
                 }
                 s.driver = seq == 3;
@@ -561,9 +529,6 @@ fn the_board_is_asked_at_most_once_a_look() {
     }
 }
 
-/// EACH GUARD THE LOOP HOLDS HOLDS THE DUE LINE, said once, from the loop's own state (F1): a
-/// person who typed within their grace, another driver's hand, the halt, the memory wall, the
-/// API's route down, an autopilot the rule is not for.
 #[test]
 fn each_guard_in_hand_holds_the_due_line_once() {
     let reads = [0, 31 * 60, 32 * 60, 33 * 60, 34 * 60];
@@ -761,18 +726,10 @@ fn each_guard_in_hand_holds_the_due_line_once() {
     );
 }
 
-/// THE F1 DAY'S ROWS ARE FEW, HOWEVER ITS GUARDS FLAP (design §6, `fact-held@v1` on a transition
-/// only; the ledger keeps its newest 1024 rows, `approvals::KEEP_ROWS`): a session held sixteen
-/// hours on its own background work, read every five minutes on a board with room, a driver's
-/// hand on every even read and a draft on every odd one, so neither line ever goes and each
-/// rule's word changes at every read. The day books the hold's open row and one held row an
-/// episode a guard: five fact rows in 193 reads. NEGATIVE CONTROL: a row at each change of a
-/// rule's word spends a row a read.
 #[test]
 fn the_f1_days_fact_rows_are_bounded_however_its_guards_flap() {
     let reads = every(0, 16 * 3600, 300);
     let run = || {
-        // The draft is first clocked at the first read, so past the person's grace by 30 min.
         let drafted = std::cell::Cell::new(None);
         day(
             "door-f1-flap",
@@ -828,11 +785,6 @@ fn the_f1_days_fact_rows_are_bounded_however_its_guards_flap() {
     );
 }
 
-/// EACH EPISODE OF A RULE BOOKS ITS OWN HELD ROW (design §6): the F1 day under `observe`, a
-/// driver's hand on the session at the read `hold-room` is first due and again at the read its
-/// second line is due, two hours after the first would have gone. Each is its own episode (the
-/// rule's ordinal in the hold), so each books its row. CONTROL: a guard that holds the first
-/// episode again, after another guard held it between, books no second row.
 #[test]
 fn each_episode_of_a_rule_books_its_own_held_row() {
     use crate::supervise::occupancy::rules::held_rows_in;
@@ -856,7 +808,6 @@ fn each_episode_of_a_rule_books_its_own_held_row() {
             .collect();
         (d.would, held)
     };
-    // The reads at 120 and 245 minutes: the line due first, and its second.
     let (would, held) = run("door-held-episodes", &[25, 50], &[]);
     let rooms: Vec<i64> = would
         .iter()
@@ -881,20 +832,8 @@ fn each_episode_of_a_rule_books_its_own_held_row() {
     );
 }
 
-/// A SUCCESSOR BOOKS NO HELD VERDICT ITS PREDECESSOR BOOKED (design §6): a loop that carries the
-/// hold seeds the held rows booked since the hold began, so the guard still holding the episode
-/// its predecessor booked books nothing more, while a new guard of that episode is booked. The
-/// predecessor's wall stamps may sit a millisecond (or a sleep) either side of what its
-/// monotonic clock put the hold's start at, so the two loops' episode ids part
-/// (`rules::episode`): the successor still books none again, since what it keeps is the
-/// episode's rule and ordinal in the hold, not its id. An earlier hold's held row is not this
-/// hold's. NEGATIVE CONTROLS: the same successor seeded from the ledger without its held row
-/// books it again, and so does one whose ledger holds only that earlier hold's row, while the
-/// same row inside the carried hold books nothing more.
 #[test]
 fn a_successor_books_no_held_verdict_again() {
-    // A loop begun at `start_ms` over the ledger text `file`, seeded from `seed`, its breaks read
-    // `at` ms after its start with `set` run before each: the ledger it leaves.
     let watch = |tag: &str,
                  file: &str,
                  seed: &str,
@@ -934,16 +873,12 @@ fn a_successor_books_no_held_verdict_again() {
     let driver = |s: &mut Session<'_, Mock>| s.driver = true;
     let held = crate::supervise::occupancy::rules::HELD_RULE;
     let predecessor = watch("door-held-1", "", "", T0, &[0, 31 * MIN], &driver);
-    // The rows stamped `skew` ms past the scripted clock's time at the read that booked them:
-    // where the wall clock and the monotonic one agree, and where they part.
     for skew in [0, 1, -1, 90_000] {
         let first = stamped(&predecessor, T0 + 31 * MIN + skew);
         assert_eq!(held_rows_of(&first), [held_by(NUDGE, "person")]);
         let row_ms = crate::supervise::occupancy::hold::seed_row_in(&first, Some("@s-1"))
             .expect("the booked hold")
             .row_ms;
-        // A successor over the predecessor's ledger that reads `seed` at its start: the held
-        // rows the ledger then holds.
         let successor = |tag: &str, seed: &str, set: &dyn Fn(&mut Session<'_, Mock>)| {
             held_rows_of(&watch(tag, &first, seed, row_ms + 2 * MIN, &[0], set))
         };
@@ -967,7 +902,6 @@ fn a_successor_books_no_held_verdict_again() {
             [held_by(NUDGE, "person"), held_by(NUDGE, "person")],
             "skew={skew}: unseeded, booked again"
         );
-        // The same held row, booked before this hold began (an earlier hold's), or after it.
         let row = first
             .lines()
             .find(|l| l.contains(held))
@@ -987,9 +921,6 @@ fn a_successor_books_no_held_verdict_again() {
     }
 }
 
-/// A CARRIED BREAK IS NO DOOR (F10): a read the session's transcript carried as a break
-/// (BG-1, `transcript_wait_seq`), which skips the screen's own break test, judges nothing; the
-/// next drawn read would.
 #[test]
 fn a_carried_break_judges_nothing() {
     let reads = [0, 31 * 60, 32 * 60];
@@ -1018,7 +949,6 @@ fn a_carried_break_judges_nothing() {
     assert_eq!(drawn.would, [(NUDGE.to_string(), 31 * MIN)]);
 }
 
-/// A would-be line a loop booked, as a `fact-would@v1` row stamped `ts`.
 fn would_row(rule: RuleId, ts: i64, held_ms: i64) -> String {
     let reason = crate::supervise::occupancy::rules::would_reason(rule, 1, held_ms, false);
     approvals::Row {
@@ -1031,15 +961,12 @@ fn would_row(rule: RuleId, ts: i64, held_ms: i64) -> String {
     .to_json(ts, Some("@s-1"))
 }
 
-/// What a successor makes of the ledger text `body`, started with its wall clock at `now_ms`:
-/// it reads a break at once and again `later_ms` on.
 fn successor_door(body: &str, now_ms: i64, later_ms: i64) -> (Vec<(String, i64)>, Vec<String>) {
     let s = successor_run(body, now_ms, later_ms, Duration::ZERO);
     let words = s.verdicts.into_iter().map(|(_, _, w)| w).collect();
     (s.would, words)
 }
 
-/// What a successor did ([`successor_run`]).
 struct Successor {
     /// Its would-be rows.
     would: Vec<(String, i64)>,
@@ -1049,8 +976,6 @@ struct Successor {
     episodes: Vec<String>,
 }
 
-/// [`successor_door`] under the break's settle `settle`: the first read is the break's first,
-/// inside any settle.
 fn successor_run(body: &str, now_ms: i64, later_ms: i64, settle: Duration) -> Successor {
     let (dir, path) = ledger_at("door-successor");
     std::fs::write(&path, body).expect("the ledger carried");
@@ -1095,7 +1020,6 @@ fn successor_run(body: &str, now_ms: i64, later_ms: i64, settle: Duration) -> Su
     }
 }
 
-/// A predecessor's open `fact-hold@v1` row: the hold had stood `held_ms` at `row_ms`.
 fn hold_row(row_ms: i64, held_ms: i64) -> String {
     use crate::supervise::occupancy::hold::{RowSaid, row_reason};
     let reason = row_reason(&RowSaid::Open {
@@ -1112,9 +1036,6 @@ fn hold_row(row_ms: i64, held_ms: i64) -> String {
     .to_json(row_ms, Some("@s-1"))
 }
 
-/// A HOLD CARRIED PAST A DAY KEEPS ITS ONE NUDGE (the review of 1b's F1): a successor carries a
-/// hold that has stood 30 h, nudged 29.5 h ago by the loop that watched it then; that nudge is
-/// this hold's, not the day's, and none would go again.
 #[test]
 fn a_hold_carried_past_a_day_keeps_its_nudge() {
     let held = 30 * 60 * MIN;
@@ -1135,9 +1056,6 @@ fn a_hold_carried_past_a_day_keeps_its_nudge() {
     assert_eq!(rows, [(NUDGE.to_string(), held + 4 * MIN)], "the control");
 }
 
-/// THE DOOR WAITS FOR THE BREAK'S SETTLE (the review of 1b's F5): a successor carries a hold
-/// that is due its nudge at once, but its first read is the break's first, inside the settle;
-/// the read past it would.
 #[test]
 fn the_door_waits_for_the_breaks_settle() {
     let held = 40 * MIN;
@@ -1160,13 +1078,6 @@ fn the_door_waits_for_the_breaks_settle() {
     );
 }
 
-/// EACH HOLD SAYS ITS OWN VERDICTS (the review of 1b's F6): another driver's hand on the session
-/// all along holds the nudge in one hold, said once; the agent's own wake ends it, and the next
-/// hold, held the same way, says it again, though the door's first break in it is already past
-/// the nudge's half hour (the hold opened at a break the transcript carried, which the door
-/// skips, F10), so its verdict there is the last hold's last. Each hold books its own held row
-/// (design §6): the held verdicts the door keeps are the open hold's alone. NEGATIVE CONTROL:
-/// a door that keeps them past the change of hold books the second hold's none.
 #[test]
 fn each_hold_says_its_own_verdicts() {
     let run = || {
@@ -1242,10 +1153,6 @@ fn each_hold_says_its_own_verdicts() {
     );
 }
 
-/// A CARRIED HOLD'S EPISODES ARE KEYED BY ITS START ON THE WALL, as the predecessor's row puts
-/// it (its stamp less how long the hold had stood), never by this loop's own clock: two
-/// successors that carry the same row at different times name the same episode, the one
-/// `rules::episode` makes of that start.
 #[test]
 fn a_carried_holds_episode_is_keyed_by_its_start_on_the_wall() {
     let held = 40 * MIN;
@@ -1265,9 +1172,6 @@ fn a_carried_holds_episode_is_keyed_by_its_start_on_the_wall() {
     assert_ne!(other.episodes, [want]);
 }
 
-/// A SUCCESSOR SEEDS THE DOOR'S BOOKS FROM THE WOULD-BE ROWS: a carried hold whose nudge a loop
-/// before booked gets none again, and three nudges booked within the day spend the cap on a new
-/// hold.
 #[test]
 fn a_successor_seeds_the_books_from_the_would_rows() {
     let body = predecessor("door-seed", false, false);
@@ -1307,8 +1211,6 @@ fn a_successor_seeds_the_books_from_the_would_rows() {
     assert_eq!(rows, [(NUDGE.to_string(), 31 * MIN)], "a day old: free");
 }
 
-/// A TAPE FROM A BUILD WITH NO OCCUPANCY DOOR REPLAYS WITHOUT IT (the red-team's F8, through
-/// the replay's own entry: the review of 1b's F4).
 #[test]
 fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     use crate::supervise::tape::codec::Item;
@@ -1375,8 +1277,6 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
             None
         }
     };
-    // What the door tells its host (1e's `host.occupancy_said`) is the door's too: an emit of
-    // its own, with no stamp.
     let is_said = |i: &Item| matches!(i.record(), Some(EffectRecord::Emit { door, .. }) if door == "host.occupancy_said");
     let mut removed = vec![false; items.len()];
     let (mut journals, mut ledgers, mut saids) = (0, 0, 0);
@@ -1450,12 +1350,6 @@ fn a_tape_from_a_build_with_no_occupancy_door_replays_without_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `prompt` TAPE FROM A BUILD WITH NO WRITE REPLAYS AS IT WAS RECORDED (the safety review's
-/// F-B): a build with no `host.occupancy_pace` door (1b's) read `prompt` as `observe`, so its due
-/// line is the would-be row it booked, and no `status` read is asked of the tape. The fixture is
-/// a hosted watch recorded under `observe` whose header then says `prompt` and names no door the
-/// write added. NEGATIVE CONTROL: the same header naming this build's doors replays the write,
-/// whose `status` read the tape does not hold: DIVERGED.
 #[test]
 fn a_prompt_tape_from_a_build_with_no_write_replays_as_observe() {
     use crate::supervise::tape::recover::recover;
@@ -1532,11 +1426,6 @@ fn a_prompt_tape_from_a_build_with_no_write_replays_as_observe() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A TAPE FROM A BUILD WITH THE DOOR BUT NO TELL REPLAYS WITHOUT THE TELLS (the tests review's
-/// F1): a 1b–1d build named `host.occupancy` among its doors but not `host.occupancy_said`, and
-/// told its host nothing, so a replay of its tape tells nothing either — not a break's word,
-/// not a close's, not the loop end's. NEGATIVE CONTROL: the same records under a header that
-/// names the tell's door are this build's, whose tells the records lack: DIVERGED.
 #[test]
 fn a_tape_from_a_build_with_no_tell_replays_without_the_tells() {
     use crate::supervise::tape::codec::Item;
@@ -1602,9 +1491,6 @@ fn a_tape_from_a_build_with_no_tell_replays_without_the_tells() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A CLOSED HOLD IS TOLD (the tests review's F3): the agent's own wake ends the hold the door
-/// told its host, and the host is told it closed, so `occupancy_hold=` and `occupancy why` no
-/// longer show it. NEGATIVE CONTROL: the word told before the close names the hold.
 #[test]
 fn a_closed_hold_is_told_to_the_host() {
     let (dir, path) = ledger_at("door-close-told");
@@ -1652,11 +1538,6 @@ fn a_closed_hold_is_told_to_the_host() {
     assert!(!closed.ready);
 }
 
-/// THE LOOP'S END IS TOLD (the safety review's F2): a hosted watch that ends with its hold open
-/// — as a policy whose occupancy moved ends a tab's loop, handing it to a successor that under
-/// `off` tells nothing — tells its host no hold, once, so the window's board counts none in
-/// `occupancy_hold=` or `ready=`; the tape replays it. NEGATIVE CONTROL: the word before it
-/// names the open hold.
 #[test]
 fn a_loop_that_ends_tells_its_host_no_hold() {
     use crate::supervise::tape::testing::assert_replays;
@@ -1718,11 +1599,6 @@ impl IdleHost for DiesAfterTheHold {
     }
 }
 
-/// A LOOP THAT UNWINDS TELLS ITS HOST NO HOLD (the exit audit's gap 6, `run::UntoldOnUnwind`):
-/// a hosted watch that panics once the door has told its host the open hold leaves no hold on
-/// the window's board — the unwind out of `drive` tells it none, once, as a return does — and
-/// the panic goes on to the loop's caller. NEGATIVE CONTROL: told on the return alone, the open
-/// hold stays the host's last word.
 #[test]
 fn a_loop_that_unwinds_tells_its_host_no_hold() {
     let run = || {

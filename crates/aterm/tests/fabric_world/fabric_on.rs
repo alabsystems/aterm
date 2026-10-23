@@ -1008,6 +1008,7 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     )
     .expect("fake launchctl");
     let path = format!("{}:/usr/bin:/bin", s.path("bin"));
+    let fake = s.dir.join("bin/launchctl");
     // The broker the fake `bootstrap` starts serves until `off` boots it out, and ends
     // itself with this test however the test ends: its lifeline is this FIFO, which the
     // test holds open for writing and never writes (`aterm_uds::lifeline`).
@@ -1027,7 +1028,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     let unmanaged_pid = unmanaged.child.id();
     let (code, out, err) = run(s
         .fabric_cmd(&["on", "--service", "launchd"])
-        .env("PATH", &path));
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
     assert_eq!(code, 1, "{out}\n{err}");
     let broker_lines = step(&out, "broker");
     assert!(
@@ -1052,7 +1054,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     assert!(!s.config().exists(), "the run stopped before the config");
     let (code, dry, _) = run(s
         .fabric_cmd(&["on", "--service", "launchd", "--dry-run"])
-        .env("PATH", &path));
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
     assert_eq!(code, 1, "{dry}");
     assert!(
         step(&dry, "broker").iter().any(|l| l.contains("FAILED")),
@@ -1084,7 +1087,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     };
     let (code, out, err) = run(s
         .fabric_cmd(&["on", "--service", "systemd"])
-        .env("PATH", &path));
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
     assert_eq!(code, 1, "{out}\n{err}");
     assert!(
         step(&out, "broker")
@@ -1102,7 +1106,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     let _ = std::fs::remove_file(&systemd_calls);
     let (code, out, err) = run(s
         .fabric_cmd(&["on", "--service", "systemd"])
-        .env("PATH", &path));
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
     assert_eq!(code, 1, "{out}\n{err}");
     let broker = step(&out, "broker");
     assert!(
@@ -1132,7 +1137,10 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         if dry {
             args.push("--dry-run");
         }
-        let (code, out, err) = run(s.fabric_cmd(&args).env("PATH", &path));
+        let (code, out, err) = run(s
+            .fabric_cmd(&args)
+            .env("PATH", &path)
+            .env("ATERM_TEST_LAUNCHCTL", &fake));
         assert_eq!(code, 1, "{out}\n{err}");
         assert!(
             step(&out, "broker")
@@ -1166,7 +1174,10 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
         if dry {
             args.push("--dry-run");
         }
-        let (code, out, err) = run(s.fabric_cmd(&args).env("PATH", &path));
+        let (code, out, err) = run(s
+            .fabric_cmd(&args)
+            .env("PATH", &path)
+            .env("ATERM_TEST_LAUNCHCTL", &fake));
         assert_eq!(code, 1, "{out}\n{err}");
         assert!(
             step(&out, "broker")
@@ -1186,7 +1197,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
 
     let (code, out, err) = run(s
         .fabric_cmd(&["on", "--service", "launchd"])
-        .env("PATH", &path));
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
     assert_eq!(code, 0, "{out}\n{err}");
     let text = std::fs::read_to_string(&plist).expect("the plist was written inside the root");
     assert!(
@@ -1237,7 +1249,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     std::fs::remove_file(&calls).expect("reset");
     let (code, out, _) = run(s
         .fabric_cmd(&["on", "--service", "launchd"])
-        .env("PATH", &path));
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
     assert_eq!(code, 0, "{out}");
     assert!(
         step(&out, "plist").iter().any(|l| l.contains("already")),
@@ -1258,7 +1271,8 @@ fn launchd_is_asked_through_a_derived_label_and_the_plist_is_the_scripts() {
     std::fs::remove_file(&calls).expect("reset");
     let (code, out, _) = run(s
         .fabric_cmd(&["off", "--service", "launchd"])
-        .env("PATH", &path));
+        .env("PATH", &path)
+        .env("ATERM_TEST_LAUNCHCTL", &fake));
     assert_eq!(code, 0, "{out}");
     assert!(!plist.exists(), "off removes the plist");
     assert!(

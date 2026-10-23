@@ -1,16 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `cat_glyph` — render one layered glyph asset TOML
-//! (`crates/aterm-effects/art/glyphs/<id>.toml`) to a PNG for visual review, with the
-//! [`aterm_scene::vector`] filler the bake uses, on a light or dark ground.
-//!
-//! ```text
-//! targo --unverified run -q -p aterm-effects --example cat_glyph -- <asset.toml> <out.png> [--px 200] [--bg dark|light]
-//! ```
-//!
-//! The asset format is in `art/glyphs/README.md`. This tool always paints each layer's
-//! `ref_fill`, ignoring its `recolor` tag; painter order is file order.
+//! `cat_glyph` — render one layered glyph asset TOML to a PNG for visual review.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -59,7 +50,6 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    // Preserve aspect: fit the viewbox height to `px`, width follows.
     let scale = px as f32 / vh;
     let tw = (vw * scale).round().max(1.0) as u32;
     let th = px;

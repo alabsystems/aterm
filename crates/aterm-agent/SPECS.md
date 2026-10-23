@@ -552,7 +552,7 @@ ledger-gather	contract	ledger::{gather,Ledger::summary,items}, parse_history_rec
 ledger-since	contract	parse_since, ledger::gather (since filter)	parse_since is total and accepts ms or a valid date[-time][zone]; with since every item has t ≥ since.	1,3,5,7	3/3
 ledger-clock-words	contract	span, stamp, zone	span in s / m ss / h mm; stamp in local time with or without the date; zone UTC±HH:MM.	1,3	1/1
 ledger-render-escapes	contract	render_md, render (Html)	Markdown escapes | in cells; HTML is one self-contained, well-formed page with worker text escaped and `</script>` only where it belongs.	1,3,5,7	2/2
-limit-zone-and-reset-grammar	contract	limit::{parse_zone,parse_reset,parse_clock,resumes_by_itself,one_line}	parse_zone = ±HHMM seconds; parse_reset accepts the span, clock and date shapes with zones and refuses out-of-range parts; resumes_by_itself by its phrases; one_line joins words.	1,3,5,7	8/8
+limit-zone-and-reset-grammar	contract	limit::{parse_reset,parse_clock,resumes_by_itself,one_line,zone_offset_at}	parse_reset accepts the span, clock and date shapes with zones and refuses out-of-range parts; resumes_by_itself by its phrases; one_line joins words; zone_offset_at is None for a name no zone has.	1,3,5,7	8/8
 limit-reset-placement	refinement	limit::{reset_at,civil,days_from_civil}	reset_at equals the reference placement (spans from now, dated in the nearest year, bare clocks today unless passed beyond SAME_DAY); civil and days_from_civil are inverse bijections.	1,3,5,7,13	3/3
 limit-wall-placement	contract	limit::{reset_in_zone,reset_at_with,place_reset,place_reset_with,within_a_session_window,offset_at,zone_offset_at}, Session::{reset_unix_for,reset_unix}	reset_in_zone finds the wall-clock instant after now in that zone's offset at that instant (DST-correct); place_reset puts a weekly/spend wall's bare clock after its print, a session wall's within 5 h of the print, else the session rule; an undated cancelled limit is clamped to a session window; zone lookups refuse non-zone names.	1,3,5,7,8,13	7/7
 mail-row-and-principal	round-trip	mail::{MailRow::parse,line,is_report_from,is_from_session,newest_id,body_rows}	parse reads exactly the msg row grammar; line prints the MAIL line; is_from_session matches whole principals; body_rows skips the report stamp line.	1,3,5,7	2/2
@@ -1979,7 +1979,7 @@ src/supervise/limit.rs	a_walls_bare_clock_is_the_first_occurrence_after_its_prin
 src/supervise/limit.rs	a_zones_offset_is_read_at_the_instant	limit-wall-placement	
 src/supervise/limit.rs	both_spellings_parse_with_the_zone	limit-zone-and-reset-grammar	
 src/supervise/limit.rs	the_auto_continue_shapes_are_a_time_today_or_tomorrow_or_a_minute	limit-zone-and-reset-grammar	
-src/supervise/limit.rs	the_local_zone_is_read_from_date	limit-zone-and-reset-grammar	
+src/supervise/limit.rs	the_local_zone_is_the_c_librarys_and_no_zone_is_made_up	limit-zone-and-reset-grammar	
 src/supervise/mail.rs	a_busy_worker_is_not_nudged	mail-task-protocol	
 src/supervise/mail.rs	a_nudge_never_lands_in_a_live_box	mail-task-protocol	
 src/supervise/mail.rs	a_post_that_did_not_land_is_the_servers_words	mail-task-protocol	
@@ -3134,7 +3134,7 @@ Status 2026-10-17: the rows of those six are gone, and so is the **move-to-bench
 32. `src/harness/upgrade_queued_tests.rs` fixture `limit_row` uses max(1791046800, now+86400), so the exercised case changes once the real date passes the recorded reset.
 33. `src/supervise/answer.rs::the_box_token_names_one_screen` asserts pairwise distinctness of a 32-bit folded hash, which is not a universal property; the spec claims only determinism.
 34. `src/supervise/config.rs::a_value_it_cannot_read_keeps_its_default_and_only_an_off_limits`: `"off"` for continue_per_hour and human_grace_s changes nothing, contradicting the doc's 'an off is still the limit'; state the numeric-key exemption or fix the code.
-36. `src/supervise/limit.rs::the_local_zone_is_read_from_date` depends on the runner's zone and duplicates the parse_zone table.
+36. `src/supervise/limit.rs::the_local_zone_is_the_c_librarys_and_no_zone_is_made_up` depends on the runner's zone (a bound, not a value); its `date +%z` oracle is `aterm_uds::zone`'s.
 37. `src/supervise/ledger_tests.rs::without_a_clock_*` (two tests) are near-duplicates over the same branch.
 39. `src/supervise/approvals.rs::a_row_carries_the_hash_of_the_whole_command_and_a_cut_copy` includes a sha256("abc") known-vector check of the sha2 dependency.
 40. `src/supervise/ledger_html.rs` and the HTML ledger test rely on cfg(test) checkers (is_self_contained, well_formed); the spec they imply is checked only by test code.

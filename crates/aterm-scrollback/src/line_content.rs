@@ -6,43 +6,31 @@
 use super::INLINE_SIZE;
 
 /// Fixed-capacity inline byte buffer for short scrollback lines.
-///
-/// Holds up to `INLINE_SIZE` (32) bytes inline. The length is a `u8` (bounded by
-/// `INLINE_SIZE`, asserted below), saving 7 bytes on every hot-tier `Line`
-/// against a `usize` length.
 #[derive(Debug, Clone)]
 pub(crate) struct InlineBuf {
     buf: [u8; INLINE_SIZE],
     len: u8,
 }
 
-// `len: u8` holds only while the inline capacity fits in a `u8`.
 const _: () = assert!(INLINE_SIZE <= u8::MAX as usize);
 
 impl InlineBuf {
-    /// Create from a slice. Caller guarantees `bytes.len() <= INLINE_SIZE`.
-    // Skip: the one open is `copy_from_slice`'s len-mismatch assert, in the
-    // absent std body; both sub-slices are `..n`, so it cannot fire. Drop the
-    // skip once Trust has a conditional `copy_from_slice` len==len template.
+    /// Create from a slice.
+    // Skip: the one open is `copy_from_slice`'s len-mismatch assert, in the absent std body.
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     fn from_slice(bytes: &[u8]) -> Self {
         debug_assert!(bytes.len() <= INLINE_SIZE);
         let mut buf = [0u8; INLINE_SIZE];
         let n = bytes.len();
-        // Total `get_mut`/`get`: `n <= INLINE_SIZE` by contract, but the
-        // panic-freedom verifier cannot see it.
         if let (Some(dst), Some(src)) = (buf.get_mut(..n), bytes.get(..n)) {
             dst.copy_from_slice(src);
         }
-        // `n <= INLINE_SIZE <= u8::MAX` by contract, so the `as u8` is exact.
         Self { buf, len: n as u8 }
     }
 
     #[inline]
     fn as_slice(&self) -> &[u8] {
-        // Checked `get`: `len <= INLINE_SIZE` by construction, so the fallback is
-        // unreachable and there is no slice-bounds panic path to prove away.
         self.buf.get(..self.len as usize).unwrap_or(&self.buf)
     }
 
@@ -53,9 +41,6 @@ impl InlineBuf {
 }
 
 /// Line content storage.
-///
-/// Uses small-string optimization: lines up to `INLINE_SIZE` bytes are stored
-/// inline, longer lines use heap allocation.
 #[derive(Debug, Clone)]
 #[allow(clippy::large_enum_variant)] // Inline variant is intentionally large — that's the point of inline storage
 pub(crate) enum LineContent {
@@ -84,14 +69,7 @@ impl LineContent {
         }
     }
 
-    /// Create from an owned buffer, taking it over instead of copying it.
-    ///
-    /// A row materialized out of the grid builds its text into a fresh `String`;
-    /// moving it saves the second allocation and copy that
-    /// [`from_bytes`](Self::from_bytes) makes for any line over 32 bytes. The
-    /// shrink keeps `Line::memory_used()` (which counts `Vec::capacity` and backs
-    /// the byte budget) at the exact-fit size `from_bytes` produces; it is a
-    /// no-op when the caller sized the buffer exactly.
+    /// Create from an owned buffer ([`from_bytes`](Self::from_bytes)).
     #[must_use]
     #[inline]
     pub(crate) fn from_vec(mut bytes: Vec<u8>) -> Self {

@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The sub-row scroll translate on the shipping renderer (`render_input` /
-//! `render_input_cached`): at `scroll_frac_px == 0` it is the identity, and for
-//! any `scroll_frac_px` every pixel outside the grid band
-//! `[grid_top_row, grid_bot_row)` is byte-identical to the frac-0 frame. The
-//! geometry's own lattice proofs are in `aterm_render::scroll_translate`.
+//! Sub-row scroll translation tests on `render_input` and `render_input_cached`.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme};
@@ -23,14 +19,10 @@ fn seeded_terminal() -> Terminal {
         };
         t.process(line.as_bytes());
     }
-    // Into history, so the grid shows scrollback.
     t.scroll_display(5);
     t
 }
 
-/// A frame with row 0 as tab-strip chrome, the last row as bottom chrome and
-/// the middle as the grid: the `[grid_top_row, grid_bot_row)` layout the compose
-/// path emits.
 fn frame_with_partition(t: &mut Terminal, frac: i32) -> aterm_core::render::RenderInput {
     let mut input = t.cell_frame(ROWS, COLS);
     input.grid_top_row = 1; // row 0 = tab strip (chrome)
@@ -44,9 +36,7 @@ fn frac_zero_is_byte_identical_to_untranslated() {
     let mut r = Renderer::from_system(16.0, Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     let mut t = seeded_terminal();
-    // A frame with a grid partition but frac 0.
     let zero = r.render_input(&frame_with_partition(&mut t, 0));
-    // The same viewport with no partition set at all.
     let plain = {
         let input = t.cell_frame(ROWS, COLS);
         r.render_input(&input)
@@ -69,7 +59,6 @@ fn chrome_pixels_are_invariant_under_any_frac() {
         .expect("no font: build with aterm-render's default embedded-font feature");
     let (_cw, cell_h) = r.cell_size();
     let pad = r.pad();
-    // Grid band in device pixels (the renderer's own row→px mapping).
     let y0 = pad + cell_h; // grid_top_row = 1
     let y1 = pad + (ROWS - 1) * cell_h; // grid_bot_row = ROWS-1
 
@@ -79,8 +68,6 @@ fn chrome_pixels_are_invariant_under_any_frac() {
 
     let mut any_moved = false;
     let mut any_down = false;
-    // Both signs: a positive frac shifts the grid band up (glide), a negative
-    // one down (the overscroll bounce at a history end).
     for frac in (-(cell_h as i32 - 1)..cell_h as i32).filter(|&f| f != 0) {
         let mut t = seeded_terminal();
         let shifted = r.render_input(&frame_with_partition(&mut t, frac));

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! SETTINGS ▸ HARNESS (`docs/DESIGN-harness-autopilot-2026-10-15.md` §4): the coding agents' harness page, headed "Coding agent harness" where that fits (else "Harness", its rail entry), a SPECIAL route built like Packages over the host's [`HarnessState`] (`crate::harness_screen`).
+//! Native Settings Harness page ([`HarnessState`]).
 
 use super::*;
 use crate::autopilot_timers::TimerChoice;
@@ -13,29 +13,28 @@ use crate::harness_screen::{
 use crate::native_app::{HarnessRequest, HarnessTimerRequest};
 use aterm_agent::supervise::Autopilot;
 
-/// Every action the page mints starts with this (`harness/refresh`, `harness/open-config`, `harness/session/<id>/autopilot/<word>`).
+/// Every action the page mints starts with this.
 pub(super) const HARNESS_ACTION_PREFIX: &str = "harness/";
 
-/// The Refresh button's key and action: read the ledgers again.
+/// The Refresh button's key and action.
 pub(super) const HARNESS_REFRESH: &str = "harness/refresh";
 
 /// The Open aterm.toml button's key and action.
 pub(super) const HARNESS_OPEN_CONFIG: &str = "harness/open-config";
 
-/// The SETTINGS IN ATERM.TOML card's disclosure: every key, or only yours.
+/// The SETTINGS IN ATERM.TOML card's disclosure.
 pub(super) const HARNESS_CONFIG_TOGGLE: &str = "harness/config/toggle";
 
-/// DECIDED FOR YOU's disclosure (§10.4.1): every choice made today, or the newest three.
+/// DECIDED FOR YOU's disclosure (§10.4.1).
 pub(super) const HARNESS_DECIDED_ALL: &str = "harness/decided/all";
 
 /// How many of today's choices DECIDED FOR YOU shows, its disclosure closed.
 const DECIDED_SHOWN: usize = 3;
 
-/// The most lines one choice's sentence is drawn on (its label keeps it
-/// whole).
+/// The most lines one choice's sentence is drawn on (its label keeps it whole).
 const DECIDED_LINES: usize = 4;
 
-/// A SESSIONS row's timer press: `harness/session/<id>/land-in/<minutes>`, `…/land-at`, `…/land-cancel` (design §9.3.4) — under the session prefix, so Owner-only on the control surface like its mode buttons.
+/// A SESSIONS row's timer press: `harness/session/<id>/land-in/<minutes>`.
 pub(super) fn timer_action(local_id: u64, choice: TimerChoice) -> String {
     let prefix = crate::harness_screen::SESSION_ACTION_PREFIX;
     match choice {
@@ -45,7 +44,7 @@ pub(super) fn timer_action(local_id: u64, choice: TimerChoice) -> String {
     }
 }
 
-/// [`timer_action`] read back; `None` for any other action, and for a duration the page does not offer.
+/// [`timer_action`] read back.
 pub(super) fn parse_timer_action(action: &str) -> Option<(u64, TimerChoice)> {
     let rest = action.strip_prefix(crate::harness_screen::SESSION_ACTION_PREFIX)?;
     let (id, what) = rest.split_once('/')?;
@@ -62,7 +61,7 @@ pub(super) fn parse_timer_action(action: &str) -> Option<(u64, TimerChoice)> {
     Some((id.parse().ok()?, choice))
 }
 
-/// A SESSIONS row's Timer disclosure: `harness/session/<id>/timer`.
+/// A SESSIONS row's Timer disclosure.
 pub(super) fn timer_toggle(local_id: u64) -> String {
     format!(
         "{}{local_id}/timer",
@@ -79,7 +78,7 @@ fn parse_timer_toggle(action: &str) -> Option<u64> {
         .ok()
 }
 
-/// A SESSIONS row's `Show`: `harness/session/<id>/show` — raise the session's tab and pane (§10.3.1).
+/// A SESSIONS row's `Show`: `harness/session/<id>/show`.
 pub(super) fn show_action(local_id: u64) -> String {
     format!(
         "{}{local_id}/show",
@@ -87,7 +86,7 @@ pub(super) fn show_action(local_id: u64) -> String {
     )
 }
 
-/// The `Every session` row's Timer disclosure: `harness/session/all/timer` (design §11.5.1), under the session prefix like a row's.
+/// The `Every session` row's Timer disclosure.
 pub(super) fn every_timer_toggle() -> String {
     format!(
         "{}{}/timer",
@@ -107,8 +106,7 @@ fn parse_show_action(action: &str) -> Option<u64> {
 
 pub(super) use crate::harness_screen::HARNESS_LAND;
 
-/// The key the page lands on for `focus`: a session row's `Show` button (a
-/// control of the row's own stop), or SUPERVISION's first switch.
+/// The key the page lands on for `focus`.
 fn landing_key(focus: crate::harness_screen::HarnessFocus) -> Option<UiKey> {
     use crate::harness_screen::HarnessFocus;
     match focus {
@@ -120,16 +118,16 @@ fn landing_key(focus: crate::harness_screen::HarnessFocus) -> Option<UiKey> {
     }
 }
 
-/// The AI CLIs button's key: its action is the sub-page's route.
+/// The AI CLIs button's key.
 pub(super) const HARNESS_AI_CLIS: &str = "harness/ai-clis";
 
-/// The Tab Control button's key: its action is the sub-page's route.
+/// The Tab Control button's key.
 pub(super) const HARNESS_TAB_CONTROL: &str = "harness/tab-control";
 
 /// The page's heading (its rail label is the route's, "Harness").
 pub(super) const HARNESS_PAGE_TITLE: &str = "Coding agent harness";
 
-/// The SUPERVISION card's registry rows: every row of the Harness section, in the registry's order, so an agent's switch added to the registry is on the page with no list here — but the AI CLIs' (`ai.`), which its AI CLIs sub-page draws ([`super::ai_page::ai_page_rows`]).
+/// The SUPERVISION card's registry rows ([`super::ai_page::ai_page_rows`]).
 pub(super) fn harness_page_rows() -> impl Iterator<Item = &'static str> {
     prefs::NESTED_LEAVES
         .iter()
@@ -138,7 +136,7 @@ pub(super) fn harness_page_rows() -> impl Iterator<Item = &'static str> {
         .filter(|key| !key.starts_with(super::ai_page::AI_KEY_PREFIX))
 }
 
-/// A card's padding (the metadata cards' own), the tight padding a row card takes where its tallest row fits a page's room only that way, and the gap between a card's rows.
+/// A card's padding.
 pub(super) const CARD_PAD: f32 = ABOUT_METADATA_CARD_PADDING;
 pub(super) const TIGHT_CARD_PAD: f32 = 8.0;
 pub(super) const CARD_GAP: f32 = 6.0;
@@ -146,7 +144,7 @@ pub(super) const CARD_GAP: f32 = 6.0;
 /// The gap between a session row's three buttons.
 const MODE_GAP: f32 = 6.0;
 
-/// The page's subtitle, which yields to nothing: it must fit the compact phone page and the minimum Medium measure (the subtitle-fit test).
+/// The page's subtitle, which yields to nothing.
 pub(super) fn harness_page_subtitle(width: SettingsWidth) -> &'static str {
     if width == SettingsWidth::Compact {
         "Autopilot, switches, and stats."
@@ -155,9 +153,7 @@ pub(super) fn harness_page_subtitle(width: SettingsWidth) -> &'static str {
     }
 }
 
-/// The page's heading on a page `width` wide: "Coding agent harness" where it
-/// is whole, else the route's own name, "Harness" (large type on a phone
-/// page).
+/// The page's heading on a page `width` wide.
 fn harness_page_title(width: f32) -> &'static str {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Hero);
     if crate::tray_raster::ui_text_width_for(face, HARNESS_PAGE_TITLE, px) <= width {
@@ -167,7 +163,7 @@ fn harness_page_title(width: f32) -> &'static str {
     }
 }
 
-/// A card's heading at `width`: its full words, else its short ones.
+/// A card's heading at `width`.
 pub(super) fn card_heading(full: &str, short: &str, width: f32) -> String {
     let (px, face) = crate::native_ui::text_paint_metrics(SemanticRole::Heading, StyleRef::Quiet);
     let fits = |text: &str| {
@@ -200,7 +196,7 @@ pub(super) fn harness_commands(harness: &HarnessState) -> Vec<Command> {
 }
 
 impl SettingsApp {
-    /// A press on the page ([`HARNESS_ACTION_PREFIX`]): Refresh and a session's Autopilot become typed host requests ([`HarnessRequest`]); Open aterm.toml is the Manual route's own act, aimed at the `[harness]` table and staying on this page.
+    /// A press on the page ([`HARNESS_ACTION_PREFIX`], [`HarnessRequest`]).
     pub(super) fn reduce_harness_action(
         &mut self,
         view: &mut SettingsViewState,
@@ -273,11 +269,6 @@ impl SettingsApp {
                 view.harness_every_timer_open = false;
                 view.reveal_pressed(timer_opening_reveal(Some(session)));
             } else {
-                // THE TIMER CLOSED GIVES BACK THE PLACE ITS OPENING SCROLLED:
-                // the list seats on its stops again, and the press's reveal
-                // keeps the Timer whole under the pointer — the closed row is
-                // drawn whole where it was, never left under the caption
-                // above it (the second review of 2026-10-20, R2).
                 view.drop_list_nudge();
             }
             view.invalidate_result_page_limit();
@@ -287,7 +278,6 @@ impl SettingsApp {
                 view.harness_timer_open = None;
                 view.reveal_pressed(timer_opening_reveal(None));
             } else {
-                // Its place given back, as a row's Timer closing (above).
                 view.drop_list_nudge();
             }
             view.invalidate_result_page_limit();
@@ -382,9 +372,7 @@ pub(super) fn harness_page(
     out
 }
 
-/// The page while a choice picker for one of its rows is open: the picker
-/// alone under the heading (beside nothing on a short landscape host, where
-/// it takes the compact landscape choice page).
+/// The page while a choice picker for one of its rows is open.
 fn harness_choice_page(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -418,8 +406,7 @@ fn harness_choice_page(
     out
 }
 
-/// Every card of the page, in order, each no taller than `room` where its
-/// rows allow (a single row taller than the room is a card of its own).
+/// Every card of the page.
 fn harness_cards(
     state: &SettingsViewState,
     harness: &HarnessProjection,
@@ -535,8 +522,7 @@ fn harness_cards(
     cards
 }
 
-/// Running harness provenance and installed CLI facts are distinct: an idle
-/// session may still be waiting to resume on the installed replacement.
+/// Running harness provenance and installed CLI facts are distinct.
 fn harness_update_rows(
     harness: &HarnessProjection,
     update: &UpdateProjection,
@@ -574,8 +560,7 @@ fn harness_update_rows(
     ]
 }
 
-/// Existing update and version pages remain the places that check, install,
-/// and report failures.
+/// Existing update and version pages remain the places that check, install, and report failures.
 fn harness_update_actions(card_width: f32) -> (UiNode, f32) {
     let buttons = [
         ("software", "Software Update", SettingsRoute::SoftwareUpdate),
@@ -628,7 +613,8 @@ fn fits_in(text: &str, width: f32, role: SemanticRole, style: StyleRef) -> bool 
     crate::tray_raster::ui_text_width_for(face, text, px) <= width
 }
 
-/// STATUS'S TODAY (§10.3.1, [`crate::harness_screen::HarnessState::today_lines`]) as one block of the card, keyed `harness/status/today`, its label both lines whole, no taller than `budget`: the first line in Hero type (the page heading's) where it counts and is whole at the card's `inner` width, else in the page's plain type — a note (`nothing yet today`, `reading…`, [`crate::harness_screen::today_counts`]) always plain; the second, where there is one, plain.
+/// Today's status ([`crate::harness_screen::HarnessState::today_lines`],
+/// [`crate::harness_screen::today_counts`]).
 pub(super) fn today_block(
     lines: &(String, String),
     inner: f32,
@@ -709,10 +695,7 @@ const LEAD_WORD_GAP: f32 = 6.0;
 /// The room between the lead's two sides.
 const LEAD_SIDE_GAP: f32 = 24.0;
 
-/// `text` as `width` lines in plain type, each whole: broken greedily at the
-/// joins `tokens` carry (`(join, token)`; the first join is never drawn) and,
-/// inside a token too wide for a line, between its words; a word too wide
-/// alone is elided.
+/// `text` as `width` lines in plain type, each whole.
 fn lead_lines(tokens: &[(&str, String)], width: f32) -> Vec<String> {
     let fits = |text: &str| fits_in(text, width, SemanticRole::Text, StyleRef::Primary);
     let mut pieces: Vec<(&str, &str)> = Vec::new();
@@ -755,20 +738,7 @@ fn lead_lines(tokens: &[(&str, String)], width: f32) -> Vec<String> {
         .collect()
 }
 
-/// EFFECT OF EACH AUTOPILOT'S LEAD (§11.6.3, item 2;
-/// [`crate::harness_ab::ab_lead`]) as the card's first block, keyed
-/// `harness/ab/lead` and spoken whole ([`AbLead::words`]), its parts
-/// drawn only:
-///
-/// * **Both sides**: the caption, `Working time held at a box or a
-///   question`, in the page's plain type; under it the two sides in a row —
-///   each share in Hero type (the page heading's), its working time beside
-///   it plain, on the figure's baseline — where the row is whole at the
-///   card's `inner` width. Otherwise the whole lead in plain type, `Working
-///   time held at a box or a question: <1% of 6h 10m on Cruise · 14% of 25m
-///   off`, on as many lines as it needs, broken at its joins
-///   ([`lead_lines`]): never cut, since each side is half the comparison.
-/// * **No Off time**: the note, always plain, broken between words.
+/// Autopilot lead block ([`crate::harness_ab::ab_lead`], [`AbLead::words`], [`lead_lines`]).
 pub(super) fn ab_lead_block(lead: &AbLead, inner: f32) -> (UiNode, f32) {
     let plain_height = 28.0_f32.max(18.0 * settings_text_scale());
     let hero_height = page_heading_height();
@@ -906,9 +876,7 @@ pub(super) fn ab_lead_block(lead: &AbLead, inner: f32) -> (UiNode, f32) {
     block(vec![caption, shares], plain_height + 4.0 + hero_height)
 }
 
-/// The SETTINGS IN ATERM.TOML card's facts: every `[harness]` setting while
-/// its disclosure is `open`; else the ones the person changed, then how many
-/// more are at their defaults.
+/// The `SETTINGS IN ATERM.TOML` card's facts.
 fn config_facts(harness: &HarnessProjection, open: bool) -> Vec<(String, String)> {
     if harness.config_rows.is_empty() {
         return vec![("Settings".to_string(), "reading\u{2026}".to_string())];
@@ -929,9 +897,7 @@ fn config_facts(harness: &HarnessProjection, open: bool) -> Vec<(String, String)
     rows
 }
 
-/// The disclosure under the SETTINGS IN ATERM.TOML card: every one of the
-/// table's `keys`, or only the ones the person changed (`open` says which it
-/// shows).
+/// The disclosure under the SETTINGS IN ATERM.TOML card.
 fn config_disclosure(open: bool, keys: usize, card_width: f32) -> (UiNode, f32) {
     let height = scaled_control_height();
     let (label, forms) = if open {
@@ -979,7 +945,7 @@ fn config_disclosure(open: bool, keys: usize, card_width: f32) -> (UiNode, f32) 
     )
 }
 
-/// A fact card ([`metadata_card`]) `card_width` wide keyed `key`, its caption fitted to the card's text column ([`card_heading`], `heading` its full and short words), its facts set by the one measured rule ([`FactColumns`]) with a name column `label_width` wide where they sit beside each other.
+/// Fact card ([`metadata_card`]) keyed `key` ([`card_heading`], [`FactColumns`]).
 pub(super) fn metadata_cards(
     key: &str,
     heading: (&str, &str),
@@ -991,7 +957,7 @@ pub(super) fn metadata_cards(
     vec![metadata_card(key, &caption, rows, card_width, label_width)]
 }
 
-/// A card of control rows: a Secondary group, its heading, then its rows — ONE CARD, however tall, as every group of a settings list is: the page's list lists it a row at a time and keeps its heading over a screen that starts inside it ([`scroll::SplitCard`]).
+/// A card of control rows: a Secondary group, its heading, then its rows ([`scroll::SplitCard`]).
 pub(super) fn row_cards(
     key: &str,
     names: (&str, (&str, &str)),
@@ -1002,16 +968,10 @@ pub(super) fn row_cards(
     row_cards_inset(key, names, rows, (room, card_width), false)
 }
 
-/// How far a SESSIONS row's words stand inside the block its landing draws the accent card on (§10.3.1): the outline clear of every glyph and button.
+/// How far a SESSIONS row's words stand inside the block its landing draws the accent card on.
 pub(super) const ROW_INSET: f32 = 8.0;
 
-/// [`row_cards`], where `blocks`, of rows a landing can draw selected
-/// (SESSIONS, [`session_timer`]'s block): each row's block keeps
-/// [`ROW_INSET`] beside its words and half the gap between rows over and
-/// under them, taken from the card's padding and that gap — so every word
-/// stands where it would stand without it, the heading's too (inset as the
-/// rows are, in a frame the list still reads as the card's head), and
-/// nothing moves when a row lands.
+/// [`row_cards`] ([`session_timer`], [`ROW_INSET`]).
 fn row_cards_inset(
     key: &str,
     names: (&str, (&str, &str)),
@@ -1098,9 +1058,7 @@ fn row_cards_inset(
     vec![(card, height)]
 }
 
-/// The page's four actions under the STATUS card: Refresh (busy while the
-/// ledgers are read), Open aterm.toml, AI CLIs (Settings ▸ Harness ▸ AI CLIs),
-/// and Tab Control (Settings ▸ Harness ▸ Tab Control).
+/// The page's four actions under the STATUS card.
 fn harness_actions(harness: &HarnessProjection, card_width: f32) -> (UiNode, f32) {
     let control_height = scaled_control_height();
     let need = |label: &str| crate::native_ui::native_button_label_width(label) + 40.0;
@@ -1242,9 +1200,7 @@ fn harness_actions(harness: &HarnessProjection, card_width: f32) -> (UiNode, f32
     )
 }
 
-/// The SUPERVISION card's rows, each the way every page draws a setting
-/// ([`page_box_setting_rows`]): its note and its Changed tag and Reset with
-/// it.
+/// The SUPERVISION card's rows ([`page_box_setting_rows`]).
 fn switch_rows(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -1261,10 +1217,7 @@ fn switch_rows(
     page_box_setting_rows(state, &rows, width, inner, None, Some(row_room))
 }
 
-/// "No Claude Code or Codex session is open": every agent the harness
-/// supervises or watches (`Program::ALL`, `harness_table`) by its product
-/// name, so a new agent's sessions are named here as its Settings row is,
-/// with no edit.
+/// "No Claude Code or Codex session is open".
 fn no_session_open() -> String {
     let products: Vec<&str> = aterm_phase::Program::ALL
         .into_iter()
@@ -1279,10 +1232,7 @@ fn no_session_open() -> String {
     format!("No {named} session is open")
 }
 
-/// The SESSIONS card's rows: one per live session of an agent the harness
-/// supervises, then — where it lists two or more — the `Every session` row
-/// ([`every_row`]), or the one line that says none is open (or that the
-/// page is still reading).
+/// The SESSIONS card's rows ([`every_row`]).
 fn session_rows(
     harness: &HarnessProjection,
     width: SettingsWidth,
@@ -1329,12 +1279,7 @@ fn session_rows(
     rows
 }
 
-/// AN OPEN TIMER'S CHOICES, ONE PIECE OF ITS ROW: its lines of choices
-/// (`<row>/timer-row/<n>`) in one column, `<row>/timer-choices`, so a row
-/// listed a part at a time by the page's list ([`scroll::row_parts`]) keeps
-/// every choice the Timer opened in one
-/// part where they fit one, never `1 hour` on one screen and `at 18:00` on
-/// the next (the open `Every session` row at 2× text on a short page).
+/// AN OPEN TIMER'S CHOICES, ONE PIECE OF ITS ROW ([`scroll::row_parts`]).
 fn timer_choices(key: &str, rows: Vec<(UiNode, f32)>) -> (UiNode, f32) {
     let height = rows.iter().map(|(_, height)| height).sum::<f32>()
         + 4.0 * rows.len().saturating_sub(1) as f32;
@@ -1349,12 +1294,7 @@ fn timer_choices(key: &str, rows: Vec<(UiNode, f32)>) -> (UiNode, f32) {
     )
 }
 
-/// WHAT A TIMER'S OPENING REVEALS: its first choice, whose stop holds every
-/// choice it opened ([`scroll::row_parts`] keeps them one part) — the block
-/// itself where the room holds it whole, the part listing the choices where
-/// the block is listed a part at a time (the open `Every session` row at 2×
-/// text on a short page: its Timer button's part was revealed, and `at 18:00`
-/// was on no screen).
+/// WHAT A TIMER'S OPENING REVEALS: its first choice ([`scroll::row_parts`]).
 fn timer_opening_reveal(session: Option<u64>) -> UiKey {
     let first = TimerChoice::In(crate::autopilot_menu::LAND_IN_MINUTES[0]);
     UiKey::new(match session {
@@ -1363,18 +1303,10 @@ fn timer_opening_reveal(session: Option<u64>) -> UiKey {
     })
 }
 
-/// The `Every session` row's faces, in its order: Cruise, Land, its Timer
-/// disclosure, Follow the default.
+/// The `Every session` row's faces, in its order.
 const EVERY_FACES: [&str; 4] = ["Cruise", "Land", "Timer", "Follow the default"];
 
-/// SESSIONS' `EVERY SESSION` ROW (design §11.5.1), after the per-session
-/// rows: its name and what is there now (`5 sessions: 3 cruising, 1
-/// landing, 1 off`, [`EveryRow::line`]), then `Cruise`, `Land`, `Timer` and
-/// `Follow the default`, each spoken with what it moves (`Land every
-/// session, 3 sessions`) and described with what stays (`Land 3 sessions;
-/// the 1 off stays off`, [`EveryRow::description`]); its Timer, open, holds
-/// `1 hour`, `2 hours`, `4 hours` and `at 18:00` (with `[harness] land_at` set,
-/// `offer`) as a row's does, and no cancel: Cruise drops every timer.
+/// SESSIONS' `EVERY SESSION` ROW ([`EveryRow::line`], [`EveryRow::description`]).
 fn every_row(
     every: &EveryRow,
     measure: RowMeasure,
@@ -1742,25 +1674,13 @@ fn every_row(
     )
 }
 
-/// THE TIMER'S CHOICES WHERE THEY WRAP (owner-eye-3, the Every row's in
-/// §11.13 and a session row's in the final check of 2026-10-20, F2): the one
-/// width each choice takes where `own` — each its own words' width — do not
-/// all stand on one line in `room` (between them, [`MODE_GAP`]): the
-/// widest, so each line's choices start where the line above's do — never
-/// `at 18:00` a few points right of `1 hour`, nor `Cancel` of `2 hours`.
+/// THE TIMER'S CHOICES WHERE THEY WRAP ([`MODE_GAP`]).
 fn wrapped_width(own: &[f32], room: f32) -> Option<f32> {
     let line = own.iter().sum::<f32>() + own.len().saturating_sub(1) as f32 * MODE_GAP;
     (line > room).then(|| own.iter().copied().fold(0.0_f32, f32::max))
 }
 
-/// A SESSIONS row under its STATE LINE and its open TIMER (§9.3.4): the
-/// `row` node as built (its `Timer` disclosure beside the mode buttons, and
-/// its setting line, [`session_row`]), then — where its glass says
-/// something — the state line
-/// (`lands at 18:00`, `landed 17:42`, `last: ✓ approved 14:05`: clock times
-/// only), then, the disclosure open, `1 hour`, `2 hours`, `4 hours`, `at 18:00` (with
-/// `[harness] land_at` set, `offer`) and `Cancel` (while a timer is armed),
-/// in as many lines as the column needs.
+/// A SESSIONS row under its STATE LINE and its open TIMER ([`session_row`]).
 fn session_timer(
     row: &HarnessSessionRow,
     (node, height): (UiNode, f32),
@@ -1960,12 +1880,7 @@ fn session_timer(
     )
 }
 
-/// DECIDED FOR YOU'S ROWS (§10.4.1): the newest three of today's choices, or
-/// every one kept with its disclosure `open`, newest first — each its clock
-/// time, its sentence on as many lines as the column needs (at most
-/// [`DECIDED_LINES`], its label whole), and `Show tab` while its session is
-/// open, beside the words where the column leaves them room, else under
-/// them; then, where there are more than three, the disclosure.
+/// DECIDED FOR YOU'S ROWS ([`DECIDED_LINES`]).
 fn decided_rows(harness: &HarnessProjection, inner: f32, open: bool) -> Vec<(UiNode, f32)> {
     let shown = if open {
         harness.decided.len()
@@ -2007,8 +1922,7 @@ fn decided_rows(harness: &HarnessProjection, inner: f32, open: bool) -> Vec<(UiN
     out
 }
 
-/// How DECIDED FOR YOU's rows are laid out at the page's measure: one
-/// decision for every row ([`decided_rows`]).
+/// How DECIDED FOR YOU's rows are laid out at the page's measure ([`decided_rows`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct DecidedMeasure {
     /// The clock column's width.
@@ -2021,8 +1935,7 @@ struct DecidedMeasure {
     stacked: bool,
 }
 
-/// One choice's row, keyed `harness/decided/<id>` (its decision's id), its
-/// label its clock and its sentence whole.
+/// One choice's row.
 fn decided_row(row: &crate::harness_screen::DecidedRow, measure: DecidedMeasure) -> (UiNode, f32) {
     let scale = settings_text_scale();
     let line_height = 20.0_f32.max(18.0 * scale);
@@ -2142,9 +2055,7 @@ fn decided_row(row: &crate::harness_screen::DecidedRow, measure: DecidedMeasure)
     (node, height)
 }
 
-/// DECIDED FOR YOU's disclosure (`harness/decided/all`): every one of the
-/// `kept` choices (of `total` today: the newest [`aterm_agent::harness::stats::DECIDED_KEEP`]
-/// are kept), or, `open`, only the newest three.
+/// DECIDED FOR YOU's disclosure ([`aterm_agent::harness::stats::DECIDED_KEEP`]).
 fn decided_disclosure(open: bool, (kept, total): (usize, u64), inner: f32) -> (UiNode, f32) {
     let height = scaled_control_height();
     let (label, visual) = if open {
@@ -2191,9 +2102,7 @@ fn decided_disclosure(open: bool, (kept, total): (usize, u64), inner: f32) -> (U
     )
 }
 
-/// Why a session's Autopilot press writes nothing: the harness steers no
-/// mode for it — no host here, the master switch Off, or (the window
-/// supervising) its agent's own switch Off, named as its row is.
+/// Why a session's Autopilot press writes nothing: the harness steers no mode for it.
 fn nothing_to_steer(posture: crate::autopilot::HarnessPosture, product: &str) -> String {
     match posture {
         crate::autopilot::HarnessPosture::Unhosted => {
@@ -2224,18 +2133,15 @@ const fn mode_label(mode: Autopilot) -> &'static str {
     }
 }
 
-/// What a mode does, for its button's description: its sentence from the
-/// one table (`autopilot::MODE_WORDS`, §12.4.1).
+/// What a mode does, for its button's description.
 const fn mode_description(mode: Autopilot) -> &'static str {
     crate::autopilot::mode_words(mode).button
 }
 
-/// The five faces of a SESSIONS row's buttons, in their order: the three
-/// modes, `Timer`, `Show`.
+/// The five faces of a SESSIONS row's buttons, in their order.
 const ROW_FACES: [&str; 5] = ["Cruise", "Land", "Off", "Timer", "Show"];
 
-/// HOW THE SESSIONS ROWS ARE LAID OUT at the page's measure (§10.3.4, "A
-/// narrow page"): one decision for every row, so the list reads as one.
+/// HOW THE SESSIONS ROWS ARE LAID OUT at the page's measure (§10.3.4, "A narrow page").
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct RowMeasure {
     /// A fixed button's width, beside the words.
@@ -2303,12 +2209,7 @@ fn setting_line_height() -> f32 {
     18.0_f32.max(16.0 * settings_text_scale())
 }
 
-/// A SESSIONS ROW'S SETTING LINE (design §11.7.1, §11.7.7;
-/// [`HarnessSessionRow::setting`]), keyed `harness/session/<id>/setting`:
-/// `its own setting, set 14:05 over aterm ctl` or `follows the default`,
-/// its label the words whole and its text the words whole too, on as many
-/// lines of the column `inner` as they need ([`wrapped_words_node`]) — once
-/// cut after a comma where the column was narrow.
+/// A SESSIONS ROW'S SETTING LINE ([`HarnessSessionRow::setting`], [`wrapped_words_node`]).
 fn setting_line(row: &HarnessSessionRow, inner: f32) -> (UiNode, f32) {
     let key = format!("harness/session/{}/setting", row.local_id);
     let (text, height) = wrapped_words_node(
@@ -2336,12 +2237,7 @@ fn line_button(inner: f32, count: u8) -> f32 {
     (inner - (count - 1.0) * MODE_GAP) / count
 }
 
-/// One session's row: its title and detail (fitted to the text column; the
-/// row's group carries both whole), its Cruise | Land | Off buttons keyed
-/// `harness/session/<id>/autopilot/<word>`, the mode it runs under selected,
-/// and beside them its `Timer` disclosure (`harness/session/<id>/timer`,
-/// `timer_open` its `expanded` state; [`session_timer`] lays what it opens)
-/// and its `Show`.
+/// One session's row ([`session_timer`]).
 fn session_row(
     row: &HarnessSessionRow,
     timer_open: bool,

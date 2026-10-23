@@ -1,12 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Fallback-coverage gate: a chain face may only win a code point its Unicode cmap
-//! really covers. fontdue's char lookup can mis-select a Mac Roman subtable on Apple
-//! `.ttc` fonts (as `primary_unicode_gid` documents), letting a face such as
-//! `Hiragino Sans GB.ttc`, which has no Hangul, claim Korean syllables and draw Han glyphs.
 
-/// Every syllable of a Korean line lands on one face that has it.
+//! Fallback-coverage tests for Unicode cmap selection.
+
 #[test]
 fn korean_resolves_consistently_to_a_face_that_has_hangul() {
     let mut r = aterm_render::Renderer::from_system(28.0, aterm_render::Theme::default())
@@ -30,8 +26,6 @@ fn korean_resolves_consistently_to_a_face_that_has_hangul() {
          symptom of a face claiming coverage it does not have",
         homes.len()
     );
-    // Non-vacuity: an empty `homes` (every syllable tofu) also passes the check above, so
-    // where a Hangul face is installed every syllable must resolve.
     if hangul_face_installed() {
         assert_eq!(
             resolved,
@@ -43,15 +37,10 @@ fn korean_resolves_consistently_to_a_face_that_has_hangul() {
     }
 }
 
-/// Whether a face known to carry Hangul is on disk. Read from the filesystem, not the
-/// candidate list, so dropping the Hangul face from the chain fails instead of skipping.
 fn hangul_face_installed() -> bool {
     const KNOWN_HANGUL_FACES: &[&str] = &[
-        // Windows
         "C:\\Windows\\Fonts\\malgun.ttf",
-        // macOS (Arial Unicode carries the syllables)
         "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-        // Linux
         "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     ];

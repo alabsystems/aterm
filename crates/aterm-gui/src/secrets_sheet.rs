@@ -24,8 +24,7 @@ pub(crate) struct SecretsSheet {
 
 impl Drop for SecretsSheet {
     fn drop(&mut self) {
-        // SAFETY: retained AppKit objects on the main thread; -setStringValue: copies
-        // and -endSheet:returnCode: ends an attached sheet.
+        // SAFETY: retained AppKit objects on the main thread; -setStringValue: copies and -endSheet:returnCode: ends an attached sheet.
         unsafe {
             if let Some(empty) = appkit::nsstring("") {
                 appkit::send_v_id(self.field.id(), sel!(setStringValue:), empty.id());
@@ -42,7 +41,6 @@ impl Drop for SecretsSheet {
     }
 }
 
-/// The sheet's words.
 const TITLE: &str = "Connect secrets vault";
 
 fn informative() -> String {
@@ -67,8 +65,7 @@ impl App {
                     .as_ref()
                     .map(|w| crate::platform::ns_window_of(w))
                     .filter(|id| !id.is_null())
-                    // SAFETY: a live NSWindow borrowed on the main thread; `-window` is +0,
-                    // retained into an owning `Obj`.
+                    // SAFETY: a live NSWindow borrowed on the main thread; `-window` is +0, retained into an owning `Obj`.
                     .and_then(|id| unsafe { Obj::retain(id) })
                     .map(|ns_window| (*wid, ns_window))
             });
@@ -167,11 +164,7 @@ impl App {
             appkit::send_v_id(accessory.id(), sel!(addSubview:), field.id());
             (url, accessory)
         };
-        // SAFETY: standard NSAlert and event-queue calls on the main thread, as the askpass
-        // sheet's: text setters copy, `-addButtonWithTitle:` returns the +0 button the alert
-        // owns, `-setAccessoryView:` retains the accessory, and
-        // `-beginSheetModalForWindow:completionHandler:` copies the block. The field and
-        // panel are retained for the App to hold.
+        // SAFETY: standard NSAlert and event-queue calls on the main thread: text setters copy, `-addButtonWithTitle:` returns +0 owned by alert, `-setAccessoryView:` retains accessory, `-beginSheetModalForWindow:completionHandler:` copies block, and field/panel are retained.
         let (panel, input_fence) = crate::askpass::PROMPT_INPUT.present(|| unsafe {
             let past = appkit::send_id(class(c"NSDate").as_id(), sel!(distantPast));
             if past.is_null() {

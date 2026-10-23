@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Each `sys` view, as text lines and as JSON (§13.4, §13.6).
-//!
-//! TEXT: the header goes on stderr (`OK <n> sys v=1 view=… as_of=… age_ms=…
-//! window_ms=… next=…`), body lines on stdout, one record per line, each
-//! starting with its key word, so a reader parses by the first token. Two
-//! kinds of line never mix: SENTENCE lines (`global`, `aterm`, `tab 1`,
-//! `cpu`, `mem`, …), whose words carry no name any process chose; and RECORD
-//! lines (`cluster`, `core`, `proc`, `part`, `top`, `root`, `writer`,
-//! `volume`, `e`), `key=value` after the key word, values in base units
-//! (`cpu_mc=` millicores, `fp_bytes=`, `write_bps=`, `busy_pm=` permille),
-//! every name pct-encoded. An unmeasured value reads `unavailable(<word>)`,
-//! never 0; a bound carries `≥`/`≤`.
-//!
-//! JSON: `"schema": 1`, `"kind": "sys.<view>"`, `as_of` at the top, every
-//! figure in one of the four shapes of [`super::json`], every scope object
-//! with its `exact` word.
+//! Each `sys` view as text lines and as JSON.
 
 use super::disk::{self, RootSize};
 use super::jobs_view;
@@ -31,13 +16,11 @@ use crate::words;
 /// One body line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Line {
-    /// Its key (`global`, `tab 1`, `core S1`, `proc 52114`): what a delta
-    /// compares by.
+    /// Line key compared by a delta.
     pub key: String,
     /// The line as printed.
     pub text: String,
-    /// Whether it states a value a delta compares (`more=`, events, notes
-    /// and `gap` lines do not).
+    /// Whether it states a value a delta compares.
     pub value: bool,
 }
 
@@ -48,8 +31,7 @@ pub struct Reply {
     pub view: View,
     /// The scope read, for the views that take one.
     pub scope: Option<ScopeArg>,
-    /// What a `why` reply reads (`global.cpu`, `global.mem`, or `global` for
-    /// the calm reply); `None` for every other view.
+    /// Subject of a `why` reply, or `None` for every other view.
     pub subject: Option<&'static str>,
     /// Body lines.
     pub lines: Vec<Line>,
@@ -58,9 +40,7 @@ pub struct Reply {
 }
 
 impl Reply {
-    /// The header line (no trailing newline): `OK <n> sys v=1 view=<v>
-    /// [scope=<s>] [subject=<s>] as_of=<hh:mm:ss.mmm> age_ms=<n>
-    /// window_ms=<n> next=<cursor> [state=stale|warming] [delta=1]`.
+    /// Format the reply header line without a trailing newline.
     #[must_use]
     pub fn header(&self, ctx: &Ctx<'_>, delta: bool) -> String {
         let n = if self.json.is_some() {
@@ -108,10 +88,6 @@ pub(super) fn header_line(
     h
 }
 
-/// When the figures `view` prints were read, unix ms, how old they are, ms,
-/// and the window they cover, ms; `None` with no snapshot. A `why` reply's
-/// are its split's, read on some readings and carried on the others (the
-/// snapshot's before the first split).
 fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, u64, Option<u64>)> {
     let snap = ctx.snap?;
     match snap.why.as_deref().filter(|_| view == View::Why) {
@@ -127,7 +103,7 @@ fn as_of(view: View, ctx: &Ctx<'_>) -> Option<(u64, u64, Option<u64>)> {
     }
 }
 
-/// The rate window a snapshot's figures cover, ms.
+/// Rate window covered by a snapshot's figures, in milliseconds.
 #[must_use]
 pub fn window_ms(s: &Snapshot) -> Option<u64> {
     s.procs_window_ns
@@ -190,9 +166,6 @@ impl Fig {
         }
     }
 
-    /// The share of the scope's demand that waited for a core: `None` only
-    /// when no member's runnable time gave a delta (not sampled); a measured
-    /// scope that neither ran nor waited starved 0%, never "not sampled".
     fn starved(&self) -> Option<f32> {
         let w = self.wait?;
         let d = w + self.cores;
@@ -226,10 +199,8 @@ pub(super) fn scope_keys(ctx: &Ctx<'_>, scope: ScopeArg) -> Vec<u64> {
     }
 }
 
-/// The figures of the sessions `keys`.
 fn tabs_fig(s: &Snapshot, keys: &[u64], target: u64) -> Fig {
     let mut f = Fig::default();
-    // The target's own session first, so its program names the scope.
     let mut ordered: Vec<u64> = keys.to_vec();
     ordered.sort_by_key(|k| u8::from(*k != target));
     for k in ordered {
@@ -242,7 +213,6 @@ fn tabs_fig(s: &Snapshot, keys: &[u64], target: u64) -> Fig {
     f
 }
 
-/// Cores-worth to one decimal with `c`: `4.1c`.
 fn c1(x: f32) -> String {
     format!("{}c", words::cores(x))
 }
@@ -260,7 +230,6 @@ fn mc_opt(x: Option<f32>) -> Option<u64> {
     x.map(mc)
 }
 
-/// A rate in bytes per second as people read it: `7.1 MB/s`, `0 B/s`.
 fn bps_word(b: f64) -> String {
     let b = b.max(0.0);
     if b >= 1e9 {
@@ -284,7 +253,6 @@ pub(super) fn rec<T: std::fmt::Display>(v: Option<T>, why: &str) -> String {
     v.map_or_else(|| unavailable(why), |v| v.to_string())
 }
 
-/// The machine's words for a sentence: `3.1 of 10 cores busy, rising; …`.
 fn global_clauses(ctx: &Ctx<'_>, s: &Snapshot) -> Vec<String> {
     let mut parts = Vec::new();
     if let Some(cpu) = s.cpu.as_ref() {
@@ -420,7 +388,6 @@ fn note(key: &str, text: impl Into<String>) -> Line {
     }
 }
 
-/// The `rest` line: the split in words.
 fn rest_line(ctx: &Ctx<'_>, s: &Snapshot, tab: &Fig) -> Option<Line> {
     let Some(sp) = s.split else {
         return s.procs_window_ns.map(|_| {
@@ -450,11 +417,8 @@ fn rest_line(ctx: &Ctx<'_>, s: &Snapshot, tab: &Fig) -> Option<Line> {
     Some(line("rest", text))
 }
 
-/// The wall clock of an event, from the snapshot's.
 fn event_unix_ms(ctx: &Ctx<'_>, s: &Snapshot, at_ns: u64) -> u64 {
     match at_ns.checked_sub(s.at_ns) {
-        // A newer machine-only reading may have published this event while
-        // the workers still hold the last whole snapshot.
         Some(after) => ctx.as_of_unix_ms.saturating_add(after / 1_000_000),
         None => ctx
             .as_of_unix_ms
@@ -462,11 +426,6 @@ fn event_unix_ms(ctx: &Ctx<'_>, s: &Snapshot, at_ns: u64) -> u64 {
     }
 }
 
-/// Whether event `e` prints for this caller (§13.3): an owner-class caller
-/// sees every event; anyone else the machine's (pressure, throttle, swap,
-/// disk, lanes, and the machine's and aterm's load without its `top=` name,
-/// [`load_top_shown`]) and the target tab's own (its load, its jobs).
-/// Another tab's load, opening, orphans and jobs are that tab's.
 fn event_shown(ctx: &Ctx<'_>, e: &crate::events::Event) -> bool {
     if ctx.owner_class {
         return true;
@@ -483,9 +442,6 @@ fn event_shown(ctx: &Ctx<'_>, e: &crate::events::Event) -> bool {
     }
 }
 
-/// Whether a load event's `top=`, a name a process chose, prints: the
-/// target tab's own load names its own process; the machine's or aterm's
-/// names any, an owner-class caller's to read (like `procs scope=global`).
 fn load_top_shown(ctx: &Ctx<'_>, scope: &LoadScope) -> bool {
     ctx.owner_class || matches!(scope, LoadScope::Tab(k) if ctx.target.panes.contains(k))
 }
@@ -585,7 +541,6 @@ fn event_line(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Line {
                 to.word(),
                 class.word()
             ));
-            // The task id is a join key of the caller's own tab's calls.
             if let Some(task) = task.as_deref().filter(|_| ctx.target.panes.contains(tab)) {
                 t.push_str(&format!(" task={}", exe_word(task)));
             }
@@ -705,7 +660,7 @@ fn event_json(ctx: &Ctx<'_>, s: &Snapshot, e: &crate::events::Event) -> Jv {
     o
 }
 
-/// The reply's text lines for `q`.
+/// Render the reply's text lines for `q`.
 #[must_use]
 pub fn render_text(q: &SysQuery, ctx: &Ctx<'_>) -> Reply {
     let scope = q.effective_scope();
@@ -862,8 +817,6 @@ fn tab_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     ));
 }
 
-/// `: cwd, repo, build`: what the scope's roots are, counted not named (a
-/// name goes in a record line, `sys disk`).
 fn root_kinds_words(ctx: &Ctx<'_>) -> String {
     let mut kinds: Vec<&str> = Vec::new();
     for k in ctx.roots.iter().flat_map(|r| r.kinds.iter()) {
@@ -878,7 +831,6 @@ fn root_kinds_words(ctx: &Ctx<'_>) -> String {
     }
 }
 
-/// `zsh 1 · claude 1 · trustc 6 · other 3`: the scope's processes by exe word.
 fn proc_census(s: &Snapshot, keys: &[u64]) -> String {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for r in s
@@ -1163,8 +1115,6 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
     );
 }
 
-/// Machine-wide rows (processes outside aterm): owner-class callers only; a
-/// scoped caller gets `withheld=<n>`.
 fn top_rows(
     q: &SysQuery,
     ctx: &Ctx<'_>,
@@ -1202,9 +1152,6 @@ fn top_rows(
     }
 }
 
-/// The rows' summed CPU, cores-worth: `None` while it is warming (some row
-/// is readable and none has a rate yet: one sweep has no interval), so the
-/// total never reads 0 for a scope nothing measured yet.
 fn procs_total(rows: &[&ProcView]) -> Option<f32> {
     let measured = rows.iter().any(|r| r.cores.is_some());
     let readable = rows.iter().any(|r| !r.refused);
@@ -1271,12 +1218,10 @@ fn g2(b: u64) -> String {
     format!("{:.2}", b as f64 / f64::from(1u32 << 30))
 }
 
-/// One class's GiB, or why it is not read.
 fn class_g2(b: Option<u64>) -> String {
     b.map_or_else(|| unavailable("not_sampled"), g2)
 }
 
-/// `used … = app … + wired … + compressed … · cache … · free … · <rest> … GiB`.
 fn mem_sum_words(m: &crate::model::MemView, exact: bool) -> String {
     let c = mem_classes(m, exact);
     format!(
@@ -1302,9 +1247,6 @@ fn mem_class_words(m: &crate::model::MemView, exact: bool) -> String {
     t
 }
 
-/// The commit charge against its limit (Linux, Windows): whether the
-/// limit is enforced (Windows fails an allocation there while RAM is
-/// free) or advisory (Linux overcommit).
 fn commit_words(c: &crate::model::CommitSample) -> String {
     let pct = c
         .pct()
@@ -1317,8 +1259,6 @@ fn commit_words(c: &crate::model::CommitSample) -> String {
     format!("{} of {} GiB ({pct}) · {how}", g2(c.charge), g2(c.limit))
 }
 
-/// Without counters no interval can supply a rate; with them, the first
-/// reading is warming until a second one supplies the interval.
 fn paging_why(m: &crate::model::MemView) -> &'static str {
     if m.sample.counters.is_some() {
         "warming"
@@ -1398,8 +1338,6 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         q.top,
         &|k| ctx.tab_number(k),
     ));
-    // `await sys job=` reads the rows of the session it targets: a job of
-    // another tab is waited on through that tab's session id.
     let (at, wait_on) = rows
         .iter()
         .find(|r| r.verdict != crate::jobs::Verdict::Exited)
@@ -1422,7 +1360,6 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
         ScopeArg::Aterm => " · sys jobs scope=global (owner)",
         ScopeArg::Global => "",
     };
-    // One `more=` line: the rows `top=` left out first, then what to ask next.
     let left = jobs_view::overflow(rows.len(), q.top).map_or_else(String::new, |w| w + " · ");
     lines.push(note(
         "more",
@@ -1432,7 +1369,6 @@ fn jobs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     ));
 }
 
-/// A core's people label: its cluster's letter and its 1-based place in it.
 fn core_labels(cpu: &crate::model::CpuView) -> Vec<(usize, String, usize)> {
     let mut out = Vec::new();
     for (level, c) in cpu.clusters.iter().enumerate() {
@@ -1547,9 +1483,6 @@ fn gpu_text(ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     ));
 }
 
-/// A device's model name as the OS reports it, for a sentence: letters,
-/// digits, spaces and `.-+()` only (a kernel fact, never a process's choice;
-/// anything else is dropped rather than printed).
 fn device_word(name: &str) -> String {
     let kept: String = name
         .chars()
@@ -1674,9 +1607,6 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     }
 }
 
-/// Writer identities in the requested scope: an owner sees every row, a
-/// scoped caller only its target tab's. Window aggregates and root facts
-/// stay available without exposing another tab's process names.
 fn disk_writers<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> (Vec<&'a ProcView>, usize) {
     let keys = scope_keys(ctx, ScopeArg::Tab);
     let mut withheld = 0usize;
@@ -1781,8 +1711,6 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
             rec.push_str(&format!(" counted_in=tab{t}"));
         }
         lines.push(line(format!("root {n}"), rec));
-        // Where the space is: subtrees down to `depth=`, the paths only in a
-        // folder of the caller's own tab (§13.3 rule 4), a rank otherwise.
         for (rank, d) in r
             .dirs
             .iter()
@@ -1846,11 +1774,9 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(note("summary", disk_summary(ctx)));
 }
 
-/// The subtrees `sys disk` lists under each root when `depth=` is not given.
+/// Default subtree depth listed by `sys disk` under each root.
 pub const DISK_DEPTH_DEFAULT: u8 = 3;
 
-/// `sys disk`'s closing line: the warnings and what was not measured, or
-/// that sizes are not sampled here.
 fn disk_summary(ctx: &Ctx<'_>) -> String {
     let Some(t) = ctx.disk else {
         return format!(
@@ -1888,7 +1814,6 @@ fn disk_summary(ctx: &Ctx<'_>) -> String {
     out
 }
 
-/// The rows a `procs` scope covers.
 fn procs_in_scope<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> Vec<&'a ProcView> {
     let keys = scope_keys(ctx, scope);
     s.procs
@@ -1901,8 +1826,6 @@ fn procs_in_scope<'a>(ctx: &Ctx<'_>, s: &'a Snapshot, scope: ScopeArg) -> Vec<&'
         .collect()
 }
 
-/// A row's label: `root` (the tab's shell), `fg` (the terminal's foreground
-/// group), `job` (another of the tab's processes); outside a tab, its scope.
 fn proc_label(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> &'static str {
     match r.scope {
         RowScope::Tab(k) => {
@@ -1991,8 +1914,6 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
         ));
     }
 }
-
-// JSON
 
 fn as_of_json(view: View, ctx: &Ctx<'_>) -> Jv {
     let (unix, age, window) = match as_of(view, ctx) {
@@ -2200,8 +2121,6 @@ fn split_json(s: &Snapshot, tab: &Fig) -> Jv {
     match s.split {
         Some(sp) => {
             let rest = (sp.aterm - tab.cores).max(0.0);
-            // The parts add up to the machine's busy figure exactly: the
-            // services part is the remainder after the integer parts.
             let whole = mc(sp.global) as i64;
             let t = mc(tab.cores) as i64;
             let r = mc(rest) as i64;
@@ -2228,7 +2147,7 @@ fn split_json(s: &Snapshot, tab: &Fig) -> Jv {
     }
 }
 
-/// The reply's JSON for `q`.
+/// Render the reply's JSON for `q`.
 #[must_use]
 pub fn render_json(q: &SysQuery, ctx: &Ctx<'_>) -> Jv {
     let scope = q.effective_scope();
@@ -2773,8 +2692,6 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     o
 }
 
-/// The scope's processes as JSON: `{"why":"warming"}` until a second sweep
-/// gives the rows their interval (§13.7).
 fn procs_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, scope: ScopeArg) -> Jv {
     if s.procs_window_ns.is_none() {
         return Jv::why("warming");

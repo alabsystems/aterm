@@ -1,21 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-// Enable `macro_attr` where anchor attributes expand as `macro_rules!`.
 #![cfg_attr(
     all(anchor_rules, any(test, all(debug_assertions, target_os = "macos"))),
     feature(macro_attr)
 )]
 
-//! Signature-pinned in-app self-update for macOS `aterm.app` and enrolled [`linux`] binaries.
-//!
-//! * [`apply_staged_if_ready_preserving_fds_exact`]: boot entry point that swaps a verified staged
-//!   build into place under [`ImageReplacement`], or leaves it as [`ApplyOutcome::LeftForSession`]
-//!   (until [`LEFT_STAGE_ESCAPE`] launches pass) when [`swap_staged_for_launch`] did not run first.
-//! * [`spawn_background_check_with_settings`]: background checker that downloads, verifies, and
-//!   stages newer channel releases without blocking the UI.
-//! * Verification enforces monotonic build floors, SHA-256 digests, Ed25519 roster signatures, and
-//!   optional [`PINNED_TEAM_ID`] code-signing and notarization checks.
+//! Signature-pinned in-app self-update for macOS app bundles and enrolled [`linux`] binaries.
 #![cfg_attr(
     test,
     allow(
@@ -31,7 +22,6 @@ aterm_durable::plain_durable_flushes_in_tests!();
 mod bundle;
 #[cfg(any(target_os = "macos", test))]
 mod cadence;
-/// The schedule's constants and [`STALE_CHECK_AFTER`], compiled on every target.
 mod cadence_bounds;
 #[cfg(target_os = "macos")]
 mod check_lane;
@@ -162,7 +152,6 @@ pub use relaunch::{
 /// The Apple Developer Team ID for the optional Tier APPLE anchor.
 pub const PINNED_TEAM_ID: &str = aterm_update_core::pins::APPLE_TEAM_ID;
 
-/// Runtime raise of the Tier APPLE anchor, from `[update] require_team_id` in the GUI config.
 static REQUIRED_TEAM_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 /// Opts in to Developer-ID and notarization enforcement at runtime, without a rebuild.
@@ -1042,7 +1031,6 @@ fn preverify_installed_at<R>(
     Ok(read_policy(app_root))
 }
 
-/// This process is a handoff candidate that has not taken.
 static UNCOMMITTED_CANDIDATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -1289,7 +1277,6 @@ pub fn health_failing_class(title: &str) -> Option<&'static str> {
         })
 }
 
-/// The class whose title `class` shares.
 fn health_class_canonical(class: &str) -> &'static str {
     match class {
         "apply" => "apply",
@@ -1347,7 +1334,6 @@ impl HealthAnnouncer {
         }
     }
 
-    /// The loud notice owed because a newer build has waited on this machine for more.
     fn tick_overdue(
         &mut self,
         h: &health::Health,
@@ -1373,7 +1359,6 @@ impl HealthAnnouncer {
         Some(pending_update_overdue_notice(h, current_build))
     }
 
-    /// The `(title, body)` owed to the GUI for the ledger as it stands at `now`, or `None`.
     fn tick(
         &mut self,
         h: &health::Health,
@@ -1405,15 +1390,11 @@ impl HealthAnnouncer {
         if !h.is_persistent()
             && let Some((class, _)) = self.announced.take()
         {
-            // All healed: any class may speak again. A failure this process
-            // reported gets its recovery reported once, naming the class, so the
-            // standing row can leave (see [`HealthNotify`]).
             return Some((HEALTH_RECOVERED_TITLE.to_string(), class.to_string()));
         }
         None
     }
 
-    /// [`Self::tick`] as this process's announcer.
     fn tick_for_process(
         &mut self,
         process: &AnnouncedHealth,
@@ -1429,7 +1410,6 @@ impl HealthAnnouncer {
     }
 }
 
-/// The classes [`health::Health::persistent_class`] can name.
 const ANNOUNCED_CLASSES: [&str; 4] = ["manifest", "stage", "pipeline", "apply"];
 
 /// What this process has announced about the ledger's health.
@@ -1490,7 +1470,6 @@ impl AnnouncedHealth {
     }
 }
 
-/// The process's [`AnnouncedHealth`].
 static ANNOUNCED_HEALTH: AnnouncedHealth = AnnouncedHealth::new();
 
 /// An update's successor takes up what its parent announced.
@@ -1787,7 +1766,6 @@ mod persistent_notice_tests {
             let said =
                 super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, later, 10, true);
             if withdrawal == "none" {
-                // Negative control: a stage merely consumed keeps its clock.
                 assert!(said.is_some(), "a stranded machine must still be told");
             } else {
                 assert!(
@@ -2458,7 +2436,6 @@ impl HolderBeat {
         Self::start_with(path, every, move || alive())
     }
 
-    /// Rewrites the lock at `path` every `every` while `alive` answers yes.
     fn start_with(
         path: std::path::PathBuf,
         every: std::time::Duration,
@@ -2535,7 +2512,6 @@ fn beat_fresh(beat: &checker_watch::CheckerBeat) -> bool {
 
 #[cfg(target_os = "macos")]
 thread_local! {
-    /// The liveness of the check running on this thread.
     static CHECK_ALIVE: std::cell::RefCell<Option<HolderAlive>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -2561,7 +2537,6 @@ impl Drop for CheckAliveScope {
 
 #[cfg(target_os = "macos")]
 thread_local! {
-    /// Whether the check running on this thread began inside a wake's grace.
     static CHECK_AFTER_WAKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -3017,9 +2992,6 @@ fn run_checker(
                             }
                         }
                         Ok(None) if unreadable::is_stranded() => {
-                            // Back off; the first healthy check clears it, so a channel repaired
-                            // mid-session is noticed within one jittered `max(MAX_BACKOFF,
-                            // MAX_BACKOFF_INTERVALS × base)`.
                             schedule.failed();
                         }
                         Ok(None) if github::rate_limited() => {
@@ -3298,7 +3270,6 @@ pub const PERSISTENT_SPAN: std::time::Duration = std::time::Duration::from_secs(
 /// How long a newer build may wait on this machine.
 pub const PENDING_UPDATE_OVERDUE_SECS: u64 = 60 * 60;
 
-/// Whether the host's automatic apply lane is on (`[update] auto_apply`).
 static AUTOMATIC_APPLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Tells the updater whether the host applies staged builds by itself.
@@ -3312,8 +3283,7 @@ fn automatic_apply_on() -> bool {
     AUTOMATIC_APPLY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Serializes the tests that mutate the process-global "this machine cannot read its release
-/// channel" latch (`unreadable::STRANDED`), since a crate's tests run as threads of one process.
+/// Serializes the tests that mutate the process-global "this machine cannot read its release channel" latch (`unreadable::STRANDED`), since a crate's tests run as threads of one process.
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) static STRANDED_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -3337,7 +3307,7 @@ pub struct UpdateStatus {
     pub staged_dmg_sha256: Option<String>,
     /// "What changed" notes for the staged build (from the manifest).
     pub changelog: Option<String>,
-    /// The updater's last decision (e.g. `"up to date (latest release build 824)"`).
+    /// The updater's last decision.
     pub outcome: String,
     /// RFC3339 UTC time of the last completed-check receipt (empty if absent).
     pub updated_at: String,
@@ -3397,7 +3367,6 @@ impl UpdateStatus {
         self.failing_persistent
     }
 
-    /// An empty (all-defaults) snapshot for the stub/fallback constructors.
     const fn empty(enabled: bool, current_build: u64, outcome: String) -> Self {
         Self {
             linux: None,

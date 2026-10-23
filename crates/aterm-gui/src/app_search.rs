@@ -431,7 +431,6 @@ impl SearchState {
         } else if self.query.is_empty() {
             None
         } else if self.matches.is_empty() && self.history_away {
-            // The painter's long form, at every width.
             Some(HISTORY_AWAY_NONE.to_string())
         } else if self.matches.is_empty() {
             Some(format!(
@@ -454,10 +453,8 @@ impl SearchState {
         if self.query.is_empty() {
             "aterm — find:".to_string()
         } else if self.regex_error {
-            // The panel's own word: an invalid pattern is not a miss.
             format!("aterm — find: {} (bad regex)", self.query)
         } else if self.matches.is_empty() && self.history_away {
-            // The history is away, not empty of the text.
             format!("aterm — find: {} ({HISTORY_AWAY_NONE})", self.query)
         } else if self.matches.is_empty() {
             format!(
@@ -775,8 +772,7 @@ impl App {
         self.search_enter_impl_in(wid, forward, false);
     }
 
-    /// Shared entry path. Plain Cmd-F starts at the beginning of the buffer;
-    /// Emacs Cmd-S/Cmd-R start at point (cursor or viewport edge).
+    /// Shared entry path.
     fn search_enter_impl_in(
         &mut self,
         wid: crate::WindowId,
@@ -1409,8 +1405,6 @@ impl App {
 
     pub(crate) fn search_repeat_in(&mut self, wid: crate::WindowId, forward: bool) {
         if let Some(s) = self.windows.get_mut(&wid).and_then(|ws| ws.search.as_mut()) {
-            // Set direction before a possible recall/recompute so backward recall
-            // installs the last match directly, with no transient first match.
             s.direction = SearchDirection::from_forward(forward);
         }
         let query_empty = self
@@ -1560,8 +1554,6 @@ impl App {
             .and_then(|ws| ws.search.as_ref())
             .is_some_and(|search| search.results_dirty)
         {
-            // A second concurrent mutation won the bounded retry. Keep the bar
-            // open and fail closed; the next user action retries from fresh state.
             return;
         }
         if let Some((revision_stale, content_stale)) = self.search_stamp_mismatch(wid)

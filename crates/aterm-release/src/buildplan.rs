@@ -731,7 +731,7 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     let shipped = ship_dir.join("aterm");
     std::fs::copy(&fat, &shipped).map_err(|e| format!("copy {}: {e}", fat.display()))?;
     make_executable(&shipped)?;
-    let _ = command("strip")
+    let _ = command(aterm_uds::os_path!("strip"))
         .arg("-x")
         .arg(&shipped)
         .current_dir(&plan.repo_root)
@@ -863,6 +863,9 @@ fn run_with_take(plan: &BuildPlan, take: &Take, symbol_out: &Path) -> Result<Bui
     })
 }
 
+/// The cargo command line of one slice. `static_crt` links the C library into a
+/// `--target` build (`aterm_bootstrap_verify::pin::static_build_config`); the native
+/// Trust slice never asks for it.
 fn cargo_build_args(
     verb: &str,
     workspace_config: &Path,
@@ -870,8 +873,9 @@ fn cargo_build_args(
     manifest: &Path,
     pkg: &str,
     target: Option<&str>,
+    static_crt: bool,
 ) -> Vec<OsString> {
-    let mut args = Vec::with_capacity(16);
+    let mut args = Vec::with_capacity(18);
     if target.is_none() {
         args.push("--unverified".into());
     }
@@ -880,6 +884,14 @@ fn cargo_build_args(
         workspace_config.as_os_str().to_owned(),
         "--config".into(),
         source_config.as_os_str().to_owned(),
+    ]);
+    if let (true, Some(triple)) = (static_crt, target) {
+        args.extend([
+            "--config".into(),
+            aterm_bootstrap_verify::pin::static_build_config(triple).into(),
+        ]);
+    }
+    args.extend([
         verb.into(),
         "--manifest-path".into(),
         manifest.as_os_str().to_owned(),
@@ -1007,8 +1019,39 @@ fn build_one(
         target_dir: take.slice_target(target),
         build_number: plan.build_number,
         index_hint: plan.index_hint.as_deref(),
+        static_crt: false,
     };
     run_slice(take, &run, log)
+}
+
+/// One static `cargo build --release --target <triple> -p <pkg>` on upstream stable (the
+/// STOCK EXCEPTION: the static bootstrap verifier, whose C library is linked in so it runs
+/// with no dynamic loader), in that triple's own target directory, and where its `bin`
+/// landed.
+///
+/// # Errors
+/// No stable std for `triple`, and a build that fails.
+pub(crate) fn build_static(
+    plan: &BuildPlan,
+    take: &Take,
+    pkg: &str,
+    bin: &str,
+    triple: &str,
+    log: Option<&Path>,
+) -> Result<PathBuf, String> {
+    require_rustup_target(triple)?;
+    let target_dir = take.slice_target(Some(triple));
+    let run = SliceRun {
+        verb: "build",
+        pkg,
+        target: Some(triple),
+        target_dir: target_dir.clone(),
+        build_number: plan.build_number,
+        index_hint: None,
+        static_crt: true,
+    };
+    run_slice(take, &run, log)?;
+    Ok(target_bin(&target_dir, triple, bin))
 }
 
 /// The stable `cargo check` of the x86_64 compat slice's snapshot of `commit`, its output
@@ -1033,6 +1076,7 @@ pub(crate) fn compat_check(repo_root: &Path, commit: &str, log: &Path) -> Result
         target_dir,
         build_number: COMPAT_CHECK_EPOCH,
         index_hint: None,
+        static_crt: false,
     };
     run_slice(&take, &run, Some(log)).map_err(|error| format!("{error}\n{}", log_tail(log, 40)))?;
     Ok(format!(
@@ -1051,6 +1095,8 @@ struct SliceRun<'a> {
     target_dir: PathBuf,
     build_number: u64,
     index_hint: Option<&'a str>,
+    /// Link the C library in ([`cargo_build_args`]); only with a `target`.
+    static_crt: bool,
 }
 
 fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Option<u64>, String> {
@@ -1095,6 +1141,7 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Opti
             &take.snapshot.src.join("Cargo.toml"),
             pkg,
             target,
+            run.static_crt,
         ),
         &ReleaseEnv {
             path,
@@ -1109,7 +1156,9 @@ fn run_slice(take: &Take, run: &SliceRun<'_>, log: Option<&Path>) -> Result<Opti
             index_hint: run.index_hint,
         },
     );
-    let lane = if target.is_some() {
+    let lane = if run.static_crt {
+        "upstream stable (+r) static"
+    } else if target.is_some() {
         "upstream stable (+r) compat"
     } else {
         "Trust (+t)"
@@ -1196,11 +1245,11 @@ fn require_rustup_target(triple: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// The `commit-hash` stable's `rustc -vV` answers.
+/// The whole `-vV` answer of stable's `rustc`: the identity a static build records.
 ///
 /// # Errors
-/// No rustup shim, or a stable `rustc` that does not answer `-vV` with a commit.
-pub(crate) fn stable_rustc_commit() -> Result<String, String> {
+/// No rustup shim, or a stable `rustc` that does not answer `-vV`.
+pub(crate) fn stable_rustc_version() -> Result<String, String> {
     let home = std::env::var_os("HOME").ok_or("the stable compiler probe requires HOME")?;
     let shim = release_rustup_shim_dir(&home)?;
     let out = checked_output(
@@ -1214,7 +1263,15 @@ pub(crate) fn stable_rustc_commit() -> Result<String, String> {
             .current_dir("/"),
         "ask stable's rustc -vV",
     )?;
-    commit_hash_of(&String::from_utf8_lossy(&out.stdout))
+    String::from_utf8(out.stdout).map_err(|e| format!("stable's rustc -vV is not UTF-8: {e}"))
+}
+
+/// The `commit-hash` stable's `rustc -vV` answers.
+///
+/// # Errors
+/// No rustup shim, or a stable `rustc` that does not answer `-vV` with a commit.
+pub(crate) fn stable_rustc_commit() -> Result<String, String> {
+    commit_hash_of(&stable_rustc_version()?)
         .ok_or_else(|| "stable's rustc -vV names no commit-hash".to_string())
 }
 
@@ -1568,7 +1625,7 @@ fn verify_shipped_update_pin_slices(
         let temp = PrivateSliceDir::create()?;
         for architecture in &architectures {
             let thin = temp.0.join(architecture);
-            let mut command = command("lipo");
+            let mut command = command(aterm_uds::os_path!("lipo"));
             command
                 .arg(shipped)
                 .args(["-thin", architecture, "-output"])
@@ -1741,7 +1798,7 @@ fn verify_built_slice_update_pins(
 
 /// The `SHELL` the x86_64 `--diagnose` probe runs with: the macOS default login shell,
 /// so the report's `shell-int:` line exercises the slice's zsh loader-prepare path.
-const X86_64_PROBE_SHELL: &str = "/bin/zsh";
+const X86_64_PROBE_SHELL: &str = aterm_uds::os_path!("zsh");
 
 /// What the session turn types into a slice's shell. A shell spawned by a process
 /// runs that process's slice — a Rosetta-translated one its x86_64 slice — so the
@@ -2055,7 +2112,7 @@ fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
             make_executable(out)
         }
         many => {
-            let mut cmd = command("lipo");
+            let mut cmd = command(aterm_uds::os_path!("lipo"));
             cmd.arg("-create").args(many).arg("-output").arg(out);
             run_quiet(cmd, "lipo -create")?;
             make_executable(out)
@@ -2065,7 +2122,7 @@ fn lipo_or_copy(slices: &[PathBuf], out: &Path) -> Result<(), String> {
 
 /// `lipo -archs <bin>` → e.g. "x86_64 arm64".
 fn lipo_archs(bin: &Path) -> Result<String, String> {
-    let out = command("lipo")
+    let out = command(aterm_uds::os_path!("lipo"))
         .arg("-archs")
         .arg(bin)
         .output()
@@ -2089,7 +2146,7 @@ fn extract_dsym(
 ) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
     let dsym = out_dir.join("aterm.dSYM");
     let _ = std::fs::remove_dir_all(&dsym);
-    let _ = command("dsymutil")
+    let _ = command(aterm_uds::os_path!("dsymutil"))
         .arg(bin)
         .arg("-o")
         .arg(&dsym)
@@ -2137,7 +2194,11 @@ fn extract_dsym(
 /// `dwarfdump --uuid <path>` → the UUID token of every "UUID: <hex> (<arch>)"
 /// line, or None when dwarfdump is unavailable / produced nothing.
 fn dwarf_uuids(path: &Path) -> Option<Vec<String>> {
-    let out = command("dwarfdump").arg("--uuid").arg(path).output().ok()?;
+    let out = command(aterm_uds::os_path!("dwarfdump"))
+        .arg("--uuid")
+        .arg(path)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -2610,6 +2671,7 @@ mod tests {
             manifest,
             "aterm",
             None,
+            false,
         );
         let compat = cargo_build_args(
             "build",
@@ -2618,6 +2680,7 @@ mod tests {
             manifest,
             "aterm",
             Some("x86_64-apple-darwin"),
+            false,
         );
         let text = |args: &[std::ffi::OsString]| {
             args.iter()
@@ -2647,6 +2710,50 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--target", "x86_64-apple-darwin"])
         );
+        let crt = |args: &[String]| args.iter().any(|arg| arg.contains("crt-static"));
+        assert!(
+            !crt(&native) && !crt(&compat),
+            "only a static build links the C library in"
+        );
+    }
+
+    /// The static bootstrap verifier's build: upstream stable for one explicit Linux target,
+    /// the C library linked in on that target's table alone, and the native Trust slice never
+    /// static whatever it is asked.
+    #[test]
+    fn a_static_build_links_the_c_library_into_its_target_alone() {
+        let config = std::path::Path::new("/private/take/.cargo/config.toml");
+        let manifest = std::path::Path::new("/private/take/Cargo.toml");
+        let triple = "aarch64-unknown-linux-gnu";
+        let text = |args: Vec<OsString>| -> Vec<String> {
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+        let args = text(cargo_build_args(
+            "build",
+            config,
+            config,
+            manifest,
+            "aterm-bootstrap-verify",
+            Some(triple),
+            true,
+        ));
+        let wanted = aterm_bootstrap_verify::pin::static_build_config(triple);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--config", wanted.as_str()]),
+            "{args:?}"
+        );
+        assert!(args.windows(2).any(|pair| pair == ["--target", triple]));
+        assert!(!args.contains(&"--unverified".to_owned()));
+        let native = text(cargo_build_args(
+            "build", config, config, manifest, "aterm", None, true,
+        ));
+        assert!(
+            !native.iter().any(|arg| arg.contains("crt-static")),
+            "{native:?}"
+        );
     }
 
     /// THE CUTTER NEVER COMPILES A DEVELOPMENT SEAM. Every
@@ -2660,7 +2767,7 @@ mod tests {
         let manifest = std::path::Path::new("/private/take/Cargo.toml");
         for target in [None, Some("x86_64-apple-darwin")] {
             let args: Vec<String> =
-                cargo_build_args("build", config, config, manifest, "aterm", target)
+                cargo_build_args("build", config, config, manifest, "aterm", target, false)
                     .iter()
                     .map(|a| a.to_string_lossy().into_owned())
                     .collect();
@@ -2703,7 +2810,7 @@ mod tests {
             };
             let cmd = release_build_command(
                 std::path::Path::new("/t/bin/targo"),
-                cargo_build_args("build", config, config, manifest, "aterm", None),
+                cargo_build_args("build", config, config, manifest, "aterm", None, false),
                 &e,
             );
             let env: Vec<(String, Option<String>)> = cmd

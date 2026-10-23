@@ -72,7 +72,7 @@ pub fn profile_dir_of(local_state: &str, name: &str) -> Option<String> {
 /// Builds the `open -na "Google Chrome"` command for a profile directory and URL.
 #[must_use]
 pub fn open_command(dir: &str, url: &str) -> aterm_uds::spawnfd::Command {
-    let mut cmd = aterm_uds::spawnfd::command("open");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("open"));
     cmd.args(["-na", "Google Chrome", "--args"])
         .arg(format!("--profile-directory={dir}"))
         .arg(url);
@@ -775,7 +775,7 @@ fn https_curl_exchange(
     cookies: &mut BTreeMap<String, String>,
     form_body: Option<&str>,
 ) -> Result<HttpResponse, &'static str> {
-    let mut cmd = aterm_uds::spawnfd::command("curl");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"));
     cmd.args([
         "--disable",
         "--globoff",
@@ -1256,6 +1256,17 @@ fn authorize_using_with_page(
 }
 
 fn discover_store_dir() -> Option<PathBuf> {
+    if let Some(claude_dir) = std::env::var_os(super::accounts::HOME_ENV) {
+        let p = Path::new(&claude_dir);
+        if p.parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "logins")
+            && let Some(store_dir) = p.parent().and_then(Path::parent)
+            && store_dir.is_dir()
+        {
+            return Some(store_dir.to_path_buf());
+        }
+    }
     let arg0 = std::env::args_os().next()?;
     let store_dir = Path::new(&arg0).parent().and_then(Path::parent)?;
     store_dir.is_dir().then(|| store_dir.to_path_buf())
@@ -1276,19 +1287,26 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         let force_headless = std::env::var(super::headless_oauth::HEADLESS_ENV)
             .is_ok_and(|v| matches!(v.trim(), "1" | "true" | "yes"));
         let has_mailbox_env = std::env::var_os(MAILBOX_ENV).is_some_and(|v| !v.is_empty());
+        let resolved_email = email
+            .as_deref()
+            .filter(|e| !e.trim().is_empty())
+            .map(str::to_owned)
+            .or_else(|| extract_login_hint(url));
+        let label = super::headless_oauth::infer_account_label_from_env();
         let mailbox_cfg = (force_headless
             || has_mailbox_env
             || profile.as_deref().is_none_or(|p| p.trim().is_empty()))
         .then(|| {
             super::headless_oauth::discover_mailbox_config(home.as_deref(), store_dir.as_deref())
         })
-        .flatten();
+        .flatten()
+        .filter(|cfg| has_mailbox_env || cfg.is_configured_for(resolved_email.as_deref()));
         if let Some(cfg) = mailbox_cfg {
             match authorize_with_mailbox_config(
                 url,
                 &cfg,
                 store_dir.as_deref(),
-                email.as_deref(),
+                resolved_email.as_deref(),
                 AUTHORIZE_TIMEOUT,
             ) {
                 Ok(()) => return ExitCode::from(0),
@@ -1301,18 +1319,25 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
             }
         } else {
             let has_saved_profile = store_dir.as_deref().is_some_and(|s| {
-                super::headless_oauth::has_browser_profile(s, "default", email.as_deref())
+                super::headless_oauth::has_browser_profile(
+                    s,
+                    label.as_deref().unwrap_or("default"),
+                    resolved_email.as_deref(),
+                )
             });
             if force_headless || has_saved_profile {
                 match super::headless_oauth::authorize_with_headless_browser_config(
                     url,
                     store_dir.as_deref(),
                     None,
-                    email.as_deref(),
+                    resolved_email.as_deref(),
                     AUTHORIZE_TIMEOUT,
                 ) {
                     Ok(()) => return ExitCode::from(0),
-                    Err(why) if force_headless => {
+                    Err(why)
+                        if force_headless
+                            || profile.as_deref().is_none_or(|p| p.trim().is_empty()) =>
+                    {
                         eprintln!("{OPENER}: not authorized: {why}");
                         return ExitCode::from(1);
                     }

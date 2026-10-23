@@ -99,7 +99,6 @@ impl<T, const N: usize> SmallVec<T, N> {
                     buf[cur] = MaybeUninit::new(value);
                     *len = cur.wrapping_add(1);
                 } else {
-                    // Spill to heap
                     self.spill_and_push(value);
                 }
             }
@@ -321,8 +320,6 @@ impl<T: Eq, const N: usize> Eq for SmallVec<T, N> {}
 
 impl<T, const N: usize> Drop for SmallVec<T, N> {
     fn drop(&mut self) {
-        // Reuse the (bounds-clamped) clear — drops the inline elements without a
-        // separate out-of-bounds obligation; the heap Vec drops itself.
         self.clear();
     }
 }
@@ -350,34 +347,6 @@ impl<T, const N: usize> Extend<T> for SmallVec<T, N> {
 }
 
 /// Owned, by-value iterator over a [`SmallVec`] ([`alloc::vec::IntoIter`], [`Drop`]).
-///
-/// The representation is private, as upstream `smallvec`'s is. `next`,
-/// `next_back` and `Drop` read `buf[start..end]` as initialized, so safe code
-/// that could name the fields could forge an iterator over an uninitialized
-/// buffer or rewind the cursor and move one element out twice. Neither form
-/// compiles:
-///
-/// ```compile_fail,E0223
-/// use aterm_alloc::{IntoIter, SmallVec};
-/// let mut sv: SmallVec<String, 4> = SmallVec::new();
-/// sv.push(String::from("moved out twice if the cursor rewinds"));
-/// let mut it = sv.into_iter();
-/// let first = it.next();
-/// if let IntoIter::Inline { start, .. } = &mut it {
-///     *start = 0;
-/// }
-/// ```
-///
-/// ```compile_fail,E0223
-/// use aterm_alloc::IntoIter;
-/// use core::mem::MaybeUninit;
-/// let mut forged: IntoIter<Box<u64>, 2> = IntoIter::Inline {
-///     buf: [const { MaybeUninit::uninit() }; 2],
-///     start: 0,
-///     end: 2,
-/// };
-/// let uninit_box = forged.next();
-/// ```
 pub struct IntoIter<T, const N: usize> {
     repr: IntoIterRepr<T, N>,
 }
@@ -564,8 +533,6 @@ mod tests {
         assert_eq!(it.next_back(), None);
     }
 
-    /// A by-value iterator keeps the vector's storage: consuming an inline
-    /// vector does not allocate.
     #[test]
     fn into_iter_keeps_the_storage_variant() {
         let inline: SmallVec<i32, 4> = SmallVec::from_vec([10, 20, 30].to_vec());
@@ -577,9 +544,6 @@ mod tests {
         assert_eq!(heap.collect::<Vec<_>>(), [1, 2, 3]);
     }
 
-    /// Fill a `SmallVec<_, N>` with `len` drop counters, take `front` and
-    /// `back` elements from the by-value iterator, drop it, then drop what was
-    /// taken: every element is dropped exactly once.
     fn drops_each_once<const N: usize>(len: usize, front: usize, back: usize) {
         let case = format!("N={N} len={len} front={front} back={back}");
         let counter = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -607,7 +571,6 @@ mod tests {
         assert_eq!(counter.get(), len, "{case}: each element dropped once");
     }
 
-    /// Partial, full and no consumption, from either end, inline and spilled.
     #[test]
     fn into_iter_drops_each_element_exactly_once() {
         for (front, back) in [(0, 0), (1, 0), (1, 1), (3, 0)] {

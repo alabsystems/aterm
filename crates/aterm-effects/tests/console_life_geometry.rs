@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real terminal snapshots and the public brain/frame contract: a content
-//! anchor moves with its rows, finite travel settles, and reduced motion needs
-//! no frame train to become visible.
+//! Conformance tests for content anchor translation, finite travel settling, and reduced motion.
 
 use std::time::{Duration, Instant};
 
@@ -57,8 +55,6 @@ impl Scene {
             output_burst: false,
             pointer: None,
         });
-        // Assert the emitted, pixel-rounded footprint against the same real
-        // snapshot, so a plausible internal target cannot mask clipped text.
         if let Some((x0, x1, y0, y1)) = frame.body_px(CELL_W, CELL_H, COLS, ROWS) {
             let mut world = PetWorld::default();
             assert!(world.observe(&input, &facts, PetPane::full(&input)));
@@ -68,12 +64,7 @@ impl Scene {
                 (y1 - y0) as f32 / f32::from(CELL_H),
                 (x1 - x0) as f32 / f32::from(CELL_W),
             );
-            // The caret's keep-off ring is not protected to its escort: `STATION_LEAD` seats the
-            // pet one cell past the caret, inside that 3x3 ring. Selections, images and
-            // uncertified rows still fail here.
             assert!(world.under_text_clearance_past_caret(rect, 0.0) == Some(true));
-            // Real ink under the drawn body is in front of it; the caret's ring is protection,
-            // not ink.
             assert!(frame.under_ink || world.ink_clearance(rect, 0.0) == Some(true));
         }
         frame
@@ -162,8 +153,6 @@ fn hidden_cursor_home_stays_put_while_real_output_scrolls() {
     }
     s.work();
     let moving = s.tick(16);
-    // New output interest turns the gaze; it does not start a perch trip. Flight and landing are
-    // covered by `console_handoff_conformance`.
     assert!(
         !s.brain.needs_frames(),
         "output interest must not move the base"
@@ -180,8 +169,6 @@ fn hidden_cursor_home_stays_put_while_real_output_scrolls() {
     let scrolled = s.tick(0);
     assert_eq!(s.brain.console_anchor_id(), Some(anchor));
     assert!((scrolled.col - moving.col).abs() < 0.001);
-    // The last real cursor is still home while DECTCEM hides it. Output
-    // scrolls its own anchor; it cannot carry the resident away from input.
     assert!((scrolled.row - moving.row).abs() < 0.001);
     let duplicate = s.tick(0);
     assert_eq!(duplicate.fp(), scrolled.fp());
@@ -200,8 +187,6 @@ fn output_over_the_old_perch_keeps_the_full_body_and_settles_without_polling() {
     let before = s.settle();
     let anchor = s.brain.console_anchor_id().expect("real executing block");
     let old_top = PetWorldFacts::read(&s.term, 7).stamp.top_absolute_row;
-    // The burst scrolls the old body's content away and fills its columns with new text, leaving a
-    // wide certified gutter beside the current output.
     for _ in 0..30 {
         s.term.process(b"\r\nterrain observation line");
     }

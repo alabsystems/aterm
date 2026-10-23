@@ -92,7 +92,7 @@ fn slug(s: &str) -> String {
 /// The machine's platform UUID, or `None` where none can be read.
 fn platform_uuid() -> Option<String> {
     if cfg!(target_os = "macos") {
-        let out = Command::new("ioreg")
+        let out = Command::new(aterm_uds::os_path!("ioreg"))
             .args(["-rd1", "-c", "IOPlatformExpertDevice"])
             .output()
             .ok()?;
@@ -142,7 +142,7 @@ fn platform_fingerprint() -> Option<String> {
 }
 
 fn hostname() -> String {
-    Command::new("hostname")
+    Command::new(aterm_uds::os_path!("hostname"))
         .output()
         .ok()
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -154,7 +154,7 @@ fn hostname() -> String {
 /// alias claim is DETECTABLE; see [`chip_of`] for what is actually compared.
 fn machine_shape() -> String {
     let chip = if cfg!(target_os = "macos") {
-        Command::new("sysctl")
+        Command::new(aterm_uds::os_path!("sysctl"))
             .args(["-n", "machdep.cpu.brand_string"])
             .output()
             .ok()
@@ -294,7 +294,7 @@ pub(crate) fn machine_id() -> MachineId {
 /// The tree a run measured, for its rows' sha column: see [`tree_label`].
 fn head_sha() -> String {
     let git = |args: &[&str]| {
-        aterm_uds::spawnfd::command("git")
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args(args)
             .current_dir(super::workspace_root())
             .output()

@@ -3,12 +3,7 @@
 
 //! The outlook of a wall ([`outlook`]): the one table the policy and whatever
 //! shows a wall (the tab chip, `status`) both read, so the two cannot
-//! disagree about whether a person is needed. Pure, total over [`WallKind`].
-//! So too a session usage credits carry, which is no wall
-//! ([`credits_outlook`]).
-//!
-//! [`ExceptionKind`] names the points only a person can answer;
-//! [`super::exception`] raises them with their why and their one action.
+//! disagree about whether a person is needed.
 
 use aterm_phase::wall::WallKind;
 
@@ -31,8 +26,7 @@ pub enum ExceptionKind {
     /// A wall with a reset that keeps answering the continuation after it.
     Futile,
     /// A full context `/compact` cannot lower, by Claude Code's own word after
-    /// the third `/compact`. Going back is a person's, done in the tab, so the
-    /// host files it per tab.
+    /// the third `/compact`.
     Context,
     /// A request the API refuses the same way each time it is sent
     /// ([`aterm_phase::ApiCause::Request`]: a safeguards refusal, a model not
@@ -46,9 +40,7 @@ pub enum ExceptionKind {
     /// words that stood still ([`super::exception::Exception::stalled_on_work`]).
     Stalled,
     /// A dialog no reader names, unchanged for an hour while Claude's title
-    /// says idle ([`super::exception::Exception::dialog`]). Its own kind, not
-    /// a `Stalled`: dismissing one must not silence the other in the same tab,
-    /// and the action differs.
+    /// says idle ([`super::exception::Exception::dialog`]).
     Dialog,
 }
 
@@ -74,7 +66,7 @@ impl ExceptionKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outlook {
     /// The supervisor continues it by itself, at the wall's reset when it
-    /// names one, else on its ladder. Nobody is needed; the mark says when.
+    /// names one, else on its ladder.
     Resumes,
     /// Claude Code continues it by itself (its auto-continue is armed); the
     /// supervisor is the net under it.
@@ -97,8 +89,7 @@ pub enum Outlook {
 
 /// The outlook of a wall of `kind` whose notice `resumes_by_itself` says
 /// Claude Code goes on alone, under `cfg`, `supervised` when a loop watches
-/// the session. Total over [`WallKind`]: a new kind does not compile until it
-/// is answered here.
+/// the session.
 #[must_use]
 pub const fn outlook(
     kind: WallKind,
@@ -119,13 +110,8 @@ pub const fn outlook(
         WallKind::Spend if !cfg.resume_limits => Outlook::Person(ExceptionKind::Spend),
         WallKind::Spend if has_reset => Outlook::Resumes,
         WallKind::Spend => Outlook::ResumesAndAsks(ExceptionKind::Spend),
-        // A bucket with a reset ends at it; one without ends when a person
-        // adds credits or picks another model (or, if the tab can switch by
-        // itself, when its jobs end): a digest item, and the chip says so.
         WallKind::ModelBucket { .. } if has_reset => Outlook::Resumes,
         WallKind::ModelBucket { .. } => Outlook::ResumesAndAsks(ExceptionKind::Bucket),
-        // A refused request: its slow ladder goes on, and a person's change
-        // in the tab ends it sooner (a digest item, never an interruption).
         WallKind::ApiError {
             cause: aterm_phase::ApiCause::Request,
             ..
@@ -136,9 +122,6 @@ pub const fn outlook(
         WallKind::ApiError { .. } | WallKind::Overloaded => Outlook::Unattended,
         WallKind::Context if cfg.compact_on_context_wall => Outlook::Resumes,
         WallKind::Context => Outlook::Unattended,
-        // The loop carries a lost login while it answers API errors at all
-        // (`retry_api_errors`; off, the login is left to the owner, its
-        // notice says so).
         WallKind::Auth if cfg.retry_api_errors => Outlook::Carries(ExceptionKind::Login),
         WallKind::Auth => Outlook::Person(ExceptionKind::Login),
         WallKind::Memory if cfg.relaunch => Outlook::Resumes,
@@ -147,8 +130,7 @@ pub const fn outlook(
 }
 
 /// What a surface that shows a wall (the needs border's pill, the tab chip) needs of
-/// its [`Outlook`]: who answers it. A wall the supervisor resumes is a record;
-/// only a wall a person must (or can) act on says so.
+/// its [`Outlook`]: who answers it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Answer {
     /// Nobody: a person is needed, or nothing supervises the wall here.
@@ -162,11 +144,7 @@ pub enum Answer {
 }
 
 /// The [`Answer`] to a wall of `kind` whose notice names a reset (`has_reset`)
-/// or not, under `cfg`, `supervised` by this process's own harness. A
-/// critical-memory banner is nobody's: it is drawn under a running spinner, the
-/// one place the supervisor never decides (the window's need classifier,
-/// `aterm-gui`'s `needs::of`, reads it as the host's restart or the person's),
-/// so the stop stays for a person to see whatever `relaunch` says.
+/// or not, under `cfg`, `supervised` by this process's own harness.
 #[must_use]
 pub fn answer(kind: WallKind, has_reset: bool, cfg: &SupervisorConfig, supervised: bool) -> Answer {
     if kind == WallKind::Memory {
@@ -182,10 +160,7 @@ pub fn answer(kind: WallKind, has_reset: bool, cfg: &SupervisorConfig, supervise
     }
 }
 
-/// WHAT BECOMES OF A SESSION USAGE CREDITS CARRY (Claude Code's `Now using
-/// usage credits`): no wall — the vendor goes on, paid for — and the one
-/// table the credits hold ([`super::turn_end::credits_hold`]) and a surface
-/// that shows the session both read.
+/// What becomes of a session usage credits carry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreditsOutlook {
     /// `[harness] usage_credits` on: credits are work going on, and the
@@ -193,7 +168,7 @@ pub enum CreditsOutlook {
     Carried,
     /// Off (the default), the window they carry past named: the supervisor
     /// types nothing until it resets, when Claude Code goes back onto the
-    /// subscription by itself, and then goes on. Nobody is needed.
+    /// subscription by itself, and then goes on.
     WaitsForReset,
     /// Off, no reset named: the supervisor types nothing, and a person
     /// decides — their own turns go on credits, or `[harness]

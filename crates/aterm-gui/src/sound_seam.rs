@@ -3,13 +3,6 @@
 
 //! The audibility oracle: one table that decides whether a keypress makes a sound now, and
 //! names the gate when it does not (`tone`'s `seam=` field).
-//!
-//! Precedence, pinned by a test: what the user set, then where the user is, then whether
-//! the host can sound, then transients, then the engine. The answer is an AND over every
-//! term, so `open` never disagrees with the key path; precedence only chooses which closed
-//! gate is reported when several are.
-//!
-//! Pure: no `App`, window or clock.
 
 use crate::trail_audio::HostState;
 
@@ -20,8 +13,6 @@ use crate::trail_audio::HostState;
 #[path = "sound_seam_conformance.rs"]
 mod conformance;
 
-// The light/audio fold and its `user_lit` read are the engine's
-// (`aterm_effects::sound_policy`), shared by every host; this oracle reads them.
 pub(crate) use aterm_effects::sound_policy::{fold_window_audibility, user_lit};
 
 /// `SeamInputs::trail_on` for a resolved (pre-fold) config: `enabled` and a nonzero
@@ -80,7 +71,6 @@ pub(crate) fn verb_seam_inputs(
     SeamInputs {
         sounds_on: host.sounds_on,
         volume: host.volume,
-        // Not `resolved.enabled` alone: see `trail_on`.
         trail_on: trail_on(resolved),
         serious_allows: host.serious_allows,
         focused: host.focused,
@@ -155,11 +145,9 @@ pub(crate) fn sound_seam(i: &SeamInputs) -> Option<SeamReason> {
     if !i.serious_allows {
         return Some(SeamReason::SeriousMode);
     }
-    // Where the user is.
     if !i.focused {
         return Some(SeamReason::Unfocused);
     }
-    // Whether the host can sound.
     if matches!(i.host, HostState::Inert) {
         return Some(SeamReason::HostInert);
     }
@@ -167,11 +155,9 @@ pub(crate) fn sound_seam(i: &SeamInputs) -> Option<SeamReason> {
     if matches!(i.host, HostState::Wedged) {
         return Some(SeamReason::HostWedged);
     }
-    // Transients.
     if i.resize_quiet {
         return Some(SeamReason::ResizeQuiet);
     }
-    // The engine, last, so a named gate always outranks it.
     if !i.engine_sound_live {
         return Some(SeamReason::EngineSilent);
     }
@@ -191,7 +177,6 @@ pub(crate) fn seam_field(verdict: Option<SeamReason>) -> String {
 mod tests {
     use super::*;
 
-    /// Every term open: the baseline the table is perturbed from.
     fn open() -> SeamInputs {
         SeamInputs {
             sounds_on: true,
@@ -221,10 +206,8 @@ mod tests {
         i
     }
 
-    /// The answer field is exact, and every reason is reachable.
     #[test]
     fn the_seam_names_the_gate_that_would_silence_the_key() {
-        // Negative control: a `sound_seam` that always returned `Some` would pass the table.
         assert_eq!(seam_field(sound_seam(&open())), "open");
 
         for reason in SeamReason::ALL {
@@ -236,23 +219,17 @@ mod tests {
             );
         }
 
-        // Precedence: what the user set outranks where the user is.
         let mut both = open();
         both.sounds_on = false;
         both.focused = false;
         assert_eq!(seam_field(sound_seam(&both)), "closed:sounds-off");
 
-        // A named gate outranks the engine's bare refusal, so nobody hunts the engine for a
-        // knob they turned off.
         let mut engine_and_knob = open();
         engine_and_knob.engine_sound_live = false;
         engine_and_knob.trail_on = false;
         assert_eq!(seam_field(sound_seam(&engine_and_knob)), "closed:trail-off");
     }
 
-    /// The verb and the key path share one table: `keystroke_click_audible` is
-    /// [`sound_seam`] with the trail, focus and engine terms pinned open and the host read
-    /// only as inert or not, checked against that five-term AND over the whole product.
     #[test]
     fn the_push_decision_is_the_seam_with_host_and_engine_pinned_open() {
         for sounds_on in [false, true] {

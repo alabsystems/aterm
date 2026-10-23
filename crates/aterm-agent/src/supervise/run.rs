@@ -2001,6 +2001,9 @@ pub struct Session<'a, C: Ctl> {
     held: bool,
     rejudge: bool,
     host_held: bool,
+    /// The point's decision was made but not carried out: the host's step at a new point comes
+    /// before [`Self::turn_end_execute`] ([`Self::host_steps_here`]).
+    decision_owed: bool,
     host_passed: Option<String>,
     host_follows: Option<(String, u8, bool)>,
     box_first_seen: Option<(String, Instant)>,
@@ -2244,6 +2247,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             held: false,
             rejudge: false,
             host_held: false,
+            decision_owed: false,
             host_passed: None,
             host_follows: None,
             agent_woke: None,
@@ -4570,6 +4574,7 @@ impl<'a, C: Ctl> Session<'a, C> {
                     );
                 self.limit_after(&point, deadline, handled, review)?;
             }
+            self.decision_owed = true;
             if self.host_steps_here(&point, opts, &mut false, review)? {
                 self.probe_shut(&point, ProbeGate::HostWants, None, review)?;
                 state.gone_first = false;
@@ -6074,7 +6079,16 @@ impl<C: Ctl> Session<'_, C> {
                 }
             }
             let stood = !step.as_ref().is_some_and(|s| s.moved);
-            self.host_held = stood;
+            // A LOOK THAT FOUND NOTHING (no step) at a point whose decision was carried out
+            // holds nothing for a redecision: the screen, the decision and its due are as they
+            // were (docs/measured/vitals-3-2026-10-22.md, V2). A step moved the point: its
+            // decision is owed no more.
+            if !stood {
+                self.decision_owed = false;
+                self.host_held = false;
+            } else if step.is_some() || self.decision_owed {
+                self.host_held = true;
+            }
             let key = host.wants().then(|| self.review_key(point));
             let (had, moved_before) = self
                 .host_follows

@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Lumen wake: the deterministic half of the release performance gates, and
-//! the shipping config both halves drive. The timing half is a bench,
-//! `benches/cursor_bench.rs`, which mounts this file for [`config`].
+//! Lumen wake: the deterministic half of the release performance gates, and the shipping config both halves drive.
 
 use std::time::Duration;
 
@@ -13,13 +11,10 @@ use aterm_effects::cursor_glow::{GlowConfig, GlowStyle};
 pub(crate) fn config(style: GlowStyle) -> GlowConfig {
     GlowConfig {
         classic_mono: false,
-        // Shipping default: the tall body.
         ribbon_tall: true,
         ribbon_flat: false,
         enabled: true,
         dark_theme: true,
-        // The default dark palette: a coherent pair, never 0/0 (`fg == bg` reads as a
-        // conceal-shaped theme and suppresses the tint).
         theme_fg: 0x00C8_D3F5,
         theme_bg: 0x001A_1B26,
         style,
@@ -36,16 +31,7 @@ pub(crate) fn config(style: GlowStyle) -> GlowConfig {
     }
 }
 
-/// The HOT ribbon gate the frozen-clock fixture above cannot reach: `saturated`
-/// re-ticks one Instant, so `dt == 0` never runs the momentum integrator,
-/// `rainbow.disp` stays 0, and only the cheaper resting path is measured. This
-/// 125-key/s saturation stress warms the clock 8 ms per event and keeps typing
-/// through the measured window, pinning the capped tall-ribbon worst-case cost;
-/// it cannot observe geometry growth after the deliberate budget edge. It is
-/// deliberately harsher than a claim about ordinary human cadence.
-///
-/// The deterministic half: checks the amount of render work, not host timing;
-/// the release-only timing probe (`benches/cursor_bench.rs`) is supplementary.
+/// The HOT ribbon gate the frozen-clock fixture above cannot reach: `saturated` re-ticks one Instant, so `dt == 0` never runs the momentum integrator, `rainbow.disp` stays 0, and only the cheaper resting path is measured.
 #[test]
 fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
     use aterm_effects::cursor_glow::{CursorGlow, Geom};
@@ -88,9 +74,6 @@ fn cursor_rainbow_hot_ribbon_work_stays_below_its_normalized_share() {
         under > 2_000,
         "fixture must reach the active tall ribbon ({under} quads)"
     );
-    // The ribbon's share of `MAX_QUADS` (16,384) is 5/8
-    // (`rainbow_kitty::ribbon::RIBBON_QUAD_BUDGET`); a smaller share would shed the tail of long
-    // lines. The frame-wide headroom assert below bounds the companions.
     assert!(
         under * 8 <= 16_384 * 5,
         "default tall ribbon spent more than its five-eighths normalized share: {under}"

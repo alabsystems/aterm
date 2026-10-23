@@ -5,7 +5,6 @@
 
 use super::*;
 
-/// Chrome's `Local State`, as much of it as the opener reads, for four profiles.
 const LOCAL_STATE: &str = r#"{
   "browser": {"enabled_labs_experiments": []},
   "profile": {
@@ -19,7 +18,6 @@ const LOCAL_STATE: &str = r#"{
   }
 }"#;
 
-/// A URL of the shape Claude Code hands its opener.
 const URL: &str = "https://claude.ai/oauth/authorize?login_hint=a%40example.com&state=s";
 
 #[test]
@@ -67,7 +65,7 @@ fn the_url_opens_in_that_profile_and_is_never_said() {
     assert_eq!(
         ran,
         vec![(
-            "open".to_string(),
+            aterm_uds::os_path!("open").to_string(),
             vec![
                 "-na".to_string(),
                 "Google Chrome".to_string(),
@@ -79,7 +77,6 @@ fn the_url_opens_in_that_profile_and_is_never_said() {
     );
 }
 
-/// One refusal case.
 type Case<'a> = (
     &'a [String],
     Option<&'a str>,
@@ -412,7 +409,6 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
         CdpClient, MailboxCredential, drive_cdp_oauth, extract_otp_from_email, split_nul_messages,
     };
 
-    // 1. 6-digit OTP extraction from email with recipient verification.
     let otp_eml = concat!(
         "From: Anthropic <no-reply@claude.com>\r\n",
         "To: <m27@example.test>\r\n",
@@ -430,7 +426,6 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
         Some("849204")
     );
 
-    // 2. Headless CDP OAuth state machine over real pipes (email -> OTP -> Authorize -> callback).
     let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
     let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
 
@@ -525,6 +520,76 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
+    use crate::harness::headless_oauth::{
+        MailboxCredential, mailbox_config_from_override, poll_mailbox_config_for_credential,
+    };
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
+
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let message = "To: <raw-path@example.test>\r\n\r\nYour verification code: 583921";
+    let byte_path = tmp
+        .path()
+        .join(OsString::from_vec(b"maildir-\xff".to_vec()));
+    let cfg = mailbox_config_from_override(byte_path.as_os_str(), Some(tmp.path()));
+    assert_eq!(cfg.dir.as_deref(), Some(byte_path.as_path()));
+    assert!(cfg.imap_url.is_none() && cfg.http_url.is_none());
+
+    let decoy = tmp.path().join("maildir");
+    std::fs::create_dir(&decoy).unwrap();
+    std::fs::write(decoy.join("wrong.eml"), message.replace("583921", "999999")).unwrap();
+    let dir = tmp.path().join("maildir ");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("code.eml"), message).unwrap();
+    let cfg = mailbox_config_from_override(dir.as_os_str(), Some(tmp.path()));
+    assert_eq!(cfg.dir.as_deref(), Some(dir.as_path()));
+    assert_eq!(
+        poll_mailbox_config_for_credential(
+            &cfg,
+            Some("raw-path@example.test"),
+            Duration::from_secs(60),
+        ),
+        Ok(MailboxCredential::Otp("583921".to_owned()))
+    );
+    assert!(dir.join("code.eml.clicked").exists());
+    assert!(!decoy.join("wrong.eml.clicked").exists());
+
+    std::fs::write(
+        tmp.path().join("mailbox.toml"),
+        "[mailbox]\nhttp_url = 'https://wrong.example.test/inbox'\n",
+    )
+    .unwrap();
+    let dir = tmp.path().join("configured-maildir");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("code.eml"), message).unwrap();
+    let path = tmp.path().join("mailbox.toml ");
+    std::fs::write(&path, "[mailbox]\ndir = '~/configured-maildir'\n").unwrap();
+    let cfg = mailbox_config_from_override(path.as_os_str(), Some(tmp.path()));
+    assert_eq!(cfg.dir.as_deref(), Some(dir.as_path()));
+    assert!(cfg.http_url.is_none());
+    assert_eq!(
+        poll_mailbox_config_for_credential(
+            &cfg,
+            Some("raw-path@example.test"),
+            Duration::from_secs(60),
+        ),
+        Ok(MailboxCredential::Otp("583921".to_owned()))
+    );
+    for (url, imap) in [
+        (" https://mailbox.example.test/inbox \n", false),
+        (" imaps://mailbox.example.test/INBOX \n", true),
+    ] {
+        let cfg = mailbox_config_from_override(OsStr::new(url), None);
+        assert_eq!(cfg.imap_url.as_deref(), imap.then_some(url.trim()));
+        assert_eq!(cfg.http_url.as_deref(), (!imap).then_some(url.trim()));
+        assert!(cfg.dir.is_none());
+    }
+    assert!(!mailbox_config_from_override(OsStr::new(""), None).is_configured());
+}
+
 #[test]
 fn imap_bridge_and_http_json_mailbox_fetch_credentials_and_track_seen_digests() {
     use super::super::headless_oauth::{
@@ -555,7 +620,6 @@ password_file = "{}"
     assert_eq!(parsed_cfg.user.as_deref(), Some("m27@example.test"));
     assert_eq!(parsed_cfg.password.as_deref(), Some("bridge-secret-pass"));
 
-    // 1. Stand-in local TCP IMAP server (Proton Mail Bridge style).
     let imap_listener = TcpListener::bind("127.0.0.1:0").expect("bind imap");
     let imap_port = imap_listener.local_addr().expect("addr").port();
     let imap_thread = std::thread::spawn(move || {
@@ -639,7 +703,6 @@ password_file = "{}"
     .expect("fetched OTP from IMAP");
     assert_eq!(cred, MailboxCredential::Otp("739182".to_owned()));
 
-    // Second poll with same seen_file must skip the already-consumed message and time out cleanly.
     let second = poll_mailbox_config_for_credential(
         &imap_cfg,
         Some("m27@example.test"),
@@ -651,7 +714,6 @@ password_file = "{}"
     );
     imap_thread.join().expect("imap thread");
 
-    // 2. Stand-in HTTP JSON mailbox endpoint (Mailpit / JMAP / Webhook style).
     let http_listener = TcpListener::bind("127.0.0.1:0").expect("bind http");
     let http_port = http_listener.local_addr().expect("addr").port();
     let http_thread = std::thread::spawn(move || {
@@ -706,7 +768,6 @@ fn headless_webmail_cdp_and_totp_complete_oauth_without_human_in_the_loop() {
     };
     use std::io::{Read, Write};
 
-    // 1. RFC 6238 / RFC 4226 SHA-1 TOTP test vectors ("12345678901234567890" in Base32).
     let rfc_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"; // gitleaks:allow
     assert_eq!(generate_totp_at(rfc_secret, 59).as_deref(), Some("287082"));
     assert_eq!(
@@ -714,7 +775,6 @@ fn headless_webmail_cdp_and_totp_complete_oauth_without_human_in_the_loop() {
         Some("081804")
     );
 
-    // 2. Per-account TOML parsing for webmail credentials + TOTP secrets.
     let tmp = aterm_tempfile::tempdir().expect("tempdir");
     let toml_str = r#"
 [ai.mailbox]
@@ -750,7 +810,6 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         Some(rfc_secret)
     );
 
-    // 3. End-to-end CDP OAuth + secondary-tab Webmail login (password + TOTP + decrypted iframe OTP).
     let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe1");
     let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe2");
 
@@ -804,19 +863,30 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
                         );
                         let val = match webmail_step {
                             1 => aterm_json::json!({
-                                "state": "submitted_login",
+                                "state": "submitted_user",
                                 "url": "https://mail.example.test/login"
                             }),
                             2 => aterm_json::json!({
+                                "state": "submitted_login",
+                                "url": "https://mail.example.test/login/password"
+                            }),
+                            3 => aterm_json::json!({
                                 "state": "submitted_totp",
                                 "url": "https://mail.example.test/login/2fa"
                             }),
-                            3 | 4 => aterm_json::json!({
+                            4 => aterm_json::json!({
                                 "state": "inbox",
                                 "url": "https://mail.example.test/u/0/inbox",
                                 "clicked_row": true,
-                                "html": "<div><p>Your verification code is: 111111</p></div>",
+                                "html": "<div><span>1 minute ago</span><p>Your verification code is: 111111</p></div>",
                                 "text": "Sign in to Claude\nYour verification code is: 111111"
+                            }),
+                            5 => aterm_json::json!({
+                                "state": "inbox",
+                                "url": "https://mail.example.test/u/0/inbox",
+                                "clicked_row": true,
+                                "html": "<div><span>2 minutes ago</span><p>Your verification code is: 111111</p></div>",
+                                "text": "Sign in to Claude (2m ago)\nYour verification code is: 111111"
                             }),
                             _ => aterm_json::json!({
                                 "state": "inbox",
@@ -932,7 +1002,32 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
     );
     browser_thread.join().expect("browser thread");
 
-    // 4. Minified HTML email with <style> 6-digit numbers and multi-div OTP context.
+    let store_dir = tmp.path().join("accounts");
+    let label_profile =
+        super::super::headless_oauth::browser_profile_dir(&store_dir, Some("m27-2"));
+    std::fs::create_dir_all(&label_profile).expect("mkdir label_profile");
+    assert_eq!(
+        super::super::headless_oauth::resolve_browser_profile_dir(
+            &store_dir,
+            Some("m27-2"),
+            Some("user-b@example.test"),
+        ),
+        label_profile,
+        "resolve_browser_profile_dir must reuse existing label profile directory when email profile does not exist"
+    );
+    let email_profile =
+        super::super::headless_oauth::browser_profile_dir(&store_dir, Some("user-b@example.test"));
+    std::fs::create_dir_all(&email_profile).expect("mkdir email_profile");
+    assert_eq!(
+        super::super::headless_oauth::resolve_browser_profile_dir(
+            &store_dir,
+            Some("m27-2"),
+            Some("user-b@example.test"),
+        ),
+        email_profile,
+        "resolve_browser_profile_dir must prefer existing email profile directory when present"
+    );
+
     let styled_otp_eml = concat!(
         "From: Anthropic <no-reply@claude.com>\r\n",
         "To: <user-b@example.test>\r\n\r\n",
@@ -979,7 +1074,6 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         );
     }
 
-    // 5. A failed HTTP probe hands off its consumed OTP without undoing another flow's state.
     #[cfg(unix)]
     {
         use crate::harness::headless_oauth::MailboxCredential;

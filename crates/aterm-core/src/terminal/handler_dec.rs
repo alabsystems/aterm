@@ -29,7 +29,6 @@ impl TerminalHandler<'_> {
                     }
                 }
                 2 => {
-                    // DECANM — CSI ? 2 l enters VT52, CSI ? 2 h exits.
                     self.set_vt52_mode(!set);
                 }
                 3 =>
@@ -40,7 +39,6 @@ impl TerminalHandler<'_> {
                     }
                 }
                 5 => {
-                    // DECSCNM — reverse video, forces full redraw.
                     self.set_reverse_video(set);
                 }
                 6 => {
@@ -84,22 +82,18 @@ impl TerminalHandler<'_> {
                     self.set_reverse_wraparound(set);
                 }
                 66 => {
-                    // DECNKM: set is the application keypad (ESC =), reset numeric (ESC >).
                     self.set_application_keypad(set);
                 }
                 69 => {
                     self.set_left_right_margin_mode(set);
                 }
                 40 => {
-                    // Mode 40: allow DECCOLM (80/132 columns), per xterm.
                     self.modes.deccolm_enable = set;
                 }
                 80 => {
-                    // DECSDM: set, Sixel output scrolls at the bottom margin; reset, it clips.
                     self.set_sixel_display_mode(set);
                 }
                 95 => {
-                    // DECNCSM: a DECCOLM switch does not clear screen, margins or cursor.
                     self.modes.decncsm = set;
                 }
                 47 => {
@@ -123,8 +117,6 @@ impl TerminalHandler<'_> {
                         let dead = self.take_dead_alt_screen();
                         self.exit_alternate_screen();
                         if dead {
-                            // The host's forwarded switch out of a dead app's screen
-                            // is that app's exit: what it left on goes with it.
                             self.release_dead_app_modes();
                         }
                     }
@@ -284,8 +276,6 @@ impl TerminalHandler<'_> {
         self.transient.alt_park_main_row_counter = Some(self.grid.absolute_row_counter());
     }
 
-    /// Take the parked reading position off a grid swapped back in mid-batch and hand it to
-    /// the epilogue's re-pin.
     fn flatten_restored_display_offset(&mut self) {
         self.transient.alt_screen_left_in_batch = true;
         let restored = self.grid.display_offset();
@@ -585,12 +575,6 @@ impl TerminalHandler<'_> {
         dead
     }
 
-    /// Reset the modes a dead full-screen app owned, which its own exit would
-    /// have reset and the exits above carry over: its input modes
-    /// (`release_dead_app_input`), scroll region and horizontal margins (shell
-    /// output would never reach the scrollback), and an open 2026 window, the
-    /// program's own frame included after the timeout cleared the mode
-    /// (`Terminal::sync_frame_unfinished`).
     fn release_dead_app_modes(&mut self) {
         self.grid.reset_scroll_region();
         self.modes.left_right_margin_mode = false;
@@ -679,8 +663,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Scroll every used screen row (down to the last non-blank one) into the
-    /// scrollback, leaving the screen blank and the cursor where it was.
     fn scroll_screen_into_scrollback(&mut self) {
         let region = self.grid.scroll_region();
         if region.top != 0 || region.bottom + 1 != self.grid.rows() {
@@ -826,8 +808,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Restore cursor position, style and modes from a snapshot (if any). With origin mode
-    /// restored on, the cursor is clamped as DECRC clamps it.
     fn restore_cursor_snapshot(&mut self, state: Option<SavedCursorState>) {
         let Some(state) = state else {
             self.modes.origin_mode = false;
@@ -949,7 +929,7 @@ impl TerminalHandler<'_> {
         self.send_response(cap, response.as_bytes());
     }
 
-    /// ANSI DECRQM (`CSI Ps $ p`): answers `CSI Ps ; Pm $ y`, with no `?`, Pm as for [`handle_decrqm`](Self::handle_decrqm).
+    /// ANSI DECRQM (`CSI Ps $ p`).
     pub(super) fn handle_ansi_decrqm(
         &mut self,
         cap: &super::response_capability::ResponseCapability,
@@ -965,7 +945,7 @@ impl TerminalHandler<'_> {
         let mode_state: u8 = match mode {
             4 => state(self.modes.insert_mode),
             8 => {
-                // BDSM — set means implicit BiDi (the default)
+                // BDSM — set means implicit BiDi (the default).
                 state(self.modes.bidi_mode == crate::config::BiDiMode::Implicit)
             }
             20 => state(self.modes.new_line_mode),
@@ -1004,8 +984,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Parse a VT420 rectangle `Pt;Pl;Pb;Pr` (1-indexed, 0 or absent is the default: the whole
-    /// area) into 0-indexed absolute `(top, left, bottom, right)`.
     fn parse_rect_coords(&self, params: &[u16]) -> Option<(u16, u16, u16, u16)> {
         let rows = self.grid.rows();
         let cols = self.grid.cols();
@@ -1122,9 +1100,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Split a DECRARA `Pm` list into (single-bit flags to XOR, reverse-underline). Underline
-    /// is not one bit (the underline flags combine to spell dotted and dashed), so the grid
-    /// decides it per cell (`reverse_cell_attrs`).
     fn sgr_params_to_reverse_flags(sgr_params: &[u16]) -> (CellFlags, bool) {
         let mut toggle = CellFlags::empty();
         let mut toggle_underline = false;
@@ -1192,8 +1167,6 @@ impl TerminalHandler<'_> {
             .copy_rect(src_top, src_left, src_bottom, src_right, dst_top, dst_left);
     }
 
-    /// The DECCARA subset of SGR (bold, dim, italic, underline, blink, inverse, hidden,
-    /// strikethrough and their resets) as `(flags_to_set, flags_to_clear)`.
     fn sgr_params_to_flags(sgr_params: &[u16]) -> (CellFlags, CellFlags) {
         let mut flags_to_set = CellFlags::empty();
         let mut flags_to_clear = CellFlags::empty();
@@ -1221,7 +1194,6 @@ impl TerminalHandler<'_> {
                 }
                 23 => flags_to_clear = flags_to_clear.union(CellFlags::ITALIC),
                 24 => {
-                    // SGR 24 clears every underline style, as apply_sgr_param does.
                     flags_to_clear = flags_to_clear.union(CellFlags::ALL_UNDERLINES);
                 }
                 25 => flags_to_clear = flags_to_clear.union(CellFlags::BLINK),
@@ -1235,7 +1207,7 @@ impl TerminalHandler<'_> {
         (flags_to_set, flags_to_clear)
     }
 
-    /// DECFRA, Fill Rectangular Area (VT420+): `CSI Pch ; Pt ; Pl ; Pb ; Pr $ x` fills the rectangle with character Pch.
+    /// DECFRA, Fill Rectangular Area (VT420+).
     pub(super) fn handle_decfra(&mut self, params: &[u16]) {
         let ch_code = params.first().copied().unwrap_or(0);
 
@@ -1284,9 +1256,6 @@ impl TerminalHandler<'_> {
 mod cursor_damage_scope_tests {
     use crate::terminal::Terminal;
 
-    /// A cursor-only change damages the cursor cell: something (a bare DECTCEM must not be
-    /// swallowed by the frontend's redraw early-out), but not everything (TUIs bracket every
-    /// repaint in `?25l … ?25h`).
     #[test]
     fn a_cursor_only_change_damages_the_cursor_cell_not_the_whole_grid() {
         for (name, setup, seq) in [
@@ -1323,8 +1292,6 @@ mod cursor_damage_scope_tests {
         }
     }
 
-    /// Every alt-screen exit mode leaves the restored grid fully damaged and advances the
-    /// damage epoch.
     #[test]
     fn leaving_the_alternate_screen_marks_the_restored_grid_fully_damaged() {
         for (enter, exit) in [
@@ -1353,8 +1320,6 @@ mod cursor_damage_scope_tests {
         }
     }
 
-    /// Control: a change that repaints every cell (reverse video, bidi direction) still marks
-    /// the whole grid.
     #[test]
     fn a_whole_screen_change_still_marks_the_whole_grid() {
         let mut term = Terminal::new(24, 80);
@@ -1511,8 +1476,6 @@ mod win32_input_mode_tests {
     use crate::terminal::Terminal;
     use aterm_types::keyboard::KeyboardMode;
 
-    /// A session behind a console host: the posture aterm-gui applies to a
-    /// ConPTY session (`spawn::apply_pty_keyboard_posture`).
     fn conpty_term() -> Terminal {
         let mut term = Terminal::new(24, 80);
         term.set_win32_input_enabled(true);
@@ -1719,7 +1682,6 @@ mod conhost_left_alt_screen_tests {
     const ROWS: u16 = 10;
     const PROMPT: &[u8] = b"\x1b]133;A\x07PS> \x1b]133;B\x07";
 
-    /// Every retained row, scrollback first, trailing blanks trimmed.
     fn all_rows(term: &Terminal) -> Vec<String> {
         let first = term.grid().oldest_absolute_row();
         let n = term.grid().scrollback_lines() + usize::from(ROWS);
@@ -1738,7 +1700,6 @@ mod conhost_left_alt_screen_tests {
         rows.iter().filter(|r| *r == want).count()
     }
 
-    /// conhost's blank repaint of the viewport and its `?1049h`, in one read.
     fn blank_repaint_then_enter() -> Vec<u8> {
         let mut read = b"\x1b[?25l\x1b[H".to_vec();
         for _ in 1..ROWS {
@@ -1748,8 +1709,6 @@ mod conhost_left_alt_screen_tests {
         read
     }
 
-    /// conhost's repaint of its primary buffer after `?1049l`: frozen at the
-    /// dead pager's start, so it knows nothing typed since.
     fn stale_primary_repaint() -> Vec<u8> {
         let mut read = b"\x1b[?25l\x1b[H".to_vec();
         for row in ["history 1", "history 2", "PS> less file"] {
@@ -1760,8 +1719,6 @@ mod conhost_left_alt_screen_tests {
         read
     }
 
-    /// A pager killed on the alternate screen, the prompt's recovery, and two
-    /// commands typed after it — under conhost (`?9001h`) or not.
     fn recovered_with_two_commands(conhost: bool) -> Terminal {
         let mut term = Terminal::new(ROWS, 40);
         if conhost {
@@ -1875,8 +1832,6 @@ mod conhost_left_alt_screen_tests {
         assert_eq!(count(&rows, "    echo after"), 1, "{rows:?}");
     }
 
-    /// Without a console host a program's `?9001h` is just output: the recovery still leaves
-    /// the unix way (the 1049 exit restores the saved cursor, the primary rows stay).
     #[test]
     fn a_programs_9001_does_not_fake_a_console_host_for_the_recovery() {
         let mut term = Terminal::new(ROWS, 40);
@@ -1891,9 +1846,6 @@ mod conhost_left_alt_screen_tests {
         assert_eq!(term.row_text(0).unwrap().trim_end(), "$ less file");
     }
 
-    /// A pager that filled the screen after a short history, killed, then the
-    /// shell's prompt: conhost scrolled its alternate buffer for the prompt, so
-    /// its cursor is on the bottom row, far below the row `?1049h` saved.
     fn recovered_on_the_bottom_row(conhost: bool) -> Terminal {
         let mut term = Terminal::new(ROWS, 40);
         if conhost {
@@ -2031,9 +1983,6 @@ mod stray_1049_reset_tests {
         assert!(term.style().flags.contains(CellFlags::BOLD));
     }
 
-    /// The contrast: leaving a screen `?1049h` entered is DECRC from the slot
-    /// that set filled (xterm's one `CursorRestore`), not only the cursor the
-    /// main grid kept.
     #[test]
     fn a_1049l_from_the_alternate_screen_restores_the_slot_as_decrc_does() {
         type Between = fn(&mut Terminal);
@@ -2090,10 +2039,6 @@ mod stray_1049_reset_tests {
         }
     }
 
-    /// The case that rules out xterm's restore: a full-screen app dies on the
-    /// alternate screen, the shell's prompt mark leaves it for the app
-    /// (restoring the slot its `?1049h` saved, which DECRC must keep), output
-    /// and prompts follow, and then the user types `tput rmcup`.
     #[test]
     fn a_rmcup_after_the_orphaned_screen_recovery_keeps_the_cursor() {
         let mut term = Terminal::new(8, 30);
@@ -2195,9 +2140,6 @@ mod alt_switch_bce_tests {
         );
     }
 
-    /// An OSC 8 link a program left open does not outlive its screen: every
-    /// switch, either way, closes it, so the next glyph on the other screen
-    /// carries no link.
     #[test]
     fn an_open_link_ends_at_every_screen_switch() {
         for (on, switch) in [
@@ -2334,7 +2276,6 @@ mod in_band_size_tests {
         );
     }
 
-    /// A tab behind a Windows console host, postured as the window postures one.
     fn console_host_tab() -> Terminal {
         let mut term = Terminal::new(30, 100);
         term.set_console_host_posture(crate::grid::ResizePolicy::ConPty);
@@ -2420,8 +2361,6 @@ mod mode_and_query_agreement_tests {
         term.take_response().unwrap_or_default()
     }
 
-    /// DEC mode 12 is the cursor style's blink bit: the renderer blinks only `Blinking*`
-    /// styles, and `CSI ? 12 $ p` answers the same fact.
     #[test]
     fn mode_12_moves_the_cursor_the_user_sees_and_reports_it() {
         let mut term = Terminal::new(24, 80);
@@ -2449,7 +2388,6 @@ mod mode_and_query_agreement_tests {
         assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;1$y");
     }
 
-    /// DECSCUSR carries the blink bit too, so it moves mode 12 with it.
     #[test]
     fn decscusr_moves_mode_12_with_the_style() {
         for (param, style, want_set) in [
@@ -2480,8 +2418,6 @@ mod mode_and_query_agreement_tests {
         }
     }
 
-    /// Replay the recovered mode-12 request with the current explicit ConPTY
-    /// capability: mode 12 must not replace the configured or DECSCUSR style.
     #[test]
     fn mode_12_under_conhost_keeps_the_configured_cursor() {
         const VIM_START: &[u8] = b"\x1b[?1049h\x1b[?12h\x1b[?12l";
@@ -2546,8 +2482,6 @@ mod mode_and_query_agreement_tests {
         assert_eq!(decrqm(&mut term, 12), b"\x1b[?12;2$y");
     }
 
-    /// Every mode DECRQM can report is one XTSAVE/XTRESTORE can carry: the two
-    /// tables (`query_dec_mode`, `handle_decrqm`) must agree.
     #[test]
     fn xtsave_covers_every_mode_decrqm_reports() {
         const REPORTED: &[u16] = &[

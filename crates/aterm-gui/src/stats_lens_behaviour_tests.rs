@@ -694,6 +694,58 @@ fn a_rest_on_the_decks_header_opens_how_to_read() {
     );
 }
 
+/// Why now's "this tab" is every pane of the window's front tab, the focused
+/// first (`App::deck_tab_panes`, the panes the vitals request sends as one
+/// tab): the split keys a tab split into panes by its least session, so a
+/// focused pane past it still reads the tab's part, never "not read".
+#[test]
+fn why_now_reads_the_front_tab_by_every_pane() {
+    use aterm_vitals::explain::fixtures;
+    let mut r = rig("deck");
+    let (_, cell) = r.app.win_cell_size(r.wid);
+    let ws = r.app.windows.get_mut(&r.wid).expect("window");
+    ws.metrics.head = crate::stats_deck::deck_px(StatsBars::Deck, ws.deck_form, ws.scale, cell);
+    let other = r.app.split_active_stub_tab(r.wid);
+    assert!(
+        other > r.session,
+        "PRECONDITION: the focused pane is not the least key"
+    );
+    assert_eq!(r.app.deck_tab_panes(r.wid), [other, r.session]);
+
+    let scene = fixtures::Scene {
+        tabs: vec![fixtures::tab(r.session, 1200)],
+        ..fixtures::spotlight_1032()
+    };
+    let mut vitals = aterm_vitals::Vitals::new();
+    let facts = scene
+        .series(4)
+        .iter()
+        .map(|reading| vitals.absorb(reading))
+        .last()
+        .and_then(|s| s.why);
+    let mut snap = r
+        .app
+        .vitals
+        .snapshot
+        .as_deref()
+        .expect("a snapshot")
+        .clone();
+    snap.why = facts;
+    r.app.vitals.snapshot = Some(Arc::new(snap));
+    r.app
+        .open_stats_lens(r.wid, Instrument::Cpu, Bar::Global, Opened::Pinned);
+    let (_, _, laid) = r.app.stats_lens_words(r.wid).expect("the lens is laid");
+    let why = laid
+        .wells
+        .iter()
+        .find(|(name, _)| name == "Why now")
+        .map(|(_, words)| words.as_str());
+    assert!(
+        why.is_some_and(|w| w.contains(" \u{b7} aterm 0.40, Tab 1 0.20.")),
+        "{why:?}"
+    );
+}
+
 /// T-G12 through the App (Stats Deck v2 §12): the window's tree holds the
 /// deck's group, six meters each said in its row's sentence for the
 /// window's front tab and a group of one meter a core; an open lens is a
@@ -735,6 +787,37 @@ fn the_tree_reads_the_deck_and_its_lens() {
     assert_eq!(
         lens.wells.first().map(|(name, _)| name.as_str()),
         Some("Now")
+    );
+    assert!(
+        lens.wells
+            .iter()
+            .all(|(name, words)| !name.is_empty() && !words.is_empty())
+    );
+    assert!(lens.wells.iter().all(|(name, _)| name != "Why now"));
+    // With a cause open in the engine's facts, Why now is read too.
+    let mut snap = r
+        .app
+        .vitals
+        .snapshot
+        .as_deref()
+        .expect("a snapshot")
+        .clone();
+    snap.why = Some(crate::stats_deck::paint_tests::spotlight_after_start_up());
+    r.app.vitals.snapshot = Some(Arc::new(snap));
+    let lens = r
+        .app
+        .stats_a11y(r.wid)
+        .and_then(|s| s.lens)
+        .expect("the lens is read");
+    let why = lens
+        .wells
+        .iter()
+        .find(|(name, _)| name == "Why now")
+        .map(|(_, words)| words.as_str());
+    assert!(
+        why.is_some_and(|w| w.starts_with("Why: Spotlight, after start-up, 1.42 cores. ")),
+        "{:?}",
+        lens.wells
     );
     assert!(
         lens.wells

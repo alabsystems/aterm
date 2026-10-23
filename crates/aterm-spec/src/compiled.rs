@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! A [`Model`] resolved once for the interpreter's state-space walks.
-//!
-//! Resolves state variables to sorted-name slice indices, constants to values, and `\A` indices
-//! to local stack slots (`None` from [`Compiled::new`] if an update writes a key absent from `init_state`).
 
 use std::cell::Cell;
 use std::collections::BTreeMap;

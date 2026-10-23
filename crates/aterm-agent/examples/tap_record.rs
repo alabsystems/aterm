@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// THE REVIEWER'S INSTRUMENT for the account stats' record (slice A1; kept in the tree, linted with
-// `--all-targets`): usage-tap reading files the real `aterm harness tap` wrote, in the order given,
-// recorded the way the window's host records one at a decided turn end — the freshness rule
-// (`tap::Fresh::admit`), what it saw beside the reading before (`tap::Fresh::beside`: a refill), the
-// default home's key (`profile::default_home_key`) and `accounts::note_reading` in one store
-// transaction — into a SCRATCH harness state, under `main`. For the real-Claude lab, whose Claude Code
-// runs on a scratch `CLAUDE_CONFIG_DIR` and a fake token, so that the host's own attribution (the
-// machine's stored login in the default home) never records it there. It prints, per file, whether
-// the reading was fresh, what it carried in tenths, and the ledger rows it wrote — never a path.
-// `targo --unverified run -q -p aterm-agent --example tap_record -- <scratch-harness-state> <user-home> <reading.json>...`
 use std::path::PathBuf;
 
 use aterm_agent::harness::accounts::{self, Store};

@@ -4,12 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/macos/ffi.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// LOCAL PATCH (aterm): the CoreFoundation and CoreGraphics types come from `aterm_objc::cf` and
-// `aterm_cg`, not the `core-foundation`/`core-graphics` crates. `dead_code` is not allowed: only
-// what is called is declared (a display's UUID and current refresh rate, and the keyboard
-// layout). Upstream's `CGError` values, IOKit pixel-encoding strings, display fade, capture and
-// mode calls, shielding level, and SkyLight blur and window-level calls went with exclusive
-// fullscreen, window levels and blur.
 #![allow(non_snake_case, non_upper_case_globals)]
 
 use std::ffi::c_void;

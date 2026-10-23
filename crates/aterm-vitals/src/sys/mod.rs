@@ -110,11 +110,7 @@ impl Machine {
     /// What other users' processes are called here.
     #[must_use]
     pub fn services_word(&self) -> &'static str {
-        match self.family {
-            "macOS" => "macOS services",
-            "Windows" => "Windows services",
-            _ => "system services",
-        }
+        crate::words::services_word(self.family)
     }
 }
 

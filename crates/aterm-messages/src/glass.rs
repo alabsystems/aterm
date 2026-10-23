@@ -1048,11 +1048,7 @@ fn fit_fixed(spec: &RowSpec<'_>, cols: usize, width: &dyn Fn(&str) -> usize) -> 
     }
 }
 
-/// `detail0` shaped to at most `target` cells under `width`. [`shape_detail`]
-/// cuts by chars; under a wide measure its result can still be too wide, so
-/// the char cap is lowered until the cells fit, to the largest cap that
-/// does, so what is shown at one width is shown at every wider one and the
-/// excerpt never flickers during a resize.
+/// `detail0` shaped to at most `target` cells under `width`.
 fn shape_to_cells(detail0: &str, target: usize, width: &dyn Fn(&str) -> usize) -> Option<String> {
     let whole = detail0.chars().count();
     let mut cap = target;
@@ -1211,9 +1207,6 @@ fn allocate_extras(
             detail = Some(cut);
         }
         if fit.action_excerpt {
-            // What the excerpt left is the row's again only beside a whole
-            // excerpt: a shaped one ends where its words did, and the cells a
-            // word-boundary cut left must not re-buy what a wider row had.
             room += if detail_whole { cells } else { 0 };
         } else {
             room = cells;
@@ -1506,7 +1499,6 @@ pub(crate) mod tests {
             put(*col, p);
         }
         if let Some((col, words)) = row.load {
-            // At the tail, no joint.
             put(col, words);
         }
         if let Some((col, s)) = &row.stats {
@@ -2800,7 +2792,7 @@ pub(crate) mod tests {
     /// The cuts of a Latin title, detail and sentence, every width from
     /// none to whole, as `tests/fixtures/latin-cuts.txt` records them: what
     /// [`title_in`], [`first_word`], `trim_words` and `split_sentence` gave
-    /// when they cut only at spaces (taken from that code, 2026-10-21).
+    /// when they cut only at spaces.
     fn latin_cuts() -> String {
         let corpus = [
             "Couldn't use your keybindings file",

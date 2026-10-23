@@ -263,10 +263,7 @@ fn desk(tabs: Vec<Vec<u64>>) -> TestDesk {
     d
 }
 
-/// A SUPERVISED BOX IS NO NEED: a session at a prompt, held and stalled, with
-/// no published need lights no border and no pill and makes no mark — the
-/// border reads the verdict, never the phase. The control: the same session
-/// once its verdict publishes a need is lit.
+/// A session at a prompt with no published need lights no border and no pill until its verdict publishes a need.
 #[test]
 fn a_supervised_prompt_gives_no_border_and_no_pill() {
     let mut d = desk(vec![vec![1]]);
@@ -331,12 +328,9 @@ fn more_walks_past_a_front_report_to_the_other_reports() {
     assert_eq!(d.next_need_after(1, 1), Some(2));
 }
 
-/// THE MOST PRESSING SESSION across a window's tabs and panes: stuck before
-/// decide wherever they are; within a severity the front session wins the
-/// tie, then the oldest need; `more` counts the rest.
+/// Pressing session selection orders stuck before decide, then front session, then oldest need.
 #[test]
 fn pressing_session_takes_the_most_severe_need_and_the_front_wins_ties() {
-    // Tab 0 is front: panes 1 (focused) and 2; tab 1: 3; tab 2: 4.
     let mut d = desk(vec![vec![1, 2], vec![3], vec![4]]);
     d.publish(4, decide(40));
     let p = d.pressing_session(1).expect("a need");
@@ -366,7 +360,6 @@ fn pressing_session_takes_the_most_severe_need_and_the_front_wins_ties() {
         (1, true, 3),
         "the front session wins a tie, however young its need"
     );
-    // The pill names what the border is lit for.
     let view = d.view(1);
     assert_eq!(view.pressing, Some(1));
     let pill = view.pill.as_ref().expect("the pill");
@@ -375,17 +368,13 @@ fn pressing_session_takes_the_most_severe_need_and_the_front_wins_ties() {
         (1, None, 3),
         "front: no tab number"
     );
-    // NEGATIVE CONTROL: with the front's need gone, a background tab's pill
-    // carries its number.
     d.publish(1, None);
     let pill = d.view(1).pill.clone().expect("the pill");
     assert_eq!((pill.session, pill.tab), (3, Some(2)));
     assert!(!pill.label.is_empty());
 }
 
-/// THE PERSON'S OUTLINE appears only on the front session and only while
-/// nothing in the window needs them; a need outranks it, and a hold in a
-/// background tab is no outline.
+/// The person's outline appears only on the front session while nothing in the window needs attention.
 #[test]
 fn yours_appears_only_on_the_front_session_with_no_need() {
     let mut d = desk(vec![vec![1], vec![2]]);
@@ -407,7 +396,6 @@ fn yours_appears_only_on_the_front_session_with_no_need() {
     assert_eq!(d.view(1).rim, Rim::Decide, "a need outranks the outline");
     d.publish(2, None);
     assert_eq!(d.view(1).rim, Rim::Yours);
-    // The front moves to the held background tab... and back.
     d.wins.get_mut(&1).unwrap().front_tab = 1;
     held(&mut d, 1, false);
     drive::refresh_window(&mut d, 1);
@@ -416,9 +404,7 @@ fn yours_appears_only_on_the_front_session_with_no_need() {
     assert_eq!(d.view(1).rim, Rim::None);
 }
 
-/// A STALL'S ONE REMEDY, only on the front tab's stall: RESTART for a frozen
-/// program where the host carries the act, RESUME for a stopped job; a
-/// background tab's pill goes there first.
+/// Restart and resume actions are offered only on the front tab's stall.
 #[test]
 fn restart_and_resume_are_offered_only_in_front() {
     let frozen = Some(need(NeedSeverity::Stuck, StopCause::Frozen, 5));
@@ -441,8 +427,6 @@ fn restart_and_resume_are_offered_only_in_front() {
         None,
         "a wall has no restart"
     );
-    // A stopped job is no restart's (the act answers `not-stalled` for it),
-    // however carried: it is continued.
     let stopped = Some(need(NeedSeverity::Stuck, StopCause::Suspended, 7));
     d.publish(1, stopped.clone());
     assert_eq!(
@@ -469,8 +453,7 @@ fn restart_and_resume_are_offered_only_in_front() {
     }
 }
 
-/// THE VIEW SWITCH: off, no border and no pill, while the marks, the slot
-/// and the wire stay; on again, they return at the next projection.
+/// The view switch hides the border and the pill while keeping tab marks intact.
 #[test]
 fn the_switch_hides_the_border_and_the_pill_and_keeps_the_marks() {
     let mut d = desk(vec![vec![1]]);
@@ -489,10 +472,7 @@ fn the_switch_hides_the_border_and_the_pill_and_keeps_the_marks() {
     assert_eq!(d.took("restamp"), 1, "the strip carries the pill again");
 }
 
-/// SCENARIO 1 AS A REGRESSION TEST: a hundred verdict flips on a background
-/// tab repaint the window and re-stamp its strip, and nothing else — the
-/// desk has no re-grid to ask for, and every flip's effects are the four the
-/// driver owns.
+/// Verdict flips on a background tab repaint the window and restamp its strip without side effects.
 #[test]
 fn a_hundred_verdict_flips_ask_only_for_a_repaint_and_a_restamp() {
     let mut d = desk(vec![vec![1], vec![2]]);
@@ -536,11 +516,7 @@ fn a_refresh_that_moved_nothing_repaints_nothing() {
     assert_eq!(d.took("herald"), 1, "the publication rides every refresh");
 }
 
-/// THE DEADLINE AND THE TICK: a quiet desk arms nothing; a visible pill's age
-/// is due at once, then at its next figure, and a tick there repaints its
-/// window and pushes its pill alone — no chip re-stamped; a hidden window's
-/// pill arms nothing; a lease's and a supervisor's lapse and the herald's due
-/// fold in.
+/// Visible pill ages, supervisor lapses, and herald deadlines arm and fire on tick.
 #[test]
 fn the_pill_age_ticks_only_where_seen_and_the_lapses_fold_in() {
     let mut d = desk(vec![vec![1], vec![2]]);
@@ -560,10 +536,8 @@ fn the_pill_age_ticks_only_where_seen_and_the_lapses_fold_in() {
     assert_eq!(drive::tick(&mut d, due), vec![1]);
     assert_eq!(d.took("pill [1]"), 1, "the pill alone is pushed");
     assert_eq!(d.took("restamp"), 0, "no chip moves with an age");
-    // Hidden: nothing armed for the pill.
     d.wins.get_mut(&1).unwrap().visible = false;
     assert_eq!(drive::deadline(&d, due), None);
-    // A supervisor's lapse and the herald's due fold in.
     d.supervisors.insert(1, due + Duration::from_secs(9));
     drive::refresh_session(&mut d, 1);
     assert_eq!(drive::deadline(&d, due), Some(due + Duration::from_secs(9)));
@@ -576,15 +550,7 @@ fn the_pill_age_ticks_only_where_seen_and_the_lapses_fold_in() {
     assert_eq!(d.took("lapse 1"), 1);
 }
 
-/// A RENEWED CLAIM NEVER WAKES THE LOOP (D5, the Together run): a renewal
-/// posts nothing (`meta set supervisor` by the holder it names is no change),
-/// so no refresh re-reads it; the deadline reads the claim's lapse live and
-/// moves with each renewal. A holder that stops renewing is still caught at
-/// its last lapse, and a claim gone without a refresh falls back to the
-/// table's copy, so the tick re-reads it.
-///
-/// NEGATIVE CONTROL: the table's copy alone (what the deadline read before)
-/// is the stale lapse — a wake 20 s before the claim's real one, every lease.
+/// A renewed supervisor claim moves the deadline live without a refresh, falling back to the table's copy when gone.
 #[test]
 fn a_renewed_supervisor_claim_moves_the_deadline_without_a_refresh() {
     let hidden = || {
@@ -597,7 +563,6 @@ fn a_renewed_supervisor_claim_moves_the_deadline_without_a_refresh() {
     d.supervisors.insert(2, t0 + Duration::from_secs(90));
     drive::refresh_session(&mut d, 2);
     assert_eq!(drive::deadline(&d, t0), Some(t0 + Duration::from_secs(90)));
-    // Renewed 20 s on, with no refresh: the deadline is the new lapse.
     d.supervisors.insert(2, t0 + Duration::from_secs(110));
     let t = t0 + Duration::from_secs(20);
     assert_eq!(
@@ -605,7 +570,6 @@ fn a_renewed_supervisor_claim_moves_the_deadline_without_a_refresh() {
         Some(t0 + Duration::from_secs(110)),
         "the live lapse, not the 90 s one the last refresh read"
     );
-    // Negative control: the copy the table holds is the stale one.
     let mut stale = hidden();
     stale.supervisors.insert(2, t0 + Duration::from_secs(90));
     drive::refresh_session(&mut stale, 2);
@@ -615,7 +579,6 @@ fn a_renewed_supervisor_claim_moves_the_deadline_without_a_refresh() {
         Some(t0 + Duration::from_secs(90)),
         "a claim gone without a refresh: the table's copy fires, and the tick re-reads"
     );
-    // The holder dies after its last renewal: caught at that lapse.
     let lapse = t0 + Duration::from_secs(110);
     d.now = lapse;
     assert_eq!(drive::deadline(&d, lapse), Some(lapse));
@@ -624,11 +587,7 @@ fn a_renewed_supervisor_claim_moves_the_deadline_without_a_refresh() {
     assert_eq!(drive::deadline(&d, lapse), None, "lapsed: nothing armed");
 }
 
-/// AN AGE ON GLASS RE-PRESENTS NO FRAME (§5): a window whose titlebar draws
-/// the pill gets its pill pushed at the age tick and nothing else — its
-/// view's key (`View::fp`, which the frame folds) holds and no repaint is
-/// asked. CONTROL: the same tick on a window whose own frame draws the pill
-/// (an in-grid strip) moves its key and repaints it.
+/// A glass window whose titlebar draws the pill pushes the pill at the age tick without moving the frame key.
 #[test]
 fn a_pill_age_on_glass_moves_no_frame_key() {
     let aged = |glass: bool| {
@@ -653,10 +612,7 @@ fn a_pill_age_on_glass_moves_no_frame_key() {
     );
 }
 
-/// THE TAB IN FRONT PRINTS NO AGE, SO IT ARMS NO TICK (§5, scenario 7): a
-/// need on the front tab lights the pill with no age, and nothing is armed
-/// for it however long it stands. CONTROL: the same need on a background
-/// tab prints its age and arms its tick.
+/// A need on the front tab prints no age and arms no age tick.
 #[test]
 fn a_front_tab_pill_arms_no_age_tick() {
     let mut d = desk(vec![vec![1], vec![2]]);
@@ -666,7 +622,6 @@ fn a_front_tab_pill_arms_no_age_tick() {
     assert_eq!((pill.tab, pill.since), (None, None), "the front tab's pill");
     assert_eq!(drive::deadline(&d, t0), None, "no age, no tick");
     assert!(drive::tick(&mut d, t0 + Duration::from_secs(90)).is_empty());
-    // CONTROL: behind, its age is printed and ticks.
     d.publish(1, None);
     d.publish(2, stuck(2));
     let pill = d.view(1).pill.clone().expect("lit");
@@ -675,9 +630,7 @@ fn a_front_tab_pill_arms_no_age_tick() {
     assert_eq!(drive::deadline(&d, t0), Some(t0), "its first tick is due");
 }
 
-/// ANOTHER PANE OF THE FRONT TAB IS NAMED (§5): the pill names a need in a
-/// pane that is not the focused one by its label, with no tab number and no
-/// age; the focused pane's own need is named by nothing.
+/// The pill names a need in an unfocused pane of the front tab by its label without tab number or age.
 #[test]
 fn a_need_in_another_pane_of_the_front_tab_is_named() {
     let mut d = desk(vec![vec![1, 3]]);
@@ -686,17 +639,13 @@ fn a_need_in_another_pane_of_the_front_tab_is_named() {
     assert_eq!(pill.session, 3);
     assert_eq!(pill.label, "tab-of-3");
     assert_eq!((pill.tab, pill.since), (None, None));
-    // CONTROL: the focused pane's own need wins the tie, and is bare.
     d.publish(1, decide(2));
     let pill = d.view(1).pill.clone().expect("lit");
     assert_eq!(pill.session, 1);
     assert!(pill.label.is_empty());
 }
 
-/// WHERE `+N` GOES (§5): the window's next need after the one in front, in
-/// the need's own order (stuck, then oldest, then tab), wrapping round — so
-/// presses walk every need, whatever the pill names. With one need there is
-/// nowhere else to go.
+/// `next_need_after` walks the window's needs in priority order and wraps around.
 #[test]
 fn more_walks_the_windows_needs_and_wraps() {
     let mut d = desk(vec![vec![1], vec![2], vec![3]]);
@@ -706,19 +655,15 @@ fn more_walks_the_windows_needs_and_wraps() {
     d.publish(3, decide(2));
     d.now += Duration::from_secs(1);
     d.publish(1, stuck(3));
-    // The order: 1 (stuck), then 2 (the older decide), then 3.
     assert_eq!(d.view(1).pill.as_ref().map(|p| p.session), Some(1));
     assert_eq!(d.next_need_after(1, 1), Some(2));
-    // Session 2 comes front: the walk goes on from it, not from the named.
     d.wins.get_mut(&1).unwrap().front_tab = 1;
     assert_eq!(d.next_need_after(1, 1), Some(3));
     d.wins.get_mut(&1).unwrap().front_tab = 2;
     assert_eq!(d.next_need_after(1, 1), Some(1), "it wraps");
 }
 
-/// THE STORY READ: a person's key in a calm session moves the watermark, and
-/// `status level=story` quiets; never in a session that is not calm; a told
-/// `chose` is one point.
+/// A person's key in a calm session advances the story watermark and quiets `Level::Story`.
 #[test]
 fn a_calm_key_reads_the_story_and_a_hold_keeps_it() {
     let mut d = desk(vec![vec![1]]);
@@ -760,9 +705,7 @@ fn a_calm_key_reads_the_story_and_a_hold_keeps_it() {
     assert_eq!(drive::tell(&mut d, 99, StoryVerb::Chose), None);
 }
 
-/// THE WIRE: `chrome presence` prints the border, the session it is lit for
-/// and the pill, and a quiet window the empty record; `status`'s tail is
-/// unchanged.
+/// `chrome_line` prints the border, the pressing session, and the pill.
 #[test]
 fn the_chrome_line_names_the_rim_the_pressing_session_and_the_pill() {
     let mut d = desk(vec![vec![1], vec![2]]);
@@ -785,7 +728,7 @@ fn the_chrome_line_names_the_rim_the_pressing_session_and_the_pill() {
     );
 }
 
-/// A SESSION SHOWN TWICE (two panes of one tab) counts once.
+/// A session shown in two panes of one tab counts once.
 #[test]
 fn a_session_shown_twice_counts_once() {
     let mut d = desk(vec![vec![1, 1], vec![2]]);

@@ -2,20 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The `compare` lane: paired A/B fresh-process startup of two aterm binaries,
-//! scheduled AB/BA and REPORTED BY ROUND.
-//!
-//! A pair is two launches in a row, so every pair delta carries the whole
-//! slot-1/slot-2 offset (warm-up, drift, the binary that ran just before);
-//! rotation cancels it only in the mean over pairs. Pairs 2k-1 and 2k are the
-//! quad A B B A, so one round delta cancels any per-slot offset INSIDE the
-//! reported unit ([`crate::perf::stats::fold_rounds`]). Every metric prints
-//! the 95% interval on the round mean and the resolution the run earned: two
-//! identical-binary controls of this lane read -1.36 ms and +1.54 ms, each a
-//! false finding when a point estimate is read alone.
-//!
-//! The scheduler ([`schedule`]) is pure over a [`Bench`] — the launcher and
-//! the clock — so its rotation, round fold, schema handling and eligibility
-//! are unit-tested with an injected bench; the real bench launches windows.
+//! scheduled AB/BA and reported by round.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -265,11 +252,7 @@ pub(crate) fn schedule(bench: &mut dyn Bench, plan: &Plan) -> Result<Comparison,
     let attach_by_arm = by_arm(|s| s.attach);
     let all = |m: &BTreeMap<Arm, bool>| m.len() == 2 && m.values().all(|v| *v);
     let router = all(&router_by_arm);
-    // Time-to-visible partitions nothing, so its absence drops only its own
-    // comparison; a missing router, phase or attach schema removes a sum.
     let visible = all(&visible_by_arm);
-    // Only under --allow-legacy-metric: without it a sample lacking any of
-    // these is refused before it gets here.
     let legacy_totals_only = !(router && all(&phases_by_arm) && all(&attach_by_arm));
 
     let arm_values = |arm: Arm, pick: &dyn Fn(&Sample) -> Option<f64>| -> Vec<f64> {
@@ -333,7 +316,6 @@ pub(crate) fn schedule(bench: &mut dyn Bench, plan: &Plan) -> Result<Comparison,
         *thermal_counts.entry(r.thermal).or_default() += 1;
     }
     let eligibility = Eligibility {
-        // Exact: a virtualised or decorated identity must not satisfy it.
         hardware: plan.chip.trim() == "Apple M4 Max",
         sample_count: plan.pairs >= MIN_PAIRS,
         thermal_available: thermal_counts[&Thermal::Unavailable] == 0,
@@ -641,8 +623,6 @@ pub(crate) fn result_json(c: &Comparison, provenance: Value) -> Value {
     })
 }
 
-/// The real bench: each trial in its own fresh private root, its socket in
-/// the run's short socket directory.
 struct WindowBench<'a> {
     launchers: BTreeMap<Arm, Launcher>,
     root: &'a Path,
@@ -660,7 +640,6 @@ impl Bench for WindowBench<'_> {
     }
 
     fn cool(&mut self, seconds: f64) {
-        // The cooldown is the protocol (rule zero §2), not a wait for anything.
         std::thread::sleep(Duration::from_secs_f64(seconds));
     }
 }
@@ -788,10 +767,6 @@ mod tests {
     use super::super::start::tests::{LAWS, metrics};
     use super::*;
 
-    /// A deterministic bench: the same bytes on both arms unless told
-    /// otherwise, an exact `slot_bias` on the SECOND launch of every pair (the
-    /// noise-free form of this lane's measured second-slot penalty), and a log
-    /// of every cooldown and warm flag it was handed.
     struct FakeBench {
         calls: u32,
         slot_bias: f64,
@@ -868,10 +843,6 @@ mod tests {
         })
     }
 
-    /// THE ROTATION CANCELS INSIDE THE REPORTED UNIT. Identical bytes plus an
-    /// exact +2.0 ms on every second slot: the only true answer is zero. Each
-    /// pair delta reads +/-2.0 (a win/loss alternation that made an
-    /// identical-binary control read as a finding); every round reads 0.
     #[test]
     fn the_abba_round_fold_cancels_a_slot_bias_that_every_pair_carries() {
         let mut bench = FakeBench::new();
@@ -901,7 +872,6 @@ mod tests {
             assert!(r.mean.abs() < 1e-9);
             assert_eq!((r.faster, r.ties, r.slower), (0, 2, 0));
         }
-        // The biased attach child folds to zero for the same reason.
         let setup = c
             .attach
             .iter()
@@ -1005,9 +975,6 @@ mod tests {
         assert!(e.contains("rust_main_to_first_present_ms is absent"), "{e}");
     }
 
-    /// A partially historical baseline sharing the router and phases still
-    /// reports only the enclosing totals: a subset never poses as a full
-    /// phase comparison.
     #[test]
     fn a_baseline_without_attach_drops_every_partition() {
         let mut bench = FakeBench::new();
@@ -1024,8 +991,6 @@ mod tests {
         assert!(c.phases.is_empty() && c.attach.is_empty());
     }
 
-    /// TIME-TO-VISIBLE DEGRADES ALONE: a baseline without the reveal stamp
-    /// keeps every schema current and loses exactly that one comparison.
     #[test]
     fn a_missing_reveal_stamp_drops_only_its_own_comparison() {
         let mut bench = FakeBench::new();
@@ -1039,8 +1004,6 @@ mod tests {
         );
         assert!(!c.attach.is_empty());
         assert!(report(&c).contains("rust_main_to_first_visible_ms: not compared"));
-        // Both arms carrying it: compared like any other total, and its being
-        // below first-present is ordinary.
         let mut bench = FakeBench::new();
         let c = schedule(&mut bench, &plan(2)).expect("runs");
         let v = total(&c, "rust_main_to_first_visible_ms");
@@ -1110,21 +1073,18 @@ mod tests {
         .expect("runs");
         assert!(c.eligibility.all(), "{:?}", c.eligibility);
         assert!(report(&c).contains("automated Rule-Zero inputs eligible"));
-        // The cooldown boundary is inclusive; a hair under is not.
         let c = schedule(
             &mut FakeBench::new(),
             &eligible_plan("Apple M4 Max", 2, 4.999),
         )
         .expect("runs");
         assert!(!c.eligibility.cooldown && !c.eligibility.sample_count);
-        // A decorated identity is not the hardware.
         let c = schedule(
             &mut FakeBench::new(),
             &eligible_plan("Virtual Apple M4 Max", 2, 5.0),
         )
         .expect("runs");
         assert!(!c.eligibility.hardware);
-        // A negative control is never evidence.
         let mut p = eligible_plan("Apple M4 Max", 20, 5.0);
         p.negative_control = true;
         let c = schedule(&mut FakeBench::new(), &p).expect("runs");

@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Key-repeat sing-along detector, beat clock, and music-note sprite field ([`KittySing`],
-//! [`SING_ARM_REPEATS`], [`SING_REPEAT_GAP`], [`SING_WIND_DOWN`], [`KEY_SWITCH_REPS`],
-//! [`KittySing::beat`], [`KittySing::bar`], [`SING_BPM`], [`MusicNotes`], [`MAX_NOTES`],
-//! [`bake_note`]).
+//! Key-repeat sing-along detector, beat clock, and music-note sprite field.
 
 use std::fmt;
 use std::time::Duration;
@@ -25,7 +22,7 @@ pub const SING_BAR_BEATS: f32 = 4.0;
 /// One riff bar in seconds.
 pub const SING_BAR_SECONDS: f32 = SING_BEAT_SECONDS * SING_BAR_BEATS;
 
-/// A fixed bijective mixer over a character's code point.
+/// Fixed bijective mixer over a character's code point.
 #[inline]
 #[must_use]
 pub const fn song_signature(ch: char) -> u32 {
@@ -40,38 +37,38 @@ pub const fn song_signature(ch: char) -> u32 {
 /// The signature of "nothing held".
 pub const NEUTRAL_SIGNATURE: u32 = 12;
 
-/// The most bars an armed celebration may run.
+/// Maximum bars an armed celebration may run.
 pub const CELEBRATE_MAX_BARS: u8 = 4;
 
-/// The cooldown between two arms of one window's detector, measured from the arm (not the fire).
+/// Cooldown between two arms of one window's detector.
 pub const CELEBRATE_COOLDOWN: Duration = Duration::from_secs(30);
 
-/// Fan stars on the first bar of any sing-along (armed or held).
+/// Fan stars on the first bar of any sing-along.
 pub const BAR_FAN_BASE: u8 = 5;
 
 /// Fan stars added per bar.
 pub const BAR_FAN_STEP: u8 = 2;
 
-/// The bar fan's ceiling, under half the sky's `STAR_CAP`.
+/// Bar fan ceiling.
 pub const BAR_FAN_CAP: u8 = 18;
 
-/// The shockwave ring rides every fourth bar (bars 3, 7, …).
+/// Bar interval for the shockwave ring.
 pub const BAR_RING_EVERY: u64 = 4;
 
-/// The "drop" fan thrown on the armed celebration's release, with the outro.
+/// Drop fan star count on an armed celebration's release.
 pub const DROP_FAN_N: u8 = 9;
 
-/// The outro's length in seconds (the lead on *do*, its sub and the far bell).
+/// Outro length in seconds.
 pub const OUTRO_SECONDS: f32 = 1.2;
 
 /// Which edge an armed celebration fires on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CelebrateOn {
-    /// The session's next exit-0 command block (OSC 133/633 `D` with status 0).
+    /// The session's next exit-0 command block.
     Green,
     /// The session's next keyed Enter.
     Enter,
-    /// The session's next `done` the host honours from the program in front.
+    /// The session's next honoured program `done`.
     Done,
 }
 
@@ -91,9 +88,9 @@ impl CelebrateOn {
 /// One armed, not-yet-fired celebration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArmedCelebration {
-    /// The song signature ([`song_signature`] of the chosen key).
+    /// The song signature.
     pub sig: u32,
-    /// Bars to run, `1..=CELEBRATE_MAX_BARS`.
+    /// Bars to run (`1..=CELEBRATE_MAX_BARS`).
     pub bars: u8,
     /// The edge it fires on.
     pub on: CelebrateOn,
@@ -130,18 +127,18 @@ impl fmt::Display for ArmRefusal {
     }
 }
 
-/// One bar's fan, decided by the detector and thrown by the glow engine.
+/// One bar's fan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BarFan {
     /// The bar index since the arm.
     pub bar: u64,
-    /// Star count: `min(5 + 2·bar, 18)`.
+    /// Star count.
     pub n: u8,
-    /// Whether this bar carries the shockwave ring (every fourth bar).
+    /// Whether this bar carries the shockwave ring.
     pub ring: bool,
 }
 
-/// The fan a bar earns: `5 + 2·bar` stars under [`BAR_FAN_CAP`].
+/// Compute the fan for `bar`.
 #[inline]
 #[must_use]
 pub const fn bar_fan(bar: u64) -> BarFan {
@@ -187,7 +184,7 @@ pub const SING_ARM_REPEATS: u32 = 16;
 /// Repeats that commit a key switch.
 pub const KEY_SWITCH_REPS: u32 = 3;
 
-/// Maximum gap between two presses of the same character for the run to count as key repeat.
+/// Maximum gap between two presses of the same character for key repeat.
 pub const SING_REPEAT_GAP: Duration = Duration::from_millis(250);
 
 /// Wind-down crossfade length.
@@ -254,8 +251,6 @@ impl KittySing {
             return;
         }
         if self.armed_at.is_some() && self.wind_from.is_none() {
-            // A lazy release may already have begun the fade; keep the earlier
-            // instant so the crossfade never jumps back up.
             self.wind_from = Some(self.lazy_release().map_or(at, |lazy| lazy.min(at)));
         }
         self.run = None;
@@ -264,9 +259,7 @@ impl KittySing {
         self.handover_from = None;
     }
 
-    /// The song signature the held character sings from: the one `u32` the synth derives
-    /// every per-key axis from (verse melody walk, root transpose, mode rotation;
-    /// `trail_sound::design_celebration`), or [`NEUTRAL_SIGNATURE`] when nothing is held.
+    /// Song signature of the held character, or [`NEUTRAL_SIGNATURE`] when nothing is held.
     #[inline]
     #[must_use]
     pub const fn signature(&self) -> u32 {
@@ -367,7 +360,7 @@ impl KittySing {
         self.release(now);
     }
 
-    /// Any word-breaking, editing or navigation key (Enter/Tab/Escape/chords).
+    /// Release any held-key run on a word-breaking, editing, or navigation key.
     #[inline]
     pub fn note_break(&mut self, now: Instant) {
         self.release(now);
@@ -382,7 +375,7 @@ impl KittySing {
             })
     }
 
-    /// The celebration drive 0..=1 at `now`.
+    /// The celebration drive `0..=1` at `now`.
     #[inline]
     #[must_use]
     pub fn drive(&self, now: Instant) -> f32 {
@@ -400,7 +393,7 @@ impl KittySing {
         u * u * (3.0 - 2.0 * u)
     }
 
-    /// True while armed at full drive (the wind-down has not begun).
+    /// True while armed at full drive.
     #[inline]
     #[must_use]
     pub fn is_armed(&self, now: Instant) -> bool {
@@ -434,7 +427,7 @@ impl KittySing {
         Some(bar)
     }
 
-    /// A drained detector at rest is byte-identical off — the idle contract.
+    /// Reset a drained detector at rest.
     #[inline]
     pub fn settle(&mut self, now: Instant) {
         if self.armed_at.is_some() && !self.has_drive(now) {
@@ -478,7 +471,7 @@ impl KittySing {
         Ok(arm)
     }
 
-    /// The pending arm, if any (a pure read — `fx status`).
+    /// The pending arm, if any.
     #[inline]
     #[must_use]
     pub const fn armed_external(&self) -> Option<ArmedCelebration> {
@@ -494,14 +487,14 @@ impl KittySing {
         })
     }
 
-    /// True while a fired celebration is on the stage (playing or winding down, until `settle`).
+    /// True while a fired celebration is playing or winding down.
     #[inline]
     #[must_use]
     pub const fn external_live(&self) -> bool {
         self.external.is_some()
     }
 
-    /// The next external-run event that a host must consume.
+    /// The next external-run event deadline.
     #[must_use]
     pub fn next_external_deadline(&self, now: Instant) -> Option<Instant> {
         let ext = self.external?;
@@ -520,7 +513,7 @@ impl KittySing {
         Some((release + Duration::from_secs_f32(SING_WIND_DOWN)).max(now))
     }
 
-    /// The green edge: the host reports `session`'s exit-0 block here.
+    /// Report `session`'s exit-0 block.
     #[inline]
     pub fn note_green_block(&mut self, now: Instant, session: u64) {
         if let Some(arm) = self.armed_external
@@ -531,7 +524,7 @@ impl KittySing {
         }
     }
 
-    /// The Enter edge: a keyed Enter in `session`.
+    /// Report a keyed Enter in `session`.
     #[inline]
     pub fn note_keyed_enter(&mut self, now: Instant, session: u64) {
         if let Some(arm) = self.armed_external
@@ -542,7 +535,7 @@ impl KittySing {
         }
     }
 
-    /// The done edge: the host honoured a `done` from the program in front of `session`.
+    /// Report an honoured `done` from the program in front of `session`.
     #[inline]
     pub fn note_program_done(&mut self, now: Instant, session: u64) -> bool {
         if let Some(arm) = self.armed_external
@@ -555,8 +548,6 @@ impl KittySing {
         false
     }
 
-    /// Spend the arm: anchor the beat clock at `now` and run `bars` bars with
-    /// no key under them.
     fn fire_external(&mut self, now: Instant, session: u64, arm: ArmedCelebration) {
         self.armed_external = None;
         self.session = Some(session);
@@ -575,7 +566,7 @@ impl KittySing {
         });
     }
 
-    /// The bar fan: `Some` once per bar while armed (armed run or held key).
+    /// Take the current bar's fan once per bar while armed.
     #[inline]
     pub fn take_bar_fan(&mut self, now: Instant) -> Option<BarFan> {
         let bar = self.bar(now)?;
@@ -601,7 +592,7 @@ impl KittySing {
         })
     }
 
-    /// Serious Mode's drain: clear any held-key run, pending celebration arm.
+    /// Clear any held-key run and pending celebration arm.
     #[inline]
     pub const fn drain_serious(&mut self) {
         self.run = None;
@@ -623,10 +614,9 @@ pub const MAX_NOTES: usize = 16;
 /// Note sprite lifetime in seconds.
 pub const NOTE_LIFE: f32 = 1.6;
 
-/// How far a note rises over its life, in cell heights.
 const NOTE_RISE_CELLS: f32 = 1.4;
 
-/// The rainbow palette the notes cycle through.
+/// Rainbow palette cycled by notes.
 pub const NOTE_TINTS: [u32; 6] = [
     0x00FF_5A5A,
     0x00FF_A94D,
@@ -636,12 +626,12 @@ pub const NOTE_TINTS: [u32; 6] = [
     0x00B0_6AFF,
 ];
 
-/// Which authored note glyph a sprite carries.
+/// Authored note glyph kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum NoteKind {
-    /// ♪ — a single eighth note.
+    /// Single eighth note.
     Eighth,
-    /// ♫ — a beamed pair.
+    /// Beamed pair.
     Beamed,
 }
 
@@ -654,19 +644,19 @@ struct Note {
     seed: u32,
 }
 
-/// One frame's resolved note sprite, in cell units relative to the singing cat's mouth anchor.
+/// Resolved note sprite in cell units relative to the mouth anchor.
 #[derive(Clone, Copy, Debug)]
 pub struct NoteSprite {
     pub dx: f32,
     pub dy: f32,
-    /// 0..=255 fade envelope (in over ~15% of life, out over the last 40%).
+    /// `0..=255` fade envelope.
     pub alpha: u8,
     pub kind: NoteKind,
-    /// `0x00RRGGBB` rainbow tint for the white-baked tile.
+    /// `0x00RRGGBB` rainbow tint.
     pub tint: u32,
 }
 
-/// The ring-capped note pool.
+/// Ring-capped note pool.
 pub struct MusicNotes {
     ring: [Option<Note>; MAX_NOTES],
     /// Number of `Some` slots in `ring`.
@@ -751,7 +741,7 @@ impl MusicNotes {
         self.live != 0
     }
 
-    /// Clear the field (style switch / hard reset).
+    /// Clear the field.
     #[inline]
     pub const fn clear(&mut self) {
         if self.live != 0 {
@@ -778,7 +768,6 @@ impl MusicNotes {
         let x0 = 0.1 + 0.8 * ((s >> 8) & 0xff) as f32 / 255.0;
         let phase = ((s >> 16) & 0xff) as f32 / 255.0;
         let (dx, dy) = if reduced_motion {
-            // Fixed offsets: a static spray around the mouth.
             (x0, -0.3 - 0.8 * phase)
         } else {
             (
@@ -828,8 +817,6 @@ impl MusicNotes {
     }
 }
 
-/// Salt for the note tiles' `host_tile` id space — its own family, scrambled
-/// away from the user kitty sprite ids by the splitmix finalizer.
 const NOTE_HOST_SALT: u64 = 0x5150_9A7E_D1B2_C4F3;
 
 /// Stable atlas identity for one baked note tile.
@@ -846,7 +833,7 @@ pub const fn note_host_id(kind: NoteKind, w: u16, h: u16) -> u64 {
     x ^ (x >> 31)
 }
 
-/// The natural note tile size for a cell of height `cell_h`.
+/// Natural note tile size for a cell of height `cell_h`.
 #[inline]
 #[must_use]
 pub fn note_nat_size(kind: NoteKind, cell_h: u16) -> (u16, u16) {
@@ -859,8 +846,6 @@ pub fn note_nat_size(kind: NoteKind, cell_h: u16) -> (u16, u16) {
     (w, h)
 }
 
-/// ♪ stem + flag, authored in the 0..1 glyph frame (head is a disc drawn
-/// separately so it stays round at tiny sizes).
 const EIGHTH_STEM: [PathCmd; 5] = [
     PathCmd::Move(0.44, 0.10),
     PathCmd::Line(0.56, 0.10),
@@ -875,7 +860,6 @@ const EIGHTH_FLAG: [PathCmd; 4] = [
     PathCmd::Close,
 ];
 
-/// ♫ two stems joined by a beam bar across the top.
 const BEAM_BAR: [PathCmd; 5] = [
     PathCmd::Move(0.24, 0.08),
     PathCmd::Line(0.86, 0.08),
@@ -898,11 +882,9 @@ const BEAM_STEM_R: [PathCmd; 5] = [
     PathCmd::Close,
 ];
 
-/// Glyph ink alpha: readable but below body-silhouette opacity; the notes float
-/// over arbitrary text and the free-sprite layer has no occupancy cap.
 const NOTE_A: f32 = 0.88;
 
-/// Bake one note glyph at its natural `w × h`, white (tinted per sprite).
+/// Bake one white note glyph at `w × h`.
 #[must_use]
 pub fn bake_note(w: u16, h: u16, kind: NoteKind) -> Tile {
     let mut tile = Tile::new(u32::from(w), u32::from(h));
@@ -910,8 +892,7 @@ pub fn bake_note(w: u16, h: u16, kind: NoteKind) -> Tile {
     tile
 }
 
-/// Paint one note glyph onto a cleared `tile` at its current dimensions, white
-/// (tinted per sprite).
+/// Paint one white note glyph onto a cleared `tile`.
 pub fn paint_note(tile: &mut Tile, kind: NoteKind) {
     let (w, h) = (tile.width(), tile.height());
     if w == 0 || h == 0 {
@@ -1062,8 +1043,6 @@ mod tests {
         );
     }
 
-    /// Hold `ch` for `n` presses at `gap_ms` cadence starting at `t0`;
-    /// returns the instant of the last press.
     fn hold(d: &mut KittySing, t0: Instant, ch: char, n: u32, gap_ms: u64) -> Instant {
         let mut t = t0;
         for i in 0..n {
@@ -1091,8 +1070,6 @@ mod tests {
         );
     }
 
-    /// One IME commit delivers every character at one timestamp, which counts as at most one
-    /// repeat step.
     #[test]
     fn a_batched_ime_commit_of_repeats_does_not_arm() {
         let mut d = KittySing::default();
@@ -1159,8 +1136,6 @@ mod tests {
         }
     }
 
-    /// After a key change fails to repeat, the drive falls monotonically to exactly 0 by
-    /// [`SING_WIND_DOWN`], and `settle` returns the detector to rest.
     #[test]
     fn wind_down_crossfades_to_zero() {
         let mut d = KittySing::default();
@@ -1194,7 +1169,6 @@ mod tests {
         assert_eq!(d.beat(done), None, "settled = byte-identical rest");
     }
 
-    /// The lazy release starts the crossfade one repeat gap after the last press.
     #[test]
     fn letting_go_winds_down_without_an_event() {
         let mut d = KittySing::default();
@@ -1212,7 +1186,6 @@ mod tests {
         assert_eq!(d.drive(gone), 0.0);
     }
 
-    /// The new session must re-earn the full arm count.
     #[test]
     fn session_switch_releases_the_hold() {
         let mut d = KittySing::default();
@@ -1224,8 +1197,6 @@ mod tests {
         assert!(!d.is_armed(t1), "the switch released the hold");
     }
 
-    /// Inside a live glow, recovery costs only [`KEY_SWITCH_REPS`] repeats (sixteen at repeat
-    /// cadence can outlast [`SING_WIND_DOWN`]).
     #[test]
     fn re_earning_the_threshold_during_wind_down_re_arms() {
         let mut d = KittySing::default();
@@ -1293,7 +1264,6 @@ mod tests {
         assert_eq!(d.drive(last), 1.0);
     }
 
-    /// Re-anchoring is only for a run that lapsed into a wind-down and re-earned it.
     #[test]
     fn a_continuous_hold_does_not_rewind_its_beat_clock() {
         let mut d = KittySing::default();
@@ -1386,7 +1356,6 @@ mod tests {
         );
     }
 
-    /// Note host ids stay out of the kitty-sprite id family in the shared atlas.
     #[test]
     fn note_host_ids_avoid_kitty_sprite_family() {
         for kind in [NoteKind::Eighth, NoteKind::Beamed] {
@@ -1399,12 +1368,8 @@ mod tests {
         }
     }
 
-    /// Each stage of [`song_signature`] is invertible, so the test builds the exact inverse
-    /// and round-trips every valid `char`.
     #[test]
     fn song_signature_mixer_is_bijective_over_all_chars() {
-        /// Multiplicative inverse of odd `m` mod 2^32 (Newton–Hensel: each
-        /// step doubles the correct low bits; 5 steps ≥ 32 bits).
         fn minv(m: u32) -> u32 {
             let mut x = m;
             for _ in 0..5 {
@@ -1432,8 +1397,6 @@ mod tests {
         }
     }
 
-    /// A miniature of the host's render loop: ~16 ms frames apply the
-    /// `Companions::sing_riff_bar` latch (one `(bar, signature())` push per new bar index).
     struct HostSim {
         d: KittySing,
         clock: Instant,
@@ -1455,7 +1418,6 @@ mod tests {
             }
         }
 
-        /// Render frames at ~60 Hz up to `until` (the host latch + gate).
         fn run_to(&mut self, until: Instant) {
             while self.clock <= until {
                 if let Some(bar) = self.d.bar(self.clock)
@@ -1479,8 +1441,6 @@ mod tests {
             self.d.note_char(at, S, ch);
         }
 
-        /// Hold `ch` for `n` presses at `gap_ms` cadence starting at `from`,
-        /// rendering frames between presses; returns the last press instant.
         fn hold(&mut self, from: Instant, ch: char, n: u32, gap_ms: u64) -> Instant {
             let mut t = from;
             for i in 0..n {
@@ -1491,8 +1451,6 @@ mod tests {
         }
     }
 
-    /// A w → a → r key-switch chain at repeat cadence keeps the drive at 1.0, so the host's
-    /// 0.33 face gate never swaps the singer out mid-song.
     #[test]
     fn the_owner_pattern_w_a_r_never_drops_the_drive() {
         let t0 = Instant::now();
@@ -1511,8 +1469,6 @@ mod tests {
         assert_eq!(host.d.signature(), song_signature('r'));
     }
 
-    /// Each key held over a bar: the drive never dips, every verse is heard in order, and bar
-    /// indices stay strictly monotone.
     #[test]
     fn a_six_key_medley_holds_the_stage_end_to_end() {
         let t0 = Instant::now();
@@ -1565,8 +1521,6 @@ mod tests {
         assert_eq!(d.beat(gone), None, "settled = byte-identical rest");
     }
 
-    /// The new key's initial repeat delay outruns [`SING_REPEAT_GAP`]: three repeats inside
-    /// the fading glow recover it before the drive crosses the host's 0.33 face gate.
     #[test]
     fn a_missed_gap_recovers_with_three_reps_inside_the_glow() {
         let t0 = Instant::now();
@@ -1598,7 +1552,6 @@ mod tests {
         );
     }
 
-    /// The three-repeat forgiveness applies only inside a live glow.
     #[test]
     fn cold_arms_still_cost_sixteen() {
         let mut d = KittySing::default();
@@ -1630,7 +1583,6 @@ mod tests {
         );
     }
 
-    /// Drive the detector at ~60 Hz, as the host does.
     fn frames(
         d: &mut KittySing,
         from: Instant,
@@ -1644,8 +1596,6 @@ mod tests {
         }
     }
 
-    /// Another session's green block leaves the arm waiting; a second green block while the
-    /// run plays re-anchors nothing.
     #[test]
     fn an_armed_celebration_fires_on_the_next_green_block_and_only_once() {
         let mut d = KittySing::default();
@@ -1699,8 +1649,6 @@ mod tests {
         );
     }
 
-    /// A four-bar run hands one fan per bar (5, 7, 9, 11 stars, the ring on the fourth), then
-    /// one outro at the last bar line.
     #[test]
     fn a_celebration_s_fans_ride_the_bars_and_the_outro_ends_on_do() {
         let mut d = KittySing::default();
@@ -1759,8 +1707,6 @@ mod tests {
         );
     }
 
-    /// An `on=done` arm fires on its session's next honoured `done`, once, and
-    /// on nothing else.
     #[test]
     fn an_on_done_arm_fires_on_the_session_s_next_done_and_only_once() {
         let mut d = KittySing::default();
@@ -1807,8 +1753,6 @@ mod tests {
         assert_eq!(g.drive(t0 + Duration::from_millis(5)), 0.0);
     }
 
-    /// With nothing armed, a green block, a keyed Enter and a program's `done`
-    /// are no-ops: the detector stays off and no fan or outro is handed out.
     #[test]
     fn an_unarmed_session_never_celebrates_on_a_green_block() {
         let mut d = KittySing::default();
@@ -1842,8 +1786,6 @@ mod tests {
         );
     }
 
-    /// Out-of-range bars are refused before the pending-arm and cooldown checks; the cooldown
-    /// runs from the arm, not the fire.
     #[test]
     fn the_cooldown_refuses_a_second_arm_for_thirty_seconds() {
         let mut d = KittySing::default();

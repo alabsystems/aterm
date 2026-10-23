@@ -2,11 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! A rows-only flap of the primary screen with the program's output between
-//! its halves (aterm-grid `grid/resize_handback.rs`),
-//! fed through the parser as the program wrote it and judged by what a
-//! terminal fed the same bytes shows when it never resized, or when it stayed
-//! at the final height.
+//! Primary-screen rows-only resize flap tests with intervening program output.
 
 use aterm_core::scrollback::Scrollback;
 use aterm_core::terminal::Terminal;
@@ -41,11 +37,6 @@ impl Path {
     }
 }
 
-/// A plain shell in a fresh tab of the window's shape (144 columns, tiered
-/// history): a prompt and six lines at the top of 50 rows, the window shrunk
-/// to 10, a twenty-line command run there, then the window grown part of the
-/// way back (12, 30 or 40 rows) or all of it. The screen is the one a terminal
-/// that stayed at the final height shows.
 #[test]
 fn a_shell_grown_part_of_the_way_back_shows_the_screen_that_stayed() {
     let feed = |term: &mut Terminal, part: u8| {
@@ -80,8 +71,6 @@ fn a_shell_grown_part_of_the_way_back_shows_the_screen_that_stayed() {
     }
 }
 
-/// Eight rows with history above them, the screen cleared and `top` drawn on
-/// its first row, the cursor under it.
 fn cleared() -> Terminal {
     let mut term = Terminal::new(8, 20);
     for i in 0..20 {
@@ -95,17 +84,8 @@ fn cleared() -> Terminal {
     term
 }
 
-/// A program that puts its cursor on the revealed history lines after a grow
-/// (CUP or HVP home, VPA to the first row, CUU past the top) draws
-/// top-anchored on the taller screen without erasing it (each line erases
-/// only its own tail, EL, so no cell of the row under it is left to tell the
-/// screens apart). The shrink back trims under its lines, as on a screen that
-/// never grew: every row shows what a terminal that never resized shows, and
-/// the cursor is on the same row. A cursor that stays on the rows the program
-/// drew keeps them owed (aterm-grid `Grid::note_cursor_moved_up`).
 #[test]
 fn a_program_that_moves_onto_the_revealed_rows_keeps_its_lines_through_the_shrink() {
-    // (the grow, the program's bytes)
     let shapes: [(u16, &[u8]); 5] = [
         (9, b"\x1b[HN0\x1b[K\r\nN1\x1b[K\r\nN2\x1b[K\r\n"),
         (10, b"\x1b[HN0\x1b[K\r\nN1\x1b[K\r\nN2\x1b[K\r\n"),
@@ -130,7 +110,6 @@ fn a_program_that_moves_onto_the_revealed_rows_keeps_its_lines_through_the_shrin
         assert_eq!(flapped.cursor(), never.cursor(), "{at}");
     }
 
-    // A reverse index onto the revealed line is the program there too.
     let mut term = cleared();
     term.resize(9, 20);
     assert_eq!(term.grid().revealed_rows(), 1);
@@ -139,10 +118,6 @@ fn a_program_that_moves_onto_the_revealed_rows_keeps_its_lines_through_the_shrin
     assert_eq!(term.grid().revealed_rows(), 0, "RI onto the revealed line");
 }
 
-/// The control: a program that moves relative to its own lines (a prompt's
-/// redraw, an inline renderer walking up its frame) never reaches the revealed
-/// history line, so the shrink still demotes it back and every row is where a
-/// terminal that never resized shows it.
 #[test]
 fn a_relative_redraw_after_a_grow_keeps_the_hand_back() {
     for bytes in [

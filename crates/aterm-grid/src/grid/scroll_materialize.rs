@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Full-fidelity scrollback materialization: scrollback [`Line`]s become [`MaterializedRow`]s
 //! whose cells and sparse [`CellExtra`]s render as visible-area cells do.
@@ -481,10 +480,7 @@ struct RingCell<'w> {
 /// The ring fast path cannot prove it draws the row as the round trip does.
 struct Declined;
 
-/// The walk over a ring-tier row's cells that the ring fast path draws: each
-/// non-spacer cell as one grapheme unit at its own column, as wide as the
-/// round trip would place it, or [`Declined`] where the round trip draws the
-/// row otherwise.
+/// Walk over a ring-tier row's cells for fast-path materialization, or [`Declined`] when the `Line` round trip is needed.
 struct RingCells<'a> {
     /// The row's cells up to its length.
     cells: &'a [crate::Cell],
@@ -502,9 +498,7 @@ struct RingCells<'a> {
 }
 
 impl<'a> RingCells<'a> {
-    /// The walk over `row`, or `None` for a row wider than `cols`: the round
-    /// trip clips it, which this path does not model (rare: both come from one
-    /// grid).
+    /// Walk `row`, or `None` when `row.written_len() > cols`.
     fn new(row: &'a Row, extras: &'a ScrolledRowExtras, cols: u16) -> Option<Self> {
         let len = usize::from(row.written_len());
         if len > usize::from(cols) {
@@ -586,15 +580,10 @@ impl<'a> RingCells<'a> {
             let mut scanned = 0usize;
             unit = advance_grapheme_unit_wide(&self.unit_buf, &mut scanned);
             if scanned != self.unit_buf.len() {
-                // The scan stopped early: the round trip would emit a second
-                // unit for the tail, or clip the cluster at
-                // MAX_GRAPHEME_UNIT_BYTES. Give up on the row.
                 return Err(Declined);
             }
         }
         if aterm_grapheme::char_width(base) == 0 {
-            // The text walk skips a zero-width base and shifts later columns
-            // left; not modelled here.
             return Err(Declined);
         }
 
@@ -624,8 +613,6 @@ impl<'a> RingCells<'a> {
         } else if col_u16 + 1 < self.cols {
             col_u16.saturating_add(2)
         } else {
-            // No progress: a wide unit cannot fit at the last column, and the
-            // text walk stops there, dropping the rest of the row.
             return Err(Declined);
         };
         self.col = end_col;
@@ -652,8 +639,7 @@ impl<'a> RingCells<'a> {
 /// ([`advance_grapheme_unit_wide`]).
 const MAX_GRAPHEME_UNIT_BYTES: usize = 256;
 
-/// A Fitzpatrick emoji skin-tone modifier (U+1F3FB..=U+1F3FF). Mirrors the
-/// test-gated `aterm_grapheme::is_skin_tone_modifier` and the live writer's range.
+/// A Fitzpatrick emoji skin-tone modifier (`U+1F3FB..=U+1F3FF`).
 #[inline]
 const fn is_skin_tone_modifier(c: char) -> bool {
     matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
@@ -817,28 +803,14 @@ fn advance_grapheme_unit_scan(text: &str, byte_idx: &mut usize, max_chars: usize
             force_narrow = true;
             last_was_zwj = false;
         } else if next_width == 0 || (last_was_zwj && !next_c.is_ascii()) {
-            // Zero-width chars (combining marks, other selectors) join the
-            // unit, and so does a visible non-ASCII char after a ZWJ. Printable
-            // ASCII after a ZWJ opens its own cell, as the live grid draws it
-            // (`print_ascii_bulk` never folds) and `aterm_grapheme::GridColumns`
-            // lays it out. Known gap: under insert mode, no autowrap or a
-            // translating charset the live writer takes ASCII through
-            // `write_char`, which does fold it after a ZWJ, and a `Line` does
-            // not record the mode.
+            // Combining mark or ZWJ continuation.
             last_was_zwj = false;
         } else if is_skin_tone_modifier(next_c) && aterm_grapheme::is_emoji_modifier_base(c) && wide
         {
-            // A Fitzpatrick modifier folds onto the unit's emoji base, as the
-            // live `try_combine_skin_tone_modifier` does (gated on the previous
-            // cell being wide and `is_emoji_modifier_base(base)`). The effective
-            // width is used, so `☝️🏽` (base + widening VS16 + modifier) folds
-            // while text-presentation `☝🏽` stays split.
+            // Skin-tone modifier on a wide emoji base.
             last_was_zwj = false;
         } else if is_regional_indicator(next_c) && is_regional_indicator(c) && ris < 2 {
-            // A regional indicator folds onto a unit whose base is a lone one,
-            // as `try_combine_regional_indicator` reads the cell's base and
-            // counts the indicators it holds: a mark between (`🇺́🇸`) does not
-            // stop the fold, as `aterm_grapheme::GridColumns` lays it out too.
+            // Second regional indicator of a flag pair.
             last_was_zwj = false;
         } else {
             break;
@@ -1000,19 +972,14 @@ fn store_rgb_extras(
     }
 }
 
-/// Restore a line's hyperlinks onto the cells of its first `filled` columns
-/// ([`filled_span_cols`]), with column writes bounded to O(cols): a legitimate
-/// line's spans are disjoint, and a crafted one with many overlapping
-/// full-width spans would otherwise cost O(spans × cols) on the render path.
+/// Restore a line's hyperlinks onto its first `filled` columns, bounded to `O(cols)` writes.
 fn restore_hyperlinks(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, filled: u16) {
     if let Some(spans) = line.hyperlinks() {
         restore_hyperlink_spans(extras, spans, filled);
     }
 }
 
-/// The body of [`restore_hyperlinks`] over spans from either source (a `Line`'s
-/// copy or a ring row's stored vector), shared so the two materialization paths
-/// cannot drift on the overlap budget or the end-column bound.
+/// Restore hyperlink spans onto the first `filled` columns.
 fn restore_hyperlink_spans(
     extras: &mut FxHashMap<u16, CellExtra>,
     spans: &[HyperlinkSpan],
@@ -1032,23 +999,19 @@ fn restore_hyperlink_spans(
     }
 }
 
-/// The columns of a stored span (a hyperlink or SGR 58 underline colour, `start_col..end_col`).
+/// The columns of a stored span (`start_col..end_col`) clamped to `filled`.
 pub(super) fn filled_span_cols(start_col: u16, end_col: u16, filled: u16) -> core::ops::Range<u16> {
     start_col..end_col.min(filled)
 }
 
-/// Restore a line's SGR 58 underline colours on its first `filled` columns
-/// under [`restore_hyperlinks`]' budget; `set_underline_color_u32` re-derives
-/// the RGB-or-indexed form so an indexed colour resolves against the live
-/// palette.
+/// Restore a line's SGR 58 underline colours onto its first `filled` columns.
 fn restore_underline_colors(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, filled: u16) {
     if let Some(spans) = line.underline_colors() {
         restore_underline_color_spans(extras, spans, filled);
     }
 }
 
-/// The body of [`restore_underline_colors`] over spans from either source,
-/// shared as [`restore_hyperlink_spans`] is.
+/// Restore underline-colour spans onto the first `filled` columns.
 fn restore_underline_color_spans(
     extras: &mut FxHashMap<u16, CellExtra>,
     spans: &[UnderlineColorSpan],
@@ -1069,18 +1032,14 @@ fn restore_underline_color_spans(
     }
 }
 
-/// Restore a line's inline images as the per-cell [`ImageRef`](crate::ImageRef)s
-/// a live image cell has, so a scrolled-back picture takes the on-screen draw
-/// path; every restored cell shares the one payload `Arc` the renderer's decode
-/// cache keys on.
+/// Restore a line's inline images as per-cell [`ImageRef`](crate::ImageRef)s.
 fn restore_images(extras: &mut FxHashMap<u16, CellExtra>, line: &Line, cols: u16) {
     if let Some(spans) = line.images() {
         restore_image_spans(extras, spans, cols);
     }
 }
 
-/// The body of [`restore_images`] over spans from either source, shared as
-/// [`restore_hyperlink_spans`] is.
+/// Restore inline-image spans onto the first `cols` columns.
 fn restore_image_spans(extras: &mut FxHashMap<u16, CellExtra>, spans: &[ImageSpan], cols: u16) {
     let mut budget = usize::from(cols) * crate::extra::MAX_IMAGE_LAYERS;
     'restore: for span in spans {
@@ -1115,10 +1074,6 @@ mod ascii_fast_path_tests {
         (u.chars, u.wide, u.vs16_widened, u.force_narrow)
     }
 
-    /// The search walk's ASCII runs are exactly the cells the per-cell walk
-    /// lays the line out in, on lines mixing printable ASCII with joining
-    /// marks, controls, wide, folding and ZWJ-joined characters, at every row
-    /// width, with and without a stored wide bit.
     #[test]
     fn the_search_walk_lays_a_line_out_as_materialize_does() {
         use aterm_rle::Rle;
@@ -1182,10 +1137,6 @@ mod ascii_fast_path_tests {
         }
     }
 
-    /// The printable-ASCII fast path returns exactly what the general scan
-    /// does, for every ASCII first char against every ASCII, a sample of
-    /// joining and wide second chars, and the end of the text, each followed by
-    /// a tail that would join if the scan reached it.
     #[test]
     fn ascii_fast_path_matches_the_scan() {
         for c in (0u8..0x80).map(char::from) {

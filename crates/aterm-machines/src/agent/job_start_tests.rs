@@ -58,12 +58,9 @@ fn fixture() -> (Fake, Layout) {
         )
         .file(
             "/A/state/run.lock",
-            b"pid=4242 run=1-5 start=known_child_birth\n",
+            b"pid=4242 run=1-5 start=Fri_Oct_16_22:36:10_2026\n",
         );
-    sys.on(
-        "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 4242",
-        Ran::ok("known child birth\n"),
-    );
+    sys.born(4242, 1_792_190_170);
     sys.on(EFFECT, Ran::ok("one synthetic effect"));
     (sys, Layout { root: "/A".into() })
 }
@@ -99,7 +96,7 @@ fn a_committed_exact_job_runs_and_releases_only_its_own_holder() {
     let old = state::Holder {
         pid: PID,
         run: RUN.into(),
-        start: Some("known_child_birth".into()),
+        start: Some("Fri_Oct_16_22:36:10_2026".into()),
     };
     sys.file("/A/state/run.lock", b"pid=99 run=1-5 start=later\n");
     state::release_holder(&sys, &layout, &old).unwrap();
@@ -141,7 +138,7 @@ fn absent_start_or_mismatched_job_identity_refuses_before_host_effects() {
         ));
     }
     for holder in [
-        "pid=99 run=1-5 start=known_child_birth\n",
+        "pid=99 run=1-5 start=Fri_Oct_16_22:36:10_2026\n",
         "pid=4242 run=1-5 start=other_birth\n",
         "pid=4242 run=1-5\n",
     ] {

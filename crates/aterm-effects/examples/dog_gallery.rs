@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `dog_gallery` — dog-roster contact sheets for visual QA, the breed twin of
-//! `kitty_gallery`. Bakes every breed through the real bake path
-//! ([`aterm_effects::dog_baker::bake_breed`]) on a light and a dark ground, at
-//! reference and terminal-small art heights, plus one coat sweep.
-//!
-//! ```text
-//! targo --unverified run -q -p aterm-effects --example dog_gallery -- [out_dir]
-//! (default out_dir: target/dog_gallery)
-//! ```
+//! Dog-roster contact sheets for visual QA ([`aterm_effects::dog_baker::bake_breed`]).
 
 use aterm_effects::cat_baker::ResolvedFills;
 use aterm_effects::dog_baker::{DogBaker, bake_breed};
@@ -32,8 +24,6 @@ fn main() {
     println!("dog_gallery: wrote sheets to {dir}");
 }
 
-/// All breeds at one art height, roster coats sweeping so each breed shows a
-/// different ramp stop.
 fn page_heads(dir: &str, tag: &str, bg: [u8; 3], dark: bool, art_h: u32, name: &str) {
     let tiles: Vec<Tile> = DOG_HEADS
         .iter()
@@ -47,7 +37,6 @@ fn page_heads(dir: &str, tag: &str, bg: [u8; 3], dark: bool, art_h: u32, name: &
     montage(&tiles, 5, bg).save(&format!("{dir}/{name}_{tag}.png"));
 }
 
-/// One breed swept across the whole 16-stop coat ramp.
 fn page_coats(dir: &str, tag: &str, bg: [u8; 3], dark: bool) {
     let id = DOG_HEADS[0];
     let art_h = 72u32;

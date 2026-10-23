@@ -84,6 +84,9 @@ impl System for Faults {
     fn create_new(&self, p: &Path, b: &[u8], m: u32) -> io::Result<()> {
         self.inner.create_new(p, b, m)
     }
+    fn process_started(&self, pid: u32) -> Option<u64> {
+        self.inner.process_started(pid)
+    }
     fn stage_detached(&self, c: &Cmd, p: &Path) -> Result<Box<dyn StagedChild + '_>, RunFailed> {
         self.inner.stage_detached(c, p)
     }
@@ -100,10 +103,7 @@ fn setup(fault: Fault) -> (Faults, Layout, Opened) {
     inner.next_pid = 4242;
     inner.file("/A/state/run.lock", b"pid=17 run=1-5 start=parent\n");
     if !matches!(fault, Fault::Unmeasured) {
-        inner.on(
-            "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 4242",
-            Ran::ok("known child birth\n"),
-        );
+        inner.born(4242, 1_792_190_170);
     }
     let opened = Opened {
         envelope: envelope::parse_body(
@@ -144,7 +144,7 @@ fn a_start_commits_only_after_metadata_and_exact_lock_handoff() {
         state::Holder {
             pid: 4242,
             run: "1-5".into(),
-            start: Some("known_child_birth".into())
+            start: Some("Fri_Oct_16_22:36:10_2026".into())
         }
     );
     assert_eq!(

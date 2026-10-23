@@ -234,7 +234,7 @@ fn fmt_reports_what_trustfmt_would_change_and_fix_rewrites_only_that() {
         fs::write(repo.root.join(f), "fn main() {}\n").expect("write");
     }
     for args in [&["init", "-q"][..], &["add", "src"]] {
-        let git = aterm_uds::spawnfd::command("git")
+        let git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args(args)
             .current_dir(&repo.root)
             .status()

@@ -1897,10 +1897,11 @@ pub fn limits_json(view: &LimitsView) -> String {
 
 fn limits_accounts_line(env: &Env, target: &str) -> Option<String> {
     let roster_path = env.accounts_roster()?;
-    let roster = Roster::load(&roster_path)
+    let raw = Roster::load(&roster_path)
         .ok()
         .filter(|r| !r.rows.is_empty())?;
     let store = env.accounts_store();
+    let roster = store.bound(&raw, env.now).unwrap_or(raw);
     let (state, _) = store.load(env.now).ok()?;
     let enrolled = accounts::enrolled(&roster);
     let sid = target.trim_start_matches('@');
@@ -4189,8 +4190,11 @@ fn renew_flow_of(
                     .and_then(|n| n.to_str())
                     .and_then(|s| s.rsplit_once('+').map(|(l, _)| l))
                     .unwrap_or("default");
-                let has_mailbox =
-                    super::accounts_sync::has_configured_mailbox(user_home.as_deref(), &store);
+                let has_mailbox = super::accounts_sync::has_configured_mailbox_for(
+                    user_home.as_deref(),
+                    &store,
+                    Some(email),
+                );
                 if !has_mailbox
                     && super::headless_oauth::has_browser_profile(&store.dir, label, Some(email))
                 {
@@ -5500,9 +5504,10 @@ fn run_accounts_use(
     let now = env.now;
     let done = match label {
         Some(label) => {
-            let Some((_, roster)) = accounts_read_roster(env, err) else {
+            let Some((_, raw)) = accounts_read_roster(env, err) else {
                 return ExitCode::from(1);
             };
+            let roster = store.bound(&raw, now).unwrap_or(raw);
             let enrolled = accounts::enrolled(&roster);
             let remedy = match roster.row(label) {
                 None => "`aterm harness accounts add <label>` lists an account".to_string(),
@@ -5962,6 +5967,9 @@ fn run_accounts_renew(
     };
     let store = env.accounts_store();
     let now = env.now;
+    if due && labels.is_empty() {
+        let _ = super::accounts_sync::recover_staging_renewals(&store, &file_roster, now);
+    }
     let (logins, logins_note) = match store.load_logins(now) {
         Ok(read) => read,
         Err(why) => {
@@ -6002,6 +6010,16 @@ fn run_accounts_renew(
             Some(_) => {}
         }
     }
+    let mailbox_dir = super::accounts_sync::resolve_mailbox_dir(env.home.as_deref(), &store);
+    let has_headless_browser =
+        super::headless_oauth::find_headless_browser(env.home.as_deref()).is_some();
+    let row_can_run_headless = |label: &str| {
+        let em = roster.row(label).and_then(|r| r.email.as_deref());
+        mailbox_dir.is_some()
+            || super::accounts_sync::has_configured_mailbox_for(env.home.as_deref(), &store, em)
+            || (has_headless_browser
+                && super::headless_oauth::has_browser_profile(&store.dir, label, em))
+    };
     if due {
         let (state, _) = match store.load(now) {
             Ok(read) => read,
@@ -6020,30 +6038,28 @@ fn run_accounts_renew(
                 chosen.push(label);
             }
         }
-        if chosen.is_empty()
-            && let Some(target) =
-                super::accounts_sync::next_auto_renew_target(&file_roster, &state, &logins, now)
-        {
-            chosen.push(target.label);
+        if chosen.is_empty() {
+            let candidates =
+                super::accounts_sync::auto_renew_candidates(&file_roster, &state, &logins, now);
+            let target = candidates
+                .iter()
+                .find(|r| {
+                    row_can_run_headless(&r.label)
+                        || (host.stdin_is_terminal() && r.browser.is_some())
+                })
+                .or_else(|| candidates.first());
+            if let Some(target) = target {
+                chosen.push(target.label.clone());
+            }
         }
     }
     if chosen.is_empty() && machines.is_empty() {
         let _ = writeln!(out, "nothing is due on this machine");
         return ExitCode::SUCCESS;
     }
-    let mailbox_dir = super::accounts_sync::resolve_mailbox_dir(env.home.as_deref(), &store);
-    let has_headless_browser =
-        super::headless_oauth::find_headless_browser(env.home.as_deref()).is_some();
-    let all_have_headless_profile = has_headless_browser
-        && !chosen.is_empty()
-        && chosen.iter().all(|label| {
-            let em = roster.row(label).and_then(|r| r.email.as_deref());
-            super::headless_oauth::has_browser_profile(&store.dir, label, em)
-        });
-    let has_mailbox = mailbox_dir.is_some()
-        || super::accounts_sync::has_configured_mailbox(env.home.as_deref(), &store)
-        || all_have_headless_profile;
-    if !chosen.is_empty() && !host.stdin_is_terminal() && !has_mailbox {
+    let all_can_run_headless =
+        !chosen.is_empty() && chosen.iter().all(|label| row_can_run_headless(label));
+    if !chosen.is_empty() && !host.stdin_is_terminal() && !all_can_run_headless {
         let _ = writeln!(out, "due here: {}", chosen.join(", "));
         let _ = writeln!(
             err,
@@ -6069,7 +6085,7 @@ fn run_accounts_renew(
             continue;
         };
         let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
-        let browser = if host.under_ssh() || has_mailbox {
+        let browser = if host.under_ssh() || row_can_run_headless(label) {
             RenewBrowser::Remote {
                 opener: opener
                     .get_or_insert_with(|| opener_link(&store, host))
@@ -6229,15 +6245,16 @@ fn run_accounts_stats(env: &Env, json: bool, out: &mut dyn Write) -> ExitCode {
     };
     let machine = store.machine_id(&state.machine).ok();
     let tap = stats_tap(env, |roster| roster.row(&label).is_some());
-    let roster = env
+    let raw_roster = env
         .accounts_roster()
         .and_then(|path| Roster::load(&path).ok())
         .unwrap_or_default();
-    let several = roster.several();
     let logins = store
         .load_logins(env.now)
         .map(|(logins, _)| logins)
         .unwrap_or_default();
+    let roster = accounts::bound(&raw_roster, &logins);
+    let several = roster.several();
     let login = roster
         .row(&label)
         .filter(|row| row.email.is_some())
@@ -6337,21 +6354,23 @@ fn stats_tap(env: &Env, records: impl FnOnce(&Roster) -> bool) -> super::account
 }
 
 fn stats_label(env: &Env, key: Option<profile::AccountKey>) -> String {
-    let roster = env
+    let raw = env
         .accounts_roster()
         .and_then(|path| Roster::load(&path).ok())
         .unwrap_or_default();
+    let roster = env.accounts_store().bound(&raw, env.now).unwrap_or(raw);
     if stats_default_home(env) {
         return roster
             .row_for_login(None)
+            .or_else(|| roster.row_left(None))
             .map_or(ACCOUNTS_OWN_LABEL, |row| row.label.as_str())
             .to_owned();
     }
     let row = env.claude_dir.as_deref().and_then(|dir| {
-        roster
-            .rows
-            .iter()
-            .find(|row| row.dir.as_deref().is_some_and(|d| Path::new(d) == dir))
+        roster.rows.iter().find(|row| {
+            row.dir.as_deref().is_some_and(|d| Path::new(d) == dir)
+                || row.was.iter().flatten().any(|d| Path::new(d) == dir)
+        })
     });
     match (row, key) {
         (Some(row), _) if accounts::enrolled(&roster).contains(&row.label) => row.label.clone(),

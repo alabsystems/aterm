@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 bind for `OutputStreakEpisodeDelivery`: drive the real visual engine
-//! and synth, project their observable episode edges onto the derived model, and
-//! use negative controls to show the projection rejects each regression.
-//! `RetireVisuals` binds `OutputStreak::next_change_deadline`; host event-loop
-//! wiring of that deadline is covered by host-level unit tests.
+//! Conformance tests for `OutputStreakEpisodeDelivery` binding the visual engine and synth to the derived model.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -56,9 +52,7 @@ fn assert_transition(model: &Model, action: &str, before: &State, after: &State)
     );
 }
 
-/// `Lumen`, not `RainbowKitty`: the human-gap control needs a palette that goes through
-/// the shared `MIN_GAP` governor; the music box (`rainbow_kitty_v2`) forks out of
-/// `push_meta` before it and never thins a keystroke.
+/// Build a `Lumen` sound event that passes through the shared `MIN_GAP` governor.
 fn sound(kind: SoundGesture) -> SoundEvent {
     SoundEvent {
         style: GlowStyle::Lumen,
@@ -112,8 +106,6 @@ fn real_output_episode_and_synth_refine_delivery_model() {
     );
     let idle = project(&model, Observation::default());
 
-    // The shared human gap is occupied by Enter/Jump. The shipping synth must
-    // still admit the episode's sole opening cue immediately afterward.
     let mut synth = TrailSynth::new(48_000.0, 0x0A17_0A17);
     synth.push(sound(SoundGesture::Trail(SoundKind::Jump)));
     let human_voices = synth.live_voices();
@@ -166,8 +158,6 @@ fn real_output_episode_and_synth_refine_delivery_model() {
     );
     assert_transition(&model, "OpenOutput", &after_human, &visible);
 
-    // Four bounded 250 ms integration steps retire the longest comet. The
-    // episode remains open, so the public analytic deadline must own one wake.
     for step in 1_u64..=4 {
         quads.clear();
         streak.tick(
@@ -218,8 +208,6 @@ fn real_output_episode_and_synth_refine_delivery_model() {
     );
     assert_transition(&model, "SettleAtWake", &parked, &settled);
 
-    // A fresh synth starts with the human gap open. An output cue followed
-    // immediately by a typed key proves that output did not claim that slot.
     let ready = project(
         &model,
         Observation {
@@ -266,8 +254,6 @@ fn real_output_episode_and_synth_refine_delivery_model() {
     );
     assert_transition(&model, "NextHuman", &checked, &next_human);
 
-    // Projection-level negative controls: each broken shape violates the
-    // invariant the real observations above established.
     let mut thinned = visible.clone();
     thinned.insert("shimmer", 0);
     assert!(!model.check_invariant("OpeningCueSurvivesSharedGap", &thinned));

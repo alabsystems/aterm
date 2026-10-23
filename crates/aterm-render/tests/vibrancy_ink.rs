@@ -1,25 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The M5 true-vibrancy BACKGROUND alpha: the background stream honours
-//! `background_opacity` (`round(clamp(o) * 255)`, monotone, solid at the
-//! default) and fails safe to solid on out-of-domain input.
-//!
-//! Also binds the shipping `Renderer::set_background_opacity` /
-//! `background_opacity` accessor pair to the same clamp domain.
+//! Background opacity alpha rounding, monotonicity, and clamping tests.
 
 use aterm_render::vibrancy::{bg_quad_alpha, is_translucent};
 
 #[test]
 fn bg_alpha_is_rounded_and_monotone() {
-    // Exact endpoints + rounding at the boundaries.
     assert_eq!(bg_quad_alpha(1.0), 255, "solid");
     assert_eq!(bg_quad_alpha(0.0), 0, "fully transparent");
     assert_eq!(bg_quad_alpha(0.5), 128, "half → round(127.5)=128");
-    // round(0.5*255+0.5)=128; the byte-exact rounding the present path uses.
     assert_eq!(bg_quad_alpha(0.25), 64, "quarter → round(63.75)=64");
 
-    // Monotone non-decreasing across the in-domain lattice.
     let mut prev = 0u8;
     for i in 0..=100 {
         let a = bg_quad_alpha(i as f32 / 100.0);
@@ -31,8 +23,6 @@ fn bg_alpha_is_rounded_and_monotone() {
     }
     assert_eq!(prev, 255, "the top of the lattice is opaque");
 
-    // Out-of-domain input fails safe: solid unless genuinely below 1.0, and
-    // every translucent opacity yields a translucent band.
     for o in [1.5, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         assert_eq!(bg_quad_alpha(o), 255, "opacity={o} must stay solid");
         assert!(!is_translucent(o), "opacity={o} is not translucent");
@@ -46,8 +36,6 @@ fn bg_alpha_is_rounded_and_monotone() {
 
 #[test]
 fn renderer_background_opacity_roundtrips_and_clamps() {
-    // Tier-1: the SHIPPING renderer accessor clamps to the same [0,1] domain the
-    // policy assumes, and defaults to solid.
     let mut r = aterm_render::Renderer::from_system(18.0, aterm_render::Theme::default())
         .expect("no font: build with aterm-render's default embedded-font feature");
     assert_eq!(

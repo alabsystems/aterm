@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric brief`'s fold over bodies a real session log's mirror makes:
-//! per seq space, deduped, partial without its start, `node-gone`
-//! after its node's will, opaque bodies counted, hostile bytes
-//! made safe.
+//! Tests for `aterm fabric brief`'s fold over session-log mirror bodies.
 
 use super::*;
 use aterm_slog::{
@@ -28,7 +25,6 @@ fn cfg() -> Config {
     .cfg
 }
 
-/// A session log of epoch `ep`: its open, a command that failed, a turn.
 fn session(ep: u32, at: u64) -> Log {
     let mut log = Log::new(ep);
     let t = |ms: u64| Stamp::new(at + ms, ms);
@@ -53,7 +49,6 @@ fn session(ep: u32, at: u64) -> Log {
     log
 }
 
-/// Everything `log` has, taken and encoded as the mirror's bodies.
 fn bodies(log: &mut Log) -> Vec<String> {
     let mut out = Vec::new();
     loop {
@@ -90,8 +85,6 @@ fn read_of(items: &[(&str, &str, Vec<String>)]) -> Read {
     r
 }
 
-/// The fold shows the session's state from the bus alone: its need, deduped
-/// when the bus holds a body twice, the bridge's own `v=1` bodies opaque.
 #[test]
 fn the_brief_folds_each_session_from_the_bus_alone() {
     let mut a = session(1, 1_760_000_000_000);
@@ -119,11 +112,6 @@ fn the_brief_folds_each_session_from_the_bus_alone() {
     );
 }
 
-/// A SPAWNED SESSION'S OPEN STILL FOLDS:
-/// its open names its parent locally (`parent=`, HOST since this step), the
-/// mirror's wire body carries the open without it, and the brief folds the
-/// session whole from that body (`partial=0`), its parent named nowhere.
-/// NEGATIVE CONTROL, run: `parent=` marked W fails it.
 #[test]
 fn a_spawned_sessions_open_folds_without_its_parent() {
     let parent = "s-parentqzp6";
@@ -154,10 +142,6 @@ fn a_spawned_sessions_open_folds_without_its_parent() {
     assert!(!text.contains(parent), "{text}");
 }
 
-/// a keeper-recovered session restarts its seqs in a new space;
-/// the brief folds the newest space on its own (never dropping its records
-/// as reordered behind the old space's higher seqs), and says the session
-/// has two.
 #[test]
 fn a_keeper_recovered_sid_folds_its_new_space_alone() {
     let mut old = session(1, 1_760_000_000_000);
@@ -169,7 +153,6 @@ fn a_keeper_recovered_sid_folds_its_new_space_alone() {
         .expect("a seen");
     }
     let mut old_bodies = bodies(&mut old);
-    // The crash recovery: a new log, a new epoch, seqs from 1.
     let mut new = Log::new(1_760_000_500);
     new.gap(
         aterm_slog::GapWhy::Crash,
@@ -177,7 +160,6 @@ fn a_keeper_recovered_sid_folds_its_new_space_alone() {
         Stamp::new(1_760_000_500_000, 0),
     );
     let mut new_bodies = bodies(&mut new);
-    // Interleaved on the bus as a late mirror could leave them.
     old_bodies.append(&mut new_bodies);
     let r = read_of(&[("n-1", "s-k", old_bodies)]);
     let s = &r.sessions[&("n-1".to_string(), "s-k".to_string())];
@@ -194,14 +176,10 @@ fn a_keeper_recovered_sid_folds_its_new_space_alone() {
     );
 }
 
-/// a session whose node's presence ended without the session's
-/// close is `partial why=node-gone`; one whose window holds neither its start
-/// nor a snapshot is `partial why=no-start`.
 #[test]
 fn a_session_of_a_gone_node_or_without_its_start_is_partial() {
     let mut a = session(1, 1_760_000_000_000);
     let bs = bodies(&mut a);
-    // s-b's window holds neither its start nor a snapshot.
     let late: Vec<String> = bs[2..]
         .iter()
         .filter(|b| !b.contains(" op=snap "))
@@ -209,8 +187,6 @@ fn a_session_of_a_gone_node_or_without_its_start_is_partial() {
         .collect();
     let mut r = read_of(&[("n-1", "s-a", bs.clone()), ("n-2", "s-b", late.clone())]);
     r.nodes_gone.push("n-1".to_string());
-    // The window began past the log's start: what it does not reach is its
-    // cut, said `no-start`, never `holes=` (fixer F8).
     r.from = 1;
     let text = render(&cfg(), &BriefOpts::default(), &r, 1_760_000_001_000);
     assert!(
@@ -226,23 +202,15 @@ fn a_session_of_a_gone_node_or_without_its_start_is_partial() {
         !b_line.contains(" holes="),
         "the window's cut is no loss nobody said: {b_line}"
     );
-    // A window from the log's very start that lacks the space's first ms:
-    // that is loss nobody said.
     let whole = read_of(&[("n-2", "s-b", late)]);
     let text = render(&cfg(), &BriefOpts::default(), &whole, 1_760_000_001_000);
     assert!(text.contains(" holes=1..2"), "{text}");
-    // With a snapshot in the window, the same late reader seeds and is whole.
     let seeded = read_of(&[("n-2", "s-c", bs[2..].to_vec())]);
     let text = render(&cfg(), &BriefOpts::default(), &seeded, 1_760_000_001_000);
     assert!(!text.contains("partial why=no-start"), "{text}");
     assert!(text.lines().next().unwrap().contains(" partial="), "{text}");
 }
 
-/// A NEWER WRITER'S WORDS ARE NO HOLE (§3.4: a new word never changes `v`):
-/// bodies this build cannot place — a mark kind, an operation, a node level
-/// it does not know — are counted `foreign=`, never `opaque=`, and their
-/// `ms` are held, so the brief prints no `holes=` for a record that is on
-/// the bus.
 #[test]
 fn a_newer_writers_words_are_foreign_and_no_hole() {
     let bodies: Vec<String> = [
@@ -263,7 +231,6 @@ fn a_newer_writers_words_are_foreign_and_no_hole() {
     assert!(!text.contains(" holes="), "{text}");
 }
 
-/// A hostile node's bodies: a control byte in a field is never printed raw.
 #[test]
 fn a_hostile_body_is_printed_safe() {
     let body = "v=2 t=1 ep=1 seq=1 ms=1 op=open node=- k=spawn src=aterm conf=exact".to_string();
@@ -272,7 +239,6 @@ fn a_hostile_body_is_printed_safe() {
     assert!(!text.contains('\u{1b}'), "{text:?}");
 }
 
-/// The words: a session, its node, a window and a budget within bounds.
 #[test]
 fn the_brief_reads_its_words_within_their_bounds() {
     let o = BriefOpts::parse(&[
@@ -298,8 +264,6 @@ fn the_brief_reads_its_words_within_their_bounds() {
         !BriefOpts::parse(&[]).expect("reads").json,
         "text by default"
     );
-    // The Overview's read (aterm-gui `overview_fabric::ChildRunner::brief`,
-    // after `fabric brief`): the machine form at the budget's ceiling.
     let overview: Vec<String> = ["--json", "--budget", "100000"]
         .iter()
         .map(|s| (*s).to_string())
@@ -318,11 +282,6 @@ fn the_brief_reads_its_words_within_their_bounds() {
     }
 }
 
-/// a session whose close never reached
-/// the bus is partial when its own presence says it exited (`no-close`), or
-/// when its presence row is an earlier incarnation's than its node's live one
-/// (`node-gone`: the relaunch never re-announced it). A live session of the
-/// node's current incarnation is not.
 #[test]
 fn a_session_without_its_close_past_a_relaunch_is_partial() {
     let mut a = session(1, 1_760_000_000_000);
@@ -353,9 +312,6 @@ fn a_session_without_its_close_past_a_relaunch_is_partial() {
     assert!(!line("s-z").contains("partial"), "{text}");
 }
 
-/// THE BUDGET IS THE WHOLE BRIEF'S (fixer F23): many sessions under a small
-/// budget are shown newest first while they fit, each head line counted, and
-/// the rest are `more=sessions:<k>`; `used=` never passes `budget=`.
 #[test]
 fn many_sessions_are_held_to_the_budget() {
     let items: Vec<(String, Vec<String>)> = (0..60)
@@ -398,9 +354,6 @@ fn many_sessions_are_held_to_the_budget() {
     assert!(text.contains("@s-59@n-1"), "the newest first: {text}");
 }
 
-/// The real roster and fold share a bounded read. Existing entries still
-/// accept updated presence and records when full; another session or node
-/// refuses the read rather than silently rendering a complete-looking subset.
 #[test]
 fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
     let body = b"v=2 t=1 ep=1 seq=1 ms=1 op=open node=- k=spawn src=aterm conf=exact";
@@ -435,7 +388,6 @@ fn a_brief_refuses_a_roster_or_fold_past_its_session_bound() {
         .ingest(FLEET, None, 3, &face("n-1", "s-overflow"), body)
         .is_err();
 
-    // An event-only session has the same admission boundary as a roster row.
     let mut records = Read::default();
     for i in 0..SESSIONS_MAX {
         records
@@ -525,8 +477,6 @@ fn a_window_below_the_retained_floor_reads_from_it() {
     assert_eq!(r.sessions.len(), 1, "the session it kept the rest of");
 }
 
-/// A session of epoch 1 in an approval box (`box=<tool>`): its open, an agent
-/// run, a turn, and the box open, each record `at` plus its own ms.
 fn in_approval(at: u64, tool: &str) -> Log {
     let mut log = Log::new(1);
     let t = |ms: u64| Stamp::new(at + ms, ms);
@@ -561,14 +511,11 @@ fn in_approval(at: u64, tool: &str) -> Log {
     log
 }
 
-/// `--json`'s per-session keys, the closed schema.
 const SCHEMA: [&str; 12] = [
     "node", "sid", "this", "ep", "need", "detail", "open", "mail_in", "mail_out", "last_seq",
     "age_s", "partial",
 ];
 
-/// The keys the machine form names itself: no session log key bears them.
-/// Every other key it prints must be a key the bus may carry.
 const DERIVED: [&str; 8] = [
     "node", "sid", "this", "ep", "level", "last_seq", "age_s", "partial",
 ];
@@ -590,14 +537,6 @@ fn json_opts() -> BriefOpts {
     }
 }
 
-/// THE MACHINE FORM: a two-session fold
-/// renders ONE object whose `sessions` hold each session in the closed
-/// schema, newest first. The one in its approval box says
-/// `"need":"approval:bash"` with its open path run, turn and step; the one
-/// whose command failed says `"need":"failure"`, on the node this host's
-/// state dir names (`this`); each with its mail counts, the text brief's
-/// own `as_of` as its `last_seq`, and its age. NEGATIVE CONTROL, run: a
-/// renderer that drops `age_s` fails it.
 #[test]
 fn the_json_brief_holds_each_session_in_its_closed_schema() {
     let now = 1_760_000_100_000;
@@ -626,7 +565,6 @@ fn the_json_brief_holds_each_session_in_its_closed_schema() {
         want.sort_unstable();
         assert_eq!(keys, want, "the closed schema: {text}");
     }
-    // The text brief's own reading of each, for its `as_of`.
     let plain = render(&cfg(), &BriefOpts::default(), &r, now);
     let as_of = |sid: &str| -> u64 {
         plain
@@ -685,15 +623,6 @@ fn the_json_brief_holds_each_session_in_its_closed_schema() {
     assert_eq!(get(f, "age_s").as_u64(), Some(99));
 }
 
-/// THE MACHINE FORM NAMES ONLY AN OBSERVED NEED (as the text
-/// brief; D1): a `need` mark is a claim (`src=mark conf=claim`), which any
-/// process holding a cap on a node can put on the bus, so a session whose
-/// only need is a claim says `"need":null` — no consumer of the stream (the
-/// Overview's fabric group, a program deciding from it) takes a claim for
-/// what the session needs — and a claim beside an observed failure leaves
-/// `"need":"failure"`. The local fold holds each claim as its session's top
-/// need (the precondition). NEGATIVE CONTROL, run: the top need of any kind
-/// (`top_need`) prints the claim and fails it.
 #[test]
 fn the_json_brief_names_no_claimed_need() {
     let at = 1_760_000_000_000;
@@ -746,12 +675,6 @@ fn the_json_brief_names_no_claimed_need() {
     assert_eq!(need("s-beside").as_str(), Some("failure"), "{text}");
 }
 
-/// NO HOST OR CONTENT FIELD (as the text brief): a session whose
-/// log holds a cwd, a title, a label's text and a mail's party — host and
-/// content facts, each a sentinel — renders a machine form that holds none
-/// of them, and every key it prints is either one of the schema's own names
-/// or a session log key the bus may carry (wire, or wire-meta). NEGATIVE
-/// CONTROL, run: a renderer that prints the run's `cwd` fails the tier check.
 #[test]
 fn the_json_brief_prints_no_host_or_content_field() {
     let mut log = in_approval(1_760_000_000_000, "bash");
@@ -803,10 +726,6 @@ fn the_json_brief_prints_no_host_or_content_field() {
     }
 }
 
-/// THE MACHINE FORM IS HELD TO THE BUDGET: sixty sessions under
-/// a small budget print newest first while their objects fit, `used` never
-/// past `budget`, and the rest are counted `more`. NEGATIVE CONTROL, run: a
-/// renderer that prints every object passes the budget.
 #[test]
 fn the_json_brief_is_held_to_the_budget() {
     let items: Vec<(String, Vec<String>)> = (0..60)

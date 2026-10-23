@@ -1,10 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `store/<program>/<build>.vendor` (design §1.3): what a vendor build was verified
-//! against. The stager writes it after the swap and the codesign check, then flushes the
-//! directory, then marks the build ready — so a reader trusts it only beside a complete
-//! build ([`complete_record`]).
+//! `store/<program>/<build>.vendor`: what a vendor build was verified against ([`complete_record`]).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -64,8 +61,7 @@ pub struct VendorRecord {
 
 impl VendorRecord {
     /// The bytes the stager writes to [`record_path`] (with
-    /// [`super::durable::write_durable`]). Refuses a record [`read_record`] would not read
-    /// back, apart from the build-directory checks only a path can make.
+    /// [`super::durable::write_durable`]).
     ///
     /// # Errors
     /// A field is malformed, or the record does not serialize.
@@ -89,10 +85,7 @@ impl VendorRecord {
         }
     }
 
-    /// Field shapes, independent of where the record sits: well-formed, and what this
-    /// build's compiled row would have written — its vendor, its anchor, a payload URL
-    /// under its pinned prefixes, and on darwin its Apple team (so `.ready` beside the
-    /// record still means team-checked).
+    /// Whether field shapes match what this build's compiled row would have written.
     fn well_formed(&self) -> bool {
         let Some(row) = spec(&self.program) else {
             return false;
@@ -129,9 +122,8 @@ pub fn record_path(build_dir: &Path) -> Option<PathBuf> {
     Some(build_dir.with_file_name(sidecar))
 }
 
-/// The record beside `build_dir`, or `None` when it is absent, unreadable, of another
-/// schema, malformed, or names another program or build than the directory it sits
-/// beside. It says nothing about the tree; see [`complete_record`].
+/// The record beside `build_dir`, or `None` when it is absent, unreadable, malformed, or
+/// inconsistent with `build_dir` (see [`complete_record`]).
 #[must_use]
 pub fn read_record(build_dir: &Path) -> Option<VendorRecord> {
     let record: VendorRecord =
@@ -209,7 +201,6 @@ mod tests {
         let view = rec.installed_view();
         assert_eq!(view.build, 1_000_002_000_001_000_280);
         assert_eq!(view.build_date, rec.build_date);
-        // codex: no buildDate.
         let bare = VendorRecord {
             program: "codex".into(),
             version: Version::parse("0.156.0").unwrap(),
@@ -224,10 +215,7 @@ mod tests {
         assert_eq!(read_record(&dir), Some(bare));
     }
 
-    /// A record names one payload digest under its algorithm's key: an earlier client's sha256
-    /// record reads back and re-serializes byte for byte, a sha512 record has no sha256 key, and
-    /// a record naming both, neither, or a digest of the wrong length or case is refused on
-    /// write and read.
+    /// Verify that a record names one payload digest under its algorithm's key.
     #[test]
     fn a_record_names_its_payload_digest_by_algorithm() {
         let l = layout("digest");
@@ -302,15 +290,12 @@ mod tests {
     fn a_record_that_disagrees_with_its_directory_is_none() {
         let l = layout("mismatch");
         let rec = record();
-        // Filed under another build number.
         let other = Version::parse("2.1.281").unwrap().build_id();
         assert_eq!(read_record(&place(&l, "claude", other, &rec)), None);
-        // Filed under another program.
         assert_eq!(
             read_record(&place(&l, "codex", rec.version.build_id(), &rec)),
             None
         );
-        // An ALab build number.
         assert_eq!(read_record(&place(&l, "claude", 2_026_091_901, &rec)), None);
     }
 
@@ -341,7 +326,6 @@ mod tests {
             std::fs::write(&path, &bad).unwrap();
             assert_eq!(read_record(&dir), None, "{bad}");
         }
-        // Not a regular file.
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert_eq!(read_record(&dir), None);
@@ -383,9 +367,7 @@ mod tests {
         }
     }
 
-    /// A record that is not what the program's compiled row would have written is refused
-    /// on write and on read: another anchor, vendor, payload host or Apple team — and on
-    /// darwin, no team at all (a stager that skipped codesign).
+    /// Verify that a record not matching the program's compiled row is refused on write and read.
     #[test]
     fn a_record_must_match_the_compiled_row() {
         let other_team = match team("claude") {
@@ -433,7 +415,6 @@ mod tests {
         let l = layout("row");
         for rec in bad {
             assert!(rec.record_bytes().is_err(), "{rec:?}");
-            // Written around `record_bytes`, as a buggy stager or a hand edit would.
             let dir = l.build_dir("claude", rec.version.build_id());
             std::fs::create_dir_all(&dir).unwrap();
             let bytes = super::super::durable::to_toml(&rec, MAX_RECORD_BYTES).unwrap();

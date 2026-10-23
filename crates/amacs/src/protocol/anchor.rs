@@ -2,25 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! `line:h6` anchors (design §7b-§7c, decision D-11; slice S6).
-//!
-//! An anchor names one line of a text: `<n>:<h6>`, the 1-based line number and
-//! the line's h6. The h6 is the first 24 bits of `aterm_hash::fnv1a_64` over
-//! the line's bytes without its end-of-line, written as 6 lowercase hex
-//! digits. Reads print an anchor before every line (`read::format_lines`), and
-//! an agent copies them into an edit script (`script`): it never counts lines
-//! or computes a hash of its own.
-//!
-//! What a line is: the text splits at `\n`; a `\r` just before the `\n` is part
-//! of the end-of-line, so a CRLF file's lines hash as the same lines with LF
-//! endings. A final line without an end-of-line is still a line, and a text
-//! that ends with one has no empty line after it (`"a\nb\n"` has 2 lines, `""`
-//! has none). A leading byte-order mark belongs to no line: line 1 starts after
-//! it, so an edit never removes it and the file keeps it byte-exact.
 
 use std::fmt;
 use std::str::FromStr;
 
-/// The UTF-8 byte-order mark a file may open with. It belongs to no line.
+/// The UTF-8 byte-order mark a file may open with.
 pub(crate) const BOM: &str = "\u{feff}";
 
 /// Bits an h6 keeps of the 64-bit hash: the top 24.
@@ -30,7 +16,7 @@ const H6_SHIFT: u32 = 40;
 const H6_MAX: u32 = 0x00ff_ffff;
 
 /// The first 24 bits of FNV-1a/64 over a line's bytes, without its
-/// end-of-line. Written and read as 6 hex digits.
+/// end-of-line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash6(u32);
 
@@ -39,8 +25,6 @@ impl Hash6 {
     #[must_use]
     pub fn of(line: &str) -> Self {
         let top = h6_of_hash(aterm_hash::fnv1a_64(line.as_bytes()));
-        // `h6_of_hash` keeps 24 of 64 bits, so the value always fits; the
-        // fallback is the evident bound, never taken.
         Self(u32::try_from(top).unwrap_or(H6_MAX))
     }
 
@@ -71,7 +55,6 @@ impl FromStr for Hash6 {
         if text.len() != 6 || !text.bytes().all(is_hex_digit) {
             return Err(AnchorError::Hash(text.to_string()));
         }
-        // Six hex digits are 24 bits, so the value always fits an h6.
         u32::from_str_radix(text, 16)
             .ok()
             .and_then(Self::from_value)
@@ -124,8 +107,7 @@ impl FromStr for Anchor {
     }
 }
 
-/// Why a token is not an anchor. Its `Display` names the token and the shape
-/// it should have.
+/// Why a token is not an anchor.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnchorError {
     /// No `:` between a line number and a hash.
@@ -165,12 +147,6 @@ const fn h6_of_hash(hash: u64) -> u64 {
     hash >> H6_SHIFT
 }
 
-// The two predicates an h6 token is read through carry contracts (the
-// crate's `trust_contract_fn!`, lib.rs), each proved against the compiled body
-// by a cited Clean theorem (SPECS.md, `h6-fits` and `h6-hex-digit`). The shift
-// above has none: Trust mints no import for a shift body, so no clause over it
-// can be cited (SPECS.md keeps both refusals).
-
 trust_contract_fn! {
     /// Whether `value` fits an h6: 24 bits, at most `0xff_ffff`.
     #[must_use]
@@ -181,8 +157,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `h6-fits` (SPECS.md): for every u32, the value fits an h6 exactly when
-// it is at most 2^24 - 1. Kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem fits_h6_is_24_bits (value : UInt32) :
@@ -206,8 +180,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `h6-hex-digit` (SPECS.md): for every byte, it is a hex digit exactly
-// when it is in 0-9, a-f or A-F. Kernel-checked against the compiled body.
 verify_island! {
     clean {
         theorem is_hex_digit_is_the_class (byte : UInt8) :
@@ -320,8 +292,7 @@ impl<'t> Lines<'t> {
     }
 
     /// The 1-based line holding byte `offset`: the line whose bytes, with its
-    /// end-of-line, contain it. `None` before line 1 (inside a byte-order
-    /// mark) or at or past the end of the text.
+    /// end-of-line, contain it.
     pub(crate) fn line_at(&self, offset: usize) -> Option<usize> {
         let index = self.spans.partition_point(|span| span.end <= offset);
         let span = self.spans.get(index)?;
@@ -350,14 +321,10 @@ mod tests {
             assert_eq!(Hash6::of(line).to_string(), prefix, "{line:?}");
             assert_eq!(u64::from(Hash6::of(line).value()), hash >> 40);
         }
-        // Pinned values: an anchor read today must match one read by a later
-        // release, so the hash is the published FNV-1a/64 and never changes.
         assert_eq!(Hash6::of("").to_string(), "cbf29c");
         assert_eq!(Hash6::of("a").to_string(), "af63dc");
         assert_eq!(Hash6::of("hello").to_string(), "a430d8");
 
-        // The end-of-line is not part of a line: LF and CRLF lines hash alike,
-        // and a byte-order mark belongs to no line.
         let lf = Lines::of("one\ntwo\n");
         let crlf = Lines::of("one\r\ntwo\r\n");
         let bom = Lines::of("\u{feff}one\ntwo");
@@ -422,7 +389,6 @@ mod tests {
         assert_eq!(lines.line_at(3), Some(2));
         assert_eq!(lines.line_at(text.len() - 1), Some(3));
         assert_eq!(lines.line_at(text.len()), None);
-        // A lone CR is content, not an end-of-line.
         let cr = Lines::of("a\rb\n");
         assert_eq!(cr.count(), 1);
         assert_eq!(cr.content(1), Some("a\rb"));

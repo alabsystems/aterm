@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE STUCK VERDICT (`docs/DESIGN-system-awareness-2026-10-16.md` §11.7, §17).
+//! System-awareness and process-termination models.
 
 use aterm_spec::derive::*;
 
@@ -117,26 +117,7 @@ pub fn stuck_verdict_model() -> Model {
     }
 }
 
-/// END BY PROOF (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4): the end protocol
-/// `aterm_uds::process::end_proven` runs for every tier. Before EACH pid-addressed signal it
-/// judges the process afresh: the tier's conditions read between two identity reads that must
-/// both equal the proven token (pid, birth, pid version). A read whose identity has MOVED (the
-/// process exited, its pid was reused, or it exec'd another program), or whose tier no longer
-/// holds (it left its group, it reached the program check), sends nothing more. The single law
-/// is that every signal follows its own judgment that held, and none follows such a read.
-///
-/// `v` is the protocol's point: 0 before the SIGTERM, 1 after it, 2 done (stopped or
-/// SIGKILLed); `fresh` is a judgment that held since the last signal, spent by the next one;
-/// `moved` and `lost` are what the environment did since the token was proven, each latched;
-/// `bad` latches a signal sent with no fresh judgment, or after a move or a loss. `Buggy=1` is
-/// the implementation that signals without the judgment.
-///
-/// Law (broken by its own mutant): `NoUnprovenSignal` (Buggy 1: a signal reaches a pid with no
-/// judgment since the last, or whose identity moved, or whose tier no longer holds). Tier-1
-/// against the real `end_proven` is `aterm-verify`'s `tests/conformance_end_by_proof.rs`: each
-/// real run's reads, judgments and signals are replayed here through the guards, and a trace
-/// that signals unjudged or after a move is rejected. No `#[refines]` anchors, as
-/// [`stuck_verdict_model`]: the binding is the conformance test.
+/// END BY PROOF (`docs/DESIGN-leftover-processes-2026-10-16.md` §4.4) ([`stuck_verdict_model`]).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn end_by_proof_model() -> Model {
@@ -149,21 +130,15 @@ pub fn end_by_proof_model() -> Model {
             var lost = 0;
             var bad = 0;
 
-            // The environment, between any two reads: the pid's identity no longer equals the
-            // token, or the tier's conditions no longer hold. Each, once so, stays so.
             action Move when (moved == 0) {
                 moved = 1;
             }
             action Lose when (lost == 0) {
                 lost = 1;
             }
-            // A judgment that held: both identity reads name the token, and the tier holds.
             action Judge when (v <= 1 && fresh == 0 && moved == 0 && lost == 0) {
                 fresh = 1;
             }
-            // The SIGTERM, then the SIGKILL past the grace: each only on a judgment of its own
-            // that still names the token and still proves the tier. The buggy run signals
-            // regardless.
             action Term when (v == 0 && (Buggy == 1 || (fresh == 1 && moved == 0 && lost == 0))) {
                 bad = if (fresh == 0 || moved == 1 || lost == 1) { 1 } else { bad };
                 fresh = 0;
@@ -174,8 +149,6 @@ pub fn end_by_proof_model() -> Model {
                 fresh = 0;
                 v = 2;
             }
-            // A judgment that finds the identity moved (gone, or another program) or the tier
-            // lost stops the run with nothing more sent.
             action Stop when (v <= 1 && (moved == 1 || lost == 1)) {
                 v = 2;
             }
@@ -338,7 +311,7 @@ pub fn scope_balance_model() -> Model {
     }
 }
 
-/// THE EXPLANATION'S HONESTY (`docs/DESIGN-resource-details-2026-10-20.md` §17, the laws of its first slice).
+/// THE EXPLANATION'S HONESTY.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn explain_honesty_model() -> Model {

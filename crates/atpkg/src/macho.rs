@@ -26,9 +26,7 @@ pub fn is_macho_header(head: &[u8]) -> bool {
     FAT_MAGICS.contains(&magic) && head.get(4..8).is_some_and(|n| n != [0; 4])
 }
 
-/// The load commands that name a dylib the loader maps (`<mach-o/loader.h>`):
-/// `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`, `LC_LAZY_LOAD_DYLIB` and
-/// `LC_LOAD_UPWARD_DYLIB`. `LC_ID_DYLIB` is a library's own name and loads nothing.
+/// The load commands that name a dylib the loader maps (`<mach-o/loader.h>`): `LC_LOAD_DYLIB`, `LC_LOAD_WEAK_DYLIB`, `LC_REEXPORT_DYLIB`, `LC_LAZY_LOAD_DYLIB` and `LC_LOAD_UPWARD_DYLIB`.
 const DYLIB_LOADS: [u32; 5] = [0xC, 0x8000_0018, 0x8000_001F, 0x20, 0x8000_0023];
 
 /// `LC_ID_DYLIB`: a dylib's own install name, which a program linked against it records.
@@ -232,7 +230,6 @@ pub fn load_names(bytes: &[u8]) -> Result<LoadNames, LoadError> {
 
 /// The names one thin slice's load commands carry, appended to `out`.
 fn thin_loads(slice: &[u8], what: &str, out: &mut LoadNames) -> Result<(), LoadError> {
-    // (little-endian, header size, the alignment every cmdsize keeps)
     let (little, header, align) = match word(slice, 0, false, what)? {
         0xCFFA_EDFE => (true, HEADER_64, 8),
         0xFEED_FACF => (false, HEADER_64, 8),
@@ -393,8 +390,7 @@ fn is_script_header(head: &[u8]) -> bool {
     head.starts_with(b"#!")
 }
 
-/// What the regular file at `path` opens as. Opened no-follow and proven regular on the
-/// handle, so a FIFO or a link swapped in cannot block or redirect the read.
+/// What the regular file at `path` opens as.
 fn sniff(path: &Path) -> std::io::Result<Sniffed> {
     let head = crate::metadata_io::read_head(path, 8)?;
     Ok(if is_macho_header(&head) {
@@ -446,7 +442,6 @@ pub fn find_macho(root: &Path) -> Result<Vec<PathBuf>, StageError> {
                     Sniffed::Other => {}
                 }
             } else if kind.is_symlink() {
-                // A link that resolves nowhere (dangling, a loop) runs nothing.
                 let Ok(target) = std::fs::canonicalize(&path) else {
                     continue;
                 };
@@ -477,8 +472,7 @@ pub(crate) fn is_native_object(path: &Path) -> bool {
         .is_ok_and(|head| is_macho_header(&head) || head.starts_with(b"\x7fELF"))
 }
 
-/// Whether `head` opens this platform's native executable format: Mach-O on macOS, ELF
-/// on every other unix. Elsewhere no file carries an execute bit to keep.
+/// Whether `head` opens this platform's native executable format: Mach-O on macOS, ELF on every other unix.
 fn is_native_executable(head: &[u8]) -> bool {
     if cfg!(target_os = "macos") {
         is_macho_header(head)
@@ -703,8 +697,6 @@ mod tests {
         h
     }
 
-    /// Every thin magic in either byte order is a Mach-O, and so is a universal header of
-    /// either width and order with any nonzero arch count, a Java class file's included.
     #[test]
     fn thin_and_fat_headers_are_recognised_at_any_arch_count() {
         for magic in THIN_MAGICS {
@@ -727,8 +719,6 @@ mod tests {
         );
     }
 
-    /// A universal header counting no arch (it names no slice to run), a truncated
-    /// header, and ordinary files are not Mach-O.
     #[test]
     fn empty_fat_headers_and_other_files_are_not() {
         for magic in FAT_MAGICS {
@@ -742,8 +732,6 @@ mod tests {
         assert!(!is_macho_header(b""));
     }
 
-    /// The walk finds thin and fat Mach-Os at any depth by content, whatever their names or
-    /// arch counts, skips everything else, and sorts the list.
     #[test]
     fn the_walk_finds_thin_and_fat_files_by_content() {
         let d = tmp("walk");
@@ -772,8 +760,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// An interpreter script anywhere in the tree is refused by name: the kernel runs it
-    /// with no signature to check, beside Mach-Os that all verify.
     #[test]
     fn an_interpreter_script_is_refused() {
         let d = tmp("script");
@@ -843,9 +829,6 @@ mod tests {
         )
     }
 
-    /// A build that links Homebrew's PCRE2 is refused by name, in either byte order and
-    /// inside either universal table; the libSystem-only build is self-contained. The
-    /// fish row's self-containment check (§6.2) is exactly [`foreign_dylibs`].
     #[test]
     fn a_homebrew_pcre2_link_is_foreign_and_libsystem_alone_is_not() {
         let d = tmp("pcre2");
@@ -899,7 +882,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// Every dylib kind the loader maps is read; `LC_ID_DYLIB` (a library's own name) is not.
     #[test]
     fn every_loading_command_is_read_and_the_id_is_not() {
         let mut commands: Vec<Vec<u8>> = DYLIB_LOADS
@@ -935,10 +917,6 @@ mod tests {
         )
     }
 
-    /// The install name, the loads and the run paths are each read, in load-command order
-    /// and in either byte order, and once per slice of a universal file: what `otool -D`,
-    /// `-L` and `-l` print. NEGATIVE CONTROL: a program (no `LC_ID_DYLIB`) has no id, and
-    /// an `LC_UUID` between them is skipped, not read as a name.
     #[test]
     fn the_id_the_loads_and_the_rpaths_are_each_read() {
         let want = LoadNames {
@@ -971,8 +949,6 @@ mod tests {
         assert_eq!(program.loads.len(), 2);
     }
 
-    /// An `rpath_command` is held to the same shape as a dylib command: a path offset
-    /// inside the command and past its 12 fixed bytes, a NUL-terminated non-empty path.
     #[test]
     fn a_malformed_rpath_command_is_refused() {
         let good = thin(&[rpath_command("@loader_path/../lib", true)], true);
@@ -983,8 +959,6 @@ mod tests {
         let mut low = good.clone();
         low[at + 8..at + 12].copy_from_slice(&4u32.to_le_bytes());
         cases.push(("offset inside the fixed part", low));
-        // Past a dylib command's 8-byte cmd/cmdsize but inside the rpath command's own
-        // offset word: the 12 fixed bytes, not 8, bound it.
         for offset in [8u32, 11] {
             let mut word = good.clone();
             word[at + 8..at + 12].copy_from_slice(&offset.to_le_bytes());
@@ -1015,12 +989,6 @@ mod tests {
         }
     }
 
-    /// A 32-bit Mach-O (an arm64_32 watchOS dylib, an i386 slice) reads as `otool` reads
-    /// it: a 28-byte header, then load commands each a multiple of 4 bytes, in either
-    /// byte order and as a universal file's slice. A static-archive slice (`!<arch>`)
-    /// names nothing, and the slices around it are still read. NEGATIVE CONTROL: a 32-bit
-    /// command whose cmdsize is not a multiple of 4 is refused, a 64-bit command that is a
-    /// multiple of 4 but not of 8 still is, and an archive alone is no Mach-O.
     #[test]
     fn a_32_bit_mach_o_reads_and_an_archive_slice_names_nothing() {
         let watch = |little: bool| {
@@ -1102,7 +1070,6 @@ mod tests {
                 lib.join("libLTO.dylib"),
                 lib.join("swift-5.0/watchos/libswiftCore.dylib"),
             ];
-            // `usr/lib/clang/<version>/lib/darwin`, whatever the version.
             for version in std::fs::read_dir(lib.join("clang")).into_iter().flatten() {
                 let darwin = version.map(|v| v.path().join("lib/darwin"));
                 if let Ok(darwin) = darwin {
@@ -1136,11 +1103,7 @@ mod tests {
                 .lines()
                 .map(str::trim)
                 .filter_map(|line| match flag {
-                    // `-l` prints every load command; an rpath's `path` row follows its cmd.
                     "-l" => line.strip_prefix("path "),
-                    // `-D` and `-L` print a `<file>:` or `<file> (architecture …):` header
-                    // per slice (and per archive member), then one name per line; an
-                    // archive slice opens with an `Archive : <file>` line.
                     _ => (!line.ends_with(':') && !line.starts_with("Archive : ")).then_some(line),
                 })
                 .map(|name| name.split(" (").next().unwrap_or(name).to_owned())
@@ -1157,11 +1120,9 @@ mod tests {
             let names = load_names_at(file).unwrap();
             let shown = file.display();
             assert_eq!(set(names.id.clone()), set(run("-D", file)), "-D {shown}");
-            // `-L` prints a dylib's own name first, then what it loads.
             let listed = [names.id.clone(), names.loads.clone()].concat();
             assert_eq!(set(listed), set(run("-L", file)), "-L {shown}");
             let rpaths = run("-l", file);
-            // Only `LC_RPATH` rows carry a `path` (an `LC_LOAD_DYLINKER`'s says `name`).
             assert_eq!(set(names.rpaths.clone()), set(rpaths), "-l {shown}");
             rpaths_seen += names.rpaths.len();
         }
@@ -1171,7 +1132,6 @@ mod tests {
         );
     }
 
-    /// Only an absolute path under the OS's own roots, with no `.` or `..`, is the system's.
     #[test]
     fn only_the_os_roots_are_system_dylibs() {
         for ok in [
@@ -1195,7 +1155,6 @@ mod tests {
         }
     }
 
-    /// Each malformed shape is refused, never read past or guessed at.
     #[test]
     fn malformed_load_commands_are_refused() {
         let good = homebrew_pcre2_fish(true);

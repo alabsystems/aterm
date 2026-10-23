@@ -2,32 +2,12 @@
 // Copyright 2026 Andrew Yates
 
 //! The upgrade rim: the terminal's border animates while aterm replaces itself
-//! in place, from the reader park until the successor takes over. An inset rim
-//! ramps up, thickens and pulses while its colour moves from the theme accent
-//! toward a white-cyan. It paints through the drop-target overlay pass (CPU
-//! `apply_overlay_at`, GPU `DropOverlay`, and `image`/`snapshot` introspection),
-//! so it shows on glass and to an agent. It is open-ended up to [`CHARGE_TTL`];
-//! the successor restarts it already charged ([`LevelUp::charging_continued`]) so
-//! the rim is continuous across the swap, and ends it at Commit.
-//!
-//! It has the timed lifecycle shape (`is_expired` + `deadline` + a quantized
-//! `fingerprint`): `deadline` steps every [`FRAME`], except under reduced motion
-//! or serious mode, where the rim holds still and the deadline is its cap.
-//!
-//! A border, not a card or a row: the automatic lane cannot add a status-bar row
-//! at apply time (its re-check reads the re-grid's SIGWINCH as activity), a row the
-//! explicit lane adds must exist before the handoff carry is built
-//! (`App::begin_update_installing`), and no floating card may cover the terminal.
-//! The rim covers no cell and takes no row, so it also paints over an in-app
-//! overlay.
+//! in place, from the reader park until the successor takes over.
 
 use std::time::{Duration, Instant};
 
 /// The rim's cap, counted from the reader park where each lane starts it
-/// (`App::charge_upgrade_rim_at_park`). What follows the park is bounded well
-/// inside it: the post-park proof deadline (at most 30 s, 120 s through its
-/// development seam), the capture and the grant. The rim normally ends earlier,
-/// at takeover or when a rolled-back attempt clears it.
+/// (`App::charge_upgrade_rim_at_park`).
 const CHARGE_TTL: Duration = Duration::from_secs(125);
 /// Animation cadence (~30 fps): the deadline granularity and fingerprint quantum.
 const FRAME: Duration = Duration::from_millis(33);
@@ -89,7 +69,7 @@ impl LevelUp {
     }
 
     /// Past its cap: the caller drops it and the rim vanishes on the next
-    /// present. Its owner normally ends it well before.
+    /// present.
     pub(crate) fn is_expired(&self, now: Instant) -> bool {
         now.duration_since(self.spawned) >= CHARGE_TTL
     }
@@ -101,12 +81,8 @@ impl LevelUp {
     }
 
     /// Begin the rim already charged, for the successor's half of the swap: no
-    /// ramp-in and the base already climbed, so the rim does not dip. The cap
-    /// counts from the back-dated instant, which only shortens it.
+    /// ramp-in and the base already climbed, so the rim does not dip.
     pub(crate) fn charging_continued(build: u64, now: Instant, motion: f32) -> Self {
-        // Back-dated by a whole number of pulse periods, at least the climb, so
-        // the pulse starts at its midpoint. The outgoing process's phase is
-        // unknown; a midpoint start bounds the visible step to half the swing.
         let periods = CHARGE_CLIMB
             .as_millis()
             .div_ceil(CHARGE_PULSE_PERIOD.as_millis());
@@ -120,9 +96,7 @@ impl LevelUp {
 
     /// The same rim at a re-park of its attempt: its cap counts again from `now`,
     /// as a rim [`Self::charging_continued`] started there would (already charged,
-    /// so nothing dips), keeping its build and motion. A younger rim keeps its own
-    /// instant. Without this a late re-park would run out the cap counted from the
-    /// first park mid-freeze.
+    /// so nothing dips), keeping its build and motion.
     #[cfg(any(unix, test))]
     pub(crate) fn re_anchor(&mut self, now: Instant) {
         let continued = Self::charging_continued(self.build, now, self.motion);
@@ -218,10 +192,7 @@ impl LevelUp {
     }
 
     /// A repaint fingerprint folded into `RepaintKey::level_up_fp`, quantized to
-    /// the [`FRAME`] step so the animation re-presents ~30×/s. `0` is the no-rim
-    /// sentinel (the caller's `map_or(0, …)`), so a live rim is forced non-zero.
-    /// A still rim (reduced motion) hashes stable through its hold, so a settled
-    /// window with the rim up re-presents nothing.
+    /// the [`FRAME`] step so the animation re-presents ~30×/s.
     pub(crate) fn fingerprint(&self, now: Instant) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -256,15 +227,12 @@ mod tests {
         let now = Instant::now();
         let l = LevelUp::charging(831, now, 1.0);
         assert!(l.border_alpha(now) < l.border_alpha(now + CHARGE_RAMP_IN));
-        // Pulses on its period…
         let a = l.border_alpha(now + Duration::from_millis(600));
         let b = l.border_alpha(now + Duration::from_millis(600) + CHARGE_PULSE_PERIOD / 2);
         assert_ne!(a, b, "the rim pulses over a half-period");
-        // …climbs as the freeze goes on (compare crest to crest)…
         let early = l.border_alpha(now + CHARGE_PULSE_PERIOD / 4 + CHARGE_PULSE_PERIOD);
         let late = l.border_alpha(now + CHARGE_PULSE_PERIOD / 4 + CHARGE_PULSE_PERIOD * 12);
         assert!(late >= early, "charged: {late} vs {early}");
-        // …never past the drop overlay's rim alpha, but thick and electric…
         for ms in (0..4000).step_by(37) {
             let t = now + Duration::from_millis(ms);
             assert!(l.border_alpha(t) <= CHARGE_PEAK_BORDER as u8 + 1);
@@ -275,7 +243,6 @@ mod tests {
             l.accent(0x0000_00ff, now + Duration::from_secs(1)),
             0x0000_00ff
         );
-        // …and open-ended until the cap.
         assert!(!l.is_expired(now + Duration::from_secs(60)));
         assert!(l.is_expired(now + CHARGE_TTL));
         assert_eq!(l.border_alpha(now + CHARGE_TTL), 0);
@@ -283,8 +250,7 @@ mod tests {
     }
 
     /// Under reduced motion the rim holds still (no pulse, hue travel or extra
-    /// thickening) and its deadline is its cap. The successor's continued rim
-    /// starts charged.
+    /// thickening) and its deadline is its cap.
     #[test]
     fn reduced_motion_holds_a_still_rim_and_the_successor_continues_it_charged() {
         let now = Instant::now();
@@ -308,8 +274,6 @@ mod tests {
         assert_eq!(c.deadline(held), now + CHARGE_TTL);
         assert_eq!(c.deadline(now), now + FRAME, "the ramp-in still animates");
 
-        // Continued (the successor's half): no ramp-in dip and the base already
-        // climbed, at full motion and still.
         let c = LevelUp::charging_continued(3, now, 1.0);
         assert!(
             c.border_alpha(now) >= CHARGE_FLOOR_BORDER as u8,
@@ -335,7 +299,6 @@ mod tests {
         let now = Instant::now();
         let l = LevelUp::charging(830, now, 1.0);
         assert_ne!(l.fingerprint(now), 0, "never the no-rim sentinel");
-        // Stable within one frame quantum, changes across a frame.
         assert_eq!(
             l.fingerprint(now),
             l.fingerprint(now + Duration::from_millis(10))
@@ -344,7 +307,6 @@ mod tests {
             l.fingerprint(now),
             l.fingerprint(now + FRAME + Duration::from_millis(1))
         );
-        // Two builds never alias.
         assert_ne!(
             LevelUp::charging(831, now, 1.0).fingerprint(now),
             l.fingerprint(now)

@@ -3231,7 +3231,6 @@ fn sync_restore_directory(path: &Path, flush: Flush) -> std::io::Result<()> {
 
 #[cfg(not(unix))]
 fn sync_restore_directory(_path: &Path, _flush: Flush) -> std::io::Result<()> {
-    // Windows publication/claim uses MOVEFILE_WRITE_THROUGH above.
     Ok(())
 }
 
@@ -3369,7 +3368,7 @@ pub(crate) fn take_for_launch(run: JournalId, evidence: &Evidence<'_>) -> Option
     }
 }
 
-/// `take_quit_from` in two phases, for a launch (the note above).
+/// `take_quit_from` in two phases, for a launch.
 #[cfg(unix)]
 pub(crate) fn take_holding_from(
     path: &Path,
@@ -3512,7 +3511,6 @@ fn take_holding_result(
         if let Some(unheld) = unheld
             && fs::remove_file(&unheld).is_ok()
         {
-            // Ordered, as the single-use cleanup: a leftover claim is never read.
             let _ = sync_restore_directory(parent, Flush::Ordered);
         }
         Ok((taken_together(texts), held))
@@ -4504,7 +4502,6 @@ mod tests {
             let route = if tag == "settings" {
                 "route = \"/home\"\n"
             } else {
-                // Distinct branch.
                 "uri = \"file:///tmp/notes.md\"\n"
             };
             let wire = format!("kind = \"native\"\nrestore_tag = \"{tag}\"\n{route}{extra}");
@@ -5245,7 +5242,6 @@ focused = true
         assert!(RestoreManifest::from_toml(&toml).is_none());
 
         malformed_uri.windows[0].native_tabs[1] = NativeTabRestore::Editor {
-            // Distinct branch.
             uri: "file:///tmp/readme.md".to_string(),
         };
         malformed_uri.windows[0].tab_order = vec![
@@ -5374,7 +5370,6 @@ metadata = "opaque=copy-me"
     fn v2_sanitizes_geometry_but_rejects_resource_exhaustion_shapes() {
         let mut manifest = mixed_sample("file:///tmp/readme.md");
         let mut tab = RestoredTab::from_legacy_native(&NativeTabRestore::Editor {
-            // Distinct branch.
             uri: "file:///tmp/readme.md".to_string(),
         })
         .unwrap();

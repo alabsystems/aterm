@@ -4,8 +4,6 @@
 use super::*;
 use std::collections::BTreeMap;
 
-/// Partial marks never promote to Full; `mark_full` does, every later mark
-/// keeps it Full, and `reset` returns either state to an empty Partial.
 #[test]
 fn state_machine_cycle() {
     let mut damage = Damage::new(24);
@@ -31,7 +29,6 @@ fn state_machine_cycle() {
     assert_eq!(damage.damaged_rows(24).collect::<Vec<_>>(), vec![0]);
 }
 
-/// Full damage covers every row at the full width, whatever the size asked.
 #[test]
 fn full_damage_covers_every_row_and_column() {
     let damage = Damage::Full;
@@ -52,7 +49,6 @@ fn full_damage_covers_every_row_and_column() {
     );
 }
 
-/// size_hint() does not panic after exhaustion.
 #[test]
 fn damage_iterator_size_hint_after_exhaustion() {
     let mut damage = Damage::new(24);
@@ -65,8 +61,6 @@ fn damage_iterator_size_hint_after_exhaustion() {
     assert_eq!(iter.size_hint(), (0, Some(0)));
 }
 
-/// Rows whose bounds fall wholly past the visible columns are skipped, not
-/// taken as the end of the iteration.
 #[test]
 fn damage_bounds_iterator_skips_multiple_out_of_range() {
     let mut damage = Damage::new(10);
@@ -86,7 +80,6 @@ fn damage_bounds_iterator_skips_multiple_out_of_range() {
     );
 }
 
-/// Row bounds clamp to the visible width and saturate at the `u16` edge.
 #[test]
 fn row_damage_bounds_clamp_and_saturate() {
     let mut damage = Damage::new(10);
@@ -127,7 +120,6 @@ fn mark_rows_range_behavior() {
     }
 }
 
-/// Marks and queries past the tracker's rows are ignored, never a panic.
 #[test]
 fn tracker_ignores_rows_past_its_capacity() {
     let mut tracker = DamageTracker::new(10);
@@ -140,7 +132,6 @@ fn tracker_ignores_rows_past_its_capacity() {
     }
 }
 
-/// clear() with a different row count resizes correctly.
 #[test]
 fn tracker_clear_resizes_on_row_count_change() {
     let mut tracker = DamageTracker::new(24);
@@ -157,8 +148,6 @@ fn tracker_clear_resizes_on_row_count_change() {
     assert!(tracker.is_row_damaged(99));
 }
 
-/// Damage::reset reuses allocations in the Partial→Partial path without
-/// carrying stale rows or column bounds.
 #[test]
 fn damage_reset_reuses_allocation_partial_to_partial() {
     let mut damage = Damage::new(24);
@@ -175,11 +164,6 @@ fn damage_reset_reuses_allocation_partial_to_partial() {
     assert_eq!(damage.row_damage_bounds(3, 80), Some((7, 8)));
 }
 
-/// The row and bounds iterators are exact: `BitsetRowIterator` yields exactly
-/// the set bits below `max_row`, in increasing order, against a bit-by-bit
-/// reference over 8-bit patterns within a word and across a word boundary;
-/// `DamageBoundsIterator` over one marked cell yields one bounds row covering
-/// it when the cell is visible and nothing when it is not.
 #[test]
 fn bitset_and_bounds_iterators_are_exact() {
     let reference = |bits: &[u64], max_row: u16| -> Vec<u16> {
@@ -233,8 +217,6 @@ fn bitset_and_bounds_iterators_are_exact() {
     }
 }
 
-/// Random cell marks: the damaged rows and per-row column bounds are exactly
-/// the rows marked and the min/max column marked in each.
 #[test]
 fn mark_random_cells_tracks_expected_rows_and_bounds() {
     const ROWS: u16 = 64;

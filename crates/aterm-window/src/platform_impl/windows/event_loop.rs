@@ -123,14 +123,8 @@ pub(crate) struct WindowData {
     pub minimized: Cell<bool>,
 }
 
-/// `WM_SIZE`'s `wParam` for a minimize (the vendored windows-sys carries only
-/// `SIZE_MAXIMIZED`).
 const SIZE_MINIMIZED: u32 = 1;
 
-/// aterm: the `Occluded` edge one `WM_SIZE` makes, given whether the window was
-/// minimized at the last one (`was`, updated here): `Some(true)` as it minimizes,
-/// `Some(false)` as it comes back (restored or maximized), `None` for every other
-/// resize.
 fn minimize_edge(was: &Cell<bool>, wparam: WPARAM) -> Option<bool> {
     let minimized = wparam == SIZE_MINIMIZED as usize;
     (was.replace(minimized) != minimized).then_some(minimized)
@@ -143,11 +137,8 @@ mod minimize_edge_tests {
     use super::SIZE_MINIMIZED;
     use windows_sys::Win32::UI::WindowsAndMessaging::SIZE_MAXIMIZED;
 
-    /// `WM_SIZE`'s `wParam` for a plain resize.
     const SIZE_RESTORED: u32 = 0;
 
-    /// A minimize and its return are one edge each; the resize steps of a drag
-    /// and a maximize of a shown window are none.
     #[test]
     fn only_the_edges_of_a_minimize_are_occlusion() {
         let was = Cell::new(false);
@@ -371,7 +362,6 @@ impl<T: 'static> EventLoop<T> {
         status
     }
 
-    /// Waits until new event messages arrive to be peeked.
     fn wait_for_messages(&mut self, timeout: Option<Duration>) {
         let runner = &self.window_target.p.runner_shared;
 
@@ -380,7 +370,6 @@ impl<T: 'static> EventLoop<T> {
         runner.wakeup();
     }
 
-    /// Dispatch all queued messages via `PeekMessageW`
     fn dispatch_peeked_messages(&mut self) {
         let runner = &self.window_target.p.runner_shared;
 
@@ -513,7 +502,6 @@ impl OwnedDisplayHandle {
     }
 }
 
-/// Returns the id of the main thread.
 fn main_thread_id() -> u32 {
     static mut MAIN_THREAD_ID: u32 = 0;
 
@@ -532,9 +520,6 @@ fn main_thread_id() -> u32 {
     unsafe { MAIN_THREAD_ID }
 }
 
-/// Returns the minimum `Option<Duration>`, taking into account that `None`
-/// equates to an infinite timeout, not a zero timeout (so can't just use
-/// `Option::min`)
 fn min_timeout(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
 }
@@ -562,9 +547,7 @@ impl<T> Drop for EventLoop<T> {
     }
 }
 
-/// Set upper limit for waiting time to avoid overflows.
 const FIFTY_DAYS: Duration = Duration::from_secs(50_u64 * 24 * 60 * 60);
-/// Waitable timers use 100 ns intervals to indicate due time.
 const MIN_WAIT: Duration = Duration::from_nanos(100);
 
 fn create_high_resolution_timer() -> Option<OwnedHandle> {
@@ -602,7 +585,6 @@ unsafe fn set_high_resolution_timer(timer: RawHandle, timeout: Duration) -> Resu
     }
 }
 
-/// Implementation detail of [EventLoop::wait_for_messages].
 fn wait_for_messages_impl(
     high_resolution_timer: &mut Option<OwnedHandle>,
     control_flow: ControlFlow,
@@ -619,11 +601,8 @@ fn wait_for_messages_impl(
         };
         let timeout = min_timeout(timeout, control_flow_timeout);
         if timeout == Some(Duration::ZERO) {
-            // Do not wait if we don't have time.
             return;
         }
-        // Now we decided to wait so need to do some clamping
-        // to avoid problems with overflow and calling WinAPI with invalid parameters.
         timeout
             .map(|t| t.min(FIFTY_DAYS))
             // If timeout is less than minimally supported by Windows,
@@ -668,7 +647,6 @@ fn wait_for_messages_impl(
             MWMO_INPUTAVAILABLE,
         );
         if result == WAIT_FAILED {
-            // Well, nothing smart to do in such case.
             tracing::warn!("Failed to MsgWaitForMultipleObjectsEx: error code {}", GetLastError(),);
         }
     }
@@ -745,11 +723,9 @@ pub struct LazyMessageId {
     name: &'static str,
 }
 
-/// An invalid custom window ID.
 const INVALID_ID: u32 = 0x0;
 
 impl LazyMessageId {
-    /// Create a new `LazyId`.
     const fn new(name: &'static str) -> Self {
         Self { id: AtomicU32::new(INVALID_ID), name }
     }
@@ -849,15 +825,11 @@ fn insert_event_target_window_data(
     unsafe { super::set_window_long(thread_msg_target, GWL_USERDATA, input_ptr as isize) };
 }
 
-/// Capture mouse input, allowing `window` to receive mouse events when the cursor is outside of
-/// the window.
 unsafe fn capture_mouse(window: HWND, window_state: &mut WindowState) {
     window_state.mouse.capture_count += 1;
     unsafe { SetCapture(window) };
 }
 
-/// Release mouse input, stopping windows on this thread from receiving mouse input when the cursor
-/// is outside the window.
 unsafe fn release_mouse(mut window_state: MutexGuard<'_, WindowState>) {
     window_state.mouse.capture_count = window_state.mouse.capture_count.saturating_sub(1);
     if window_state.mouse.capture_count == 0 {
@@ -873,7 +845,6 @@ fn normalize_pointer_pressure(pressure: u32) -> Option<Force> {
     }
 }
 
-/// Emit a `ModifiersChanged` event whenever modifiers have changed.
 fn update_modifiers(window: HWND, userdata: &WindowData) {
     use crate::event::WindowEvent::ModifiersChanged;
 
@@ -1264,7 +1235,6 @@ unsafe fn public_window_callback_inner(
         },
 
         WM_SIZING => {
-            /// Calculate the amount to add to round `value` to the nearest multiple of `increment`.
             fn snap_to_nearest_increment_delta(value: i32, increment: i32) -> i32 {
                 let half_one = increment / 2;
                 let half_two = increment - half_one;
@@ -1525,8 +1495,6 @@ unsafe fn public_window_callback_inner(
 
         WM_KEYUP | WM_SYSKEYUP => {
             if msg == WM_SYSKEYUP && unsafe { !GetMenu(window).is_null() } {
-                // let Windows handle event if the window has a native menu, a modal event loop
-                // is started here on Alt key up.
                 result = ProcResult::DefWindowProc(wparam);
             }
         },
@@ -1873,8 +1841,6 @@ unsafe fn public_window_callback_inner(
         WM_NCACTIVATE => {
             let is_active = wparam != false.into();
             if is_active {
-                // The process-wide menu mode, back on this window's caption side
-                // before its system menu can open (`dark_mode::reassert_menu_theme`).
                 super::dark_mode::reassert_menu_theme(window);
             }
             let active_focus_changed = userdata.window_state_lock().set_active(is_active);
@@ -2197,8 +2163,6 @@ unsafe extern "system" fn thread_event_target_callback(
     let userdata_ptr =
         unsafe { super::get_window_long(window, GWL_USERDATA) } as *mut ThreadMsgTargetData;
     if userdata_ptr.is_null() {
-        // `userdata_ptr` will always be null for the first `WM_GETMINMAXINFO`, as well as
-        // `WM_NCCREATE` and `WM_CREATE`.
         return unsafe { DefWindowProcW(window, msg, wparam, lparam) };
     }
     let userdata = unsafe { Box::from_raw(userdata_ptr) };
@@ -2364,7 +2328,6 @@ fn get_pointer_move_kind(
     let rect: RECT = unsafe {
         let mut rect: RECT = mem::zeroed();
         if GetClientRect(window, &mut rect) == false.into() {
-            // exit early if GetClientRect failed
             return PointerMoveKind::None;
         }
         rect

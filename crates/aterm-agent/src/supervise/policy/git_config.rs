@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Git configuration hazard check ([`hazard`], [`git_reads`]) for
-//! [`super::approval::RULE_READ_ONLY`] over [`crate::supervise::classify`]
-//! ([`crate::supervise::classify::runs`]), [`WorkerEnv`] ([`WorkerEnv::claude_dir`],
-//! [`WorkerEnv::raw_git_view`], [`WorkerEnv::git_settings_env`]),
-//! [`crate::harness::footer::shell_cwds`], and [`super::shell_startup`].
+//! Git configuration hazard check for read-only command approval.
 
 use aterm_uds::spawnfd::{Command, Stdio};
 use std::path::{Component, Path, PathBuf};
@@ -165,9 +161,6 @@ pub(crate) fn git_reads(
     Ok(Some(out))
 }
 
-/// Where directory operand `t` of a `cd` or `git -C` in `base` leads: every
-/// reading of it (`~/x` is `$HOME/x` unquoted and `./~/x` quoted, and the
-/// word no longer says which), lexically normalised.
 fn resolve(base: &Path, t: &str, home: Option<&Path>) -> Result<Vec<PathBuf>, String> {
     if t.contains(SUBSTITUTION) || t.contains('$') {
         return Err(format!(
@@ -190,7 +183,7 @@ fn resolve(base: &Path, t: &str, home: Option<&Path>) -> Result<Vec<PathBuf>, St
     Ok(out)
 }
 
-/// `.` and `..` resolved lexically.
+/// Resolve dot and parent components lexically.
 pub(crate) fn normalise(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -216,14 +209,11 @@ pub struct GitView {
     pub filters_selected: Option<Vec<String>>,
     /// Each populated submodule, recursively, with what git loads there.
     pub submodules: Vec<(PathBuf, GitView)>,
-    /// The worker's `GIT_EXTERNAL_DIFF`, which git runs for a diff as it runs `diff.external`.
+    /// The worker's `GIT_EXTERNAL_DIFF` environment value.
     pub external_diff: Option<String>,
 }
 
-/// How deep submodules are followed before the check gives up (and escalates).
 const MAX_SUBMODULE_DEPTH: usize = 8;
-/// How many populated submodules one view reads before the check gives up
-/// (and escalates) rather than read at length.
 const MAX_SUBMODULES: usize = 64;
 
 /// How long one git the check runs may take before it is killed and the read
@@ -253,10 +243,6 @@ impl std::fmt::Debug for WorkerEnv {
     }
 }
 
-/// Variables the probe does not pass on to its own git. `GIT_CONFIG` names
-/// the one file `git config` alone reads instead of the effective set — the
-/// probe's `git config --list` would list that file, not what a read loads;
-/// `GIT_TRACE*` would have the probe write trace files.
 fn withheld_from_probe(key: &str) -> bool {
     key == "GIT_CONFIG" || key.starts_with("GIT_TRACE")
 }
@@ -378,8 +364,6 @@ impl WorkerEnv {
         self
     }
 
-    /// The git the worker's shell runs: the first executable `git` on its
-    /// `PATH`.
     fn git_program(&self, worker_writes: &dyn Fn(&Path) -> bool) -> Result<PathBuf, String> {
         let path = self
             .var("PATH")
@@ -473,8 +457,6 @@ impl WorkerEnv {
     }
 }
 
-/// Why a git the probe ran in `at` failed: `what` and the directory, git's
-/// exit status, and the command that shows the person git's own complaint.
 fn git_failed(what: &str, at: &Path, status: std::process::ExitStatus, command: &str) -> String {
     format!(
         "{what} {} (git {status}; `{command}` there says why)",
@@ -499,24 +481,17 @@ pub(crate) fn claude_dir_at(
     Ok(normalise(&cwd.join(dir)))
 }
 
-/// Whether a variable changes which git runs or what a git read loads: `PATH`,
-/// `HOME` and `XDG_CONFIG_HOME` (where the global config is), and git's own
-/// `GIT_*` — but for `GIT_PAGER` (a pager is exempt: Claude Code's Bash tool
-/// gives git no terminal) and `GIT_EDITOR` (a read opens no editor).
 fn git_relevant(key: &str) -> bool {
     matches!(key, "PATH" | "HOME" | "XDG_CONFIG_HOME")
         || (key.starts_with("GIT_") && !matches!(key, "GIT_PAGER" | "GIT_EDITOR"))
 }
 
-/// The worker's git, ready to run.
 struct Probe<'a> {
     env: &'a WorkerEnv,
     program: PathBuf,
 }
 
 impl Probe<'_> {
-    /// `git --no-pager` in `dir`, with the worker's environment and nothing
-    /// of this process's ([`withheld_from_probe`] aside), stdin closed.
     fn git(&self, dir: &Path) -> Command {
         let mut cmd = aterm_uds::spawnfd::command(&self.program);
         cmd.arg("--no-pager")
@@ -539,8 +514,6 @@ impl Probe<'_> {
         cmd
     }
 
-    /// [`WorkerEnv::raw_git_view`] of `dir`, `depth` submodules down, `count`
-    /// populated submodules read so far.
     fn view_at(&self, dir: &Path, depth: usize, count: &mut usize) -> Result<GitView, String> {
         let dir = dir
             .ancestors()
@@ -616,8 +589,6 @@ impl Probe<'_> {
         Ok(view)
     }
 
-    /// The paths of the submodules (gitlinks, mode 160000) in the index of
-    /// the worktree at `top`.
     fn gitlinks(&self, top: &Path) -> Result<Vec<String>, String> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z", "--stage"]);
@@ -640,9 +611,6 @@ impl Probe<'_> {
             .collect())
     }
 
-    /// The filter drivers the attributes select for any tracked path of the
-    /// worktree at `top` (`git ls-files -z | git check-attr --stdin -z
-    /// filter`); `None` when they could not be read.
     fn filters_selected(&self, top: &Path) -> Option<Vec<String>> {
         let mut cmd = self.git(top);
         cmd.args(["ls-files", "-z"]);
@@ -681,22 +649,18 @@ impl Probe<'_> {
     }
 }
 
-/// Whether `view`'s configuration names an fsmonitor program (a boolean is
-/// git's own daemon).
 fn fsmonitor_program(view: &GitView) -> bool {
     view.config
         .iter()
         .any(|(_, k, v)| k == "core.fsmonitor" && !is_bool(v.as_deref()))
 }
 
-/// The driver of a `filter.<driver>.clean|smudge|process` key.
 fn filter_driver(key: &str) -> Option<&str> {
     let rest = key.strip_prefix("filter.")?;
     let (driver, var) = rest.rsplit_once('.')?;
     matches!(var, "clean" | "smudge" | "process").then_some(driver)
 }
 
-/// `scope NUL key LF value NUL` records (`key NUL` for a bare key).
 fn parse_config_list(out: &[u8]) -> Vec<(String, String, Option<String>)> {
     let text = String::from_utf8_lossy(out);
     let mut fields = text.split('\0');
@@ -726,8 +690,6 @@ fn is_executable(p: &Path) -> bool {
     p.is_file()
 }
 
-/// Whether git reads a config value as a boolean (`core.fsmonitor = true` is
-/// git's own daemon, not a program).
 fn is_bool(v: Option<&str>) -> bool {
     match v {
         None => true,
@@ -738,12 +700,10 @@ fn is_bool(v: Option<&str>) -> bool {
     }
 }
 
-/// What a partial clone's key is said to run ([`hazard`]).
 const PARTIAL_CLONE: &str = "a partial clone: a read may fetch a missing object from its \
                              promisor remote, and credential helpers, ssh and the remote's \
                              programs run there";
 
-/// Whether git reads `v` as boolean false.
 fn is_false(v: Option<&str>) -> bool {
     v.is_some_and(|v| {
         matches!(
@@ -753,7 +713,6 @@ fn is_false(v: Option<&str>) -> bool {
     })
 }
 
-/// Whether git reads `v` as boolean true — and a bare key (`None`) is true.
 fn is_true(v: Option<&str>) -> bool {
     v.is_none_or(|v| matches!(v.to_ascii_lowercase().as_str(), "true" | "yes" | "on" | "1"))
 }
@@ -781,7 +740,6 @@ enum Consulted<'a> {
     ShowSignature,
 }
 
-/// [`Consulted`] for `key`, or `None` for a key [`hazard`] never reads.
 fn consult(key: &str) -> Option<Consulted<'_>> {
     Some(match key {
         "core.fsmonitor" => Consulted::Fsmonitor,
@@ -809,9 +767,6 @@ pub const PROJECTION: u32 = 1;
 /// The one value a projected entry keeps in place of anything but a boolean ([`GitView::project`]).
 pub const VALUE_SET: &str = "<set>";
 
-/// A configuration value as [`hazard`] can tell it apart, and no finer: a
-/// bare key (`None`), git's true (`true`), git's false (`false`, the empty
-/// value among them) or anything else ([`VALUE_SET`]).
 fn value_class(v: Option<&str>) -> Option<String> {
     let v = v?;
     Some(

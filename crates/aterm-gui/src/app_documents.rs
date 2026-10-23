@@ -31,7 +31,7 @@ pub(crate) enum ConfigEditorRevealDecision {
         requested: String,
         range: std::ops::Range<usize>,
     },
-    /// The key is not in the file: add it (or, where no value is known, say how), never a Search that cannot match.
+    /// The key is not in the file.
     AddAbsent { requested: String },
 }
 
@@ -70,12 +70,6 @@ enum AbsentKeyAdded {
     Table,
 }
 
-/// The edit that adds `key`, absent from `source`, where TOML reads it — a
-/// top-level key among the root keys, a dotted key in its table, a member of
-/// a list of records in a new `[[record]]` — at the value that resolves as
-/// the key's absence does ([`crate::prefs::unset_literal`] for a Settings
-/// row, the schema's documented default otherwise), checked to change
-/// nothing; else with no value, the caret where it goes.
 fn absent_key_edit(
     source: &str,
     key: &str,
@@ -105,11 +99,6 @@ fn absent_key_edit(
     Some((edit, AbsentKeyAdded::NeedsValue { record: None }))
 }
 
-/// The value `key` resolves to when it is absent from `source`, as an item to
-/// write: a Settings row's [`crate::prefs::unset_literal`] (read with the
-/// document as it stands, so a default that follows another setting is that
-/// setting's), else the schema's documented default for a key only aterm.toml
-/// holds.
 fn absent_key_default_item(source: &str, key: &str) -> Option<aterm_toml::edit::Item> {
     let config = crate::app_config::Config::parse(source).unwrap_or_default();
     let fields = crate::prefs::editable_fields(&config);
@@ -122,9 +111,6 @@ fn absent_key_default_item(source: &str, key: &str) -> Option<aterm_toml::edit::
     Some(aterm_toml::edit::Item::Value(value))
 }
 
-/// Whether `added` (`source` with a key added at its default) means what
-/// `source` meant, as far as aterm can tell: it loads, and Manual finds
-/// nothing in it that it did not find in `source`.
 fn adding_changes_nothing(source: &str, added: &str) -> bool {
     if crate::app_config::Config::parse(added).is_err() {
         return false;
@@ -144,9 +130,6 @@ fn adding_changes_nothing(source: &str, added: &str) -> bool {
     after.is_empty()
 }
 
-/// A table or map key (`keybindings`, `harness`) absent from `source`: its
-/// empty `[key]` table at the end of the file, the caret on the line under
-/// it, where its entries go.
 fn absent_table_edit(
     source: &str,
     key: &str,
@@ -178,9 +161,6 @@ fn absent_table_edit(
     Some((edit, AbsentKeyAdded::Table))
 }
 
-/// A member of a list of records (`sparkle_words.custom`)
-/// absent from `source`: a new `[[root]]` record at the end of the file with
-/// the member's line and no value, the caret where it goes.
 fn absent_record_member_edit(
     source: &str,
     root: &'static str,
@@ -219,8 +199,6 @@ fn absent_record_member_edit(
     Some((edit, AbsentKeyAdded::NeedsValue { record: Some(root) }))
 }
 
-/// The smallest edit that turns `source` into `added`, the caret after it,
-/// or at byte `caret` of `added` when given.
 fn smallest_edit(
     source: &str,
     added: &str,
@@ -344,9 +322,6 @@ impl NativeDocumentJob {
     }
 }
 
-/// Jobs can retain a complete 32 MiB document image. The channel holds at most
-/// four waiting jobs and the single disk worker owns at most one executing job:
-/// five retained full images total.
 const NATIVE_DOCUMENT_QUEUE_CAPACITY: usize = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -385,7 +360,7 @@ impl JournalRetrySet {
     }
 }
 
-/// An append the headless test seam held back from inline execution ([`DocumentHostRuntime::held_journal_appends`]).
+/// An append the headless test seam held back from inline execution.
 #[cfg(all(test, unix))]
 #[derive(Debug)]
 pub(crate) struct HeldJournalAppend {
@@ -395,7 +370,7 @@ pub(crate) struct HeldJournalAppend {
     pub(crate) plan: crate::native_document_io::JournalAppendPlan,
 }
 
-/// A re-seat the headless test seam held back from inline execution ([`DocumentHostRuntime::held_journal_reseats`]).
+/// A re-seat the headless test seam held back from inline execution.
 #[cfg(all(test, unix))]
 #[derive(Debug)]
 pub(crate) struct HeldJournalReseat {
@@ -404,8 +379,6 @@ pub(crate) struct HeldJournalReseat {
     plan: JournalReseatPlan,
 }
 
-/// The status a save shows when its completion could not be recorded: the
-/// write may or may not have landed, so the person saves again.
 const SAVE_UNCONFIRMED: &str = "Save could not be confirmed; choose Save again";
 
 /// The status a successor gives a document whose unsaved draft it restored during an update.
@@ -415,9 +388,9 @@ pub(crate) const CARRIED_DRAFT_NOTICE: &str =
 /// Whether one document's unsaved draft rides an update to the successor ([`App::draft_carry`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DraftCarry {
-    /// Durable in its journal and verified on disk: the successor's restore replays exactly this text.
+    /// Durable in its journal and verified on disk.
     Carried { bytes: usize },
-    /// Its journal is writing the latest edit (or re-establishing itself): asking again shortly will tell, and nobody needs to act.
+    /// Its journal is writing the latest edit (or re-establishing itself).
     Writing,
     /// It cannot ride this update; the words say why.
     Refused(String),
@@ -430,9 +403,6 @@ enum JournalAdmissionEffect {
     Reseat(JournalRewriteGeneration),
 }
 
-/// Admit an already-planned journal effect without blocking the UI. `Full` is
-/// an ordinary scheduling outcome: roll the reducer back to replannable state
-/// and retain only its document ID.
 fn try_enqueue_document_journal_job<T>(
     sender: &std::sync::mpsc::SyncSender<T>,
     job: T,
@@ -485,9 +455,6 @@ impl std::fmt::Display for DocumentQueueAdmissionError {
     }
 }
 
-/// Shared admission primitive. Its non-blocking `Full` verdict is Tier-1-bound
-/// to `native_document_queue_model` below; production uses the same generic
-/// function with `NativeDocumentJob`.
 fn try_enqueue_document_job<T>(
     sender: &std::sync::mpsc::SyncSender<T>,
     job: T,
@@ -640,7 +607,6 @@ fn prepare_config_save_observation(
     }))
 }
 
-/// The draft-journal store, or why there is none, settled at its first look.
 struct JournalSlot {
     settled: std::cell::OnceCell<Result<DocumentJournalStore, String>>,
     opening: std::cell::Cell<Option<std::thread::JoinHandle<Result<DocumentJournalStore, String>>>>,
@@ -649,11 +615,9 @@ struct JournalSlot {
     deferred: std::cell::Cell<Option<JournalOpener>>,
 }
 
-/// How a [`JournalSlot`] opens its store: `DocumentJournalStore::system_default`.
 type JournalOpener = fn() -> Result<DocumentJournalStore, String>;
 
 impl JournalSlot {
-    /// A slot already settled to `store`.
     fn open(store: Result<DocumentJournalStore, String>) -> Self {
         Self {
             settled: std::cell::OnceCell::from(store),
@@ -662,8 +626,6 @@ impl JournalSlot {
         }
     }
 
-    /// A slot `open` settles inline at its first look: [`Self::opening`]
-    /// without the worker.
     fn deferred(open: JournalOpener) -> Self {
         Self {
             settled: std::cell::OnceCell::new(),
@@ -672,8 +634,6 @@ impl JournalSlot {
         }
     }
 
-    /// A slot `open` settles on an `aterm-journal-open` worker, or inline when no
-    /// thread can start.
     fn opening<F>(open: F) -> Self
     where
         F: FnOnce() -> Result<DocumentJournalStore, String> + Send + 'static,
@@ -720,7 +680,6 @@ impl JournalSlot {
         self.available_mut().ok()
     }
 
-    /// The store, or the reason there is none.
     fn available_mut(&mut self) -> Result<&mut DocumentJournalStore, String> {
         let _ = self.settle();
         match self.settled.get_mut() {
@@ -750,7 +709,7 @@ pub(crate) enum DiskConflictCause {
     Version,
     /// A save could not be confirmed: the disk may or may not hold it.
     SaveUnconfirmed,
-    /// aterm.toml's file binding (its target or logical path) changed; the document must be reopened, whatever the buffer holds.
+    /// aterm.toml's file binding (its target or logical path) changed.
     Binding,
 }
 
@@ -804,7 +763,7 @@ pub(crate) struct DocumentHostRuntime {
     pub(crate) edits: crate::app_edit::EditTickets,
     /// A document view closed, or a Suspended document's save or journal write landed, since the last [`App::release_unheld_documents`].
     pub(crate) release_due: bool,
-    /// When the last recently-closed record that alone kept a document expires (`App::lat_epoch` milliseconds).
+    /// When the last recently-closed record that alone kept a document expires.
     pub(crate) release_deadline_ms: Option<u64>,
 }
 
@@ -867,7 +826,7 @@ impl DocumentHostRuntime {
 pub(crate) struct DocumentAdmissionKey {
     pub(crate) uri: String,
     pub(crate) kind: AppKind,
-    /// The `edit` ticket this admission opens a fresh view for ([`crate::app_edit`]); `None` for every gesture.
+    /// The `edit` ticket this admission opens a fresh view for ([`crate::app_edit`]).
     pub(crate) edit: Option<crate::app_edit::EditTicketId>,
 }
 
@@ -882,9 +841,6 @@ struct PendingDocumentAdmission {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DocumentAdmissionTicket(u64);
 
-/// An `aterm-document-admit` worker silent this long counts as abandoned for
-/// coalescing only: a new request for the file starts a fresh read rather than
-/// join a wait that may never end (an unreachable volume, a stalled download).
 const DOCUMENT_ADMISSION_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(600);
 
 /// What the worker hands back through `Wake::DocumentAdmitted`.
@@ -941,7 +897,7 @@ pub(crate) enum DocumentAdmission {
     InFlight(DocumentAdmissionTicket),
     /// The same request was already in flight; this one rides on it.
     Coalesced(DocumentAdmissionTicket),
-    /// No event-loop proxy exists to report back to (the headless test harness), so the admission ran inline and the tab is already open.
+    /// No event-loop proxy exists to report back to (the headless test harness).
     Opened(String),
 }
 
@@ -962,7 +918,7 @@ impl DocumentAdmission {
 pub(crate) enum DocumentAdmissionRejected {
     /// Nothing to tell the user.
     Dropped(String),
-    /// The read or the grant refused — an evicted iCloud Drive file, a missing or oversize file, a non-UTF-8 one.
+    /// The read or the grant refused.
     Failed(String),
 }
 
@@ -983,7 +939,7 @@ impl App {
         self.ensure_and_open_config_editor_at_in_window(wid, None)
     }
 
-    /// The App menu's "Open aterm.toml": the native editor on the one config file, in the frontmost window.
+    /// The App menu's "Open aterm.toml".
     pub(crate) fn open_config_editor_in_front(&mut self) -> Result<String, String> {
         let wid = self
             .frontmost_window
@@ -1667,12 +1623,6 @@ impl App {
         }
     }
 
-    /// A COMMIT THAT PUTS BACK THE BYTES ON DISK IS CLEAN: an Undo (or any
-    /// edit) whose text is exactly what aterm last saw in the file moves the
-    /// checkpoint to it, as an unchanged refresh does
-    /// ([`Self::install_stable_file_observation`]), so the title loses its
-    /// dot, Save goes quiet, the tab reads clean, a close needs no save and
-    /// the journal drops the draft instead of autosaving it.
     fn checkpoint_commit_back_on_disk(
         &mut self,
         snapshot: &crate::document_store::DocumentSnapshot,
@@ -1688,9 +1638,6 @@ impl App {
         self.mark_buffer_the_admitted_file(snapshot)
     }
 
-    /// [`Self::checkpoint_commit_back_on_disk`] for `document`'s current text,
-    /// outside an edit: a buffer that is clean now says so to its views (the
-    /// tab's mark, Save) as an edit's publication would.
     fn checkpoint_current_back_on_disk(&mut self, document: DocumentId) -> Result<(), String> {
         let Some(snapshot) = self.document_store.snapshot(document) else {
             return Ok(());
@@ -1723,9 +1670,6 @@ impl App {
             || self.native_documents.pending_saves.contains_key(&document)
     }
 
-    /// Whether `snapshot`'s text is exactly the version of the file aterm
-    /// admitted (loaded, saved, or accepted from disk): a buffer that is
-    /// holds no local edits, conflict or not.
     fn buffer_is_admitted_baseline(
         &self,
         snapshot: &crate::document_store::DocumentSnapshot,
@@ -1746,8 +1690,6 @@ impl App {
                 .observed_text_matches(document, snapshot.text.as_ref())
     }
 
-    /// Move `snapshot`'s document checkpoint to it: its text is the admitted
-    /// file ([`Self::buffer_is_admitted_baseline`]), so it is clean.
     fn mark_buffer_the_admitted_file(
         &mut self,
         snapshot: &crate::document_store::DocumentSnapshot,
@@ -1772,12 +1714,6 @@ impl App {
         Ok(())
     }
 
-    /// A BUFFER BACK AT THE VERSION ATERM ADMITTED HAS NOTHING TO LOSE: when
-    /// an edit (an Undo, most often) returns a document whose file changed on
-    /// disk to the text aterm loaded or last saved, it has no local edits, so
-    /// the disk's current version is taken as a clean document's is — the
-    /// same fresh read Discard Changes and Reload from Disk makes — and the
-    /// conflict, its "copy any local edits" guidance and the dirty mark go.
     fn adopt_disk_when_buffer_is_base(&mut self, document: DocumentId) -> Result<(), String> {
         let Some(cause) = self.native_documents.disk_conflicts.get(&document).copied() else {
             return Ok(());
@@ -1997,9 +1933,6 @@ impl App {
         }
     }
 
-    /// An append or checkpoint that failed while a re-seat was owed most likely
-    /// failed because of it (a successor's image on disk): drive the re-seat now
-    /// rather than at the next keystroke.
     fn drive_owed_document_journal_reseat(&mut self, document: DocumentId) {
         if self
             .native_documents
@@ -2143,7 +2076,7 @@ impl App {
         }
     }
 
-    /// Whether this process's update successor reopens its document tabs (and its Settings tabs, from the same layout, with their field drafts).
+    /// Whether this process's update successor reopens its document tabs.
     pub(crate) const fn successor_restores_document_tabs(&self) -> bool {
         #[cfg(all(test, unix))]
         if self.native_documents.carry_as_windowed_for_test {
@@ -2158,7 +2091,7 @@ impl App {
         self.native_documents.carry_as_windowed_for_test = true;
     }
 
-    /// Whether any draft-journal write is on the worker now (an update may not start or commit over one — `DocumentJournalStore::writes_in_flight`).
+    /// Whether any draft-journal write is on the worker now.
     pub(crate) fn document_journal_writes_in_flight(&self) -> bool {
         self.native_documents
             .journals
@@ -2209,7 +2142,7 @@ impl App {
         }
     }
 
-    /// Drive every journal owing work nothing is doing (a re-seat, or a head a failed append left behind) before an update asks whether each unsaved draft can be carried, so the update itself retries a transient failure.
+    /// Drive every journal owing work nothing is doing (a re-seat, or a head a failed append left behind) before an update asks whether each unsaved draft can be carried.
     pub(crate) fn drive_owed_document_journals(&mut self) {
         let Some(journals) = self.native_documents.journals.as_ref() else {
             return;
@@ -2290,7 +2223,7 @@ impl App {
             .is_some_and(|journals| journals.reseat_owed(document))
     }
 
-    /// Hold every journal append from now on instead of running it inline ([`DocumentHostRuntime::held_journal_appends`]).
+    /// Hold every journal append from now on instead of running it inline.
     #[cfg(all(test, unix))]
     pub(crate) fn hold_journal_appends_for_test(&mut self) {
         self.native_documents.held_journal_appends = Some(Vec::new());
@@ -2326,7 +2259,7 @@ impl App {
         true
     }
 
-    /// Hold every journal re-seat from now on instead of running it inline ([`DocumentHostRuntime::held_journal_reseats`]).
+    /// Hold every journal re-seat from now on instead of running it inline.
     #[cfg(all(test, unix))]
     pub(crate) fn hold_journal_reseats_for_test(&mut self) {
         self.native_documents.held_journal_reseats = Some(Vec::new());
@@ -2652,9 +2585,6 @@ impl App {
         }
     }
 
-    /// `kill-buffer` of an open buffer named as `switch-to-buffer` names one:
-    /// its view closes as [`Self::close_editor_view`] closes it, and the
-    /// person stays where they were.
     fn kill_open_editor_buffer(&mut self, source_view: crate::tab_model::ViewId, query: &str) {
         let (_, _, _, target_view, title) =
             match self.resolve_open_editor_buffer(source_view, query) {
@@ -2693,8 +2623,6 @@ impl App {
         }
     }
 
-    /// Resolve an exact minibuffer name to an already-open Editor tab in the
-    /// source window.
     fn switch_to_open_editor_buffer(&mut self, source_view: crate::tab_model::ViewId, query: &str) {
         let (wid, index, instance, target_view, title) =
             match self.resolve_open_editor_buffer(source_view, query) {
@@ -2710,9 +2638,6 @@ impl App {
         self.request_native_redraw(wid);
     }
 
-    /// The one open Editor buffer in `source_view`'s window that `query`
-    /// names exactly, by title or file URI: its window, tab index, app
-    /// instance, view and title.
     fn resolve_open_editor_buffer(
         &self,
         source_view: crate::tab_model::ViewId,
@@ -2823,10 +2748,6 @@ impl App {
         self.reduce_document_observation(document, &observed.text, observed.observed)
     }
 
-    /// Read `document`'s file again through its grant. A document never saved
-    /// whose file does not exist yet (an `edit … create=1`) reads "still
-    /// missing" as no change rather than as a failure; once it has been saved,
-    /// a missing file fails as for any document.
     fn refresh_document_file(
         &self,
         document: DocumentId,
@@ -3089,8 +3010,6 @@ impl App {
         Ok(())
     }
 
-    /// "Save failed: " and why, in the save words
-    /// ([`crate::save_words`]), for a save of `document`'s file.
     fn document_save_words(
         &self,
         document: DocumentId,
@@ -3449,9 +3368,6 @@ impl App {
         }
 
         if outcome.is_err() {
-            // A conflict/failure invalidates every intent based on that unproven
-            // generation. A new stable observation must be explicitly accepted;
-            // no save may launch automatically from stale state.
             self.native_documents.pending_saves.remove(&document);
         }
         self.native_runtime.set_document_saving(document, false);
@@ -4035,8 +3951,6 @@ impl App {
         })
     }
 
-    /// Every native leaf, in every tab of every window, whose app instance
-    /// `keep` accepts.
     fn native_views_where(
         &self,
         keep: impl Fn(crate::tab_model::AppInstanceId) -> bool,
@@ -4073,8 +3987,6 @@ impl App {
         }
     }
 
-    /// [`Self::release_unheld_documents`] when a look is due at `now_ms`
-    /// ([`Self::release_documents_at_park`]).
     fn release_documents_due(&mut self, now_ms: u64) -> usize {
         let host = &self.native_documents;
         if host.release_due
@@ -4093,7 +4005,6 @@ impl App {
         if self.native_documents.pending_quit.is_some()
             || !self.native_documents.pending_window_closes.is_empty()
         {
-            // The plan names its documents: look again once it is settled.
             return 0;
         }
         let reopenable = self.closed_recovery.document_uris(now_ms);
@@ -4135,8 +4046,6 @@ impl App {
         released.len()
     }
 
-    /// Nothing but a recently-closed record could still hold `document`
-    /// ([`Self::release_unheld_documents`]).
     fn document_unheld(&self, document: DocumentId) -> bool {
         let host = &self.native_documents;
         self.document_store.phase(document) == Some(crate::document_store::DocumentPhase::Suspended)
@@ -4152,9 +4061,6 @@ impl App {
                 .is_none_or(|journals| journals.settled(document))
     }
 
-    /// Arm [`Self::release_unheld_documents`] for the next park when
-    /// `document` has no view left: a write that landed may have been all
-    /// that still held it.
     fn note_document_settling(&mut self, document: DocumentId) {
         if self.document_store.phase(document)
             == Some(crate::document_store::DocumentPhase::Suspended)
@@ -4258,7 +4164,6 @@ impl App {
         let Some(crate::native_app::AppViewState::Editor(state)) =
             self.native_runtime.view_state_mut(view)
         else {
-            // A Markdown view has no caret to move.
             return Ok(());
         };
         let buffer = state
@@ -4278,7 +4183,7 @@ impl App {
         Ok(())
     }
 
-    /// Two-phase open of one local document in the frontmost window (File ▸ Open Markdown / Open File).
+    /// Two-phase open of one local document in the frontmost window.
     pub(crate) fn request_document_tab(
         &mut self,
         kind: AppKind,
@@ -4290,7 +4195,7 @@ impl App {
         self.request_document_tab_in_window(wid, kind, uri)
     }
 
-    /// Two-phase open of one local document in one exact host window, the form every main-thread gesture uses (file drop, the Open… menu items).
+    /// Two-phase open of one local document in one exact host window, the form every main-thread gesture uses.
     pub(crate) fn request_document_tab_in_window(
         &mut self,
         wid: WindowId,
@@ -4340,7 +4245,7 @@ impl App {
         self.open_document_tab_in_window(wid, kind, uri)
     }
 
-    /// Open or focus a canonical local document in one exact host window, synchronously: the bounded read runs on the calling thread.
+    /// Open or focus a canonical local document in one exact host window, synchronously.
     pub(crate) fn open_document_tab_in_window(
         &mut self,
         wid: WindowId,
@@ -4376,8 +4281,6 @@ impl App {
         Ok(())
     }
 
-    /// The blocking half of an open, on the calling thread: resolve, read,
-    /// validate.
     fn admit_document_now(
         uri: &str,
         allow_config_symlinks: bool,
@@ -4391,9 +4294,6 @@ impl App {
         )
     }
 
-    /// [`Self::admit_document_now`] with every admission option: an `edit …
-    /// create=1` admits a file that does not exist yet as an empty text, and
-    /// its first save creates it (`AdmitOptions::allow_missing`).
     fn admit_document_with(
         uri: &str,
         options: crate::native_document_host::AdmitOptions,
@@ -4402,9 +4302,6 @@ impl App {
             .map_err(DocumentOpenFailure)
     }
 
-    /// The admission options of an open under `key`: an ordinary document's,
-    /// or, for an `edit` ticket that asked for `create=1`, one that admits a
-    /// missing file.
     fn admission_options(
         &self,
         key: &DocumentAdmissionKey,
@@ -4417,8 +4314,6 @@ impl App {
         }
     }
 
-    /// Phase one of the two-phase open. The caller has validated `wid` and the
-    /// key.
     fn begin_document_admission(
         &mut self,
         wid: WindowId,
@@ -4870,10 +4765,6 @@ impl App {
     }
 }
 
-/// Why aterm.toml could not be read to open it, in the save words for a
-/// refused open ([`crate::save_words`]: a folder that is not there does not
-/// exist, it did not go missing while saving); the reader's own account
-/// goes to the log.
 fn refused_config_read(
     path: &std::path::Path,
     error: &crate::native_document_host::DocumentHostError,
@@ -4886,8 +4777,6 @@ fn refused_config_read(
     )
 }
 
-/// Create a missing config file without truncating an existing one, and return
-/// the logical path the document-grant boundary uses.
 fn ensure_config_file(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
     if !path.is_absolute() {
         return Err(format!("config path must be absolute: {}", path.display()));
@@ -4948,9 +4837,6 @@ fn ensure_config_file(path: &std::path::Path) -> Result<std::path::PathBuf, Stri
     Ok(path.to_path_buf())
 }
 
-/// `event`'s inserted text with each CRLF as LF, for a buffer that holds a
-/// CRLF file's text with LF ([`App::dispatch_editor_event`]); `None` when it
-/// inserts no CRLF.
 fn crlf_held_insertion(event: &AppEvent) -> Option<AppEvent> {
     let as_lf = |text: &str| text.contains("\r\n").then(|| text.replace("\r\n", "\n"));
     match event {
@@ -4969,10 +4855,6 @@ fn crlf_held_insertion(event: &AppEvent) -> Option<AppEvent> {
     }
 }
 
-/// Whether the bytes a save of `text` writes for a file held with
-/// `encoding` (`encode_for_disk`) are `len` long, worked out without making
-/// them: the text, the byte order mark, and one carriage return more per line
-/// feed when every line break of the file was CRLF.
 fn encodes_to_len(text: &str, encoding: crate::native_document_io::DiskEncoding, len: u64) -> bool {
     let mark = if encoding.bom {
         crate::native_document_io::UTF8_BOM.len()
@@ -5026,13 +4908,8 @@ mod tests {
     use crate::native_editor::Minibuffer;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
 
-    /// Bound for "refused without blocking": opening a writerless FIFO or
-    /// contending a held lock must refuse rather than park the UI thread.
     const REFUSES_WITHOUT_BLOCKING: std::time::Duration = aterm_spec::wait::MUST_HAPPEN;
 
-    /// The length a save would write is told without making the bytes, and
-    /// agrees with the bytes `encode_for_disk` makes for every mapping, a
-    /// text one byte off either way included.
     #[test]
     fn encodes_to_len_agrees_with_encode_for_disk() {
         use crate::native_document_io::{DiskEncoding, LineEnding};
@@ -5056,9 +4933,6 @@ mod tests {
         }
     }
 
-    /// The running App's journal store opens on a worker: the slot is built
-    /// while its opener is still held, and the first look takes the store that
-    /// opener made, secret minted.
     #[test]
     fn the_journal_store_opens_on_a_worker_the_boot_does_not_wait_for() {
         let root = std::env::temp_dir().join(format!(
@@ -5091,8 +4965,6 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
-    /// A store that could not open is unavailable at every look, with the
-    /// opener's reason.
     #[test]
     fn a_journal_store_that_could_not_open_says_why() {
         let mut slot = JournalSlot::opening(|| Err("no private state directory".to_string()));
@@ -5104,10 +4976,6 @@ mod tests {
         );
     }
 
-    /// Tier-1 guard binding: the exact generic admission primitive used by the
-    /// shipping document worker agrees with the derived bounded-queue model at
-    /// every full/not-full decision, including the worker-owned fifth image and
-    /// the deferred retry transition.
     #[test]
     fn native_document_queue_admission_conforms_to_the_derived_model() {
         let model = aterm_models_gui::native_document_queue_model();
@@ -5227,7 +5095,6 @@ mod tests {
         let _ = fs::remove_dir_all(journal_root);
     }
 
-    /// A fresh, empty per-process scratch directory named `name`.
     fn fresh_dir(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -5235,9 +5102,6 @@ mod tests {
         dir
     }
 
-    /// A fresh `name` directory holding `aterm.toml` = `source`, opened in Manual (the
-    /// config editor) in window 0 through the shipping path:
-    /// `(dir, path, app, (instance, view))`.
     fn open_config(
         name: &str,
         source: &str,
@@ -5257,7 +5121,6 @@ mod tests {
         (dir, path, app, views)
     }
 
-    /// Type `text` into window `wid`'s focused native view.
     fn commit(app: &mut App, wid: WindowId, text: &str) {
         app.dispatch_native_event(
             wid,
@@ -5572,8 +5435,6 @@ mod tests {
     }
 
     fn file_uri(path: &std::path::Path) -> String {
-        // The shipping encoder: a hand-rolled `format!` is malformed on Windows
-        // (drive letter and backslashes after the authority).
         crate::native_document_host::path_to_file_uri(path).unwrap()
     }
 
@@ -5587,8 +5448,6 @@ mod tests {
         }
     }
 
-    /// The chord that opens the editor's incremental search on this platform:
-    /// `C-s`, except on Windows, where `C-s` is Save and isearch is `M-s`.
     fn isearch_key() -> InputEvent {
         let mods = if cfg!(windows) {
             Modifiers::ALT
@@ -5665,8 +5524,6 @@ mod tests {
         }
     }
 
-    /// Exactly what the `aterm-document-admit` worker produces, minus the thread
-    /// and the proxy: the outcome for one minted ticket.
     fn worker_outcome(
         ticket: DocumentAdmissionTicket,
         wid: WindowId,
@@ -5680,9 +5537,6 @@ mod tests {
         }
     }
 
-    /// The worker's payload, built the way the worker builds it and applied the
-    /// way the `Wake::DocumentAdmitted` arm applies it, installs the same tab
-    /// the synchronous opener would — and retires its pending entry.
     #[test]
     fn document_admission_outcome_round_trips_into_an_installed_tab() {
         let (dir, uri) = admission_fixture("round-trip", b"# dropped\n");
@@ -5713,8 +5567,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A second request for the same file while the first is still reading joins
-    /// it: one ticket, one worker, one completion, one document.
     #[test]
     fn duplicate_in_flight_admission_is_coalesced_onto_the_first() {
         let (dir, uri) = admission_fixture("coalesce", b"# once\n");
@@ -5762,9 +5614,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The requesting window closed while the worker was reading: the result is
-    /// dropped cleanly — nothing registered, nothing installed, the pending entry
-    /// retired so the file can be opened again afterwards.
     #[test]
     fn admission_completion_for_a_closed_window_is_dropped_cleanly() {
         let (dir, uri) = admission_fixture("closed-window", b"# orphan\n");
@@ -5795,10 +5644,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Coalescing is per window: the same file from a second window while the
-    /// first window's read is in flight is its own admission, so the second
-    /// window gets its tab even when the first closes before its worker returns
-    /// (that drop is `admission_completion_for_a_closed_window_is_dropped_cleanly`).
     #[test]
     fn same_file_from_another_window_is_its_own_admission_not_a_coalesce() {
         let (dir, uri) = admission_fixture("two-windows", b"# twice\n");
@@ -5828,9 +5673,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A ticket that no longer matches the pending entry (superseded by a fresh
-    /// request, or already consumed) is ignored; a failed read retires the entry
-    /// and reports the worker's error text.
     #[test]
     fn stale_and_failed_admissions_never_register_a_document() {
         let (dir, uri) = admission_fixture("stale", b"# stale\n");
@@ -5971,8 +5813,6 @@ mod tests {
         pending
     }
 
-    /// Replays the in-flight save and panics with the save's own error text, so
-    /// a failure names its stage and cause rather than a bare `unwrap` on `Err`.
     fn finish_inflight_save_for_test(
         app: &mut App,
         document: DocumentId,
@@ -6782,10 +6622,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// NumLock off, keypad 1 is KP_End. Through the real key path
-    /// (`App::on_key` -> `keymap::build_key_input` -> `App::input`) the editor
-    /// receives `NumpadEnd` (the identity DECKPAM and kitty need on the PTY
-    /// side) and the native reducer folds it onto End.
     #[test]
     fn numlock_off_keypad_end_moves_the_editor_caret_to_the_line_end() {
         let (dir, _, mut app, (_, view)) = open_config("aterm-config-editor-keypad-end", "win");
@@ -7325,10 +7161,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// Settings' "Open aterm.toml at" a key with no value that means unset
-    /// (the shell) adds its line with no value, the caret where the value
-    /// goes, and says to type one — never "at its default"; Save waits for
-    /// the value, and Undo takes the line back out.
     #[test]
     fn opening_a_key_with_no_default_awaits_its_value() {
         let dir = std::env::temp_dir().join(format!(
@@ -7396,8 +7228,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The edit that adds an absent key puts it where TOML reads it: a
-    /// top-level key ahead of the first table, a dotted key in its table.
     #[test]
     fn an_absent_key_is_added_where_toml_reads_it() {
         let source = "agents_auto_prime = false\n[update]\nenabled = false\n";
@@ -7458,11 +7288,6 @@ mod tests {
         assert!(absent_key_edit(source, "sparkle_words.custom").is_none());
     }
 
-    /// A NUMBER COMES IN AT ITS DEFAULT AS SETTINGS WRITES IT
-    /// (`prefs::written_number`): a whole default carries no `.0`, whether
-    /// the key has a Settings row (`window_padding`) or only Manual edits it
-    /// (`output_streak.idle_secs`, which came in as `10.0`), and a fraction
-    /// keeps its digits.
     #[test]
     fn an_absent_number_comes_in_at_its_default_as_settings_writes_it() {
         let source = "agents_auto_prime = false\n";
@@ -7482,13 +7307,6 @@ mod tests {
         }
     }
 
-    /// OPENING AN ABSENT KEY NEVER WRITES WORDS AS A VALUE. Over every key
-    /// the schema knows: an edit at the default loads, draws no finding the
-    /// file did not have, and writes the value that resolves as the key's
-    /// absence does (a Settings row's unset value, else the documented
-    /// default: disk.auto_free_gib is 10, disk.apply false, never the consent
-    /// to remove files); otherwise the key's line comes in with no value and
-    /// the caret where it goes.
     #[test]
     fn an_absent_key_is_added_at_its_default_or_awaits_a_value() {
         let source = "agents_auto_prime = false\n[update]\nenabled = false\n";
@@ -7961,9 +7779,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// AN UNDO BACK TO THE BYTES ON DISK IS CLEAN: the document's checkpoint
-    /// moves to it, so Save is quiet, the editor and the tab read clean, a
-    /// close is ready with no save, and the file is not written.
     #[test]
     fn an_undo_back_to_the_saved_text_leaves_the_document_clean() {
         let dir = std::env::temp_dir().join(format!("aterm-app-undo-clean-{}", std::process::id()));
@@ -8471,9 +8286,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The late-document fixture: `planned.md` dirty in window 0, the shutdown `arm`ed
-    /// on it, then — the app staying interactive while the barrier waits — a SECOND
-    /// document `late.md` opened and dirtied.
     fn late_document<R>(
         name: &str,
         arm: impl FnOnce(&mut App, DocumentId, crate::tab_model::ViewId) -> R,
@@ -8514,9 +8326,6 @@ mod tests {
         )
     }
 
-    /// A document opened in a window after its close barrier armed is absent
-    /// from the frozen plan; the ready path must re-plan, or the teardown strands
-    /// its dirty view in `view_store` with no tab or window.
     #[test]
     fn window_close_plan_frozen_before_a_later_document_cannot_orphan_its_dirty_view() {
         let wid = WindowId(0);
@@ -8546,8 +8355,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The same late document through a repeated close gesture (what a user does
-    /// when the window does not close).
     #[test]
     fn repeated_window_close_gesture_cannot_commit_a_stale_document_plan() {
         let wid = WindowId(0);
@@ -8572,14 +8379,11 @@ mod tests {
             assert_eq!(app.close_window_logical(wid), crate::CloseOutcome::Exit);
             assert!(!app.view_store.contains(late_view));
         } else {
-            // The honest alternative: the window stays, the late document reachable.
             assert!(app.view_store.contains(late_view));
         }
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The Quit twin of the window-close frozen-plan test: a document opened and
-    /// edited while the Quit's save runs withholds the exit until it is saved too.
     #[test]
     fn quit_plan_frozen_before_a_later_document_cannot_exit_over_its_edits() {
         let (dir, mut app, planned, (late_document, late_view), late, ()) =
@@ -8609,9 +8413,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The same late document, reached by repeating the Quit gesture while the
-    /// first save runs: the repeat re-plans and cannot answer ready over the late
-    /// document's edits.
     #[test]
     fn repeated_quit_gesture_cannot_exit_over_a_later_document() {
         let (dir, mut app, _, (late_document, late_view), _, ()) =
@@ -8926,10 +8727,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A close that has to wait on a save says so, and what comes next:
-    /// C-x C-c on a buffer whose save is still landing leaves the tab open,
-    /// for the person to close again once the save lands, and the same keys
-    /// then close it with the edit on disk.
     #[test]
     fn a_close_waiting_on_its_save_says_so() {
         let dir = fresh_dir("aterm-editor-close-waits");
@@ -9053,8 +8850,6 @@ mod tests {
         .unwrap();
     }
 
-    /// The document is clean, conflict-free and saying nothing about local
-    /// edits, its tab and its Save quiet, and holds `text`.
     fn assert_clean_at(
         app: &App,
         (instance, view): (crate::tab_model::AppInstanceId, crate::tab_model::ViewId),
@@ -9092,11 +8887,6 @@ mod tests {
         assert!(!save.enabled, "{context}: nothing to save");
     }
 
-    /// AN UNDO BACK TO THE BASE UNDER A DISK CONFLICT ADOPTS THE DISK TEXT:
-    /// once the buffer holds exactly the version aterm loaded, it has no local
-    /// edits, so the file's newer version comes in as it would for a clean
-    /// document and the "copy any local edits" guidance goes — in Manual and
-    /// in a plain Editor tab.
     #[test]
     fn an_undo_back_to_the_base_under_a_disk_conflict_adopts_the_disk_text() {
         let wid = WindowId(0);
@@ -9145,12 +8935,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// NEGATIVE CONTROLS for the undo-to-base adoption: an Undo that leaves a
-    /// local edit keeps the conflict, its guidance and the edit; a save in
-    /// flight owns what lands next, so an Undo to the base waits for it (and
-    /// the file's own return to the base then clears the conflict and finds
-    /// the buffer clean); and a changed file binding is settled only by a
-    /// reopen.
     #[test]
     fn undo_to_base_keeps_local_edits_saves_in_flight_and_binding_conflicts() {
         let wid = WindowId(0);
@@ -9648,11 +9432,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// a document whose last view closed stays in memory
-    /// while a reopen could bring it back — the reopen finds the very document,
-    /// its undo history with it — and leaves with every trace once nothing
-    /// can: the store's entry, its saver and grant, its journal entry and the
-    /// clean journal image no other process holds, its editor history.
     #[test]
     fn a_closed_document_leaves_memory_once_no_reopen_can_bring_it_back() {
         let dir = fresh_dir("aterm-app-release");
@@ -9739,9 +9518,6 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// A document kept only by a recently-closed record leaves at the first
-    /// park once that record has expired, with no other close or write to
-    /// prompt the look.
     #[test]
     fn a_closed_document_leaves_at_the_first_park_past_its_records_expiry() {
         let dir = fresh_dir("aterm-app-release-expiry");

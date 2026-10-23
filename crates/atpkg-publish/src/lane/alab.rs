@@ -1,22 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The Apple lane: keep the ALab programs' pins at each repo's newest signed source
-//! release, unattended, on a rostered Mac (launchd, every 6 h). A package row
-//! ([`Shape::Package`], codex-alab) is never read here: a person packs and pins it.
-//!
-//! Per run, over the verified channel head (a head or pin below what this lane last saw
-//! refuses the run): a pure [`decide`] per program row (plain → tracked, bundle → the bundle
-//! lane, which the agent cutting it runs on a release-credential machine; a vendor-direct
-//! program has no row, so the lane never reads it); the packs, aarch64 first and every
-//! other Apple target merged onto a copy; the row gate (a half-packed release is never
-//! pinned); the coherence hold ([`super::hold`]); and one index whose delta is the ready
-//! builds. For trust, the gap to main is reported ([`super::gap`]).
-//!
-//! What is built is what was signed: the lane builds beside the machine key, so it builds
-//! only the dev commit the publication engine's ledger maps to the public commit a
-//! release's `SHA256SUMS` names, that SUMS verified under the head's roster. A dev tag,
-//! which nothing signs, is never read.
+//! The Apple lane: keep the ALab programs' pins at each repo's newest signed source release.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -465,13 +450,9 @@ fn locked(
     std::fs::create_dir_all(&work)
         .map_err(|e| Error::io(format!("mkdir {}", work.display()), &e))?;
 
-    // --- the channel head the fleet sees, verified ---
     let slug = ctx.index_slug();
     let (n, head) = match quad::fetch_head(ctx, &slug, &work.join("head")) {
         Ok(h) => h,
-        // A dry run is a person asking what the lane would do: a channel it cannot read
-        // answers that question with COULD NOT RUN (exit 3), never `nothing to decide`.
-        // The unattended run keeps exit 0 and its failure counter.
         Err(Error::CannotRun(why)) if opts.dry_run => {
             return Err(Error::cannot_run(format!(
                 "could not read an atpkg-index-N release on {slug} ({why}) — the dry run \
@@ -518,10 +499,7 @@ fn locked(
     state.check_pins(TARGETS, &pins, n, tx)?;
     let groups = super::hold::groups_of(&head.index, pins.keys().map(String::as_str))?;
     if !opts.dry_run {
-        // Every pack and the index are signed by this key: one the head's roster does not
-        // list as live signs documents no client accepts.
         crate::identity::signer_for(ctx, &head.roster)?;
-        // The packs below sign under the generation this head elects: read once, here.
         crate::artifact::sign::elect_from_head(ctx, &head);
     }
     let horizon = horizon_note(ctx, &head)?;
@@ -530,7 +508,6 @@ fn locked(
         notice(ctx, opts, deps, state, h);
     }
 
-    // --- per program: the newest signed release against the pin ---
     let mut clones = Clones::new(ctx, state, opts.dry_run);
     let gaps: Vec<MainGap> = programs::PROGRAMS
         .iter()
@@ -549,8 +526,6 @@ fn locked(
         .collect();
     let mut rows = Vec::new();
     let mut required_of: BTreeMap<&str, BTreeSet<Triple>> = BTreeMap::new();
-    // A package row (codex-alab) is a person's to pack and pin: the lane never reads it, and
-    // the index carries its head pin and block as they stand.
     for def in programs::PROGRAMS.iter().filter(|d| d.lane_tracked()) {
         let facts = gather(ctx, opts, state, &head, &pins, &work, &mut clones, def, tx);
         if let Staging::Known { required, .. } = &facts.staging {
@@ -655,7 +630,6 @@ fn locked(
         return Ok(outcome);
     }
 
-    // --- pack each candidate at its tag, per target, uploaded to the staging owner ---
     for r in &candidates {
         let required = required_of.get(r.program.name).cloned().unwrap_or_default();
         match pack(ctx, deps, state, &mut clones, r, &required, tx) {
@@ -671,7 +645,6 @@ fn locked(
         }
     }
 
-    // --- the hold partition: what this index may pin ---
     let holds = holds_of(&groups, &not_ready);
     let (pin_now, held) = partition(pending.iter().copied(), &groups, &holds);
     for p in &held {
@@ -732,7 +705,6 @@ fn locked(
         return Ok(outcome);
     }
 
-    // --- publish index N+1 over the verified head ---
     let mut delta = Delta::default();
     let mut moved = pins.clone();
     for p in &pin_now {
@@ -819,10 +791,6 @@ fn locked(
     Ok(outcome)
 }
 
-/// A signing run needs the machine key, its record and both token files (the lanes never
-/// read or write anonymously), and a packer that can pack ([`Packer::can_pack`]: the zstd CLI
-/// every pack is compressed by), so a missing tool refuses the run before any build
-/// rather than failing every pack until each program latches.
 fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
     if !ctx.identity.key.is_file() {
         return Err(Error::cannot_run(format!(
@@ -871,8 +839,6 @@ fn horizon_note(ctx: &Ctx, head: &VerifiedQuad) -> Result<Option<String>> {
     }))
 }
 
-/// The scratch clones of the program repos under `<state>/alab/progs/`, each fetched at
-/// most once a run (a dry run reads what is there and fetches nothing).
 struct Clones<'a> {
     ctx: &'a Ctx,
     dir: PathBuf,
@@ -995,8 +961,6 @@ fn gather(
     facts
 }
 
-/// The newest signed release of `def`'s repo on the public owner, verified and bound to a
-/// dev commit in the scratch clone.
 fn signed_release(
     ctx: &Ctx,
     opts: &Options,
@@ -1035,8 +999,7 @@ fn signed_release(
     })
 }
 
-/// The numerically newest `vX.Y.Z` among published (non-draft, non-prerelease) releases
-/// carrying `SHA256SUMS.sig`.
+/// The numerically newest `vX.Y.Z` among published releases carrying `SHA256SUMS.sig`.
 #[must_use]
 pub fn newest_signed_tag(releases: &[Release]) -> Option<String> {
     releases
@@ -1058,15 +1021,9 @@ fn semver(tag: &str) -> Option<(u64, u64, u64)> {
     parts.next().is_none().then_some(v)
 }
 
-/// The most a release's `SHA256SUMS` (or its `.sig`) may be: it lists every file the
-/// release ships, so it outgrows a manifest (trust v0.8.0's is 8.7 MB); the cap only keeps
-/// an attacker-served asset from filling the disk.
+/// Maximum size in bytes of a release's `SHA256SUMS` or `SHA256SUMS.sig`.
 pub const SUMS_CAP: u64 = 64 << 20;
 
-/// The public commit the release's signed `SHA256SUMS` names. The pair is read as a client
-/// reads it (the anonymous download host) and verified under the channel's roster and the
-/// compiled paper master; its header must name this repo and tag, so a SUMS re-served from
-/// another tag or repo is refused.
 fn signed_commit(
     ctx: &Ctx,
     head: &VerifiedQuad,
@@ -1122,7 +1079,6 @@ fn signed_commit(
         .ok_or_else(|| "the signed SHA256SUMS names no commit".to_string())
 }
 
-/// The dev commit the engine ledger maps to `public_commit`, present in `clone`.
 fn resolve_dev(
     ctx: &Ctx,
     ledger: &Path,
@@ -1156,7 +1112,6 @@ fn resolve_dev(
                 ctx.shown(ledger)
             )
         })?;
-    // The key reaches git as a revision: only a full sha, never a ref or an option.
     if src.len() != 40 || !src.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(format!(
             "{} maps the signed commit {short} to `{src}`, which is not a 40-hex dev commit",
@@ -1178,7 +1133,6 @@ fn resolve_dev(
     })
 }
 
-/// What staging holds for `def` `build`, and what that build must carry.
 fn staging_of(
     ctx: &Ctx,
     head: &VerifiedQuad,
@@ -1272,8 +1226,6 @@ fn say_table(
     }
 }
 
-/// Pack one candidate for every Apple target it ships, then hold the result to the row
-/// gate. `Err` is the failure's headline, counted toward the latch by the caller.
 fn pack(
     ctx: &Ctx,
     deps: &Deps<'_>,
@@ -1342,8 +1294,6 @@ fn pack(
                 outcome.build
             ));
         }
-        // The next leg's base is a copy beside the stage: a pack owns (and may clear) its
-        // own output, and a merge base inside it could vanish under the next leg.
         let copy = out.join(format!("merge-base-{name}-{build}.toml"));
         std::fs::copy(&outcome.manifest, &copy)
             .map_err(|e| format!("copy {}: {e}", outcome.manifest.display()))?;
@@ -1374,7 +1324,6 @@ fn pack(
     Ok(())
 }
 
-/// aarch64 first (the fresh manifest), every other target merged onto it.
 fn pack_order(triples: &[Triple]) -> Vec<Triple> {
     let mut v: Vec<Triple> = triples.to_vec();
     v.sort_by_key(|t| *t != AARCH64_APPLE_DARWIN);
@@ -1431,8 +1380,6 @@ fn fail_pack(
     );
 }
 
-/// The groups held this run: a pinned member of a group not ready holds it (a member
-/// this lane does not track is never advanced, and never holds).
 fn holds_of(groups: &BTreeMap<String, Option<String>>, not_ready: &BTreeSet<&str>) -> Holds {
     super::hold::of_members(groups.iter().filter_map(|(p, g)| {
         Some((
@@ -1490,11 +1437,7 @@ fn notify_gaps(ctx: &Ctx, opts: &Options, deps: &Deps<'_>, state: &LaneState, ga
     }
 }
 
-/// The bundle lane's pack of a bundle, as the agent cutting it runs it on a release-credential
-/// machine (m2, m3; Trust DECISION_QUEUE D27, amended 2026-10-16: agents perform it): the
-/// `rustc` group's bundle is the group publish from one seal; any other bundle one
-/// `pack-bundle` leg per required target, aarch64 first and every other leg merged onto a
-/// copy of it, so the release it leaves is never half-packed.
+/// The bundle lane's pack commands for a sysroot bundle.
 #[must_use]
 pub fn bundle_command(row: &Row) -> Vec<String> {
     let def = row.program;

@@ -137,7 +137,6 @@ impl Line {
                 result.extend_from_slice(&run.length.to_le_bytes());
             }
         } else {
-            // has_attrs = false
             result.push(0);
         }
 
@@ -160,7 +159,6 @@ impl Line {
                 }
             }
         } else {
-            // 0 hyperlinks
             result.extend_from_slice(&0u16.to_le_bytes());
         }
 
@@ -185,7 +183,6 @@ impl Line {
 
         let version = data[0];
         if version == 0 {
-            // Legacy format (version 0 or old format without version byte)
             return Self::deserialize_legacy(data);
         }
 
@@ -288,7 +285,6 @@ impl Line {
         data.len() >= runs_start
     }
 
-    /// Deserialize RLE attributes starting at `content_end` in `data`.
     fn deserialize_attrs(
         data: &[u8],
         content_end: usize,
@@ -297,8 +293,6 @@ impl Line {
             return None;
         }
         if data[content_end] == 0 {
-            // saturating_add cannot wrap here (guard above); it discharges an obligation
-            // the verifier cannot chain.
             return Some((None, content_end.saturating_add(1)));
         }
 
@@ -414,7 +408,6 @@ impl Line {
         }
         let count = u16::from_le_bytes([count_bytes[0], count_bytes[1]]) as usize;
         if count == 0 {
-            // No links; a v4 section starts right after the count.
             return (None, header_end);
         }
 
@@ -539,7 +532,6 @@ impl Line {
         if pushed == 0 { None } else { Some(spans) }
     }
 
-    /// Deserialize legacy format (without version byte or attrs).
     fn deserialize_legacy(data: &[u8]) -> Option<Self> {
         if data.len() < 5 {
             return None;

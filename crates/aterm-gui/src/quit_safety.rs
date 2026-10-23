@@ -82,7 +82,6 @@ pub(crate) fn confirm_prompt_windows(
     reopens: bool,
 ) -> Option<ConfirmPrompt> {
     if !busy && tabs_closing <= 1 {
-        // a single idle tab: instant, per the WT convention
         return None;
     }
     confirm_prompt(exits_app, busy, reopens).or(Some(ConfirmPrompt {
@@ -182,13 +181,9 @@ pub(crate) struct ProcessFacts {
     pub(crate) image: String,
 }
 
-/// How soon after a shell a same-image child must be created to be the shell that
-/// shell launched rather than a job.
 const LAUNCHER_WINDOW_MS: u64 = 2_000;
 
 impl ProcessFacts {
-    /// Whether this process is the real shell `launcher` started for itself:
-    /// the same image name, created inside [`LAUNCHER_WINDOW_MS`] of it.
     fn is_the_shell_launched_by(&self, launcher: &Self) -> bool {
         !self.image.is_empty()
             && self.image == launcher.image
@@ -205,7 +200,6 @@ impl ChildLinks {
         Self(links)
     }
 
-    /// The child pids this capture lists under `parent`.
     fn children_of(&self, parent: u32) -> impl Iterator<Item = u32> + '_ {
         let start = self.0.partition_point(|&(p, _)| p < parent);
         self.0[start..]
@@ -297,7 +291,6 @@ impl JobProbe {
             return fg != shell_pid;
         }
         if !cfg!(windows) || shell_pid <= 0 {
-            // Matches `foreground_is_job`'s non-windows / unknown-pid arm.
             return false;
         }
         self.child_verdict(session, key, now, capture, |links| {
@@ -305,9 +298,6 @@ impl JobProbe {
         })
     }
 
-    /// The rate-limited child-walk oracle, free of any platform call so the
-    /// scheduling laws are unit-testable everywhere: `capture` takes the
-    /// system table, `verdict` reads one shell's answer from it.
     fn child_verdict(
         &mut self,
         session: u64,
@@ -340,8 +330,6 @@ impl JobProbe {
     }
 }
 
-/// One system process-table capture. Non-windows never reaches this (the child
-/// walk is the windows-only arm) and answers with an empty table.
 fn capture_child_links() -> ChildLinks {
     #[cfg(windows)]
     {
@@ -353,15 +341,10 @@ fn capture_child_links() -> ChildLinks {
     }
 }
 
-/// The probe's verdict for one shell, read from a capture: the same vetted
-/// walk the close path runs ([`ChildLinks::has_job`]), with the system's own
-/// process facts.
 fn links_have_job(links: &ChildLinks, shell_pid: u32) -> bool {
     links.has_job(shell_pid, None, process_facts)
 }
 
-/// One process's facts, read through a handle. Non-windows never reaches this
-/// (the child walk is the windows-only arm) and reads nothing.
 fn process_facts(pid: u32) -> Option<ProcessFacts> {
     #[cfg(windows)]
     {
@@ -403,8 +386,6 @@ pub(crate) struct SessionRoot {
     pub(crate) children: Vec<i32>,
 }
 
-/// The shells a session root may be and still be "at its prompt" when it has
-/// no child and holds the foreground itself.
 const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "fish", "dash", "ash", "ksh", "mksh", "oksh", "loksh", "pdksh", "yash",
     "tcsh", "csh", "nu", "xonsh", "elvish", "ion", "pwsh", "rc", "es",
@@ -607,13 +588,9 @@ mod windows_jobs {
         ) -> i32;
     }
 
-    /// `TH32CS_SNAPPROCESS` — snapshot every process in the system.
     const TH32CS_SNAPPROCESS: u32 = 0x2;
     const INVALID_HANDLE_VALUE: isize = -1;
-    /// The one right [`process_facts`] asks for: creation time and image name,
-    /// and nothing that could read or change the process.
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
-    /// FILETIME ticks (100 ns) from 1601-01-01 to the unix epoch.
     const FILETIME_UNIX_EPOCH_TICKS: u64 = 116_444_736_000_000_000;
 
     /// `PROCESSENTRY32W`, transcribed from the SDK.
@@ -641,9 +618,6 @@ mod windows_jobs {
         dwHighDateTime: u32,
     }
 
-    /// The console host the OS attaches to a console process: plumbing, never a user
-    /// job, so the child walk ignores it (a shell that allocated a classic console
-    /// must not read as busy forever).
     const CONHOST: &str = "conhost.exe";
 
     /// Every live parent -> child link, in one Toolhelp32 pass (~2.2 ms in the kernel plus ~1.6 ms of walk), so one capture answers every shell.
@@ -740,7 +714,6 @@ mod windows_jobs {
             .collect()
     }
 
-    /// Case-insensitive (ASCII) match of a NUL-terminated UTF-16 exe name.
     fn exe_name_is(exe: &[u16; 260], name: &str) -> bool {
         let len = exe.iter().position(|&u| u == 0).unwrap_or(exe.len());
         char::decode_utf16(exe[..len].iter().copied())
@@ -848,15 +821,11 @@ mod tests {
         }
     }
 
-    /// The shell's word that a command is running, and nothing else.
     const EXECUTING: ShellWord = ShellWord {
         executing: true,
         idle_since_ms: None,
     };
 
-    /// A running block is busy on its own: the `Start-Sleep 60` shape, executing with
-    /// no child process and no foreground pgrp (every ConPTY on windows, a
-    /// `tcgetpgrp` error on unix), arms the guard where `foreground_is_job` reads idle.
     #[test]
     fn a_running_block_is_busy_without_a_foreground_child() {
         assert!(
@@ -870,8 +839,6 @@ mod tests {
         assert!(foreground_busy(-1, 0, EXECUTING));
     }
 
-    /// The union: the PTY's verdict still counts when the shell has no blocks
-    /// (a bare shell without integration), and an idle prompt stays idle.
     #[test]
     fn the_guard_is_the_union_of_the_pty_and_the_block() {
         assert!(
@@ -888,9 +855,6 @@ mod tests {
         );
     }
 
-    /// A terminal whose host required and authorized a capability nonce —
-    /// the shape every aterm-spawned integrated shell has (`spawn.rs`) — and
-    /// the hex its marks must carry.
     fn nonced_terminal() -> (aterm_core::terminal::Terminal, String) {
         let nonce = [0x5Au8; 32];
         let hex = nonce.iter().map(|b| format!("{b:02x}")).collect();
@@ -906,9 +870,6 @@ mod tests {
             .as_millis() as u64
     }
 
-    /// The shell's idle word is earned, not assumed: only a nonce-signed
-    /// integration that has reported a whole command (C then D) carries one,
-    /// stamped with that command's 133;D.
     #[test]
     fn the_shells_idle_word_needs_its_own_completed_command() {
         let (mut term, id) = nonced_terminal();
@@ -934,9 +895,6 @@ mod tests {
         assert_eq!(shell_word(&term).idle_since_ms, Some(since));
     }
 
-    /// Unsigned marks (no nonce required: `--no-shell-integration`, a user's own
-    /// prompt script) are output a program could print, so they never silence the
-    /// child walk.
     #[test]
     fn unsigned_marks_never_earn_the_shells_idle_word() {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -949,8 +907,6 @@ mod tests {
         assert_eq!(shell_word(&term), ShellWord::default());
     }
 
-    /// A prompt-only integration (cmd.exe's `%PROMPT%` tier, pwsh without
-    /// PSReadLine) never earns the word: the engine drops a D that no C opened.
     #[test]
     fn a_prompt_only_integration_never_earns_the_shells_idle_word() {
         let (mut term, id) = nonced_terminal();
@@ -969,7 +925,6 @@ mod tests {
         assert_eq!(shell_word(&term), ShellWord::default());
     }
 
-    /// A process as `facts` reports it.
     fn born(created_ms: u64, image: &str) -> ProcessFacts {
         ProcessFacts {
             created_ms,
@@ -977,8 +932,6 @@ mod tests {
         }
     }
 
-    /// A `facts` reader over a fixed table; a pid it does not list is
-    /// unreadable (exited, or another user's).
     fn facts_of(table: &[(u32, ProcessFacts)]) -> impl Fn(u32) -> Option<ProcessFacts> + '_ {
         move |pid| {
             table
@@ -990,8 +943,6 @@ mod tests {
 
     const SHELL_BORN: u64 = 1_790_549_217_000;
 
-    /// A process born before the shell it names as parent is a recycled pid (Windows
-    /// hands pids on), not a job: an idle pwsh tab must not refuse its close.
     #[test]
     fn a_child_older_than_its_shell_is_a_recycled_pid_not_a_job() {
         let links = ChildLinks::from_links(vec![(17636, 22432)]);
@@ -1007,8 +958,6 @@ mod tests {
         assert!(links.has_job(17636, None, facts_of(&table)));
     }
 
-    /// A candidate that cannot be read is not counted — exited, or not one the
-    /// shell's user started — and an unreadable shell vets nothing.
     #[test]
     fn an_unreadable_process_is_not_counted() {
         let links = ChildLinks::from_links(vec![(100, 200)]);
@@ -1021,8 +970,6 @@ mod tests {
         );
     }
 
-    /// The idle shell — no candidate at all — opens no handle: the common
-    /// case costs the snapshot and nothing more.
     #[test]
     fn a_shell_with_no_candidate_opens_no_handle() {
         let links = ChildLinks::from_links(vec![(7, 8), (9, 10)]);
@@ -1035,8 +982,6 @@ mod tests {
         assert_eq!(reads.get(), 0, "no candidate, no handle");
     }
 
-    /// Git Bash: `Git\bin\bash.exe` (the program the ConPTY starts) keeps the real
-    /// `usr\bin\bash.exe` as its child for life, started ~30 ms after itself.
     #[test]
     fn the_shell_a_launcher_started_is_not_a_job_but_its_children_are() {
         let launcher = 26612;
@@ -1057,9 +1002,6 @@ mod tests {
         assert!(!links.has_job(launcher, None, facts_of(&table)));
     }
 
-    /// The launcher rule is narrow: a same-image child started later than
-    /// the launch window is a shell a person typed (`pwsh` at a pwsh prompt),
-    /// which is a job like any other.
     #[test]
     fn a_nested_shell_typed_later_is_a_job() {
         let links = ChildLinks::from_links(vec![(300, 301)]);
@@ -1070,10 +1012,6 @@ mod tests {
         assert!(links.has_job(300, None, facts_of(&table)));
     }
 
-    /// With the shell's idle word, a child the finished command left behind
-    /// — `Start-Process notepad`, a `Start-Job`, `sleep 60 &` — is not a
-    /// foreground job, and one created after the word is: a command the
-    /// integration failed to announce.
     #[test]
     fn after_the_shells_idle_word_only_a_newer_child_is_a_job() {
         let since = SHELL_BORN + 20_000;
@@ -1103,9 +1041,6 @@ mod tests {
         assert!(links.has_job(600, Some(since), facts_of(&table)));
     }
 
-    /// `shell_executing` follows the OSC 133 marks exactly: only the span
-    /// between C and D is busy; a prompt, an entered-but-unrun command line, a
-    /// completed command and a shell without integration are all idle.
     #[test]
     fn shell_executing_follows_the_133_marks() {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -1128,8 +1063,6 @@ mod tests {
         assert!(!shell_executing(&term));
     }
 
-    /// A running command that clears the scrollback stays busy: ED 3 (`clear`, `cls`,
-    /// `Clear-Host`) is output, and only the shell's own 133;D ends the command.
     #[test]
     fn a_command_that_clears_the_scrollback_is_still_executing() {
         let mut term = aterm_core::terminal::Terminal::new(24, 80);
@@ -1257,21 +1190,14 @@ mod tests {
         }
     }
 
-    /// Every process in a probe fixture was born at the same instant with no
-    /// readable name: a listed child is then always a vetted one, so these
-    /// tests pin the probe's scheduling, not the walk's rules (proven above).
     fn same_age(_: u32) -> Option<ProcessFacts> {
         Some(born(SHELL_BORN, ""))
     }
 
-    /// The probe's verdict for `shell` against the capture it is handed.
     fn job_of(shell: u32) -> impl FnOnce(&ChildLinks) -> bool {
         move |links| links.has_job(shell, None, same_age)
     }
 
-    /// `master` values are ConPTY registry keys on windows (>= 0x4000_0000) and
-    /// never a real fd here; the probe tests drive `child_verdict` directly so
-    /// no `tcgetpgrp` is involved on any platform.
     #[test]
     fn one_capture_answers_every_session_in_a_sweep() {
         let mut probe = JobProbe::default();
@@ -1293,8 +1219,6 @@ mod tests {
         assert_eq!(probe.capture_count(), 1);
     }
 
-    /// A sweep whose evidence has not moved reuses the last capture until the
-    /// ceiling — the idle property.
     #[test]
     fn a_settled_window_buys_one_capture_per_ceiling() {
         let mut probe = JobProbe::default();
@@ -1328,9 +1252,6 @@ mod tests {
         assert_eq!(captures, 2, "the ceiling refreshes once, for every session");
     }
 
-    /// Moved evidence is never answered from a capture taken before it: a
-    /// session whose grid/output/input changed forces a fresh capture in that
-    /// same sweep, which is what keeps a real job start detected on time.
     #[test]
     fn moved_evidence_forces_a_fresh_capture() {
         let mut probe = JobProbe::default();
@@ -1358,8 +1279,6 @@ mod tests {
         assert_eq!(captures, 2, "moved evidence buys exactly one fresh capture");
     }
 
-    /// The verdict itself is the vetted child walk, read from the shared
-    /// capture: every session asks its own shell's question of one table.
     #[test]
     fn the_verdict_is_the_child_walk_of_the_shared_capture() {
         let mut probe = JobProbe::default();
@@ -1370,8 +1289,6 @@ mod tests {
         assert!(!probe.child_verdict(3, key(0), now, || links.clone(), job_of(7)));
     }
 
-    /// A retired session's evidence is dropped, so a recycled id re-probes
-    /// instead of inheriting a dead tab's answer.
     #[test]
     fn forget_drops_the_retired_sessions_evidence() {
         let mut probe = JobProbe::default();
@@ -1392,8 +1309,6 @@ mod tests {
         );
     }
 
-    /// The unix arm is untouched: a live `tcgetpgrp` answer short-circuits
-    /// before any capture, and keeps no state.
     #[test]
     fn a_live_foreground_pgrp_never_buys_a_capture() {
         let mut probe = JobProbe::default();

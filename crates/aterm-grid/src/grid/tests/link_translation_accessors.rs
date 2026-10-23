@@ -47,11 +47,8 @@ fn row_len_is_logical_length() {
 
 #[test]
 fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
-    // A scrolled-back history row past the ring base (where `Grid::row` is None) reports
-    // `row_len`/`row_is_wrapped` through the tier-aware view, as `row_text` does.
     let scrollback = Scrollback::new(100, 1000, 10_000_000);
     let mut grid = Grid::with_tiered_scrollback(3, 40, 2, scrollback);
-    // Three 30-char lines fill the screen with nothing scrolled off yet.
     for (i, ch) in ['A', 'B', 'C'].into_iter().enumerate() {
         for _ in 0..30 {
             grid.write_char(ch);
@@ -60,8 +57,6 @@ fn scrolled_history_wrapped_row_metadata_is_tier_aware() {
             grid.line_feed();
         }
     }
-    // Each 30-char line rewraps to a 20-col head plus a 10-col continuation, overflowing into
-    // history.
     grid.resize(3, 20);
     grid.scroll_to_top();
     assert!(grid.display_offset() > 0, "scrolled into history");

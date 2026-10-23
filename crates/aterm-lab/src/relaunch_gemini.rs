@@ -34,9 +34,6 @@ pub const CONTINUED_CRASH: &str = "[aterm harness] Relaunched: Gemini CLI exited
 /// …and after aterm's own end.
 pub const CONTINUED_HOST: &str = "aterm ended while this session ran";
 
-/// The script a person's `gemini` resolves to on PATH (Homebrew's link).
-pub const PATH_GEMINI: &str = "/opt/homebrew/bin/gemini";
-
 fn could_not(m: &str) -> Fail {
     Fail::exit(3, format!("gemini-relaunch: COULD NOT RUN: {m}"))
 }
@@ -181,7 +178,7 @@ pub fn shell_exports(run: &Run) -> String {
          all_proxy\n",
     );
     s.push_str(&format!(
-        "export PATH={}:{}:/opt/homebrew/bin:\"$PATH\" HOME={} TMPDIR={}\n",
+        "export PATH={}:{}:\"$PATH\" HOME={} TMPDIR={}\n",
         q(&gbin.to_string_lossy()),
         q(&shim.to_string_lossy()),
         q(&format!("{w}/home")),
@@ -203,10 +200,11 @@ pub fn shell_exports(run: &Run) -> String {
 
 /// The lab's `gemini` wrapper.
 #[must_use]
-pub fn wrapper(elsewhere: Option<&str>) -> String {
+pub fn wrapper(bin: &str, elsewhere: Option<&str>) -> String {
     let cd = elsewhere.map_or_else(String::new, |d| format!("cd {} || exit 1\n", q(d)));
     format!(
-        "#!/bin/sh\n# aterm-lab gemini-relaunch: the shell's gemini\n{cd}exec {PATH_GEMINI} \"$@\"\n"
+        "#!/bin/sh\n# aterm-lab gemini-relaunch: the shell's gemini\n{cd}exec {} \"$@\"\n",
+        q(bin)
     )
 }
 
@@ -225,7 +223,7 @@ fn put_wrapper(run: &Run, elsewhere: Option<&str>) -> Result<(), Fail> {
     crate::sys::put(
         &run.run.join("gbin/gemini"),
         0o755,
-        &crate::sys::PutSrc::Bytes(wrapper(elsewhere).as_bytes()),
+        &crate::sys::PutSrc::Bytes(wrapper(&run.gemini_bin, elsewhere).as_bytes()),
     )
     .map_err(|e| could_not(&format!("the gemini wrapper: {e}")))
 }
@@ -334,14 +332,9 @@ fn run_check(tag: &str, armed: bool) -> Result<Verdict, Fail> {
     let mut run = Run::load(tag)?;
     let aterm = restore::seam_checked(&run)?;
     crate::gemini::need(&run, Agent::Gemini).map_err(|f| could_not(&f.msg.unwrap_or_default()))?;
-    if !crate::sys::executable(PATH_GEMINI) {
-        return Err(could_not(&format!(
-            "no {PATH_GEMINI}, where this lane's shell runs the Gemini CLI; aterm installs none"
-        )));
-    }
     println!(
-        "gemini-relaunch: lab '{tag}', Gemini CLI {} ({PATH_GEMINI}), {aterm}",
-        run.gemini_ver
+        "gemini-relaunch: lab '{tag}', Gemini CLI {} ({}), {aterm}",
+        run.gemini_ver, run.gemini_bin
     );
     let mut failed = Vec::new();
     let unseen: Vec<String> = Vec::new();
@@ -1009,18 +1002,23 @@ mod tests {
             "GEMINI_API_KEY=",
             "GOOGLE_GEMINI_BASE_URL=http://127.0.0.1:5",
             "NO_BROWSER=true",
-            "PATH=/s/runs/t/gbin:/s/runs/t/shim:/opt/homebrew/bin:",
+            "PATH=/s/runs/t/gbin:/s/runs/t/shim:\"$PATH\" ",
             "HOME=/s/runs/t/scratch/home ",
             "unset GOOGLE_API_KEY",
         ] {
             assert!(s.contains(want), "{want}: {s}");
         }
         assert!(!s.contains("HTTPS_PROXY=http"), "{s}");
-        assert_eq!(
-            wrapper(None),
-            "#!/bin/sh\n# aterm-lab gemini-relaunch: the shell's gemini\nexec /opt/homebrew/bin/gemini \"$@\"\n"
+        assert!(
+            !s.contains("homebrew"),
+            "no Homebrew prefix on the lane's PATH: {s}"
         );
-        assert!(wrapper(Some("/x y")).contains("cd '/x y' || exit 1\n"));
+        assert_eq!(
+            wrapper("/l/gemini-cli/bundle/gemini.js", None),
+            "#!/bin/sh\n# aterm-lab gemini-relaunch: the shell's gemini\nexec /l/gemini-cli/bundle/gemini.js \"$@\"\n"
+        );
+        assert!(wrapper("/a b/gemini", None).contains("exec '/a b/gemini' \"$@\"\n"));
+        assert!(wrapper("/g", Some("/x y")).contains("cd '/x y' || exit 1\n"));
         assert_eq!(
             launch_line(&run, &["--resume", "s1"]),
             "HOME=/s/runs/t/scratch/gemini-home gemini --resume s1"

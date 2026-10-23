@@ -22,7 +22,7 @@ pub const SKEW_SECS: u64 = 300;
 pub const MAX_WIRE: usize = 8 << 20;
 
 /// The tool every signature goes through.
-const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
+const SSH_KEYGEN: &str = aterm_uds::os_path!("ssh-keygen");
 
 /// What an envelope authorizes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

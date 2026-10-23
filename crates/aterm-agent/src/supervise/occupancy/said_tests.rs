@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `OccupancySaid`: its change, the Entry it names under `prompt`, and its `why` form, asserted
-//! by structure (each line's head, its closed words and its marks), not its prose.
+//! `OccupancySaid`: its change, the Entry it names under `prompt`, and its `why` form, asserted by structure (each line's head, its closed words and its marks), not its prose.
 
 use super::*;
 use crate::supervise::config::Autopilot;
@@ -65,8 +64,7 @@ fn said(mode: Occupancy, verdicts: [SaidVerdict; 2], guards: Option<Guards>) -> 
     }
 }
 
-/// The change is the mode, the hold, the ready proxy, the guard and each rule's word; the
-/// stamp and the reading alone are not.
+/// The change is the mode, the hold, the ready proxy, the guard and each rule's word; the stamp and the reading alone are not.
 #[test]
 fn a_new_reading_or_stamp_alone_is_no_change() {
     let base = said(
@@ -85,7 +83,6 @@ fn a_new_reading_or_stamp_alone_is_no_change() {
     let mut guarded = base.clone();
     guarded.guards = Some(holding(&[Guard::Draft]));
     assert!(!base.same_change(&guarded));
-    // A guard past the first is the change too: `why` marks each.
     let mut both = guarded.clone();
     both.guards = Some(holding(&[Guard::Draft, Guard::Memory]));
     assert_eq!(both.guard(), guarded.guard(), "the first guard is the same");
@@ -98,8 +95,7 @@ fn a_new_reading_or_stamp_alone_is_no_change() {
     assert!(!base.same_change(&prompt));
 }
 
-/// A spent cap names an Entry only under `prompt`, with a hold open; under `observe` nothing
-/// the owner sees was spent (the negative control).
+/// A spent cap names an Entry only under `prompt`, with a hold open; under `observe` nothing the owner sees was spent (the negative control).
 #[test]
 fn a_spent_cap_is_named_under_prompt_alone() {
     let spent = [SaidVerdict::Quiet, SaidVerdict::Spent];
@@ -126,9 +122,7 @@ fn a_spent_cap_is_named_under_prompt_alone() {
     );
 }
 
-/// `occupancy why` against a scripted `OccupancySaid`: the head line names the mode and the
-/// hold, a line a rule in `RuleId::ALL`'s order carries its verdict's words and a mark a term,
-/// and the guards' line names each guard of §2.1 with its mark, a cross where it holds (§6).
+/// `occupancy why` against a scripted `OccupancySaid`: the head line names the mode and the hold, a line a rule in `RuleId::ALL`'s order carries its verdict's words and a mark a term, and the guards' line names each guard of §2.1 with its mark, a cross where it holds (§6).
 #[test]
 fn why_renders_each_rule_and_each_guard() {
     let s = said(
@@ -155,11 +149,9 @@ fn why_renders_each_rule_and_each_guard() {
     assert_eq!(room[0], "hold-room@v1", "{lines:#?}");
     assert!(room.contains(&"held:person".to_string()), "{lines:#?}");
     assert!(room.contains(&"1/3".to_string()), "{lines:#?}");
-    // Every term of hold-room's holds on this reading: no mark is a cross.
     assert!(!lines[2].contains('✗'), "{lines:#?}");
     assert!(lines[2].matches('✓').count() >= 6, "{lines:#?}");
 
-    // Each guard is its word (the brake's and the autopilot's with their own) and its mark.
     let marks = |line: &str| -> Vec<(String, String)> {
         let w = words(line);
         assert_eq!(w[0], "guards:", "{line}");
@@ -190,8 +182,6 @@ fn why_renders_each_rule_and_each_guard() {
         .collect();
     assert_eq!(crossed, ["person", "memory"], "{lines:#?}");
 
-    // The negative control: no guard, and a reading that is not fresh, show as such; a word
-    // told before any break judged its guards says so.
     let mut clear = s.clone();
     clear.guards = Some(holding(&[]));
     clear.reading.stale = true;
@@ -245,7 +235,6 @@ fn spans_and_clocks_are_spelled_plainly() {
     assert_eq!(clock_words(SINCE, 0), "18:52");
     assert_eq!(clock_words(SINCE, -7 * 3600), "11:52");
     assert_eq!(clock_words(SINCE, 6 * 3600), "00:52");
-    // A cap's words carry its number.
     assert!(cap_words(RuleId::WaitNudge).starts_with(&rules::NUDGES_PER_DAY.to_string()));
     assert!(cap_words(RuleId::HoldRoom).starts_with(&rules::HOLD_ROOM_PER_HOLD.to_string()));
 }

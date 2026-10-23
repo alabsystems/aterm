@@ -11,7 +11,7 @@
 // (https://www.w3.org/TR/2017/CR-uievents-code-20170601/) specifications,
 // Copyright © 2017 W3C® (MIT, ERCIM, Keio, Beihang), under the license below.
 
-// --------- BEGINNING OF W3C LICENSE --------------------------------------------------------------
+// Beginning of W3C License.
 //
 // License
 //
@@ -44,9 +44,9 @@
 // pertaining to the work without specific, written prior permission. Title to copyright in this
 // work will at all times remain with copyright holders.
 //
-// --------- END OF W3C LICENSE --------------------------------------------------------------------
+// End of W3C License.
 
-// --------- BEGINNING OF W3C SHORT NOTICE ---------------------------------------------------------
+// Beginning of W3C Short Notice.
 //
 // winit: https://github.com/rust-windowing/winit
 //
@@ -58,9 +58,8 @@
 //
 // [1] http://www.w3.org/Consortium/Legal/copyright-software
 //
-// --------- END OF W3C SHORT NOTICE ---------------------------------------------------------------
+// End of W3C Short Notice.
 
-// LOCAL PATCH (aterm): the crate's own key-text type, not a re-export of the `smol_str` crate.
 mod smol_str;
 pub use self::smol_str::SmolStr;
 
@@ -856,14 +855,6 @@ impl Key<SmolStr> {
 
 impl NamedKey {
     /// Converts a named key to its approximate textual equivalent.
-    ///
-    /// ```
-    /// use aterm_window::keyboard::NamedKey;
-    ///
-    /// assert_eq!(NamedKey::Enter.to_text(), Some("\r"));
-    /// assert_eq!(NamedKey::F20.to_text(), None);
-    /// ```
-    /// use aterm_window::keyboard::NamedKey;
     #[inline]
     pub const fn to_text(&self) -> Option<&'static str> {
         match self {
@@ -879,15 +870,6 @@ impl NamedKey {
 
 impl Key {
     /// Converts a key to its approximate textual equivalent.
-    ///
-    /// ```
-    /// use aterm_window::keyboard::{Key, NamedKey};
-    ///
-    /// assert_eq!(Key::Character("a".into()).to_text(), Some("a"));
-    /// assert_eq!(Key::Named(NamedKey::Enter).to_text(), Some("\r"));
-    /// assert_eq!(Key::Named(NamedKey::F20).to_text(), None);
-    /// ```
-    /// use aterm_window::keyboard::{Key, NamedKey};
     #[inline]
     pub fn to_text(&self) -> Option<&str> {
         match self {

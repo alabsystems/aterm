@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Keys, tiers, caps and values (design §3.1, §3.6).
+//! Keys, tiers, caps and values.
 
 use crate::vocab::{
     ACT_WORDS, ASK_WORDS, BOX_WORDS, CAUSE_WORDS, CHANGE_WORDS, CLASS_WORDS, CLS_WORDS, DIR_WORDS,
@@ -10,7 +10,7 @@ use crate::vocab::{
     ShortId, VERB_WORDS, WALL_WORDS, WHY_WORDS, WORD_WORDS, lookup,
 };
 
-/// Where a value may be stored (§3.6).
+/// Where a value may be stored.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Tier {
     /// **W**: ids, counts, closed words.
@@ -212,12 +212,6 @@ keys! {
     LandAt "land_at" Host Cap::I,
     Sev "sev" Wire Cap::Word(SEV_WORDS),
     Held "held" Wire Cap::Word(HELD_WORDS),
-    // Appended so no discriminant moves: a `row` mark's
-    // fields, a timeline row the log holds as its row alone. The ring's
-    // kind as a token (`row=job-change`, a space a `-`), WIRE; and the
-    // row's whole payload (`row_text=`, the ring's 256 bytes, a space and
-    // an escape's `%` each three encoded), CONTENT, RAM only as the ring
-    // row it stands for always was: never journaled, carried or published.
     RowKind "row" Wire Cap::Tok(Charset::Lower, 32),
     RowText "row_text" Content Cap::Text(360),
 }
@@ -225,8 +219,6 @@ keys! {
 impl Key {
     /// The key's row of [`FIELDS`].
     fn row(self) -> &'static (Key, Tier, Cap) {
-        // `FIELDS` is declared in `Key` order (one macro list), so the
-        // discriminant is the row; `fields_table_is_in_key_order_and_names_are_unique` holds it.
         &FIELDS[self as usize]
     }
 
@@ -354,7 +346,7 @@ impl BoundedText {
     }
 }
 
-/// A field value (§3.1, corrected).
+/// A field value.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Val {
     /// A word of the key's closed list.

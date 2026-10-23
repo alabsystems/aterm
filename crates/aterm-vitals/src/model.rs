@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! System vitals model: absorbs [`Sample`] readings into an immutable [`Snapshot`].
-//!
-//! [`Vitals::absorb`] converts cumulative counters into rates under the gap rule,
-//! smooths series ([`crate::trend`]), updates 1-hour rings ([`crate::ring`]), and
-//! attributes process usage across Global, `aterm`, and per-tab scopes in O(N).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -357,10 +353,7 @@ impl VolumeSample {
 pub struct TabRoot {
     /// The host's stable key for it (its session id).
     pub key: u64,
-    /// The key the tab it is a pane of goes by, the same on each of that
-    /// tab's panes: the least of their keys (its own for a tab of one pane
-    /// or a session no window shows). The split counts a tab split into
-    /// panes as one (`explain::split`).
+    /// Key of the tab this pane belongs to (the least key among its panes, or its own).
     pub tab: u64,
     /// Its shell's pid; 0 when it has none (a native tab).
     pub shell_pid: u32,
@@ -1113,7 +1106,6 @@ impl ResourceView {
         }
     }
 
-    /// Construct a [`ResourceView`] from primary and optional secondary series.
     fn of(first: Series, second: Option<Series>, ring_k: i64, over: bool, basis: CapBasis) -> Self {
         let a = heat_of(first.now, first.capacity);
         let b = second.as_ref().and_then(|s| heat_of(s.now, s.capacity));
@@ -1139,7 +1131,6 @@ impl ResourceView {
     }
 }
 
-/// Compute `v / cap` as `f32`, or `None` if either is missing.
 fn heat_of(v: Option<f64>, cap: Option<f64>) -> Option<f32> {
     let (v, cap) = (v?, cap?);
     Some(if cap > 0.0 {
@@ -1151,7 +1142,6 @@ fn heat_of(v: Option<f64>, cap: Option<f64>) -> Option<f32> {
     })
 }
 
-/// The larger of two optional shares, a known one over an unknown one.
 fn larger(a: Option<f32>, b: Option<f32>) -> Option<f32> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.max(b)),
@@ -1322,9 +1312,7 @@ pub struct Snapshot {
     pub events: Vec<crate::events::Event>,
     /// Most recent split-tick attribution facts ([`crate::explain`]).
     pub why: Option<Arc<crate::explain::WhyFacts>>,
-    /// Whether the coalition lane reads: the sample's word, or `Off` once a
-    /// read misread the layout. A reply with no [`Self::why`] says by it
-    /// whether the coalitions are still to come or never read.
+    /// Whether the coalition lane reads (`Off` once a read misread the layout).
     pub coal_lane: crate::explain::CoalLane,
 }
 
@@ -1457,7 +1445,6 @@ impl Stamp {
         }
     }
 
-    /// Elapsed seconds since `then` if within [`GAP_CADENCES`] and [`SLEEP_SKEW_MS`].
     fn rate_dt(self, then: Option<Self>) -> Option<f64> {
         let then = then?;
         let dt = self.mono_ms.checked_sub(then.mono_ms).filter(|&d| d > 0)?;
@@ -1510,8 +1497,6 @@ impl Session {
             && self.complete == t.complete
     }
 
-    /// Compute `(output, input)` tokens/min to `t` at `read_ms` if both folds are complete
-    /// and output is within [`TOKENS_CAP_PER_S`].
     fn rates_to(&self, t: &TabTokens, read_ms: i64) -> Option<(f64, f64)> {
         if !self.baseline
             || self.unread != t.unread
@@ -1665,8 +1650,7 @@ impl Vitals {
         self.seq
     }
 
-    /// Inject a fault into scope-balance attribution or the cause engine for
-    /// negative-control testing.
+    /// Inject a fault into scope-balance attribution or the cause engine for negative-control testing.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn with_fault(mut self, fault: crate::explain::Fault) -> Self {
@@ -2147,7 +2131,6 @@ impl Vitals {
     }
 }
 
-/// Compute paging rates across `window_ns` (`None` if zero or counter wrapped).
 fn mem_rates(then: MemCounters, now: MemCounters, window_ns: u64) -> Option<MemRates> {
     if window_ns == 0 {
         return None;
@@ -2164,7 +2147,6 @@ fn mem_rates(then: MemCounters, now: MemCounters, window_ns: u64) -> Option<MemR
     })
 }
 
-/// Busiest first: CPU (unknown last), then footprint.
 fn busiest_first(a: &ProcView, b: &ProcView) -> std::cmp::Ordering {
     b.cores
         .unwrap_or(-1.0)
@@ -2173,7 +2155,6 @@ fn busiest_first(a: &ProcView, b: &ProcView) -> std::cmp::Ordering {
         .then(a.pid.cmp(&b.pid))
 }
 
-/// Retain up to [`ATERM_ROWS`] `aterm` rows plus the top [`TOP_ROWS`] by CPU and footprint.
 fn keep_rows(rows: Vec<ProcView>) -> Vec<ProcView> {
     let (mut mine, mut rest): (Vec<ProcView>, Vec<ProcView>) =
         rows.into_iter().partition(|r| r.scope.in_aterm());
@@ -2190,7 +2171,6 @@ fn keep_rows(rows: Vec<ProcView>) -> Vec<ProcView> {
 }
 
 impl Rows {
-    /// Absorb one sample into row rings, scope figures, peaks, states, and facts.
     fn absorb(
         &mut self,
         s: &Sample,
@@ -2397,7 +2377,6 @@ impl Rows {
         (resources, facts)
     }
 
-    /// Compute aggregate RX/TX bytes/s across counted links and update the reference link in `facts`.
     fn absorb_links(
         &mut self,
         links: Option<&[LinkSample]>,
@@ -2435,8 +2414,6 @@ impl Rows {
         }
     }
 
-    /// Select the reference network link, switching to a busier link only after
-    /// [`LINK_LEAD_READINGS`] consecutive readings above [`LINK_LEAD_BPS`] and >2x the held link.
     fn pick_link<'a>(
         &mut self,
         moved: &[(&'a LinkSample, u64)],
@@ -2482,7 +2459,6 @@ impl Rows {
         }
     }
 
-    /// Update per-session token fold rates and sum active rates into `aterm` and tab scopes.
     fn absorb_tokens(&mut self, tokens: &[TabTokens], stamp: Stamp) -> TokenPass {
         let mut pass = TokenPass::default();
         let mut seen: HashSet<&str> = HashSet::with_capacity(tokens.len());
@@ -2529,7 +2505,6 @@ impl Rows {
     }
 }
 
-/// Trailing averaging window (ms) for `res` (`10_000`, or [`TOKENS_WINDOW_MS`] for `Tokens`).
 fn window_of(res: Resource) -> i64 {
     if res == Resource::Tokens {
         TOKENS_WINDOW_MS
@@ -2538,7 +2513,6 @@ fn window_of(res: Resource) -> i64 {
     }
 }
 
-/// One series of `ring` as of `now`.
 fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) -> Series {
     Series {
         now: ring.now_mean(now, window_ms),
@@ -2548,7 +2522,6 @@ fn series(ring: &BucketRing, now: i64, window_ms: i64, capacity: Option<f64>) ->
     }
 }
 
-/// Record one scope's readings, row by row.
 fn push_figs(recents: &mut [Recent; 7], now: i64, vals: [Option<f64>; 7]) {
     for (r, v) in recents.iter_mut().zip(vals) {
         if let Some(v) = v {
@@ -2557,7 +2530,6 @@ fn push_figs(recents: &mut [Recent; 7], now: i64, vals: [Option<f64>; 7]) {
     }
 }
 
-/// Note the sustained-30 s value ending at the bucket that just closed.
 fn note_peak(ring: &BucketRing, closed: Option<i64>, peak: &mut DailyMax) {
     if let Some(k) = closed
         && let Some(v) = ring.sustained(k)
@@ -2566,7 +2538,6 @@ fn note_peak(ring: &BucketRing, closed: Option<i64>, peak: &mut DailyMax) {
     }
 }
 
-/// Determine RX/TX network capacity and [`CapBasis`] from 7-day peaks and link speed.
 fn net_capacity(
     peaks: &Peaks,
     today: u32,
@@ -2582,7 +2553,6 @@ fn net_capacity(
     }
 }
 
-/// Compute the Disk row's worst [`State`] from watch facts and the 1-hour filling projection.
 fn disk_state(facts: Option<&DiskFacts>, filling: Option<&Filling>) -> Option<State> {
     let mut states = Vec::new();
     if let Some(f) = facts.filter(|f| f.watch) {
@@ -2603,19 +2573,16 @@ fn disk_state(facts: Option<&DiskFacts>, filling: Option<&Filling>) -> Option<St
     states.into_iter().max()
 }
 
-/// The unix day (UTC) of `unix_ms`.
 fn day_of(unix_ms: i64) -> u32 {
     u32::try_from(unix_ms.div_euclid(86_400_000)).unwrap_or(0)
 }
 
-/// Elapsed seconds between `before` and `now` (ns), defaulting to `1.0` on the first sample.
 fn interval_s(before: Option<u64>, now: u64) -> f32 {
     before
         .filter(|&then| now > then)
         .map_or(1.0, |then| (now - then) as f32 / 1e9)
 }
 
-/// Infer each tab's foreground program name from its largest direct child or shell.
 fn front_names(procs: &[ProcSample], tabs: &[TabRoot]) -> Vec<String> {
     tabs.iter()
         .map(|t| {
@@ -2659,7 +2626,6 @@ pub fn attribute(procs: &[ProcSample], self_pid: u32, tabs: &[TabRoot]) -> Vec<M
         .collect()
 }
 
-/// Attribute processes with explicit identity-bound delegated roots.
 fn attribute_delegated(
     procs: &[ProcSample],
     self_pid: u32,
@@ -3069,7 +3035,6 @@ mod tests {
         }
     }
 
-    /// Per-process `at_ns` timestamps rate each process over its own read interval.
     #[test]
     fn each_process_is_rated_over_its_own_reads() {
         let stamped = |cpu_ms, at_ms: u64| ProcSample {
@@ -3384,7 +3349,6 @@ mod tests {
         assert_eq!(gib(1 << 30), 1.0);
     }
 
-    /// Numbered performance levels produce distinct short labels (`M1`, `M2`).
     #[test]
     fn short_labels_keep_numbered_levels_apart() {
         let spec = |name: &str, logical: Vec<u16>| ClusterSpec {
@@ -3406,7 +3370,6 @@ mod tests {
         assert_eq!(cluster_views(&[spec("7", vec![0])], 1)[0].short, "7");
     }
 
-    /// `near_limit` fires only for enforced limits at or above 90%.
     #[test]
     fn commit_is_near_its_limit_only_where_the_limit_is_enforced() {
         let c = |charge, limit, exact| CommitSample {
@@ -3427,7 +3390,6 @@ mod tests {
 
     const T0: i64 = 1_792_000_800_000;
 
-    /// Synthetic sample fixture at `(mono_ms, T0 + wall_ms, cadence_ms)`.
     fn rig(mono_ms: u64, wall_ms: i64, cadence_ms: u32) -> Sample {
         let ticks = mono_ms / 10;
         let mine = |p: ProcSample, written: u64| ProcSample {
@@ -3895,7 +3857,6 @@ mod tests {
         assert_eq!(v.peaks().tokens.peak(day_of(T0)), Some(36_000.0));
     }
 
-    /// Token rates are computed across fold timestamps, held for [`TOKENS_HOLD_MS`], and reset on sleep.
     #[test]
     fn token_rates_span_folds_not_readings() {
         let mut v = Vitals::new();
@@ -4146,7 +4107,6 @@ mod tests {
         assert!(State::Waiting > State::Stopped);
     }
 
-    /// Reference network link switches only after [`LINK_LEAD_READINGS`] sustained leading intervals.
     #[test]
     fn the_measured_link_holds_while_the_mix_holds() {
         let link = |name: &str, kind, total: u64, rate_bps| LinkSample {

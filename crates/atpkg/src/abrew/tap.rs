@@ -153,7 +153,7 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool)
     if update {
         if let Some(url) = url {
             let origin = fetch::run_capture(
-                "git",
+                aterm_uds::os_path!("git"),
                 &["-C", &path.to_string_lossy(), "remote", "get-url", "origin"],
             )
             .ok()
@@ -189,7 +189,7 @@ pub fn add(prefix: &Prefix, name: &str, url: Option<&str>) -> Result<(Tap, bool)
         let staged_s = staged.to_string_lossy();
         let mut git_args: Vec<&str> = git_protocol_args(is_local_remote(&remote));
         git_args.extend(["clone", "--depth=1", "--", &remote, &staged_s]);
-        let code = fetch::run_inherit("git", &git_args);
+        let code = fetch::run_inherit(aterm_uds::os_path!("git"), &git_args);
         if code != 0 {
             return Err(format!(
                 "abrew: git clone failed for tap {user}/{repo} ({code})"
@@ -216,14 +216,14 @@ pub(super) fn update(prefix: &Prefix, tap: &Tap) -> Result<(), String> {
 fn pull(path: &std::path::Path, user: &str, repo: &str) -> Result<(), String> {
     eprintln!("==> Updating tap {user}/{repo}");
     let local = fetch::run_capture(
-        "git",
+        aterm_uds::os_path!("git"),
         &["-C", &path.to_string_lossy(), "remote", "get-url", "origin"],
     )
     .is_ok_and(|out| is_local_remote(String::from_utf8_lossy(&out.stdout).trim()));
     let path_s = path.to_string_lossy();
     let mut git_args: Vec<&str> = git_protocol_args(local);
     git_args.extend(["-C", &path_s, "pull", "--ff-only"]);
-    let code = fetch::run_inherit("git", &git_args);
+    let code = fetch::run_inherit(aterm_uds::os_path!("git"), &git_args);
     if code != 0 {
         return Err(format!(
             "abrew: git pull failed for tap {user}/{repo} ({code})"

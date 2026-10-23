@@ -6,8 +6,6 @@
 
 use super::*;
 
-// Legacy encoding: character keys
-
 #[test]
 #[rustfmt::skip]
 fn legacy_character_encodings() {
@@ -15,23 +13,15 @@ fn legacy_character_encodings() {
     assert_cases(&[
         ("plain", ch('a'), NO_MODS, LEGACY, KEY, b"a"),
         ("shift", ch('a'), Modifiers::SHIFT, LEGACY, KEY, b"A"),
-        // Alt+Shift on a symbol sends ESC + the shifted glyph.
         ("alt+shift symbol", ch('2'), alt_shift, LEGACY, KEY, &[0x1b, b'@']),
-        // Mode 1039 set (the default): Alt+key -> ESC + key.
         ("alt", ch('a'), Modifiers::ALT, LEGACY, KEY, &[0x1b, b'a']),
         ("alt+shift", ch('a'), alt_shift, LEGACY, KEY, &[0x1b, b'A']),
-        // Ctrl+Alt+C = ESC + Ctrl-C
         ("ctrl+alt", ch('c'), Modifiers::CTRL | Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x03]),
-        // Without META_SENDS_ESC a Meta-modified key falls through to the plain glyph.
         ("meta, 1036 reset", ch('a'), Modifiers::META, LEGACY, KEY, b"a"),
-        // Release events in legacy mode encode to nothing.
         ("release", ch('a'), NO_MODS, LEGACY, RELEASE, b""),
     ]);
 }
 
-/// Ctrl-`_` (Ctrl+Shift+'-', since `Key::Character` carries the unshifted base) is US (0x1F),
-/// readline's and emacs's `undo`. The siblings pin that the shifted fallback is additive:
-/// Ctrl+Shift+'/' stays 0x1F, not Ctrl-? (0x7F).
 #[test]
 fn legacy_encode_ctrl_underscore_is_us_for_emacs_undo() {
     let ctrl_shift = Modifiers::CTRL | Modifiers::SHIFT;
@@ -41,7 +31,6 @@ fn legacy_encode_ctrl_underscore_is_us_for_emacs_undo() {
         "Ctrl-_ is US (0x1F) — the readline/emacs undo byte"
     );
 
-    // Unchanged siblings: the fallback must not renegotiate any of these.
     for (base, want, name) in [
         ('/', 0x1f_u8, "Ctrl+Shift+/ stays US, not DEL"),
         ('2', 0x00, "Ctrl+Shift+2 is NUL"),
@@ -54,7 +43,6 @@ fn legacy_encode_ctrl_underscore_is_us_for_emacs_undo() {
         );
     }
 
-    // Without SHIFT there is nothing to fall back to: Ctrl+- stays `-`.
     assert_eq!(
         encode_key(&Key::Character('-'), Modifiers::CTRL, KeyboardMode::empty()),
         vec![b'-'],
@@ -62,7 +50,6 @@ fn legacy_encode_ctrl_underscore_is_us_for_emacs_undo() {
     );
 }
 
-/// Shift on a non-letter yields the shifted glyph in legacy mode (Shift+2 is '@').
 #[test]
 fn legacy_encode_shift_symbol() {
     let cases: &[(char, u8)] = &[
@@ -103,8 +90,6 @@ fn legacy_encode_shift_symbol() {
     }
 }
 
-// Legacy encoding: named keys
-
 #[test]
 #[rustfmt::skip]
 fn legacy_control_and_editing_key_encodings() {
@@ -125,8 +110,6 @@ fn legacy_control_and_editing_key_encodings() {
         ("insert", named(NamedKey::Insert), NO_MODS, LEGACY, KEY, b"\x1b[2~"),
     ]);
 }
-
-// Legacy encoding: arrows (with and without DECCKM) and function keys
 
 #[test]
 #[rustfmt::skip]
@@ -149,8 +132,6 @@ fn legacy_cursor_and_function_key_encodings() {
     ]);
 }
 
-/// Shift+F10 is a real legacy sequence, `CSI 21;2 ~` (terminfo `kf22`: xterm numbers
-/// Shift+F1..F12 as F13..F24), so a host chord does not claim it by default.
 #[test]
 fn legacy_encode_shift_f10_is_terminfo_kf22() {
     assert_eq!(
@@ -171,8 +152,6 @@ fn legacy_encode_shift_f10_is_terminfo_kf22() {
     );
 }
 
-// Legacy encoding: numpad
-
 #[test]
 #[rustfmt::skip]
 fn legacy_numpad_encodings() {
@@ -180,11 +159,8 @@ fn legacy_numpad_encodings() {
     assert_cases(&[
         ("kp0", named(NamedKey::Numpad0), NO_MODS, LEGACY, KEY, b"0"),
         ("kp0, DECKPAM", named(NamedKey::Numpad0), NO_MODS, app_keypad, KEY, b"\x1bOp"),
-        // NumpadEnter in legacy = same as Enter (0x0d)
         ("kp enter", named(NamedKey::NumpadEnter), NO_MODS, LEGACY, KEY, &[0x0d]),
-        // NumpadEnter in DECKPAM sends SS3 M, distinguishing from main Enter (#7558).
         ("kp enter, DECKPAM", named(NamedKey::NumpadEnter), NO_MODS, app_keypad, KEY, b"\x1bOM"),
-        // Shift cancels application keypad mode (#7558), leaving the main Shift+Enter: LF.
         (
             "shift kp enter, DECKPAM",
             named(NamedKey::NumpadEnter),
@@ -193,15 +169,11 @@ fn legacy_numpad_encodings() {
             KEY,
             &[0x0a],
         ),
-        // Alt+NumpadEnter sends ESC+CR, same as Alt+Enter.
         ("alt kp enter", named(NamedKey::NumpadEnter), Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x0d]),
-        // Matches the character fallback for '='.
         ("alt kp equal", named(NamedKey::NumpadEqual), Modifiers::ALT, LEGACY, KEY, b"\x1b="),
     ]);
 }
 
-/// Outside application keypad mode KP_Enter is the main Enter byte for byte: CR, Shift's LF,
-/// Ctrl's CR, Alt's ESC CR.
 #[test]
 fn legacy_numpad_enter_outside_app_keypad_is_the_main_enter() {
     for mods in [
@@ -231,7 +203,6 @@ fn legacy_numpad_enter_outside_app_keypad_is_the_main_enter() {
         vec![0x0a],
         "the witness: Shift+KP_Enter is the LF imposition"
     );
-    // Application mode keeps its own forms — SS3 M, and ESC ? M under VT52.
     assert_eq!(
         encode_key(
             &Key::Named(NamedKey::NumpadEnter),
@@ -242,31 +213,20 @@ fn legacy_numpad_enter_outside_app_keypad_is_the_main_enter() {
     );
 }
 
-// Emacs keybindings
-
 #[test]
 #[rustfmt::skip]
 fn legacy_emacs_bindings() {
     assert_cases(&[
-        // Ctrl+Space = NUL (0x00) — set mark in emacs
         ("C-SPC", ch(' '), Modifiers::CTRL, LEGACY, KEY, &[0x00]),
-        // Ctrl+/ = US (0x1F) — undo in readline
         ("C-/", ch('/'), Modifiers::CTRL, LEGACY, KEY, &[0x1f]),
-        // Ctrl+2 = NUL (0x00) — alias for Ctrl-@
         ("C-2", ch('2'), Modifiers::CTRL, LEGACY, KEY, &[0x00]),
-        // Ctrl+6 = RS (0x1E) — alias for Ctrl-^
         ("C-6", ch('6'), Modifiers::CTRL, LEGACY, KEY, &[0x1e]),
-        // Ctrl+8 = DEL (0x7F) — alias for Ctrl-?
         ("C-8", ch('8'), Modifiers::CTRL, LEGACY, KEY, &[0x7f]),
-        // Meta-Backspace = ESC + DEL (0x1B 0x7F) — kill word backward in readline
         ("M-DEL", named(NamedKey::Backspace), Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x7f]),
-        // Ctrl+Alt+a = ESC + 0x01 (used in some emacs modes)
         ("C-M-a", ch('a'), Modifiers::CTRL | Modifiers::ALT, LEGACY, KEY, &[0x1b, 0x01]),
-        // Ctrl+X = CAN (0x18) — prefix key in emacs readline
         ("C-x", ch('x'), Modifiers::CTRL, LEGACY, KEY, &[0x18]),
     ]);
 
-    // Every Ctrl+letter produces its control character.
     for (letter, expected) in [
         ('a', 0x01u8), // beginning of line
         ('b', 0x02),   // backward char
@@ -303,20 +263,15 @@ fn legacy_emacs_bindings() {
 
 #[test]
 fn legacy_meta_word_movement() {
-    // Meta+f = ESC f (forward word)
     let result = encode_key(&Key::Character('f'), Modifiers::ALT, KeyboardMode::empty());
     assert_eq!(result, vec![0x1b, b'f']);
 
-    // Meta+b = ESC b (backward word)
     let result = encode_key(&Key::Character('b'), Modifiers::ALT, KeyboardMode::empty());
     assert_eq!(result, vec![0x1b, b'b']);
 
-    // Meta+d = ESC d (kill word forward)
     let result = encode_key(&Key::Character('d'), Modifiers::ALT, KeyboardMode::empty());
     assert_eq!(result, vec![0x1b, b'd']);
 }
-
-// VT52 mode (#7712)
 
 #[test]
 fn test_vt52_cursor_keys() {
@@ -341,7 +296,6 @@ fn test_vt52_cursor_keys() {
 
 #[test]
 fn test_vt52_mode_overrides_decckm() {
-    // VT52 outranks DECCKM: ESC A, not SS3 A.
     let mode = KeyboardMode::VT52_MODE | KeyboardMode::APP_CURSOR;
     assert_eq!(
         encode_key(&Key::Named(NamedKey::ArrowUp), Modifiers::empty(), mode),
@@ -363,7 +317,6 @@ fn test_vt52_mode_overrides_decckm() {
 
 #[test]
 fn test_vt52_cursor_keys_ignore_modifiers() {
-    // VT52 mode ignores modifiers — always produces bare ESC + letter.
     let mode = KeyboardMode::VT52_MODE;
     assert_eq!(
         encode_key(&Key::Named(NamedKey::ArrowUp), Modifiers::SHIFT, mode),
@@ -379,8 +332,6 @@ fn test_vt52_cursor_keys_ignore_modifiers() {
     );
 }
 
-/// VT52: F1-F4 are PF1-PF4 (`ESC P`..`ESC S`) and Home/End `ESC H`/`ESC F`, modifiers ignored
-/// as for the arrows (xterm's VT52_CURSOR_KEYS); F5 up keep their ANSI form.
 #[test]
 fn vt52_function_keys_and_home_end() {
     let mode = KeyboardMode::VT52_MODE;
@@ -396,9 +347,6 @@ fn vt52_function_keys_and_home_end() {
     );
 }
 
-/// Alt ESC-prefixes the Ctrl byte of Space and Backspace, as it does a Ctrl
-/// letter (kitty's legacy C0 table; xterm under altSendsEscape): readline's
-/// M-C-h and emacs's C-M-SPC. Alt+Shift+Tab stays `ESC [ Z`.
 #[test]
 fn ctrl_alt_space_and_backspace_keep_the_alt() {
     let ctrl_alt = Modifiers::CTRL | Modifiers::ALT;
@@ -413,8 +361,6 @@ fn ctrl_alt_space_and_backspace_keep_the_alt() {
     );
 }
 
-/// Ctrl+~ (`` Ctrl+Shift+` `` on US keyboards) is RS, 0x1E: kitty's legacy ctrl table ("~ -> 30")
-/// and xterm's control alias.
 #[test]
 fn ctrl_tilde_is_record_separator() {
     let mode = KeyboardMode::empty();
@@ -431,7 +377,6 @@ fn ctrl_tilde_is_record_separator() {
 
 #[test]
 fn test_vt52_numpad_application_mode() {
-    // VT52 application keypad: ESC ? followed by the digit character.
     let mode = KeyboardMode::VT52_MODE | KeyboardMode::APP_KEYPAD;
     for digit in 0..=9 {
         let key = match digit {
@@ -458,7 +403,6 @@ fn test_vt52_numpad_application_mode() {
 
 #[test]
 fn test_vt52_numpad_without_app_keypad_sends_digits() {
-    // VT52 mode without APP_KEYPAD: numpad sends normal digits (no ESC ?).
     let mode = KeyboardMode::VT52_MODE;
     assert_eq!(
         encode_key(&Key::Named(NamedKey::Numpad0), Modifiers::empty(), mode),
@@ -470,11 +414,8 @@ fn test_vt52_numpad_without_app_keypad_sends_digits() {
     );
 }
 
-// DECBKM (mode 67): Backspace sends BS (0x08) or DEL (0x7f)
-
 #[test]
 fn legacy_backspace_default_sends_del() {
-    // Default (DECBKM reset): Backspace -> DEL (0x7f), Ctrl+Backspace -> BS.
     let del = encode_key(
         &Key::Named(NamedKey::Backspace),
         Modifiers::empty(),
@@ -491,7 +432,6 @@ fn legacy_backspace_default_sends_del() {
 
 #[test]
 fn legacy_backspace_decbkm_sends_bs() {
-    // DECBKM set: Backspace -> BS (0x08), Ctrl inverts to DEL, Alt ESC-prefixes.
     let mode = KeyboardMode::BACKARROW_SENDS_BS;
     assert_eq!(
         encode_key(&Key::Named(NamedKey::Backspace), Modifiers::empty(), mode),
@@ -507,17 +447,13 @@ fn legacy_backspace_decbkm_sends_bs() {
     );
 }
 
-// xterm private modes 1035/1036/1039 (numLock, metaSendsEscape, altSendsEscape)
-
 #[test]
 fn legacy_alt_no_esc_suppresses_esc_prefix() {
-    // Mode 1039 reset (ALT_NO_ESC): Alt+key -> bare key, no ESC prefix.
     let mode = KeyboardMode::ALT_NO_ESC;
     assert_eq!(
         encode_key(&Key::Character('a'), Modifiers::ALT, mode),
         vec![b'a']
     );
-    // Ctrl+Alt still folds to the control byte, but without the ESC prefix.
     assert_eq!(
         encode_key(&Key::Character('c'), Modifiers::CTRL | Modifiers::ALT, mode),
         vec![0x03]
@@ -526,13 +462,11 @@ fn legacy_alt_no_esc_suppresses_esc_prefix() {
 
 #[test]
 fn legacy_meta_sends_escape_on_prefixes_esc() {
-    // Mode 1036 set (META_SENDS_ESC): Meta+key -> ESC + key, mirroring Alt.
     let mode = KeyboardMode::META_SENDS_ESC;
     assert_eq!(
         encode_key(&Key::Character('a'), Modifiers::META, mode),
         vec![0x1b, b'a']
     );
-    // Ctrl+Meta folds to the control byte with the ESC prefix.
     assert_eq!(
         encode_key(
             &Key::Character('c'),
@@ -545,13 +479,11 @@ fn legacy_meta_sends_escape_on_prefixes_esc() {
 
 #[test]
 fn legacy_special_modifiers_off_strips_numlock() {
-    // Mode 1035 reset (NO_SPECIAL_MODIFIERS): NumLock alone is no modifier.
     let mode = KeyboardMode::NO_SPECIAL_MODIFIERS;
     assert_eq!(
         encode_key(&Key::Character('a'), Modifiers::NUM_LOCK, mode),
         vec![b'a']
     );
-    // The flag does not corrupt an accompanying real modifier.
     assert_eq!(
         encode_key(
             &Key::Character('a'),
@@ -562,8 +494,6 @@ fn legacy_special_modifiers_off_strips_numlock() {
     );
 }
 
-/// KP_Begin, the NumLock-off centre key, has no glyph and never types a digit: xterm's `kb2`,
-/// `CSI E` in normal mode and `SS3 E` under DECKPAM.
 #[test]
 fn legacy_numpad_begin_is_the_xterm_letter_form_never_a_digit() {
     let begin = Key::Named(NamedKey::NumpadBegin);
@@ -576,17 +506,14 @@ fn legacy_numpad_begin_is_the_xterm_letter_form_never_a_digit() {
         encode_key(&begin, Modifiers::empty(), KeyboardMode::APP_KEYPAD),
         b"\x1bOE"
     );
-    // Shift cancels application keypad mode, as it does for every keypad key.
     assert_eq!(
         encode_key(&begin, Modifiers::SHIFT, KeyboardMode::APP_KEYPAD),
         b"\x1b[E"
     );
-    // ALT is `altSendsEscape` on the sequence the key would otherwise send.
     assert_eq!(
         encode_key(&begin, Modifiers::ALT, KeyboardMode::empty()),
         b"\x1b\x1b[E"
     );
-    // VT52 application keypad keeps its keypad-character form.
     assert_eq!(
         encode_key(
             &begin,
@@ -595,7 +522,6 @@ fn legacy_numpad_begin_is_the_xterm_letter_form_never_a_digit() {
         ),
         b"\x1b?5"
     );
-    // The legacy and kitty letter forms agree.
     assert_eq!(
         encode_key(
             &begin,
@@ -606,13 +532,6 @@ fn legacy_numpad_begin_is_the_xterm_letter_form_never_a_digit() {
     );
 }
 
-/// NumLock does not cancel DECKPAM: it is a lock, not a chord. A physical keypad types digits
-/// only with NumLock on, so letting it cancel application mode would put DECKPAM's `SS3 p..y`
-/// out of a keyboard's reach. Under `smkx` programs (vim, less, tmux) the keypad digits send
-/// `SS3 p..y`, as VTE does; xterm's default (`numLock: true`) lets NumLock cancel DECKPAM, and
-/// vim maps most of them back but takes keypad 3 and 9 as PageDown and PageUp (terminfo `kc3`,
-/// `ka3`). Behind a Windows console host in win32-input-mode the keypad is its key records
-/// instead, DECKPAM or not (`encode_win32_keys`).
 #[test]
 fn legacy_numpad_digit_under_app_keypad_ignores_num_lock() {
     let kp5 = Key::Named(NamedKey::Numpad5);
@@ -631,7 +550,6 @@ fn legacy_numpad_digit_under_app_keypad_ignores_num_lock() {
         b"5",
         "with no application keypad mode the keypad still types its glyph"
     );
-    // SHIFT remains the one thing that cancels application keypad mode.
     assert_eq!(
         encode_key(
             &kp5,

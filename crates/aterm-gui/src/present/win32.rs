@@ -72,10 +72,8 @@ struct BitfieldsInfo {
     masks: [u32; 3],
 }
 
-/// Red, green and blue in aterm's `0x00RRGGBB` words.
 const MASKS: [u32; 3] = [0x00ff_0000, 0x0000_ff00, 0x0000_00ff];
 
-/// A rectangle as `BitBlt` takes it, or `None` past `i32`.
 fn gdi_rect(rect: &DamageRect) -> Option<(i32, i32, i32, i32)> {
     let fits = |v: u32| i32::try_from(v).ok();
     Some((
@@ -86,8 +84,6 @@ fn gdi_rect(rect: &DamageRect) -> Option<(i32, i32, i32, i32)> {
     ))
 }
 
-/// Flush even when a later copy failed: an earlier batched copy may still
-/// read the section.
 fn flush_present_blits(
     copy: impl FnOnce() -> Result<(), Win32PresentError>,
     flush: impl FnOnce() -> bool,
@@ -97,9 +93,6 @@ fn flush_present_blits(
     copied.and(flushed)
 }
 
-/// The part of `hwnd`'s update region's bounding rectangle inside a `width` x
-/// `height` buffer: what Windows asks to be repainted (rows the window gained,
-/// say) and the validation that ends a present would otherwise mark drawn.
 fn exposed_rect(hwnd: HWND, width: i32, height: i32) -> Option<DamageRect> {
     let mut r = RECT::default();
     // SAFETY: this surface's window and an out rectangle; FALSE erases nothing.
@@ -117,7 +110,6 @@ fn exposed_rect(hwnd: HWND, width: i32, height: i32) -> Option<DamageRect> {
     })
 }
 
-/// One DIB section, selected into a memory DC of its own.
 struct Dib {
     dc: HDC,
     bitmap: HBITMAP,
@@ -133,7 +125,6 @@ struct Dib {
 }
 
 impl Dib {
-    /// A `width` x `height` buffer compatible with `window_dc`.
     fn new(window_dc: HDC, width: i32, height: i32) -> Result<Self, Win32PresentError> {
         let too_big = || Win32PresentError::Size(width.unsigned_abs(), height.unsigned_abs());
         let len = usize::try_from(width)
@@ -225,15 +216,12 @@ impl Drop for Dib {
     }
 }
 
-/// The window's DC for one use: `GetDC`'s common DC, released when this is
-/// dropped.
 struct WindowDc {
     hwnd: HWND,
     dc: HDC,
 }
 
 impl WindowDc {
-    /// `hwnd`'s DC, which a window of this thread gives.
     fn get(hwnd: HWND) -> Result<Self, Win32PresentError> {
         // SAFETY: the surface's window, on its thread (`GdiSurface::new`).
         let dc = unsafe { GetDC(hwnd) };
@@ -315,7 +303,6 @@ pub(crate) struct Win32Presenter {
     _window: Arc<Window>,
 }
 
-/// The window's HWND, when it is a Win32 window.
 fn hwnd_of(window: &Window) -> Option<HWND> {
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(ptr::without_provenance_mut(h.hwnd.get() as usize)),

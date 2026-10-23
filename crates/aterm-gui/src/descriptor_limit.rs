@@ -6,8 +6,6 @@
 
 use crate::handoff_env::HandoffName;
 
-/// The soft `RLIMIT_NOFILE` a launched successor raises itself to before it
-/// dials (never above its hard limit).
 const SUCCESSOR_DESCRIPTOR_FLOOR: u64 = 4096;
 
 /// The lane a successor's sessions arrive on, for the record its raise leaves
@@ -67,12 +65,6 @@ pub(crate) fn raised_soft_limit(soft: u64, hard: u64) -> Option<u64> {
     (target > soft).then_some(target)
 }
 
-/// The soft `RLIMIT_NOFILE` this process was LAUNCHED with, recorded by the
-/// first [`raise_descriptor_limit_for_claim`] that moved it — a claim's, a
-/// park's or a recovery's — or adopted from a predecessor that carried it
-/// ([`adopt_carried_launcher_limit`]); unset when the limit was never raised
-/// (a Dock launch that has not yet attempted an update, a limit that already
-/// had room).
 static LAUNCHER_SOFT_NOFILE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
 /// The soft descriptor limit a shell this process spawns must be handed back.
@@ -80,8 +72,6 @@ pub(crate) fn launcher_soft_descriptor_limit() -> Option<u64> {
     LAUNCHER_SOFT_NOFILE.get().copied()
 }
 
-/// The soft `RLIMIT_NOFILE` this process would hold had no PARK raised it;
-/// 0 when it holds no park's raise.
 static PARK_RAISED_FROM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// See [`PARK_RAISED_FROM`].
@@ -89,14 +79,12 @@ pub(crate) fn park_raised_from() -> Option<u64> {
     Some(PARK_RAISED_FROM.load(std::sync::atomic::Ordering::Relaxed)).filter(|from| *from > 0)
 }
 
-/// The raise this process now holds is one a claim or a recovery makes
-/// whatever a park did before it (see [`PARK_RAISED_FROM`]).
 fn forget_park_raise() {
     PARK_RAISED_FROM.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// The launch variable in which a predecessor tells its successor the soft
-/// descriptor limit it held before a PARK raised it.
+/// The launch variable in which a predecessor tells its successor the soft descriptor limit it held
+/// before a PARK raised it.
 pub(crate) const ENV_PARK_RAISED_FROM: HandoffName =
     HandoffName::new("ATERM_HANDOFF_PARK_RAISED_FROM");
 
@@ -104,18 +92,12 @@ pub(crate) const ENV_PARK_RAISED_FROM: HandoffName =
 pub(crate) const ENV_LAUNCHER_NOFILE: HandoffName =
     HandoffName::new("ATERM_HANDOFF_LAUNCHER_NOFILE");
 
-/// v0.100.0's build (`RELEASES.ledger`; no v0.99.0 was cut): the first
-/// release that takes [`ENV_LAUNCHER_NOFILE`] out of its environment at its
-/// capture (06b06e74e).
 const TAKES_LAUNCHER_NOFILE_FROM_BUILD: u64 = 1_790_807_622;
 
-/// v0.101.0's build: the first release that takes [`ENV_PARK_RAISED_FROM`]
-/// out of its environment (ddaf83ae2f, after v0.100.0 was cut).
 const TAKES_PARK_RAISED_FROM_BUILD: u64 = 1_791_501_389;
 
-/// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps
-/// this process's soft descriptor limit — the fork lane's child and the cold
-/// lane's `exec` alike.
+/// Name [`ENV_LAUNCHER_NOFILE`] on a successor's `command` whose image keeps this process's soft
+/// descriptor limit — the fork lane's child and the cold lane's `exec` alike.
 pub(crate) fn carry_launcher_limit(
     command: &mut aterm_uds::spawnfd::StdCommand,
     target_build: u64,
@@ -134,7 +116,7 @@ pub(crate) fn carry_launcher_limit(
     }
 }
 
-/// A carried limit is an update's word to its successor, and nothing ELSE's .
+/// Removes stray carried descriptor-limit env vars on non-update launches.
 pub(crate) fn forget_stray_limits(env: &mut crate::handoff_env::HandoffEnv, update_launch: bool) {
     if update_launch || !(env.present(ENV_LAUNCHER_NOFILE) || env.present(ENV_PARK_RAISED_FROM)) {
         return;
@@ -148,9 +130,6 @@ pub(crate) fn forget_stray_limits(env: &mut crate::handoff_env::HandoffEnv, upda
     );
 }
 
-/// A carried launcher limit this process may adopt: a number, and never above
-/// the soft limit it runs at (`soft`) — it only ever gives the shells LESS
-/// than this process has, which is the one direction the raise moved.
 fn carried_launcher_limit(carried: Option<&str>, soft: u64) -> Option<u64> {
     carried?
         .parse::<u64>()
@@ -164,7 +143,7 @@ pub(crate) fn adopt_carried_launcher_limit(env: &crate::handoff_env::HandoffEnv)
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: A valid resource id and an exclusively borrowed, writable out-parameter for the one.
+    // SAFETY: A valid resource id and an exclusively borrowed, writable out-parameter.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
         return None;
     }
@@ -185,7 +164,7 @@ pub(crate) fn raise_descriptor_limit_for_claim() -> std::io::Result<Option<(u64,
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: A valid resource id and an exclusively borrowed, writable out-parameter for the one.
+    // SAFETY: A valid resource id and an exclusively borrowed, writable out-parameter.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &raw mut limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -197,7 +176,8 @@ pub(crate) fn raise_descriptor_limit_for_claim() -> std::io::Result<Option<(u64,
         rlim_cur: target,
         rlim_max: limit.rlim_max,
     };
-    // SAFETY: A valid resource id and a fully initialised rlimit that keeps the hard limit as it.
+    // SAFETY: A valid resource id and a fully initialized rlimit that keeps the hard limit
+    // unchanged.
     if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const raised) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -223,7 +203,7 @@ pub(crate) fn raise_descriptor_limit_for_recovery() {
     }
 }
 
-/// The outgoing process needs the same room at its park (#3).
+/// Raises this process's soft descriptor limit for the park when `target_build >= build`.
 pub(crate) fn raise_descriptor_limit_for_park(target_build: u64, build: u64) {
     if target_build < build {
         aterm_log::info!(
@@ -250,7 +230,7 @@ pub(crate) fn raise_descriptor_limit_for_park(target_build: u64, build: u64) {
     }
 }
 
-/// The limit an older successor is started.
+/// Pre-park soft descriptor limit to restore when starting an older successor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct OlderImageLimit {
     /// The soft limit the image is started at: this process's before the
@@ -262,9 +242,6 @@ pub(crate) struct OlderImageLimit {
     table: libc::c_int,
 }
 
-/// The soft limit an image of `target_build`, started by a process of `build`
-/// that runs at `soft`, is started at — `None` to leave it the limit it
-/// inherits: only an older target, and only under a park's raise.
 fn older_image_soft_limit(
     target_build: u64,
     build: u64,
@@ -278,8 +255,6 @@ fn older_image_soft_limit(
 }
 
 impl OlderImageLimit {
-    /// What an image of `target_build` is started at by this process of
-    /// `build` ([`older_image_soft_limit`] over this process's limits).
     fn toward(target_build: u64, build: u64) -> Option<Self> {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
@@ -298,21 +273,16 @@ impl OlderImageLimit {
         })
     }
 
-    /// The first descriptor at or above [`Self::soft`] that an `exec` keeps:
-    /// open, and not close-on-exec.
     fn inheritable_at_or_above(&self) -> Option<libc::c_int> {
         let floor = libc::c_int::try_from(self.soft).unwrap_or(libc::c_int::MAX);
         (floor..self.table).find(|fd| {
-            // SAFETY: `F_GETFD` only reads one number's flags; a number that
-            // is not open answers -1.
+            // SAFETY: `F_GETFD` only reads one number's flags; a number that is not open answers
+            // -1.
             let flags = unsafe { libc::fcntl(*fd, libc::F_GETFD) };
             flags >= 0 && flags & libc::FD_CLOEXEC == 0
         })
     }
 
-    /// Set this process's soft limit to `soft`, the hard one as it is. A
-    /// bare `setrlimit` — async-signal-safe, as the PTY's own post-fork child
-    /// relies on.
     fn set_soft(&self, soft: u64) -> std::io::Result<()> {
         let limit = libc::rlimit {
             rlim_cur: soft,
@@ -327,7 +297,7 @@ impl OlderImageLimit {
     }
 }
 
-/// Start the FORK lane's successor `command` at [`OlderImageLimit`] when its `target_build`.
+/// Starts the fork-lane successor `command` at [`OlderImageLimit`] when `target_build < build`.
 pub(crate) fn start_older_image_at_its_limit(
     command: &mut aterm_uds::spawnfd::StdCommand,
     target_build: u64,
@@ -360,8 +330,8 @@ pub(crate) fn start_older_image_at_its_limit(
          successor is started at the soft descriptor limit {soft} this process held before the \
          park's raise"
     );
-    // SAFETY: the closure runs between fork and exec and calls only `fcntl`
-    // and `setrlimit` over integers it owns — no allocation, no lock.
+    // SAFETY: the closure runs between fork and exec and calls only `fcntl` and `setrlimit` over
+    // integers it owns — no allocation, no lock.
     unsafe {
         command.pre_exec(move || {
             // A descriptor the image would keep at or above the limit, or a
@@ -434,7 +404,6 @@ pub(crate) mod tests {
         unsafe { (OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1])) }
     }
 
-    /// THE LAUNCHER'S LIMIT OUTLIVES A FORK-LANE HOP.
     #[test]
     fn a_forked_successor_adopts_the_carried_launcher_limit() {
         assert_eq!(carried_launcher_limit(Some("256"), 4096), Some(256));
@@ -450,7 +419,6 @@ pub(crate) mod tests {
         assert_eq!(carried_launcher_limit(None, 4096), None, "an older parent");
     }
 
-    /// THE LAUNCHER'S LIMIT OUTLIVES A COLD-LANE EXEC TOO (#81).
     #[test]
     fn a_cold_lane_exec_carries_the_launchers_limit_to_the_new_images_shells() {
         const NEW_IMAGE: &str = "ATERM_TEST_COLD_EXEC_NEW_IMAGE";
@@ -496,7 +464,6 @@ pub(crate) mod tests {
         image.spawn().passed();
     }
 
-    /// This process's soft descriptor limit.
     fn soft_nofile() -> u64 {
         let mut limit = libc::rlimit {
             rlim_cur: 0,
@@ -510,14 +477,11 @@ pub(crate) mod tests {
         limit.rlim_cur
     }
 
-    /// Mark every descriptor at or above `floor` close-on-exec: what a busy
-    /// test run leaked into a child of the test binary there is not the
-    /// desk's, and a window at that limit could hold none.
     fn mark_close_on_exec_at_or_above(floor: u64) {
         let floor = i32::try_from(floor).expect("a descriptor number");
         for fd in floor..aterm_uds::spawnfd::descriptor_bound() {
-            // SAFETY: F_GETFD/F_SETFD on any number only reads or sets its
-            // close-on-exec flag; a number that is not open answers -1.
+            // SAFETY: F_GETFD/F_SETFD on any number only reads or sets its close-on-exec flag; a
+            // number that is not open answers -1.
             unsafe {
                 let flags = libc::fcntl(fd, libc::F_GETFD);
                 if flags >= 0 {
@@ -527,10 +491,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The soft descriptor limit a fork-lane successor of `target_build`,
-    /// started by this process of `build` and handed `inherited`, runs at —
-    /// read by a stand-in's own `ulimit -n`, through the lane's own hook
-    /// ([`start_older_image_at_its_limit`]).
     fn successor_soft_nofile(
         target_build: u64,
         build: u64,
@@ -547,7 +507,6 @@ pub(crate) mod tests {
             .expect("a limit")
     }
 
-    /// AN OLDER SUCCESSOR STARTS AT THE LIMIT HELD BEFORE A PARK'S RAISE.
     #[test]
     fn an_older_successor_starts_at_the_limit_held_before_a_parks_raise() {
         const NEW_IMAGE: &str = "ATERM_TEST_PARK_RAISE_NEW_IMAGE";
@@ -621,8 +580,8 @@ pub(crate) mod tests {
 
         let (read, _write) = pipe_for_test();
         let launchd_fd = i32::try_from(launchd).expect("a descriptor number");
-        // SAFETY: F_DUPFD duplicates a live descriptor at the first free
-        // number at or above `launchd_fd`, with close-on-exec clear.
+        // SAFETY: F_DUPFD duplicates a live descriptor at the first free number at or above
+        // `launchd_fd`, with close-on-exec clear.
         let high = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_DUPFD, launchd_fd) };
         assert!(
             high >= launchd_fd,
@@ -693,8 +652,8 @@ pub(crate) mod tests {
         let cap = authority.grant::<aterm_sandbox::Sandbox>(aterm_cap::Tier::Trusted);
         let mut shell = std::process::Command::new("/bin/sh");
         shell.args(["-c", "ulimit -n"]);
-        // SAFETY: `apply` is a bare `getrlimit`/`setrlimit` loop with a valid
-        // cap — async-signal-safe, as the PTY's own post-fork child relies on.
+        // SAFETY: `apply` is a bare `getrlimit`/`setrlimit` loop with a valid cap —
+        // async-signal-safe, as the PTY's own post-fork child relies on.
         unsafe {
             shell.pre_exec(move || limits.apply(&cap));
         }
@@ -708,8 +667,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// EVERY LANE SETTLES ITS DESCRIPTOR LIMIT IN ONE PLACE (
-    /// U9).
     #[test]
     fn every_lane_settles_its_descriptor_limit_in_one_place() {
         fn soft_limit() -> u64 {
@@ -759,17 +716,10 @@ pub(crate) mod tests {
         assert_eq!(park_raised_from(), None, "and the record stays the claim's");
     }
 
-    /// A STRAY LAUNCHER LIMIT IS NOBODY'S. A window
-    /// whose limit a park raised updates; its successor is a build that never
-    /// reads the names (every release up to v0.99.0, reached by a rollback,
-    /// played here by a stand-in that takes neither) and so leaves them in the
-    /// environment of every shell it opens, while it takes `ATERM_UPDATED_FROM`
-    /// out as every build does.
     #[test]
     fn only_an_updates_launch_adopts_a_carried_launcher_limit() {
         const ROLE: &str = "ATERM_TEST_STRAY_LIMIT_ROLE";
         const BUILD: u64 = 7;
-        /// `main_entry`'s steps for the limit, in its order.
         fn launch() -> crate::handoff_env::HandoffEnv {
             let mut env = crate::handoff_env::HandoffEnv::capture();
             forget_stray_limits(&mut env, std::env::var_os("ATERM_UPDATED_FROM").is_some());
@@ -833,8 +783,6 @@ pub(crate) mod tests {
         successor.spawn().passed();
     }
 
-    /// ONLY A TARGET THAT TAKES THE NAMES IS TOLD THEM:
-    /// a successor built before a name leaves it in its shells' environment.
     #[test]
     fn only_a_target_that_takes_the_names_is_told_them() {
         const V0_98_0: u64 = 1_790_607_299;

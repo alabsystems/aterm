@@ -201,8 +201,6 @@ impl App {
                 .get(&window)
                 .and_then(|ws| ws.os_window.as_ref())
         {
-            // The editor was painted, so its removal repaints even when nothing was
-            // written (Escape, a no-op commit).
             w.request_redraw();
         }
     }
@@ -302,8 +300,6 @@ impl App {
         match self.write_session_meta_field(session, field, text) {
             Ok(_) => {}
             Err(error) => {
-                // Both editors canonicalize as the user types, so only a scripted `invoke`
-                // can reach this.
                 aterm_log::info!("rename refused for session {session}: {error:?}");
             }
         }
@@ -327,7 +323,6 @@ impl App {
         text: &str,
     ) -> Result<bool, MetaWriteError> {
         let Some(ctx) = self.pool.get(session).map(|s| s.ctx.clone()) else {
-            // The session exited while the editor was open: nothing left to name.
             return Ok(false);
         };
         let edit = if text.trim().is_empty() {
@@ -356,7 +351,6 @@ mod tests {
 
     use crate::session_pin_for_test as pin;
 
-    /// The recorded `meta-change` payloads, oldest-first.
     fn meta_events(app: &App, session: u64) -> Vec<String> {
         let ctx = app.pool.get(session).expect("session").ctx.clone();
         let tl = ctx.timeline.lock().unwrap();
@@ -366,8 +360,6 @@ mod tests {
             .collect()
     }
 
-    /// A commit pins the title, the tab label follows, one `meta-change` is recorded, and the
-    /// editor closes.
     #[test]
     fn a_commit_pins_the_title_and_closes_the_editor() {
         let mut app = App::headless_for_test();
@@ -386,8 +378,6 @@ mod tests {
         );
     }
 
-    /// Renaming a different tab while one edit is live commits the first, like every other way
-    /// of leaving a field.
     #[test]
     fn opening_another_rename_commits_the_one_it_replaces() {
         let mut app = App::headless_for_test();
@@ -412,7 +402,6 @@ mod tests {
         );
     }
 
-    /// Escape writes and records nothing and closes the editor; an existing pin survives.
     #[test]
     fn a_cancel_writes_nothing_and_leaves_an_existing_pin_alone() {
         let mut app = App::headless_for_test();
@@ -433,8 +422,6 @@ mod tests {
         assert_eq!(meta_events(&app, 0).len(), 1, "cancel recorded nothing");
     }
 
-    /// An empty commit clears the pin: the label falls back to the OSC title and the event
-    /// says `value=-`, the cleared marker, not the `value=` a `Set("")` would record.
     #[test]
     fn an_empty_commit_clears_the_pin_and_the_ladder_falls_back() {
         let mut app = App::headless_for_test();
@@ -460,8 +447,6 @@ mod tests {
         );
     }
 
-    /// A commit queued behind its tab's close writes nothing, and a begin against the dead tab
-    /// id is refused rather than retargeted at whatever tab holds the slot now.
     #[test]
     fn a_close_during_the_edit_drops_the_commit_instead_of_retargeting() {
         let mut app = App::headless_for_test();
@@ -485,9 +470,6 @@ mod tests {
         assert_eq!(app.rename_edit_session(wid), None);
     }
 
-    /// No menu command runs through an open editor: macOS resolves a key equivalent before
-    /// the first responder sees the key, so a structural command settles the edit first, and
-    /// `RenameSession` itself leaves the open field alone.
     #[test]
     fn a_menu_command_ends_the_edit_before_it_runs_and_rename_stays_idempotent() {
         use crate::menu::MenuAction;
@@ -517,8 +499,6 @@ mod tests {
         );
     }
 
-    /// The pin write refuses rather than truncates (the control socket's ladder), and a
-    /// refusal leaves the store untouched.
     #[test]
     fn an_over_cap_pin_is_refused_and_stores_nothing() {
         let mut app = App::headless_for_test();
@@ -533,9 +513,6 @@ mod tests {
         assert!(meta_events(&app, 0).is_empty());
     }
 
-    /// With no native editor and no in-grid strip (`tab_strip_rows == 0`, the macOS default and
-    /// every plain `headless_for_test`), a rename is refused outright and stores no edit that
-    /// nothing could end.
     #[test]
     fn a_surface_less_window_refuses_the_edit_instead_of_storing_a_phantom() {
         use crate::menu::MenuAction;
@@ -565,8 +542,6 @@ mod tests {
         );
     }
 
-    /// The in-grid editor is driven and ended through the engine-neutral input seam (the one
-    /// controller `key`/`text` verbs arrive on), so a headless instance can use it.
     #[test]
     fn the_input_seam_drives_the_in_grid_field_and_commits_it() {
         use crate::input::InputEvent;
@@ -600,7 +575,6 @@ mod tests {
         assert_eq!(app.rename_edit_session(wid), None, "the editor closed");
     }
 
-    /// ⎋ through the same seam cancels and writes nothing.
     #[test]
     fn the_input_seam_cancels_on_escape_and_writes_nothing() {
         use crate::input::InputEvent;
@@ -625,8 +599,6 @@ mod tests {
         assert!(meta_events(&app, 0).is_empty());
     }
 
-    /// The field canonicalizes as the user types, like the macOS field editor: a mid-word space
-    /// survives and an over-cap paste is clamped, so the field only holds storable values.
     #[test]
     fn the_in_grid_field_holds_only_storable_values() {
         let mut app = App::headless_for_test();
@@ -659,8 +631,6 @@ mod tests {
         );
     }
 
-    /// The strip's repaint fingerprint carries the live in-grid field, so the RepaintKey
-    /// early-out and the painted-row cache both see every keystroke.
     #[test]
     fn a_keystroke_in_the_field_moves_the_strip_fingerprint() {
         let mut app = App::headless_for_test();

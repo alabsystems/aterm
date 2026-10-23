@@ -1,9 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Minimum-contrast floor coverage beyond glyph fg: block-cursor fill and
-// line decorations. CPU fills are exact; GPU parity is covered by the shared
-// `floor_cursor_fill` / `deco_inks` functions and the `gpu_matches_cpu` suite.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{
@@ -15,14 +11,11 @@ fn renderer() -> Renderer {
         .expect("no font: build with aterm-render's default embedded-font feature")
 }
 
-/// An OSC-12 cursor colour equal to the cell bg is invisible with the
-/// minimum-contrast knob off and floored to a visible fill with it on.
 #[test]
 fn block_cursor_near_bg_is_floored_visible() {
     let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = Terminal::new(2, 4);
-    // Steady block; one space cell with bg #202020; cursor back on it (CUP).
     term.process(b"\x1b[2 q\x1b[48;2;32;32;32m \x1b[0m\x1b[H");
     let mut input = term.cell_frame(2, 4);
     let bg = input.cells[0][0].bg;
@@ -86,14 +79,11 @@ fn sparse_block_cursor_uses_its_pane_default_for_contrast() {
     }
 }
 
-/// A low-contrast underline (fg near bg, no explicit SGR 58 colour) routes
-/// through the glyph fg contrast floor when the knob is on and stays raw when off.
 #[test]
 fn underline_routes_through_the_min_contrast_floor() {
     let mut r = renderer();
     let (cw, ch) = r.cell_size();
     let mut term = Terminal::new(2, 8);
-    // Space glyph so no AA ink lands on the underline rows.
     term.process(b"\x1b[48;2;32;32;32m\x1b[38;2;48;48;48m\x1b[4m \x1b[0m");
     let input = term.cell_frame(2, 8);
     let fg = 0x0030_3030u32;

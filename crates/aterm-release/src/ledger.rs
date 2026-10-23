@@ -144,7 +144,7 @@ impl GitCli {
 impl GitRunner for GitCli {
     fn git(&self, args: &[&str]) -> Result<RunOut> {
         use aterm_uds::spawnfd::Stdio;
-        let mut git = command("git");
+        let mut git = command(aterm_uds::os_path!("git"));
         let child = crate::credential_wait::ask_no_one(&mut git)
             .arg("-C")
             .arg(&self.repo)
@@ -167,7 +167,7 @@ impl GitRunner for GitCli {
     }
 
     fn git_input(&self, args: &[&str], input: &[u8]) -> Result<RunOut> {
-        let mut cmd = command("git");
+        let mut cmd = command(aterm_uds::os_path!("git"));
         crate::credential_wait::ask_no_one(&mut cmd)
             .arg("-C")
             .arg(&self.repo);
@@ -187,7 +187,7 @@ pub(crate) const BYTE_EXACT: [&str; 6] = [
 
 /// `git -C <repo>` that answers for that repository's objects as recorded and nothing else: every inherited `GIT_*` variable is removed (`GIT_DIR`, `GIT_OBJECT_DIRECTORY`, `GIT_GRAFT_FILE` … would answer for another repository or rewrite this one), no system or global config is read, replace refs are ignored, nothing is fetched lazily or prompts, no optional lock is taken, and stdin is empty.
 pub fn object_git(repo: &Path) -> Command {
-    let mut cmd = command("git");
+    let mut cmd = command(aterm_uds::os_path!("git"));
     for (key, _) in std::env::vars_os() {
         if key.to_string_lossy().starts_with("GIT_") {
             cmd.env_remove(&key);

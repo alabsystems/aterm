@@ -256,9 +256,9 @@ impl Launch for Signals {
             ));
         }
         let child = cmd.spawn()?;
-        let during = self
-            .during
-            .is_some_and(|sub| cmd.get_program() == "git" && cmd.get_args().any(|a| a == sub));
+        let during = self.during.is_some_and(|sub| {
+            cmd.get_program() == aterm_uds::os_path!("git") && cmd.get_args().any(|a| a == sub)
+        });
         if during {
             self.caught.set(Some(15));
         }

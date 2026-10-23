@@ -71,9 +71,7 @@ fn select_script(list: &ScriptList, tags: &[Tag]) -> Option<u16> {
         .find_map(|tag| index_for_tag(&have, Tag::from_bytes(tag)))
 }
 
-/// The OpenType script tags for a Unicode (ISO 15924) script, preferred
-/// first (HarfBuzz's `hb_ot_all_tags_from_script`): the version 3 and 2 tags
-/// of the Indic scripts that have them, then the old tag.
+/// OpenType script tags for a Unicode (ISO 15924) script, preferred first.
 fn script_tags_from_unicode(unicode_script: Tag) -> Vec<Tag> {
     const NEW_TAGS: &[(&[u8; 4], &[u8; 4])] = &[
         (b"Beng", b"bng2"),
@@ -126,8 +124,7 @@ fn feature_index_for_tag(
         .find(|&feature_ix| features.tag(feature_ix) == Some(tag))
 }
 
-/// The `GSUB` subtables of a lookup, each that parses (a malformed one is
-/// skipped, not the rest of the lookup).
+/// Valid `GSUB` subtables of a lookup.
 fn subtables<'a>(
     lookup: &crate::opentype_layout::Lookup<'a>,
 ) -> impl Iterator<Item = SubstitutionSubtable<'a>> {
@@ -327,8 +324,6 @@ impl<'a, 'f> Shaper<'a, 'f> {
         if let Some(range) = gsub_handler.finish() {
             let mut result = false;
             for glyph_style in &mut glyph_styles[range] {
-                // We only want to return true here if we actually assign the
-                // style to avoid computing unnecessary metrics
                 result |= glyph_style.maybe_assign_gsub_output_style(style);
             }
             result
@@ -578,7 +573,6 @@ impl<'a, 'b> GsubHandler<'a, 'b> {
     fn finish(self) -> Option<Range<usize>> {
         self.visited_set.clear();
         if self.min_gid > self.max_gid || self.glyph_styles.is_empty() {
-            // We didn't touch any glyphs
             return None;
         }
         let range = self.min_gid..self.max_gid + 1;
@@ -702,8 +696,6 @@ mod tests {
         }
     }
 
-    /// The visited-lookup bit set: an index past its bits reads as
-    /// visited, so a lookup index past the lookup list is never walked.
     #[test]
     fn visited_set() {
         let mut storage = [0u8; 2];

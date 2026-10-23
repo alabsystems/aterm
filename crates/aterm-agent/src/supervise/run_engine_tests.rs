@@ -840,7 +840,7 @@ fn loop_scratch(tag: &str) -> PathBuf {
 #[cfg(unix)]
 fn loop_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("git")
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -3606,6 +3606,19 @@ struct TestHost {
     standing: std::sync::Mutex<Option<crate::harness::upgrade::StandingLimit>>,
     tails: std::sync::Mutex<Option<(String, String)>>,
     tail_asks: std::sync::atomic::AtomicUsize,
+    /// Each step leaves the next look due at once (the window's look every `first_look` at a
+    /// conversation it has not named).
+    keeps_looking: AtomicBool,
+    /// A step takes nothing (`None`): the look found nothing to do.
+    finds_nothing: AtomicBool,
+    /// From this step on (1-based; 0: never) a step takes nothing, whatever the steps before it
+    /// took.
+    nothing_from: std::sync::atomic::AtomicUsize,
+    /// The turn-end decisions on the run's tape, each its outcome ([`hosted_with_host_at`] reads
+    /// them).
+    decided: std::sync::Mutex<Vec<String>>,
+    /// Each wait the loop told, in order: its `at_unix`, or `None` for a wait ended.
+    told: std::sync::Mutex<Vec<Option<i64>>>,
 }
 
 const HEALTHY_MIB: u64 = 450;
@@ -3621,8 +3634,15 @@ impl IdleHost for TestHost {
         if again {
             self.again.fetch_sub(1, Ordering::SeqCst);
         }
-        self.wants.store(again, Ordering::SeqCst);
-        self.steps.fetch_add(1, Ordering::SeqCst);
+        self.wants.store(
+            again || self.keeps_looking.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        let n = self.steps.fetch_add(1, Ordering::SeqCst) + 1;
+        let from = self.nothing_from.load(Ordering::SeqCst);
+        if self.finds_nothing.load(Ordering::SeqCst) || (from > 0 && n >= from) {
+            return None;
+        }
         let step = |line: &str, moved: bool| {
             Some(HostStep {
                 line: line.to_string(),
@@ -3677,6 +3697,9 @@ impl IdleHost for TestHost {
     fn owns_turn_end(&self) -> bool {
         self.turn_ends.fetch_add(1, Ordering::SeqCst);
         self.owns.load(Ordering::SeqCst)
+    }
+    fn waiting(&self, plan: Option<crate::supervise::WaitPlan>) {
+        self.told.lock().unwrap().push(plan.map(|p| p.at_unix));
     }
     fn restart(&self, why: &crate::supervise::policy::turn_end::Restart) -> Option<String> {
         self.restarted.lock().unwrap().push(why.word());
@@ -5227,6 +5250,12 @@ fn hosted_with_host_at(
     drop(taped);
     m.after_call = None;
     tape.finish(&crate::supervise::tape::replay::hosted_end(&r));
+    let read = crate::supervise::tape::show::open(&tape.sink.bytes(), false).expect("reads");
+    *host.decided.lock().unwrap() = crate::supervise::tape::show::decisions(&read)
+        .into_iter()
+        .filter(|d| d.door == crate::supervise::tape::doors::DECIDE_TURN_END)
+        .map(|d| d.outcome)
+        .collect();
     let lines: Vec<String> = String::from_utf8(out)
         .expect("utf-8")
         .lines()
@@ -6700,6 +6729,229 @@ fn a_turn_end_the_host_let_go_is_decided_again() {
             assert_eq!(typed, 0, "{why}: still the host's");
         }
     }
+}
+
+/// What the host's looks at one point came to ([`looks_at_one_point`]).
+#[derive(Debug)]
+struct LooksAtOnePoint {
+    /// The host's steps (its looks).
+    looks: usize,
+    /// The journal's `WAITING` lines.
+    waiting: Vec<String>,
+    /// The ledger's `waiting` rows.
+    rows: usize,
+    /// The loop's own writes into the session.
+    typed: usize,
+    /// The turn-end decisions on the run's tape, each its outcome.
+    decided: Vec<String>,
+    /// Each wait the host was told, in order (`None`: a wait ended).
+    told: Vec<Option<i64>>,
+}
+
+/// A hosted run whose host wants every point and looks again at once (the window's look every
+/// `first_look` at a conversation it has not named, `WorkerIdle::unnamed`), `host` set up by
+/// `arm`, over `screens`, stopped once the host has looked `looks` times. The policy's short
+/// back-off is an hour, so nothing but a re-decision decides the point again.
+fn looks_at_one_point(
+    tag: &str,
+    screens: Vec<Vec<String>>,
+    looks: usize,
+    arm: impl FnOnce(&TestHost),
+) -> LooksAtOnePoint {
+    let host = Arc::new(TestHost::default());
+    host.wants.store(true, Ordering::SeqCst);
+    host.keeps_looking.store(true, Ordering::SeqCst);
+    arm(&host);
+    let mut m = Mock::new(screens);
+    m.cursor_on_caret = true;
+    m.stall_sleep = Some(Duration::from_millis(5));
+    let (jdir, journal) = journal_file(tag);
+    let (ldir, ledger) = ledger_file(tag);
+    let opts = SuperviseOpts {
+        max: Duration::from_secs(30),
+        journal: Some(journal.clone()),
+        ..SuperviseOpts::hosted()
+    };
+    let (r, _) = hosted_with_host_ledger(
+        &mut m,
+        &opts,
+        &host,
+        Stop::reached(
+            move |h| h.steps.load(Ordering::SeqCst) >= looks,
+            Duration::from_millis(300),
+        ),
+        Some(TurnEndTiming {
+            short_backoff: Duration::from_secs(3600),
+            ..TurnEndTiming::default()
+        }),
+        &ledger,
+    );
+    assert_eq!(r, Ok(()));
+    let (records, _) = journal_records(&journal);
+    let waiting = records
+        .iter()
+        .filter(|r| r.line.starts_with("WAITING "))
+        .map(|r| r.line.clone())
+        .collect();
+    let rows = ledger_rows(&ledger)
+        .iter()
+        .filter(|l| l.contains("\"waiting\""))
+        .count();
+    let _ = std::fs::remove_dir_all(&jdir);
+    let _ = std::fs::remove_dir_all(&ldir);
+    let typed = count(&m, "@s-1 turn") + count(&m, "@s-1 send") + count(&m, "@s-1 key");
+    let decided = host.decided.lock().unwrap().clone();
+    let told = host.told.lock().unwrap().clone();
+    LooksAtOnePoint {
+        looks: host.steps.load(Ordering::SeqCst),
+        waiting,
+        rows,
+        typed,
+        decided,
+        told,
+    }
+}
+
+/// A LOOK THAT FINDS NOTHING DECIDES THE POINT NO MORE (`docs/measured/vitals-3-2026-10-22.md`,
+/// V2). The window looks every `first_look` at a conversation it has not named; the look's step
+/// takes nothing. The point is decided twice, as before: once when it is new, and once more to
+/// carry out that decision, which the host's step at the new point came before. Then however
+/// many looks follow, the decision stands: no third decision, one journal `WAITING` line, one
+/// ledger `waiting` row, the host told its wait once, nothing typed. Measured live on main
+/// (Gemini CLI 0.46.0's ladder tab, `v3b-gl`): 36 looks, 48 decisions for 7 points, and 28 of its
+/// 35 `WAITING` lines the same line again, 20 s apart.
+///
+/// NEGATIVE CONTROL: a look whose step took something and left the point standing
+/// (`upgrade step=wait:settling`) still decides the point again at each look (the host may have
+/// held it: `a_turn_end_the_host_let_go_is_decided_again`); but a re-decision whose outcome is the
+/// wait on record writes nothing new and tells the host nothing new (one `WAITING`, one tell).
+#[test]
+fn a_look_that_finds_nothing_decides_the_point_no_more() {
+    let nothing = looks_at_one_point("look-nothing", vec![busy_screen(), idle_screen()], 6, |h| {
+        h.finds_nothing.store(true, Ordering::SeqCst)
+    });
+    assert!(nothing.looks >= 6, "the looks came: {nothing:#?}");
+    assert_eq!(
+        nothing.decided.len(),
+        2,
+        "the new point's decision, and the one that carried it out, over {} looks: {nothing:#?}",
+        nothing.looks
+    );
+    assert!(
+        nothing.decided.iter().all(|d| d.starts_with("WaitUntil")),
+        "{nothing:#?}"
+    );
+    assert_eq!(
+        (
+            nothing.waiting.len(),
+            nothing.rows,
+            nothing.told.len(),
+            nothing.typed
+        ),
+        (1, 1, 1, 0),
+        "{nothing:#?}"
+    );
+    let stood = looks_at_one_point("look-stood", vec![busy_screen(), idle_screen()], 6, |h| {
+        h.lets_go.store(true, Ordering::SeqCst)
+    });
+    assert!(stood.looks >= 6, "the looks came: {stood:#?}");
+    assert!(
+        stood.decided.len() >= 4,
+        "a step that left the point standing: decided again at its looks: {stood:#?}"
+    );
+    assert!(
+        stood.decided.iter().all(|d| d == &stood.decided[0]),
+        "the same wait each time: {stood:#?}"
+    );
+    assert_eq!(
+        (
+            stood.waiting.len(),
+            stood.rows,
+            stood.told.len(),
+            stood.typed
+        ),
+        (1, 1, 1, 0),
+        "the same wait decided again: nothing new written or told: {stood:#?}"
+    );
+}
+
+/// A STEP THAT MOVED THE POINT LEAVES NO DECISION OWED (`SupervisorHostTurnEnd`'s
+/// `NeverDecideAPointAStepMoved`): the host's step at the new point moved it
+/// (`upgrade step=done:fresh`, nothing typed), and the looks after it find nothing. The point's
+/// own decision, made before the step, is never carried out, and no look decides it again:
+/// one decision, no `WAITING`, nothing typed, the host told no wait.
+///
+/// NEGATIVE CONTROL: the same host whose first step finds nothing too has its decision carried
+/// out once (two decisions, one `WAITING`). Main's rule, a look that took nothing holding the
+/// point for a re-decision (`host_held = stood`), decided the moved point at the first look after
+/// the move.
+#[test]
+fn a_step_that_moved_the_point_leaves_no_decision_owed() {
+    let moved = looks_at_one_point("look-moved", vec![busy_screen(), idle_screen()], 4, |h| {
+        h.ends.store(true, Ordering::SeqCst);
+        h.nothing_from.store(2, Ordering::SeqCst);
+    });
+    assert!(moved.looks >= 2, "the looks came: {moved:#?}");
+    assert_eq!(
+        (moved.decided.len(), moved.waiting.len(), moved.typed),
+        (1, 0, 0),
+        "the moved point: decided once, never carried out, never decided again: {moved:#?}"
+    );
+    assert!(
+        moved.told.iter().all(Option::is_none),
+        "no wait told: {moved:#?}"
+    );
+    let unmoved = looks_at_one_point("look-unmoved", vec![busy_screen(), idle_screen()], 4, |h| {
+        h.ends.store(true, Ordering::SeqCst);
+        h.nothing_from.store(1, Ordering::SeqCst);
+    });
+    assert_eq!(
+        (unmoved.decided.len(), unmoved.waiting.len(), unmoved.typed),
+        (2, 1, 0),
+        "{unmoved:#?}"
+    );
+}
+
+/// A DECISION TO DO NOTHING, CARRIED OUT, IS OWED NO MORE: at a launch point of a tab with no
+/// task, the policy decides `Nothing`, and the host's looks after it find nothing. The point is
+/// decided twice (new, then carried out: `HOLD … why=policy`) and never again however many looks
+/// follow. Seen live on the final branch (`v3d-agy`, five of its 15 tabs): a look 20 s after the
+/// launch point `seq=351`, held by policy, found nothing and decided nothing; main, replaying
+/// each of those tapes, decides the point again there.
+///
+/// NEGATIVE CONTROL: the same launch point in a tab with a task is decided a `WaitUntil`, the
+/// same two decisions and no more ([`a_look_that_finds_nothing_decides_the_point_no_more`]).
+#[test]
+fn a_decision_to_do_nothing_carried_out_is_owed_no_more() {
+    let screen = || {
+        let mut r = rows(&["", "", "", ""]);
+        r.extend(composer("  ? for shortcuts"));
+        r
+    };
+    let launch = looks_at_one_point("look-launch", vec![screen()], 6, |h| {
+        h.finds_nothing.store(true, Ordering::SeqCst);
+        h.taskless.store(true, Ordering::SeqCst);
+    });
+    assert!(launch.looks >= 6, "the looks came: {launch:#?}");
+    assert_eq!(
+        launch.decided,
+        ["Nothing", "Nothing"],
+        "decided when new and carried out, then never again over {} looks: {launch:#?}",
+        launch.looks
+    );
+    assert_eq!((launch.waiting.len(), launch.typed), (0, 0), "{launch:#?}");
+    assert!(
+        launch.told.iter().all(Option::is_none),
+        "no wait told: {launch:#?}"
+    );
+    let tasked = looks_at_one_point("look-tasked", vec![screen()], 6, |h| {
+        h.finds_nothing.store(true, Ordering::SeqCst);
+    });
+    assert_eq!(tasked.decided.len(), 2, "{tasked:#?}");
+    assert!(
+        tasked.decided.iter().all(|d| d.starts_with("WaitUntil")),
+        "{tasked:#?}"
+    );
 }
 
 #[test]

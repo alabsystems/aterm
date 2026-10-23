@@ -471,14 +471,14 @@ const STARTER_CONFIG: &str = concat!(
 # conpty = \"bundled\"               # Windows console host for new tabs: \"bundled\" (default) | \"inbox\" | \"auto\" | path to OpenConsole.exe
 # desktop_alerts = false           # also post aterm's own needs-you alerts as system notifications (default off;
 #                                  #   macOS: UNUserNotificationCenter from Applications/aterm.app once authorized,
-#                                  #   else terminal-notifier or osascript when run outside an app bundle).
+#                                  #   else /usr/bin/osascript when run outside an app bundle).
 #                                  #   Program OSC 9/99/777 notifications are gated by allow_notifications below
 
 # --- program permissions (default OFF unless noted) --------------------------
 # allow_window_ops = false         # XTWINOPS title/grid/pixel/cell-size reports (position/screen size stay unanswered);
 #                                  #   Linux also applies window ops except move
 # allow_notifications = false      # OSC 9/99/777 desktop notifications (default off; macOS: UNUserNotificationCenter
-#                                  #   from Applications/aterm.app once authorized, else terminal-notifier/osascript;
+#                                  #   from Applications/aterm.app once authorized, else /usr/bin/osascript;
 #                                  #   Windows: Shell_NotifyIcon balloon/toast; Linux: D-Bus org.freedesktop.Notifications)
 # allow_palette_reconfigure = true   # allow OSC 4/21 256-colour palette changes for the session (default ON)
 # allow_kitty_file_transfer = false # allow Kitty file/temp-file/shm media to read host files (new sessions)

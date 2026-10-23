@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `ledger`, over a scripted host and a real journal file on disk: what each
-//! source contributes, the clock, the latency numbers, the three formats, and
-//! what it still prints when a source is missing.
+//! Tests for the supervisor ledger over scripted hosts and journal files.
 
 use std::collections::{BTreeMap, VecDeque};
 
@@ -61,12 +59,10 @@ fn err(text: &str) -> CtlReply {
     }
 }
 
-/// The worker's process clock's zero, and the times in it.
 const EPOCH: i64 = 1_789_000_000_000;
 const WORKER: &str = "s-work";
 const MANAGER: &str = "s-mgr";
 
-/// The three turns the manager typed, as `history` prints them.
 fn history() -> CtlReply {
     let mut out = String::new();
     for (id, started, dur, status, text) in [
@@ -90,7 +86,6 @@ fn history() -> CtlReply {
     ok(&out)
 }
 
-/// The screen the worker is on: the third turn's row, its reply, a done row.
 fn screen() -> Vec<String> {
     let mut r = rows(&[
         "❯ Third turn: stop and report",
@@ -103,8 +98,6 @@ fn screen() -> Vec<String> {
     r
 }
 
-/// One `offscreen … screen=1` reply, as `aterm ctl` prints it: the rows on
-/// stdout, the header on stderr.
 fn offscreen() -> CtlReply {
     offscreen_of(&[
         "⏺ Older words.",
@@ -116,7 +109,6 @@ fn offscreen() -> CtlReply {
     ])
 }
 
-/// The same read with `archived` as the rows the archive holds.
 fn offscreen_of(archived: &[&str]) -> CtlReply {
     let archived = rows(archived);
     let screen = screen();
@@ -138,8 +130,6 @@ fn offscreen_of(archived: &[&str]) -> CtlReply {
     }
 }
 
-/// This session's inbox: one message from the worker, one from someone else,
-/// and one post to the worker that has not landed.
 fn inbox() -> CtlReply {
     CtlReply {
         code: 0,
@@ -153,8 +143,6 @@ fn inbox() -> CtlReply {
     }
 }
 
-/// This session's timeline: one landed post to the worker, one still queued,
-/// and a post to another session.
 fn timeline() -> CtlReply {
     ok(&format!(
         "event 1 t=0 kind=spawned state=spawning\n\
@@ -165,7 +153,6 @@ fn timeline() -> CtlReply {
     ))
 }
 
-/// The journal the watcher wrote, on disk.
 fn journal_file(tag: &str, lines: &[String]) -> (std::path::PathBuf, std::path::PathBuf) {
     let dir = crate::supervise::test_scratch_path("ledger-journal", tag);
     std::fs::create_dir_all(&dir).expect("tmp dir");
@@ -183,7 +170,6 @@ fn record(t: i64, line: &str) -> String {
     JournalRecord::of_line(t, Some(WORKER), line, None).to_json()
 }
 
-/// The watcher's lines: one per kind, and two that are not this worker's.
 fn journal_lines() -> Vec<String> {
     let mut v: Vec<String> = [
         (
@@ -216,8 +202,6 @@ fn journal_lines() -> Vec<String> {
     .iter()
     .map(|(t, line)| record(EPOCH + t, line))
     .collect();
-    // Another session's watch wrote into the same file, and a line was cut
-    // short by the crash that ended it.
     v.push(
         JournalRecord::of_line(
             EPOCH + 40_000,
@@ -231,7 +215,6 @@ fn journal_lines() -> Vec<String> {
     v
 }
 
-/// A host with every source scripted.
 fn whole_host() -> Host {
     Host::default()
         .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
@@ -274,8 +257,6 @@ fn opts(journal: Option<std::path::PathBuf>) -> LedgerOpts {
     }
 }
 
-/// The whole path: every source read once, the turns placed on the wall clock with their reply
-/// sizes, the journal filtered to this worker, mail both ways, and the summary's numbers.
 #[test]
 fn the_ledger_joins_the_four_sources() {
     let (dir, path) = journal_file("whole", &journal_lines());
@@ -294,7 +275,6 @@ fn the_ledger_joins_the_four_sources() {
     assert_eq!(l.worker, WORKER);
     assert_eq!(l.manager.as_deref(), Some(MANAGER));
     assert!(l.aligned);
-    // The turns: placed, sized, and each with the EVENT that ended it.
     type Placed = (u64, Option<i64>, Result<usize, String>, Option<i64>);
     let turns: Vec<Placed> = l
         .turns
@@ -309,8 +289,6 @@ fn the_ledger_joins_the_four_sources() {
             (3, Some(EPOCH + 200_000), Ok(4), Some(EPOCH + 210_000)),
         ]
     );
-    // The journal: this worker's lines only, the other session's and the cut
-    // one left out, and both counted in SOURCES.
     assert_eq!(l.journal.len(), 11);
     let journal = l
         .sources
@@ -318,7 +296,6 @@ fn the_ledger_joins_the_four_sources() {
         .find(|s| s.name == "journal")
         .expect("a journal source");
     assert!(journal.ok, "{}", journal.detail);
-    // The mail: one in from the worker, two posts out (one not landed).
     assert_eq!(
         l.mail,
         [
@@ -348,8 +325,6 @@ fn the_ledger_joins_the_four_sources() {
             },
         ]
     );
-    // The numbers, including the latency from each EVENT idle/question to the
-    // next turn: 80 s and 50 s (the last idle has no turn after it).
     let s = l.summary();
     assert_eq!((s.turns, s.settled, s.timeouts, s.carried), (3, 2, 1, 0));
     assert_eq!(s.turn_ms, 1_800 + 6_005 + 1_750);
@@ -366,7 +341,6 @@ fn the_ledger_joins_the_four_sources() {
     assert_eq!((s.context, s.compacted, s.reconnects), (1, 1, 1));
     assert_eq!((s.mail_in, s.mail_out), (1, 2));
     assert_eq!((s.timeouts_seen, s.exits), (1, 0));
-    // Every item is in time order, one lane each.
     let items = l.items();
     let times: Vec<Option<i64>> = items.iter().map(|i| i.t).collect();
     let mut sorted = times.clone();
@@ -377,8 +351,6 @@ fn the_ledger_joins_the_four_sources() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// The markdown form: the same content as tables, with `|` escaped so a
-/// worker's own pipe cannot break a row.
 #[test]
 fn the_md_form_is_tables() {
     let (dir, path) = journal_file("md", &journal_lines());
@@ -391,9 +363,6 @@ fn the_md_form_is_tables() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// The HTML form is one file: no URL it would fetch, a policy that forbids one, every tag
-/// closed, and everything a worker said escaped, so neither a `</script>` in a transcript nor
-/// a tag in a command can close one.
 #[test]
 fn the_html_form_is_one_self_contained_page() {
     let (dir, path) = journal_file("html", &journal_lines());
@@ -404,7 +373,6 @@ fn the_html_form_is_one_self_contained_page() {
     assert_eq!(super::super::ledger_html::is_self_contained(&html), Ok(()));
     assert_eq!(well_formed(&html), Ok(()));
     assert!(html.starts_with("<!doctype html>"), "no doctype");
-    // The hostile text survives as text, and nowhere as markup.
     assert!(
         html.contains("&lt;/script&gt;&lt;img src=http://evil/x&gt; &amp; &lt;b&gt;bold&lt;/b&gt;"),
         "the worker's own tags are text, not markup"
@@ -414,7 +382,6 @@ fn the_html_form_is_one_self_contained_page() {
         "the data is escaped"
     );
     assert_eq!(html.matches("</script>").count(), 2, "one close per script");
-    // The three lanes and the mail lane are all drawn and all in the table.
     for want in ["\"manager\"", "\"watcher\"", "\"worker\"", "\"fabric\""] {
         assert!(html.contains(want), "the html is missing lane {want}");
     }
@@ -422,8 +389,6 @@ fn the_html_form_is_one_self_contained_page() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// Every tag in `html` closes, in order, outside `<script>`/`<style>`; void elements close
-/// themselves. A small check, not a browser: it catches an unbalanced or unescaped tag.
 fn well_formed(html: &str) -> Result<(), String> {
     const VOID: &[&str] = &[
         "meta", "br", "hr", "img", "input", "link", "source", "!doctype",
@@ -463,7 +428,6 @@ fn well_formed(html: &str) -> Result<(), String> {
             continue;
         }
         stack.push(tag.clone());
-        // A script's or style's body is not markup: skip to its close.
         if tag == "script" || tag == "style" {
             let want = format!("</{tag}>");
             let rest: String = bytes[i..].iter().collect();
@@ -480,8 +444,6 @@ fn well_formed(html: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A missing source is named and the rest still prints: a host that knows none of the verbs,
-/// with a journal, gives the watcher's lane and four misses.
 #[test]
 fn a_missing_source_is_named_and_the_rest_prints() {
     let (dir, path) = journal_file("missing", &journal_lines());
@@ -491,14 +453,11 @@ fn a_missing_source_is_named_and_the_rest_prints() {
     assert_eq!(misses, ["history", "mail"]);
     assert!(l.turns.is_empty() && l.mail.is_empty());
     assert_eq!(l.journal.len(), 11);
-    // No journal: the turns still read, none stopped by a journal's EVENT.
     let mut host = whole_host();
     let l = read(&mut host, &opts(None), &mut anchors);
     assert!(!l.journaled && !l.journal_unreadable);
     assert_eq!(l.turns.len(), 3);
     assert!(l.turns.iter().all(|t| t.stopped.is_none()));
-    // An unreadable journal is a miss, not an error, and not a journal of
-    // zero events.
     let l = read(
         &mut whole_host(),
         &opts(Some(dir.join("nothing-here.jsonl"))),
@@ -511,8 +470,6 @@ fn a_missing_source_is_named_and_the_rest_prints() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// Without a clock no working time is claimed: an unanchored `turn.t` and a journal record's
-/// wall-clock `t` do not subtract to a duration.
 #[test]
 fn without_a_clock_no_working_time_is_claimed() {
     let (dir, path) = journal_file("clockless-spans", &journal_lines());
@@ -546,12 +503,9 @@ fn without_a_clock_no_working_time_is_claimed() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// A turn older than the archive, or from another archive, says so instead of claiming a size.
 #[test]
 fn a_reply_the_archive_lost_says_so() {
     let mut host = whole_host();
-    // The archive starts after the first two turns' marks, and turn 3's row
-    // is not in it either (the read is the screen alone).
     let mut off = offscreen();
     off.stdout = screen().iter().map(|r| format!("{r}\n")).collect();
     off.stderr = format!(
@@ -576,7 +530,6 @@ fn a_reply_the_archive_lost_says_so() {
             "another archive (aterm restarted since)"
         ]
     );
-    // A host with no `offscreen` at all says so too.
     let mut host = Host::default()
         .on("whoami", ok(&format!("OK {MANAGER} deadbeef owner\n")))
         .on("history", history());
@@ -594,8 +547,6 @@ fn a_reply_the_archive_lost_says_so() {
     assert!(!src.ok, "{}", src.detail);
 }
 
-/// A `history` header carrying ` unheld_below=` (on stderr, as `aterm ctl` prints it) makes the
-/// ledger say the turns were lost to an update, not that nobody drove the session.
 #[test]
 fn a_ledger_an_update_could_not_carry_is_not_blamed_on_the_person() {
     let lost = CtlReply {
@@ -610,7 +561,6 @@ fn a_ledger_an_update_could_not_carry_is_not_blamed_on_the_person() {
     let l = read(&mut host, &opts(None), &mut anchors);
     let src = l.sources.iter().find(|s| s.name == "history").expect("row");
     assert!(!src.ok && src.detail.contains("48"), "{}", src.detail);
-    // A raw reply (the header on its first line) says the same.
     assert_eq!(
         history_floor(&ok("OK 2 unheld_below=7\nturn 9 x\n")),
         Some(7)
@@ -618,7 +568,6 @@ fn a_ledger_an_update_could_not_carry_is_not_blamed_on_the_person() {
     assert_eq!(history_floor(&history()), None);
 }
 
-/// `--since` drops what came before it, from every source.
 #[test]
 fn since_drops_what_came_before_it() {
     let (dir, path) = journal_file("since", &journal_lines());
@@ -644,22 +593,17 @@ fn since_drops_what_came_before_it() {
     let _ = std::fs::remove_dir(dir);
 }
 
-/// `--since` takes Unix milliseconds, a date (local midnight) or a date and time (local, or the
-/// zone it names). Anything else is `None`, never zero or a panic: a year too large for the
-/// millisecond arithmetic, a 4-byte zone suffix whose byte 2 is inside a character.
 #[test]
 fn a_malformed_since_is_refused_not_a_panic() {
     assert_eq!(parse_since("4294967295-01-01", 0), None);
     assert_eq!(parse_since("4294967295-12-31T23:59:59Z", 0), None);
     assert_eq!(parse_since("2026-09-14T10:30+1\u{e9}1", 0), None);
-    // Controls: the same shapes in range still parse.
     assert!(parse_since("2026-09-14T10:30+0130", 0).is_some());
     assert!(parse_since("9999-01-01", 0).is_some());
 }
 
 #[test]
 fn since_takes_ms_or_a_time_word() {
-    // 2026-09-14T00:00:00Z
     const DAY: i64 = 1_789_344_000_000;
     assert_eq!(parse_since("1789344000000", 0), Some(DAY));
     assert_eq!(parse_since("2026-09-14", 0), Some(DAY));
@@ -696,8 +640,6 @@ fn since_takes_ms_or_a_time_word() {
     }
 }
 
-/// A `history` record's every field, `carried=1` and a pct-encoded text included; a carried
-/// turn has no time.
 #[test]
 fn a_history_record_is_read_whole() {
     let body = "OK 2\n\
@@ -748,13 +690,6 @@ fn a_history_record_is_read_whole() {
     assert!(l.turns[1].t.is_some());
 }
 
-/// THE WINDOW HARNESS'S OWN TURNS ARE NOT THE MANAGER'S (`by=harness`: its
-/// `keep going`, its done check, its `/usage`): left out of the timeline's
-/// turns, its counts and its latencies, and out of the reply-size join — a
-/// turn's reply runs on through the continuations the harness typed into
-/// it — with SOURCES saying how many. NEGATIVE CONTROL: the same row typed
-/// by an owner-token client (`by=ctl`) is a turn, and the reply join counts
-/// it (its `❯` row not found, it is inside the turn before it).
 #[test]
 fn the_harness_turns_are_not_the_managers() {
     let with = |by: &str| {
@@ -799,7 +734,6 @@ fn the_harness_turns_are_not_the_managers() {
     assert!(!history_detail(&l).contains("harness"), "{l:#?}");
 }
 
-/// `View::All` renders as `render`; another view adds `view=` and `kept=` to the same header.
 #[test]
 fn a_report_renders_its_view() {
     let report = Report {
@@ -835,12 +769,9 @@ fn a_report_renders_its_view() {
     );
 }
 
-/// A turn whose `❯` row is nowhere (queued while the worker was busy, or a restart took it) has
-/// its reply inside the previous turn's count, and that row names it.
 #[test]
 fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     let mut host = whole_host();
-    // The middle turn's row never appeared.
     let off = offscreen_of(&[
         "⏺ Older words.",
         "❯ Go on the amended lever",
@@ -855,7 +786,6 @@ fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     assert_eq!(l.turns[0].swallowed, [2]);
     assert!(l.turns[1].rows.is_err());
     assert!(l.turns[2].rows.is_ok() && l.turns[2].swallowed.is_empty());
-    // And when no later turn's row is found, every one after it is named.
     let mut host = whole_host();
     let archived = rows(&[
         "⏺ Older words.",
@@ -885,21 +815,9 @@ fn a_turn_whose_row_is_missing_is_named_in_the_span_that_holds_it() {
     assert!(l.turns[1].rows.is_err() && l.turns[2].rows.is_err());
 }
 
-// ---- `--source log` -------------------
-
-/// How far the log's wall times may sit from the anchor's: the anchor is the
-/// control socket's birth, a guess at the clock's zero.
 const ANCHOR_ERROR_MS: i64 = 1_000;
-/// Where this fixture's log times sit from the anchor's.
 const SKEW: i64 = 40;
 
-/// The worker's `log class=turn`, as `aterm ctl` prints its body: the ring
-/// evicted the turn ledger's first turn's OPEN (its close, which restates
-/// `ledger=` (5F-4a), and every later record kept) and a closed person's
-/// turn's open (eviction takes closed turns' opens first: its close, which
-/// names no `ledger=` because it never had one, is kept), then turns 2 and
-/// 3 whole and an open person's turn with no `ledger=`. With `restated`
-/// false the close of turn 1 is an older aterm's, naming no `ledger=`.
 fn log_turns_reply(restated: bool) -> CtlReply {
     let t = |ms: i64| EPOCH + ms + SKEW;
     let ledger1 = if restated { " ledger=1" } else { "" };
@@ -926,8 +844,6 @@ fn log_turns_reply(restated: bool) -> CtlReply {
     ))
 }
 
-/// This session's `log kinds=mail`: the posts and the messages the
-/// anchor path reads from `timeline` and `inbox`, at the same moments.
 fn log_mail_reply() -> CtlReply {
     let t = |ms: i64| EPOCH + ms + SKEW;
     ok(&format!(
@@ -946,8 +862,6 @@ fn log_mail_reply() -> CtlReply {
     ))
 }
 
-/// A host for `--source log`: every source the anchor path reads, the two
-/// log reads in the order asked (the worker's, then this session's).
 fn log_host(restated: bool) -> Host {
     whole_host()
         .on("log", log_turns_reply(restated))
@@ -961,14 +875,12 @@ fn log_opts() -> LedgerOpts {
     }
 }
 
-/// `--source log`, never asking for a clock anchor.
 fn read_log(host: &mut Host) -> Ledger {
     read(host, &log_opts(), &mut |sid| {
         panic!("--source log asked for @{sid}'s clock anchor")
     })
 }
 
-/// Whether two placed times agree within the anchor's error.
 fn near(a: Option<i64>, b: Option<i64>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => (a - b).abs() <= ANCHOR_ERROR_MS,
@@ -977,7 +889,6 @@ fn near(a: Option<i64>, b: Option<i64>) -> bool {
     }
 }
 
-/// A turn row without its time.
 type Untimed = (
     u64,
     String,
@@ -1007,17 +918,6 @@ fn untimed(l: &Ledger) -> Vec<Untimed> {
         .collect()
 }
 
-/// THE LOG PATH AND THE ANCHOR PATH AGREE: over the
-/// same recorded replies, `--source log` gives the same turns — ids,
-/// kinds, texts, statuses and reply sizes — and the same mail, with every
-/// time within the anchor's error of the anchor path's, and it never asks
-/// for an anchor or the timeline. The turn whose OPEN the ring evicted is
-/// placed by its close, which restates `ledger=`, and SOURCES says how many
-/// were; the person's turns, which name no `ledger=`, join nothing, and the
-/// closed one whose open was evicted is said as a turn no exchange opened,
-/// never as a lost `ledger=`. Each log-placed row says the turn BEGAN (the
-/// screen's sight of it, after the press), where the anchor path's says the
-/// exchange SENT it.
 #[test]
 fn log_and_anchor_paths_agree_modulo_times() {
     let anchor = read(&mut whole_host(), &opts(None), &mut anchors);
@@ -1068,7 +968,6 @@ fn log_and_anchor_paths_agree_modulo_times() {
         ) && detail.contains("the ring evicted 9 record(s)"),
         "{detail}"
     );
-    // The person's closed turn is no lost join: every history turn is placed.
     assert!(
         detail.contains(
             "; 1 closed turn(s) whose open was evicted name no ledger= (no `turn` exchange \
@@ -1096,7 +995,6 @@ fn log_and_anchor_paths_agree_modulo_times() {
     assert!(src(&anchor, "log").is_none(), "the old path reads no log");
     let (ok, clock) = src(&log, "clock").expect("a clock source");
     assert!(ok && clock.contains("no clock anchor"), "{clock}");
-    // The summary reads the same.
     let (s, a) = (log.summary(), anchor.summary());
     assert_eq!(
         (s.turns, s.settled, s.timeouts, s.mail_in, s.mail_out),
@@ -1104,12 +1002,6 @@ fn log_and_anchor_paths_agree_modulo_times() {
     );
 }
 
-/// NEGATIVE CONTROL: a close WITHOUT the restated `ledger=` (an
-/// older aterm's) loses the join — the evicted-open turn has no time, even
-/// though its close's time less its duration is exactly the anchor path's
-/// start (nothing is ever joined by time) — and SOURCES counts it twice:
-/// a history turn the log no longer places, and, beside the person's, a
-/// closed log turn that names no `ledger=`.
 #[test]
 fn a_close_without_its_ledger_loses_the_join() {
     let anchor = read(&mut whole_host(), &opts(None), &mut anchors);
@@ -1132,9 +1024,6 @@ fn a_close_without_its_ledger_loses_the_join() {
     );
 }
 
-/// A log the host cannot read places nothing and says so; the rows still
-/// print. A message whose `mail` mark the log no longer holds keeps no time,
-/// counted in the mail source.
 #[test]
 fn a_log_that_cannot_be_read_places_nothing_and_says_so() {
     let mut host = whole_host()

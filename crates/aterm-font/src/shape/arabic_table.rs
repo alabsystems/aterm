@@ -14,9 +14,6 @@ use super::arabic::JoiningType::{self, D, GroupAlaph as A, GroupDalathRish as DR
 
 #[rustfmt::skip]
 pub(crate) static JOINING_TABLE: &[JoiningType] = &[
-
-  /* Arabic */
-
   /* 0600 */ U,U,U,U,U,U,X,X,U,X,X,U,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 0620 */ D,U,R,R,R,R,D,R,D,R,D,D,D,D,D,R,R,R,R,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 0640 */ D,D,D,D,D,D,D,D,R,D,D,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
@@ -25,116 +22,53 @@ pub(crate) static JOINING_TABLE: &[JoiningType] = &[
   /* 06A0 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 06C0 */ R,D,D,R,R,R,R,R,R,R,R,R,D,R,D,R,D,D,R,R,X,R,X,X,X,X,X,X,X,U,X,X,
   /* 06E0 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,R,R,X,X,X,X,X,X,X,X,X,X,D,D,D,X,X,D,
-
-  /* Syriac */
-
   /* 0700 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,T,A,X,D,D,D,DR,DR,R,R,R,D,D,D,D,R,D,
   /* 0720 */ D,D,D,D,D,D,D,D,R,D,DR,D,R,D,D,DR,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 0740 */ X,X,X,X,X,X,X,X,X,X,X,X,X,R,D,D,
-
-  /* Arabic Supplement */
-
   /* 0740 */                                 D,D,D,D,D,D,D,D,D,R,R,R,D,D,D,D,
   /* 0760 */ D,D,D,D,D,D,D,D,D,D,D,R,R,D,D,D,D,R,D,R,R,D,D,D,R,R,D,D,D,D,D,D,
-
-  /* FILLER */
-
   /* 0780 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 07A0 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
-
-  /* NKo */
-
   /* 07C0 */ X,X,X,X,X,X,X,X,X,X,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 07E0 */ D,D,D,D,D,D,D,D,D,D,D,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,D,X,X,X,X,X,
-
-  /* FILLER */
-
   /* 0800 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 0820 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
-
-  /* Mandaic */
-
   /* 0840 */ R,D,D,D,D,D,R,R,D,R,D,D,D,D,D,D,D,D,D,D,R,D,R,R,R,X,X,X,X,X,X,X,
-
-  /* Syriac Supplement */
-
   /* 0860 */ D,U,D,D,D,D,U,R,D,R,R,X,X,X,X,X,
-
-  /* Arabic Extended-B */
-
   /* 0860 */                                 R,R,R,R,R,R,R,R,R,R,R,R,R,R,R,R,
   /* 0880 */ R,R,R,D,D,D,D,U,U,D,D,D,D,D,R,X,U,U,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
-
-  /* Arabic Extended-A */
-
   /* 08A0 */ D,D,D,D,D,D,D,D,D,D,R,R,R,U,R,D,D,R,R,D,D,D,D,D,D,R,D,D,D,D,D,D,
   /* 08C0 */ D,D,D,D,D,D,D,D,D,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 08E0 */ X,X,U,
-
-  /* Mongolian */
-
   /* 1800 */             U,D,X,X,D,X,X,X,U,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 1820 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 1840 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 1860 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,X,X,X,X,X,X,X,
   /* 1880 */ U,U,U,U,U,T,T,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 18A0 */ D,D,D,D,D,D,D,D,D,X,D,
-
-  /* General Punctuation */
-
   /* 2000 */                         U,D,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 2020 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,U,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 2040 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 2060 */ X,X,X,X,X,X,U,U,U,U,
-
-  /* Phags-pa */
-
   /* A840 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* A860 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,L,U,
-
-  /* Manichaean */
-
   /* 10AC0 */ D,D,D,D,D,R,U,R,U,R,R,U,U,L,R,R,R,R,R,D,D,D,D,L,D,D,D,D,D,R,D,D,
   /* 10AE0 */ D,R,U,U,R,X,X,X,X,X,X,D,D,D,D,R,
-
-  /* Psalter Pahlavi */
-
   /* 10B80 */ D,R,D,R,R,R,D,D,D,R,D,D,R,D,R,R,D,R,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 10BA0 */ X,X,X,X,X,X,X,X,X,R,R,R,R,D,D,U,
-
-  /* Hanifi Rohingya */
-
   /* 10D00 */ L,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 10D20 */ D,D,R,D,
-
-  /* Arabic Extended-C */
-
   /* 10EC0 */     R,D,D,
-
-  /* Sogdian */
-
   /* 10F20 */                                 D,D,D,R,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 10F40 */ D,D,D,D,D,U,X,X,X,X,X,X,X,X,X,X,X,D,D,D,R,X,X,X,X,X,X,X,X,X,X,X,
   /* 10F60 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
-
-  /* Old Uyghur */
-
   /* 10F60 */                                 D,D,D,D,R,R,D,D,D,D,D,D,D,D,D,D,
   /* 10F80 */ D,D,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
   /* 10FA0 */ X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,X,
-
-  /* Chorasmian */
-
   /* 10FA0 */                                 D,U,D,D,R,R,R,U,D,R,R,D,D,R,D,D,
   /* 10FC0 */ U,D,R,R,D,U,U,U,U,R,D,L,
-
-  /* Kaithi */
-
   /* 110A0 */                                                           U,X,X,
   /* 110C0 */ X,X,X,X,X,X,X,X,X,X,X,X,X,U,
-
-  /* Adlam */
-
   /* 1E900 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 1E920 */ D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,D,
   /* 1E940 */ D,D,D,D,X,X,X,X,X,X,X,T,
@@ -152,9 +86,6 @@ const JOINING_OFFSET_0X10F30: usize = 1185;
 const JOINING_OFFSET_0X110BD: usize = 1341;
 const JOINING_OFFSET_0X1E900: usize = 1358;
 
-/// The table's blocks: `(first, last, offset)`, the offset of `first` in
-/// [`JOINING_TABLE`]. Upstream matches on `u >> 12` first; the blocks are
-/// disjoint, so scanning them answers the same.
 const JOINING_BLOCKS: [(u32, u32, usize); 11] = [
     (0x0600, 0x08E2, JOINING_OFFSET_0X0600),
     (0x1806, 0x18AA, JOINING_OFFSET_0X1806),

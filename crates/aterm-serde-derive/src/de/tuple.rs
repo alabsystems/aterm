@@ -23,8 +23,6 @@ pub(super) fn deserialize(
     cattrs: &attr::Container,
     form: &TupleForm,
 ) -> Fragment {
-    // Tuples and tuple variants cannot have flatten fields: the checks refuse
-    // `flatten` there before any code is generated.
     let field_count = fields
         .iter()
         .filter(|field| !field.attrs.skip_deserializing())
@@ -147,10 +145,6 @@ fn deserialize_newtype_struct(
             q!("#func(#deserializer_var)?", func, deserializer_var)
         }
         Some(path) => {
-            // If #path returns wrong type, error will be reported here (^^^^^).
-            // We attach span of the path to the function so it will be reported
-            // on the #[serde(deserialize_with = "...")]
-            //                                   ^^^^^
             q_spanned!(span_of(path) => "#path(#deserializer_var)?", path, deserializer_var)
         }
     };

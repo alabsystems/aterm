@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `spec-check`: the obligations only the Trust checkers can discharge, run on
-//! purpose.
-//!
-//! A plain `targo test` never looks for a checker
-//! ([`crate::verify::checkers_required`]), so its verdict is the same on every
-//! machine. This is the other half: it requires every checker its selected
-//! checks need, fails closed when one is missing, and holds the whole registry
-//! to them.
-//!
-//! ```text
-//! targo --unverified run -q -p aterm-models --bin spec-check -- [CHECK...] [--full]
-//! ```
-//!
-//! Exit 0: every selected check passed. 1: a check failed. 2: usage. 3: could
-//! not run (a checker or an input it reads is missing).
-//!
-//! The obligations written inside tests run on purpose too: every tiered
-//! discharge (a Tier-1 `ty trace validate` beside the interpreter's) under
-//! aterm-spec's `checkers` feature; [`crate::verify::checkers_required`] gives
-//! the commands.
+//! `spec-check`: the obligations only the Trust checkers can discharge, run on purpose.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -56,7 +37,6 @@ impl Tool {
     }
 }
 
-/// What one check found.
 enum Verdict {
     /// Passed, with a one-line account of what was held.
     Pass(String),
@@ -66,13 +46,11 @@ enum Verdict {
     CouldNotRun(String),
 }
 
-/// How a run was asked for.
 struct Options {
     /// Include the minutes-class `ay` obligations.
     full: bool,
 }
 
-/// One check: what it holds, and the checker it holds it with.
 struct Check {
     name: &'static str,
     needs: Tool,
@@ -165,8 +143,6 @@ pub fn main(args: &[String]) -> i32 {
         selected = CHECKS.iter().collect();
     }
 
-    // Every checker a selected check needs, before anything runs: a missing
-    // one is a run that could not happen, never a pass.
     let mut tools: BTreeMap<&'static str, PathBuf> = BTreeMap::new();
     for check in &selected {
         let tool = check.needs;
@@ -190,8 +166,6 @@ pub fn main(args: &[String]) -> i32 {
         }
     }
     verify::require_checkers();
-    // A finding is reported by the check that met it; the default hook would
-    // print each caught panic a second time.
     std::panic::set_hook(Box::new(|_| {}));
 
     let started = Instant::now();
@@ -260,7 +234,6 @@ pub fn main(args: &[String]) -> i32 {
     }
 }
 
-/// Run `f`, turning a panic into its message.
 fn attempt<R>(f: impl FnOnce() -> R) -> Result<R, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
         payload
@@ -271,10 +244,7 @@ fn attempt<R>(f: impl FnOnce() -> R) -> Result<R, String> {
     })
 }
 
-/// `work` over every item on every core, results in item order: here each
-/// item's work is a checker process of its own, and in a test each is one
-/// seed's walk, one fixture's sweep or one configuration's replay. A panic in
-/// `work` is raised again on the caller's thread, with its own message.
+/// `work` over every item on every core, results in item order.
 pub fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec<R> {
     let next = AtomicUsize::new(0);
     let workers = std::thread::available_parallelism()
@@ -305,17 +275,12 @@ pub fn each<T: Sync, R: Send>(items: &[T], work: impl Fn(&T) -> R + Sync) -> Vec
     done.into_iter().map(|(_, r)| r).collect()
 }
 
-/// `aterm-spec-models`, beside this crate.
 fn spec_models() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-spec-models")
 }
 
 const LABEL: &str = "spec-check";
 
-// ---- models ----------------------------------------------------------------
-
-/// The findings of `work` over every registered model in every configuration
-/// it declares, each named by its model.
 fn over_configurations(
     models: &[Vec<Model>],
     work: impl Fn(&[Model]) -> Vec<String> + Sync,
@@ -328,7 +293,6 @@ fn over_configurations(
     .collect()
 }
 
-/// Where `config` sits among `m`'s configurations, for a finding.
 fn config_label(m: &Model, config: &Model) -> String {
     let overrides: Vec<String> = config
         .consts
@@ -343,8 +307,6 @@ fn config_label(m: &Model, config: &Model) -> String {
     }
 }
 
-/// The registered model named `name`: the runs below that need a real model take a committed one
-/// from the registry the binary links (`aterm_models::link_all`), not a copy of their own.
 fn registered(name: &str) -> Result<Model, String> {
     xref::model_registry()
         .into_iter()
@@ -352,10 +314,6 @@ fn registered(name: &str) -> Result<Model, String> {
         .ok_or_else(|| format!("no model `{name}` is registered in this binary"))
 }
 
-/// A search `ty` stops short (a memory limit's stop, here forced by a 2-state
-/// bound on a 7-state model) must never read as a verdict:
-/// [`verify::TyCommand::output`] refuses it, and this ties that refusal to the
-/// real tool's wording rather than to transcripts written here.
 fn a_stopped_search_is_refused(ty: &Path) -> Option<String> {
     let m = match registered("Ring") {
         Ok(m) => m,
@@ -405,9 +363,6 @@ fn models(ty: &Path, _: &Options) -> Verdict {
     ))
 }
 
-/// One model under `ty`, in every configuration it declares: its findings,
-/// the configuration/dial checks compared. An interpreter panic, including
-/// exhaustion of its state budget, is a failed requested check at every dial.
 fn model_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
     let m = &all[0];
     if m.is_function_valued() {
@@ -445,8 +400,6 @@ fn model_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
                         ));
                     }
                 }
-                // Both tiers refute a mutant: what a mutant is for. With no
-                // mutant on, the model itself is broken.
                 (Err((state, inv)), false) if dial == 0 => findings.push(format!(
                     "{label}: both tiers find `{inv}` violated with no mutant on, at \
                      {state:?}\n{evidence}"
@@ -466,9 +419,6 @@ fn model_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
     (findings, compared)
 }
 
-/// A function-valued model, which only `ty` can check: every configuration
-/// holds, each design claim is broken alone by some mutant in some
-/// configuration, and no `bound` is.
 fn function_valued_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
     let m = &all[0];
     let mut findings = Vec::new();
@@ -508,8 +458,6 @@ fn function_valued_under_ty(ty: &Path, all: &[Model]) -> (Vec<String>, usize) {
     (findings, all.len())
 }
 
-// ---- vacuity ---------------------------------------------------------------
-
 fn vacuity(ty: &Path, _: &Options) -> Verdict {
     let registry = xref::model_configurations();
     let dead = AtomicUsize::new(0);
@@ -535,9 +483,6 @@ fn vacuity(ty: &Path, _: &Options) -> Verdict {
     ))
 }
 
-/// `ty`'s dead-action report, strict (`vacuous: N dead action(s) (never
-/// fired): A, B`) or relaxed (`… downgraded by --allow-vacuous=dead-action:
-/// N dead action(s) (never fired): A, B`).
 fn dead_actions(transcript: &str) -> Vec<String> {
     const MARKER: &str = "dead action(s) (never fired): ";
     transcript
@@ -553,15 +498,6 @@ fn dead_actions(transcript: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One model's strict-vacuity runs, one per configuration it declares, and
-/// the interpreter's audit of them: the number of dead actions proved to be
-/// negative controls.
-///
-/// A scalar model's dead actions are allowed (`--allow-vacuous=dead-action`)
-/// only because the interpreter recomputes each configuration's dead set and
-/// must agree with `ty`'s, and then proves every action dead in all of them a
-/// negative control ([`verify::audit_dead_negative_controls`]); a
-/// function-valued model cannot be audited, so it stays fully strict.
 fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
     let auditable = !all[0].is_function_valued();
     for config in all {
@@ -573,7 +509,6 @@ fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
         std::fs::write(&tla, config.to_tla()).map_err(|e| e.to_string())?;
         std::fs::write(&cfg, config.to_cfg()).map_err(|e| e.to_string())?;
         let mut cmd = verify::TyCommand::check(ty, &tla, &cfg);
-        // Exact coverage counters, so the relaxed run still names its dead set.
         cmd.arg("--strict-vacuity").arg("--coverage");
         if auditable {
             cmd.arg("--allow-vacuous=dead-action");
@@ -600,7 +535,6 @@ fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
         if !auditable {
             continue;
         }
-        // A dead set measured on a reduced space is no evidence about the model.
         verify::assert_ty_saw_whole_space(config, &text, LABEL);
         let reported = dead_actions(&text);
         let reported: Vec<&str> = reported.iter().map(String::as_str).collect();
@@ -612,8 +546,6 @@ fn vacuity_of(ty: &Path, all: &[Model]) -> Result<usize, String> {
     verify::audit_dead_negative_controls(all)
         .map_err(|why| format!("dead actions that are not audited negative controls: {why}"))
 }
-
-// ---- liveness --------------------------------------------------------------
 
 fn liveness(ty: &Path, _: &Options) -> Verdict {
     let obligations = xref::liveness_registry();
@@ -695,8 +627,6 @@ fn transcript(out: &std::process::Output) -> String {
     )
 }
 
-// ---- trace -----------------------------------------------------------------
-
 fn trace(ty: &Path, _: &Options) -> Verdict {
     let m = match registered("WindowRouting") {
         Ok(m) => m,
@@ -709,7 +639,6 @@ fn trace(ty: &Path, _: &Options) -> Verdict {
     let spec = dir.join(format!("{}.tla", m.name));
     let cfg = dir.join(format!("{}.cfg", m.name));
     let trace = dir.join("t.json");
-    // `Init` is open, so each trace's verdict is `Next`'s alone.
     let laid = std::fs::write(&spec, m.transition_spec()).and_then(|()| {
         std::fs::write(
             &cfg,
@@ -737,14 +666,11 @@ fn trace(ty: &Path, _: &Options) -> Verdict {
         Ok((out.status.success(), transcript(&out)))
     };
     let mut findings = Vec::new();
-    // An honest close of a window that is not the last: the survivor is front.
     match validate([2, 1, 3, 0], [1, 2, 3, 0]) {
         Ok((true, _)) => {}
         Ok((false, text)) => findings.push(format!("a real CloseWindow step is refused\n{text}")),
         Err(e) => findings.push(e),
     }
-    // The last window closes and the app does not exit: `Next` admits no such
-    // step, so the refusal must come at step 1, not on the way in.
     match validate([1, 1, 2, 0], [0, 0, 2, 0]) {
         Ok((false, text)) if text.contains("trace step 1 has no matching spec states") => {}
         Ok((ok, text)) => findings.push(format!(
@@ -761,8 +687,6 @@ fn trace(ty: &Path, _: &Options) -> Verdict {
         Verdict::Fail(findings)
     }
 }
-
-// ---- ay --------------------------------------------------------------------
 
 fn ay_bundles(ay_bin: &Path, options: &Options) -> Verdict {
     let root = spec_models().join("proofs/ay");
@@ -822,9 +746,6 @@ fn ay_bundles(ay_bin: &Path, options: &Options) -> Verdict {
 mod tests {
     use super::*;
 
-    /// An interpreter error is not a budget verdict, at the committed dial
-    /// or a mutant. This malformed model fails before any external tool can
-    /// run, so neither a missing checker nor checker output decides the test.
     #[test]
     fn an_interpreter_panic_is_a_failed_model_check_at_every_dial() {
         let mut model = crate::test_models::ring_model();

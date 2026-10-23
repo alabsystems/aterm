@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
-//! The signature bar: the measurements aterm's own signature themes clear,
-//! stricter than the admission floor every theme gets.
-//!
-//! [`signature_report`] is the one implementation. The built-ins' law test
-//! calls it, and `aterm theme check --signature` prints it, so an author (a
-//! person or an AI) measures a theme against exactly the bar the built-ins
-//! are held to. The hue and chroma rows are `OkLCh` (Björn Ottosson's `OkLab`
-//! in polar form); contrasts are WCAG ratios.
+//! Measurements aterm's signature themes clear (`OkLCh` hue/chroma and WCAG contrast ratios).
 
 use crate::Rgb;
 use crate::scheme::ColorScheme;
@@ -17,10 +9,7 @@ use crate::scheme::ColorScheme;
 /// One bar of the signature set that a theme misses.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SignatureDefect {
-    /// Which bar, as a stable snake-case code: `text_contrast`,
-    /// `accent_contrast`, `hue_spacing`, `bright_distance`, `color8_band`,
-    /// `color0_visible`, `white_contrast`, `selection_band`, `text_on_band`,
-    /// `cursor_contrast`, `cursor_chroma`, `cursor_hue`, `chroma_balance`.
+    /// Stable snake-case bar code (e.g., `text_contrast`, `accent_contrast`, `hue_spacing`).
     pub code: &'static str,
     /// The measurement and the bar, in words.
     pub message: String,
@@ -76,8 +65,8 @@ pub fn oklab_distance(x: Rgb, y: Rgb) -> f64 {
     ((p.0 - q.0).powi(2) + (p.1 - q.1).powi(2) + (p.2 - q.2).powi(2)).sqrt()
 }
 
-/// The angle between two hues, in `[0, 180]`.
 // Skip: f64 arithmetic — the float-interval lane.
+/// The angle between two hues, in `[0, 180]`.
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 fn hue_gap(x: f64, y: f64) -> f64 {
@@ -86,12 +75,6 @@ fn hue_gap(x: f64, y: f64) -> f64 {
 }
 
 /// Every signature bar `s` misses; empty when the theme clears them all.
-/// The bars: text 7:1; each accent (ANSI 1-6 and brights 9-14) 4.5:1; the
-/// accents of one tier 25 deg apart in `OkLCh` hue; each bright 0.05 `OkLab`
-/// from its normal; color8 in `[3, 4.5)`; color0 1.15:1; color7 and color15
-/// 4.5:1; the selection band 1.5:1 with text 4.5:1 on it; a cursor at 3:1,
-/// chroma 0.08 or more, within 15 deg of an accent's hue (1-6); accent
-/// chroma (both tiers) within 0.07-0.17 with max/min at most 1.75.
 #[must_use]
 // Skip: f64 arithmetic — the float-interval lane.
 #[cfg_attr(trust_verify, trust::skip)]

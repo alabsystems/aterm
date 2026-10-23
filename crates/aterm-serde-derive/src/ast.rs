@@ -1,11 +1,6 @@
 // Copyright (c) Erick Tryzelaar, David Tolnay et al. (the serde authors)
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Derived from serde_derive 1.0.228 src/internals/ast.rs,
-// src/internals/check.rs and src/internals/receiver.rs, and modified by the
-// aterm project in 2026: built on aterm-macro-support's DeriveInput, and only
-// the checks that can fire on aterm's attribute set.
-// See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
+// Derived from serde_derive 1.0.228 src/internals/ (see ../LICENSE-MIT and ../LICENSE-APACHE).
 
 //! A Serde AST, parsed from the derive input and ready to generate Rust code.
 

@@ -1,32 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `wasm` lane: build the two SHIPPED renderer modules (`aterm-wasm` on
-//! the CPU canvas path, `aterm-gpu-web` on the WebGL path) for
-//! `wasm32-unknown-unknown` with the shipping `+simd128` flag, bind them
-//! with `verify glue`'s generator (neither module has wasm-bindgen:
-//! docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.7 and WP.8), apply
-//! the shipping `wasm-opt -O3` pass, and drive their real exports with
-//! `crates/aterm-verify/perf/wasm/bench.mjs` in a page of the pinned
-//! chrome-headless-shell ([`crate::wasm_page`]): V8 as the site's visitors
-//! run it, not node's.
-//!
-//! STOCK EXCEPTION (Trust lacks a wasm32 std: error[E0463] can't find crate
-//! for `core`): the build rides rustup's `stable`, resolved to its own
-//! `cargo`/`rustc` by path, since a stock or rerouted `cargo` earlier on PATH
-//! ignores `RUSTUP_TOOLCHAIN`. It runs from a neutral cwd so no repo
-//! config (vendored source replacement, Trust `-Z` flags) applies.
-//!
-//! A box without the pinned browser, rustup's stable wasm32 target or
-//! `wasm-opt` is COULD NOT RUN naming the provider, found before anything
-//! builds; a failure on an equipped box fails. The floors were recorded in the
-//! pinned shell, so a run in another browser (`ATERM_BROWSER`) is measured
-//! and not judged, and records nothing.
-//!
-//! An honest seam, on purpose: the GPU scenarios time the wasm-side frame
-//! build only (`render()` before `init()` gave it a WebGL context, and
-//! bench.mjs asserts the seam is where it errors; the browser lane draws the
-//! frames).
+//! WebAssembly renderer performance lane (`aterm-wasm` and `aterm-gpu-web`).
 
 use aterm_uds::output::CommandOutput as _;
 use std::fmt::Write as _;
@@ -39,8 +14,7 @@ use super::LaneRun;
 use super::floors::{self, FloorLane};
 use super::workspace_root;
 use crate::wasm_page::{self, Page, Refused};
-// The shipping `wasm-opt` pass: pre-opt numbers are not the product's, so the
-// lane never measures without it.
+
 use crate::wasm_glue::WASM_OPT_FLAGS;
 
 pub(crate) const WASM_LANE: FloorLane = FloorLane {
@@ -71,23 +45,12 @@ pub(crate) const WASM_LANE: FloorLane = FloorLane {
     cli: "wasm",
 };
 
-/// The CPU module's size ceiling in bytes: ABSOLUTE and lower-is-better, on
-/// the post-`wasm-opt -O3` `aterm_wasm_bg.wasm` (`wasm_cpu_module_bytes`). The
-/// measured 5,351,532 B + 10% (docs/DESIGN-host-boundary-2026-08-30.md §7
-/// decision 5). A trip is a raise-or-shrink call, recorded in decision 5 with
-/// its measurement, never a re-record.
+/// CPU module size ceiling in bytes after `wasm-opt -O3`.
 pub(crate) const WASM_CPU_MODULE_BYTES_CAP: f64 = 5_886_685.0;
 
-/// The GPU module's size ceiling in bytes, on the post-`wasm-opt -O3`
-/// `aterm_gpu_web_bg.wasm` (`wasm_gpu_module_bytes`), the same rule as the
-/// CPU module's: the measured 5,575,741 B (2026-10-23) + 10%. Raised from
-/// 5,391,794 B (4,901,631 B on 2026-10-19 + 10%) because the growth ships:
-/// about 492 KB of effects, fx-layer and search code the page runs, and
-/// 176 KB of `#[inline]` on hot paths the page shares with the app. Decision
-/// 5 has the attribution and the shrinks measured and not taken.
+/// GPU module size ceiling in bytes after `wasm-opt -O3`.
 pub(crate) const WASM_GPU_MODULE_BYTES_CAP: f64 = 6_133_315.0;
 
-/// Does `program args` run and exit 0?
 fn answers(program: &Path, args: &[&str]) -> bool {
     command(program)
         .args(args)
@@ -95,12 +58,7 @@ fn answers(program: &Path, args: &[&str]) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-/// What building the two modules needs, found or refused: rustup (whose
-/// `stable` carries the wasm32 std), and `wasm-opt` when `wasm_opt` asks for
-/// it: rustup's path, or COULD NOT RUN naming the provider (both are rows
-/// `verify provision` gives every develop machine). Binding needs nothing
-/// more: `verify glue`'s generator runs in process. The browser the drivers
-/// run in is found first ([`wasm_page::browser`]).
+/// Resolves rustup and optional `wasm-opt` for building the WebAssembly modules.
 pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     let Some(rustup) = crate::rustup::find_rustup() else {
         return Err(LaneRun::could_not_run(
@@ -136,8 +94,8 @@ pub(crate) fn build_tools(wasm_opt: bool) -> Result<PathBuf, LaneRun> {
     Ok(rustup)
 }
 
-/// WASM floors: the shipped modules in the browser, every gated key against
-/// its floor, plus the module-size ceilings.
+/// WASM floors: the shipped modules in the browser, every gated key against its floor, plus the
+/// module-size ceilings.
 pub(crate) fn gate_wasm(record: bool) -> LaneRun {
     let root = workspace_root();
     let browser = match wasm_page::browser() {
@@ -166,10 +124,6 @@ pub(crate) fn gate_wasm(record: bool) -> LaneRun {
     run
 }
 
-/// Whether this run's floors can be judged or recorded: only in the browser
-/// they were recorded in, the pinned shell ([`crate::browser::chromium::pinned_product`]).
-/// Another (an `ATERM_BROWSER` override) is measured and not judged, and
-/// records nothing: V8 at another version is not the same engine.
 fn floors_engine(product: &str, record: bool) -> Result<(), LaneRun> {
     let pinned = pinned_product();
     if product == pinned {
@@ -197,10 +151,7 @@ fn pinned_product() -> String {
     String::new()
 }
 
-/// The CPU module's boundary replay recorded again (`verify glue
-/// --record-replay`): both modules built in the DEV profile and bound as the
-/// `wasm-smoke` check binds them, then [`replay`] with `record`, which
-/// rewrites the answers and checks them back. Progress goes to `log`.
+/// Re-records and verifies the CPU module boundary replay fixture.
 pub(crate) fn record_replay(log: &mut String) -> LaneRun {
     let root = workspace_root();
     let browser = match wasm_page::browser() {
@@ -225,22 +176,12 @@ pub(crate) fn record_replay(log: &mut String) -> LaneRun {
     }
 }
 
-/// The CPU module's recorded boundary answers (`perf/wasm/replay.mjs`).
+/// Path to the CPU module's recorded boundary replay fixture.
 pub(crate) fn replay_answers(root: &Path) -> PathBuf {
     root.join("crates/aterm-wasm/tests/fixtures/abi_replay.json")
 }
 
-/// The CPU module's boundary replay: `replay.mjs`, in a fresh tab of `page`
-/// serving `site` (the debug module's glue in `cpu/`, [`wasm_page::lay_drivers`]'
-/// drivers and font), drives the module through its ES module glue, and the
-/// run must give the recorded answers ([`replay_answers`]); `record`
-/// rewrites them from a run first. The answers were recorded on the glue
-/// wasm-bindgen 0.2.108 wrote, so a module bound another way that reproduces
-/// them carries every value across the boundary as that one did.
-///
-/// NEGATIVE CONTROL: the same run against a copy of the answers with one
-/// frame's hash changed must fail and name that answer, so a replay that
-/// compares nothing cannot pass.
+/// Runs the CPU module boundary replay and its negative control in `page`.
 pub(crate) fn replay(
     root: &Path,
     site: &Path,
@@ -303,8 +244,6 @@ pub(crate) fn replay(
     Ok(())
 }
 
-/// `answers` with the first frame's `rgba` hash changed in its first digit:
-/// the planted text and the planted hash.
 fn plant_frame_hash(answers: &str) -> Option<(String, String)> {
     const KEY: &str = "\"rgba\":\"";
     let at = answers.find(KEY)? + KEY.len();
@@ -318,9 +257,6 @@ fn plant_frame_hash(answers: &str) -> Option<(String, String)> {
     ))
 }
 
-/// Build both modules for wasm32 on rustup's stable in `profile`, with
-/// `rustflags` for the wasm32 target only; the directory the `.wasm` files
-/// land in.
 fn build_modules(
     root: &Path,
     rustup: &Path,
@@ -335,8 +271,6 @@ fn build_modules(
     eprintln!("  building aterm-wasm + aterm-gpu-web (wasm32, {profile}) on stable");
     let mut build = stable.cargo();
     let target = root.join("target");
-    // The intermediates go where Spotlight never looks; the `.wasm` files are
-    // uplifted to `<target>/wasm32-unknown-unknown/<profile>/` as before.
     if let Some(value) =
         crate::fallback_build_dir(&crate::EnvSnapshot::capture(), &neutral, &target)
     {
@@ -373,13 +307,12 @@ fn build_modules(
         Ok(s) => return Err(format!("the stable wasm32 build exited {:?}", s.code())),
         Err(e) => return Err(format!("could not run {}: {e}", stable.cargo.display())),
     }
-    // cargo names the dev profile's directory `debug`.
     let dir = if profile == "dev" { "debug" } else { profile };
     Ok(root.join("target/wasm32-unknown-unknown").join(dir))
 }
 
-/// Bind both modules into `out/cpu` and `out/gpu` with `verify glue`'s
-/// generator, then apply the shipping `wasm-opt` pass when `optimise`.
+/// Bind both modules into `out/cpu` and `out/gpu` with `verify glue`'s generator, then apply the
+/// shipping `wasm-opt` pass when `optimise`.
 pub(crate) fn bind_modules(built: &Path, out: &Path, optimise: bool) -> Result<(), String> {
     for (module, dir) in [("aterm_wasm.wasm", "cpu"), ("aterm_gpu_web.wasm", "gpu")] {
         crate::wasm_glue::bind(&built.join(module), &out.join(dir))?;
@@ -402,15 +335,10 @@ pub(crate) fn bind_modules(built: &Path, out: &Path, optimise: bool) -> Result<(
     Ok(())
 }
 
-/// The wasm-opt the lane runs: the resolver's (`ATERM_TEST_WASM_OPT`, the pinned
-/// binaryen `verify provision` places, then PATH), else the bare name, whose failure to
-/// start names it.
 fn wasm_opt_program() -> PathBuf {
     aterm_uds::host::find_tool("wasm-opt").unwrap_or_else(|| "wasm-opt".into())
 }
 
-/// Build, bind, optimise and bench in `browser`: the browser's product
-/// string, and the bench's report with the two optimised modules' sizes.
 fn build_and_bench(
     root: &Path,
     rustup: &Path,
@@ -453,8 +381,6 @@ fn build_and_bench(
     Ok((product, report))
 }
 
-/// Each gated key's samples, as the bench answered them beside its median
-/// (`samples`, never gated): `key: n=5 [a b c d e]`, in the lane's order.
 fn sample_lines(report: &Value) -> Vec<String> {
     WASM_LANE
         .keys
@@ -486,8 +412,7 @@ fn run_step(cmd: &mut aterm_uds::spawnfd::Command, what: &str) -> Result<(), Str
     }
 }
 
-/// The module-size ceilings, CPU then GPU: a finding for each one breached or
-/// missing (an unmeasured size is not a small one).
+/// The module-size ceilings, CPU then GPU.
 pub(crate) fn wasm_module_fences(json: &Value) -> Vec<String> {
     let fences = [
         (
@@ -580,8 +505,6 @@ mod tests {
         );
     }
 
-    /// A key's samples print in the lane's order; a key the bench gave none
-    /// prints nothing, and an ungated key never prints.
     #[test]
     fn each_gated_keys_samples_print_in_lane_order() {
         let report = json(

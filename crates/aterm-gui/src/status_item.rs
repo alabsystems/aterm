@@ -1331,12 +1331,6 @@ pub(crate) enum NoticeFallback {
         /// Whether the running bundle's id was read.
         named: bool,
     },
-    /// terminal-notifier, speaking as itself: a bare binary has no bundle id to speak for.
-    #[cfg_attr(
-        all(not(target_os = "macos"), not(test)),
-        expect(dead_code, reason = "terminal-notifier is macOS's")
-    )]
-    Notifier,
     /// `osascript`: Script Editor's banner, and a click opens Script Editor — a bare binary's, without terminal-notifier.
     ScriptEditor,
 }
@@ -2343,17 +2337,10 @@ fn notify_tip(voice: Option<NoticeVoice>, on: bool) -> String {
                  and aterm shows them only as its own, so none reach the desktop; aterm's next \
                  start tries again, and {elsewhere}."
             ),
-            NoticeFallback::Notifier => format!(
-                "{what}. This aterm is not running from aterm.app, so they are \
-                 terminal-notifier's banners; run from aterm.app, they are aterm's own once \
-                 macOS allows it."
-            ),
             NoticeFallback::ScriptEditor => format!(
-                "{what}. This aterm is not running from aterm.app, and without terminal-notifier \
-                 macOS shows them as Script Editor's banners, and a click opens Script Editor. \
-                 With terminal-notifier installed, they are terminal-notifier's banners from \
-                 aterm's next start; run from aterm.app, they are aterm's own once macOS \
-                 allows it."
+                "{what}. This aterm is not running from aterm.app, so macOS shows them as Script \
+                 Editor's banners, and a click opens Script Editor; run from aterm.app, they are \
+                 aterm's own once macOS allows it."
             ),
         },
     }
@@ -5926,23 +5913,16 @@ mod tests {
         let fallbacks = [
             NoticeFallback::Withheld { named: true },
             NoticeFallback::Withheld { named: false },
-            NoticeFallback::Notifier,
             NoticeFallback::ScriptEditor,
         ];
         let mut cases = vec![(None, false)];
         for fallback in fallbacks {
             cases.push((voice(Center::Absent, fallback), false));
         }
-        let without = tip(voice(Center::Absent, NoticeFallback::ScriptEditor), false);
-        let found = tip(voice(Center::Absent, NoticeFallback::Notifier), false);
-        assert!(without.contains("Script Editor's banners"), "{without}");
-        for bare in [&without, &found] {
-            assert!(
-                bare.contains("they are terminal-notifier's banners"),
-                "{bare}"
-            );
-            assert!(bare.contains("not running from aterm.app"), "{bare}");
-        }
+        let bare = tip(voice(Center::Absent, NoticeFallback::ScriptEditor), false);
+        assert!(bare.contains("Script Editor's banners"), "{bare}");
+        assert!(bare.contains("not running from aterm.app"), "{bare}");
+        assert!(!bare.contains("terminal-notifier"), "{bare}");
         let unread = tip(
             voice(Center::Absent, NoticeFallback::Withheld { named: false }),
             false,

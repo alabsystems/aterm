@@ -1,15 +1,10 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 //! Complexity tests for scroll-off and lazy scrollback promotion.
 
 use super::super::*;
 
-// Op-count scaling (O(n * cols)).
-
-/// scroll_up captures cells into `DeferredLine`s without `row_to_line`
-/// conversion; draining scrollback materializes them in linear ops.
 #[test]
 fn scroll_up_linear_time() {
     let rows = 100;
@@ -35,7 +30,6 @@ fn scroll_up_linear_time() {
         grid.scroll_up(scroll_lines);
         let scroll_ops = take_row_to_line_ops();
 
-        // Drain lazy buffer to trigger materialization.
         grid.drain_lazy_buffer();
         let drain_ops = take_row_to_line_ops();
 
@@ -45,7 +39,6 @@ fn scroll_up_linear_time() {
     let (small_scroll, small_drain) = measure_scroll_and_drain(rows, cols, 10);
     let (large_scroll, large_drain) = measure_scroll_and_drain(rows, cols, 50);
 
-    // Lazy promotion: zero ops at scroll time.
     assert_eq!(
         small_scroll, 0,
         "scroll_up(10) should defer row_to_line (lazy promotion), got {small_scroll} ops"
@@ -55,7 +48,6 @@ fn scroll_up_linear_time() {
         "scroll_up(50) should defer row_to_line (lazy promotion), got {large_scroll} ops"
     );
 
-    // Materialization ops scale linearly.
     assert!(
         small_drain > 0,
         "drain after scroll_up(10) should perform row_to_line ops, got 0"
@@ -72,7 +64,6 @@ fn scroll_up_linear_time() {
     );
 }
 
-/// Reflow scales linearly with the number of rows.
 #[test]
 fn reflow_linear_time() {
     fn build_wrapped_grid(rows: u16, cols: u16) -> Grid {
@@ -121,7 +112,6 @@ fn reflow_linear_time() {
     );
 }
 
-/// Reflow scales linearly with column count.
 #[test]
 fn reflow_linear_time_columns() {
     fn build_filled_grid(rows: u16, cols: u16) -> Grid {
@@ -172,8 +162,6 @@ fn reflow_linear_time_columns() {
     );
 }
 
-/// A single scroll_up(1) costs zero conversion ops at any grid size; draining
-/// costs O(cols).
 #[test]
 fn scroll_single_line_constant_time() {
     let cols = 80;
@@ -207,7 +195,6 @@ fn scroll_single_line_constant_time() {
     let (small_scroll, small_drain) = measure_single_scroll_and_drain(100, cols);
     let (large_scroll, large_drain) = measure_single_scroll_and_drain(1000, cols);
 
-    // Lazy promotion: zero ops at scroll time regardless of grid size.
     assert_eq!(
         small_scroll, 0,
         "scroll_up(1) on 100-row grid should defer row_to_line, got {small_scroll} ops"
@@ -217,7 +204,6 @@ fn scroll_single_line_constant_time() {
         "scroll_up(1) on 1000-row grid should defer row_to_line, got {large_scroll} ops"
     );
 
-    // Materialization should happen on drain.
     assert!(
         small_drain > 0,
         "drain after scroll_up(1) on 100-row grid should perform row_to_line ops, got 0"
@@ -227,14 +213,12 @@ fn scroll_single_line_constant_time() {
         "drain after scroll_up(1) on 1000-row grid should perform row_to_line ops, got 0"
     );
 
-    // One line's materialization costs the same at 100 or 1000 rows.
     assert!(
         large_drain <= small_drain * 2,
         "Single-line drain should be O(1): 100-row grid {small_drain} ops, 1000-row grid {large_drain} ops (10x grid size should not increase ops)"
     );
 }
 
-/// row_to_line_with_hyperlinks extracts hyperlink spans.
 #[test]
 fn row_to_line_extracts_hyperlinks() {
     use std::sync::Arc;

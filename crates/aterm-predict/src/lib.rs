@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Speculative local-echo state machine (`aterm-predict`), shared by `aterm-gui` and web embedders.
-//!
-//! Tracks typed glyphs ([`Predictor::predict_glyph`]) and line-editing keys ([`Predictor::predict_edit`]),
-//! reconciles them against terminal output ([`Predictor::reconcile_seen`]), and produces the
-//! per-frame ghost overlay ([`Predictor::overlay_frame`]) gated by [`PredictMode`] and measured RTT.
 
 use aterm_time::Instant;
 use std::collections::VecDeque;
@@ -1026,7 +1022,6 @@ impl Predictor {
         cols: u16,
         now: Instant,
     ) -> bool {
-        // `rows = 0` ⇒ no row is available to wrap INTO, so the margin declines.
         self.predict_char_in_grid(ch, cursor, coords, (cols, 0), now)
     }
 
@@ -1069,7 +1064,6 @@ impl Predictor {
         }
         let (cols, rows) = grid;
         if cols == 0 {
-            // Distinct branch.
             return false;
         }
         self.observe_coordinates(coords);
@@ -1346,8 +1340,6 @@ impl Predictor {
         if !self.engaged()
             && let Some(cells) = sample.row
         {
-            // A chain starts: nothing the last chain's reconcile read describes
-            // this one's line; the row this press read does (`start_chain`).
             self.start_chain(cells, &e);
         }
         self.chain = true;
@@ -5133,8 +5125,6 @@ mod tests {
                 assert!(p.predict_char('n', (0, 2), G, 80, at));
                 assert_eq!(p.overlay(at).len(), 1);
             } else {
-                // The same custody applies to unmodelled input: a Right arrow,
-                // for example, may reprint an existing 'n'.
                 p.note_unmodelled_input(at);
             }
             let parked = p.take_link_estimate();

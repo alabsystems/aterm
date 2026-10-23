@@ -51,7 +51,7 @@ pub enum State {
 }
 
 /// The launchctl binary.
-pub const LAUNCHCTL: &str = "/bin/launchctl";
+pub const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
 /// Where `systemctl` may be, tried in order: never a `PATH` lookup.
 pub const SYSTEMCTL_PATHS: [&str; 3] = [

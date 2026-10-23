@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Rust: the line lexer, and indentation by bracket depth.
-//!
-//! The lexer knows comments (nested `/* */` across lines), strings (escaped,
-//! raw with any number of `#`, byte and C prefixes, open across lines), char
-//! literals and lifetimes, numbers with their suffixes, keywords, macro
-//! calls, attributes and punctuation. Brackets outside those are counted
-//! into the [`LexState`], which is what indentation reads.
 
 use super::{Cursor, IndentStyle, LexState, Mode, Spans, SyntaxClass, leading, line_space};
 
@@ -52,7 +46,6 @@ pub(super) fn lex(state: LexState, line: &str, out: &mut Spans) -> LexState {
             b'#' if cur.nth(1) == Some(b'[')
                 || (cur.nth(1) == Some(b'!') && cur.nth(2) == Some(b'[')) =>
             {
-                // `#[` or `#![`, then the attribute's name.
                 cur.bump();
                 cur.eat(b'!');
                 cur.bump();
@@ -147,7 +140,6 @@ fn raw_quoted(cur: &mut Cursor<'_>, start: usize, hashes: u8, out: &mut Spans) -
 fn quote(cur: &mut Cursor<'_>, out: &mut Spans) {
     let start = cur.pos();
     if cur.nth(1) == Some(b'\\') {
-        // An escape: at most `\u{10FFFF}` before the closing quote.
         cur.bump_n(3);
         let mut budget = 10usize;
         while budget > 0 && cur.peek().is_some_and(|byte| byte != b'\'') {
@@ -195,9 +187,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `utf8-lead-width` (SPECS.md), kernel-checked against the compiled
-// body: the table's rows are the lead-byte ranges, each closed off by the
-// row above it.
 verify_island! {
     clean {
         def utf8_width_table (b : UInt8) : UInt8 :=
@@ -230,7 +219,6 @@ fn number(cur: &mut Cursor<'_>, out: &mut Spans) {
             cur.bump_n(2);
         }
     }
-    // Hex digits, the exponent's digits and the suffix are all word bytes.
     cur.eat_while(ident_byte);
     out.push(start, cur.pos(), SyntaxClass::Number);
 }
@@ -239,7 +227,6 @@ fn number(cur: &mut Cursor<'_>, out: &mut Spans) {
 /// (`b"…"`, `br#"…"#`, `c"…"`, `r"…"`, `b'x'`) or raw identifier (`r#type`).
 fn word(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
     let start = cur.pos();
-    // A literal's prefix is at most `br` or `cr`.
     let first = cur.peek();
     let second = cur.nth(1);
     let (prefix, raw) = match (first, second) {
@@ -265,7 +252,6 @@ fn word(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
                 let hashes = u8::try_from(hashes).unwrap_or(u8::MAX);
                 return raw_quoted(cur, start, hashes, out);
             }
-            // `r#type`: a raw identifier, never a keyword.
             cur.eat_while(ident_byte);
             return Mode::Code;
         }
@@ -314,8 +300,6 @@ trust_contract_fn! {
     }
 }
 
-// Spec `rust-ident-byte-set` (SPECS.md), kernel-checked against the compiled
-// body: the set is the clause, byte for byte.
 verify_island! {
     clean {
         theorem ident_byte_is_exactly_the_word_set (byte : UInt8) :
@@ -328,10 +312,7 @@ verify_island! {
     }
 }
 
-/// The bracket count of one line. Each bracket opened deepens the nesting; a
-/// line that ends deeper than the shallowest point it reached left the
-/// bracket opened there open, and that bracket alone adds an indent level, so
-/// `foo(bar(` indents its next line once, not twice.
+/// The bracket count and active indent levels of one line.
 struct Brackets {
     depth: u16,
     levels: u32,
@@ -385,7 +366,6 @@ const fn levels_below(levels: u32, depth: u16) -> usize {
 
 pub(super) fn indent_column(state: LexState, kept: usize, line: &str, style: IndentStyle) -> usize {
     match state.mode {
-        // A string's lines are its content: leave them where they are.
         Mode::Quoted | Mode::RawQuoted(_) => style.columns_of(line),
         Mode::BlockComment(_) => kept,
         _ => {

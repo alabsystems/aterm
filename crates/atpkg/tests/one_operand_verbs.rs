@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Verify single-operand `atpkg` verbs (`uninstall`, `install`, `verify`,
-//! `which`, `repair`, etc.) reject extra operands before taking the store lock
-//! and leave installed state untouched, using an isolated temp `HOME`.
+//! Verify single-operand `atpkg` verbs reject extra operands before taking the store lock.
 
 #![cfg(unix)]
 #![allow(
@@ -43,7 +41,6 @@ impl Fixture {
         Self { root, home, layout }
     }
 
-    /// A ready store build of `program` with its `bin/<program>` shim laid.
     fn install(&self, program: &str) {
         let dir = self.layout.build_dir(program, BUILD);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -61,7 +58,6 @@ impl Fixture {
         atpkg::store::mark_build_ready(&dir).unwrap();
     }
 
-    /// Record the root of `program`'s build in `status.toml` as its signed one.
     fn record_root(&self, program: &str) {
         let root = atpkg::tree::tree_root(&self.layout.build_dir(program, BUILD)).unwrap();
         let mut status = atpkg::status::Status {
@@ -79,7 +75,6 @@ impl Fixture {
         atpkg::status::write(&self.layout, &status).unwrap();
     }
 
-    /// Whether `program` is still on this machine: its store tree AND its shim.
     fn installed(&self, program: &str) -> bool {
         let shim = self
             .layout
@@ -138,8 +133,6 @@ fn uninstall_of_two_names_refuses_both_and_removes_neither() {
         "no removal intent may be recorded for a refused command:\n{all}"
     );
 
-    // CONTROL: the same fixture DOES uninstall one name, so the refusal above is the
-    // guard speaking, not a fixture that could not have removed anything.
     let one = f.atpkg(&["uninstall", "ta"]);
     let one_all = text(&one);
     assert_eq!(one.status.code(), Some(0), "{one_all}");
@@ -156,7 +149,6 @@ fn uninstall_of_two_names_refuses_both_and_removes_neither() {
 #[test]
 fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
     let f = Fixture::new("verbs");
-    // An empty store gives the audit (see the CONTROL below) nothing to fail.
     let out = f.atpkg(&["verify"]);
     assert_eq!(out.status.code(), Some(0), "{}", text(&out));
     f.install("ta");
@@ -177,9 +169,6 @@ fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
     }
     assert!(f.installed("ta"), "no verb above may have acted on `ta`");
 
-    // CONTROL: `verify ta` alone runs the audit, whose exit is its verdict — 1 while no
-    // signed root is recorded (fail closed), 0 once the recorded root matches — and a bare
-    // `verify` fails when any one program it audits does.
     let out = f.atpkg(&["verify", "ta"]);
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
     f.record_root("ta");
@@ -190,10 +179,6 @@ fn every_one_name_verb_refuses_a_second_name_at_the_usage_exit() {
     assert_eq!(out.status.code(), Some(1), "{}", text(&out));
 }
 
-/// A verb that takes no operand refuses a stray argument at the usage exit, before the
-/// store lock: `repair --dry-run` (there is no such flag) must not re-lay a single shim or rc
-/// line. No bare-`repair` control: repair re-asserts the rustup seam, and `RUSTUP_HOME`
-/// is the real one under a rustup-run test.
 #[test]
 fn a_no_argument_verb_refuses_a_stray_one_and_touches_nothing() {
     let f = Fixture::new("zero");
@@ -215,8 +200,6 @@ fn a_no_argument_verb_refuses_a_stray_one_and_touches_nothing() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect::<std::collections::BTreeSet<_>>();
-    // Rosetta writes `$HOME/.cache/rosetta` regardless of `XDG_CACHE_HOME`;
-    // ignore `.cache` when running under a binary translator.
     if let Some(translator) = aterm_uds::process::translator() {
         let cache = std::ffi::OsString::from(".cache");
         let held = std::fs::read_dir(f.home.join(&cache))

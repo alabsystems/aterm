@@ -1,17 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `gen_animal_glyphs` — regenerate the checked-in species-head const drawlists.
-//!
-//! Reads every species-head asset TOML under `crates/aterm-effects/art/animal/` and
-//! writes `crates/aterm-effects/src/animal_glyphs_gen.rs`; the
-//! `animal_glyphs_gen_matches_assets` drift test fails until they match. Same parser
-//! as `gen_cat_glyphs`, separate roster: species heads must not land in the
-//! collectible `GLYPHS` table.
-//!
-//! ```text
-//! targo --unverified run -p aterm-effects --example gen_animal_glyphs
-//! ```
+//! Regenerate `src/animal_glyphs_gen.rs` from `art/animal/*.toml`
+//! (`targo --unverified run -p aterm-effects --example gen_animal_glyphs`).
 
 use std::path::Path;
 use std::process::ExitCode;

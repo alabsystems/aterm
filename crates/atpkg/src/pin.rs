@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Local pin state: the programs the user has frozen against `update`/`sync`.
-//!
-//! A pin only suppresses an upgrade; it never grants, moves or downgrades a build. It is a
-//! local file, never signed trust input, and is consulted after [`crate::gate::decide`], so a
-//! tombstone or floor always wins over it. The state is a `0600` newline-delimited file under
-//! the prefix, replaced atomically (temp + rename).
+//! Local pin state for programs frozen against `update` and `sync`.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -18,13 +13,11 @@ use crate::store::Layout;
 const MAX_PIN_FILE_BYTES: usize = 256 * 1024;
 const MAX_PINNED_PROGRAMS: usize = 2048;
 
-/// `pins`, directly under the prefix.
 fn pins_path(layout: &Layout) -> PathBuf {
     layout.prefix.join("pins")
 }
 
-/// The set of pinned program names. An absent, unreadable, oversized or over-count file
-/// reads as empty: a pin is suppression state, not trust input.
+/// Returns the set of locally pinned program names.
 #[must_use]
 pub fn pinned_set(layout: &Layout) -> BTreeSet<String> {
     let Ok(body) =
@@ -48,10 +41,7 @@ pub fn is_pinned(layout: &Layout, program: &str) -> bool {
     pinned_set(layout).contains(program)
 }
 
-/// Set (or clear) the local pin for `program`, returning `Ok(changed)`. A name that is not a
-/// single safe path component, or holds a newline (a phantom pin line), is
-/// [`io::ErrorKind::InvalidInput`] and writes nothing. The file is written `0600` to a temp
-/// file and renamed into place, so a crash leaves the old file or none.
+/// Sets or clears the local pin for `program`, returning `Ok(changed)`.
 pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bool> {
     if program.is_empty()
         || program == "."

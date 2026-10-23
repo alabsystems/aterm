@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The checks the CLI runs: each a name, the stages that decide it, what it
-//! needs and what it runs; and the two sets, `dev` and `release`.
+//! Definitions and sets for `aterm-verify` checks.
 
 use crate::plan::StageId;
 
@@ -47,9 +46,7 @@ pub struct Spec {
     /// The stages whose rows decide it.
     pub stages: &'static [StageId],
     pub reach: Reach,
-    /// The tools the machine must have for it to run: rows of `aterm_uds::host::TOOLS`,
-    /// so `list` prints each with its provider and a missing one ends COULD NOT RUN
-    /// naming that provider ([`needs_of`]).
+    /// The tools the machine must have for it to run (`aterm_uds::host::TOOLS`).
     pub needs: &'static [&'static str],
     /// What else it needs that is no tool: the network, a pushed HEAD, an argument.
     pub also: &'static str,
@@ -101,8 +98,6 @@ pub const CHECKS: [Spec; 19] = [
             "pwsh",
             "vim",
             "zstd",
-            "python3",
-            "openssl3",
             "chrome-headless-shell",
         ],
         also: "",
@@ -262,10 +257,6 @@ pub const DEV: [Check; 5] = [
 ];
 
 /// What publication requires: the whole workspace, and a skip is not a pass.
-/// `cells` is not in it: the release builds only the
-/// macOS bundle, so nothing it builds is for the foreign triples, and a
-/// Windows-only type error or a stable without a cross std stopped a macOS
-/// release. `verify cells` runs by hand.
 pub const RELEASE: [Check; 12] = [
     Check::Fmt,
     Check::Lint,
@@ -326,8 +317,7 @@ pub fn lookup(w: &str) -> Option<Word> {
     }
 }
 
-/// The stages a selection of checks plans, each check's in order, without
-/// repeats.
+/// The stages a selection of checks plans, each check's in order, without repeats.
 #[must_use]
 pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
     let mut v: Vec<StageId> = Vec::new();
@@ -339,36 +329,19 @@ pub fn stages_of(checks: &[Check]) -> Vec<StageId> {
     v
 }
 
-/// The package whose tests and lint have a second arm behind a feature, and that
-/// feature: aterm-gpu's renderer against the wgpu oracle. The default build
-/// compiles none of the oracle's tests, so a selection that holds aterm-gpu
-/// tests and lints that arm too ([`PULLS`], the lint's oracle pass).
+/// The package whose tests and lint have a second arm behind a feature, and that feature.
 pub const ORACLE: (&str, &str) = ("aterm-gpu", "wgpu-oracle");
 
-/// The checks that judge what some packages' own tests cannot, each with those
-/// packages: a selection holding one runs the check with `test`
-/// ([`with_pulled`]).
+/// The checks that judge what some packages' own tests cannot, each with those packages.
 pub const PULLS: [(Check, &[&str]); 2] = [
-    // The renderer against the wgpu oracle: the default build compiles none
-    // of its tests ([`ORACLE`]).
     (Check::GpuOracle, &[ORACLE.0]),
-    // The two web modules' CPU replay, which holds the engine and renderer to
-    // the answers recorded on wasm32 (`crates/aterm-wasm/tests/fixtures/
-    // abi_replay.json`); no native test reads them. The change cone is closed
-    // under reverse dependency, so a change to any crate either module builds
-    // on (aterm-grid, aterm-core, aterm-types, aterm-render, …) holds them,
-    // and its author meets the drift, not the next integration. The cone is
-    // taken on this host's graph, where neither module has its host boundary:
-    // both take aterm-wasm-abi (and through it its macros) on wasm32 alone,
-    // so that crate is named here itself.
     (
         Check::WasmSmoke,
         &["aterm-wasm", "aterm-gpu-web", "aterm-wasm-abi"],
     ),
 ];
 
-/// The [`PULLS`] checks `wanted` lacks whose packages the selection holds
-/// (`holds`), each with the first package it holds, when `wanted` runs `test`.
+/// The [`PULLS`] checks `wanted` lacks whose packages `holds` selects when `wanted` runs `test`.
 #[must_use]
 pub fn pulled(wanted: &[Check], holds: impl Fn(&str) -> bool) -> Vec<(Check, &'static str)> {
     if !wanted.contains(&Check::Test) {
@@ -381,10 +354,7 @@ pub fn pulled(wanted: &[Check], holds: impl Fn(&str) -> bool) -> Vec<(Check, &'s
         .collect()
 }
 
-/// `wanted`, plus what it [`pulled`], in [`CHECKS`] order as a run holds them:
-/// the oracle's tests run wherever aterm-gpu's do, and the web modules' replay
-/// wherever theirs do, never only at release or by hand. A `release` run is
-/// its set and nothing more ([`RELEASE`]).
+/// `wanted`, plus what it [`pulled`], in [`CHECKS`] order.
 #[must_use]
 pub fn with_pulled(wanted: &[Check], release: bool, holds: impl Fn(&str) -> bool) -> Vec<Check> {
     if release {
@@ -398,8 +368,7 @@ pub fn with_pulled(wanted: &[Check], release: bool, holds: impl Fn(&str) -> bool
         .collect()
 }
 
-/// The check a stage's rows count toward in this selection: the selected check
-/// that runs it.
+/// The check a stage's rows count toward in this selection.
 #[must_use]
 pub fn owner(id: StageId, checks: &[Check]) -> Option<Check> {
     checks
@@ -425,8 +394,7 @@ pub fn sets_of(check: Check) -> String {
     }
 }
 
-/// What `check` needs, as `list` prints it: each tool with its provider
-/// (`fish (verify provision)`), then what else it needs; `-` for nothing.
+/// What `check` needs, as `list` prints it.
 ///
 /// # Panics
 ///
@@ -449,9 +417,7 @@ pub fn needs_of(check: Check) -> String {
     }
 }
 
-/// `verify list`'s second table: every tool a check needs, once, in the order the checks
-/// first name it, with who provides it and WHY aterm runs it (each row's `why` in
-/// `aterm_uds::host::TOOLS`, so the reason cannot drift from the gate).
+/// `verify list`'s second table: every tool a check needs, once, in first-mention order.
 #[must_use]
 pub fn tools_table() -> String {
     let mut names: Vec<&str> = Vec::new();
@@ -492,8 +458,7 @@ pub fn tools_table() -> String {
     out
 }
 
-/// `verify list`: every check, its sets, what it reads, needs and runs, then the tools
-/// those need ([`tools_table`]).
+/// `verify list`: every check, its sets, what it reads, needs and runs, then [`tools_table`].
 #[must_use]
 pub fn list_table() -> String {
     let rows: Vec<[String; 5]> = CHECKS
@@ -549,8 +514,6 @@ mod tests {
     use super::*;
     use crate::scope::Scope;
 
-    /// `list`'s NEEDS column is the TOOLS table's: each tool with its provider, so the
-    /// remedy a COULD NOT RUN names is the one `list` shows, and none is Homebrew.
     #[test]
     fn list_renders_each_checks_needs_from_the_tools_table() {
         let test = needs_of(Check::Test);
@@ -558,14 +521,17 @@ mod tests {
             "fish (verify provision)",
             "pwsh (verify provision)",
             "cc (CLT)",
-            // The producer's one real-CLI pack test (§6.1 row 18); the rest pack through
-            // aterm-zstd's raw-block writer.
             "zstd (unprovided)",
-            "python3 (unprovided)",
             "vim (OS)",
         ] {
             assert!(test.contains(want), "{want} in {test}");
         }
+        // S11: the embedded verifier's tests run in the Linux guest, so the dev test check
+        // needs neither of its tools on a Mac.
+        assert!(
+            !test.contains("python3") && !test.contains("openssl3"),
+            "{test}"
+        );
         assert_eq!(
             needs_of(Check::Linux),
             "Apple silicon with Rosetta, limactl (verify provision --linux), network for the first \
@@ -574,8 +540,6 @@ mod tests {
         assert_eq!(needs_of(Check::Census), "-");
         let table = list_table();
         assert!(!table.contains("brew"), "{table}");
-        // node is the release host's (`ship site`'s firebase-tools), never a check's: every
-        // wasm driver runs in the pinned chrome-headless-shell (init-system S10).
         for spec in CHECKS {
             let needs = needs_of(spec.check);
             assert!(
@@ -592,7 +556,6 @@ mod tests {
                 needs_of(check)
             );
         }
-        // And each tool's reason, once: the comment the owner asked for, printed.
         let fish = aterm_uds::host::tool("fish");
         let line = table
             .lines()
@@ -646,18 +609,9 @@ mod tests {
         );
     }
 
-    /// A change to a crate the web modules build on reaches them through the
-    /// cone ([`crate::changed::select`], closed under reverse dependency), and
-    /// their replay runs with the tests: the drift is the change's author's to
-    /// see. A change no web module builds on, a run without `test`, `-p`
-    /// naming neither module, and a release pull nothing.
     #[test]
     fn a_selection_holding_a_web_module_runs_its_replay_with_its_tests() {
         use crate::changed::{Manifests, Member, Members, Replan, Selection, cone, select};
-        // Each crate with its dependents, closed (`targo tree --invert`): the
-        // real crates' path edges on this host. aterm-wasm-abi's dependents
-        // here are tools (aterm-verify, aterm-release): both web modules take
-        // it on wasm32 alone, an edge this graph does not show.
         const DEPENDENTS: [(&str, &str); 7] = [
             (
                 "aterm-types",

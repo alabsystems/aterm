@@ -11,7 +11,7 @@ use super::view::{
 };
 use super::{Ctx, clock_s, exe_word};
 use crate::explain::{
-    Account, Bare, CauseId, CoalRow, Context, Evidence, Part, Role, Shown, Via, WakeFact,
+    Account, Bare, CauseId, CoalRow, Context, Evidence, Lead, Part, Role, Shown, Via, WakeFact,
     WhySubject, account_of, bare_subject,
 };
 use crate::model::{Snapshot, Throttle};
@@ -44,13 +44,6 @@ fn line(key: impl Into<String>, text: impl Into<String>) -> Line {
         text: text.into(),
         value: true,
     }
-}
-
-fn team_word(team: &str) -> bool {
-    team.len() == 10
-        && team
-            .bytes()
-            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
 }
 
 fn cores(mc: i64) -> f32 {
@@ -127,8 +120,6 @@ impl<'a> Reading<'a> {
             (None, Role::Unavailable(w)) => (Err(w), f.split.parts_of(&[])),
             (None, _) => (Err("not_sampled"), f.split.parts_of(&[])),
         };
-        let cut = self.s.procs_truncated || f.procs_truncated;
-        let pair = cut || self.a.you.unattributed_mc.is_some_and(|u| u > 0) || tab.is_err();
         let (services, unaccounted) = if f.split.via == Via::Subtraction && p.unaccounted >= 0 {
             (p.services + p.unaccounted, None)
         } else {
@@ -136,9 +127,9 @@ impl<'a> Reading<'a> {
         };
         Some(Printed {
             tab,
-            tab_low: pair || !self.s.delegated.is_empty(),
+            tab_low: self.a.tab_at_least(self.s),
             aterm_rest: p.aterm_rest,
-            rest_high: pair,
+            rest_high: self.a.bounded(self.s),
             others: p.others,
             services,
             unaccounted,
@@ -245,20 +236,6 @@ impl<'a> Reading<'a> {
         };
         words::cause_words(&base, context)
     }
-    fn tab_clause(&self) -> &'static str {
-        let y = &self.a.you;
-        match y.role {
-            Role::Main => "this tab is the main cause",
-
-            Role::Part => "this tab is part of the cause",
-            Role::Minor => "this tab is not the cause",
-            Role::None => "this tab uses none of it",
-            Role::Unavailable(_) if y.figure.is_some() && y.unattributed_mc.is_none() => {
-                "whether this tab is the largest part is not read now"
-            }
-            Role::Unavailable(_) => "this tab's share is not read now",
-        }
-    }
 
     fn sentence(clauses: &[String]) -> Line {
         line("why", format!("{:<8}{}", "why", clauses.join("; ")))
@@ -268,7 +245,7 @@ impl<'a> Reading<'a> {
         let mut clauses = vec![format!("global cpu: {}", self.busy_words())];
         clauses.extend(self.mostly());
         clauses.push(self.headline(WhySubject::Cpu));
-        clauses.push(self.tab_clause().into());
+        clauses.push(self.a.you.clause().into());
         Self::sentence(&clauses)
     }
 
@@ -299,7 +276,7 @@ impl<'a> Reading<'a> {
             None => clauses.push(format!("global memory: {}", unavailable("unsupported"))),
         }
         clauses.push(self.headline(WhySubject::Mem));
-        clauses.push(self.tab_clause().into());
+        clauses.push(self.a.you.clause().into());
         Self::sentence(&clauses)
     }
 
@@ -445,7 +422,7 @@ impl<'a> Reading<'a> {
                     l.exe.as_deref().map_or("-", exe_word),
                     l.voucher.word()
                 ));
-                if let Some(team) = l.team.as_deref().filter(|t| team_word(t)) {
+                if let Some(team) = l.team_id() {
                     t.push_str(&format!(" team={team}"));
                 }
             }
@@ -911,10 +888,7 @@ impl Reading<'_> {
                 Jv::s(lead.map_or("unknown", |l| l.voucher.word())),
             ),
         ]);
-        if let Some(team) = lead
-            .and_then(|l| l.team.as_deref())
-            .filter(|t| team_word(t))
-        {
+        if let Some(team) = lead.and_then(Lead::team_id) {
             o.set("team", Jv::s(team));
         }
         match r.part {

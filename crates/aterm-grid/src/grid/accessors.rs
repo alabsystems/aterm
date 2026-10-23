@@ -12,7 +12,6 @@ use crate::Damage;
 use crate::extra_collection::CellRenderData;
 use crate::{CellCoord, CellExtra, CellExtras};
 
-/// `Dimensions` for `Grid`, so consumers need no foreign impl.
 impl Dimensions for Grid {
     #[inline]
     fn total_lines(&self) -> usize {
@@ -156,9 +155,7 @@ impl Grid {
         self.damage_selection_visible_rows(top, bottom);
     }
 
-    /// Drain this batch's accumulated selection damage (see [`SelectionDamage`]).
-    ///
-    /// [`SelectionDamage`]: crate::SelectionDamage
+    /// Drain this batch's accumulated selection damage (see [`crate::SelectionDamage`]).
     #[inline]
     pub fn take_selection_damage(&mut self) -> crate::SelectionDamage {
         self.storage.take_selection_damage()

@@ -1,15 +1,7 @@
 // Copyright (c) 2019 Fontations Developers
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Derived from skrifa 0.46.2 src/outline/glyf/mod.rs, src/outline/glyf/outline.rs
-// and src/outline/glyf/memory.rs, and from read-fonts 0.43.2
-// src/tables/glyf.rs, src/tables/loca.rs, src/tables/hmtx.rs and
-// generated/generated_glyf.rs, and modified by the aterm project in 2026:
-// FreeType's unscaled `glyf` loader (the path skrifa's autohinter loads its
-// outlines through), without the TrueType interpreter, the scaled paths or the
-// metrics it does not reach, every read checked.
-// See ../../LICENSE-FONTATIONS for the upstream license.
+// Derived from skrifa 0.46.2 and read-fonts 0.43.2 (see ../../LICENSE-FONTATIONS).
 
 //! Unscaled TrueType `glyf` outline loader for the autohinter.
 
@@ -275,7 +267,7 @@ impl<'a> SimpleGlyph<'a> {
         Ok(())
     }
 
-    /// The number of points: the last contour end point, plus one.
+    /// The number of points.
     pub(crate) fn num_points(&self) -> usize {
         match self.contour_count() {
             0 => 0,
@@ -368,7 +360,7 @@ impl<'a> SimpleGlyph<'a> {
     }
 }
 
-/// A composite glyph: transformed references to other glyphs.
+/// A composite glyph.
 #[derive(Clone, Copy)]
 pub(crate) struct CompositeGlyph<'a> {
     data: &'a [u8],
@@ -415,7 +407,7 @@ impl<'a> CompositeGlyph<'a> {
         self.data.get(10..).unwrap_or_default()
     }
 
-    /// Every component, fully read; stops at the first that runs past the data.
+    /// Every component, fully read.
     fn components(&self) -> impl Iterator<Item = Component> + 'a {
         let data = self.component_data();
         let mut pos = 0usize;
@@ -586,7 +578,7 @@ pub(crate) struct Tables<'a> {
 }
 
 impl<'a> Outlines<'a> {
-    /// `None` without `loca`, `glyf`, `hhea` or `hmtx`, or with a short `head` or `hhea` or a `loca` of partial offsets.
+    /// Returns `None` if `loca`, `glyf`, `hhea`, or `hmtx` is missing or invalid.
     pub(crate) fn new(tables: &Tables<'a>) -> Option<Self> {
         if tables.head.len() < 54 {
             return None;

@@ -53,7 +53,7 @@ pub struct MessageAsKeyEvent {
 pub struct KeyEventBuilder {
     event_info: Mutex<Option<PartialKeyEventInfo>>,
     pending: PendingEventQueue<MessageAsKeyEvent>,
-    /// LOCAL PATCH (aterm): the Alt code being typed, and the character the last one composed.
+    /// The Alt code being typed, and the character the last one composed.
     alt_code: Mutex<AltCode>,
     alt_code_commit: Mutex<Option<String>>,
 }
@@ -68,22 +68,19 @@ impl Default for KeyEventBuilder {
     }
 }
 impl KeyEventBuilder {
-    /// LOCAL PATCH (aterm): the character the last Alt code composed, once. Windows posts it as a
-    /// WM_CHAR with no key-down after Alt is released, which upstream dropped as "probably IME";
-    /// the event loop sends it on as `Ime::Commit`.
+    /// The character the last Alt code composed, once.
     pub(crate) fn take_alt_code_commit(&self) -> Option<String> {
         self.alt_code_commit.lock().unwrap().take()
     }
 
-    /// LOCAL PATCH (aterm): a key-down for [`AltCode`], with the live Alt and Ctrl state.
+    /// Record a key-down for [`AltCode`], with the live Alt and Ctrl state.
     fn note_alt_code_key(&self, vkey: VIRTUAL_KEY) {
         let held = |vk: VIRTUAL_KEY| key_state(vk) < 0;
         let (alt, ctrl) = (held(VK_MENU), held(VK_CONTROL));
         self.alt_code.lock().unwrap().key_down(vkey, alt, ctrl);
     }
 
-    /// LOCAL PATCH (aterm): a WM_CHAR no key-down claimed. `true` when it belongs to an Alt
-    /// code; the last unit of the character stores it for [`Self::take_alt_code_commit`].
+    /// Handle a `WM_CHAR` no key-down claimed ([`Self::take_alt_code_commit`]).
     fn alt_code_char(&self, hwnd: HWND, unit: u16) -> bool {
         if !self.alt_code.lock().unwrap().push(unit) {
             return false;
@@ -129,7 +126,6 @@ impl KeyEventBuilder {
                 },
                 WM_KEYDOWN | WM_SYSKEYDOWN => {
                     if msg_kind == WM_SYSKEYDOWN && wparam as VIRTUAL_KEY == VK_F4 {
-                        // This is handled in `event_loop.rs`
                         return MatchResult::Nothing;
                     }
                     self.note_alt_code_key(wparam as VIRTUAL_KEY);
@@ -154,8 +150,6 @@ impl KeyEventBuilder {
                             WM_KEYDOWN | WM_SYSKEYDOWN | WM_KEYUP | WM_SYSKEYUP
                         );
                         if next_belongs_to_this {
-                            // The next OS event belongs to this Winit event, so let's just
-                            // store the partial information, and add to it in the upcoming events
                             *event_info = finished_event_info.take();
                         } else {
                             let (_, layout) = layouts.get_current_layout();
@@ -235,8 +229,6 @@ impl KeyEventBuilder {
                         .map(|m| matches!(m.message, WM_CHAR | WM_SYSCHAR))
                         .unwrap_or(false);
                     if more_char_coming {
-                        // No need to produce an event just yet, because there are still more
-                        // characters that need to be appended to this keyboard event
                         MatchResult::TokenToRemove(pending_token)
                     } else {
                         let mut event_info = self.event_info.lock().unwrap();
@@ -455,9 +447,7 @@ impl KeyEventBuilder {
     }
 }
 
-/// LOCAL PATCH (aterm): Windows' Alt-code entry. Alt held, a code typed on the NumLock-on
-/// keypad (Alt, 0, 2, 3, 3), and on Alt's release the system posts the composed character
-/// (`é`) as a WM_CHAR no key-down belongs to.
+/// Windows Alt-code entry state.
 #[derive(Default)]
 struct AltCode {
     armed: bool,
@@ -486,7 +476,7 @@ impl AltCode {
         }
     }
 
-    /// Takes a WM_CHAR unit when armed; `false` leaves it to upstream's IME path.
+    /// Takes a WM_CHAR unit when armed.
     fn push(&mut self, unit: u16) -> bool {
         if self.armed {
             self.units.push(unit);
@@ -580,8 +570,6 @@ impl PartialKeyEventInfo {
         let logical_key = if let Some(key) = code_as_key.clone() {
             PartialLogicalKey::This(key)
         } else if is_pressed && key_is_char && !mods.contains(WindowsModifiers::CONTROL) {
-            // In some cases we want to use the UNICHAR text for logical_key in order to allow
-            // dead keys to have an effect on the character reported by `logical_key`.
             PartialLogicalKey::TextOr(preliminary_logical_key)
         } else {
             PartialLogicalKey::This(preliminary_logical_key)
@@ -706,8 +694,7 @@ fn ex_scancode_from_lparam(lparam: LPARAM) -> ExScancode {
     new_ex_scancode(lparam.scancode, lparam.extended)
 }
 
-/// LOCAL PATCH (aterm): what the key path reads from Windows, answered from a recorded message
-/// sequence while one is replayed on this thread (`super::recorded`). Tests and debug builds only.
+/// Recorded message-sequence replay hooks for tests and debug builds (`super::recorded`).
 #[cfg(any(test, debug_assertions))]
 pub(crate) mod replay {
     use std::cell::RefCell;
@@ -758,7 +745,7 @@ pub(crate) mod replay {
     }
 }
 
-/// LOCAL PATCH (aterm): `GetKeyState(vk)` (the replay's recorded state while one runs).
+/// `GetKeyState(vk)`, or the replay's recorded state while one runs.
 pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     #[cfg(any(test, debug_assertions))]
     if let Some(keys) = replay::keys() {
@@ -768,8 +755,7 @@ pub(crate) fn key_state(vk: VIRTUAL_KEY) -> i16 {
     unsafe { GetKeyState(vk as i32) }
 }
 
-/// LOCAL PATCH (aterm): the layout `MapVirtualKeyExW` maps a scan code through; a replay maps with
-/// the thread's own, since a recorded layout is none Windows loaded.
+/// The layout `MapVirtualKeyExW` maps a scan code through.
 pub(crate) fn mapping_layout(hkl: HKL) -> HKL {
     #[cfg(any(test, debug_assertions))]
     if replay::layout().is_some() {
@@ -817,7 +803,7 @@ fn get_async_kbd_state() -> [u8; 256] {
     }
 }
 
-/// On windows, AltGr == Ctrl + Alt
+/// On windows, AltGr == Ctrl + Alt.
 fn is_current_fake(curr_info: &PartialKeyEventInfo, next_msg: MSG, layout: &Layout) -> bool {
     let curr_is_ctrl =
         matches!(curr_info.logical_key, PartialLogicalKey::This(Key::Named(NamedKey::Control)));
@@ -870,8 +856,6 @@ impl<T> PendingEventQueue<T> {
             }
         }
         if target_is_first {
-            // If the message that we just finished was the first one in the pending queue,
-            // then we can empty the queue, and dispatch all of the messages.
             Self::drain_pending(&mut *pending)
         } else {
             Vec::new()
@@ -1140,8 +1124,6 @@ mod alt_code_tests {
         VK_LMENU, VK_MENU, VK_NUMPAD0, VK_NUMPAD2, VK_NUMPAD3, VK_RETURN, VK_SHIFT,
     };
 
-    /// Alt, 0, 2, 3, 3 on the keypad, then Alt's release posts `é` as one WM_CHAR: the
-    /// code takes it and hands it over whole, once.
     #[test]
     fn an_alt_code_hands_over_its_character() {
         let mut code = AltCode::default();
@@ -1154,7 +1136,6 @@ mod alt_code_tests {
         assert!(!code.push(0x00e9), "one character per code");
     }
 
-    /// A surrogate pair arrives as two WM_CHARs and leaves as one character.
     #[test]
     fn a_surrogate_pair_is_one_character() {
         let mut code = AltCode::default();
@@ -1164,8 +1145,6 @@ mod alt_code_tests {
         assert_eq!(code.finish().as_deref(), Some("😀"));
     }
 
-    /// Nothing arms without Alt, Ctrl+Alt (AltGr) does not, and a key that is not a
-    /// modifier disarms: those WM_CHARs stay upstream's (an IME's, or nobody's).
     #[test]
     fn only_alt_and_a_keypad_digit_arm_it() {
         let mut code = AltCode::default();

@@ -2,21 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The press guard: bind an approving keystroke to the box that was judged.
-//!
-//! `key if=<re> <key>` presses only while some visible row matches `<re>`,
-//! checked under the terminal lock the write takes (aterm-gui
-//! `control_input.rs`). [`row_guard`] anchors the classified row, indentation
-//! and all, at both ends, so the press lands only while that row is still
-//! drawn, never on a swapped box or a transcript copy.
-//!
-//! The wire splits a control line on whitespace and nothing quotes, so the
-//! pattern holds no whitespace: a space is `\x20`.
-//!
-//! Where the server supports it ([`server_fences_gen`]), [`key_args`] also
-//! fences the press on the judged read's screen generation (`if-gen=`, answered
-//! `OK skipped reason=changed` when the screen moved): the generation, not
-//! `seq=`, which repeats after an alternate-screen re-entry. `if-fp=` is not
-//! sent: within one generation the screen cannot change.
 
 /// The longest pattern the server compiles for a guard
 /// (`aterm_observe::row_matcher`'s `MAX_REGEX_PATTERN_LEN`).
@@ -30,10 +15,6 @@ pub const ROW_END: &str = "\\s*$";
 /// indentation, its text, and any trailing whitespace the grid pads it with)
 /// and nothing else; past [`MAX_GUARD_BYTES`], the longest anchored prefix
 /// that fits.
-///
-/// The trailing run is [`ROW_END`], any whitespace, not only spaces: a `text`
-/// read trims what `str::trim_end` trims, the server tests the row as drawn,
-/// and Claude Code draws its empty composer as `❯` and a no-break space.
 pub fn row_guard(row: &str) -> String {
     let body = row.trim_end();
     let indent = body.chars().take_while(|c| *c == ' ').count();
@@ -70,8 +51,6 @@ fn escape_char(c: char) -> String {
     } else if c.is_ascii_control() || c.is_ascii_whitespace() {
         format!("\\x{:02X}", c as u32)
     } else if "\\.+*?()|[]{}^$".contains(c) {
-        // The metacharacters only: `\<` and `\>` are word-boundary
-        // assertions in this engine, so the rest of ASCII is written bare.
         format!("\\{c}")
     } else if c.is_whitespace() || c.is_control() {
         format!("\\x{{{:X}}}", c as u32)
@@ -91,34 +70,24 @@ pub fn key_args(guard: &str, key: &str, gen_fence: Option<&str>) -> String {
 }
 
 /// Whether the server's `help` text (the whole catalog, or `help key`) says
-/// `key` takes the `if-gen=<epoch>.<seq>` fence. An entry is the row naming
-/// its verb in column 0 plus the indented rows under it; `if-seq=` is not the
-/// fence (a server that knows `if-gen=` names `if-seq=` only to refuse it).
+/// `key` takes the `if-gen=<epoch>.<seq>` fence.
 pub fn server_fences_gen(help: &str) -> bool {
     entry_names_gen(help, "key")
 }
 
-/// Whether the server's `help` text says `send` takes the `if-gen=` fence. An
-/// older `send` types a leading `if-gen=` into its body as text, so a fenced
-/// send is sent only where this is true.
+/// Whether the server's `help` text says `send` takes the `if-gen=` fence.
 pub fn server_fences_send(help: &str) -> bool {
     entry_names_gen(help, "send")
 }
 
 /// Whether the server's `help` text says `key` takes `act=`:
-/// what a press means for the box it dismisses. An
-/// older `key` refuses the option as a key name, so a press carries it only
-/// where this is true. Read off the same `help key` reply as
-/// [`server_fences_gen`], so it costs no request of its own.
+/// what a press means for the box it dismisses.
 pub fn server_takes_act(help: &str) -> bool {
     entry_names(help, "key", "act=approve")
 }
 
 /// What a dismissing key means for the box it dismisses:
-/// the leading `act=<word>` the server's `key` takes. Only the
-/// key that dismisses carries one (the digit, the focused Enter, the
-/// decline's Enter, a question's answering Enter), never an arrow, a Tab or
-/// a text.
+/// the leading `act=<word>` the server's `key` takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAct {
     /// The box's command is approved.
@@ -187,7 +156,6 @@ mod tests {
         for (k, row) in rows.iter().enumerate() {
             assert_eq!(m(row), k == cmd_row, "row {k}: {row:?}");
         }
-        // Grid padding on the right still matches.
         assert!(m("   git log --oneline -5      "));
     }
 
@@ -223,8 +191,7 @@ mod tests {
     }
 
     /// Claude Code's empty composer is drawn as the caret and a no-break space,
-    /// which `text` reads trimmed to `❯`. Negative controls: a draft, and an
-    /// option row's caret.
+    /// which `text` reads trimmed to `❯`.
     #[test]
     fn the_guard_of_a_trimmed_read_matches_the_row_the_server_tests() {
         let g = row_guard("❯");
@@ -255,8 +222,6 @@ mod tests {
         assert!(!server_fences_gen(
             "key [id=<key>] [if=<re>] <name>: send a named key"
         ));
-        // The server's own answers: `help key` (one entry, the fence on a
-        // continuation row) and the full catalog.
         let help_key = aterm_types::control_verbs::spec("key")
             .expect("the key verb")
             .entry_lines()
@@ -267,8 +232,6 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(server_fences_gen(&shipped));
-        // Negative controls: `if-seq=` alone is not the fence, and `if-gen=`
-        // under another verb is not key's.
         assert!(!server_fences_gen(
             "status: …\nkey [id=<key>] [if-seq=<n>] [if=<re>] <name>: send a named key"
         ));

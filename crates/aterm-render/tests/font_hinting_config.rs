@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `font_hinting` renderer seam ([`Renderer::set_font_hinting`]), on the native hint
-//! seam (Linux and Windows): the default is `full` and every spelling reads back as its
-//! canonical mode (unknown ones resolve to `full`, the retired `native` to `light`); a
-//! same-value set returns `false`; a mode change alters coverage at 12px but never cell
-//! geometry. Without the seam (macOS CoreText, wasm) the setter is inert and the getter
-//! reports `"off"`.
+//! Tests for the `font_hinting` renderer seam ([`Renderer::set_font_hinting`]).
 
 #![cfg(feature = "embedded-font")]
 
@@ -63,8 +58,6 @@ fn same_value_is_free_change_reports_true() {
     assert!(!r.set_font_hinting("light"), "and is then idempotent");
 }
 
-/// A live-set mode carries through the semantic-surface fork (Settings specimens,
-/// Markdown) and the sealed rebuild instead of reverting to the construction default.
 #[test]
 fn live_mode_rides_semantic_forks_and_rebuilds() {
     let mut r = renderer();
@@ -108,17 +101,11 @@ fn mode_change_moves_coverage_but_never_geometry() {
             "no hint seam: the setter must be pixel-inert"
         );
     }
-    // And back: the original bytes return exactly.
     r.set_font_hinting("full");
     let full_again = render_stems(&mut r);
     assert_eq!(full.pixels, full_again.pixels, "mode flips are reversible");
 }
 
-/// The retired `native` spelling renders as `light` (`HintMode::Light`, src/hinted.rs). On
-/// the seam, `native` over `light` is a free no-op that reads back as `light`, and `native`
-/// paints light's pixels whichever mode it replaces. `full` painting the row differently from
-/// `light` is the control that keeps the equality from being vacuous. Off the seam everything
-/// is the inert `off`.
 #[test]
 fn native_renders_as_light() {
     let mut r = renderer();

@@ -4,13 +4,7 @@
 
 //! Core terminal types: capabilities.
 
-// Terminal Capabilities
-
 /// Terminal capabilities query result.
-///
-/// Reports what features this terminal emulator supports. Useful for
-/// applications that want to query terminal capabilities before using
-/// advanced features.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(
     clippy::struct_excessive_bools,
@@ -69,26 +63,11 @@ impl TerminalCapabilities {
             hyperlinks: true,
             sixel_graphics: true,
             iterm_images: true,
-            // Kitty graphics protocol (APC 'G' → decode PNG/RGBA/RGB → place via
-            // the shared image pipeline): transmit/put/query, chunked and `o=z`
-            // transfers, the file/shm mediums behind the host's opt-in resolver,
-            // placement ids, `I=` numbers, every delete selector (frames
-            // included), source rectangles, `z<0` under text, Unicode
-            // placeholders with their virtual placements, relative placements
-            // (a virtual parent's included), in-cell offsets, images layered by
-            // z, and frame loading, composition (PNG included), selection and
-            // playback. What is not built is listed on
-            // `handle_complete_kitty_command`, with what it does instead. Pinned
-            // by `kitty_graphics_advertised_after_kitty_core` below.
             kitty_graphics: true,
             clipboard: true,
             shell_integration: true,
             synchronized_output: true,
             kitty_keyboard: true,
-            // Soft fonts (DRCS/DECDLD) are not supported: the integration was
-            // permanently removed (dd8061b06) and the DCS `{` payload is consumed
-            // and discarded (handler_dcs.rs), so the capability is advertised
-            // false. Pinned by `soft_fonts_not_advertised` below.
             soft_fonts: false,
             unicode: true,
             bracketed_paste: true,
@@ -99,9 +78,6 @@ impl TerminalCapabilities {
     }
 
     /// Format enabled capabilities as a semicolon-separated feature list.
-    ///
-    /// Used by OSC 62 feature reporting (xterm-401). Feature names follow
-    /// xterm/kitty conventions where applicable.
     #[must_use]
     pub fn feature_list_string(&self) -> String {
         let mut features = Vec::with_capacity(16);
@@ -172,7 +148,6 @@ mod capability_tests {
 
     #[test]
     fn soft_fonts_not_advertised() {
-        // DECDLD is still compiled out, so soft-fonts stays honestly unadvertised.
         let feats = TerminalCapabilities::aterm_capabilities().feature_list_string();
         assert!(!feats.contains("soft-fonts"), "soft fonts unimplemented");
     }

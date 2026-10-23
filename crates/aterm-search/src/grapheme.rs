@@ -119,9 +119,7 @@ pub(crate) fn map_lower_byte_to_original(original: &str, lower_byte: usize) -> u
 /// Run-length encoded byte-offset-to-column map for one line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ColumnMap {
-    /// The graphemes, in byte order, as runs of a repeating shape. Empty for
-    /// the identity map (every byte one grapheme one column wide: printable
-    /// ASCII drawn one cell per character).
+    /// The graphemes, in byte order, as runs of a repeating shape.
     runs: Box<[ClusterRun]>,
     /// Length of the source text in bytes: the identity map clamps lookups
     /// here, and a lookup at or past it answers `total`.
@@ -152,9 +150,7 @@ struct ClusterColumns {
     offset: usize,
     /// The first column it is drawn in: a match starting here starts here.
     start: usize,
-    /// The cursor column before it: a match ending here ends here. Larger
-    /// than `start` when the grapheme joins the cell before it (the `ය` of
-    /// Sinhala `ක්‍ය`, which the grid draws in `ක`'s cell).
+    /// The cursor column before it: a match ending here ends here.
     before: usize,
 }
 

@@ -2,24 +2,14 @@
 // Copyright 2026 Andrew Yates
 
 //! Combined `aterm-containment` integration test binary.
-//!
-//! Tests that initialize the process-wide containment mode `OnceLock` run in
-//! an isolated child via [`in_fresh_process`] (`--exact <module>::<fn>` with
-//! [`FRESH_CHILD`]). `audit_denial_logged` and `image_anchor_live` remain
-//! separate `[[test]]` targets in `Cargo.toml` (`autotests = false`).
 #![allow(
     clippy::disallowed_types,
     reason = "test code: a stand-in child may inherit descriptors"
 )]
 
-/// Names, in a re-executed child, the one test that child exists to run.
 const FRESH_CHILD: &str = "ATERM_CONTAINMENT_FRESH_CHILD";
 
-/// Re-execute this test binary with `--exact <module>::<test> --test-threads=1`
-/// and [`FRESH_CHILD`] set so `body` runs in a fresh process with an unset
-/// containment mode `OnceLock`, asserting that libtest ran `1 passed`.
 fn in_fresh_process(module: &str, test: &str, body: impl FnOnce()) {
-    // libtest names a test by its module path WITHOUT the crate segment.
     let module = module.split_once("::").map_or("", |(_, rest)| rest);
     let name = if module.is_empty() {
         test.to_string()

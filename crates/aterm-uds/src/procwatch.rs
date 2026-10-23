@@ -269,7 +269,6 @@ impl ProcWatch {
 
     /// [`ProcWatch::new`], saying why there is no watch.
     #[cfg(target_vendor = "apple")]
-    // Skip: bottoms out at the `kqueue`/`kevent`/`fcntl` FFI calls.
     #[cfg_attr(trust_verify, trust::skip)]
     pub fn open(shell_pid: i32) -> Result<Self, NoWatch> {
         use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -427,7 +426,6 @@ impl ProcWatch {
     }
 
     #[cfg(target_vendor = "apple")]
-    // Skip: bottoms out at the `kevent` FFI call.
     #[cfg_attr(trust_verify, trust::skip)]
     fn drain_kernel(&mut self, out: &mut Vec<ProcEvent>) {
         use std::os::fd::AsRawFd as _;
@@ -487,7 +485,6 @@ impl ProcWatch {
 
 /// Register `pids` with `fflags`, `EV_CLEAR`, one call, each answering in its own receipt.
 #[cfg(target_vendor = "apple")]
-// Skip: bottoms out at the `kevent` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 fn register(fd: &std::os::fd::OwnedFd, pids: &[i32], fflags: u32) -> Vec<bool> {
     use std::os::fd::AsRawFd as _;
@@ -534,7 +531,6 @@ fn register(fd: &std::os::fd::OwnedFd, pids: &[i32], fflags: u32) -> Vec<bool> {
 
 /// Remove `pid`'s knote (a gone process's went with it; that error is the answer).
 #[cfg(target_vendor = "apple")]
-// Skip: bottoms out at the `kevent` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 fn delete(fd: &std::os::fd::OwnedFd, pid: i32) {
     use std::os::fd::AsRawFd as _;

@@ -14,13 +14,13 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// The one tool every preference read and write goes through.
-pub const DEFAULTS: &str = "/usr/bin/defaults";
+pub const DEFAULTS: &str = aterm_uds::os_path!("defaults");
 /// Relaunches a process after its preferences changed.
-pub const KILLALL: &str = "/usr/bin/killall";
+pub const KILLALL: &str = aterm_uds::os_path!("killall");
 /// Asks whether a user has a GUI login session (`launchctl print gui/<uid>`).
-pub const LAUNCHCTL: &str = "/bin/launchctl";
+pub const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 /// Reads a system plist file directly when `defaults export` printed an empty domain.
-pub const PLUTIL: &str = "/usr/bin/plutil";
+pub const PLUTIL: &str = aterm_uds::os_path!("plutil");
 
 /// Preference domains stored in an App-Sandboxed container (`~/Library/Containers/<id>/Data/Library/Preferences`), paired with app names.
 pub const CONTAINED: [(&str, &str); 1] =

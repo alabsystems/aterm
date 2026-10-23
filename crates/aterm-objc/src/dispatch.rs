@@ -18,14 +18,10 @@ struct DispatchObjectS {
 
 // SAFETY: `_dispatch_main_q` and `dispatch_sync_f` are provided by libSystem.
 unsafe extern "C" {
-    /// The main queue. `dispatch_get_main_queue()` is a header inline that
-    /// evaluates to `&_dispatch_main_q`, so the address is the queue.
+    /// The main queue (`&_dispatch_main_q`).
     static _dispatch_main_q: DispatchObjectS;
 
-    /// `dispatch_sync_f(queue, context, work)` — the function-pointer form. A
-    /// block would need `_Block_copy` and [`crate::RcBlock`]'s `Fn + 'static`
-    /// bound; this allocates nothing and, being synchronous, lets the context
-    /// be a local of the calling frame.
+    /// `dispatch_sync_f(queue, context, work)` — the function-pointer form.
     fn dispatch_sync_f(
         queue: *const DispatchObjectS,
         context: *mut c_void,
@@ -33,14 +29,11 @@ unsafe extern "C" {
     );
 }
 
-/// The slot the trampoline and the caller share for one call. Both fields are
-/// `Option` so the trampoline can move the closure out and the result in, and
-/// so "never ran" is distinguishable from "ran".
+/// The slot the trampoline and the caller share for one call.
 struct Job<F, R> {
-    /// Taken by the trampoline. `None` afterwards.
+    /// Closure taken by the trampoline.
     f: Option<F>,
-    /// Filled by the trampoline: `Ok(value)`, or the payload of a panic that
-    /// must be re-raised on the calling thread rather than unwound through C.
+    /// Result or caught panic payload filled by the trampoline.
     out: Option<std::thread::Result<R>>,
 }
 
@@ -62,9 +55,7 @@ impl std::fmt::Display for ContainedInRunOnMain {
     }
 }
 
-/// What the main queue runs. `extern "C"`, so it must not unwind: a Rust panic
-/// is caught and carried back as data, and an `NSException` is contained and
-/// carried back the same way.
+/// Main-queue C callback that catches Rust panics and `NSException`s into `Job::out`.
 ///
 /// # Safety
 /// `ctx` must be the address of a live `Job<F, R>` whose `f` is `Some`, and the
@@ -77,8 +68,6 @@ where
     // SAFETY: `ctx` points to a uniquely borrowed `Job<F, R>` while the caller blocks in `dispatch_sync_f`.
     let job = unsafe { &mut *ctx.cast::<Job<F, R>>() };
     let Some(f) = job.f.take() else {
-        // Only if libdispatch ran one submission twice; leave `out` as `None`
-        // and let the caller report it.
         return;
     };
 
@@ -97,29 +86,6 @@ where
 }
 
 /// Runs `f` on the process main thread inside an autorelease pool and returns its result.
-///
-/// # Blocking
-/// Off the main thread this waits for the main queue, so two situations hang silently: a main
-/// thread that never services its queue (call this only where the main thread runs an event
-/// loop; a libtest binary's main thread is parked joining workers), and a main thread inside a
-/// `run_on_main` closure that waits on a thread calling `run_on_main` (reachable from safe code,
-/// e.g. a closure that spawns and joins a helper). Both are `dispatch_sync` semantics.
-///
-/// # Panics
-///
-/// Re-raises any panic from `f`, or panics with [`ContainedInRunOnMain`] if an
-/// `NSException` was contained. Off the main thread, an `NSException` that `f`
-/// raises is contained on the main thread (reported against `"run_on_main"`
-/// through [`crate::exception`], Rust frames dropped, main thread continuing).
-/// Also panics if libdispatch never runs the submitted function.
-///
-/// # Examples
-///
-/// ```no_run
-/// # use aterm_objc::run_on_main;
-/// let scale = run_on_main(|_mt| 2.0_f64);
-/// assert_eq!(scale, 2.0);
-/// ```
 pub fn run_on_main<F, R>(f: F) -> R
 where
     F: Send + FnOnce(MainThread) -> R,
@@ -128,9 +94,6 @@ where
     // Hot: winit's `get_modifierless_char` reaches this on every ordinary
     // character key event, so `MainThread::new` caches its class lookup.
     if let Some(mt) = MainThread::new() {
-        // Already on the main thread: call directly, since `dispatch_sync_f`
-        // here would trap. The pool wraps the closure on this path too, so the
-        // pool semantics do not depend on the calling thread.
         return autoreleasepool(|_pool| f(mt));
     }
 

@@ -6,10 +6,10 @@
 /// Every stage agreed.
 #[cfg(target_os = "macos")]
 const PASS: i32 = 0;
-/// At least one finding. See the transcript.
+/// At least one finding.
 #[cfg(target_os = "macos")]
 const FAIL: i32 = 1;
-/// The drive could not execute here. Not a pass.
+/// The drive could not execute here.
 const NOT_RUN: i32 = 2;
 
 #[cfg(not(target_os = "macos"))]
@@ -436,7 +436,7 @@ mod macos {
             Some((delegate, window))
         }
 
-        /// The window's own content `NSView`. Nil if there is none.
+        /// The window's own content `NSView`.
         fn ns_view(&self) -> Id {
             self.window
                 .as_ref()
@@ -756,11 +756,7 @@ mod macos {
             );
         }
 
-        /// The fullscreen state machine, leaving. `set_fullscreen(None)` right after
-        /// `set_fullscreen(Some(_))` need not return `fullscreen()` to `None`: AppKit
-        /// delivers `windowWillEnterFullScreen:` synchronously inside
-        /// `-toggleFullScreen:`, setting `in_fullscreen_transition`, and winit defers a
-        /// change during a transition into `target_fullscreen`.
+        /// The fullscreen state machine, leaving.
         fn stage_fullscreen_exit(&mut self) {
             println!("\n[10] fullscreen — leaving");
             let before = self.w().fullscreen().is_some();
@@ -782,11 +778,7 @@ mod macos {
             );
         }
 
-        /// `aterm_objc::weak` against the objects it exists for. `aterm-objc`'s
-        /// `tests/weak.rs` proves each property on `NSObject` and `NSMutableString`
-        /// (libtest cannot host AppKit); this runs the same experiments on the live
-        /// `NSWindow`, its `NSView` and the `WinitWindowDelegate`, AppKit classes with
-        /// their own `dealloc` and references.
+        /// `aterm_objc::weak` against the objects it exists for.
         fn stage_weak_references(&mut self, delegate: Id, ns: Id) {
             println!(
                 "\n[11] weak references — objc_initWeak/loadWeak/storeWeak/copyWeak/destroyWeak"
@@ -1043,9 +1035,6 @@ mod macos {
                     &format!("row {i} separator={} (want {separator})", row.separator),
                 );
                 if *separator {
-                    // A separator's title, action and key equivalent are
-                    // AppKit's, not the fork's; asserting them would be
-                    // asserting `+separatorItem`.
                     continue;
                 }
                 self.report.check(

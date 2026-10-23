@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `occupancy check --replay` over a synthetic F1 night (design §3.4): the nudge at about
-//! 19:22, and `hold-room` no earlier than the first 20-minute free-slot window, which the
-//! records first show after 10:44:31 — so at about 11:05. The negative control: a ring with no
-//! free-slot window gives no `hold-room` line at all.
+//! `occupancy check --replay` tests over a synthetic F1 night.
 
 use super::*;
 use crate::harness::disk::Level;
@@ -16,10 +13,8 @@ use crate::supervise::occupancy::{OccupancyReading, SlotsSeen};
 const S: i64 = 1000;
 const MIN: i64 = 60 * S;
 const HOUR: i64 = 60 * MIN;
-/// 2026-10-19 00:00:00 UTC: F1's clocks are read as UTC here (`offset_s` 0).
 const DAY: i64 = 1_792_368_000_000;
 
-/// `h:m:s` on F1's evening (from 18:00) or the next morning (before 18:00).
 fn at(h: i64, m: i64, s: i64) -> i64 {
     let day = if h >= 18 { DAY } else { DAY + 24 * HOUR };
     day + h * HOUR + m * MIN + s * S
@@ -27,15 +22,10 @@ fn at(h: i64, m: i64, s: i64) -> i64 {
 
 const SID: &str = "s-1b0e";
 
-/// The free-slot instants the records show (§3.4), each taken at once by a waiting job.
 fn instants() -> [i64; 4] {
     [at(23, 57, 2), at(0, 21, 9), at(2, 11, 2), at(2, 28, 48)]
 }
 
-/// THE F1 RING, a look a minute from the turn's end (18:51:41) to 13:30: no slot free but at
-/// F1's instants (never for 20 minutes) until the consumer runner ended at 10:44:31; then two
-/// free, which the board's latch reports once they have held 20 minutes (`free_window`). The
-/// session's own main track holds a slot all night; the machine has room throughout.
 fn f1_ring(free_window: bool) -> Vec<RingRow> {
     let mut rows = Vec::new();
     let mut t = at(18, 51, 41);
@@ -48,7 +38,6 @@ fn f1_ring(free_window: bool) -> Vec<RingRow> {
         } else {
             u16::from(instant)
         };
-        // The latch: free at consecutive looks, reported once it spans 20 minutes.
         free_since = if usable >= 1 && t >= runner_end {
             free_since.or(Some(t))
         } else {
@@ -81,8 +70,6 @@ fn f1_ring(free_window: bool) -> Vec<RingRow> {
     rows
 }
 
-/// The session's ledger hold rows (§3.4): the hold began about 22 s after the turn ended
-/// (18:52:03), booked once it stood ten minutes; declared at the nudge's answer; open still.
 fn f1_holds() -> Vec<(i64, RowSaid)> {
     let since = at(18, 52, 3);
     vec![
@@ -130,15 +117,12 @@ fn the_f1_night_replays_the_slice_one_times() {
         }]
     );
     let replayed = replay(&rows, &spans, SID, rows[0].at);
-    // wait-nudge at about 19:22: the first look 30 minutes into the hold, once a hold.
     let nudge = woulds(&replayed, RuleId::WaitNudge);
     assert_eq!(nudge.len(), 1, "{replayed:#?}");
     assert!(
         (at(19, 22, 3)..at(19, 23, 3)).contains(&nudge[0]),
         "{replayed:#?}"
     );
-    // hold-room: none before the runner ended at 10:44:31 (F1's instants are no 20-minute
-    // window), the first by about 11:05, then two hours apart.
     let room = woulds(&replayed, RuleId::HoldRoom);
     let first = room.first().copied().expect("hold-room fires");
     assert!(first >= at(10, 44, 31) + 20 * MIN, "{replayed:#?}");
@@ -148,7 +132,6 @@ fn the_f1_night_replays_the_slice_one_times() {
         room[1] - room[0] >= rules::HOLD_ROOM_APART_MS,
         "{replayed:#?}"
     );
-    // Its lines: the head, the changes, and each rule's first.
     let lines = replay_lines(
         &replayed,
         rows.len(),
@@ -171,8 +154,6 @@ fn the_f1_night_replays_the_slice_one_times() {
     );
 }
 
-/// THE NEGATIVE CONTROL: the same night with no free-slot window (the latch never spans its
-/// 20 minutes) gives no `hold-room` line; the nudge still comes.
 #[test]
 fn a_ring_with_no_free_window_gives_no_hold_room() {
     let rows = f1_ring(false);
@@ -197,8 +178,6 @@ fn a_ring_with_no_free_window_gives_no_hold_room() {
     );
 }
 
-/// A guard the loop told holds the line at each look it stands: the replay says `held:<guard>`,
-/// and the line goes once the guard is gone (an undeclared hold: a declared one owes no nudge).
 #[test]
 fn a_told_guard_holds_the_replayed_line() {
     let mut rows = f1_ring(true);
@@ -226,9 +205,6 @@ fn a_told_guard_holds_the_replayed_line() {
     );
 }
 
-/// The ledger's rows make the holds: a close ends one; a close with no open row is a hold of
-/// its own; an open row of the hold open already (a loop's last row as it ends) is the same
-/// hold; one of another hold ends the earlier where it began.
 #[test]
 fn the_ledger_rows_make_the_holds() {
     let t = at(20, 0, 0);

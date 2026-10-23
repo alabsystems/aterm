@@ -1028,9 +1028,6 @@ impl App {
             return (0, 0, 0, 0);
         };
         if self.active_tab_is_single_focused_pane(wid) {
-            // Exactly the plan's answer for a lone pane: the sanitized window bounds, built
-            // from `rows.max(1)`/`cols.max(1)`, so a bare `(ws.rows, ws.cols)` would disagree
-            // at zero. The no-active-tab default below stays unmaxed.
             return (0, 0, ws.rows.max(1), ws.cols.max(1));
         }
         self.active_visible_leaf_plan(wid)
@@ -1283,12 +1280,10 @@ impl App {
             x: f32::from(wc),
             y: f32::from(wr),
         }) else {
-            // Distinct branch.
             return false; // divider / outside grid: nothing to focus
         };
         let hit = hit_leaf.view;
         if hit == plan.focused {
-            // Distinct branch.
             return false; // already focused: proceed with the normal press
         }
         let hit_origin = (
@@ -1543,8 +1538,6 @@ impl App {
         if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
             self.finish_selection(wid, false);
             if let Some(ws) = self.windows.get_mut(&wid) {
-                // Clear the left reported bit like the release path does, so a later
-                // non-reporting press can't leak an orphan release.
                 forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
             }
         }
@@ -1605,7 +1598,6 @@ impl App {
     /// Map a pixel position to a 0-based `(row, col)` terminal grid cell of window `wid`, clamped to the grid.
     #[cfg(test)]
     pub(crate) fn pixel_to_cell(&self, wid: WindowId, x: f64, y: f64) -> (u16, u16) {
-        // One geometry derivation, shared with the nested `window_to_frame`.
         self.pixel_to_cell_with(wid, self.pointer_geometry(wid), x, y)
     }
 
@@ -1754,8 +1746,6 @@ impl App {
         let seen = pressed.then(|| self.focused_session_id(wid)).flatten();
         self.on_mouse_input(wid, state, button);
         if pressed {
-            // Resolve the hit against the frame that was shown before stopping
-            // the timer changes its label and invalidates that frame's stamp.
             self.interact_system_state(wid);
         }
         if let Some(session) = seen {
@@ -2287,7 +2277,6 @@ impl App {
             if paste_up {
                 self.answer_paste_banner(false);
             } else {
-                // Nothing closes on a press that named no answer.
                 self.answer_close_banner(false);
             }
             self.request_redraw_all_windows();
@@ -2734,7 +2723,6 @@ impl App {
             return false;
         }
         if row != hit.row {
-            // Distinct branch.
             return true; // the panel's pad / hints rows: inert chrome, but consumed
         }
         let on =
@@ -2744,16 +2732,12 @@ impl App {
         } else if on(&hit.regex_cols) {
             self.search_toggle_regex();
         } else if on(&hit.prev_cols) || on(&hit.next_cols) {
-            // The toolbar's arrows are Shift+F3 / F3 (`find_bar::FIND_TOOLBAR`).
             self.search_repeat_in(wid, on(&hit.next_cols));
         } else if on(&hit.close_cols) {
-            // `✕` is Esc: cancel, the viewport back where find began.
             self.search_cancel_in(wid);
         } else if let Some(slot) = x.and_then(|x| self.find_box_slot(wid, &hit, x)) {
             self.search_click_caret_in(wid, slot);
         } else if hit.field_cols.contains(&col) {
-            // The well's first cell shows character `field_scroll`, so the click's
-            // distance into it is the character index — the same mapping the paint used.
             self.search_click_caret_in(wid, hit.field_scroll + (col - hit.field_cols.start));
         }
         true
@@ -2858,9 +2842,6 @@ impl App {
             HoverProbe::Deferred => parked,
         };
         if let Some(ws) = self.windows.get_mut(&wid) {
-            // A plain write: the park/settle bracket at the event boundary owns
-            // the repaint decision, because only it can see what the value was
-            // before the whole routing ran.
             ws.link_hover = resolved;
         }
     }
@@ -4320,9 +4301,6 @@ impl App {
                     self.close_tab_menu(wid);
                 }
             } else {
-                // A swallowed release still settles a drag in flight when the menu popped,
-                // or a divider/selection drag would keep tracking motion this gate no longer
-                // delivers.
                 self.settle_pointer_drags(wid);
             }
             return;
@@ -4886,9 +4864,6 @@ impl App {
             if !pressed && self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
                 self.finish_selection(wid, false);
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    // Clear the Left bit too: this branch returns before the bookkeeping
-                    // below, and a stuck bit would let a later non-reporting press leak an
-                    // orphan release.
                     forget_reported_button(ws, aterm_types::mouse::MouseButton::Left);
                 }
                 return;
@@ -9665,7 +9640,6 @@ mod tests {
                 let sid = app.next_session_id;
                 app.push_stub_tab(wid, stub_session(sid));
             } else {
-                // Focus is stolen mid-sweep; the release never comes back.
                 app.on_focus(wid, false);
             }
 

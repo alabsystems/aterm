@@ -1,9 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The manifest writer, proven by the client: fresh and merged manifests
-//! signed with testkit keys pass `VerifiedQuad::verify_pkg`, a merge keeps its base as a
-//! byte prefix, and every merge and provenance refusal fires before anything is signed.
+//! Tests for manifest writing, merging, and signature verification.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -111,7 +109,6 @@ fn a_merge_appends_one_row_and_keeps_the_base_as_a_byte_prefix() {
     pkgdoc::check_parsed(&parsed, &header(), &first).expect("the base row");
     pkgdoc::check_parsed(&parsed, &header(), &second).expect("the appended row");
 
-    // A base that ends without a newline still extends cleanly.
     let mut trimmed = base.clone();
     while trimmed.last() == Some(&b'\n') {
         trimmed.pop();
@@ -156,8 +153,6 @@ fn a_merge_onto_a_foreign_or_conflicting_base_is_refused() {
         &x86,
         "is version Some(\"0.2.0\")",
     );
-    // One build, one exposed set: a target that lacks a shimmed tool cannot join it,
-    // and neither can one that shims a tool the base's targets lack.
     refused(
         base.clone(),
         &with(&|h| h.exposes = vec!["ay".into()]),
@@ -184,7 +179,6 @@ fn a_merge_onto_a_foreign_or_conflicting_base_is_refused() {
     same_asset.asset = pkgdoc::asset_name("ay", 9, AARCH64_APPLE_DARWIN);
     refused(base.clone(), &header(), &same_asset, "already names asset");
     refused(b"schema = = 1".to_vec(), &header(), &x86, "does not parse");
-    // The exposed set is a set: the order a list was written in makes no difference.
     let reordered = with(&|h| h.exposes.reverse());
     pkgdoc::merge(base, &reordered, &x86).expect("the same set, another order");
 }
@@ -283,10 +277,6 @@ fn the_aarch64_darwin_asset_keeps_its_bare_name_and_every_other_target_names_its
     assert_eq!(pkgdoc::manifest_name("ay", 9), "pkg-ay-9.toml");
 }
 
-/// A shell is never shimmed (design S13), so the writer never renders a manifest exposing
-/// one: a fresh manifest naming `fish` is refused, and so is a merge onto a base signed
-/// before `pwsh` was refused, naming each. The control is the same header with only tool
-/// names, which renders and merges.
 #[test]
 fn the_writer_refuses_an_exposed_shell_fresh_or_merged() {
     let r = row(AARCH64_APPLE_DARWIN, Kind::Binary);
@@ -302,7 +292,6 @@ fn the_writer_refuses_an_exposed_shell_fresh_or_merged() {
     let err = pkgdoc::fresh(&exposing(&["FISH"]), &r).expect_err("any spelling");
     assert!(err.to_string().contains("`FISH`"), "{err}");
 
-    // A base an older writer signed for `["ay", "pwsh"]`, spelled as it would have been.
     let base = String::from_utf8(pkgdoc::fresh(&header(), &r).expect("base").bytes().to_vec())
         .expect("utf8")
         .replace("\"ay-lsp\"", "\"pwsh\"");
@@ -310,7 +299,6 @@ fn the_writer_refuses_an_exposed_shell_fresh_or_merged() {
         .expect_err("the base's shell is refused, not extended");
     assert!(err.to_string().contains("`pwsh`"), "{err}");
 
-    // The control: tool names only.
     let base = pkgdoc::fresh(&header(), &r).expect("tool names render");
     pkgdoc::merge(base.bytes().to_vec(), &header(), &x86).expect("and merge");
     pkgdoc::check_exposes("ay", &header().exposes).expect("tool names pass the gate");

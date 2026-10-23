@@ -3,8 +3,6 @@
 
 //! Changelog gate/roll/extract (release spec §3): the one Rust port of `changelog_real_body` semantics (strip HTML comments, `###` scaffolds, blanks) over the hand-written Keep-a-Changelog `CHANGELOG.md`.
 
-use std::process::Command;
-
 use crate::ledger::{Error, Result};
 
 /// The changelog's repo-root-relative path: the one hand-written source of release notes.
@@ -523,31 +521,23 @@ mod release_body_bound_tests {
     }
 }
 
-/// Today's date in America/Los_Angeles as `YYYY-MM-DD`.
+/// Today's date in America/Los_Angeles as `YYYY-MM-DD`, from the zone's TZif file.
 pub fn today_la() -> Result<String> {
-    let out = Command::new("/bin/date")
-        .env("TZ", "America/Los_Angeles")
-        .arg("+%Y-%m-%d")
-        .output()
-        .map_err(|e| Error::new(format!("failed to spawn /bin/date: {e}")))?;
-    if !out.status.success() {
-        return Err(Error::new(format!(
-            "/bin/date failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-    let date = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let shaped = date.len() == 10
-        && date.bytes().enumerate().all(|(i, b)| match i {
-            4 | 7 => b == b'-',
-            _ => b.is_ascii_digit(),
-        });
-    if !shaped {
-        return Err(Error::new(format!(
-            "/bin/date produced {date:?}, not YYYY-MM-DD"
-        )));
-    }
-    Ok(date)
+    const ZONE: &str = "America/Los_Angeles";
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .ok_or_else(|| Error::new("the clock is before 1970"))?;
+    let offset = aterm_uds::zone::zone_offset_at(ZONE, now)
+        .ok_or_else(|| Error::new(format!("no {ZONE} zone file under /usr/share/zoneinfo")))?;
+    Ok(la_date(now, offset))
+}
+
+/// `unix` on a clock `offset` seconds east of UTC, as `YYYY-MM-DD`.
+fn la_date(unix: i64, offset: i64) -> String {
+    let (y, m, d) = aterm_types::rfc3339::civil_from_days((unix + offset).div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 /// 0-based (start, end) line indices of a section: `start` is the `## [name]` header, `end`
@@ -566,6 +556,28 @@ fn section_span(text: &str, section: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// TODAY IN LOS ANGELES IS WHAT `date` SAYS under `TZ=America/Los_Angeles` (the reader
+    /// [`today_la`] replaced, as its oracle; read between two of ours, so a midnight between
+    /// them is no failure). NEGATIVE CONTROL: the zone's offset moves the day, so a midnight
+    /// UTC is still the day before there.
+    #[test]
+    fn today_in_los_angeles_is_what_date_says() {
+        assert_eq!(la_date(1_792_627_200, -7 * 3600), "2026-10-21");
+        assert_eq!(la_date(1_792_627_200, 0), "2026-10-22");
+        let before = today_la().expect("the zone file");
+        let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("date"))
+            .env("TZ", "America/Los_Angeles")
+            .arg("+%Y-%m-%d")
+            .output()
+            .expect("run date");
+        let after = today_la().expect("the zone file");
+        let said = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert!(
+            said == before || said == after,
+            "{said} vs {before}..{after}"
+        );
+    }
 
     const SOURCE: &str = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- **One** — shipped.\n  A continuation line.\n\n- **Two** — shipped.\n\n## [0.91.0] - 2026-09-22\n\n- older.\n";
 

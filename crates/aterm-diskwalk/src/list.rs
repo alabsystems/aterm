@@ -79,32 +79,28 @@ pub enum ListerChoice {
 #[cfg(unix)]
 pub(crate) const LEVEL_BUFFER: usize = 16 * 1024;
 
-/// A device number as every lister and `fstat` spell it, so a child's device compares equal to its
-/// root's whichever call read each (a mismatch makes every subfolder a mount boundary, never
-/// entered).
+/// A device number normalized across every lister and `fstat`.
 #[cfg(target_vendor = "apple")]
 #[must_use]
 pub(crate) fn dev_of(st_dev: libc::dev_t) -> u64 {
     u64::from(u32::from_ne_bytes(st_dev.to_ne_bytes()))
 }
 
-/// A device number as every lister and `fstat` spell it (see the macOS arm): Linux's `dev_t` is
-/// already the `u64` both read.
+/// A device number normalized across every lister and `fstat`.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) const fn dev_of(st_dev: libc::dev_t) -> u64 {
     st_dev
 }
 
-/// A device number as every lister and `fstat` spell it (see the macOS arm).
+/// A device number normalized across every lister and `fstat`.
 #[cfg(all(unix, not(any(target_vendor = "apple", target_os = "linux"))))]
 #[must_use]
 pub(crate) fn dev_of(st_dev: libc::dev_t) -> u64 {
     st_dev as u64
 }
 
-/// `statx`'s device as `fstat`'s `st_dev` spells it: `makedev(major, minor)` (`(minor & 0xff) |
-/// (major << 8) | ((minor & !0xff) << 12)` and the high bits), never `major << 32 | minor`.
+/// `statx`'s device normalized to match `fstat`'s `st_dev` via `makedev(major, minor)`.
 #[cfg(target_os = "linux")]
 #[must_use]
 pub(crate) fn dev_of_parts(major: u32, minor: u32) -> u64 {

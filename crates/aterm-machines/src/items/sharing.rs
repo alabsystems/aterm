@@ -9,7 +9,7 @@ use crate::port::{Cmd, Ran, System};
 use serde::Deserialize;
 
 /// `launchctl`.
-pub const LAUNCHCTL: &str = "/bin/launchctl";
+pub const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
 /// `print system/<label>`'s exit status for a job launchd has not loaded.
 pub const NOT_LOADED: i32 = 113;

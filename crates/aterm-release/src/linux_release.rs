@@ -8,6 +8,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
+use aterm_bootstrap_verify::pin::{self, Pin};
 use aterm_update_core::linux::{LINUX_BINARY_MAX_BYTES, LinuxTarget};
 use aterm_update_core::{Manifest, sha256_file};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,160 @@ pub struct Artifact {
     pub compiler_provenance_sha256: String,
 }
 
+/// The static bootstrap verifier a worker built beside the executable
+/// (crates/aterm-bootstrap-verify): the release asset install.sh fetches and holds to the
+/// SHA-256 it pins ([`pin::Pin`]). No signature covers it and the appcast never names it:
+/// install.sh's pin is its trust anchor, so a release without one changes nothing but
+/// leaving install.sh on its embedded verifier for that architecture. It is built by
+/// upstream stable, static (the STOCK EXCEPTION, `buildplan::build_static`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifierArtifact {
+    pub schema: u32,
+    pub version: String,
+    pub build_number: u64,
+    pub commit: String,
+    pub target: String,
+    pub asset: String,
+    pub sha256: String,
+    pub size: u64,
+    pub source_fingerprint: String,
+    /// Stable's `rustc -vV`, the compiler that built it.
+    pub compiler_version: String,
+}
+
+/// The ELF program header type of a dynamic loader's path.
+const PT_INTERP: u32 = 3;
+
+/// Whether `elf`, an ELF64 little-endian file, names no program interpreter: the kernel
+/// runs it with no dynamic loader, on any C library or none. A program header table that
+/// does not fit the file is no answer.
+fn names_no_interpreter(elf: &[u8]) -> bool {
+    let field = |at: usize, len: usize| -> Option<u64> {
+        let bytes = elf.get(at..at.checked_add(len)?)?;
+        Some(
+            bytes
+                .iter()
+                .rev()
+                .fold(0, |value, byte| (value << 8) | u64::from(*byte)),
+        )
+    };
+    let (Some(offset), Some(size), Some(count)) = (field(32, 8), field(54, 2), field(56, 2)) else {
+        return false;
+    };
+    if count > 0 && size < 4 {
+        return false;
+    }
+    (0..count).all(|n| {
+        let at = n
+            .checked_mul(size)
+            .and_then(|step| step.checked_add(offset))
+            .and_then(|at| usize::try_from(at).ok());
+        at.and_then(|at| field(at, 4))
+            .is_some_and(|kind| kind != u64::from(PT_INTERP))
+    })
+}
+
+impl VerifierArtifact {
+    /// The receipt is this cut's: its version, build and commit, its architecture's asset
+    /// name, a size install.sh downloads, and stable's identity for its host.
+    pub fn validate(&self, version: &str, build: u64, commit: &str) -> Result<(), String> {
+        check_identity(version, build, commit)?;
+        let target = target(&self.target)?;
+        if self.schema != 1
+            || self.version != version
+            || self.build_number != build
+            || self.commit != commit
+            || self.asset != pin::asset_name(version, target.arch())
+            || !(64..=pin::MAX_ASSET).contains(&self.size)
+            || !aterm_codec::hex::is_lower(&self.sha256, 64)
+            || !aterm_codec::hex::is_lower(&self.source_fingerprint, 64)
+            || !self
+                .compiler_version
+                .lines()
+                .any(|line| line.starts_with("release: "))
+            || !self
+                .compiler_version
+                .lines()
+                .any(|line| line == format!("host: {}", target.triple()))
+        {
+            return Err(
+                "Linux bootstrap verifier receipt has mismatched source/build/target or no \
+                 compiler identity"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The file at `path` is the receipt's: a regular file of its size, this
+    /// architecture's static ELF, of its SHA-256.
+    pub fn verify_file(&self, path: &Path) -> Result<(), String> {
+        let metadata =
+            fs::symlink_metadata(path).map_err(|e| format!("inspect {}: {e}", path.display()))?;
+        if !metadata.file_type().is_file() || metadata.len() != self.size {
+            return Err(format!(
+                "Linux bootstrap verifier is not a regular file of the claimed size: {}",
+                path.display()
+            ));
+        }
+        let mut bytes = Vec::new();
+        File::open(path)
+            .and_then(|file| file.take(pin::MAX_ASSET + 1).read_to_end(&mut bytes))
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        target(&self.target)?.validate_elf_header(bytes.get(..64).unwrap_or(&bytes))?;
+        if !names_no_interpreter(&bytes) {
+            return Err(format!(
+                "Linux bootstrap verifier is not a static executable (it names a program \
+                 interpreter): {}",
+                path.display()
+            ));
+        }
+        let mut digest = aterm_digest::Sha256::new();
+        digest.update(&bytes);
+        if aterm_codec::hex::encode_lower(&digest.finalize()) != self.sha256 {
+            return Err(format!(
+                "Linux bootstrap verifier hash changed: {}",
+                path.display()
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// The receipts a cut writes into its dist/ beside its other files when it froze a static
+/// verifier ([`Handoff::record`]): what `ship pin-verifier` writes install.sh's pin from.
+pub const PIN_RECORD: &str = "aterm-bootstrap-verify-pin.toml";
+
+/// `targo --unverified ship pin-verifier <record>`, once the release a cut's [`PIN_RECORD`]
+/// names is public: write it into the checkout at `root` as tools/install.sh's pin and the
+/// committed record beside it ([`pin::RECORD`]), the two `pin::check` holds to each other.
+/// The pin it wrote.
+///
+/// # Errors
+/// A record of another shape or interface, one this checkout's RELEASES.ledger does not
+/// claim, or an install.sh whose pin it cannot place: nothing is written.
+pub fn pin_verifier(root: &Path, record: &Path) -> Result<Pin, String> {
+    let read =
+        |path: &Path| fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
+    let record = pin::Record::parse(&read(record)?)?;
+    let ledger = read(&root.join("RELEASES.ledger"))?;
+    record.claimed_in(&ledger).map_err(|why| {
+        format!(
+            "{why}. Pin from a checkout of main that holds the release's claim (pull it into {} \
+             first)",
+            root.display()
+        )
+    })?;
+    let install = root.join("tools/install.sh");
+    let script = record.pin().rewrite(&read(&install)?)?;
+    let body = record.to_toml();
+    let pinned = pin::check(&script, Some(&body), &ledger)?;
+    fs::write(&install, script).map_err(|e| format!("{}: {e}", install.display()))?;
+    let at = root.join(pin::RECORD);
+    fs::write(&at, body).map_err(|e| format!("{}: {e}", at.display()))?;
+    Ok(pinned)
+}
+
 /// The directory is fixed before the claim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Handoff {
@@ -37,6 +192,11 @@ pub struct Handoff {
     pub targets: Vec<String>,
     #[serde(default)]
     pub artifacts: Vec<Artifact>,
+    /// The static bootstrap verifiers beside the artifacts, in target order: optional per
+    /// architecture (one a worker could not build stays on install.sh's embedded
+    /// verifier), and frozen with the artifacts.
+    #[serde(default)]
+    pub verifiers: Vec<VerifierArtifact>,
     /// The native hosts the cutter drives itself (`--linux-worker`), journaled so a resumed cut
     /// still knows where each architecture is built.
     #[serde(default)]
@@ -176,6 +336,8 @@ impl Worker {
         check_identity(version, build, commit)?;
         let name = target.asset_name(version);
         let receipt = format!("{name}.handoff.toml");
+        let verifier = pin::asset_name(version, target.arch());
+        let verifier_receipt = format!("{verifier}.handoff.toml");
         if pair_is_current(directory, target, version, build, commit) {
             println!(
                 "==> Linux worker {}: this cut's pair is already in {}; not rebuilding",
@@ -184,7 +346,7 @@ impl Worker {
             );
             return Ok(());
         }
-        for stale in [&name, &receipt] {
+        for stale in [&name, &receipt, &verifier, &verifier_receipt] {
             match fs::remove_file(directory.join(stale)) {
                 Ok(()) => println!(
                     "==> Linux worker {}: removed a stale {stale}",
@@ -274,6 +436,35 @@ impl Worker {
         for file in [&name, &receipt] {
             fs::rename(staging.join(file), directory.join(file))
                 .map_err(|e| format!("move the Linux worker's {file} into place: {e}"))?;
+        }
+        // The static bootstrap verifier's pair, when the worker built one: best effort,
+        // since a release without it leaves install.sh on its embedded verifier for this
+        // architecture. Receipt last, as above.
+        let copied = command("scp")
+            .args(SSH_OPTIONS)
+            .args(["-q", "--"])
+            .arg(format!("{}:{remote_out}/{verifier}", self.destination))
+            .arg(format!(
+                "{}:{remote_out}/{verifier_receipt}",
+                self.destination
+            ))
+            .arg(&staging)
+            .stderr(aterm_uds::spawnfd::Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success())
+            && [&verifier, &verifier_receipt]
+                .into_iter()
+                .all(|file| fs::rename(staging.join(file), directory.join(file)).is_ok());
+        if !copied {
+            for file in [&verifier, &verifier_receipt] {
+                let _ = fs::remove_file(directory.join(file));
+                let _ = fs::remove_file(staging.join(file));
+            }
+            println!(
+                "==> Linux worker {}: no static bootstrap verifier came back; this release \
+                 publishes none for it",
+                target.triple()
+            );
         }
         let _ = fs::remove_dir(&staging);
         let _ = command("ssh")
@@ -446,7 +637,58 @@ impl Handoff {
                 return Err("Linux handoff target order/identity mismatch".into());
             }
         }
+        for verifier in &self.verifiers {
+            verifier.validate(version, build, commit)?;
+        }
+        let order: Vec<Option<usize>> = self
+            .verifiers
+            .iter()
+            .map(|verifier| self.targets.iter().position(|t| *t == verifier.target))
+            .collect();
+        if order.iter().any(Option::is_none) || order.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(
+                "Linux handoff's bootstrap verifiers are not in its declared target order".into(),
+            );
+        }
         Ok(())
+    }
+
+    /// The receipts install.sh's pin is written from ([`pin::Record`]): this cut's
+    /// verifiers, published on `repo` as release `version` (build `build`, commit
+    /// `commit`). None when it froze no verifier.
+    #[must_use]
+    pub fn record(
+        &self,
+        repo: &str,
+        version: &str,
+        build: u64,
+        commit: &str,
+    ) -> Option<pin::Record> {
+        if self.verifiers.is_empty() {
+            return None;
+        }
+        let verifiers = TARGETS
+            .iter()
+            .filter_map(|target| {
+                self.verifiers
+                    .iter()
+                    .find(|verifier| verifier.target == target.triple())
+                    .map(|verifier| pin::Receipt {
+                        arch: target.arch().to_string(),
+                        asset: verifier.asset.clone(),
+                        sha256: verifier.sha256.clone(),
+                        size: verifier.size,
+                    })
+            })
+            .collect();
+        Some(pin::Record {
+            repo: repo.to_string(),
+            tag: format!("v{version}"),
+            build_number: build,
+            commit: commit.to_string(),
+            interface: pin::INTERFACE,
+            verifiers,
+        })
     }
     pub fn new(directory: &Path, targets: &[String], workers: &[String]) -> Result<Self, String> {
         let directory = directory
@@ -484,6 +726,7 @@ impl Handoff {
             directory,
             targets,
             artifacts: Vec::new(),
+            verifiers: Vec::new(),
             workers,
         })
     }
@@ -543,7 +786,8 @@ impl Handoff {
             artifact.verify_file(&self.directory.join(&name))?;
             found.push(artifact);
         }
-        if !self.artifacts.is_empty() && self.artifacts != found {
+        let verifiers = self.verifier_pairs(version, build, commit)?;
+        if !self.artifacts.is_empty() && (self.artifacts != found || self.verifiers != verifiers) {
             return Err(
                 "Linux worker inputs changed after this cut froze their identities; resume refused"
                     .into(),
@@ -556,8 +800,63 @@ impl Handoff {
             )?;
             artifact.verify_file(&dist.join(&artifact.asset))?;
         }
+        for verifier in &verifiers {
+            atomic_copy(
+                &self.directory.join(&verifier.asset),
+                &dist.join(&verifier.asset),
+            )?;
+            verifier.verify_file(&dist.join(&verifier.asset))?;
+        }
         self.artifacts = found;
+        self.verifiers = verifiers;
         Ok(())
+    }
+
+    /// Each declared architecture's bootstrap verifier pair in the handoff directory, in
+    /// target order. One with no receipt is absent: that architecture's release publishes
+    /// none, and install.sh keeps its embedded verifier there. A receipt that is there must
+    /// be this cut's and its file the receipt's.
+    fn verifier_pairs(
+        &self,
+        version: &str,
+        build: u64,
+        commit: &str,
+    ) -> Result<Vec<VerifierArtifact>, String> {
+        let mut found = Vec::new();
+        for requested in &self.targets {
+            let target = target(requested)?;
+            let name = pin::asset_name(version, target.arch());
+            let receipt_path = self.directory.join(format!("{name}.handoff.toml"));
+            match fs::symlink_metadata(&receipt_path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!(
+                        "==> no static bootstrap verifier for {}: this release publishes none \
+                         for it, and install.sh keeps its embedded verifier there",
+                        target.triple()
+                    );
+                    continue;
+                }
+                Err(e) => return Err(format!("inspect {}: {e}", receipt_path.display())),
+                Ok(metadata) if !metadata.file_type().is_file() || metadata.len() > 65536 => {
+                    return Err("unsafe or oversized Linux bootstrap verifier receipt".into());
+                }
+                Ok(_) => {}
+            }
+            let verifier: VerifierArtifact = aterm_toml::from_str(
+                &fs::read_to_string(&receipt_path).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| format!("parse Linux bootstrap verifier receipt: {e}"))?;
+            verifier.validate(version, build, commit)?;
+            if verifier.target != target.triple() {
+                return Err(
+                    "Linux bootstrap verifier receipt's architecture does not match its filename"
+                        .into(),
+                );
+            }
+            verifier.verify_file(&self.directory.join(&name))?;
+            found.push(verifier);
+        }
+        Ok(found)
     }
 
     pub fn verify_staged(
@@ -578,6 +877,9 @@ impl Handoff {
                 return Err("Linux handoff duplicate or reordered target".into());
             }
             artifact.verify_file(&dist.join(&artifact.asset))?;
+        }
+        for verifier in &self.verifiers {
+            verifier.verify_file(&dist.join(&verifier.asset))?;
         }
         Ok(())
     }
@@ -676,7 +978,9 @@ fn atomic_copy(_source: &Path, _destination: &Path) -> Result<(), String> {
 
 fn clean_head(repo: &Path, commit: &str) -> Result<(), String> {
     let head = output_text(
-        command("git").args(["rev-parse", "HEAD"]).current_dir(repo),
+        command(aterm_uds::os_path!("git"))
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo),
         "Linux worker source HEAD",
     )?;
     let dirty = crate::gates::dirty_paths(repo).map_err(|e| e.to_string())?;
@@ -710,7 +1014,14 @@ pub fn run_worker(
     private_directory(out)?;
     let name = native.asset_name(version);
     let receipt = out.join(format!("{name}.handoff.toml"));
-    if out.join(&name).exists() || receipt.exists() {
+    let verifier = pin::asset_name(version, native.arch());
+    let outputs = [
+        out.join(&name),
+        receipt.clone(),
+        out.join(&verifier),
+        out.join(format!("{verifier}.handoff.toml")),
+    ];
+    if outputs.iter().any(|path| path.exists()) {
         return Err("Linux output already exists; choose a fresh handoff directory (never overwrite provenance)".into());
     }
     let compiler_dir = crate::gates::trust_stage2_bin().map_err(|e| e.to_string())?;
@@ -833,20 +1144,107 @@ pub fn run_worker(
     artifact.validate(version, build, commit)?;
     artifact.verify_file(&binary)?;
     atomic_copy(&binary, &out.join(&name))?;
-    let text = aterm_toml::to_string(&artifact).map_err(|e| e.to_string())?;
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&receipt)
-        .map_err(|e| e.to_string())?;
-    file.write_all(text.as_bytes())
-        .and_then(|()| crate::durable::sync_all(&file))
-        .map_err(|e| e.to_string())?;
+    write_receipt(
+        &receipt,
+        &aterm_toml::to_string(&artifact).map_err(|e| e.to_string())?,
+    )?;
     println!(
         "Linux local handoff ready: {} (unsigned; only ship cut may publish it)",
         out.join(&name).display()
     );
+    // The static bootstrap verifier beside it, from the same take. Soft: a host that
+    // cannot build it (no stable, no static C library) leaves this architecture's release
+    // without one, and install.sh keeps its embedded verifier there.
+    match build_bootstrap_verifier(&plan, &take, native, out, version, build, commit) {
+        Ok(path) => println!(
+            "Linux bootstrap verifier ready: {} (unsigned; install.sh pins it by SHA-256)",
+            path.display()
+        ),
+        Err(why) => println!(
+            "==> no static bootstrap verifier for {}: {why}. This release publishes none for \
+             it, and install.sh keeps its embedded verifier there",
+            native.triple()
+        ),
+    }
+    take.verify()?;
+    clean_head(repo, commit)?;
     Ok(())
+}
+
+/// A receipt at `path`, written once and synced.
+fn write_receipt(path: &Path, text: &str) -> Result<(), String> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    file.write_all(text.as_bytes())
+        .and_then(|()| crate::durable::sync_all(&file))
+        .map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Build this host's static bootstrap verifier from `take` and put its pair in `out`:
+/// upstream stable, static (the STOCK EXCEPTION, `buildplan::build_static`), held to what
+/// install.sh runs: this architecture's static ELF, which refuses an invocation it cannot
+/// read in install.sh's words.
+fn build_bootstrap_verifier(
+    plan: &super::BuildPlan,
+    take: &super::Take,
+    native: LinuxTarget,
+    out: &Path,
+    version: &str,
+    build: u64,
+    commit: &str,
+) -> Result<PathBuf, String> {
+    let binary = super::build_static(
+        plan,
+        take,
+        "aterm-bootstrap-verify",
+        "aterm-bootstrap-verify",
+        native.triple(),
+        None,
+    )?;
+    take.verify()?;
+    let said = command(&binary)
+        .env_clear()
+        .current_dir("/")
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .output()
+        .map_err(|e| format!("run {}: {e}", binary.display()))?;
+    let refusal = format!(
+        "{}invalid Linux verifier invocation\n",
+        aterm_bootstrap_verify::REFUSED
+    );
+    if said.status.code() != Some(1) || !said.stdout.is_empty() || said.stderr != refusal.as_bytes()
+    {
+        return Err(format!(
+            "the built verifier does not refuse a bare invocation as install.sh reads one \
+             ({}: {:?})",
+            said.status,
+            String::from_utf8_lossy(&said.stderr)
+        ));
+    }
+    let name = pin::asset_name(version, native.arch());
+    let verifier = VerifierArtifact {
+        schema: 1,
+        version: version.into(),
+        build_number: build,
+        commit: commit.into(),
+        target: native.triple().into(),
+        asset: name.clone(),
+        sha256: sha256_file(&binary)?,
+        size: fs::metadata(&binary).map_err(|e| e.to_string())?.len(),
+        source_fingerprint: take.snapshot.digest.clone(),
+        compiler_version: super::stable_rustc_version()?,
+    };
+    verifier.validate(version, build, commit)?;
+    verifier.verify_file(&binary)?;
+    atomic_copy(&binary, &out.join(&name))?;
+    write_receipt(
+        &out.join(format!("{name}.handoff.toml")),
+        &aterm_toml::to_string(&verifier).map_err(|e| e.to_string())?,
+    )?;
+    Ok(out.join(name))
 }
 
 #[cfg(all(test, unix))]
@@ -896,6 +1294,307 @@ mod tests {
         )
         .unwrap();
         artifact
+    }
+
+    /// A synthetic static verifier for `target` beside its receipt: an ELF header and one
+    /// `PT_LOAD` program header (`interpreter` makes it `PT_INTERP`, a dynamic one).
+    fn verifier_fixture(dir: &Path, target: LinuxTarget, interpreter: bool) -> VerifierArtifact {
+        let mut bytes = vec![0u8; 64 + 56];
+        bytes[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+        let machine: u16 = if target == LinuxTarget::Aarch64 {
+            183
+        } else {
+            62
+        };
+        bytes[18..20].copy_from_slice(&machine.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        let kind = if interpreter { PT_INTERP } else { 1 };
+        bytes[64..68].copy_from_slice(&kind.to_le_bytes());
+        let asset = pin::asset_name("0.100.0", target.arch());
+        fs::write(dir.join(&asset), &bytes).unwrap();
+        let verifier = VerifierArtifact {
+            schema: 1,
+            version: "0.100.0".into(),
+            build_number: 100,
+            commit: "a".repeat(40),
+            target: target.triple().into(),
+            asset: asset.clone(),
+            sha256: sha256_file(&dir.join(&asset)).unwrap(),
+            size: bytes.len() as u64,
+            source_fingerprint: "b".repeat(64),
+            compiler_version: format!(
+                "rustc 1.99.1\nbinary: rustc\nhost: {}\nrelease: 1.99.1\n",
+                target.triple()
+            ),
+        };
+        fs::write(
+            dir.join(format!("{asset}.handoff.toml")),
+            aterm_toml::to_string(&verifier).unwrap(),
+        )
+        .unwrap();
+        verifier
+    }
+
+    /// `ship pin-verifier` writes install.sh's four lines and the committed record from a
+    /// cut's receipts, and the pair passes `pin::check`; a record this checkout's ledger
+    /// does not claim, or of another interface, writes nothing.
+    #[test]
+    fn pin_verifier_writes_the_pin_and_its_record_together() {
+        let root = scratch();
+        let script = format!(
+            "#!/bin/bash\n# the installer\n{}rest\n",
+            Pin::default().lines()
+        );
+        fs::create_dir_all(root.path().join("tools")).unwrap();
+        fs::create_dir_all(root.path().join("crates/aterm-bootstrap-verify")).unwrap();
+        fs::write(root.path().join("tools/install.sh"), &script).unwrap();
+        fs::write(
+            root.path().join("RELEASES.ledger"),
+            "# ledger\n100 0.100.0\n",
+        )
+        .unwrap();
+        let record = pin::Record {
+            repo: "alabsystems/aterm".into(),
+            tag: "v0.100.0".into(),
+            build_number: 100,
+            commit: "a".repeat(40),
+            interface: pin::INTERFACE,
+            verifiers: vec![pin::Receipt {
+                arch: "x86_64".into(),
+                asset: pin::asset_name("0.100.0", "x86_64"),
+                sha256: "c".repeat(64),
+                size: 4096,
+            }],
+        };
+        let dist = scratch();
+        let receipts = dist.path().join(PIN_RECORD);
+        let refused = |record: &pin::Record, why: &str| {
+            fs::write(&receipts, record.to_toml()).unwrap();
+            let said = pin_verifier(root.path(), &receipts).expect_err(why);
+            assert!(said.contains(why), "{why}: {said}");
+            assert_eq!(
+                fs::read_to_string(root.path().join("tools/install.sh")).unwrap(),
+                script,
+                "{why}: nothing written"
+            );
+            assert!(!root.path().join(pin::RECORD).exists(), "{why}");
+        };
+        refused(
+            &pin::Record {
+                build_number: 101,
+                ..record.clone()
+            },
+            "records no claim",
+        );
+        refused(
+            &pin::Record {
+                interface: pin::INTERFACE + 1,
+                ..record.clone()
+            },
+            "speaks interface",
+        );
+        fs::write(&receipts, record.to_toml()).unwrap();
+        assert_eq!(pin_verifier(root.path(), &receipts), Ok(record.pin()));
+        let written = fs::read_to_string(root.path().join("tools/install.sh")).unwrap();
+        assert_eq!(
+            written,
+            format!(
+                "#!/bin/bash\n# the installer\n{}rest\n",
+                record.pin().lines()
+            )
+        );
+        let committed = fs::read_to_string(root.path().join(pin::RECORD)).unwrap();
+        assert_eq!(
+            pin::check(&written, Some(&committed), "100 0.100.0\n"),
+            Ok(record.pin())
+        );
+    }
+
+    /// A worker's static verifier joins the cut beside its executable: imported into the
+    /// stage, uploaded with the Linux assets, never in the signed appcast, and printed as
+    /// install.sh's pin, which reads back as it was printed. An architecture with none
+    /// stays on install.sh's embedded verifier (its digest empty in the pin).
+    #[test]
+    fn a_workers_static_verifier_is_staged_and_pinned() {
+        let source = scratch();
+        let dist = scratch();
+        for t in TARGETS {
+            fixture(source.path(), t);
+        }
+        let verifier = verifier_fixture(source.path(), LinuxTarget::Aarch64, false);
+        let mut handoff = Handoff::new(source.path(), &[], &[]).unwrap();
+        handoff
+            .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
+            .unwrap();
+        assert_eq!(handoff.verifiers, std::slice::from_ref(&verifier));
+        handoff
+            .verify_staged(dist.path(), "0.100.0", 100, &"a".repeat(40))
+            .unwrap();
+        verifier
+            .verify_file(&dist.path().join(&verifier.asset))
+            .unwrap();
+        let mut manifest = manifest();
+        handoff.stamp(&mut manifest).unwrap();
+        assert_eq!(
+            manifest_asset_names(&manifest).unwrap().len(),
+            2,
+            "the appcast names no verifier"
+        );
+        let commit = "a".repeat(40);
+        let record = handoff
+            .record("alabsystems/aterm", "0.100.0", 100, &commit)
+            .expect("a verifier was frozen");
+        assert_eq!(record.validate(), Ok(()));
+        assert_eq!(pin::Record::parse(&record.to_toml()), Ok(record.clone()));
+        assert_eq!(
+            record.pin(),
+            Pin {
+                repo: "alabsystems/aterm".into(),
+                tag: "v0.100.0".into(),
+                x86_64: String::new(),
+                aarch64: verifier.sha256.clone(),
+            }
+        );
+        assert_eq!(
+            record.verifiers,
+            [pin::Receipt {
+                arch: "aarch64".into(),
+                asset: verifier.asset.clone(),
+                sha256: verifier.sha256.clone(),
+                size: verifier.size,
+            }]
+        );
+        assert!(
+            Handoff::new(source.path(), &[], &[])
+                .unwrap()
+                .record("alabsystems/aterm", "0.100.0", 100, &commit)
+                .is_none()
+        );
+        let frozen: Handoff =
+            aterm_toml::from_str(&aterm_toml::to_string(&handoff).unwrap()).unwrap();
+        assert_eq!(frozen, handoff);
+        let old: Handoff = aterm_toml::from_str(
+            aterm_toml::to_string(&handoff)
+                .unwrap()
+                .split("[[verifiers]]")
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            old.verifiers.is_empty(),
+            "a journal from before verifiers reads as none"
+        );
+        let mut published = crate::channel::required_asset_names("0.100.0", false, false);
+        let linux: Vec<String> = handoff
+            .artifacts
+            .iter()
+            .map(|a| a.asset.clone())
+            .chain([verifier.asset.clone()])
+            .collect();
+        published.extend(linux.iter().cloned());
+        crate::channel::validate_channel_asset_set(&published, "0.100.0", false, false, &linux)
+            .unwrap();
+        assert!(crate::channel::publishable_asset_names("0.100.0").contains(&verifier.asset));
+        let foreign = vec![pin::asset_name("0.99.0", "aarch64")];
+        assert!(
+            crate::channel::validate_channel_asset_set(
+                &published, "0.100.0", false, false, &foreign
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("noncanonical")
+        );
+    }
+
+    /// Negative controls: a dynamic, tampered, misnamed or mislabelled verifier is refused,
+    /// and a resumed cut refuses a verifier that appeared, changed or went after it froze.
+    #[test]
+    fn a_verifier_that_is_not_the_receipts_static_build_is_refused() {
+        let source = scratch();
+        let dist = scratch();
+        let dynamic = verifier_fixture(source.path(), LinuxTarget::Aarch64, true);
+        assert!(
+            dynamic
+                .verify_file(&source.path().join(&dynamic.asset))
+                .unwrap_err()
+                .contains("static")
+        );
+        let verifier = verifier_fixture(source.path(), LinuxTarget::Aarch64, false);
+        let mut misnamed = verifier.clone();
+        misnamed.asset = pin::asset_name("0.100.0", "x86_64");
+        assert!(misnamed.validate("0.100.0", 100, &"a".repeat(40)).is_err());
+        let mut unknown = verifier.clone();
+        unknown.compiler_version = "rustc 1.99.1\n".into();
+        assert!(unknown.validate("0.100.0", 100, &"a".repeat(40)).is_err());
+        let mut oversized = verifier.clone();
+        oversized.size = pin::MAX_ASSET + 1;
+        assert!(oversized.validate("0.100.0", 100, &"a".repeat(40)).is_err());
+        let mut foreign = verifier.clone();
+        foreign.target = LinuxTarget::X86_64.triple().into();
+        assert!(
+            foreign
+                .verify_file(&source.path().join(&verifier.asset))
+                .is_err()
+        );
+        let mut data = fs::read(source.path().join(&verifier.asset)).unwrap();
+        data[100] ^= 1;
+        fs::write(source.path().join(&verifier.asset), &data).unwrap();
+        assert!(
+            verifier
+                .verify_file(&source.path().join(&verifier.asset))
+                .unwrap_err()
+                .contains("hash")
+        );
+        fixture(source.path(), LinuxTarget::Aarch64);
+        let mut handoff =
+            Handoff::new(source.path(), &[LinuxTarget::Aarch64.triple().into()], &[]).unwrap();
+        assert!(
+            handoff
+                .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
+                .unwrap_err()
+                .contains("hash"),
+            "a tampered verifier fails the import"
+        );
+        for file in [
+            verifier.asset.clone(),
+            format!("{}.handoff.toml", verifier.asset),
+        ] {
+            fs::remove_file(source.path().join(file)).unwrap();
+        }
+        handoff
+            .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
+            .unwrap();
+        assert!(handoff.verifiers.is_empty());
+        verifier_fixture(source.path(), LinuxTarget::Aarch64, false);
+        assert!(
+            handoff
+                .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
+                .unwrap_err()
+                .contains("changed"),
+            "a verifier that appeared after the cut froze none"
+        );
+        let mut frozen = handoff.clone();
+        frozen.verifiers = vec![verifier.clone()];
+        frozen.verifiers[0].sha256 = "f".repeat(64);
+        assert!(
+            frozen
+                .import(dist.path(), "0.100.0", 100, &"a".repeat(40))
+                .unwrap_err()
+                .contains("changed")
+        );
+        frozen.verifiers = vec![verifier.clone(), verifier];
+        assert!(
+            frozen
+                .validate_identity("0.100.0", 100, &"a".repeat(40), true)
+                .is_err(),
+            "two verifiers for one architecture"
+        );
     }
 
     fn manifest() -> Manifest {

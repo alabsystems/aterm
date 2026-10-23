@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! skrifa 0.46.2 as the hinting oracle's [`Hinter`]: the options and
-//! instance aterm-render's src/hinted.rs (`HintMode::options`,
-//! `HintBank::instance_with`) and src/subpixel.rs (`lcd_hint_options`) built
-//! before TF.4, copied line for line so they run on macOS. The raster paths
-//! and digests are `../hint_raster.rs`, shared with aterm-font's replay.
-//! Since TF.2 the linear advance (src/variation.rs
-//! `VariedFace::linear_advance`) and the unhinted subpixel outline come from
-//! ttf-parser, and skrifa answers only the grid fit; `native` renders as
-//! `light` since TF.2b and has no mode here.
+//! Skrifa implementation of the hinting oracle's [`Hinter`].
 
 use skrifa::{
     FontRef, MetadataProvider, Tag,
@@ -56,7 +48,6 @@ pub fn options(mode: Mode) -> HintingOptions {
 /// skrifa's autohinter, ttf-parser's reader.
 pub(crate) struct Skrifa;
 
-/// skrifa's pen into the oracle's.
 struct Pen<'a>(&'a mut PathPen);
 
 impl OutlinePen for Pen<'_> {
@@ -77,7 +68,6 @@ impl OutlinePen for Pen<'_> {
     }
 }
 
-/// src/subpixel.rs `Scaled`: a ttf-parser outline into the pen, in pixels.
 struct Scaled<'a> {
     pen: &'a mut PathPen,
     scale: f32,

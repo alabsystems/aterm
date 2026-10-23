@@ -205,7 +205,7 @@ fn capability_list() -> Vec<(&'static str, bool)> {
 /// (`aterm_gpu::default_backends`).
 #[cfg(target_os = "macos")]
 const GPU_BACKEND_LABEL: &str = "gpu (metal)";
-/// Linux: the first-party GLES renderer over EGL (docs/AUDIT-third-party-2026-10-15.md GW.4).
+/// Linux: the first-party GLES renderer over EGL.
 #[cfg(target_os = "linux")]
 const GPU_BACKEND_LABEL: &str = "gpu (gl)";
 /// Windows restricts wgpu to DX12, the only backend wired for the HDR/scRGB present.
@@ -1166,12 +1166,7 @@ fn shell_config_warning(shell: &str) -> Option<String> {
     }
 }
 
-/// Windows. A value resolves in two stages, and only the second is `execve`-like:
-///
-/// 1. [`aterm_pty::classify_shell_name`], the spawn's own resolution: alias discovery,
-///    then `SearchPathW` with a default `.exe`, so `shell = "pwsh"` validates clean.
-/// 2. `CreateProcessW(lpApplicationName = <result>)`: no search, no extension appended
-///    (aterm-pty's `create_process_application_name_contract`).
+/// Windows.
 #[cfg(windows)]
 fn shell_config_warning(shell: &str) -> Option<String> {
     // `shell` names one program: a quoted value reaches `lpApplicationName` as a
@@ -1311,8 +1306,7 @@ fn first_authored_package_key(config: &crate::app_config::Config) -> Option<&'st
     }
 }
 
-/// Pure atpkg admission projection. The package preferences remain parseable in an
-/// unpinned build, but no package operation may act without a verification root.
+/// Pure atpkg admission projection.
 fn package_capability_warnings(
     config: &crate::app_config::Config,
     root_available: bool,
@@ -1343,8 +1337,7 @@ pub(crate) enum ConfigCapabilityPlatform {
 }
 
 impl ConfigCapabilityPlatform {
-    /// The build host's family. `cfg!` rather than `#[cfg]` constants, so every variant
-    /// stays a live value and the validator is testable for all four on any host.
+    /// The build host's family.
     const CURRENT: Self = if cfg!(target_os = "macos") {
         Self::MacOs
     } else if cfg!(windows) {
@@ -2353,9 +2346,7 @@ pub(crate) fn list_keybinds() -> String {
     s
 }
 
-/// The inline annotation for one user `[keybindings]` row in [`list_keybinds`]. The
-/// unbind spelling is checked first: `"f11" = "none"` is the documented way to free a
-/// seeded default.
+/// The inline annotation for one user `[keybindings]` row in [`list_keybinds`].
 fn user_keybinding_note(chord: &str, action: &str) -> String {
     user_keybinding_note_for(action, crate::keybinding::builtin_shadow_label(chord))
 }
@@ -2429,11 +2420,7 @@ fn show_config_shell(config: &crate::app_config::Config) -> (String, String) {
     )
 }
 
-/// `--show-config`'s console-host row (Windows): the host a new tab of this launch runs
-/// in under aterm.toml `conpty`, with its version and path, in the words of `aterm
-/// doctor`'s `conpty:` row. A preview (`aterm_pty::preview_console_host`): it neither
-/// states the process's choice, copies Windows Terminal's host nor starts one, so a
-/// host that would fail to start reads as chosen here and as a fallback in `doctor`.
+/// `--show-config`'s console-host row (Windows): the host a new tab of this launch runs in under aterm.toml `conpty`, with its version and path, in the words of `aterm doctor`'s `conpty:` row.
 #[cfg(windows)]
 fn show_config_console_host(config: &crate::app_config::Config) -> String {
     aterm_pty::preview_console_host(&aterm_pty::ConsoleHostChoice::from_config(
@@ -4606,11 +4593,7 @@ ink = "rainbow"
         );
     }
 
-    /// The window's `--show-config` names the shell a new tab starts (it had no shell row;
-    /// on Windows 0.95.0, 2026-09-27, `aterm --window --shell cmd --show-config` could not
-    /// say it would run cmd.exe): the program the spawn's own resolver picks over the
-    /// captured override, and the input that chose it, in the CLI's tokens plus `--shell`
-    /// for the flag only a window launch carries.
+    /// The window's `--show-config` names the shell a new tab starts.
     #[test]
     fn show_config_names_the_shell_a_new_tab_starts() {
         use aterm_pty::ShellOrigin as O;
@@ -4641,9 +4624,7 @@ ink = "rainbow"
         }
     }
 
-    /// The window's `--show-config` names the console host a new tab runs in on Windows
-    /// (WINDOWS_PARAGON_DESIGN §5.4's `console_host:` row, missing until 2026-10-17): the
-    /// preview of aterm.toml `conpty`, in `aterm doctor`'s `conpty:` words.
+    /// The window's `--show-config` names the console host a new tab runs in on Windows.
     #[test]
     fn show_config_names_the_console_host_on_windows_only() {
         let out = show_config();

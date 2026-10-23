@@ -9,7 +9,7 @@ use std::path::PathBuf;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn scratch_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("git")
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args([
                 "-c",
                 "user.name=Andrew Yates",

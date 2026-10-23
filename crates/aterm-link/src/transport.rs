@@ -62,7 +62,7 @@ where
     }
 }
 
-/// THE FLOOR A READ WAS TOLD (astream's R4).
+/// The floor a read was told.
 #[must_use]
 pub fn retained_past(e: &io::Error, from: u64) -> Option<u64> {
     astream_broker::broker_refusal(e)
@@ -117,10 +117,7 @@ pub fn connect(endpoint: &str, deadline: Duration) -> io::Result<(Conn, Closer)>
     Ok((conn, closer))
 }
 
-/// The reconnect back-off floor and ceiling. §7: a bridge reconnects with jittered
-/// back-off and opens its publisher connection before its drain connection, because
-/// `MAX_CONNS` can refuse a herd and the publisher's `live inc+1` suppresses a fenced
-/// will.
+/// The reconnect back-off floor and ceiling.
 const RECONNECT_MIN: Duration = Duration::from_millis(100);
 pub(crate) const RECONNECT_MAX: Duration = Duration::from_secs(5);
 
@@ -215,7 +212,7 @@ pub fn read_mint_secret(path: &str) -> io::Result<Vec<u8>> {
 
 /// [`read_mint_secret`] as it reads once the secret's directory is 0700
 /// ([`astream_cap::capfile::read_secret_at_narrowed`]): `fabric on --dry-run`'s reader, since the
-/// real run narrows the root before it reads the secret. A real read never uses it.
+/// real run narrows the root before it reads the secret.
 ///
 /// # Errors
 /// [`read_mint_secret`]'s, but for its directory's group or other mode bits.
@@ -248,8 +245,6 @@ mod tests {
                 let served = if what == "hello" {
                     conn.hello().map(|_| ())
                 } else {
-                    // 256 KiB: the bridge's post cap, far past a Unix
-                    // socket's buffers.
                     conn.publish(1, 1, "/f/t/x", &[0; 256 * 1024]).map(|_| ())
                 };
                 let _ = tx.send(served);
@@ -426,8 +421,6 @@ mod tests {
         assert!(e.to_string().contains("chmod 700"), "{e}");
         assert!(!e.to_string().contains("exposed"), "{e}");
         once(p, &e);
-        // A dry run reads it as the real run will once the root is narrowed: the
-        // directory's mode alone is waived, the file's own is not.
         assert_eq!(read_mint_secret_narrowed(p).expect("once narrowed"), bytes);
         mode(&path, 0o644);
         let e = read_mint_secret_narrowed(p).expect_err("the file's own mode");
@@ -509,7 +502,6 @@ mod tests {
             let said = describe("absent.secret", &absent);
             assert!(said.starts_with("absent.secret: "), "{said}");
             assert_eq!(read_mint_secret(bare).expect("a bare name, here"), bytes);
-            // On a line of its own: the harness has printed the test's name without one.
             println!("\nbare-name=read");
             return;
         }

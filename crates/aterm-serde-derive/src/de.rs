@@ -1,13 +1,6 @@
 // Copyright (c) Erick Tryzelaar, David Tolnay et al. (the serde authors)
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Derived from serde_derive 1.0.228 src/de.rs and modified by the aterm
-// project in 2026: templates over std proc_macro instead of quote, and only
-// the paths aterm's attribute set reaches (no remote, getter, from/try_from,
-// identifier enums, `borrow`, `bound`, `expecting`, adjacent tagging, or
-// variant-level skip/with/untagged; `deserialize_in_place` is off upstream by
-// default and absent here).
-// See ../LICENSE-MIT and ../LICENSE-APACHE for the upstream licenses.
+// Derived from serde_derive 1.0.228 src/de.rs (see ../LICENSE-MIT and ../LICENSE-APACHE).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -108,8 +101,7 @@ pub(crate) struct Parameters {
     /// Generics including any explicit and inferred bounds for the impl.
     generics: Generics,
 
-    /// Lifetimes borrowed from the deserializer. These will become bounds on
-    /// the `'de` lifetime of the deserializer.
+    /// Lifetimes borrowed from the deserializer.
     borrowed: BorrowedLifetimes,
 }
 
@@ -124,14 +116,12 @@ impl Parameters {
         }
     }
 
-    /// Type name to use in error messages and `&'static str` arguments to
-    /// various Deserializer methods.
+    /// Type name for error messages and `Deserializer` arguments.
     fn type_name(&self) -> String {
         self.this_type.to_string()
     }
 
-    /// The data structure's generics for its `Deserialize` impl, with the
-    /// `'de` lifetime (bounded by the borrowed lifetimes) added in front.
+    /// The data structure's generics for its `Deserialize` impl.
     fn de_impl_generics(&self) -> TokenStream {
         let mut generics = self.generics.clone();
         if let Some(de_lifetime) = self.borrowed.de_lifetime_param() {
@@ -426,7 +416,7 @@ fn field_i(i: usize) -> Ident {
     Ident::new(&format!("__field{i}"), Span::call_site())
 }
 
-/// The span of a path's first token: upstream's `path.span()`.
+/// The span of a path's first token.
 fn span_of(tokens: &TokenStream) -> Span {
     tokens
         .clone()
@@ -565,8 +555,7 @@ fn effective_style(variant: &Variant) -> Style {
     }
 }
 
-/// True if there is any field with a `#[serde(flatten)]` attribute, other than
-/// fields which are skipped.
+/// True if there is any field with a `#[serde(flatten)]` attribute.
 fn has_flatten(fields: &[Field]) -> bool {
     fields
         .iter()
@@ -608,8 +597,7 @@ fn visitor_struct(params: &Parameters) -> TokenStream {
     )
 }
 
-/// `impl Visitor<'de> for __Visitor` around `body` (its items after
-/// `expecting`).
+/// `impl Visitor<'de> for __Visitor` around `body` (its items after `expecting`).
 fn visitor_impl(params: &Parameters, expecting: &str, body: &dyn ToTokens) -> TokenStream {
     let this_type = &params.this_type;
     let de_impl_generics = params.de_impl_generics();

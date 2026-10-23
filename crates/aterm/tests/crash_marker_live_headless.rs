@@ -1,21 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The crash marker's lifecycle across real aterm processes sharing one log dir
-//! (`aterm-gui`'s `crash_signal::markers`): a start sweeps only markers whose owner is gone,
-//! and a clean exit removes its own. One scratch `$HOME`, three headless instances:
-//!
-//! 1. B starting does not remove A's marker (A is alive, holding its lock);
-//! 2. B SIGKILLed leaves its marker; C starting removes it (B is gone and was not the
-//!    installed app) and still keeps A's;
-//! 3. A closing its last tab (a clean `exit(3)`) removes A's own marker.
-//!
-//! Headless starts arm as `other`: only the installed app's `app` markers are reported as
-//! "killed" (unit-tested in `crash_signal::marker_tests` and `logging::tests`), so harness
-//! SIGKILLs like step 2 never reach the owner. Isolation is `support/launch_isolation.rs`'s;
-//! an instance that cannot start fails the test (`support/headless_boot.rs` `await_ready`, on
-//! the instance's own `--ready-fd` word), and an environment refusal named there (scratch, log,
-//! spawn, a refused bind) is COULD NOT RUN.
+//! Crash marker lifecycle tests across real headless aterm processes sharing one log directory.
 
 #![cfg(unix)]
 #![allow(
@@ -31,11 +17,8 @@ use std::time::Duration;
 
 use crate::{headless_boot, launch_isolation};
 
-/// How long a wait for something that must happen (a reply, a marker going) may take before it
-/// is read as a hang (AGENTS.md).
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 
-/// One scratch world every instance of the test shares; removed on drop.
 struct World(PathBuf);
 
 impl Drop for World {
@@ -44,7 +27,6 @@ impl Drop for World {
     }
 }
 
-/// One headless instance, killed on drop.
 struct Instance {
     child: Child,
     /// Cut after `child` is killed (fields drop after `Drop::drop`), and closed by
@@ -75,7 +57,6 @@ fn world() -> World {
     aterm_spec::host::could_not_run("no scratch base with a socket path short enough for sun_path")
 }
 
-/// The log dir `aterm_types::dirs::logs_dir` resolves under the scratch world.
 fn logs_dir(root: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
         root.join("home/Library/Logs/aterm")
@@ -84,8 +65,6 @@ fn logs_dir(root: &Path) -> PathBuf {
     }
 }
 
-/// Boot one headless instance on its own socket in `root`. A log or spawn refusal is COULD NOT
-/// RUN; an instance that exits or never listens panics (`headless_boot::await_ready`).
 fn boot(root: &Path, tag: &str) -> Instance {
     let sock = root.join(format!("run/aterm/{tag}.sock"));
     let log_path = root.join(format!("{tag}.log"));
@@ -122,7 +101,6 @@ fn boot(root: &Path, tag: &str) -> Instance {
     instance
 }
 
-/// The markers in the log dir armed by `pid`.
 fn markers_of(root: &Path, pid: u32) -> Vec<String> {
     let prefix = format!("crash-marker-{pid}-");
     std::fs::read_dir(logs_dir(root))
@@ -136,7 +114,6 @@ fn markers_of(root: &Path, pid: u32) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// One owner-token request on `sock`; the status line back.
 fn request(sock: &Path, line: &str) -> String {
     let token = std::fs::read_to_string(format!("{}.token", sock.display())).unwrap();
     let mut stream = UnixStream::connect(sock).unwrap();
@@ -147,7 +124,6 @@ fn request(sock: &Path, line: &str) -> String {
     reply.trim_end().to_string()
 }
 
-/// The instance's first session id, from `sessions` (`<local> <sid> …`).
 fn first_sid(sock: &Path) -> String {
     let token = std::fs::read_to_string(format!("{}.token", sock.display())).unwrap();
     let mut stream = UnixStream::connect(sock).unwrap();
@@ -164,7 +140,6 @@ fn first_sid(sock: &Path) -> String {
         .to_string()
 }
 
-/// Wait until `pred` holds (a bounded poll on an event, not a sleep verdict).
 fn wait_until(what: &str, mut pred: impl FnMut() -> bool) {
     let seen = aterm_spec::wait::within(HANG, Duration::from_millis(25), || pred().then_some(()));
     assert!(seen.is_some(), "timed out waiting for {what}");
@@ -184,7 +159,6 @@ fn another_start_never_unlinks_a_live_marker_and_a_clean_exit_removes_its_own() 
         "headless is never `app`"
     );
 
-    // 1. B's start sweeps the dir: A's live marker survives it.
     let mut b = boot(&root, "b");
     let b_pid = b.child.id();
     assert_eq!(markers_of(&root, b_pid).len(), 1);
@@ -194,7 +168,6 @@ fn another_start_never_unlinks_a_live_marker_and_a_clean_exit_removes_its_own() 
         "B's sweep kept A's marker"
     );
 
-    // 2. B dies without an exit path; its marker stays until C's start.
     b.child.kill().unwrap();
     b.child.wait().unwrap();
     assert_eq!(
@@ -213,7 +186,6 @@ fn another_start_never_unlinks_a_live_marker_and_a_clean_exit_removes_its_own() 
         "C's sweep kept A's marker"
     );
 
-    // 3. A closes its last tab: a clean exit removes A's own marker.
     let sid = first_sid(&a.sock);
     let closed = request(&a.sock, &format!("@{sid} close"));
     assert!(closed.starts_with("OK closed"), "{closed}");

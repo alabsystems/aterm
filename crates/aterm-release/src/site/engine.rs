@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `/terminal` engine, built by `ship site` itself. Until 2026-10-16 the sync ran
-//! the site checkout's `build-terminal-wasm.sh`; this is that script as Trust code
-//! (AGENTS.md: no shell scripts), so the sync runs nothing the site repo carries but
-//! its `deploy.sh` (docs/AUDIT-third-party-2026-10-15.md, the site-engine follow-up of
-//! wasm-platform WP.7). In order:
-//!
-//! 1. the CPU module: `aterm-wasm` built in the clone of the public commit for wasm32,
-//!    release profile, on the wasm32 pin `publish/config.sh` names (a STOCK EXCEPTION:
-//!    Trust ships only its host std), `+simd128`, the builder's paths remapped out
-//!    ([`World::build_module`]);
-//! 2. its ES-module glue from `verify glue`'s generator, in process
-//!    ([`aterm_verify::wasm_glue::glue`], its ES module glue);
-//! 3. the shipping `wasm-opt` pass over the bound module ([`World::optimise`]): a
-//!    module it left unchanged is refused, so nothing ships pre-opt;
-//! 4. refused when a remapped path survives in the module: a panic location must never
-//!    show a visitor the builder's home;
-//! 5. installed at `aterm_wasm.<sha12>.js` and `.wasm`, where `sha12` hashes the
-//!    optimized WASM. Both names are immutable: existing non-link regular files must
-//!    match exactly. A JS-only generator change under the same WASM hash refuses and
-//!    needs a deliberate URL-contract change. The glue names the hashed module, and
-//!    `boot.js` imports the atomically replaced stable `engine.js` pointer.
-//!
-//! The commit it was built from (`ENGINE_SOURCE`) is the sync's to write.
+//! The `/terminal` engine, built by `ship site` itself.
 
 use std::io::Write;
 use std::path::Path;
@@ -32,16 +10,13 @@ use aterm_verify::wasm_glue::{self, WASM_OPT_FLAGS};
 
 use super::{World, say};
 
-/// The CPU module's stem: cargo writes `aterm_wasm.wasm`, the glue loads
-/// `aterm_wasm_bg.wasm` until it is renamed to the pair's.
+/// The CPU module's stem.
 pub const STEM: &str = "aterm_wasm";
 
 /// The CPU module's target.
 pub const TARGET: &str = "wasm32-unknown-unknown";
 
-/// The wasm32 target's rustflags: the shipping `+simd128`, and the remaps that keep the
-/// builder's cargo home, the clone and the home directory out of the module's panic
-/// locations, in the site script's order (rustc applies the last prefix that matches).
+/// The wasm32 target's rustflags with `+simd128` and path-prefix remaps.
 #[must_use]
 pub fn rustflags(clone: &Path, home: Option<&Path>) -> Vec<String> {
     let remap = |from: &Path, to: &str| format!("--remap-path-prefix={}={to}", from.display());
@@ -52,7 +27,6 @@ pub fn rustflags(clone: &Path, home: Option<&Path>) -> Vec<String> {
     flags
 }
 
-/// A home directory worth remapping and looking for: absolute, and not `/` itself.
 fn usable_home(home: Option<&Path>) -> Option<&Path> {
     home.filter(|h| h.is_absolute() && h.parent().is_some())
 }
@@ -76,8 +50,6 @@ pub fn build(
     out: &mut dyn Write,
 ) -> Result<String, String> {
     let home = usable_home(home);
-    // cargo names the sources under the clone's resolved path (macOS's temp dir sits
-    // behind the /var link), so the remap and the build both use that path
     let resolved = clone.canonicalize().unwrap_or_else(|_| clone.to_path_buf());
     let module = world.build_module(&resolved, pin, &rustflags(&resolved, home), out)?;
     let mut files = wasm_glue::glue(&module, STEM)
@@ -124,7 +96,6 @@ pub fn build(
     Ok(hash)
 }
 
-/// The first of `paths` whose bytes appear in `module`.
 fn leaked<'p>(module: &[u8], paths: impl IntoIterator<Item = &'p Path>) -> Option<&'p Path> {
     paths.into_iter().find(|p| {
         let needle = p.as_os_str().as_encoded_bytes();
@@ -132,18 +103,10 @@ fn leaked<'p>(module: &[u8], paths: impl IntoIterator<Item = &'p Path>) -> Optio
     })
 }
 
-/// `js` with its module URL — `<STEM>_bg.wasm` between two quotes, each `"` or `'` —
-/// renamed to `wasm`, the quotes kept: the site script's
-/// `sed -E "s/([\"'])aterm_wasm_bg\.wasm([\"'])/…/g"`, so a quote one match closed
-/// never opens the next.
-///
-/// # Errors
-/// The glue never names its module that way.
 fn rename_module(js: &str, wasm: &str) -> Result<String, String> {
     let from = format!("{STEM}_bg.wasm");
     let quote = |c: Option<char>| matches!(c, Some('"' | '\''));
     let mut renamed = String::with_capacity(js.len());
-    // `copied`: what `renamed` holds of `js`; `free`: where the next opening quote may be
     let (mut copied, mut free, mut found) = (0, 0, 0);
     for (at, _) in js.match_indices(&from) {
         let end = at + from.len();
@@ -172,7 +135,6 @@ pub fn engine_js(hash: &str) -> String {
     )
 }
 
-/// Only the site's twelve-lowercase-hex asset schema and its two legacy names.
 fn replaced(name: &str, keep: [&str; 2]) -> bool {
     let hashed = name.strip_prefix(&format!("{STEM}.")).is_some_and(|rest| {
         rest.strip_suffix(".js")
@@ -190,7 +152,6 @@ fn valid_hash(hash: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Only a stage this invocation successfully created is eligible for its cleanup.
 struct Stage {
     path: std::path::PathBuf,
     owned: bool,
@@ -216,7 +177,6 @@ impl Stage {
             use std::os::unix::fs::PermissionsExt as _;
             file.set_permissions(std::fs::Permissions::from_mode(0o644))
         });
-        // Close before the guard may remove the file, including on Windows.
         drop(file);
         written.map_err(|e| format!("cannot write {}: {e}", stage.path.display()))?;
         Ok(stage)
@@ -287,8 +247,6 @@ fn open_asset(_path: &Path) -> std::io::Result<std::fs::File> {
     ))
 }
 
-/// Missing is the only permission to publish a new immutable name. An existing name
-/// is reused only for the exact bytes, read from its admitted handle within that bound.
 fn existing_asset(path: &Path, bytes: &[u8]) -> Result<bool, String> {
     use std::io::Read as _;
     let mut file = match open_asset(path) {
@@ -340,8 +298,6 @@ fn publish_asset(term: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
         return Ok(());
     }
     let stage = Stage::write(term, name, bytes)?;
-    // A hard link publishes a complete file without replacing a name another writer
-    // supplied. No overwrite fallback is safe if this filesystem cannot make the link.
     match std::fs::hard_link(&stage.path, &path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -358,10 +314,6 @@ fn publish_asset(term: &Path, name: &str, bytes: &[u8]) -> Result<(), String> {
     }
 }
 
-/// Complete immutable assets first, then atomically replace the stable pointer with a
-/// separately staged regular file. Failures before that rename keep the old pointer and
-/// pair; newly published but unreferenced assets may remain. Retirement can fail after
-/// the new pointer is installed. This is not a whole-site or crash-durability transaction.
 fn install(term: &Path, hash: &str, js: &str, wasm: &[u8]) -> Result<(), String> {
     if !valid_hash(hash) {
         return Err("an engine asset hash must be twelve lowercase hexadecimal digits".to_string());
@@ -369,8 +321,6 @@ fn install(term: &Path, hash: &str, js: &str, wasm: &[u8]) -> Result<(), String>
     let js_name = format!("{STEM}.{hash}.js");
     let wasm_name = format!("{STEM}.{hash}.wasm");
     std::fs::create_dir_all(term).map_err(|e| format!("cannot create {}: {e}", term.display()))?;
-    // Check both existing names before publishing either: a JS-only generator change
-    // under the same WASM hash must refuse, never mutate an already referenced URL.
     existing_asset(&term.join(&js_name), js.as_bytes())?;
     existing_asset(&term.join(&wasm_name), wasm)?;
     publish_asset(term, &js_name, js.as_bytes())?;
@@ -378,7 +328,6 @@ fn install(term: &Path, hash: &str, js: &str, wasm: &[u8]) -> Result<(), String>
     let mut pointer = Stage::write(term, "engine.js", engine_js(hash).as_bytes())?;
     std::fs::rename(&pointer.path, term.join("engine.js"))
         .map_err(|e| format!("cannot replace engine.js in {}: {e}", term.display()))?;
-    // Rename consumed this stage name; never clean a later entry at the old name.
     pointer.owned = false;
     let entries =
         std::fs::read_dir(term).map_err(|e| format!("cannot read {}: {e}", term.display()))?;
@@ -411,7 +360,6 @@ mod tests {
                 "--remap-path-prefix=/Users//b=/build",
             ]
         );
-        // no home: only the clone is remapped, and `/` is no home
         assert_eq!(
             rustflags(Path::new("/c"), None)[2..],
             ["--remap-path-prefix=/c=/aterm"]
@@ -441,7 +389,6 @@ mod tests {
              b('aterm_wasm.0123456789ab.wasm');\nc(\"aterm_wasm.0123456789ab.wasm');\n\
              // aterm_wasm_bg.wasm stays in prose\n"
         );
-        // as with sed, the quote that closed one match does not open the next
         assert_eq!(
             rename_module("'aterm_wasm_bg.wasm'aterm_wasm_bg.wasm'", "x.wasm").unwrap(),
             "'x.wasm'aterm_wasm_bg.wasm'"

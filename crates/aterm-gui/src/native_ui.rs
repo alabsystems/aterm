@@ -716,7 +716,6 @@ pub(crate) fn display_face_name_typography(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-
 /// The wheel's disk geometry within its painted node rect.
 pub(crate) struct ColorWheelGeometry {
     pub(crate) cx: f32,
@@ -1890,8 +1889,6 @@ pub(crate) fn editor_painted_line_capacity_with_palette(
 }
 
 fn whole_editor_rows(geometry: &TextViewportGeometry) -> usize {
-    // A hair of slack: a body that is a whole number of rows tall in exact
-    // arithmetic must not lose its last row to float rounding.
     (((geometry.body_h + 0.01) / geometry.line_h).floor() as usize).clamp(1, 256)
 }
 
@@ -4720,7 +4717,6 @@ fn paint_compiled_node(
             } else if control.state.hovered {
                 mix_rgb(roles.elevated, roles.text_primary, 0.09)
             } else if navigation {
-                // Rail rows rest flush with the rail; only their states paint.
                 roles.elevated
             } else {
                 control_rest_fill(&roles)
@@ -4765,7 +4761,6 @@ fn paint_compiled_node(
                 } else if danger {
                     (roles.danger, 200)
                 } else if nav_selected {
-                    // The chosen segment's cell rim.
                     (mark, 150)
                 } else if inert {
                     (roles.separator, 96)
@@ -4822,7 +4817,6 @@ fn paint_compiled_node(
             let color = if chip_selected && control.state.enabled {
                 crate::native_appearance::ensure_text_contrast(roles.on_accent, fill)
             } else if nav_selected && !idle && !fluent_row {
-                // A Fluent row keeps its ink; the pill says selected.
                 roles.accent_ink
             } else if danger && control.state.enabled {
                 crate::native_appearance::ensure_text_contrast(roles.danger, fill)
@@ -5027,7 +5021,6 @@ fn paint_compiled_node(
                     if enabled && !control.state.muted {
                         roles.accent
                     } else if enabled {
-                        // Idle: the switch still says On, in quiet ink.
                         roles.text_tertiary
                     } else {
                         mix_rgb(roles.accent, roles.elevated, 0.55)
@@ -5088,7 +5081,6 @@ fn paint_compiled_node(
             };
             let geometry = slider_geometry(rect);
             let fill = if control.state.muted && control.state.enabled {
-                // Idle: the slider still shows its value, in quiet ink.
                 roles.text_tertiary
             } else if control.state.enabled || control.state.busy {
                 roles.accent
@@ -7597,12 +7589,8 @@ fn paint_control_surface(
 
 fn control_text_color(state: ControlState, roles: &crate::settings::Roles) -> [u8; 3] {
     if !state.enabled {
-        // Disabled stays visibly subordinate but never vanishes into the surface, which
-        // matters most for icon-only document actions.
         mix_rgb(roles.text_tertiary, roles.text_secondary, 0.35)
     } else if state.muted {
-        // Idle ([`ControlState::muted`]): the value is said in quiet ink, a
-        // step below a live control's, and still legible — the control works.
         quiet_text(roles)
     } else {
         roles.text_primary
@@ -7645,12 +7633,10 @@ fn rainbow_banner_sky(roles: &crate::settings::Roles) -> ([u8; 3], [u8; 3]) {
 }
 
 pub(crate) fn readable_secondary(roles: &crate::settings::Roles) -> [u8; 3] {
-    // Lifted for native apps' low-density prose, still a visible step below primary text.
     mix_rgb(roles.text_secondary, roles.text_primary, 0.55)
 }
 
 fn quiet_text(roles: &crate::settings::Roles) -> [u8; 3] {
-    // Quiet is hierarchy, never "disabled": only disabled controls use tertiary text.
     readable_secondary(roles)
 }
 

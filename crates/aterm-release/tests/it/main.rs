@@ -154,7 +154,7 @@ mod trust_facts_model;
 fn git_first_path() -> &'static str {
     static PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
-        let o = aterm_uds::spawnfd::command("git")
+        let o = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .arg("--exec-path")
             .stdin(aterm_uds::spawnfd::Stdio::null())
             .output()

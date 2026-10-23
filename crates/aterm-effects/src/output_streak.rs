@@ -876,11 +876,14 @@ const fn pan_of(pending: Pending, geom: Geom) -> f32 {
 /// perceptually re-paced.
 #[inline]
 fn nearest_spectrum_stop_by_hue(rgb: u32) -> usize {
+    static STOP_HUES: std::sync::OnceLock<[f32; crate::spectrum::SPECTRUM_STOPS]> =
+        std::sync::OnceLock::new();
+    let stop_hues = STOP_HUES
+        .get_or_init(|| std::array::from_fn(|index| hue_position_of(spectrum_stop(index))));
     let hue = hue_position_of(rgb);
     let mut nearest = 0;
     let mut nearest_distance = f32::INFINITY;
-    for index in 0..crate::spectrum::SPECTRUM_STOPS {
-        let stop_hue = hue_position_of(spectrum_stop(index));
+    for (index, &stop_hue) in stop_hues.iter().enumerate() {
         let direct = (hue - stop_hue).abs();
         let distance = direct.min(1.0 - direct);
         if distance < nearest_distance {

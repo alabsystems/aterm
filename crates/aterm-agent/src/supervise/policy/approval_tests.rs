@@ -16,7 +16,6 @@ const CAP_RM: &str = include_str!("fixtures/cap-rm.txt");
 const CAP_BOX1: &str = include_str!("fixtures/cap-box1.txt");
 const CAP_EDIT: &str = include_str!("fixtures/cap-edit.txt");
 const CAP_TRUST: &str = include_str!("fixtures/cap-trust.txt");
-/// A Bash heredoc box taller than the pane (160x45, user redacted).
 const CAP_TALL_HEREDOC: &str = include_str!("fixtures/cap-tall-heredoc.txt");
 
 /// The decline, captured: one rm breaker box in the four states a decline walks.
@@ -24,19 +23,16 @@ pub(crate) const CAP_DECLINE_1: &str = include_str!("fixtures/cap-decline-1-box.
 pub(crate) const CAP_DECLINE_2: &str = include_str!("fixtures/cap-decline-2-focus-no.txt");
 pub(crate) const CAP_DECLINE_3: &str = include_str!("fixtures/cap-decline-3-amend-open.txt");
 pub(crate) const CAP_DECLINE_4: &str = include_str!("fixtures/cap-decline-4-amend-typed.txt");
-/// The text typed into `CAP_DECLINE_4`.
 const DECLINE_MEASURED_TEXT: &str = "aterm harness: this rm was not run: $NOPE is not assigned on \
      this line. Rewrite the removal with literal absolute paths strictly inside /tmp/<dir> or \
      /private/tmp/<dir>, then run it.";
 
-/// The command row of `CAP_RM`, as drawn.
 const CAP_RM_ROW: &str = "   S=$PWD/tmp; for p in a b; do set -- $p; rm -rf $S/$1; done";
 
 fn lines(s: &str) -> Vec<String> {
     s.lines().map(str::to_string).collect()
 }
 
-/// The safe rules alone.
 fn ctx() -> ApprovalCtx {
     ApprovalCtx {
         approve: Approve::Safe,
@@ -45,7 +41,6 @@ fn ctx() -> ApprovalCtx {
     }
 }
 
-/// `approve = "safe"` under the default `rm_breaker_ask = false`.
 fn safe_warn() -> ApprovalCtx {
     ApprovalCtx {
         approve: Approve::Safe,
@@ -63,7 +58,6 @@ fn full() -> ApprovalCtx {
     )
 }
 
-/// `c` for a box the git rule reads (`git status`).
 fn git_host(c: ApprovalCtx) -> ApprovalCtx {
     if cfg!(windows) {
         ApprovalCtx {
@@ -75,7 +69,6 @@ fn git_host(c: ApprovalCtx) -> ApprovalCtx {
     }
 }
 
-/// `ctx` under `approve = "none"`.
 fn none(ctx: ApprovalCtx) -> ApprovalCtx {
     ApprovalCtx {
         approve: Approve::None,
@@ -110,7 +103,6 @@ fn reason(d: &Decision) -> &str {
     }
 }
 
-/// The captured rm box with its command row replaced by `cmd`.
 fn rm_box(cmd: &str) -> Vec<String> {
     let rows = lines(CAP_RM);
     assert!(rows.iter().any(|r| r == CAP_RM_ROW), "the capture's row");
@@ -125,7 +117,6 @@ fn rm_box(cmd: &str) -> Vec<String> {
         .collect()
 }
 
-/// A 2.1.280-shaped Bash box.
 fn bash_box(cmd_rows: &[&str], desc: Option<&str>) -> Vec<String> {
     let mut r = vec!["─".repeat(120), " Bash command".to_string(), String::new()];
     r.extend(cmd_rows.iter().map(|c| format!("   {c}")));
@@ -159,7 +150,6 @@ fn read_box(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The Read box as 2.1.292 draws it.
 fn read_call_box(path: &str) -> Vec<String> {
     let rows = phase_fixtures::screen(phase_fixtures::BOX_READ_OUTSIDE_2_1_292);
     assert!(
@@ -177,7 +167,6 @@ fn read_call_box(path: &str) -> Vec<String> {
         .collect()
 }
 
-/// The same box as 2.1.284 draws it.
 fn read_call_box_2_1_284(path: &str) -> Vec<String> {
     let rows = phase_fixtures::screen(phase_fixtures::BOX_READ_OUTSIDE_2_1_284);
     assert!(
@@ -314,10 +303,6 @@ fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
         noted.insert(q + 3, " Parse error".to_string());
         let why = reason(&on_screen(&noted, &ctx())).to_string();
         assert!(why.starts_with("the box carries a vendor note: "), "{why}");
-        // A note under the countdown makes the countdown a note too, so even
-        // the vendor's no-rule note there escalates; above the countdown it is
-        // lifted under its own rule (`no-rule-read-only@v2`), the countdown
-        // still no note.
         noted[q + 3] = " This command requires approval".to_string();
         let why = reason(&on_screen(&noted, &git_host(ctx()))).to_string();
         assert!(why.starts_with("the box carries a vendor note: "), "{why}");
@@ -331,7 +316,6 @@ fn the_2_1_281_breaker_with_its_auto_deny_countdown_is_the_rm_rules() {
     }
 }
 
-/// A zsh snapshot's person's part, as 2.1.284 writes it, with `functions` and `options`.
 fn zsh_startup(functions: &str, options: &str) -> Result<ShellStartup, String> {
     let text = format!(
         "# Snapshot file\nunalias -a 2>/dev/null || true\n# Functions\n{functions}# Shell \
@@ -725,7 +709,6 @@ fn a_wide_character_row_never_hides_a_wrapped_tail() {
     assert!(approved(&d).is_none(), "{d:?}");
 }
 
-/// The captured rm box with its command row replaced by `cmd` and `tail` drawn as a second command.
 fn rm_breaker_rows(cmd: &str, tail: &str) -> Vec<String> {
     let mut rows = rm_box(cmd);
     let at = rows
@@ -1014,7 +997,6 @@ fn the_measured_trust_dialog_is_answered_for_the_sessions_folder_under_a_trust_r
     );
 }
 
-/// `c` with the captured trust dialog's folder under a named trust root (by default none is).
 fn rooted(mut c: ApprovalCtx) -> ApprovalCtx {
     c.set_trust_roots(&["/private/tmp/claude-502/scratch/work*".to_string()], 502);
     c
@@ -1438,18 +1420,15 @@ fn full_power_with_a_model_fallback_waits_at_the_limit_and_never_buys_credits() 
     }
 }
 
-/// The usage-limit dialog with a limit reset on offer, composed from the vendor bundle's texts.
 fn reset_dialog() -> Vec<String> {
     phase_fixtures::screen(aterm_phase::reset::fixtures::DIALOG_GRANT)
 }
 
 const GRANT: &str = "Use a weekly reset (2 left, until Oct 5)";
-/// The grant row as Claude Code 2.1.287–2.1.303 drew it.
 const OLD_GRANT: &str = "Use your reset now (2 left, until Oct 5)";
 const WEEKLY_RESET: &str = "Reset your session limit now";
 const WAIT_OCT_9: &str = "Wait here, then continue automatically at Oct 9 at 5am";
 
-/// `ctx` with `[harness] limit_reset` on.
 fn resetting(ctx: ApprovalCtx) -> ApprovalCtx {
     ApprovalCtx {
         limit_reset: true,
@@ -2013,7 +1992,6 @@ fn no_rule_ever_spends_a_limit_reset() {
     }
 }
 
-/// A composed reset confirmation's rows with no part of the confirmation left.
 fn no_reset_left(rows: &[String]) -> Vec<String> {
     let yes = rows
         .iter()
@@ -2134,8 +2112,6 @@ fn a_reset_confirmation_is_never_answered_yes_at_any_level() {
             if head == "off" {
                 unread(&d, &what);
             } else {
-                // A dialog of no kind aterm reads, its title on the screen:
-                // declined, never spent and never allowed.
                 assert_eq!(approved(&d), Some(RULE_DECLINE), "{what}: {d:?}");
             }
         }
@@ -2572,7 +2548,6 @@ fn the_claude_tmp_root_is_the_uids_own() {
     }
 }
 
-/// The trust dialog's rows for `folder` in place of the captured one's.
 fn trust_rows(folder: &str) -> Vec<String> {
     lines(CAP_TRUST)
         .into_iter()
@@ -2666,7 +2641,6 @@ fn with_no_trust_root_only_the_system_roots_are_read() {
     }
 }
 
-/// The digit a full-power decision presses, and under which rule.
 fn pressed(d: &Decision) -> (&'static str, Choice) {
     match d {
         Decision::Approve {
@@ -2769,18 +2743,6 @@ pub(crate) fn sixty_five(swaps: &[(usize, &str)]) -> Vec<String> {
     lines
 }
 
-/// A TOO-MANY BOX IS JUDGED BY ITS SCREEN'S READINGS ALONE
-/// (`breaker-read-only@v7`): no transcript is read, and every refusal the
-/// screen's readings give is kept. The measured box (`echo` and 65 `$(true)`
-/// as one line, wrapped into four barred rows) is refused on its newline
-/// reading, which puts a `$(true)` where a command's name goes, in manual
-/// mode and in bypass, under a bash and a zsh startup; so is its captured
-/// newline twin (the same box rows under another call's row), and the
-/// reason names no transcript.
-///
-/// NEGATIVE CONTROL: the box whose barred lines are each a read (thirteen
-/// lines of `echo` and five `$(true)`) is approved under the rule, with no
-/// unproven warning, under a zsh startup too.
 #[test]
 fn a_too_many_box_is_judged_by_its_screens_readings_alone() {
     use phase_fixtures::{
@@ -2806,7 +2768,6 @@ fn a_too_many_box_is_judged_by_its_screens_readings_alone() {
             assert!(r.contains("not read-only (newline reading)"), "{r}");
             assert!(!r.contains("transcript"), "{r}");
         }
-        // NEGATIVE CONTROL
         let unambiguous = too_many_box(&sixty_five(&[]), base.bypass_mode);
         for c in [
             base.clone(),
@@ -2837,20 +2798,6 @@ fn a_too_many_box_is_judged_by_its_screens_readings_alone() {
     );
 }
 
-/// EVERY MEASURED BARRED BOX IS JUDGED BY ITS SCREEN ALONE: the 2.1.307 and
-/// 2.1.308 captures breaker-4 measured its transcript lane on (long words,
-/// spaces and newlines at a wrap, tabs, East Asian wide characters, the
-/// call's row's cut, characters its renderer model refused, and the stale
-/// box an older read call stood waiting under; MEASURED 2026-10-22,
-/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`) are each
-/// handed to a person on the screen's own readings, in manual mode and in
-/// bypass, as `main` decided them with no transcript read: every
-/// too-many box on a reading that is not a read, the backticks box on its
-/// `Parse error` note. No reason names a transcript.
-///
-/// NEGATIVE CONTROL: the captures are boxes, all of them Bash boxes the
-/// breaker or a vendor note holds, so the loop above judged each (a capture
-/// that read as no box would pass vacuously).
 #[test]
 fn every_measured_barred_box_is_judged_by_its_screen_alone() {
     use super::super::box_command::tests::{
@@ -2870,7 +2817,6 @@ fn every_measured_barred_box_is_judged_by_its_screen_alone() {
     for (name, text) in captures {
         let rows = phase_fixtures::screen(text);
         let p = aterm_phase::prompt::parse_prompt_v2(&rows).expect(name);
-        // NEGATIVE CONTROL
         assert_eq!(p.kind, PromptKind::Bash, "{name}");
         assert!(p.gutter, "{name}: barred rows");
         for base in [ctx(), bypass()] {
@@ -2888,27 +2834,8 @@ fn every_measured_barred_box_is_judged_by_its_screen_alone() {
     }
 }
 
-/// NO RULE PROVES A BASH BOX FROM A READING WHOSE WORDS TURN ON A BLANK THE
-/// SCREEN CANNOT SHOW (`read-only@classify-v7`, `breaker-read-only@v7`,
-/// `rm-breaker@v6`; [`blanks_shown`]; MEASURED 2026-10-22 under `/bin/bash`
-/// 3.2, the measured note's §B). The screen draws a tab as the blanks to its
-/// stop and shows no blank at a row's end, so `echo \⇥#; tee x` (the tab at
-/// column 6, drawn as two blanks) draws as `echo \  #; tee x`, which reads as
-/// an echo and a comment, and `echo a\ ⏎tee x` draws as `echo a\⏎tee x`,
-/// which reads as one echo: each command runs `tee x`, and every reading of
-/// its rows classifies read-only. Each box is escalated, the reason naming
-/// the reading and the form: a one-row Bash box and a barred one under the
-/// read-only rule, the too-many breaker in manual mode and in bypass, and
-/// the rm breaker over a proven rm. (A here-document on barred rows needs
-/// no such check here: the classifier refuses its space reading, which
-/// holds no body.)
-///
-/// NEGATIVE CONTROLS, each approved under its rule: a backslash before one
-/// blank and a word (`a\ b`, read alike whether the blank is a tab drawn as
-/// one), blanks before a `#` that no backslash escapes, and a here-string.
 #[test]
 fn a_reading_that_turns_on_a_blank_the_screen_cannot_show_proves_no_box() {
-    // The commands the rows below are drawn for.
     assert!(!classify_command("echo \\\t#; tee x").read_only);
     assert!(!classify_command("echo a\\ \ntee x").read_only);
     assert!(classify_command("echo \\  #; tee x").read_only);
@@ -3001,9 +2928,6 @@ fn readings_read_only_names_the_classifiers_refusal_before_the_blanks() {
     assert_eq!(readings_read_only(&["ls x".to_string()], &[]), Ok(()));
 }
 
-/// Claude Code 2.1.308's Bash boxes over the probes of
-/// `docs/measured/box-notes-2026-10-22.md` (MEASURED in the real-Claude lab,
-/// manual mode, 144 columns), each under the note the vendor drew for it.
 const NOTE_BOXES: &[(&str, &str)] = &[
     (
         "n01-awk-read",
@@ -3095,7 +3019,6 @@ const NOTE_BOXES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The screen of [`NOTE_BOXES`]' `name`.
 fn note_box(name: &str) -> Vec<String> {
     NOTE_BOXES
         .iter()
@@ -3104,25 +3027,6 @@ fn note_box(name: &str) -> Vec<String> {
         .unwrap_or_else(|| panic!("the capture {name}"))
 }
 
-/// THE VENDOR'S NO-RULE NOTE ALONE IS LIFTED BY THE READ-ONLY PROOF, UNDER
-/// ITS OWN RULE (`no-rule-read-only@v2`; MEASURED 2026-10-22 on 2.1.308,
-/// `docs/measured/box-notes-2026-10-22.md`): Claude Code draws `This command
-/// requires approval` where no allow rule matched and its own read-only
-/// check did not prove the command, after its parse, its too-complex walk
-/// and its flag checks found nothing to say. Each measured box under it
-/// whose every reading aterm proves a read is approved under the rule, its
-/// one-shot `Yes` pressed (never the `don't ask again` row): an awk read,
-/// awk then `cat /etc/hosts` (a read outside the working directory, which
-/// draws only a folder grant, no note), `less`, a write to `/dev/null`, a
-/// pipeline, two lines; under a zsh startup too.
-///
-/// NEGATIVE CONTROLS, each under the same note and escalated with the
-/// note named: a prefix assignment (`FOO=1 awk …`, which the vendor draws
-/// this note over and the classifier vets only against its hazard list), a
-/// write (`sort -o`), and the two concerns the note hid in the lab's
-/// compound lines, a later subcommand's network redirect (`cat <
-/// /dev/tcp/…`) and its `sed` write (`w out.txt`); a bypass session; the
-/// note beside a second note; the note's text changed by one character.
 #[test]
 fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() {
     let zsh = || Ok(ShellStartup::of_parts(Vec::new(), true));
@@ -3153,7 +3057,6 @@ fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() 
             assert_eq!(unproven_of(&d), None, "{name}");
         }
     }
-    // NEGATIVE CONTROLS
     let noted = |why: &str, r: &str| {
         r.contains(why) && r.ends_with("(the box's vendor note: This command requires approval)")
     };
@@ -3203,8 +3106,6 @@ fn the_no_rule_note_alone_is_lifted_by_the_read_only_proof_under_its_own_rule() 
     );
 }
 
-/// The measured n01 box (an awk read under the no-rule note) with its
-/// command row made `command`.
 fn no_rule_box(command: &str) -> Vec<String> {
     let rows: Vec<String> = note_box("n01-awk-read")
         .into_iter()
@@ -3222,24 +3123,6 @@ fn no_rule_box(command: &str) -> Vec<String> {
     rows
 }
 
-/// THE NO-RULE NOTE STAYS WITH A PERSON OVER WHAT IT MAY STAND FOR AND THE
-/// PROOF DOES NOT SETTLE ([`no_rule_clear`]): Claude Code 2.1.308 draws it
-/// even where its own read-only check passed (read in its bundle at byte
-/// 17777748), over an unquoted glob for a program off its glob-safe list,
-/// `xargs` beside a Read deny rule, and an assignment, so a box under it is
-/// refused, the note named, when a reading holds an unquoted glob beside a
-/// program off [`GLOB_SAFE`] (`awk 'NR<3' *`, a glob in a redirect or in
-/// another command of the line, `cd` before a glob), runs `xargs`, `env` or
-/// `export` anywhere on the classifier's walk to a program (behind
-/// `timeout` too), assigns a variable anywhere on that walk (after `time`,
-/// `time -p`, `!`, `if`, a redirect, in a pipeline, a subshell or a
-/// substitution; `+=` the classifier refuses itself), or runs a `for` loop;
-/// under a bash startup, where the zsh grammar check does not apply.
-///
-/// NEGATIVE CONTROLS, each approved under the rule: the same awk read with
-/// its glob quoted or escaped, globs beside programs on the list (behind
-/// `timeout` too), an assignment-shaped operand after the program
-/// (`awk -v n=3`, `grep 'a=b'`), and the awk read alone.
 #[test]
 fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
     for (command, why) in [
@@ -3334,14 +3217,12 @@ fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
             "{command}: {r}"
         );
     }
-    // The assignment form `+=`, which the classifier refuses on its own.
     let r = reason(&on_screen(
         &no_rule_box("FOO+=1 awk 'NR<3' README.md"),
         &git_host(ctx()),
     ))
     .to_string();
     assert!(r.contains("not read-only (space reading): FOO+=1"), "{r}");
-    // NEGATIVE CONTROLS
     for command in [
         "awk 'NR<3' '*.md'",
         "awk 'NR<3' \\*.md",
@@ -3363,24 +3244,6 @@ fn the_no_rule_note_stays_with_a_person_over_what_it_may_stand_for() {
     }
 }
 
-/// EVERY OTHER NOTE CLAUDE CODE 2.1.308 DRAWS ON A BASH BOX STAYS WITH A
-/// PERSON (MEASURED 2026-10-22, `docs/measured/box-notes-2026-10-22.md`):
-/// the too-complex notes (`A variable…`, `Quoted text…`, `A command used as
-/// a file…`, `Parse error`, `A variable in braces…`, `A nested command…`,
-/// `Brace expansion`) say the vendor's walk stopped at the first form it
-/// could not check and checked nothing else, a form the classifier has
-/// holes in (it reads `sort x {-o,y}` as a read; bash runs `sort x -o y`);
-/// the flag and command notes (`awk program contains system()…`, `find with
-/// '-exec'…`, a `cd` before git, `awk has an option…`, a `/dev/tcp`
-/// redirect) name a concern of the vendor's own. Each box is escalated with
-/// its note, whatever the classifier says of its command (it proves `for`,
-/// `<<<`, `${HOME}`, `$(date)`, `ls {a,b}`, `find -exec grep` and `cd sub
-/// && git status` reads; the brace expansion is refused on aterm's own
-/// proof too, [`brace_free`]).
-///
-/// NEGATIVE CONTROL: the boxes whose command the read-only rule proves, with
-/// their one-row note taken off, are approved under `read-only@classify-v7`,
-/// so it is the note that holds each.
 #[test]
 fn every_other_vendor_note_on_a_bash_box_stays_with_a_person() {
     for (name, note, proven) in [
@@ -3447,28 +3310,12 @@ fn every_other_vendor_note_on_a_bash_box_stays_with_a_person() {
         if !proven {
             continue;
         }
-        // NEGATIVE CONTROL
         let bare: Vec<String> = rows.into_iter().filter(|r| r.trim() != note).collect();
         let d = on_screen(&bare, &git_host(ctx()));
         assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{name}: {d:?}");
     }
 }
 
-/// NO RULE PROVES A BASH BOX WHOSE COMMAND MAY OPEN A NETWORK CONNECTION BY
-/// READING A FILE ([`network_free`]; a safety fix to `read-only@classify-v7`,
-/// `breaker-read-only@v7` and `rm-breaker@v6`): bash opens `/dev/tcp/H/P` and
-/// `/dev/udp/H/P` in a redirect as a socket (after its expansions, so
-/// `/dev/"tcp"/…` is one too), an expansion may compute that target, and
-/// gawk's `getline <` opens `/inet/…`. The classifier reads each as a read.
-/// MEASURED on 2.1.308: alone such a redirect draws its own note, but after
-/// a subcommand that draws the no-rule note it draws only that note, and a
-/// subcommand that reads outside the working directory draws none. Each
-/// form is refused, the target named: a one-row box with no note (the
-/// read-only rule), the too-many breaker's box and the rm breaker's.
-///
-/// NEGATIVE CONTROLS, each approved: an input redirect from a file, a
-/// here-string, a descriptor (`<&3`), and `cat /dev/tcp/…` with no
-/// redirect (a path bash opens as a file, which macOS does not have).
 #[test]
 fn a_reading_that_may_open_a_network_connection_proves_no_box() {
     for (cmd, target) in [
@@ -3481,9 +3328,6 @@ fn a_reading_that_may_open_a_network_connection_proves_no_box() {
         ("cat < \"$F\"", "$…"),
         ("head -c1 < $(echo x)", "$…"),
     ] {
-        // Classifier audit 2: the classifier itself refuses the network read
-        // now (so the CLI and presence word agree); the box's message is still
-        // network_free's, which runs first and names the reading.
         assert!(!classify_command(cmd).read_only, "{cmd}");
         let r = reason(&on_screen(&bash_box(&[cmd], Some("Read")), &ctx())).to_string();
         assert!(
@@ -3516,7 +3360,6 @@ fn a_reading_that_may_open_a_network_connection_proves_no_box() {
     .to_string();
     assert!(r.starts_with("rm circuit breaker: "), "{r}");
     assert!(r.contains("may open a network connection"), "{r}");
-    // NEGATIVE CONTROLS
     for cmd in [
         "grep -c x < README.md",
         "wc -l <<< x",
@@ -3530,30 +3373,6 @@ fn a_reading_that_may_open_a_network_connection_proves_no_box() {
     assert_eq!(approved(&d), Some(RULE_RM_BREAKER), "{d:?}");
 }
 
-/// A BASH BOX WHOSE COMMAND HOLDS A BRACE EXPANSION PROVES NO BOX at the box
-/// layer ([`brace_free`]): bash makes words of an unquoted `{a,b}` or `{a..b}`
-/// before any grammar applies, so `sort x {-o,y}` runs `sort x -o y` (MEASURED
-/// 2026-10-22: `echo sort x {-o,y}` under `/bin/bash` 3.2.57 and zsh 5.9 prints
-/// `sort x -o y`), a write a word scan read as a sort of three files. Breaker-4's
-/// `breaker-read-only@v4` approved the too-many box over that line, in a
-/// bypass session too: the breaker's box draws no `Brace expansion` note.
-///
-/// Classifier audit 2 (2026-10-22): the classifier itself refuses a brace that
-/// can reach a FLAG or a PATH through its head-aware option-slot scan (`sort x
-/// {-o,y}`, `git config user.{name,email}`), so `read-only@classify-v7` is what
-/// stops those, and every consumer agrees. An operand-only brace (`wc -l
-/// {a,b}.md`, `echo a{1..3}`) stays a read in the classifier, and so at the CLI
-/// and the presence word. `brace_free` adds a CONSERVATIVE box-level refusal of
-/// EVERY brace expansion (operand ones too) with the reading named: each form
-/// below is refused as a one-row box with no note, as the too-many breaker's
-/// box under the bash session and bypass, and as the rm breaker's rest of line.
-/// A quoted separator inside the braces expands all the same (`{"a",b}`), a
-/// brace inside `$(…)` is the line's even inside double quotes, and an escaped
-/// `$` opens no `$'…'`.
-///
-/// NEGATIVE CONTROLS, each approved: a quoted awk program and a quoted
-/// regex interval, `find … {} +`, `${HOME}`, an escaped and a quoted brace
-/// pair, and a brace pair with no separator.
 #[test]
 fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
     for (cmd, braces) in [
@@ -3565,9 +3384,6 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
         ("wc \\$'a\\' {a,b}.md b'c'", "{a,b}"),
         ("grep -c x README.md; ls {a,{b,c}}", "{a,{b,c}}"),
     ] {
-        // These are operand-only braces: the classifier reads them (precise),
-        // and `brace_free` is the conservative box-level check that refuses
-        // them, its reading-named message won before the per-reading classify.
         let r = reason(&on_screen(&bash_box(&[cmd], Some("Read")), &ctx())).to_string();
         assert!(
             r.contains(&format!(
@@ -3576,8 +3392,6 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
             "{cmd}: {r}"
         );
     }
-    // The measured write: `read-only@classify-v7` refuses it on its own (the
-    // head-aware brace-into-a-flag scan), and `brace_free` refuses it too.
     for cmd in [
         "sort x {-o,y}",
         "sort x {\"-o\",y}",
@@ -3610,7 +3424,6 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
         r.starts_with("rm circuit breaker: a brace expansion"),
         "{r}"
     );
-    // NEGATIVE CONTROLS
     for cmd in [
         "awk '{print $1}' README.md",
         "grep -E 'a{1,3}' README.md",
@@ -3630,22 +3443,6 @@ fn a_reading_that_holds_a_brace_expansion_proves_no_box() {
     assert_eq!(approved(&d), Some(RULE_BREAKER_READ_ONLY), "{d:?}");
 }
 
-/// NO RULE PROVES A BASH BOX THAT READS A SECRET (classifier audit 2,
-/// [`secrets_free`]; the known-open `cat ~/.ssh/id_rsa` approval): the Read
-/// box's secret matcher ([`default_secrets`]) is now run over the words a
-/// command reads as paths ([`path_operands`]) on the Bash path too, in every
-/// rule (the read-only rule, the no-rule note, the too-many breaker and the
-/// rm breaker). A read of a private key, credential or named secret is
-/// refused, the operand named: an operand, a glued or spaced redirect
-/// target, a `--flag=value` value, a `~` resolved against home for a rule
-/// under it, a `$(<file)`, a word that starts with an expansion (read as
-/// under home, its literal parts kept), a `REV:PATH` in a git tree, every
-/// operand once an option supplies the pattern or past `--`, a file-valued
-/// option (glued to a short flag too: `git config -fFILE`), an awk program's
-/// string literal, and any word on a line that turns a listing into another
-/// command's path (`| xargs`, `$(…)`, `--files0-from`). A `.env.*` template is still the Read box's `.env.*`.
-/// The negative control — the words that are no read stay approved — is
-/// [`a_non_secret_read_beside_it_stays_read_only`].
 #[test]
 fn a_bash_read_of_a_secret_is_not_read_only() {
     for cmd in [
@@ -3692,8 +3489,6 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
             "{cmd}: expected a secret refusal, got {r}"
         );
     }
-    // A value glued to a short flag (a box with no description row, whose
-    // joined reading would hand `git config` a second operand).
     for cmd in [
         "git config -f/Users/_owner/.aws/credentials --list",
         "git config -f.aws/credentials --list",
@@ -3705,8 +3500,6 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
             "{cmd}: expected a secret refusal, got {r}"
         );
     }
-    // The same secret read under the no-rule note, the rm breaker and the
-    // too-many breaker.
     let d = on_screen(&no_rule_box("cat ~/.ssh/id_rsa"), &ctx());
     assert!(reason(&d).contains("a read of a secret"), "no-rule: {d:?}");
     let rm = "rm -rf /private/tmp/claude-502/scratch/x";
@@ -3723,19 +3516,6 @@ fn a_bash_read_of_a_secret_is_not_read_only() {
     );
 }
 
-/// NEGATIVE CONTROL for [`a_bash_read_of_a_secret_is_not_read_only`]: a genuine
-/// read beside the secret matcher stays read-only. A plain file, a file whose
-/// name only resembles a secret-bearing one (`repo.gitconfig`, not
-/// `credentials`), a sibling in a non-secret directory, and a `--flag=value`
-/// whose value is an ordinary path are each still approved under the read-only
-/// rule. So are the words no command reads as a path, each a read classify-v6
-/// approved and c1a32598c2 sent to a person because the word looked like a
-/// secret (the review's over-refusals): a grep or rg pattern, a jq filter, a
-/// filter glob (`--include=`, `--glob`, `-name`), a `git log --grep`
-/// pattern, echoed text, a name `which` looks up, and a file `ls`, `stat`,
-/// `du`, `wc` or `test` only lists or measures. A mutant that made
-/// `secrets_free` refuse every word, or that read every word as a path
-/// whatever its command, would fail here.
 #[test]
 fn a_non_secret_read_beside_it_stays_read_only() {
     for cmd in [
@@ -3784,19 +3564,8 @@ fn a_non_secret_read_beside_it_stays_read_only() {
     assert_eq!(approved(&d), Some(RULE_READ_ONLY), "{d:?}");
 }
 
-/// `git remote show` WITH NO REMOTE NAMED LISTS THE REMOTES AND CONTACTS NONE,
-/// so the box's git check ([`git_reads_clear`]) and the classifier now agree on
-/// one rule (`classify::git_remote_show_contacts`): a show that names a remote
-/// in any spelling escalates, `-v` included (classify-v6's box approved `git
-/// remote -v show origin`, which called ssh when measured).
-///
-/// NEGATIVE CONTROL: the named shows escalate (a mutant that dropped the name
-/// requirement from the shared rule would escalate `git remote show` too).
 #[test]
 fn a_git_remote_show_that_names_no_remote_is_a_read() {
-    // No description row: a box cannot tell one from a wrapped command row, so
-    // `git remote show` over `List the remotes` reads as naming the remote
-    // `List` and escalates (the safe reading).
     for cmd in [
         "git remote show",
         "git remote -v show",
@@ -4159,7 +3928,6 @@ fn a_removal_is_rm_or_rmdir_as_a_word_in_any_case() {
     }
 }
 
-/// Why the safe rules did not prove an answer (`None`: a safe rule proved it, or not an answer).
 fn unproven_of(d: &Decision) -> Option<&str> {
     match d {
         Decision::Approve { unproven, .. } => unproven.as_deref(),
@@ -4312,7 +4080,6 @@ fn full_power_accepts_a_consent_and_never_buys() {
     }
 }
 
-/// Claude Code's Dialog frame.
 fn dialog(body: &[&str]) -> Vec<String> {
     let mut rows: Vec<String> =
         phase_fixtures::screen(aterm_phase::reset::fixtures::CONFIRM)[..3].to_vec();
@@ -4553,7 +4320,6 @@ fn full_power_answers_agy_boxes_by_role() {
     );
 }
 
-/// Gemini CLI's screens (measured on 0.46.0) under `node`, the name its process runs as.
 fn gemini_box(fixture: &str) -> (Vec<String>, Decision) {
     let rows = phase_fixtures::screen(fixture);
     let d = decide_screen(Some("node"), &rows, &full()).expect("a box");
@@ -4774,21 +4540,6 @@ fn gemini_clis_usage_limit_with_its_reset_named_is_kept_trying_past_it() {
     }
 }
 
-/// GEMINI CLI'S BUCKET DIALOG IS TRIED BY ITS `Stop` AT THE SAME DUE
-/// ([`RULE_LIMIT_STOP`], [`LimitTry::StopThenResume`]): a terminal quota of
-/// the session's model's own bucket (`Usage limit reached for all Pro
-/// models.`, hand-built from the bundle's `ProQuotaDialog`) offers `Switch to
-/// <fallback>` over `Stop` — `Upgrade for higher limits` between them under
-/// the Google login — and no `Keep trying`. At every level, once the loop's
-/// clock says the reset and its grace have passed, its `Stop` is pressed by
-/// digit (`2`, or `3` past the upgrade), guarded on the reset's own row, so
-/// the turn-end policy types the resume at the error it leaves; before then
-/// it is not pressed, the reason naming the reset and the try. Measured
-/// before: `only Keep trying over Stop is pressed`, a person's for good.
-/// NEGATIVE CONTROLS: never the switch nor the upgrade; the retryable quota's
-/// three options (`Keep trying`, a switch, `Stop`), a switch naming no model,
-/// and the options in another order are a person's; with `limit_wait` off it
-/// is a person's.
 #[test]
 fn gemini_clis_bucket_dialog_is_tried_by_its_stop_at_the_same_due() {
     use aterm_phase::gemini::fixtures as g;
@@ -4846,7 +4597,6 @@ fn gemini_clis_bucket_dialog_is_tried_by_its_stop_at_the_same_due() {
             assert!(reason(&d).contains("limit_wait is off"), "{d:?}");
         }
     }
-    // The options as the policy reads them: only the measured shapes.
     let switch = "Switch to gemini-3.5-flash";
     let upgrade = "Upgrade for higher limits";
     assert_eq!(
@@ -4871,7 +4621,6 @@ fn gemini_clis_bucket_dialog_is_tried_by_its_stop_at_the_same_due() {
     ] {
         assert_eq!(LimitTry::of(other), None, "{other:?}");
     }
-    // The retryable quota's dialog drawn as the bundle draws it: a person's.
     let rows = phase_fixtures::screen(g::LIMIT_DIALOG_BUCKET);
     let first = rows
         .iter()
@@ -5327,7 +5076,6 @@ fn full_power_leaves_muses_tool_action_and_unix_socket_boxes_to_a_person() {
     }
 }
 
-/// The approval, or a panic naming the escalation.
 fn approval(d: &Decision) -> (&'static str, &Choice, &str, &str, Option<&str>) {
     match d {
         Decision::Approve {
@@ -5342,7 +5090,6 @@ fn approval(d: &Decision) -> (&'static str, &Choice, &str, &str, Option<&str>) {
     }
 }
 
-/// The rows of `rows` the guard matches, on the server's own engine.
 fn guarded<'r>(guard: &str, rows: &'r [String]) -> Vec<&'r str> {
     let m = aterm_observe::row_matcher(guard).expect("the guard compiles");
     rows.iter()
@@ -5351,7 +5098,6 @@ fn guarded<'r>(guard: &str, rows: &'r [String]) -> Vec<&'r str> {
         .collect()
 }
 
-/// `rows` with the row whose text is exactly `from` replaced by `to`.
 fn with_row(rows: &[String], from: &str, to: &str) -> Vec<String> {
     assert!(rows.iter().any(|r| r == from), "no row {from:?}");
     rows.iter()
@@ -6015,7 +5761,6 @@ fn an_answer_kept_for_good_by_its_label_is_never_taken_under_a_lowercase_rest() 
     assert!(!kept_for_good(&o), "{o:?}");
 }
 
-/// The safety check's Tool box.
 fn unnumbered_tool_box(opts: [&str; 3]) -> Vec<String> {
     let mut rows: Vec<String> = [
         "⏺ Working on it.",
@@ -6876,10 +6621,8 @@ fn the_session_paused_dialog_switches_to_the_fallback() {
     );
 }
 
-/// The rule id these tests build declines.
 const RULE_UNDER_TEST: &str = "decline-under-test@v0";
 
-/// A reason as a rule words one, through [`decline_text`].
 fn a_decline_text() -> String {
     decline_text(
         "this command",
@@ -6910,7 +6653,6 @@ pub(crate) fn typed_box(text: &str) -> Vec<String> {
     out
 }
 
-/// The row of `rows` a guard matches, on the server's own matcher.
 fn guarded_row(guard: &str, rows: &[String]) -> Option<String> {
     let m = aterm_observe::row_matcher(guard).expect("the guard compiles");
     let hits: Vec<&String> = rows.iter().filter(|r| m.matches(r)).collect();
@@ -6918,7 +6660,6 @@ fn guarded_row(guard: &str, rows: &[String]) -> Option<String> {
     hits.first().map(|r| r.to_string())
 }
 
-/// The decline [`decline`] builds on the box on `rows` for `text`.
 fn decline_on(rows: &[String], text: &str) -> Result<Decision, String> {
     let p = aterm_phase::parse_prompt_v2(rows).expect("the box");
     decline(RULE_UNDER_TEST, &p, text.to_string(), "the box".to_string())
@@ -7142,12 +6883,9 @@ fn a_fixed_refusal_label_under_the_focus_is_no_open_input() {
 /// A real 527-line Bash command.
 pub(crate) const OWNER_COMMAND: &str = include_str!("fixtures/owner-bash-command-2026-09-24.txt");
 
-/// The captured screen's width, and the command text's: a command with a
-/// newline is drawn as `   │ ` rows inside the dialog's padding.
 const WIDTH: usize = 160;
 const TEXT_WIDTH: usize = 152;
 
-/// `line` wrapped as Claude Code's Ink wraps text.
 fn wrap(line: &str, width: usize) -> Vec<String> {
     let chars: Vec<char> = line.chars().collect();
     let mut out = Vec::new();
@@ -7211,7 +6949,6 @@ pub(crate) fn owner_screen(command: &str) -> Vec<String> {
     all.split_off(all.len() - 48)
 }
 
-/// The session, bypass on, at `approve`.
 fn owner_ctx(approve: Approve) -> ApprovalCtx {
     ApprovalCtx {
         bypass_mode: true,
@@ -7226,7 +6963,6 @@ fn owner_ctx(approve: Approve) -> ApprovalCtx {
     }
 }
 
-/// The decline a decision is, or a panic naming what it was instead.
 fn declined(d: &Decision) -> (&'static str, &str) {
     match d {
         Decision::Decline { rule_id, text, .. } => (rule_id, text),
@@ -7312,17 +7048,6 @@ fn a_tall_box_under_a_not_ruled_out_breaker_is_declined_with_a_split() {
     );
 }
 
-/// A TALL BOX UNDER A BREAKER WHY ATERM HAS NO READING OF (2.1.309's
-/// `not ruled out — the shell may read this command differently than it was
-/// parsed`, its note row MEASURED in `claude-2.1.309-box-bash-rm-parse-diverged`,
-/// and an unknown rmdir why) in a bypass session is declined, at safe and
-/// at full power, with a split into shorter, plainer commands: never the
-/// advice about substitutions, which names a why aterm read. Before 2.1.309
-/// such a note was no breaker and the box went to a person. NEGATIVE
-/// CONTROLS: the same why with no `not ruled out` is no breaker note, and
-/// out of bypass the box is handed over; both name the unread head. MUTANTS:
-/// the decline narrowed to the breakers aterm reads (a hand-over), or the
-/// plainer split cut (the substitutions' text), each fails here.
 #[test]
 fn a_tall_box_under_a_why_aterm_cannot_read_is_declined_with_a_plainer_split() {
     let note = " │ Dangerous rm operation on possibly-empty variable path: $S/$1 in `rm -rf $S/$1` \
@@ -7372,14 +7097,11 @@ fn a_tall_box_under_a_why_aterm_cannot_read_is_declined_with_a_plainer_split() {
     }
 }
 
-/// A bypass session's screen rebuilt from a screenshot.
 const OWNER_SUBAGENT_RM: &str = include_str!("fixtures/owner-rm-breaker-subagent-2026-09-26.txt");
 
-/// The first command row of [`OWNER_SUBAGENT_RM`], as drawn.
 const OWNER_SUBAGENT_RM_FIRST_ROW: &str = "   │ cd /Users/_owner/aterm-wt-gap && git branch -m \
      fix/rainbow-reflow-echo-and-degraded-notice fix/rainbow-relayout-echo && git branch";
 
-/// The command of [`OWNER_SUBAGENT_RM`] as the box shows it.
 const OWNER_SUBAGENT_RM_COMMAND: &str = "cd /Users/_owner/aterm-wt-gap && git branch -m \
      fix/rainbow-reflow-echo-and-degraded-notice fix/rainbow-relayout-echo && git branch \
      --unset-upstream 2>/dev/null; git log --oneline -2 && git status --short | wc -l; rm -rf \
@@ -7389,7 +7111,6 @@ const OWNER_SUBAGENT_RM_COMMAND: &str = "cd /Users/_owner/aterm-wt-gap && git br
      $SP/sa-*.log $SP/late-*.log $SP/seed34*.log; du -sh /Users/_owner/aterm-wt-gap; df -h / | \
      tail -1";
 
-/// The context of [`OWNER_SUBAGENT_RM`]'s session at `approve`.
 fn subagent_owner_ctx(approve: Approve, bypass_mode: bool) -> ApprovalCtx {
     ApprovalCtx {
         approve,
@@ -7446,7 +7167,6 @@ fn the_owners_subagent_rm_box_is_pressed_at_default_power() {
     }
 }
 
-/// A fresh git repository in a scratch directory (removed by the caller), created hermetically.
 fn scratch_repo(tag: &str) -> PathBuf {
     let dir = crate::supervise::test_scratch_path("approval-git", tag);
     let _ = std::fs::remove_dir_all(&dir);
@@ -7456,7 +7176,6 @@ fn scratch_repo(tag: &str) -> PathBuf {
     dir
 }
 
-/// `dir` as a word of a Bash line.
 fn shell_word(dir: &Path) -> String {
     let word = dir.display().to_string();
     if cfg!(windows) {
@@ -7468,7 +7187,7 @@ fn shell_word(dir: &Path) -> String {
 
 fn scratch_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("git")
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -7911,7 +7630,6 @@ fn full_power_confirms_the_model_switch_the_person_typed() {
     );
 }
 
-/// Claude Code 2.1.295: a file box an ask rule sends to a person draws no reason.
 const ASK_WRITE: &str = include_str!("fixtures/claude-2.1.295-box-write-ask-rule.txt");
 const ASK_EDIT: &str = include_str!("fixtures/claude-2.1.295-box-edit-ask-rule.txt");
 const ASK_READ_OUTSIDE: &str =
@@ -7919,7 +7637,6 @@ const ASK_READ_OUTSIDE: &str =
 const ASK_NOTEBOOK: &str =
     include_str!("fixtures/claude-2.1.295-box-edit-notebook-ask-rule-acceptedits.txt");
 
-/// The bare ask rule `tool` (written so) in the settings document `source`.
 fn bare_rule(tool: &str, source: &str) -> OwnerAsk {
     OwnerAsk {
         kind: AskKind::Rule {
@@ -7984,14 +7701,12 @@ fn a_file_box_the_agents_bare_ask_rule_sends_is_held_at_every_level() {
     }
 }
 
-/// The rule full power presses the captured Read of `/etc/hosts` under, with no ask rule holding it
 const READ_ETC_HOSTS: &str = if cfg!(unix) {
     RULE_READ_OUTSIDE_CWD
 } else {
     RULE_ALLOW_ONCE
 };
 
-/// Claude Code 2.1.295 measured.
 const ASK_BASH_SED: &str = include_str!("fixtures/claude-2.1.295-box-bash-sed-edit-ask-rule.txt");
 
 #[test]
@@ -8038,7 +7753,6 @@ fn a_box_more_than_one_tool_draws_is_held_under_a_bare_rule_for_any_of_them() {
     }
 }
 
-/// Claude Code 2.1.300: a Bash `sed -i` drawn as an `Edit file` box with no reason.
 const ASK_BASH_SED_SPECIFIER_300: &str =
     include_str!("fixtures/claude-2.1.300-box-bash-sed-specifier-ask.txt");
 const ASK_BASH_SED_HOOK_300: &str =
@@ -8425,18 +8139,13 @@ fn a_muse_note_open_under_the_recommended_word_is_a_persons() {
     }
 }
 
-/// The Edit tool's own `Edit file` box.
 const EDIT_STAR_HOOK_303: &str = include_str!("fixtures/claude-2.1.303-box-edit-star-hook.txt");
-/// A Bash `sed -i` drawn as that box under the same hook (2.1.303).
 const SED_STAR_HOOK_303: &str = include_str!("fixtures/claude-2.1.303-box-bash-sed-star-hook.txt");
-/// One message calling a `sed -i` then an Edit of the same file (2.1.303).
 const SED_THEN_EDIT_303: &str =
     include_str!("fixtures/claude-2.1.303-box-bash-sed-then-edit-parallel.txt");
-/// The same two calls the other way round.
 const EDIT_THEN_SED_303: &str =
     include_str!("fixtures/claude-2.1.303-box-edit-then-bash-sed-parallel.txt");
 
-/// An owner's ask rule as the settings chain reads it.
 fn ask_rule(text: &str) -> OwnerAsk {
     let (tool, bare) = super::super::claude_settings::rule_tool(text).expect("a rule");
     OwnerAsk {
@@ -8449,7 +8158,6 @@ fn ask_rule(text: &str) -> OwnerAsk {
     }
 }
 
-/// An owner's PreToolUse hook on `matcher`.
 fn ask_hook(matcher: &str) -> OwnerAsk {
     OwnerAsk {
         kind: AskKind::Hook {
@@ -8460,14 +8168,12 @@ fn ask_hook(matcher: &str) -> OwnerAsk {
     }
 }
 
-/// `rows` with `row` put in at `at`.
 fn put_row(rows: &[String], at: usize, row: &str) -> Vec<String> {
     let mut r = rows.to_vec();
     r.insert(at, row.to_string());
     r
 }
 
-/// The index of the box's call row on `rows`.
 fn call_row_of(rows: &[String]) -> usize {
     rows.iter()
         .rposition(|r| r.starts_with("⏺ Update("))
@@ -8652,7 +8358,6 @@ fn a_transcript_candidate_cannot_remove_a_possible_tools_owner_hold() {
     assert!(matches!(d, Decision::Escalate { .. }), "the cut: {d:?}");
 }
 
-/// A box under a `*` hook with a transcript Edit candidate.
 fn edit_named(rows: &[String]) -> (bool, Decision) {
     let p = aterm_phase::prompt::parse_prompt_v2(rows).expect("the box");
     let d = on_screen(
@@ -8805,7 +8510,6 @@ fn a_box_whose_calls_message_reaches_off_the_screen_is_held() {
     assert!(matches!(d, Decision::Escalate { .. }), "{d:?}");
 }
 
-/// `rows` read as Claude Code's and decided with a trace kept.
 fn traced(rows: &[String], ctx: &ApprovalCtx) -> (Decision, Vec<super::super::trace::TraceStep>) {
     let reading = aterm_phase::read(Some("claude"), rows, None);
     let mut steps = Vec::new();
@@ -8862,11 +8566,6 @@ fn a_trace_names_the_rule_that_decided() {
     );
 }
 
-/// 2.1.309'S NEW BREAKER WHY (MEASURED, `claude-2.1.309-box-bash-rm-parse-diverged`, over
-/// `echo $(` with no rm): a `not ruled out — <why>` aterm has no reading of is the breaker,
-/// named in the vendor's own words, and refused at safe power for that cause, never proven
-/// read-only and never pressed by the warn rule. NEGATIVE CONTROL: the 2.1.308 nested box keeps
-/// its own cause. MUTANT: a refusal naming every why but too-many as the nested one's fails here.
 #[test]
 fn a_not_ruled_out_why_aterm_cannot_read_is_refused_in_its_own_words() {
     use phase_fixtures::{BOX_RM_NESTED_2_1_308, BOX_RM_PARSE_DIVERGED_2_1_309, screen};

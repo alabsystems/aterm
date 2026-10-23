@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The publisher fence says who holds it and whether that publisher is alive, dead or
-//! unprovable, and a `--resume` takes the fence back only under proof of death. The recorded
-//! identity survives a real push/fetch between two clones, and the verdict leans to "alive"
-//! wherever it cannot prove otherwise.
+//! Publisher fence liveness and reclaim integration tests.
 
 use crate::{ledger, publish};
 
-// `spawnfd`'s: every child here holds its stdio and nothing else of this process, not a pipe
-// another test thread had open at the spawn.
 use aterm_uds::spawnfd::Command;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -20,8 +15,6 @@ use publish::{
     FenceIdentity, FenceLiveness, FenceReclaim, GroupState, LocalProbe, PUBLISHER_FENCE_REF,
     PidState, PublisherProbe,
 };
-
-// --- fixture: a bare remote and two clones; one machine's fence is read by the other ---
 
 static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
@@ -78,9 +71,6 @@ fn bare_fixture(name: &str) -> BareFixture {
     }
 }
 
-/// [`bare_fixture`]'s tree, built from nothing under `root` (once per process,
-/// [`crate::template::Template`]): a bare origin holding two claim
-/// commits and two clones of it; the two commits.
 fn build_bare(root: &Path) -> (String, String) {
     let remote = root.join("origin.git");
     let seed = root.join("seed");
@@ -139,8 +129,6 @@ fn build_bare(root: &Path) -> (String, String) {
     (owner, other_owner)
 }
 
-/// Write a fence whose body we choose, exactly as a publisher would: an
-/// annotated tag peeled to the claim, force-pushed to the fence ref.
 fn forge_fence(repo: &Path, owner: &str, body: &str) -> String {
     let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
     let local = format!("forged-fence-{}-{sequence}", std::process::id());
@@ -159,7 +147,6 @@ fn forge_fence(repo: &Path, owner: &str, body: &str) -> String {
     token
 }
 
-/// The body a publisher on this machine, in this boot session, would write.
 fn body_for(
     owner: &str,
     pid: u32,
@@ -182,9 +169,6 @@ fn body_for(
     )
 }
 
-/// What this process is cutting. The recorded version is process-global and these tests run
-/// in parallel, so every test sets the same value; a test needing another version records it
-/// in the fence.
 fn this_invocation_publishes() {
     publish::set_publisher_fence_version("0.87.0");
 }
@@ -203,18 +187,12 @@ fn local_exe() -> String {
     LocalProbe.exe().expect("this test has an executable path")
 }
 
-/// This test process's own process group, which a fence standing in for it records.
 fn own_pgid() -> u32 {
     LocalProbe
         .pgid()
         .expect("this machine reports process groups")
 }
 
-/// A publisher that is provably gone: spawned in a process group of its own and reaped, so
-/// the pid is out of the table and the group is empty. The group is what proof of death is
-/// about, since a publisher's `curl` children share it and outlive a killed parent.
-/// Returns `(pid, pgid)`, equal for a group leader; the assert guards against immediate pid
-/// reuse.
 fn reaped_pid() -> (u32, u32) {
     let mut child = Command::new("/bin/sh")
         .args(["-c", "exit 0"])
@@ -231,8 +209,6 @@ fn reaped_pid() -> (u32, u32) {
     (pid, pid)
 }
 
-// --- the decision itself, at every verdict, without a real reboot ----------
-
 struct FakeProbe {
     host: Option<String>,
     boot: Option<String>,
@@ -244,8 +220,6 @@ struct FakeProbe {
     own_pgid: Option<u32>,
 }
 
-/// The group the fake publisher's fence records, and the one this fake process is in:
-/// distinct, as a real resume's are.
 const FENCE_GROUP: u32 = 4200;
 const PROBE_GROUP: u32 = 9000;
 
@@ -313,8 +287,6 @@ impl PublisherProbe for FakeProbe {
     }
 }
 
-/// A format-2 block for the fake publisher: pid 4242 in group [`FENCE_GROUP`],
-/// on this host, in this boot session.
 const FULL: &str = "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4200\nfence-host: publisher-host\n\
                     fence-boot: boot-session-7\nfence-exe: /opt/aterm/aterm-release\n";
 
@@ -328,7 +300,6 @@ fn identity(extra: &str) -> FenceIdentity {
 #[test]
 fn a_running_pid_on_this_host_and_boot_is_alive() {
     let identity = identity(FULL);
-    // The group is not stubbed: a running publisher is alive on its pid alone.
     let probe = FakeProbe::here().with_pid(
         4242,
         PidState::Running {
@@ -378,11 +349,6 @@ fn a_reused_pid_running_another_program_with_an_empty_group_is_dead() {
     );
 }
 
-/// No GitHub mutation runs in the publisher process: each runs in a spawned `curl`,
-/// which a SIGKILL of the parent does not stop. The parent's pid is gone; its upload is not.
-///
-/// Kills judging liveness on the recorded pid alone, which would let a `--resume` run beside a
-/// `curl --upload-file` still streaming the previous session's asset.
 #[test]
 fn a_child_that_outlived_its_publisher_keeps_the_fence_alive() {
     let identity = identity(FULL);
@@ -396,7 +362,6 @@ fn a_child_that_outlived_its_publisher_keeps_the_fence_alive() {
         ),
         other => panic!("a live child in the publisher's group must read ALIVE, got {other:?}"),
     }
-    // A reused pid with a survivor in the group is the same answer.
     let reused = FakeProbe::here()
         .with_pid(
             4242,
@@ -413,8 +378,6 @@ fn a_child_that_outlived_its_publisher_keeps_the_fence_alive() {
 
 #[test]
 fn a_truncated_executable_name_is_never_read_as_a_mismatch() {
-    // `/proc/<pid>/comm` truncates at 15 bytes: a truncation reads as the same program
-    // (alive, refuse), never as a reused pid.
     let identity = identity(
         "fence-format: 1\nfence-pid: 4242\nfence-host: publisher-host\n\
          fence-boot: boot-session-7\nfence-exe: /opt/aterm/aterm-release-cutter\n",
@@ -440,7 +403,6 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
         .with_pid(4242, PidState::NotRunning)
         .with_group(FENCE_GROUP, &[]);
     let full = FULL;
-    // Sanity: the same shape is provable when nothing is off.
     assert!(matches!(
         publish::fence_liveness(&identity(full), &probe),
         FenceLiveness::Dead(_)
@@ -477,8 +439,6 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
             "fence-format: 2\nfence-pid: 5151\nfence-pgid: 4200\nfence-host: publisher-host\n\
              fence-boot: boot-session-7\n",
         ),
-        // The pid is gone, and a format-1 fence cannot say whether the child it spawned
-        // is.
         (
             "no process group recorded (a format-1 fence)",
             "fence-format: 1\nfence-pid: 4242\nfence-host: publisher-host\n\
@@ -489,7 +449,6 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
             "fence-format: 2\nfence-pid: 4242\nfence-pgid: 4300\nfence-host: publisher-host\n\
              fence-boot: boot-session-7\n",
         ),
-        // A process cannot judge a group it is itself inside.
         (
             "the process group this very process is in",
             "fence-format: 2\nfence-pid: 4242\nfence-pgid: 9000\nfence-host: publisher-host\n\
@@ -503,7 +462,6 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
         );
     }
 
-    // pid 0 and pid 1 are what a corrupt field parses to; neither is an answer.
     for pid in [0u32, 1] {
         let body = format!(
             "fence-format: 2\nfence-pid: {pid}\nfence-pgid: 4200\nfence-host: publisher-host\n\
@@ -518,7 +476,6 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
         );
     }
 
-    // A machine that cannot name its own host or boot proves nothing either.
     for blinded in [
         FakeProbe {
             host: None,
@@ -540,8 +497,6 @@ fn every_unprovable_shape_refuses_rather_than_guessing() {
     }
 }
 
-// --- end to end, against a real remote --------------------------------------
-
 #[test]
 fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     let fixture = bare_fixture("round-trip");
@@ -551,8 +506,6 @@ fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     publish::acquire_release_lease(&git_a, &fixture.owner).unwrap();
     let guard = publish::acquire_publisher_fence(&git_a, &fixture.owner).unwrap();
 
-    // The second clone has never seen the tag object, so reading the identity fetches it:
-    // the cross-machine path the refusal depends on.
     let identity = publish::publisher_fence_identity(&git_b, guard.token());
     assert_eq!(identity.unreadable, None, "{identity:?}");
     assert_eq!(identity.format, Some(publish::FENCE_IDENTITY_FORMAT));
@@ -567,7 +520,6 @@ fn a_fence_this_binary_writes_is_readable_from_another_clone() {
     assert_eq!(identity.version.as_deref(), Some("0.87.0"));
     assert!(identity.started_unix.is_some(), "{identity:?}");
 
-    // And this process is alive, so the other clone refuses.
     assert!(matches!(
         publish::fence_liveness(&identity, &LocalProbe),
         FenceLiveness::Alive(_)
@@ -581,7 +533,6 @@ fn a_live_publisher_still_refuses_and_is_never_reclaimed() {
     let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
-    // This test process is the recorded publisher, and it is alive.
     let token = forge_fence(
         &fixture.repo_a,
         &fixture.owner,
@@ -643,8 +594,6 @@ fn a_resume_reclaims_a_fence_whose_publisher_is_provably_dead() {
         "the reclaimed token must be gone"
     );
 
-    // The resume acquires its own fence, and the loser of the same reclaim race refuses
-    // against that live winner.
     let mine = publish::acquire_publisher_fence(&git, &fixture.owner).unwrap();
     assert_ne!(mine.token(), stale);
     match publish::reclaim_dead_publisher_fence(&git, &fixture.owner, &LocalProbe).unwrap() {
@@ -660,8 +609,6 @@ fn a_reused_pid_is_proof_of_death_end_to_end() {
     let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
-    // A live pid (this process) recorded against an executable it is not running: a reused
-    // pid. Its group is empty, as a dead publisher's tree is when a stranger got its number.
     let (_, empty_group) = reaped_pid();
     forge_fence(
         &fixture.repo_a,
@@ -683,23 +630,18 @@ fn a_reused_pid_is_proof_of_death_end_to_end() {
     assert_eq!(publish::publisher_fence(&git).unwrap(), None);
 }
 
-/// On the real process table: a long-lived child stands in for the `curl --upload-file` the
-/// publisher spawned, and the publisher is spawned into its group and reaped. The fence stays
-/// alive, naming the survivor, until it exits.
 #[test]
 fn a_spawned_request_that_outlives_the_publisher_keeps_the_fence_end_to_end() {
     let fixture = bare_fixture("orphaned-child");
     let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
-    // A process group of its own, led by the survivor …
     let mut survivor = Command::new("/bin/sleep")
         .arg("60")
         .process_group(0)
         .spawn()
         .expect("spawn the survivor in its own group");
     let group = survivor.id();
-    // … and the "publisher", spawned into that group and reaped.
     let mut publisher = Command::new("/bin/sh")
         .args(["-c", "exit 0"])
         .process_group(group as i32)
@@ -726,7 +668,6 @@ fn a_spawned_request_that_outlives_the_publisher_keeps_the_fence_end_to_end() {
         other => panic!("a fence whose group still has a live member must be kept, got {other:?}"),
     }
 
-    // Stopping the survivor, the remedy the refusal names, lets the next resume reclaim.
     survivor.kill().expect("stop the survivor");
     survivor.wait().expect("reap the survivor");
     assert!(matches!(
@@ -745,7 +686,6 @@ fn a_fence_from_another_host_refuses_and_is_kept() {
     let token = forge_fence(
         &fixture.repo_a,
         &fixture.owner,
-        // A pid that is alive here, so only the host field can decide.
         &body_for(
             &fixture.owner,
             std::process::id(),
@@ -777,7 +717,6 @@ fn a_fence_from_another_boot_session_refuses_and_is_kept() {
     let token = forge_fence(
         &fixture.repo_a,
         &fixture.owner,
-        // The pid is gone and the host matches; the boot session alone keeps the fence.
         &body_for(
             &fixture.owner,
             dead,
@@ -805,7 +744,6 @@ fn a_fence_written_by_an_older_binary_refuses_instead_of_crashing() {
     let git = Git::new(&fixture.repo_a);
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
-    // A fence body with the message line alone, no liveness block.
     let token = forge_fence(
         &fixture.repo_a,
         &fixture.owner,
@@ -833,7 +771,6 @@ fn a_fence_for_another_claim_is_never_reclaimed() {
     this_invocation_publishes();
     publish::acquire_release_lease(&git, &fixture.owner).unwrap();
     let (dead, dead_group) = reaped_pid();
-    // Provably dead, but it fences a different claim: not this resume's to take.
     let token = forge_fence(
         &fixture.repo_a,
         &fixture.other_owner,
@@ -861,14 +798,12 @@ fn a_fence_for_another_claim_is_never_reclaimed() {
 fn an_unreadable_fence_body_refuses_rather_than_crashing() {
     let fixture = bare_fixture("unreadable-body");
     let git = Git::new(&fixture.repo_a);
-    // No such object anywhere, and the remote cannot supply it.
     let identity = publish::publisher_fence_identity(&git, &"0".repeat(40));
     assert!(identity.unreadable.is_some(), "{identity:?}");
     assert!(matches!(
         publish::fence_liveness(&identity, &LocalProbe),
         FenceLiveness::Unprovable(_)
     ));
-    // A token that is not an object id at all is rejected without shelling out.
     let malformed = publish::publisher_fence_identity(&git, "not-a-sha");
     assert!(
         malformed

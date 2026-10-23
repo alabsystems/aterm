@@ -11,8 +11,7 @@ use proc_macro::{Punct, Spacing, TokenStream, TokenTree};
 pub enum Fragment {
     /// Tokens that can be used as an expression.
     Expr(TokenStream),
-    /// Tokens that can be used inside a block. The surrounding curly braces are
-    /// not part of these tokens.
+    /// Tokens inside a block, without surrounding curly braces.
     Block(TokenStream),
 }
 
@@ -28,8 +27,7 @@ macro_rules! quote_block {
     }
 }
 
-/// Interpolate a fragment in place of an expression. This involves surrounding
-/// Block fragments in curly braces.
+/// Interpolate a fragment as an expression, bracing [`Fragment::Block`].
 pub struct Expr(pub Fragment);
 impl ToTokens for Expr {
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {
@@ -51,8 +49,7 @@ impl ToTokens for Stmts {
     }
 }
 
-/// Interpolate a fragment as the value part of a `match` expression. This
-/// involves putting a comma after expressions and curly braces around blocks.
+/// Interpolate a fragment as a `match` arm body.
 pub struct Match(pub Fragment);
 impl ToTokens for Match {
     fn to_tokens(&self, out: &mut Vec<TokenTree>) {

@@ -1,26 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TIMELINE'S ROWS: a host's grammar
-//! ([`Log::keep_rows`]) flags the records its timeline prints, each takes
-//! the next dense row ids, and the newest of them, up to [`row_floor`],
-//! outlive every other record an eviction batch may take.
-//!
-//! The flood (10^4 status changes, 600 directory moves, 300 program flaps
-//! and 2000 runs, the last 400 runs after every row) keeps the newest rows
-//! within the floor, their ids the ones they took (the program marks aside,
-//! under their share); every record is live or counted lost
-//! (`NoSilentLoss`), and the fold is what a refold of every append makes
-//! (`ProjectionIndependentOfEviction`). The ids: dense in append order, a
-//! session close two; a carried update's successor and an uncarried one's
-//! continue past the ceiling their host carried, and a crash adoption's are
-//! named by its new epoch, never by when it started.
-//!
-//! NEGATIVE CONTROLS: the same flood under no grammar loses the rows the
-//! floor keeps (in the test); a successor whose counter is not carried
-//! reuses the predecessor's ids (in the test); and, scratch at 6G-1's
-//! commit, the floor's deferral taken out of `Log::evict_batch` fails the
-//! flood.
+//! Timeline row-floor retention and dense row-ID tests.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,13 +14,8 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::at;
 
-/// The overlap reserve a host carries its count with (aterm-gui's
-/// `HANDOFF_ID_RESERVE`).
 const RESERVE: u64 = 1 << 16;
 
-/// A timeline grammar shaped as the host's: the session's open and its
-/// handoff and crash gaps a row each, its close two (the reason's and the
-/// last state's), and the marks a timeline prints one each.
 fn grammar(r: &Rec) -> u8 {
     match (r.op, r.node == Node::SESSION, r.k) {
         (Op::Open, true, _) => 1,
@@ -98,12 +74,10 @@ fn bell(log: &mut Log, ms: u64) -> u64 {
         .expect("a bell")
 }
 
-/// The ids every live row stands for, by its seq.
 fn ids_by_seq(log: &Log) -> BTreeMap<u64, (u64, u8)> {
     log.rows().map(|r| (r.rec.seq, (r.id, r.span))).collect()
 }
 
-/// Every row id a log's live rows stand for.
 fn ids(log: &Log) -> BTreeSet<u64> {
     log.rows()
         .flat_map(|r| r.id..r.id + u64::from(r.span))
@@ -118,8 +92,6 @@ enum Ev {
     Run,
 }
 
-/// The flood's events: 10^4 status changes, 600 directory moves, 300
-/// program flaps and 1600 runs shuffled, then 400 more runs.
 fn schedule() -> Vec<Ev> {
     let mut evs = Vec::new();
     evs.extend(std::iter::repeat_n(Ev::Status, 10_000));
@@ -134,9 +106,6 @@ fn schedule() -> Vec<Ev> {
     evs
 }
 
-/// One flood under way: the log, every record appended, the fold of every
-/// append (the refold, which no eviction touches), and every row's seq,
-/// ids and kind in append order.
 struct Flood {
     log: Log,
     ms: u64,
@@ -166,7 +135,6 @@ impl Flood {
         f
     }
 
-    /// Note the record just appended (the newest, which no batch takes).
     fn note(&mut self) {
         let r = self.log.window().last().expect("the record just appended");
         let span = u64::from(grammar(r));
@@ -225,8 +193,6 @@ impl Flood {
         self.note();
     }
 
-    /// The floor's rows as the test counts them: the newest rows within a
-    /// quarter of the ring's records and bytes, as (seq, first id, kind).
     fn floor(&self) -> Vec<(u64, u64, Kind)> {
         let q = row_floor(self.log.effective_limits());
         let size: BTreeMap<u64, usize> = self
@@ -237,7 +203,6 @@ impl Flood {
         let mut out = Vec::new();
         let mut bytes = 0;
         for &(seq, id, k) in self.rows.iter().rev() {
-            // What the ring counts a record: its content-tier line.
             bytes += size[&seq];
             if out.len() == q.records || bytes > q.bytes {
                 break;
@@ -247,7 +212,6 @@ impl Flood {
         out
     }
 
-    /// The newest `PROGRAM_SHARE_MAX` program marks' seqs: the share's.
     fn program_share(&self) -> BTreeSet<u64> {
         self.rows
             .iter()
@@ -259,13 +223,6 @@ impl Flood {
     }
 }
 
-/// THE FLOOR UNDER A FLOOD: after every 97th event and at the end, each of
-/// the newest rows within the floor is live with the ids it took (a program
-/// mark past its node's share aside), every record is live or counted lost,
-/// and the fold is the refold of every append so far. The floor is the
-/// record quarter (512), its bytes well within theirs. CONTROL: the same
-/// flood under no grammar keeps almost none of those records, so the floor,
-/// not the flood's shape, is what kept them.
 #[test]
 fn a_flood_keeps_the_newest_rows_within_the_floor() {
     let evs = schedule();
@@ -315,7 +272,6 @@ fn a_flood_keeps_the_newest_rows_within_the_floor() {
         "every row took the next id, densely"
     );
 
-    // CONTROL: no grammar, no floor: the batch takes those same records.
     let mut bare = Flood::new(false);
     for (i, ev) in evs.iter().enumerate() {
         bare.apply(*ev, i as u64);
@@ -333,11 +289,6 @@ fn a_flood_keeps_the_newest_rows_within_the_floor() {
     );
 }
 
-/// DENSE IDS: each row takes the next ids in append order (a session close
-/// two), a record the grammar does not print takes none, and a row the ring
-/// no longer holds is a hole [`Log::rows_lost_between`] counts. On a ring of
-/// eight (a floor of two) a run of bells takes the older rows outside the
-/// floor and leaves the two newest.
 #[test]
 fn row_ids_are_dense_in_append_order_and_a_session_close_takes_two() {
     let limits = Limits::new(8, 1 << 20).expect("a small ring");
@@ -391,14 +342,6 @@ fn row_ids_are_dense_in_append_order_and_a_session_close_takes_two() {
     );
 }
 
-/// NO ID IS REUSED ACROSS AN UPDATE: a carried update's successor and an
-/// uncarried one's continue past the ceiling the host carried (the head
-/// plus the overlap's reserve, which the outgoing process keeps under), the
-/// carried records are no rows of the successor, and its first record is.
-/// A crash adoption's ids start at 1 at its new epoch: as numbers they meet
-/// the predecessor's, as (epoch, id) never, though both started in one wall
-/// second. NEGATIVE CONTROL: a successor whose counter is not carried reuses
-/// the predecessor's ids.
 #[test]
 fn no_row_id_is_reused_across_a_carried_update_or_a_crash_adoption() {
     let mut pred = Log::with_limits(4, Limits::SESSION);
@@ -408,7 +351,6 @@ fn no_row_id_is_reused_across_a_carried_update_or_a_crash_adoption() {
     status(&mut pred, "running", 3);
     bell(&mut pred, 4);
     let ceiling = pred.row_head() + RESERVE;
-    // The overlap: the outgoing process writes on, under its ceiling.
     status(&mut pred, "idle", 5);
     assert!(pred.row_head() <= ceiling);
     let pred_ids = ids(&pred);
@@ -457,8 +399,6 @@ fn no_row_id_is_reused_across_a_carried_update_or_a_crash_adoption() {
         "an uncarried successor's gap is its first row, past the ceiling"
     );
 
-    // NEGATIVE CONTROL: the counter not carried: the successor's first row
-    // takes an id the predecessor's rows hold.
     let (mut uncounted, _, _) = Log::from_carry(&lines, adopt).expect("the carry reads");
     uncounted.keep_rows(grammar, 0);
     assert!(
@@ -466,11 +406,6 @@ fn no_row_id_is_reused_across_a_carried_update_or_a_crash_adoption() {
         "CONTROL: a counter not carried reuses ids"
     );
 
-    // A crash adoption, in the same wall second as the predecessor began:
-    // its epoch (the keeper tag's, above every earlier one) names its ids.
-    // The epoch is picked here; the host's own pick (`Epochs::crash`,
-    // through the production adoption) is aterm-gui's
-    // `a_keeper_recovery_names_its_rows_apart_by_epoch`.
     let mut crash = Log::with_limits(pred.ep() + 7, Limits::SESSION);
     crash.gap(GapWhy::Crash, 0, at(1));
     crash.keep_rows(grammar, 0);
@@ -485,12 +420,6 @@ fn no_row_id_is_reused_across_a_carried_update_or_a_crash_adoption() {
     );
 }
 
-/// The count moves only forward: a lower count, or one past
-/// [`SEQ_LIMIT`] (no host's), is none; a count continued past the head
-/// skips the ids between, which a reader is told of as holes, and the ids
-/// below the first are another process's, no loss of this log's (a host
-/// tells an update's jump past them itself). Installing the grammar again
-/// flags nothing twice.
 #[test]
 fn the_count_moves_only_forward() {
     let mut log = Log::with_limits(1, Limits::SESSION);
@@ -516,8 +445,6 @@ fn the_count_moves_only_forward() {
         "below the first: another's"
     );
 
-    // The last encodable id is usable; the next record has no row rather
-    // than wrapping its id to zero or advancing the exhausted counter.
     let mut last = Log::with_limits(2, Limits::SESSION);
     last.keep_rows(grammar, SEQ_LIMIT - 2);
     open_session(&mut last, 1);
@@ -526,8 +453,6 @@ fn the_count_moves_only_forward() {
     assert_eq!(ids(&last), BTreeSet::from([SEQ_LIMIT - 1]));
     assert_eq!(last.row_head(), SEQ_LIMIT - 1);
 
-    // A two-row close must fit as a whole: one remaining id cannot take
-    // it. With two ids remaining, both rows still take those final ids.
     for (carried, expected) in [
         (SEQ_LIMIT - 3, vec![SEQ_LIMIT - 2]),
         (

@@ -7,7 +7,6 @@ use std::path::PathBuf;
 
 /// Returns this account's home directory from `getpwuid_r(getuid())`.
 #[must_use]
-// Skip: bottoms out at the `getuid` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn home() -> Option<PathBuf> {
     // SAFETY: `getuid` reads this process's real uid and cannot fail.
@@ -16,13 +15,12 @@ pub fn home() -> Option<PathBuf> {
 
 /// Returns the home directory the account database names for `uid`.
 #[must_use]
-// Skip: bottoms out at the `getpwuid_r` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn home_of(uid: u32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
-    // SAFETY: `pw` and `buf` are stack buffers handed to the reentrant `getpwuid_r`, which
-    // writes the entry's strings into `buf` and points `pw`'s fields at them; `pw_dir` is
-    // read only when the call succeeded and found an entry, while `buf` is still alive.
+    // SAFETY: `pw` and `buf` are stack buffers handed to the reentrant `getpwuid_r`, which writes
+    // the entry's strings into `buf` and points `pw`'s fields at them; `pw_dir` is read only when
+    // the call succeeded and found an entry, while `buf` is still alive.
     unsafe {
         let mut pw: libc::passwd = std::mem::zeroed();
         let mut buf = [0u8; 4096];
@@ -47,11 +45,10 @@ pub fn home_of(uid: u32) -> Option<PathBuf> {
 
 /// Returns the login name for `uid` from the account database.
 #[must_use]
-// Skip: bottoms out at the `getpwuid_r` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn user_name(uid: u32) -> Option<String> {
-    // SAFETY: same contract as `home`: stack buffers handed to the
-    // reentrant call, `pw_name` read only on success while `buf` lives.
+    // SAFETY: same contract as `home`: stack buffers handed to the reentrant call, `pw_name` read
+    // only on success while `buf` lives.
     unsafe {
         let mut pw: libc::passwd = std::mem::zeroed();
         let mut buf = [0u8; 4096];
@@ -73,7 +70,6 @@ pub fn user_name(uid: u32) -> Option<String> {
 
 /// Returns this account's login shell from `getpwuid_r(getuid())`.
 #[must_use]
-// Skip: bottoms out at the `getuid` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn shell() -> Option<PathBuf> {
     // SAFETY: `getuid` reads this process's real uid and cannot fail.
@@ -82,12 +78,11 @@ pub fn shell() -> Option<PathBuf> {
 
 /// Returns the login shell the account database names for `uid`.
 #[must_use]
-// Skip: bottoms out at the `getpwuid_r` FFI call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn shell_of(uid: u32) -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
-    // SAFETY: as in `home_of`: stack buffers handed to the reentrant `getpwuid_r`, and
-    // `pw_shell` read only when the call succeeded and found an entry, while `buf` lives.
+    // SAFETY: as in `home_of`: stack buffers handed to the reentrant `getpwuid_r`, and `pw_shell`
+    // read only when the call succeeded and found an entry, while `buf` lives.
     unsafe {
         let mut pw: libc::passwd = std::mem::zeroed();
         let mut buf = [0u8; 4096];
@@ -118,9 +113,6 @@ mod tests {
         assert!(home.is_absolute(), "{}", home.display());
     }
 
-    /// [`super::home_of`] reads the uid it is given, not this process's: uid 0's home is the
-    /// one `sh` expands `~root` to (no `$HOME` to read), and a uid the database has no entry
-    /// for has no home.
     #[test]
     fn a_uid_s_home_is_the_one_the_shell_expands_its_name_to() {
         let out = crate::spawnfd::command("sh")
@@ -138,14 +130,8 @@ mod tests {
         assert_eq!(super::home_of(2_000_000_123), None, "no such uid");
     }
 
-    /// Set in the child [`a_uid_s_login_shell_comes_from_the_account_record`] runs: it
-    /// prints [`super::shell`] and returns.
     const LOGIN_SHELL_CHILD_ENV: &str = "ATERM_UDS_TEST_LOGIN_SHELL_CHILD";
 
-    /// [`super::shell`] reads the account record, never `$SHELL`: this test binary, run
-    /// again with `$SHELL` naming a shell no record names, prints this uid's record
-    /// ([`super::shell_of`]). uid 0's record names an absolute shell, and a uid the
-    /// database has no entry for has none.
     #[test]
     fn a_uid_s_login_shell_comes_from_the_account_record() {
         if std::env::var_os(LOGIN_SHELL_CHILD_ENV).is_some() {

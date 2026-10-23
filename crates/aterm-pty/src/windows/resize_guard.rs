@@ -27,8 +27,7 @@ const GUARD_RECORD: &[u8] = b"\x1b[16;42;0;0;0;1_";
 /// bytes the key encoder writes for Escape once conhost asked for records.
 const ESCAPE_KEY_RECORDS: &[u8] = b"\x1b[27;1;27;1;0;1_\x1b[27;1;27;0;0;1_";
 
-/// Writes after one resize that lead with [`GUARD_RECORD`] (see the module
-/// docs for why two).
+/// Number of writes after a resize that lead with [`GUARD_RECORD`].
 const GUARDED_WRITES: u8 = 2;
 
 /// Where the INPUT byte stream stands after the bytes written so far: at a
@@ -71,9 +70,7 @@ impl InputTail {
         }
     }
 
-    /// The state after `b` read at a boundary: inside the UTF-8 character it
-    /// leads, or at the boundary still (ASCII, a stray continuation, or a byte
-    /// UTF-8 never uses — each of which the decoder settles at once).
+    /// Next state after reading `b` at a sequence boundary.
     fn lead(b: u8) -> Self {
         match b {
             0xc2..=0xdf => Self::Utf8(1),
@@ -89,9 +86,7 @@ impl InputTail {
 struct InputStream {
     /// Where the bytes written so far end.
     tail: InputTail,
-    /// A win32-input-mode record (a CSI whose final byte is `_`) has been
-    /// written, so conhost's parser has thrown its one-way switch to win32-input-mode and
-    /// holds a trailing lone ESC.
+    /// Whether a win32-input-mode record (`CSI … _`) has been written.
     switched: bool,
 }
 
@@ -125,8 +120,6 @@ impl HandshakeScan {
             self.matched = if b == WIN32_INPUT_REQUEST[self.matched] {
                 self.matched + 1
             } else {
-                // ESC occurs only at the pattern's start, so a mismatch can
-                // restart a match only on an ESC.
                 usize::from(b == ESC)
             };
             if self.matched == WIN32_INPUT_REQUEST.len() {
@@ -240,9 +233,7 @@ pub(super) struct ResizeGuard {
     records: AtomicBool,
     /// The reader thread's scan for that request.
     handshake: Mutex<HandshakeScan>,
-    /// The input stream after the last write. Held across each write, so the
-    /// decision and the bytes it decided about stay in order; writes on one
-    /// pipe handle are serialized by the kernel anyway.
+    /// Input stream state after the last write.
     input: Mutex<InputStream>,
 }
 
@@ -332,7 +323,6 @@ impl ResizeGuard {
                 }
                 Err(e) => {
                     if written == 0 {
-                        // Nothing landed: the next write still owes it.
                         self.pending.fetch_add(1, Ordering::AcqRel);
                     }
                     return Err(e);
@@ -456,7 +446,6 @@ impl ResizeGuard {
             }
             Err(e) => {
                 if guarded {
-                    // Nothing landed: the next write owes the record.
                     self.pending.fetch_add(1, Ordering::AcqRel);
                 }
                 Err(e)
@@ -746,9 +735,7 @@ mod tests {
         assert_eq!(tail_after(Utf8(1), b"\xad"), Ground);
     }
 
-    /// The switch is thrown by a completed `CSI … _` and by nothing else: not
-    /// by other CSI finals, not by `_` outside a CSI, and not by a record cut
-    /// before its final byte — until the write that completes it.
+    /// The switch is thrown only by a completed `CSI … _` record.
     #[test]
     fn the_switch_follows_completed_win32_records_only() {
         let start = InputStream::default();
@@ -918,12 +905,7 @@ mod tests {
         assert_eq!(write(&g, b"x").1, b"x", "the stream is at a boundary again");
     }
 
-    /// A paste of astral characters whose records outgrow the pipe (72 bytes
-    /// of records for 4 of text) goes in writes of at most [`INPUT_WRITE_MAX`],
-    /// the record included, each ending between characters: the pipe takes
-    /// such a write whole or, released, not at all, so the caller hears the
-    /// characters each one took, and a released one answers `Ok(0)`, never an
-    /// error after part of the paste went.
+    /// Astral pastes whose records exceed [`INPUT_WRITE_MAX`] are split on character boundaries.
     #[test]
     fn records_that_outgrow_the_pipe_go_in_writes_it_takes_whole() {
         let g = armed_guard();
@@ -973,14 +955,7 @@ mod tests {
         }
     }
 
-    /// The quota counts every byte of a write of records, not the records
-    /// alone: the text that follows them (a 4 KiB slice of 905 characters then
-    /// 476 `a`, whose records and first 376 `a` fill it to the byte), the text
-    /// before them (behind 17 `x`, the 910th character's records end one byte
-    /// past it, so 909 go) and the record a resize puts in front (behind it and
-    /// `ab`, 909 characters fit, where without it 910 would). The pipe takes
-    /// each such write whole, so a stop that releases the next one leaves the
-    /// paste `Stopped`, not failed.
+    /// The [`INPUT_WRITE_MAX`] quota counts surrounding text and any leading [`GUARD_RECORD`].
     #[test]
     fn the_quota_counts_the_text_after_records_and_the_record_before_them() {
         let after = INPUT_WRITE_MAX - 905 * GRIN_RECORDS.len();

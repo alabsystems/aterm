@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Per-session fabric endpoint: bounded [`Inbox`] ring, outbound post queue, [`Holds`] gate,
-//! [`SessionFabric`] verb handlers (`inbox`, `post`, `deliver`, `hold`, `topic`), and instance `LINK` state.
+//! Per-session fabric endpoint: bounded [`Inbox`] ring, outbound post queue, [`Holds`] gate, [`SessionFabric`] verb handlers (`inbox`, `post`, `deliver`, `hold`, `topic`), and instance `LINK` state.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -16,21 +15,15 @@ use aterm_gui_timing::now_ms;
 
 /// What the fabric needs of a session.
 pub trait FabricSession: Send + Sync {
-    /// The session's stable id.
     fn self_id(&self) -> &SessionId;
-    /// The session's fabric endpoint.
     fn fabric(&self) -> &SessionFabric;
-    /// Record one event on the session's timeline.
     fn record(&self, kind: &'static str, payload: String);
-    /// [`Self::record`], with what the record says typed ([`FabricFact`]) for the session log's mark beside it, written in the same timeline hold.
     fn record_fact(&self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
         let _ = fact;
         self.record(kind, payload);
         false
     }
-    /// Tell the presence band this session's mail or hold moved.
     fn fabric_changed(&self);
-    /// The `holder=` token of `inbox`.
     fn holder_token(&self) -> Option<String>;
 }
 
@@ -57,15 +50,12 @@ impl<T: FabricSession + ?Sized> FabricSession for Arc<T> {
 
 /// A session's timeline, as the fabric writes it.
 pub trait Timeline {
-    /// Append one `kind` record carrying `payload`.
     fn record(&mut self, kind: &'static str, payload: String);
-    /// [`Self::record`] with its typed [`FabricFact`] (see [`FabricSession::record_fact`]).
     fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
         let _ = fact;
         self.record(kind, payload);
         false
     }
-    /// Whether this session's log is the one the predecessor of a seamless update wrote, carried and read (not one that started over after a gap), so every [`FabricFact::MailIn`] that predecessor recorded is already in it ([`FabricCarry::marked`]).
     fn log_carried(&self) -> bool {
         false
     }
@@ -135,15 +125,10 @@ pub enum FabricFact<'a> {
 
 /// What the two bridge verbs need of the registry.
 pub trait Registry: Send + Sync + 'static {
-    /// Every live session, in local-id order (the order `outbox` drains them).
     fn sessions(&self) -> Vec<Arc<dyn FabricSession>>;
-    /// The live session with this id, if any.
     fn session(&self, sid: &SessionId) -> Option<Arc<dyn FabricSession>>;
-    /// A lost bridge left `sessions` running with an advisory instead of halting them ([`bridge_lost`]).
     fn bridge_lost_advised(&self, sessions: usize);
-    /// The bridge that owns the link moved `files` state files it found torn after an unclean shutdown into its state dir's quarantine (`link set-aside`, [`cmd_link`]).
     fn torn_state_set_aside(&self, files: u64, told_when_empty: bool);
-    /// The bridge that owns the link says its quarantine still holds `files` of the torn files it set aside (`link quarantine`, [`cmd_link`]).
     fn torn_state_held(&self, files: u64);
 }
 
@@ -152,7 +137,6 @@ pub type Store = Arc<RwLock<dyn Registry>>;
 
 /// A registry handle the bridge verbs take.
 pub trait AsStore {
-    /// The [`Store`] this handle is (a reference count, not a copy).
     fn as_store(&self) -> Store;
 }
 
@@ -825,7 +809,6 @@ pub struct FabricCarry {
     pub marked: Vec<u64>,
 }
 
-/// What one carried [`FabricCarry::marked`] offset costs the manifest: its digits and the array's `, `.
 fn mark_cost(off: u64) -> usize {
     off.checked_ilog10().map_or(1, |d| d as usize + 1) + 2
 }
@@ -862,9 +845,7 @@ pub struct ReceiptCarry {
     pub from: String,
 }
 
-/// The most mailbox bytes — carried posts and owed receipts, each at what the
-/// manifest's TOML spends on it ([`PostCarry::cost`], [`ReceiptCarry::cost`])
-/// — one handoff manifest carries across every session ([`FabricCarry`]).
+/// The most mailbox bytes — carried posts and owed receipts, each at what the manifest's TOML spends on it ([`PostCarry::cost`], [`ReceiptCarry::cost`]) — one handoff manifest carries across every session ([`FabricCarry`]).
 pub const CARRY_MAIL_BYTES: usize = 256 * 1024;
 
 /// What one carried row costs the manifest beyond its escaped strings.
@@ -892,9 +873,7 @@ const CARRY_INT_MAX: u64 = i64::MAX as u64;
 /// How many inbox row ids a seamless update leaves this process between the park's draw and its `_exit` ([`SessionFabric::handoff_carry`]).
 pub const INBOX_ID_RESERVE: u64 = 1 << 12;
 
-/// How often a delivery waiting on a committing update — one past
-/// [`INBOX_ID_RESERVE`], or a broadcast — logs that it is still waiting
-/// ([`SessionFabric::wait_fenced_delivery`]): a cadence, never a bound.
+/// How often a delivery waiting on a committing update — one past [`INBOX_ID_RESERVE`], or a broadcast — logs that it is still waiting ([`SessionFabric::wait_fenced_delivery`]): a cadence, never a bound.
 pub const MSG_ROOM_NOTICE_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// The production bound every fenced verb waits for a committing update before it answers [`HOLD_BUSY`] ([`SessionFabric::fence_wait`], which reads it through the process's timing value).
@@ -1440,10 +1419,6 @@ impl SessionFabric {
     ) -> Result<bool, TopicsFull> {
         let mut set = self.topics.lock().unwrap_or_else(|p| p.into_inner());
         if set.contains_key(t) {
-            // `entry`'s answer, not `insert`'s: `insert` REPLACES, so a
-            // repeated `topic add t since=@0` would rewind a running topic to
-            // the start of the log while answering `added=0` — the value would
-            // have moved and the reply would say nothing had.
             return Ok(false);
         }
         if set.len() >= MAX_TOPICS {
@@ -1748,8 +1723,6 @@ impl SessionFabric {
                 carry.receipts_uncarried = carry.receipts_uncarried.saturating_add(1);
             }
         }
-        // The marks last: one the budget leaves out costs a second mark, never a mail.
-        // The newest first, since the oldest are the likeliest handled.
         for off in inbox
             .dedup
             .iter()
@@ -1844,7 +1817,6 @@ impl SessionFabric {
             });
         }
         let mut tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
-        // A log that started over holds none of the predecessor's marks, so its refilled rows are marked as new.
         if tl.log_carried() {
             inbox.carried_marks = carry
                 .marked
@@ -1960,8 +1932,6 @@ impl SessionFabric {
             inbox.holds.seed(hold);
         }
         if inbox.holds == before {
-            // Every slot it carried already stood: a second carry of one hold
-            // (a cold restore's layout over a keeper's META) moves nothing.
             return;
         }
         let (origin, reason, hold_origin) = inbox.holds.event_fields("local");
@@ -2329,13 +2299,7 @@ fn stale_in() -> Option<std::time::Duration> {
 }
 
 fn note_work_owed() {
-    // It is also the gate every other writer of this struct has and this one
-    // was missing: `bridge_attached`, `link_report` and `link_evidence` all
-    // refuse a write that does not belong to the live bridge generation, so a
-    // caller with no bridge cannot move the link's state. Without the same rule
-    // here, ANY `post` moved it — including one from a test with no bridge at
-    // all, which made `owed_since` the one field of `LinkReport` that leaked
-    // across the section lock `with_link` exists to provide.
+    // It is also the gate every other writer of this struct has and this one was missing: `bridge_attached`, `link_report` and `link_evidence` all refuse a write that does not belong to the live bridge generation, so a caller with no bridge cannot move the link's state.
     if LINK.state.load(Ordering::Relaxed) != FABRIC_CONNECTED {
         return;
     }
@@ -2537,9 +2501,6 @@ pub fn link_report(
     if went_down {
         wake_parked(store);
     } else if went_up {
-        // The link is BACK: every band's fabric slot returns from `~ Ns` to
-        // `⟟` — a presence wake per live session, and no parked `await inbox`
-        // is woken (its answer did not change).
         wake_presence(store);
     }
     true
@@ -2584,9 +2545,6 @@ pub fn cmd_hello(rest: &str, generation: Option<BridgeGeneration>) -> String {
                 _ => HelloLog::Off,
             };
         } else if let Some(v) = kv(tok, "refill") {
-            // WHAT THE BRIDGE OFFERS AGAIN to a session a relaunch keeps, as a
-            // comma list of lanes; `say` is the broadcast topics, which is all
-            // this endpoint asks. An unknown lane in the list is read past.
             refills_broadcasts = v.split(',').any(|lane| lane == "say");
         } else if let Some(v) = kv(tok, "lane") {
             match v.parse::<u32>() {
@@ -3547,8 +3505,7 @@ fn apply_hold_as(
         }
     }
     if issuer == HoldIssuer::Owner {
-        // Not the owner's slot to name at all (`cmd_hold` refuses it first;
-        // this keeps the rule where the slots are).
+        // Not the owner's slot to name at all (`cmd_hold` refuses it first; this keeps the rule where the slots are).
         if act.origin() != Some("local") {
             return Applied::FleetHeld;
         }
@@ -3988,8 +3945,7 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
                 Err(_) => return DELIVER_USAGE.to_string(),
             }
         } else if let Some(v) = kv(tok, "err") {
-            // A bridge is a separate process and its output is still input:
-            // the reason is one bounded token or the line is refused.
+            // A bridge is a separate process and its output is still input: the reason is one bounded token or the line is refused.
             if !valid_dead_reason(v) {
                 return DELIVER_USAGE.to_string();
             }
@@ -4074,8 +4030,6 @@ fn deliver_fetched(ctx: &dyn FabricSession, toks: &[&str]) -> String {
         None => {
             evict_answered_fetch(&mut inbox);
             if inbox.fetches.len() >= FETCH_SLOTS {
-                // Every slot is a parked read of some OTHER offset: nothing
-                // waits on this one, so keeping it would evict nothing safely.
                 return "OK unrequested=1\n".to_string();
             }
             inbox.fetches.push_back((off, slot));
@@ -4188,17 +4142,13 @@ fn parse_deliver_fields(toks: &[&str], len_max: usize) -> Result<DeliverFields, 
             }
             f.via = Some(v.to_string());
         } else if let Some(v) = kv(tok, "topic") {
-            // CLOSED TO THE GRAMMAR, like every other word on this line: the
-            // bridge is a separate process and its output is still input, and a
-            // topic that could carry a space or an `=` is a topic that can
-            // invent a second field on the `msg` row this becomes.
+            // CLOSED TO THE GRAMMAR, like every other word on this line: the bridge is a separate process and its output is still input, and a topic that could carry a space or an `=` is a topic that can invent a second field on the `msg` row this becomes.
             if !is_topic(v) {
                 return Err(DELIVER_USAGE.to_string());
             }
             f.topic = Some(v.to_string());
         } else if let Some(v) = kv(tok, "verdict") {
-            // CLOSED, like `trust=`: a receipt's word is one of three, and an
-            // agent never reads a verdict token this endpoint did not classify.
+            // CLOSED, like `trust=`: a receipt's word is one of three, and an agent never reads a verdict token this endpoint did not classify.
             if !VERDICTS.contains(&v) {
                 return Err(DELIVER_USAGE.to_string());
             }
@@ -4450,8 +4400,7 @@ pub fn cmd_outbox(store: &impl AsStore, rest: &str) -> String {
         let sid = h.self_id().as_str();
         let inbox = h.fabric().lock();
         for r in &inbox.receipts {
-            // Older bridges ignore unknown receipt fields. They must never
-            // publish an old log's offset merely because they skipped its tag.
+            // Older bridges ignore unknown receipt fields.
             if r.earlier_log && !earlier_receipts {
                 continue;
             }
@@ -4587,10 +4536,7 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
         .filter(|r| !r.listed && quota_key(&r.from) == key)
         .count();
     if unread_from_peer >= SENDER_QUOTA {
-        // AND COUNTED ONCE: its offset is remembered as delivered, so a bridge
-        // that starts and walks this topic again from an earlier unhandled row
-        // ([`InboxRow::refill`]) is answered `OK 0` — taken once, held no
-        // more — rather than refused, and counted, a second time.
+        // AND COUNTED ONCE: its offset is remembered as delivered, so a bridge that starts and walks this topic again from an earlier unhandled row ([`InboxRow::refill`]) is answered `OK 0` — taken once, held no more — rather than refused, and counted, a second time.
         if topic.is_some() {
             inbox.dropped += 1;
             remember_offset(&mut inbox, off, false);
@@ -4639,9 +4585,6 @@ fn deliver_row(ctx: &dyn FabricSession, toks: &[&str], wake: &dyn Fn()) -> Strin
     inbox.oldest_on_bus = Some(inbox.oldest_on_bus.map_or(off, |o| o.min(off)));
     remember_offset(&mut inbox, off, true);
     if inbox.carried_marks.remove(&off) {
-        // THE REFILL OF A CARRIED MARK: the row is back in the ring, and
-        // the carried log already marks its delivery (and its fold holds it
-        // waiting), so a second mark would count one mail twice.
         drop(inbox);
         ctx.fabric().changed.notify_all();
         ctx.fabric_changed();
@@ -4748,7 +4691,6 @@ pub fn cmd_topic(ctx: &dyn FabricSession, rest: &str) -> String {
                 });
             drop(unfenced);
             let Ok(added) = added else {
-                // Nothing changed, so nothing is pushed or woken.
                 return format!("ERR topics full (max {MAX_TOPICS}): drop one first\n");
             };
             ctx.fabric().changed.notify_all();
@@ -5107,9 +5049,7 @@ fn inbox_get_at_within(ctx: &dyn FabricSession, off: u64, wait: std::time::Durat
     let deadline = std::time::Instant::now() + wait;
     loop {
         let Some(i) = inbox.fetches.iter().position(|(o, _)| *o == off) else {
-            // Evicted from under a parked read: only an answered slot is ever
-            // evicted, and this one was pending — but a reader that cannot
-            // tell must say "nothing" rather than hang.
+            // Evicted from under a parked read: only an answered slot is ever evicted, and this one was pending — but a reader that cannot tell must say "nothing" rather than hang.
             return fetch_failure("no-record", off);
         };
         match &inbox.fetches[i].1 {
@@ -5320,9 +5260,7 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
         } else if let Some(v) = kv(tok, "via") {
             via = Some(v.to_string());
         } else if let Some(v) = kv(tok, "key") {
-            // BOUNDED AT THE DOOR, like `to`: it is printed onto the `outbox`
-            // line and into the bridge's state dir, so its charset is the
-            // charset of the ids those already carry, and nothing longer.
+            // BOUNDED AT THE DOOR, like `to`: it is printed onto the `outbox` line and into the bridge's state dir, so its charset is the charset of the ids those already carry, and nothing longer.
             if !valid_key(v) {
                 return POST_USAGE.to_string();
             }
@@ -5375,8 +5313,6 @@ pub fn cmd_post(ctx: &dyn FabricSession, rest: &str, body: Option<Vec<u8>>) -> S
     let body = match (body, declared_len) {
         (Some(bytes), _) => bytes,
         (None, Some(_)) => {
-            // A `len=` with no frame behind it: the caller announced bytes the
-            // serve loop never saw. Refuse rather than post an empty message.
             return "ERR usage: post len=<n> must be followed by <n> raw bytes\n".to_string();
         }
         (None, None) => {
@@ -5553,8 +5489,7 @@ fn wait_receipt_on_log(
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(bound_ms);
     let mut guard = ctx.fabric().lock();
     loop {
-        // The post's own record must still be on the log: a move that kept
-        // it (a moved generation, below the fork) keeps the wait.
+        // The post's own record must still be on the log: a move that kept it (a moved generation, below the fork) keeps the wait.
         if !post.on_log() {
             return format!("ERR log-replaced id={id} off={off}\n");
         }
@@ -5644,8 +5579,7 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
             }
             kinds = Some(list);
         } else if let Some(v) = kv(tok, "topic") {
-            // THE GRAMMAR `post to=say:<t>` AND `topic add` TAKE: a word outside
-            // it is a topic no row can carry, so a wait on it could only time out.
+            // THE GRAMMAR `post to=say:<t>` AND `topic add` TAKE: a word outside it is a topic no row can carry, so a wait on it could only time out.
             if !is_topic(v) {
                 return USAGE.to_string();
             }
@@ -5681,8 +5615,7 @@ pub fn cmd_await_inbox(ctx: &dyn FabricSession, args: &[&str], timeout_ms: u64) 
     let hold_at_arm = guard.holds.is_held();
     let named = re.map(|off| guard.watch(off, true));
     loop {
-        // The named post's record must still be on the log: a moved
-        // generation that kept it (below the fork) keeps the wait.
+        // The named post's record must still be on the log: a moved generation that kept it (below the fork) keeps the wait.
         if let Some(post) = &named
             && !post.on_log()
         {
@@ -6528,14 +6461,6 @@ mod inbox_hold {
         );
     }
 
-    /// THE MARKS A SEAMLESS UPDATE CARRIES (6G-4's latch finding). The
-    /// ring is not carried, so the successor's bridge offers the unhandled
-    /// mail again. Only a delivery that recorded its `MailIn` is carried as
-    /// marked; a quota refusal recorded none. A successor whose log is the
-    /// carried one takes each marked row back with no second `MailIn`, and
-    /// marks a new offset and a refused one. A successor whose log started
-    /// over marks every row. A log switch forgets the carried marks with the
-    /// rest of the offsets.
     #[test]
     fn a_carried_mark_takes_its_refill_back_without_a_second_mail_in() {
         let mail_ins = |ctx: &SessionCtx| {
@@ -7590,8 +7515,7 @@ mod inbox_hold {
     fn a_wait_parked_with_nothing_owed_answers_stale_when_a_later_debt_goes_stale() {
         use std::time::Duration;
         with_link(|| {
-            // A fetch parked with nothing owed looks again a whole horizon later: shorten the
-            // horizon so the test waits 300 ms of it, not the instance's 6 s.
+            // A fetch parked with nothing owed looks again a whole horizon later: shorten the horizon so the test waits 300 ms of it, not the instance's 6 s.
             STALE_AFTER_IN_TEST.store(300, Ordering::Relaxed);
             let store = new_store();
             let (_sid, ctx) = registered(&store);

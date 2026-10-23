@@ -5,9 +5,6 @@
 
 use super::*;
 
-/// The stars read the flanking rows through v2's occupancy bitsets alone; the
-/// engine's own row copies ([`NbrProbe`]) serve only the seam's content
-/// witnesses.
 #[test]
 fn neighbor_probe_still_gates_star_pixels_after_discarding_duplicate_row_storage() {
     let now = Instant::now();
@@ -101,10 +98,7 @@ fn full_ribbon_row_budget_keeps_pending_source_and_caret_samples() {
         glow.v2.tick(at, geom, &cfg, &mut frame);
     };
 
-    // Three separated live runs request exactly eight distinct rows:
-    // the current run, its two follow destinations, two older run rows,
-    // and three of their follow destinations. None may be traded for a
-    // pending key's source when the fixed ribbon budget fills.
+    // Three separated live runs fill all eight ribbon content slots.
     glow.v2.on_event(
         rk::Event::Move {
             from: (3, 0),
@@ -138,12 +132,7 @@ fn full_ribbon_row_budget_keeps_pending_source_and_caret_samples() {
         "the ribbon really fills all eight content slots"
     );
 
-    // A temporarily parked caret can be outside every ribbon row and
-    // the unspent press can originate on a third row. The host samples
-    // the caret first, then the engine's list: the bands' eight rows,
-    // then the source and the rows one above and below it (its arming
-    // rows). All twelve rows must reach the same-frame witness and the
-    // source-prefix classifier.
+    // Sample the parked caret, eight band rows, and the pending key's source plus arming rows.
     let caret_row = 18;
     let source_row = 20;
     glow.last = Some((source_row, 4));
@@ -257,8 +246,7 @@ fn two_orphan_exact_keys_keep_press_order_across_the_credit_ring_wrap() {
     for i in 0..TYPED_STAMP_DEPTH - 1 {
         credits.bank(t0 + ms(i as u64), 1, Some('x'));
     }
-    // The first eligible key occupies the last physical slot and the
-    // second the first. Storage order would reverse their exact glyphs.
+    // Wrap across the last and first physical slots.
     credits.bank(t0 + ms(200), 1, Some('k'));
     credits.bank(t0 + ms(201), 1, Some('m'));
     let (keys, n) = credits

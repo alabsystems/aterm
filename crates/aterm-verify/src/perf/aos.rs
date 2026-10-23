@@ -525,7 +525,7 @@ fn summary(warm: &Value, stranded: &Value, rows: &[ColdRow]) -> Vec<String> {
 
 /// `sysctl -n vm.loadavg`'s three averages, or `unavailable`.
 fn load_average() -> String {
-    stdout_of(command("sysctl").args(["-n", "vm.loadavg"]))
+    stdout_of(command(aterm_uds::os_path!("sysctl")).args(["-n", "vm.loadavg"]))
         .map(|s| {
             s.trim_matches(|c| c == '{' || c == '}' || c == ' ')
                 .to_string()
@@ -538,13 +538,13 @@ fn load_average() -> String {
 fn commit() -> (String, usize) {
     let root = workspace_root();
     let head = stdout_of(
-        command("git")
+        command(aterm_uds::os_path!("git"))
             .args(["rev-parse", "HEAD"])
             .current_dir(&root),
     )
     .unwrap_or_else(|| "unknown".into());
     let dirty = stdout_of(
-        command("git")
+        command(aterm_uds::os_path!("git"))
             .args(["status", "--porcelain"])
             .current_dir(&root),
     )

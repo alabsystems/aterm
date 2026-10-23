@@ -28,8 +28,7 @@ pub(crate) fn raise(host: &mut impl AlertHost, posture: LaunchPosture, title: &s
     host.run();
 }
 
-/// Whether this launch is an update's handoff candidate: it names a rendezvous to
-/// dial or the overlap pipes.
+/// Whether this launch is an update's handoff candidate: it names a rendezvous to dial or the overlap pipes.
 static HANDOFF_CANDIDATE: AtomicBool = AtomicBool::new(false);
 
 /// Record that this launch is an update's handoff candidate.
@@ -185,8 +184,7 @@ mod tests {
         Run,
     }
 
-    /// A host that records each step; `makes` and `shows` are whether it can
-    /// make the application object and put the panel on screen.
+    /// A host that records each step; `makes` and `shows` are whether it can make the application object and put the panel on screen.
     struct Recorder {
         makes: bool,
         shows: bool,
@@ -227,10 +225,7 @@ mod tests {
         Step::Present("aterm could not start: spawn failed".into())
     }
 
-    /// A window launch's fatal alert asks to be the active app after the
-    /// application object exists and the alert's panel is on screen, and runs
-    /// after that: a bare `-runModal` before `NSApplication` came up behind the
-    /// person's window, and an ask with no window up is refused.
+    /// A window launch's fatal alert asks to be the active app after the application object exists and the alert's panel is on screen, and runs after that: a bare `-runModal` before `NSApplication` came up behind the person's window, and an ask with no window up is refused.
     #[test]
     fn a_window_launch_activates_after_its_app_and_panel_and_before_the_run() {
         assert_eq!(
@@ -239,9 +234,7 @@ mod tests {
         );
     }
 
-    /// An update's candidate never asks to activate at launch, its fatal alert
-    /// included; nor does a launch whose application object or panel is not
-    /// there (no windowed proof, off the main thread, off macOS).
+    /// An update's candidate never asks to activate at launch, its fatal alert included; nor does a launch whose application object or panel is not there (no windowed proof, off the main thread, off macOS).
     #[test]
     fn a_candidate_or_a_missing_app_or_panel_is_never_activated_and_still_runs() {
         for (makes, shows, candidate) in [

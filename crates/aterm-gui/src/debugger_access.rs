@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The owner's debugger-access change (`docs/DESIGN-macos-debugger-access-2026-09-29.md` §3.4, §3.5, §5.1).
+//! Owner debugger-access change.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -314,7 +314,6 @@ pub(crate) fn settle_markers(
             crate::durable::Flush::Ordered,
         )
     {
-        // Only the next launch's tell between drift and first sight is lost.
         aterm_log::warn!("debugger access: observed mode not recorded: {error}");
     }
     let Some(child) = release else {
@@ -346,8 +345,6 @@ pub(crate) fn settle_markers_detached(
         "aterm-debugger-marker",
         crate::qos::Role::Background,
         move || {
-            // Background: it takes no lock the UI thread contends (only this
-            // module's own marker mutex and the change lock).
             settle_markers(&config_path, observed, release.as_ref());
         },
     );
@@ -1129,7 +1126,6 @@ impl DriftWatch {
         self.seeded = true;
         self.recorded = recorded;
         if recorded.is_some_and(|m| m.mode == DebuggerMode::Enabled || m.origin == Origin::Aterm) {
-            // On now, or off by aterm's hand (a peer's): no drift to show.
             self.drift_since = None;
         }
         match self.early.take() {
@@ -1545,8 +1541,6 @@ impl DebuggerChangeLane {
         if let Some(read) = records_read {
             self.records_out = false;
             if read.unsettled {
-                // A worker holds the lock with no marker yet: read again
-                // once it has written one, or let go.
                 self.records_again_at = Some(now_wall.saturating_add(RESULT_RECHECK.as_secs()));
             } else {
                 let stale = read.stale.filter(|m| !self.follows(&m.child));
@@ -1556,8 +1550,6 @@ impl DebuggerChangeLane {
                 {
                     self.settling = stale.map(|m| m.child);
                 } else {
-                    // Something is under way here: nobody re-reads that
-                    // change, so its dead marker goes now.
                     step.remove_change_marker = stale.map(|m| m.child);
                 }
                 step.invalidate_probe |= stale.is_some();
@@ -5684,7 +5676,6 @@ pub(crate) mod conformance {
                                 exit
                             };
                         if fault == Fault::SkipRecheck {
-                            // The fault: spawn on the render's reading.
                             spawn(&change_argv(change))
                         } else {
                             aterm_containment::consent::devtools_change_with_for_test(
@@ -5759,7 +5750,6 @@ pub(crate) mod conformance {
             if self.fault == Fault::PressWhileInFlight
                 && matches!(self.lane.flow.phase, Phase::InFlight { .. })
             {
-                // The fault: the press guard lets it through.
                 self.lane.flow.phase = Phase::Idle;
             }
             let press_enabled = self.model.action_enabled("Press", &pre);
@@ -5841,13 +5831,11 @@ pub(crate) mod conformance {
                 }
                 _ => {
                     if fault == Fault::OfferAgain {
-                        // The fault: an ask that never reads the record.
                         let _ = std::fs::remove_file(self.dir.join(ASKED_RECORD));
                     }
                     let confirm = || {
                         reached = true;
                         if fault == Fault::OfferRunsUnasked {
-                            // The fault: a yes no alert gave.
                             OwnerAnswer::yes_for_test()
                         } else {
                             answer
@@ -5965,7 +5953,6 @@ pub(crate) mod conformance {
                 if rig.fault == Fault::ClaimFromExit
                     && let Phase::Exited(change) = rig.lane.flow.phase
                 {
-                    // The fault: the exit read as the target.
                     rig.lane.flow.observed = change.target();
                 }
                 rig.lane.flow.phase() != before
@@ -6035,7 +6022,6 @@ pub(crate) mod conformance {
             self.step(action, |rig| {
                 let before = rig.now();
                 let liveness: fn(&DevtoolsChild) -> bool = if rig.fault == Fault::AdoptLive {
-                    // The fault: no pid-and-birth check, so every child is gone.
                     |_| false
                 } else {
                     alive

@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The outlook of a wall: a person is asked for only what only a person can
-//! do, and a wait is never one.
+//! Wall outlook and supervisor answer policy tests.
 
 use super::*;
 
@@ -10,9 +9,6 @@ fn cfg() -> SupervisorConfig {
     SupervisorConfig::default()
 }
 
-/// A bucket with no reset asks a person, one with a reset does not; a lost
-/// login is the supervisor's to carry (a person's where API errors are left
-/// to the owner); a switched-off key is nobody's.
 #[test]
 fn every_wall_kind_has_an_outlook() {
     let c = cfg();
@@ -67,8 +63,6 @@ fn every_wall_kind_has_an_outlook() {
         outlook(WallKind::UsageWeekly, true, false, &c, false),
         Outlook::Unattended
     );
-    // A refused request: resumed slowly, and a person can lift it; a 500 and
-    // a reply past its maximum are resumed, nobody asked.
     let refused = WallKind::ApiError {
         code: Some(400),
         retryable: false,
@@ -119,8 +113,6 @@ fn every_wall_kind_has_an_outlook() {
     );
 }
 
-/// Memory and login walls are nobody's whatever the switches say; a reset-less
-/// bucket or spend limit resumes slowly and names the one action.
 #[test]
 fn a_wall_is_answered_by_the_harness_or_by_nobody() {
     let on = SupervisorConfig::default();
@@ -148,9 +140,7 @@ fn a_wall_is_answered_by_the_harness_or_by_nobody() {
         answer(WallKind::Spend, false, &on, true),
         Answer::ResumesAsks("add credits")
     );
-    // A lost login is the loop's to carry (its notice asks the owner's step).
     assert_eq!(answer(WallKind::Auth, false, &on, true), Answer::Resumes);
-    // Nobody: the memory banner, the owner's switches off.
     assert_eq!(answer(WallKind::Memory, false, &on, true), Answer::Nobody);
     let off = SupervisorConfig {
         resume_limits: false,
@@ -169,11 +159,6 @@ fn a_wall_is_answered_by_the_harness_or_by_nobody() {
     assert_eq!(answer(WallKind::Auth, false, &off, true), Answer::Nobody);
 }
 
-/// A session usage credits carry, the key off (the default): it waits for
-/// the subscription's reset where the window they carry past is named, and
-/// is a person's where none is. NEGATIVE CONTROLS: the key on carries it as
-/// work going on, and an unsupervised session is nobody's; neither says a
-/// word on a surface.
 #[test]
 fn a_session_on_usage_credits_waits_for_the_subscriptions_reset() {
     let off = cfg();

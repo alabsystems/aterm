@@ -815,33 +815,15 @@ fn stage_wrappers(
 }
 
 /// The payload-relative path an artifact source (or a wrapper's executable)
-/// names, or `None` when it names nothing in this cask's payload. Brew spells
-/// a source by where it is once installed, and each spelling resolves to the
-/// payload path of what put it there, one installed artifact deep:
-/// - plain: the payload itself;
-/// - `$HOMEBREW_PREFIX/Caskroom/<token>/<version>/…`: its own staged tree
-///   (brew stages the payload in exactly that tree, and so does abrew;
-///   android-platform-tools' binaries, prince's wrapper);
-/// - `$HOMEBREW_PREFIX/<target>/…`: inside a generic artifact's install
-///   tree (android-commandlinetools' binaries);
-/// - `/Applications/<App>/…` (the API's `$APPDIR/`): inside an app or suite
-///   this cask installs, itself sourced by any spelling above (ruffle's and
-///   wezterm's binaries), or inside a generic artifact's `$APPDIR/` tree
-///   (isabelle's). macOS's default volume folds case, so brew finds kate's
-///   `kate.app` as `/Applications/Kate.app`; so does this.
-///
-/// Another cask's or version's tree, another prefix path, an app this cask
-/// does not install, and any path that leaves the payload, have no mapping.
+/// names, or `None` when it names nothing in this cask's payload.
 fn payload_source(cask: &Cask, name: &str) -> Option<PathBuf> {
     let own = format!("$HOMEBREW_PREFIX/Caskroom/{}/{}/", cask.token, cask.version);
-    // What the payload holds, spelled plainly or by its own staged tree.
     let staged = |name: &str| -> Option<String> {
         match name.strip_prefix(own.as_str()) {
             Some(tail) => Some(tail.to_string()),
             None => (!name.starts_with("$HOMEBREW_PREFIX/")).then(|| name.to_string()),
         }
     };
-    // ... or under a generic artifact's install tree.
     let prefixed = |name: &str| -> Option<String> {
         let Some(rest) = name
             .strip_prefix("$HOMEBREW_PREFIX/")
@@ -860,8 +842,6 @@ fn payload_source(cask: &Cask, name: &str) -> Option<PathBuf> {
             Some(format!("{}/{tail}", staged(src)?))
         })
     };
-    // ... or under what this cask installs into the appdir: an app, a
-    // suite, or a generic artifact's tree (isabelle's app).
     let source = match name.strip_prefix("/Applications/") {
         None => prefixed(name)?,
         Some(rest) => cask.artifacts.iter().find_map(|artifact| {
@@ -883,8 +863,6 @@ fn payload_source(cask: &Cask, name: &str) -> Option<PathBuf> {
             Some(format!("{payload}/{tail}"))
         })?,
     };
-    // A placeholder left over (`$HOME/…`) is a machine path brew expands;
-    // it is no more payload-relative than `/` or `..`.
     let path = PathBuf::from(&source);
     (!source.is_empty()
         && !source.starts_with('$')
@@ -1044,10 +1022,6 @@ fn artifact_paths(
                 continue;
             }
             Artifact::Other(kind) => {
-                // Name the artifact that forced delegation: a bare
-                // "unsupported" makes every upstream recipe change
-                // look like an abrew regression (1password-cli's
-                // generate_completions_from_executable did).
                 return Err(InstallError::PassThrough(format!(
                     "cask {} has an unsupported artifact recipe ({kind})",
                     cask.token
@@ -1891,9 +1865,6 @@ mod tests {
                 true
             )]
         );
-        // An app staged in its own tree is found there by the binaries
-        // that source from its installed path, and a generic artifact
-        // sources from its own tree like every other kind.
         c.artifacts = vec![
             Artifact::App(
                 "$HOMEBREW_PREFIX/Caskroom/demo/1/Demo.app".to_string(),
@@ -1931,9 +1902,6 @@ mod tests {
                 ),
             ]
         );
-        // Another cask's tree, another version's, an escape from its own,
-        // any other prefix path and a placeholder brew expands still
-        // delegate, whichever artifact sources from them.
         for source in [
             "$HOMEBREW_PREFIX/Caskroom/other/1/platform-tools/adb",
             "$HOMEBREW_PREFIX/Caskroom/demo/2/platform-tools/adb",
@@ -1965,17 +1933,12 @@ mod tests {
     /// wezterm's shape: brew's `$APPDIR/WezTerm.app/...` binaries name
     /// the app the cask installs, which its zip keeps in a folder; and
     /// isabelle's: the app is a generic artifact installed into `$APPDIR/`.
-    /// Such a source resolves to that app's payload path, so what preflight
-    /// admits installs; an app the cask does not install delegates before
-    /// anything is downloaded.
     #[test]
     #[cfg(unix)]
     fn appdir_sources_resolve_to_the_app_the_cask_installs() {
         let tmp = aterm_tempfile::tempdir().unwrap();
         let machine = Machine::mac("arm64", "27.0", Some("27.0"), true);
         let binary = aterm_json::json!({"binary": ["$APPDIR/Demo.app/Contents/MacOS/demo"]});
-        // Each shape installs from a zip that keeps the app under `root`,
-        // into a prefix of its own, and its binary runs.
         let installs = |shape: &str, root: &str, installer: aterm_json::Value| {
             let plist = format!("{root}Demo.app/Contents/Info.plist");
             let script = format!("{root}Demo.app/Contents/MacOS/demo");
@@ -2024,8 +1987,6 @@ mod tests {
                 aterm_json::json!({"artifact": [format!("{root}Demo.app"), {"target": "$APPDIR/Demo.app"}]}),
             );
         }
-        // A renamed app (android-studio-preview@beta) is found by the name
-        // it is installed under, in the case brew's volume folds (kate).
         let prefix = Prefix::at(&tmp.path().join("prefix"));
         let renamed = Cask::from_api(&aterm_json::json!({
             "token": "demo", "version": "1", "sha256": "no_check", "url": "unused.zip",
@@ -2039,9 +2000,6 @@ mod tests {
             artifact_paths(&prefix, &renamed).unwrap()[1].0,
             PathBuf::from("Studio.app/Contents/MacOS/studio")
         );
-        // An appdir path nothing this cask installs there holds (another
-        // app, a name that only starts like the app's, a generic tree
-        // installed outside the appdir) has no payload path.
         let app = aterm_json::json!({"app": ["Top/Demo.app"]});
         let tree =
             |target: &str| aterm_json::json!({"artifact": ["Top/Demo.app", {"target": target}]});

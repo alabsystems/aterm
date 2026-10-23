@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fold's laws (§7.1, §3.7) and the clause (§7.3).
+//! The fold's laws and the clause.
 
 use aterm_slog::{
     Actor, Amend, BoxWord, Close, Conf, Fields, Fold, Key, Kind, Limits, Log, Mark, Open, Out, Rec,
@@ -124,16 +124,14 @@ fn apply_is_idempotent_across_a_handoff() {
     );
     assert_eq!(crossed.state().ep, 3);
     assert_eq!(crossed.state().as_of, new.last_seq());
-    // The old epoch's turns count once, the new one's once.
     assert_eq!(
         crossed.state().totals.turns,
         old.state().totals.turns + new.state().totals.turns
     );
 }
 
-/// A claim never outranks an observation (§3.7, §7.1): a `need` mark raises
-/// only `review`, `decision` or `help` (`escalated` only from the owner's
-/// attention flag), and ranks below every observed need.
+/// A claim never outranks an observation: a `need` mark raises only `review`,
+/// `decision` or `help`, and ranks below every observed need.
 #[test]
 fn a_claimed_need_never_displaces_an_observed_one() {
     let now = |ms: u64| WALL0 + ms;
@@ -174,7 +172,6 @@ fn a_claimed_need_never_displaces_an_observed_one() {
     );
     let words: Vec<&str> = log.state().needs.iter().flatten().map(|n| n.word).collect();
     assert_eq!(words, vec!["failure", "help"]);
-    // The owner's attention flag escalates, above `exited`, below a failure.
     need(&mut log, "escalated", Src::Meta, Conf::Strong, 9);
     let words: Vec<&str> = log.state().needs.iter().flatten().map(|n| n.word).collect();
     assert_eq!(words, vec!["failure", "escalated", "help"]);
@@ -227,7 +224,6 @@ fn needs_rank_by_precedence_not_arrival() {
     assert_eq!(log.state().top_need().map(|n| n.word), Some("unresponsive"));
     assert_eq!(log.state().totals.appr_by, [0, 1, 0, 0]);
 
-    // A clear lifts a mark's need only from its raiser or the owner.
     for (by, lifted) in [(Actor::Bridge, false), (Actor::Harness, true)] {
         log.mark(
             Mark::new(Kind::Clear, Src::Mark, Conf::Claim)
@@ -244,7 +240,6 @@ fn needs_rank_by_precedence_not_arrival() {
             .any(|n| n.word == "review");
         assert_eq!(held, !lifted, "a clear by {by:?}");
     }
-    // A clear never lifts a step's need: the step holds it.
     log.mark(
         Mark::new(Kind::Clear, Src::Mark, Conf::Claim).by(Actor::Human),
         at(7),
@@ -301,9 +296,7 @@ fn the_confidence_law_keeps_the_most_reliable_value() {
     ));
 }
 
-/// Equal field counts can retain different amounts of owned text. The
-/// estimate must follow that storage in both open and closed fold state;
-/// numeric magnitudes and static word lengths do not allocate more space.
+/// Equal field counts can retain different amounts of owned text.
 #[test]
 fn retained_heap_grows_with_owned_values_but_not_inline_values() {
     let node_sizes = |fields: Fields| {
@@ -528,10 +521,7 @@ fn clause_rows_in_order() {
 
 /// THE FAILURE-SUPERSEDE RULE ([`aterm_slog::lifts_failure`]): a shell
 /// command's failure is the newest command's outcome, as `status outcome=`
-/// holds it. A later `cmd` run that ends `ok` lifts it; one that ends `fail`
-/// replaces it with its own (one need, the newest's age, never one per failed
-/// command). NEGATIVE CONTROLS: a later run that ended `unknown`, and a run of
-/// another kind ending `ok`, leave the failure standing.
+/// holds it.
 #[test]
 fn a_later_command_supersedes_an_earlier_commands_failure() {
     let mut log = Log::new(0);
@@ -567,7 +557,6 @@ fn a_later_command_supersedes_an_earlier_commands_failure() {
     };
     let grep = cmd(&mut log, Kind::Cmd, RunOut::Fail, 10);
     assert_eq!(failures(&log), vec![(grep.to_string(), WALL0 + 11)]);
-    // NEGATIVE CONTROLS: an interrupted command and a program in front.
     cmd(&mut log, Kind::Cmd, RunOut::Unknown, 20);
     cmd(&mut log, Kind::Prog, RunOut::Ok, 30);
     assert_eq!(
@@ -575,10 +564,8 @@ fn a_later_command_supersedes_an_earlier_commands_failure() {
         vec![(grep.to_string(), WALL0 + 11)],
         "an unknown end and another kind's success say nothing about it"
     );
-    // A later failure replaces it: one need, dated at the newest.
     let make = cmd(&mut log, Kind::Cmd, RunOut::Fail, 40);
     assert_eq!(failures(&log), vec![(make.to_string(), WALL0 + 41)]);
-    // A later success lifts it, and brief stops saying `need=failure`.
     cmd(&mut log, Kind::Cmd, RunOut::Ok, 50);
     assert_eq!(failures(&log), Vec::<(String, u64)>::new());
     assert!(log.state().top_need().is_none());
@@ -623,16 +610,13 @@ fn amend_out(log: &mut Log, node: aterm_slog::Node, kind: Kind, out: &str, conf:
     .expect("amends");
 }
 
-/// PHASE 3B: an EXACT amend refines a held turn's outcome
-/// and moves it between the totals' buckets, the bus totals following; a
-/// STRONG one (an unmeasured build's transcript) never overrules the
-/// screen's close, whatever its seq.
+/// An exact amend refines a held turn's outcome and moves it between the
+/// totals' buckets, while a strong one never overrules the screen's close.
 #[test]
 fn an_exact_amend_refines_a_held_outcome_and_a_strong_one_never_does() {
     let (mut log, turn) = closed_turn();
     let t0 = log.state().totals.clone();
     assert_eq!((t0.done, t0.walled), (1, 0));
-    // Strong, later seq: kept as a record, never the outcome.
     amend_out(
         &mut log,
         turn,
@@ -650,7 +634,6 @@ fn an_exact_amend_refines_a_held_outcome_and_a_strong_one_never_does() {
         Some("done"),
         "the held field agrees with the outcome"
     );
-    // Exact: the outcome is refined and re-bucketed.
     amend_out(
         &mut log,
         turn,
@@ -671,13 +654,11 @@ fn an_exact_amend_refines_a_held_outcome_and_a_strong_one_never_does() {
     let bus = log.fold().bus_totals();
     assert_eq!((bus.done, bus.walled), (0, 1));
     assert_eq!(bus.last_turn.map(|(_, o)| o), Some("wall:usage-session"));
-    // A later strong amend back to `done` changes nothing: exact holds.
     amend_out(&mut log, turn, Kind::Turn, "done", Conf::Strong, 8);
     assert_eq!(
         log.state().last[1].as_ref().map(|c| c.out),
         Some("wall:usage-session")
     );
-    // The same fold from the records, applied twice, agrees (idempotent).
     let mut f = Fold::new(0);
     for r in log.window() {
         f.apply(r);
@@ -686,12 +667,8 @@ fn an_exact_amend_refines_a_held_outcome_and_a_strong_one_never_does() {
     assert_eq!(f.state(), log.state());
 }
 
-/// PHASE 3B (S9, A5; found by `SessionLogFold`'s `ConfidenceMonotone`): an
-/// exact `out=` amend made while the turn is still open outranks the
-/// screen's strong close that follows it — the close counts the turn in the
-/// exact word's bucket and its held field says the same — while a strong
-/// amend while open never overrules even a weaker (heuristic) close, and
-/// `brief` prints what the fold holds.
+/// An exact `out=` amend made while the turn is still open outranks the
+/// screen's strong close that follows it.
 #[test]
 fn an_exact_amend_while_open_outranks_the_later_screen_close() {
     let mut log = Log::new(0);
@@ -762,9 +739,8 @@ fn an_exact_amend_while_open_outranks_the_later_screen_close() {
     assert_eq!((t.asked, t.walled), (1, 1));
 }
 
-/// A turn no longer held (a newer one closed since) keeps its totals: the
-/// stated approximation (plan §11 Q9); its own record still says the
-/// refinement, which `brief` reads.
+/// A turn no longer held (a newer one closed since) keeps its totals while its
+/// own record still carries the refinement.
 #[test]
 fn an_exact_amend_of_an_unheld_turn_keeps_the_totals() {
     let (mut log, first) = closed_turn();
@@ -790,9 +766,9 @@ fn an_exact_amend_of_an_unheld_turn_keeps_the_totals() {
     assert_eq!(log.state().totals, t0);
 }
 
-/// PHASE 3B (A5): an exact `confirmed=1` raises the wall step's need to the
-/// transcript's source and confidence; a strong one, or an exact amend
-/// without `confirmed=1`, leaves the need as the screen raised it.
+/// An exact `confirmed=1` raises the wall step's need to the transcript's
+/// source and confidence; a strong one, or an exact amend without
+/// `confirmed=1`, leaves the need as the screen raised it.
 #[test]
 fn an_exact_confirmation_raises_the_step_needs_confidence() {
     let mut log = Log::new(0);
@@ -846,10 +822,8 @@ fn an_exact_confirmation_raises_the_step_needs_confidence() {
     assert!(b.text.contains("[transcript!]"), "{}", b.text);
 }
 
-/// PHASE 3B (A5): the clause names the row it came from, keeps its head
-/// words without the coarse age, and `clause_of_proven` admits only a
-/// proven author's label: a `ctl` label neither shows nor hides the step
-/// beneath it there, while `clause_of` (brief's) still shows it.
+/// The clause names the row it came from, keeps its head words without the
+/// coarse age, and `clause_of_proven` admits only a proven author's label.
 #[test]
 fn the_clause_names_its_row_and_the_proven_clause_skips_a_ctl_label() {
     use aterm_slog::{ClauseRow, clause_of, clause_of_proven};
@@ -917,7 +891,6 @@ fn the_clause_names_its_row_and_the_proven_clause_skips_a_ctl_label() {
         (proven.row, proven.head.as_str(), proven.by),
         (ClauseRow::Label, "reviewing", Actor::Harness)
     );
-    // A need outranks every label in both.
     log.open(
         Open::new(Kind::Approval, Src::Screen, Conf::Strong)
             .under(turn)
@@ -937,14 +910,8 @@ fn the_clause_names_its_row_and_the_proven_clause_skips_a_ctl_label() {
     }
 }
 
-/// ONLY A MOVE CLOSES MAIL (phase 6, 6F-6): every `inbox seen` is a
-/// `mail-seen` mark, `moved=1` when it moved the watermark or decided a
-/// verdict and `moved=0` when it moved nothing. Two mails in and one seen
-/// that moved leave one open, and that seen repeated three times leaves the
-/// fold's mail counts where they were; a mark with no `moved=` (an older
-/// writer's, written only on a move) closes one. NEGATIVE CONTROL (by
-/// scratch revert): a fold that reads the unmoved marks closes the second
-/// mail on the first repeat.
+/// Every `inbox seen` is a `mail-seen` mark, `moved=1` when it moved the
+/// watermark or decided a verdict and `moved=0` when it moved nothing.
 #[test]
 fn a_repeated_inbox_seen_moves_no_mail_count() {
     let mut log = Log::new(0);

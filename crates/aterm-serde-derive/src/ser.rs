@@ -76,15 +76,12 @@ impl Parameters {
         }
     }
 
-    /// Type name to use in error messages and `&'static str` arguments to
-    /// various Serializer methods.
+    /// Type name to use in error messages and `&'static str` arguments to various Serializer methods.
     fn type_name(&self) -> String {
         self.this_type.to_string()
     }
 }
 
-// All the generics in the input, plus a bound `T: Serialize` for each generic
-// field type that will be serialized by us.
 fn build_generics(cont: &Container) -> Generics {
     bound::with_bound(
         cont,
@@ -94,9 +91,6 @@ fn build_generics(cont: &Container) -> Generics {
     )
 }
 
-// Fields with a `skip` attribute are not serialized by us so we do not
-// generate a bound. All other fields may need a `T: Serialize` bound where T is
-// the type of the field.
 const fn needs_serialize_bound(field: &attr::Field) -> bool {
     !field.skip_serializing()
 }
@@ -508,8 +502,6 @@ fn serialize_internally_tagged_variant(
             &variant.fields,
             type_name,
         ),
-        // Refused when the attributes were read (`decide_tag`); a tuple
-        // variant in an internally tagged enum never reaches here.
         Style::Tuple => quote_expr!(
             "_serde::__private::Err(_serde::ser::Error::custom(\"tuple variant in an internally tagged enum\"))"
         ),
@@ -938,12 +930,6 @@ fn serialize_struct_visitor(
         .collect()
 }
 
-// Serialization of an empty struct results in code like:
-//
-//     let mut __serde_state = serializer.serialize_struct("S", 0)?;
-//     _serde::ser::SerializeStruct::end(__serde_state)
-//
-// where we want to omit the `mut` to avoid a warning.
 fn mut_if(is_mut: bool) -> Option<TokenStream> {
     if is_mut { Some(q!("mut")) } else { None }
 }
@@ -982,9 +968,6 @@ enum StructTrait {
 impl StructTrait {
     fn serialize_field(&self, span: Span) -> TokenStream {
         match *self {
-            // A field of a struct written as a map (it has a flattened field)
-            // is still a field, which a format may treat unlike a map entry
-            // (TOML leaves a `None` field out but refuses a `None` map value).
             StructTrait::SerializeMap => {
                 q_spanned!(span => "_serde::ser::SerializeMap::serialize_field_entry")
             }

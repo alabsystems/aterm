@@ -148,7 +148,7 @@ impl Notifier for Osascript {
             clean(message),
             clean(title)
         );
-        let _ = aterm_uds::spawnfd::command("osascript")
+        let _ = aterm_uds::spawnfd::command(aterm_uds::os_path!("osascript"))
             .arg("-e")
             .arg(script)
             .output();

@@ -67,9 +67,6 @@ fn a_rows_buttons_are_pinned_right_with_details_last_at_every_width() {
             let row = &p.rows[0];
             let caps = &row.capsules;
             assert!(!caps.is_empty(), "{}@{cols}: buttons", msg.title);
-            // Below the degenerate step the capsules may start at column 0
-            // (the documented best effort under ~24 cols); every width here
-            // is above it.
             let last = caps.last().unwrap();
             assert_eq!(
                 last.col + last.width,

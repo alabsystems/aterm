@@ -223,7 +223,7 @@ pub(super) fn messages_look(config: &Path, conversation: &str, now_ms: u64) -> O
 
 /// Apple's `sqlite3`, named absolutely (a platform binary): the one reader of
 /// agy's summary database, READ ONLY.
-const SQLITE3: &str = "/usr/bin/sqlite3";
+const SQLITE3: &str = aterm_uds::os_path!("sqlite3");
 
 /// File name of `agy`'s conversation summary database.
 pub(super) const SUMMARIES: &str = "conversation_summaries.db";

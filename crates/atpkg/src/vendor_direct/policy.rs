@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Signed policy for vendor programs (design §1.4): yanks only, from the channel's
-//! existing `yanked` list, latched on disk so staleness can never un-apply one.
-//!
-//! A vendor program's entry may name its version (`"claude@2.1.285"`) or a build number
-//! as `gate::is_yanked` spells it: a vendor build id (`"claude@1000002000001000285"`)
-//! names that same version, and an ALab build number names a legacy index build. A
-//! build-number entry means the same build to both readers; the version spelling is this
-//! reader's alone, so older clients skip it.
+//! Signed policy for vendor programs: yanks from the channel's `yanked` list, latched on disk.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
@@ -25,18 +18,12 @@ use crate::manifest::Index;
 use crate::sig::{BuildFloor, TrustedIndex};
 use crate::store::Layout;
 
-/// The latch file's schema.
 const LATCH_SCHEMA: u32 = 1;
-
-/// Bound on a latch read.
 const MAX_LATCH_BYTES: usize = 64 * 1024;
 
-/// How long a fresh index verification keeps the latch current for a targeted vendor
-/// door (seconds): past it, or with no latch, the door verifies the index first.
+/// How long a fresh index verification keeps the latch current for a targeted vendor door.
 pub(crate) const LATCH_CURRENT_FOR_SECS: i64 = 60 * 60;
 
-/// How far ahead of the clock a latch may be stamped and still be current (seconds): one
-/// stamped further ahead was written by a clock that was wrong.
 const LATCH_CLOCK_SLACK_SECS: i64 = 60 * 60;
 
 /// The vendor yanks a signed channel carries.
@@ -61,8 +48,7 @@ impl Policy {
         Self::from_entries(channel.yanked.iter().map(String::as_str))
     }
 
-    /// The vendor entries of every channel of `index`: a vendor program follows its
-    /// vendor, not a channel, so a yank in any channel binds it.
+    /// The vendor entries of every channel of `index`.
     #[must_use]
     pub fn from_index(index: &Index) -> Self {
         let mut policy = Self::from_entries(
@@ -83,24 +69,19 @@ impl Policy {
         policy
     }
 
-    /// Record `floor` for ALab-built `program`; a zero floor is none.
     fn set_floor(&mut self, program: &str, floor: u64) {
         if floor > 0 && crate::alab::agent(program).is_some() {
             self.floors.insert(program.to_string(), floor);
         }
     }
 
-    /// The signed build floor of ALab-built `program` (`0`: none): an ALab build below it is
-    /// revoked (`lane::Revoked`).
+    /// The signed build floor of ALab-built `program` (`0`: none).
     #[must_use]
     pub(crate) fn alab_floor(&self, program: &str) -> u64 {
         self.floors.get(program).copied().unwrap_or(0)
     }
 
-    /// The policy the lane reads: the yanks of the newest index this machine verified
-    /// (`fresh`, verified this pass, unless the latch holds a newer one), else the latch, else
-    /// none. A replayed older index, still signed and inside its window, never lifts a yank a
-    /// newer one latched; "newer" is the build floor's order ([`YankLatch::admits`]).
+    /// The policy of the newest index this machine verified, else the latch, else none.
     #[must_use]
     pub(crate) fn current(layout: &Layout, fresh: Option<&TrustedIndex>) -> Self {
         let latch = YankLatch::read(layout);
@@ -111,8 +92,7 @@ impl Policy {
         }
     }
 
-    /// Keep each `"<program>@<version>"` or `"<program>@<build>"` whose program is
-    /// vendor-direct; every other entry (an ALab program's, a typo) is ignored.
+    /// Keep each `"<program>@<version>"` or `"<program>@<build>"` whose program is vendor-direct.
     #[must_use]
     pub(crate) fn from_entries<'a>(entries: impl IntoIterator<Item = &'a str>) -> Self {
         let mut policy = Self::default();
@@ -126,8 +106,6 @@ impl Policy {
         policy
     }
 
-    /// One vendor program's entry. A build number parses as `gate::is_yanked` parses it,
-    /// so the two readers never disagree on which build an entry names.
     fn insert(&mut self, program: &str, spelling: &str) {
         if let Some(version) = Version::parse(spelling) {
             self.yanked
@@ -174,7 +152,6 @@ impl Policy {
             .unwrap_or_default()
     }
 
-    /// program → the entries as the latch stores them: versions, then legacy builds.
     fn spellings(&self) -> BTreeMap<String, Vec<String>> {
         let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for (program, set) in &self.yanked {
@@ -192,20 +169,15 @@ impl Policy {
 }
 
 /// The vendor yanks of the newest freshly verified index (`<prefix>/vendor-yanks.toml`).
-/// Read when no index verifies this pass; replaced only by an index at least as new
-/// ([`Self::admits`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct YankLatch {
     /// The index build these yanks came from.
     pub index_build: u64,
-    /// The roster generation that index was authorized by — what the build floor records
-    /// beside its build ([`TrustedIndex::roster_seq`]); `None` for a latch written before
-    /// it was kept.
+    /// The roster generation that index was authorized by.
     pub roster_seq: Option<u64>,
     /// Its vendor yanks.
     pub policy: Policy,
-    /// When a fresh verification last wrote or confirmed it (Unix seconds; `0` for a
-    /// latch written before this was kept, which is never current).
+    /// When a fresh verification last wrote or confirmed it (Unix seconds).
     pub checked_at: i64,
 }
 
@@ -231,8 +203,7 @@ pub(crate) fn latch_path(layout: &Layout) -> PathBuf {
 }
 
 impl YankLatch {
-    /// The latch on disk. `None` when absent or unreadable; an entry that does not parse
-    /// is dropped alone, so one bad line cannot lift every other yank.
+    /// The latch on disk, or `None` when absent or unreadable.
     #[must_use]
     pub(crate) fn read(layout: &Layout) -> Option<Self> {
         let file: LatchFile = durable::read_toml(&latch_path(layout), MAX_LATCH_BYTES)?;
@@ -258,19 +229,11 @@ impl YankLatch {
         })
     }
 
-    /// Whether `index` is at least as new as the index these yanks came from, by the build
-    /// floor's rule ([`BuildFloor::admits`], asked as `select_index` asks it): an index that
-    /// declares a strictly newer roster generation (which only the paper master can mint)
-    /// supersedes the latch whatever its `index_build`, as it re-bases the floor; within a
-    /// generation an older build never does. By build alone, a latch filled at an absurd
-    /// `index_build` would refuse every later yank. A latch without a generation is ordered
-    /// by build alone.
     fn admits(&self, index: &TrustedIndex) -> bool {
         let (index_build, generation, _) = rank(index);
         self.admits_at(generation, index_build)
     }
 
-    /// [`Self::admits`] for an index declaring `generation` at `index_build`.
     const fn admits_at(&self, generation: u64, index_build: u64) -> bool {
         match self.roster_seq {
             Some(roster_seq) => BuildFloor {
@@ -282,19 +245,14 @@ impl YankLatch {
         }
     }
 
-    /// Whether a fresh verification wrote or confirmed the latch at most
-    /// [`LATCH_CURRENT_FOR_SECS`] before `now` (and at most [`LATCH_CLOCK_SLACK_SECS`] after
-    /// it): a targeted door then decides on it without verifying the index again.
+    /// Whether a fresh verification wrote or confirmed the latch within [`LATCH_CURRENT_FOR_SECS`] of `now`.
     #[must_use]
     pub(crate) fn is_current(&self, now: i64) -> bool {
         let age = now.saturating_sub(self.checked_at);
         self.checked_at > 0 && (-LATCH_CLOCK_SLACK_SECS..=LATCH_CURRENT_FOR_SECS).contains(&age)
     }
 
-    /// Record `channel`'s vendor yanks from a freshly verified index `index_build`, verified
-    /// at `checked_at`, unless the latch holds a newer index. The caller holds the Floor's
-    /// lock, which serializes every index admission. Returns whether the file was rewritten:
-    /// an identical latch is not; the same yanks confirmed later are, which keeps it current.
+    /// Record `channel`'s vendor yanks from `index_build`, verified at `checked_at`.
     ///
     /// # Errors
     /// The latch could not be written.
@@ -313,8 +271,7 @@ impl YankLatch {
         )
     }
 
-    /// [`Self::update_from_fresh_index`] with every channel's yanks ([`Policy::from_index`]):
-    /// what each fresh verification records.
+    /// Record every channel's yanks from `index`, verified at `checked_at`.
     ///
     /// # Errors
     /// The latch could not be written.
@@ -326,9 +283,7 @@ impl YankLatch {
         Self::update(layout, rank(index), Policy::from_index(index), checked_at)
     }
 
-    /// [`Self::update_from_index`] for an index verified from cached bytes (the source was
-    /// not reached): its yanks carry forward, but the stamp stays what the last live
-    /// verification left, so a targeted door still verifies live when it is due.
+    /// Carry yanks forward from cached `index` while preserving the last live verification stamp.
     ///
     /// # Errors
     /// The latch could not be written.
@@ -340,8 +295,6 @@ impl YankLatch {
         Self::update(layout, rank(index), Policy::from_index(index), stamp)
     }
 
-    /// Latch `policy` from the index [`rank`]ed `(index_build, generation, roster_seq)`
-    /// unless the latch holds a newer one.
     fn update(
         layout: &Layout,
         (index_build, generation, roster_seq): (u64, u64, Option<u64>),
@@ -373,9 +326,6 @@ impl YankLatch {
     }
 }
 
-/// Where `index` stands in the latch's order: its build, the generation it declares
-/// ([`TrustedIndex::authorizing_seq`], what `select_index` admits a candidate by) and the
-/// generation that authorized it ([`TrustedIndex::roster_seq`], what the build floor records).
 fn rank(index: &TrustedIndex) -> (u64, u64, Option<u64>) {
     (
         index.index_build,
@@ -412,8 +362,6 @@ mod tests {
         index_at(crate::sig::testkit::SEQ, index_build, yanked)
     }
 
-    /// The index `index_build` yanking `yanked`, declaring roster generation `generation`
-    /// and authorized under it through the real chain.
     fn index_at(generation: u64, index_build: u64, yanked: &[&str]) -> TrustedIndex {
         let yanked: Vec<String> = yanked.iter().map(|y| format!("\"{y}\"")).collect();
         let body = format!(
@@ -426,9 +374,6 @@ mod tests {
         crate::sig::testkit::trusted_index_at(generation, body.into_bytes())
     }
 
-    /// A strictly newer roster generation supersedes the latch whatever its index build, as
-    /// it re-bases the build floor: a latch at the TOML integer ceiling does not refuse the
-    /// next generation's yanks, and an older build of that generation never lifts them.
     #[test]
     fn a_newer_generation_supersedes_the_latch_whatever_its_index_build() {
         let l = layout("rebase");
@@ -447,8 +392,6 @@ mod tests {
         );
     }
 
-    /// A replayed older index (signed, in its window) never lifts a yank the latch took from
-    /// a newer one; a newer or equal fresh index is what the lane reads.
     #[test]
     fn an_older_fresh_index_never_lifts_a_latched_yank() {
         let l = layout("replay");
@@ -467,7 +410,6 @@ mod tests {
         assert!(same.is_yanked("claude", v("2.1.281")));
     }
 
-    /// Cached bytes carry their yanks forward but never vouch that the latch is current.
     #[test]
     fn a_cached_verification_carries_yanks_but_not_currency() {
         let l = layout("cached");
@@ -478,7 +420,6 @@ mod tests {
         assert!(latch.policy.is_yanked("codex", v("0.156.1")));
         assert_eq!(latch.checked_at, 1_000, "cached bytes restamped the latch");
         assert!(!latch.is_current(1_000 + LATCH_CURRENT_FOR_SECS + 1));
-        // With no latch at all, cached bytes leave it never-current.
         let fresh = layout("cached-empty");
         YankLatch::carry_from_cached_index(&fresh, &index(44, &[])).unwrap();
         assert!(!YankLatch::read(&fresh).unwrap().is_current(0));
@@ -513,8 +454,6 @@ mod tests {
         );
     }
 
-    /// A publisher who copies a vendor build's directory name from the store yanks that
-    /// version: the lane and `gate::is_yanked` read the entry alike.
     #[test]
     fn a_vendor_build_id_entry_yanks_its_version() {
         let id = v("2.1.285").build_id();
@@ -524,12 +463,10 @@ mod tests {
         let p = Policy::from_channel(&ch);
         assert!(p.is_yanked("claude", v("2.1.285")));
         assert!(!p.is_legacy_yanked("claude", id));
-        // gate's parse, so a spelling gate reads the same way is the same yank.
         let padded = format!("claude@0{id}");
         assert!(Policy::from_entries([padded.as_str()]).is_yanked("claude", v("2.1.285")));
     }
 
-    /// A revision-form entry names its one version, spelled as text or as its build id.
     #[test]
     fn a_revision_form_entry_yanks_its_version_by_text_or_build() {
         let head = v("1.4.9-R6297.1");
@@ -542,8 +479,6 @@ mod tests {
         }
     }
 
-    /// `gate::is_yanked` keeps its build-number meaning for ALab programs and never reads a
-    /// version spelling — not even as the version's own build id.
     #[test]
     fn gate_is_yanked_ignores_version_entries() {
         let ch = channel(&["claude@2.1.279", "trust@4790"]);
@@ -580,14 +515,11 @@ mod tests {
         assert!(got.policy.is_yanked("claude", v("2.1.279")));
         assert!(got.policy.is_yanked("codex", v("0.156.1")));
         assert!(got.policy.is_legacy_yanked("claude", 2_026_091_901));
-        // The same index at the same moment rewrites nothing; confirmed later, only the
-        // time moves.
         assert!(!YankLatch::update_from_fresh_index(&l, 44, &first, 100).unwrap());
         assert!(YankLatch::update_from_fresh_index(&l, 44, &first, 200).unwrap());
         let confirmed = YankLatch::read(&l).unwrap();
         assert_eq!((confirmed.index_build, confirmed.checked_at), (44, 200));
         assert_eq!(confirmed.policy, got.policy);
-        // An older index can neither lift the yank nor confirm the latch.
         let older = channel(&[]);
         assert!(!YankLatch::update_from_fresh_index(&l, 43, &older, 300).unwrap());
         assert_eq!(YankLatch::read(&l).unwrap().checked_at, 200);
@@ -597,12 +529,10 @@ mod tests {
                 .policy
                 .is_yanked("claude", v("2.1.279"))
         );
-        // A newer index can.
         assert!(YankLatch::update_from_fresh_index(&l, 45, &older, 300).unwrap());
         let lifted = YankLatch::read(&l).unwrap();
         assert_eq!(lifted.index_build, 45);
         assert!(!lifted.policy.is_yanked("claude", v("2.1.279")));
-        // An equal build with different content is a fresh verification: it wins.
         let again = channel(&["codex@0.156.0"]);
         assert!(YankLatch::update_from_fresh_index(&l, 45, &again, 300).unwrap());
         assert!(
@@ -613,9 +543,6 @@ mod tests {
         );
     }
 
-    /// A latch is current for an hour after the fresh verification that wrote or last
-    /// confirmed it; one never stamped, or stamped more than an hour ahead of the clock,
-    /// is not.
     #[test]
     fn a_latch_is_current_for_an_hour_after_its_verification() {
         let at = |checked_at: i64| YankLatch {
@@ -634,7 +561,6 @@ mod tests {
         );
         assert!(at(now + LATCH_CLOCK_SLACK_SECS).is_current(now));
         assert!(!at(now + LATCH_CLOCK_SLACK_SECS + 1).is_current(now));
-        // A latch written before `checked_at` was kept reads as never checked.
         let l = layout("unstamped");
         std::fs::write(
             latch_path(&l),
@@ -669,7 +595,6 @@ mod tests {
         let got = YankLatch::read(&l).unwrap();
         assert!(got.policy.is_yanked("claude", v("2.1.279")));
         assert!(got.policy.is_legacy_yanked("claude", 2_026_091_901));
-        // An unreadable latch is replaced by the next fresh index, whatever its build.
         std::fs::write(latch_path(&l), "garbage").unwrap();
         assert!(YankLatch::update_from_fresh_index(&l, 1, &channel(&[]), 1).unwrap());
         assert_eq!(YankLatch::read(&l).unwrap().index_build, 1);

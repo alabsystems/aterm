@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::sync::Mutex;
 
 /// `scutil`.
-pub const SCUTIL: &str = "/usr/sbin/scutil";
+pub const SCUTIL: &str = aterm_uds::os_path!("scutil");
 
 /// The SMB server's preferences (a `defaults` domain given as a path).
 pub const SMB_SERVER: &str = "/Library/Preferences/SystemConfiguration/com.apple.smb.server";

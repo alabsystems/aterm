@@ -1435,8 +1435,7 @@ fn burst_mutex_end(ep: &Episode) -> Option<Instant> {
     let win = match ep.burst_kind {
         Some(BurstKind::SuperNova) if ep.burst_roll => super_window_of(ep.burst_tier),
         Some(BurstKind::Nova) => {
-            // Duration-only decode: this runs from full-map walks every tick
-            // and needs one genome field.
+            // Duration-only decode.
             Duration::from_millis(u64::from(nova_duration_ms(ep.genome.gkey)))
         }
         _ => return None,
@@ -1883,7 +1882,6 @@ impl WordDecorations {
     pub const fn set_presentable(&mut self, _now: Instant, presentable: bool) {
         // Distinct branch.
         if self.away != presentable {
-            // Distinct branch.
             return;
         }
         self.away = !presentable;
@@ -1943,7 +1941,6 @@ impl WordDecorations {
             .saturating_add(lead)
             .min(grid_w.saturating_sub(i32::from(w)));
         if x < 0 {
-            // Distinct branch.
             return None;
         }
         let rest_top = i32::from(crow) * ch_i + ch_i / 2 - i32::from(h) / 2;
@@ -2342,7 +2339,7 @@ impl WordDecorations {
                     .find_map(|eyes| self.cat_baker.peek_v4(&BakeKeyV4 { eyes, ..key }))
             });
             let Some(tile) = tile else {
-                // Distinct branch.
+                // Cached tile not yet baked.
                 return None;
             };
             (tile.ax, tile.ay, w, h)
@@ -2393,7 +2390,6 @@ impl WordDecorations {
                 }
                 let (nw, nh) = crate::kitty_sing::note_nat_size(note.kind, geom.cell_h);
                 if i32::from(nw) > grid_w {
-                    // Distinct branch.
                     continue;
                 }
                 let kind_idx = match note.kind {
@@ -2408,7 +2404,6 @@ impl WordDecorations {
                     (nw, nh),
                     |tile| crate::kitty_sing::paint_note(tile, note.kind),
                 ) else {
-                    // Distinct branch.
                     continue;
                 };
                 let nx = mouth_x + (note_dir * note.dx * f32::from(geom.cell_w)).round() as i32
@@ -2575,7 +2570,6 @@ impl WordDecorations {
                 Self::paint_pet_mote(paint, m.kind, bucket, side);
                 self.cat_baker.host_tile(host, side, side, paint.pixels())
             }) else {
-                // Distinct branch.
                 continue;
             };
             *slot = Some(FreeSprite {
@@ -2984,7 +2978,6 @@ impl WordDecorations {
         let w = ((f32::from(h) * aspect).round() as i32).clamp(1, i32::from(u16::MAX)) as u16;
         let grid_w = i32::from(geom.cols).saturating_mul(cw);
         if i32::from(w) > grid_w {
-            // Distinct branch.
             return None;
         }
 
@@ -3201,8 +3194,6 @@ impl WordDecorations {
             return false;
         };
         let Some((edit_row, edit_col)) = e.cell else {
-            // No caret has ever been scanned: abstain rather than veto (see
-            // [`TypedEdit::cell`]).
             return true;
         };
         edit_row == row
@@ -3567,7 +3558,6 @@ impl WordDecorations {
             let occupied = !self.scan_text.trim().is_empty();
             self.scan_row_occupied[r] = occupied;
             if !occupied || cutoff > 0 {
-                // Distinct branch.
                 continue;
             }
             let est = if self.scan_memo.touch(&self.scan_text) {
@@ -3637,7 +3627,6 @@ impl WordDecorations {
                 ink_end = col.saturating_add(1);
             }
             if cell.wide {
-                // Distinct branch.
                 continue;
             }
             self.scan_text.push(cell.ch);
@@ -4237,8 +4226,6 @@ impl WordDecorations {
         self.curse_cues.clear();
         self.peek_cues.clear();
         if !self.host_brackets_frames {
-            // No host frame bracket: one baker prologue per tick. A bracketing
-            // host resets it once per presented frame, so panes share the budget.
             self.cat_baker_ready = false;
         }
         match (companion, companion_at) {
@@ -4312,7 +4299,6 @@ impl WordDecorations {
                 continue;
             }
             if self.curse_cues.len() >= MAX_CURSE_CUES {
-                // Distinct branch.
                 break;
             }
             ep.bonk_pending = false;
@@ -4406,7 +4392,6 @@ impl WordDecorations {
                         unlogged: ep.is_some_and(|e| !e.logged),
                     };
                     if peek.peek_done {
-                        // Distinct branch.
                         break 'graphic;
                     }
                     let vetoed_by = |cell: Option<(u16, u16)>| {
@@ -4419,7 +4404,6 @@ impl WordDecorations {
                     }
                     if occ.spec.graphic.map(|g| g.collection) == Some(Collection::Animals) {
                         let Some(species) = occ.species else {
-                            // Distinct branch.
                             break 'graphic;
                         };
                         let eligible = peek_eligible(occ, geom);
@@ -4596,10 +4580,6 @@ impl WordDecorations {
                     } else {
                         let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
                         let f = if cfg.reduced_motion {
-                            // Under reduced motion: no static resurrection once
-                            // the burst one-shot faded (`burst_done`). A
-                            // reduced-from-birth episode never advances the
-                            // flag, so its static spark persists.
                             (!ep.is_some_and(|e| e.burst_done)).then_some(1.0f32)
                         } else if t < cfg.anim_ms + RESIDUAL_FADE_MS {
                             let until = occ.appeared
@@ -4652,7 +4632,6 @@ impl WordDecorations {
                 let dest_w = ((f32::from(nw) * d.sx).round() as i32).max(1);
                 let dest_h = ((f32::from(nh) * d.sy).round() as i32).max(1);
                 if dest_w > grid_w {
-                    // Distinct branch.
                     continue;
                 }
                 let host = crate::nuke::nuke_host_id(part, nw, nh);
@@ -4663,7 +4642,6 @@ impl WordDecorations {
                     (nw, nh),
                     |tile| crate::nuke::paint_nuke(tile, part),
                 ) else {
-                    // Distinct branch.
                     continue;
                 };
                 let dy = (d.dy_cells * f32::from(geom.cell_h)).round() as i32;
@@ -4774,8 +4752,6 @@ impl WordDecorations {
                         let arm = if !is_animal && cfg.feline_style != FelineStyle::Cat {
                             KittyShownAs::PawStyle
                         } else if !drawable {
-                            // Drawability includes text clearance, so a word born
-                            // under dense output does not claim a §5.2 slot.
                             KittyShownAs::PawFallbackFloor
                         } else if is_animal {
                             if animal_slots < MAX_ANIMALS {
@@ -4926,8 +4902,6 @@ impl WordDecorations {
         self.super_until = None;
         self.prune_ignitions(now);
         if cfg.reduced_motion {
-            // reduced_motion suppresses the supernova outright (the word keeps
-            // its static rainbow); perf_reduced degrades via freeze/thaw.
             return None;
         }
         let mut until: Option<Instant> = None;
@@ -5017,7 +4991,6 @@ impl WordDecorations {
             until = Some(until.map_or(end, |u: Instant| u.max(end)));
             self.super_until = Some(self.super_until.map_or(end, |u: Instant| u.max(end)));
             if now < start {
-                // Distinct branch.
                 continue;
             }
             if self.supers.len() < supernova::MAX_ACTIVE_SUPERNOVAE {
@@ -5101,7 +5074,6 @@ impl WordDecorations {
             }
             until = Some(until.map_or(start + d, |u: Instant| u.max(start + d)));
             if now < start {
-                // Distinct branch.
                 continue;
             }
             if self.novas.len() >= nova::MAX_ACTIVE_NOVAS {
@@ -5236,7 +5208,6 @@ fn grant_ignition(
         for reservation in igns.iter() {
             let (t, c) = (reservation.start, reservation.center);
             if t > slot || t + IGNITION_WINDOW <= slot {
-                // Distinct branch.
                 continue;
             }
             count += 1;
@@ -5526,7 +5497,6 @@ fn split_super_selection(quads: &mut Vec<GlowQuad>, n0: usize, geom: EffectGeom,
         if replaced {
             i += 1;
         } else {
-            // Distinct branch.
             quads.remove(i);
         }
     }
@@ -5632,8 +5602,6 @@ fn ink_fx(
         let pair = (hue_nudge(core, n0), hue_nudge(fringe, n1));
         let done = ep.is_none_or(|e| e.nova_done);
         if cfg.reduced_motion || done {
-            // §6.1 Ember: the settled gradient shifted to the palette's ember
-            // tone (reduced_motion takes it from frame 0 — the static glint).
             fx.pair = Some(nova::ember_pair(pair, magic));
         } else {
             fx.pair = Some(pair);
@@ -6215,7 +6183,6 @@ fn emit_peek<'a>(
         }
         let t = now.saturating_duration_since(ps).as_millis() as u64;
         if peek.peek_done || t >= total {
-            // Distinct branch.
             return None;
         }
         arm_until(active_until, ps + Duration::from_millis(total));
@@ -6246,7 +6213,6 @@ fn emit_peek<'a>(
         }
     };
     if reveal <= 0 {
-        // Distinct branch.
         return None;
     }
     let vh = reveal.min(rest);
@@ -6344,21 +6310,8 @@ fn feline_glow_env(t_ms: u64, window_ms: u64, amp: f32) -> f32 {
     amp * carrier * (1.0 - p)
 }
 
-/// The share of its own contrast with the page a self-glowing word keeps on a
-/// light ground ([`paper_glow_scale`]). A trail body under the word is solved so the
-/// theme's text keeps `cursor_glow::BODY_CONTRAST_BAR` (5.25:1) over it and
-/// lands near 5:1 once its rounding and dither composite, so a word that keeps
-/// 4.5 / 5.0 of its contrast still reads at 4.5:1 over such a body.
 const PAPER_GLOW_KEEP: f32 = 0.9;
 
-/// The share of its envelope a self-glow `mix(fg, lit, glow)` lifts by on the
-/// word's ground `bg`, for an envelope that peaks under `amp`. On a dark
-/// ground the lift raises the word's contrast, and the glow stands as asked
-/// (`1`). On a light one a lift toward white is a fade: the whole pulse is
-/// scaled down until even `amp` leaves the lit ink [`PAPER_GLOW_KEEP`] of the
-/// word's own contrast, so it keeps its shape (no plateau at a clamp, no dip
-/// back to the word's ink), and a word that glows as a Return commits it, with
-/// a trail's band still lit beneath it, never drops under 4.5:1.
 fn paper_glow_scale(fg: u32, lit: u32, bg: u32, amp: f32) -> f32 {
     let (lum_fg, lum_bg) = (relative_luminance(fg), relative_luminance(bg));
     if lum_bg <= lum_fg || amp <= 0.0 {
@@ -6430,14 +6383,12 @@ fn emit_ink(
             let window = u64::from(window_ms.max(1));
             let t = now.saturating_duration_since(occ.appeared).as_millis() as u64;
             if cfg.reduced_motion || t >= window {
-                // Distinct branch.
                 return;
             }
             let until = occ.appeared + Duration::from_millis(window);
             arm_until(active_until, until);
             let glow = feline_glow_env(t, window, amp);
             if glow <= 0.0 {
-                // Distinct branch.
                 return;
             }
             let frame_term = frame.wrapping_mul(0x9E37_79B1);
@@ -6504,8 +6455,6 @@ fn emit_ink(
         };
         (center, 0.65 * ramp_in * ramp_out)
     } else {
-        // Settled (or reduced motion): zero highlight ⇒ the emitted bytes are
-        // exactly mix_rgb(base_fg, base(u), strength) — constant forever.
         (0.0, 0.0)
     };
     let mid_raw = mix_rgb(
@@ -6535,7 +6484,6 @@ fn emit_ink(
         };
         let mut color = mix_rgb(rgb3_to_u32(fg_rgb), raw, strength);
         if fx.dim < 1.0 {
-            // §6.1 Dip: the whole ink envelope dims ~35 % — the indrawn breath.
             color = dim_rgb(color, fx.dim);
         }
         let cell = InkCell {
@@ -6551,8 +6499,6 @@ fn emit_ink(
     }
     if animating {
         let until = if ink_loop {
-            // A looping sweep never settles while visible; keep the scheduler's
-            // is_active chain armed one window ahead.
             now + Duration::from_millis(sweep)
         } else {
             occ.appeared + Duration::from_millis(sweep + INK_FADE_MS)
@@ -6978,7 +6924,6 @@ fn cat_peek_plan(
     let body = (i64::from(g.hart) - i64::from(g.chin)).max(0);
     let band_rows = usize::try_from((body + ch - 1) / ch).unwrap_or(0);
     if band_rows == 0 {
-        // A head with no body outside the word row disturbs nothing either way.
         return Some(PeekDir::Up);
     }
     let trigger = usize::from(row);
@@ -17136,14 +17081,6 @@ mod trick_flash_hook_tests {
         wd.rescan(term, 4, 40, &lex, &c, 2, t0);
     }
 
-    /// ON PAPER A GLOWING WORD KEEPS ITS LETTERS OVER A TRAIL'S BAND: `kitty`
-    /// in GitHub Light's text on its page, ticked across its whole glow: every
-    /// lit cell keeps 4.5:1 over a grey ground where the theme's text reads
-    /// 5:1 (a trail body at its bar, as it composites), the word still lifts,
-    /// and the lift follows the envelope (a scaled pulse, not one cut flat at
-    /// a clamp). Negative control: the unbounded lift on the same word, at
-    /// the envelope's peak, falls under 4.5:1 over that ground. On a dark
-    /// ground the glow stands as asked.
     #[test]
     fn on_paper_a_glowing_word_keeps_its_letters_over_a_trails_band() {
         use crate::color_math::contrast_ratio;
@@ -17207,8 +17144,6 @@ mod trick_flash_hook_tests {
         );
     }
 
-    /// With no live flash (even a pending one), a wordless tick returns empty
-    /// ink, fp 0 and a `None` deadline.
     #[test]
     fn a_wordless_screen_with_no_flash_still_returns_fp_zero_and_disarms() {
         let t0 = Instant::now();
@@ -17364,8 +17299,6 @@ mod trick_flash_hook_tests {
         };
         let mut free = Vec::new();
 
-        // Exact-size custom sprite (w=36, h=36 at cell_h=20 -> max_h=36, s=1.0 -> (36, 36))
-        // should blit directly from `cust.rgba` without allocating `cache_rgba`.
         let exact_rgba: Arc<[u8]> = vec![200u8; 36 * 36 * 4].into();
         wd.set_kitty_sprite_source(KittySpriteSource::Custom {
             source_fp: 0x1111,
@@ -17381,7 +17314,6 @@ mod trick_flash_hook_tests {
             "exact-size custom sprite must blit directly without allocating resample cache"
         );
 
-        // Non-matching size (8x8 -> resampled to 36x36) allocates once and reuses across reloads.
         let small_a: Arc<[u8]> = vec![120u8; 8 * 8 * 4].into();
         wd.set_kitty_sprite_source(KittySpriteSource::Custom {
             source_fp: 0x2222,

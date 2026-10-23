@@ -152,7 +152,7 @@ pub(crate) fn run_in(
             live::opening(&ghostty.app);
             // Arguments, not environment: variables do not survive `open -na`,
             // and ghostty refuses a direct CLI launch.
-            let status = command("open")
+            let status = command(aterm_uds::os_path!("open"))
                 .arg("-na")
                 .arg(&ghostty.app)
                 .arg("--args")

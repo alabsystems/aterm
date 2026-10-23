@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The channel's tests: the index plan and its compare-and-swap, the mirror, the `rustc`
-//! group's preflight and re-checks, the candidate gate, the seed pin, the release host
-//! adapter, the signer's identity, and the producer→client proof.
-//!
-//! Every host is a [`FakeHost`] (or a wrapper adding one failure mode), every key is minted
-//! in-process by the shipping signer, and every "verified" is the client's chain.
+//! Tests for channel index planning, publishing, mirroring, and verification.
 
 mod agh_read_contract;
 mod conformance_index_publish;
@@ -43,7 +38,7 @@ pub fn scratch(label: &str) -> aterm_tempfile::TempDir {
         .expect("scratch dir")
 }
 
-/// An `index.toml` this machine would sign, with every channel key spelled out.
+/// An index manifest this machine would sign, with every channel key spelled out.
 #[derive(Clone, Debug)]
 pub struct Doc {
     pub index_build: u64,
@@ -170,7 +165,6 @@ impl Rig {
         let home = tmp.path().join("home");
         let host = Arc::new(FakeHost::new());
         let mut ctx = keys.ctx(&home, host.clone());
-        // Hermetic: never the operator's dist/ roster.
         ctx.repo_root = tmp.path().join("repo");
         ctx.state_dir = tmp.path().join("state");
         std::fs::create_dir_all(ctx.tokens.channel.parent().expect("secrets dir"))
@@ -212,8 +206,8 @@ impl Rig {
         self.keys.write_quad(dir, &doc.render(&self.keys));
     }
 
-    /// A signed pack of `program` `build` carrying one row per target, laid on `owner`'s
-    /// `<repo>` release `atpkg-<program>-<build>` (assets, manifest, signature).
+    /// A signed pack of `program` `build` carrying one row per target, laid on `owner`'s `<repo>`
+    /// release `atpkg-<program>-<build>` (assets, manifest, signature).
     pub fn lay_pack(&self, owner: &str, program: &str, build: u64, targets: &[&str]) -> Pack {
         let pack = self.pack(program, build, targets);
         let slug = Slug::new(owner, &pack.repo);
@@ -277,11 +271,10 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     atpkg::sha256_file(&path).expect("hash")
 }
 
-/// `git -C <dir> <args…>` for a fixture ([`atpkg_publish::testkit::git`]), with a fixed
-/// identity and no signing; its trimmed stdout.
+/// `git -C <dir> <args…>` for a fixture ([`atpkg_publish::testkit::git`]), with a fixed identity
+/// and no signing; its trimmed stdout.
 ///
 /// # Panics
-///
 /// When git fails — a broken fixture.
 pub fn git(dir: &Path, args: &[&str]) -> String {
     let out = atpkg_publish::testkit::git()
@@ -296,8 +289,6 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "init.defaultBranch=main",
-            // No template: a fixture repository carries no sample hooks, no description and
-            // no info/exclude, files every test lays down and removes and nothing reads.
             "-c",
             "init.templateDir=",
         ])
@@ -314,15 +305,12 @@ pub fn git(dir: &Path, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
-/// A fresh repository at `dir` with `commits` commits of one file, checked out; its
-/// HEAD. The history is one `git fast-import` stream, not a commit per process, and each
-/// count is made once per process and laid down after (no test reads its dates).
+/// Creates a fresh repository at `dir` with `commits` commits and returns its HEAD.
 pub fn repo(dir: &Path, commits: usize) -> String {
     static MADE: Made<usize, String> = Mutex::new(BTreeMap::new());
     made_once(&MADE, &commits, dir, |dir| make_repo(dir, commits))
 }
 
-/// [`repo`], made.
 fn make_repo(dir: &Path, commits: usize) -> String {
     use std::io::Write as _;
     std::fs::create_dir_all(dir).expect("mkdir repo");
@@ -350,8 +338,6 @@ fn make_repo(dir: &Path, commits: usize) -> String {
     let mut child = atpkg_publish::testkit::git()
         .arg("-C")
         .arg(dir)
-        // One pack, not a loose object (and a directory) per object: below its unpack limit
-        // fast-import explodes what it wrote, and every test lays the tree down and removes it.
         .args(["-c", "fastimport.unpackLimit=0", "fast-import", "--quiet"])
         .stdin(aterm_uds::spawnfd::Stdio::piped())
         .spawn()

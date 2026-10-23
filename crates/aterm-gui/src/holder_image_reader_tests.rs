@@ -1019,3 +1019,40 @@ fn a_watch_turns_the_byte_arms_c_cuts_and_rereads_off() {
         );
     }
 }
+
+/// THE READER COUNTS THE FEEDS THAT MOVE THE SCREEN ([`crate::vitals_host::ScreenMoves`]), under
+/// its own hold of the term lock, so the output wake reads the count without that lock
+/// (`docs/measured/vitals-3-2026-10-22.md`, V1). Muse Code 1.4.12's write at rest in the forever
+/// lab (`subscribe … bytes`: colours reset, the cursor put back) counts nothing; a prompt drawn
+/// counts one, and a byte typed after it one more. NEGATIVE CONTROL: the moving writes. MUTANTS
+/// caught: the reader not counting; every feed counted.
+#[test]
+fn the_reader_counts_only_the_feeds_that_move_the_screen() {
+    const MUSE_AT_REST: &[u8] = b"\x1b[39m\x1b[49m\x1b[59m\x1b[0m\x1b[18;3H";
+    let shell = 8100;
+    set_image(shell, zsh(shell));
+    let rig = Rig::attach(9320, shell, SHIPPING);
+    set_fg(rig.session.master, shell);
+    let fed = |bytes: &[u8]| {
+        let before = rig.wakes.lock().unwrap().len();
+        let mut sent = 0;
+        while sent < bytes.len() {
+            // SAFETY: Bounded write of a live slice to the test-owned slave.
+            let wrote = unsafe {
+                libc::write(rig.slave, bytes[sent..].as_ptr().cast(), bytes.len() - sent)
+            };
+            assert!(wrote > 0, "write {bytes:?}");
+            sent += wrote.cast_unsigned();
+        }
+        let woke = aterm_spec::wait::within(PATIENCE, Duration::from_millis(1), || {
+            (rig.wakes.lock().unwrap().len() > before).then_some(())
+        });
+        assert!(woke.is_some(), "the reader fed {bytes:?} and woke the loop");
+        rig.session.ctx.screen_moves.count()
+    };
+    let drawn = fed(b"$ ");
+    assert!(drawn >= 1, "the prompt moved the screen: {drawn}");
+    assert_eq!(fed(MUSE_AT_REST), drawn, "the colour reset moved no cell");
+    assert_eq!(fed(MUSE_AT_REST), drawn, "nor again");
+    assert_eq!(fed(b"x"), drawn + 1, "a byte drawn moved it");
+}

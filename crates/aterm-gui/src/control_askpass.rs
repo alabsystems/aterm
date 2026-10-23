@@ -71,8 +71,8 @@ pub(crate) fn serve(
     if crate::spare::askpass_refused(invoker_pid) {
         return public_reply("ERR askpass refused no such session\n");
     }
-    let command = ps_command_line(sudo_pid);
-    let invoker = ps_command_line(invoker_pid);
+    let command = argv.as_deref().map(display_line).unwrap_or_default();
+    let invoker = command_line(invoker_pid);
     if command.is_empty() {
         return public_reply("ERR askpass refused command-unreadable\n");
     }
@@ -122,23 +122,33 @@ fn peer_is_our_binary(pid: i32) -> bool {
     }
 }
 
-/// Reads and escapes `pid`'s command line via `/bin/ps` for display on the sheet.
+/// `words` as the sheet shows a command line: joined by spaces and escaped as
+/// `/bin/ps -ww -o args=` escaped it (`aterm_sysprobe::kproc::vis`), then escaped
+/// again so no control or bidi byte can forge the sheet. A display only, never a
+/// classification.
 #[cfg(target_os = "macos")]
-fn ps_command_line(pid: i32) -> String {
-    if pid <= 0 {
-        return String::new();
-    }
-    let out = aterm_uds::spawnfd::command("/bin/ps")
-        .args(["-ww", "-o", "args=", "-p", &pid.to_string()])
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .output();
-    let line = out
+fn display_line(words: &[String]) -> String {
+    let joined = words.join(" ");
+    let shown = aterm_sysprobe::kproc::vis(joined.as_bytes(), aterm_sysprobe::kproc::Locale::Utf8)
+        .unwrap_or(joined);
+    crate::askpass::escape_display(shown.trim())
+}
+
+/// The invoker's command line for the sheet: what `/bin/ps -ww -o args=`
+/// printed, read in process (`aterm_sysprobe::kproc::ps_args`: its argv where
+/// the kernel hands it over, its image's path for another user's process),
+/// then escaped as [`display_line`] escapes. Empty when no process has `pid`.
+#[cfg(target_os = "macos")]
+fn command_line(pid: i32) -> String {
+    let Some(record) = u32::try_from(pid)
         .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    crate::askpass::escape_display(&line)
+        .filter(|&pid| pid > 0)
+        .and_then(aterm_sysprobe::kproc::record)
+    else {
+        return String::new();
+    };
+    let line = aterm_sysprobe::kproc::ps_args(&record, aterm_sysprobe::kproc::Locale::Utf8);
+    crate::askpass::escape_display(line.trim())
 }
 
 /// Classifies whether `sudo`'s direct target executable in `argv` is a debugger, returning `Err(())` if `argv` is absent or ambiguous.
@@ -327,5 +337,68 @@ mod debugger_tests {
         ] {
             assert!(sudo_target_is_debugger(Some(&argv)).is_err(), "{argv:?}");
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod display_tests {
+    use super::{command_line, display_line};
+    use std::io::BufRead;
+
+    /// `/bin/ps -ww -o args= -p <pid>` in `locale`, the reader [`command_line`]
+    /// replaced, as its oracle, escaped as the sheet escapes.
+    fn ps_says(pid: u32, locale: &str) -> String {
+        let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"))
+            .env("LC_ALL", locale)
+            .args(["-ww", "-o", "args=", "-p"])
+            .arg(pid.to_string())
+            .output()
+            .expect("run ps");
+        crate::askpass::escape_display(String::from_utf8_lossy(&out.stdout).trim())
+    }
+
+    /// The sheet's command lines are what `ps` printed: the invoker's read in
+    /// process, sudo's from the argv the classification read, for a process
+    /// whose words hold a space, a newline, a tab and a non-ASCII letter.
+    /// NEGATIVE CONTROL: `ps` in the C locale escapes the letter, so the
+    /// comparison can fail; a pid no process holds shows nothing.
+    #[test]
+    fn the_command_lines_are_what_ps_printed() {
+        let mut child = aterm_uds::spawnfd::command(aterm_uds::os_path!("sh"))
+            .args([
+                "-c",
+                "echo up; read x",
+                "sh",
+                "a b",
+                "new\nline",
+                "t\tab",
+                "café",
+            ])
+            .stdin(aterm_uds::spawnfd::Stdio::piped())
+            .stdout(aterm_uds::spawnfd::Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        // Its argv is the shell's once it says so: read before that, it is ours.
+        let mut up = String::new();
+        std::io::BufReader::new(child.stdout.take().expect("stdout"))
+            .read_line(&mut up)
+            .expect("the child's line");
+        assert_eq!(up, "up\n");
+        let pid = child.id();
+        let oracle = ps_says(pid, "en_US.UTF-8");
+        assert!(
+            oracle.contains("café") && oracle.contains("\\012"),
+            "{oracle}"
+        );
+        assert_eq!(command_line(i32::try_from(pid).unwrap()), oracle);
+        let argv = atpkg::caller_shell::process_args(pid)
+            .expect("its argv")
+            .argv;
+        assert_eq!(display_line(&argv), oracle);
+        assert_ne!(ps_says(pid, "C"), oracle);
+        assert_eq!(command_line(i32::MAX), "");
+        assert_eq!(command_line(0), "");
+        drop(child.stdin.take());
+        let _ = child.wait();
     }
 }

@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Fabric bridge runtime (`aterm-link serve`).
-//!
-//! Connects one local `aterm` instance (over inherited verb and push descriptors or
-//! observer socket) to the `astream` broker: publishes session presence, `ev` records,
-//! outbound posts, and receipts under the node capability; drains `/f/<F>/in/<node>/>`
-//! and `fleet/>` into the endpoint with pipelined group commits; enforces per-producer
-//! subject budgets; and reports broker link health (`link up` / `link down`).
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
@@ -1421,7 +1415,6 @@ impl Bridge {
             return Ok(Some(ident));
         }
         if !no_ring {
-            // The attach's own `Hello` answered none: a broker before identity.
             return Ok(None);
         }
         let started = fx.now();
@@ -2249,8 +2242,6 @@ impl Bridge {
             return;
         }
         if !self.refill_pending_admissions(true) {
-            // `Unaccounted` can leave the publisher connection open, so the
-            // failed refill must force this transition itself.
             self.conn = None;
         }
     }
@@ -2345,9 +2336,6 @@ impl Bridge {
     fn on_inbox_record(&mut self, rec: &BrokerRecord) {
         let (off, subject, body) = rec;
         if self.conn.is_none() {
-            // A failed live admission left this old subscription's record
-            // queued. The group has not committed it; reconnect will reoffer
-            // it after the pending session's refill.
             return;
         }
         if let Ok(addr) = subject::parse_in(&self.cfg.fleet, &self.node, subject) {
@@ -2477,9 +2465,6 @@ impl Bridge {
             return;
         }
         if self.fan_in_say(frontier, *off, subject, raw) == Delivery::Unaccounted {
-            // The aterm lane was lost, or a required refill floor was not
-            // written. The frontier sweep must not move the cursor that
-            // deliver_broadcast just declined to advance.
             return;
         }
         self.advance_frontier(frontier, next);
@@ -3000,13 +2985,6 @@ impl Bridge {
             &format!("undeliverable off={off} reason={}", reject.token()),
         );
         if reject == Reject::ForgedSelf {
-            // A forged record on our own lane means somebody else holds the node
-            // cap; that is not a delivery problem, it is a compromise, and its
-            // remedy is a new mint secret — every cap minted under the old one
-            // refused at attach (re-minting the node cap under the same secret
-            // cuts nothing off). It is therefore only
-            // ever raised on EVIDENCE — see [`Bridge::is_forged_self`], which
-            // fails open below the remembered window rather than accusing.
             self.publish_ev_for(sid, &format!("cap-compromised off={off}"));
         }
     }
@@ -3814,7 +3792,6 @@ impl Bridge {
             return;
         }
         if ours {
-            // A failed write is the drain's landing's to make again.
             let _ = self.remember_self_ack(off);
         }
         self.unsettled.insert(off, seq);
@@ -5071,7 +5048,6 @@ impl Bridge {
             if let Some(v) = tok.strip_prefix("agent=") {
                 sample.agent = Some(v.to_string());
             } else if let Some(v) = tok.strip_prefix("hold=") {
-                // `status` says THAT a hold stands, never whose.
                 sample.hold = EndpointHold::of(v == "1", None);
             } else if let Some(v) = tok.strip_prefix("detail=") {
                 sample.detail = v.to_string();
@@ -5532,8 +5508,7 @@ impl Bridge {
                 pin.identity.as_ref(),
             ) {
                 (Some(actual), Some(original), Some(attempt)) if original != attempt => {
-                    // Verified different semantic identities
-                    // decide ownership without an offset.
+                    // Verified different semantic identities decide ownership without an offset.
                     Some(actual == attempt)
                 }
                 _ => pin.original_off.map(|original_off| off != original_off),
@@ -5624,14 +5599,8 @@ impl Bridge {
             self.retire_at_the_door(post, SUBJECT_BUDGET);
             PostNext::Moves
         } else if self.conn.is_none() {
-            // The transport failed: `observe` dropped the
-            // link, and every session's posts wait for it.
             PostNext::Ends
         } else {
-            // Not known to be permanent — an append that
-            // failed, an older broker's every refusal: the
-            // post stays queued under its pinned sequence,
-            // and only its own session waits with it.
             PostNext::Holds
         }
     }
@@ -6396,8 +6365,6 @@ impl Bridge {
         }
         if self.inbox_pending.is_none() && handed_over.is_some() {
             if let Err(e) = self.state.clear_inbox_owed() {
-                // Harmless if it stays: the group commit is monotone, and the
-                // next attach commits the same offset again.
                 eprintln!("aterm-link: could not clear the inbox commit handed over: {e}");
             }
         }
@@ -7366,8 +7333,6 @@ impl Bridge {
 
 impl Drop for Bridge {
     fn drop(&mut self) {
-        // Reader threads own their streams independently. Close every owned
-        // subscription on all returns and unwinds, including direct Drop.
         self.close_subscriptions();
     }
 }

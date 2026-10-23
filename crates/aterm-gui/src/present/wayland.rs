@@ -58,7 +58,6 @@ impl From<aterm_wayland::proxy::Error> for WaylandPresentError {
     }
 }
 
-/// The pool size for a `width` x `height` buffer.
 fn pool_size(width: i32, height: i32) -> Option<usize> {
     let bytes = usize::try_from(width)
         .ok()?
@@ -69,7 +68,6 @@ fn pool_size(width: i32, height: i32) -> Option<usize> {
     fits.then_some(len)
 }
 
-/// A rectangle as `damage_buffer` takes it, or `None` past `i32`.
 fn wl_rect(rect: &DamageRect) -> Option<(i32, i32, i32, i32)> {
     let fits = |v: u32| i32::try_from(v).ok();
     Some((
@@ -80,14 +78,12 @@ fn wl_rect(rect: &DamageRect) -> Option<(i32, i32, i32, i32)> {
     ))
 }
 
-/// A live `wl_buffer` and its release handler.
 struct Live {
     buffer: Proxy,
     /// Freed only after `buffer` is destroyed ([`Buffer::destroy_buffer`]).
     listener: Listener,
 }
 
-/// One pool, and the `wl_buffer` over it at the current size.
 struct Buffer {
     mem: ShmMem,
     pool: Proxy,
@@ -99,7 +95,6 @@ struct Buffer {
     age: u8,
 }
 
-/// XRGB8888, `wl_shm.format`'s 1.
 const FORMAT: u32 = wl_shm::format::XRGB8888;
 
 impl Buffer {
@@ -125,7 +120,6 @@ impl Buffer {
         Ok(b)
     }
 
-    /// A `wl_buffer` of `width` x `height` over the pool, with its release handler ([`pool_size`]).
     fn make_buffer(&mut self, width: i32, height: i32) -> Result<(), WaylandPresentError> {
         let stride = width.checked_mul(4).ok_or(WaylandPresentError::Size(
             width.unsigned_abs(),
@@ -159,7 +153,6 @@ impl Buffer {
         Ok(())
     }
 
-    /// Destroy the live `wl_buffer`, if there is one, then free its listener.
     fn destroy_buffer(&mut self) {
         if let Some(Live { buffer, listener }) = self.live.take() {
             // SAFETY: the live wl_buffer, taken out of `live`, so destroyed
@@ -169,7 +162,6 @@ impl Buffer {
         }
     }
 
-    /// Hold a `width` x `height` buffer.
     fn resize(&mut self, width: i32, height: i32) -> Result<(), WaylandPresentError> {
         if (self.width, self.height) == (width, height) && self.live.is_some() {
             return Ok(());

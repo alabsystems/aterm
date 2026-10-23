@@ -34,7 +34,7 @@ pub struct Table {
 pub const TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
 /// Path to `/usr/bin/sqlite3`.
-pub const SQLITE3: &str = "/usr/bin/sqlite3";
+pub const SQLITE3: &str = aterm_uds::os_path!("sqlite3");
 
 /// Formats [`TCC_DB`] as an immutable `file:` URI for lock-free SQLite reads.
 #[must_use]
@@ -43,7 +43,7 @@ pub fn tcc_target() -> String {
 }
 
 /// Path to `/bin/launchctl`.
-pub const LAUNCHCTL: &str = "/bin/launchctl";
+pub const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
 /// Diagnostic message when the system TCC database cannot be opened over SSH.
 pub const NEEDS_REMOTE_FDA: &str = "turn on Allow full disk access for remote users";

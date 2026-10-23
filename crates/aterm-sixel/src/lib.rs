@@ -20,17 +20,13 @@ pub const SIXEL_MAX_DIMENSION: usize = 4096;
 /// Maximum total pixel count (width × height) of a decoded raster.
 pub const SIXEL_MAX_PIXELS: usize = 4 * 1024 * 1024;
 
-/// The six pixel rows a sixel byte paints, top first: bit `row` of the data
-/// value.
 const SIXEL_ROW_MASKS: [u8; 6] = [1, 2, 4, 8, 16, 32];
 
 /// Maximum decoded-image byte budget (packed RGBA, 4 bytes/px) for a single sixel sequence.
 pub const SIXEL_MAX_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
-/// Maximum numeric parameters a sixel introducer (`#`/`!`/`"`) may accumulate.
 const SIXEL_MAX_PARAMS: usize = 8;
 
-/// Packed `0x00000000` for a fully-transparent pixel (alpha `0x00` = unset).
 const TRANSPARENT: u32 = 0;
 
 /// A decoded sixel raster image.
@@ -345,8 +341,6 @@ impl SixelDecoder {
         (self.declared_w, self.declared_h)
     }
 
-    /// Drop the raster/mask/param buffers (keep palette small; it is reset on
-    /// the next hook).
     fn release(&mut self) {
         self.raster = Vec::new();
         self.params = Vec::new();
@@ -385,7 +379,6 @@ impl SixelDecoder {
         self.params.clear();
     }
 
-    /// `#Pc` (select) or `#Pc;Pu;Px;Py;Pz` (define).
     fn apply_color(&mut self) {
         let Some(&pc) = self.params.first() else {
             return;
@@ -423,12 +416,10 @@ impl SixelDecoder {
         self.pending_repeat = self.params.first().copied().unwrap_or(0);
     }
 
-    /// Paint `count` columns of the 6-bit `bits` pattern starting at `self.x`.
     fn emit_sixel(&mut self, bits: u8, count: u32) {
         let max_run = SIXEL_MAX_DIMENSION.saturating_sub(self.x);
         let count = (count as usize).min(max_run);
         if count == 0 {
-            // Even a clamped-to-zero run must not advance forever; bail.
             return;
         }
         if bits == 0 {
@@ -794,9 +785,6 @@ fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
     let hue = (h + 240.0) % 360.0;
     let chroma_scale = 1.0 - (2.0 * l - 1.0).abs();
     let c = if chroma_scale > 0.0 && chroma_scale <= 1.0 && s > 0.0 && s <= 1.0 {
-        // Written as `mul_add(s, 0.0)` because the verifier's MIR lowering
-        // cannot discharge a float `Mul`/`Add` overflow-to-infinity check even
-        // when operands are branch-pinned.
         chroma_scale.mul_add(s, 0.0)
     } else {
         0.0
@@ -826,14 +814,12 @@ fn hls_to_rgb(h: u32, l: u32, s: u32) -> u32 {
         } else if chan > 0.0 {
             chan.mul_add(255.0, 0.0).round() as u32
         } else {
-            // Covers `chan <= 0.0` and NaN.
             0
         }
     };
     (to_u8(r1) << 16) | (to_u8(g1) << 8) | to_u8(b1)
 }
 
-/// The VT340 default 16-color sixel palette as packed `0x00RRGGBB`.
 fn default_palette() -> Vec<u32> {
     const DEC: [(u32, u32, u32); 16] = [
         (0, 0, 0),

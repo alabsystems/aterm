@@ -17,8 +17,6 @@ fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
         run_total, rle.total_length,
         "sum of run lengths must match total_length at step {step}"
     );
-    // `find_run`'s precondition: no zero-length run, and run starts
-    // accumulate exactly to `total_length`.
     let mut expected_start = 0u32;
     for (run_idx, run) in rle.runs.iter().enumerate() {
         assert!(
@@ -72,8 +70,6 @@ fn assert_rle_matches_model(rle: &Rle<u8>, model: &[u8], step: usize) {
     );
 }
 
-/// `set` of one element, from each row's own starting run layout: the write
-/// lands, the length never changes, and runs split or merge as the row says.
 #[test]
 fn rle_set_single_element() {
     for (what, start, index, value, runs) in [
@@ -81,7 +77,6 @@ fn rle_set_single_element() {
         ("middle splits into three", &[1, 1, 1, 1, 1], 2, 9, 3),
         ("start splits into two", &[1, 1, 1], 0, 9, 2),
         ("end splits into two", &[1, 1, 1], 2, 9, 2),
-        // Setting the middle to match both neighbours compacts to one run.
         ("compacts with both neighbours", &[1, 2, 1], 1, 1, 1),
     ] {
         let mut rle = Rle::from_iter(start.iter().copied());
@@ -92,9 +87,6 @@ fn rle_set_single_element() {
     }
 }
 
-/// The public splice's observed run boundaries refine RleLocalCompactModel.
-/// Its negative control corrupts the captured topology as an omitted right
-/// merge would: the left boundary disappears but the equal right run stays.
 #[test]
 fn local_compaction_observations_refine_the_derived_model() {
     let model = aterm_models_core::rle_local_compact_model();
@@ -107,7 +99,6 @@ fn local_compaction_observations_refine_the_derived_model() {
         if let Some(action) = splice {
             assert!(model.fire(action, &mut before));
         }
-        // Compact outer runs stay outside the splice's two boundaries.
         let mut rle = Rle::from_iter([0u8, 1, 1, 2, 2, 2, 1, 1, 1, 1, 3]);
         rle.set_range(3, 6, value);
         let crosses =
@@ -146,8 +137,6 @@ fn local_compaction_observations_refine_the_derived_model() {
     }
 }
 
-/// `set_range(from, to, value)` over each row's starting layout, then
-/// `(index, value)` probes on both sides of the written range.
 #[test]
 fn rle_set_range_cases() {
     for (what, start, from, to, probes, runs) in [
@@ -214,11 +203,6 @@ fn rle_set_range_cases() {
     }
 }
 
-/// Verify the run-structure invariants across mixed mutation sequences.
-///
-/// This is the `find_run` precondition: run lengths are non-zero and accumulate
-/// exactly to `total_length` after every mutation, so the linear walk lands on
-/// the right run for every in-bounds index.
 #[test]
 fn rle_run_structure_consistent_across_mutations() {
     let mut rle = Rle::from_iter([0u8, 1, 1, 2, 2, 2, 3, 3]);

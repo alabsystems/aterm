@@ -33,7 +33,6 @@ fn parse_esc_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // ESC 7 (save cursor)
     parser.advance_fast(b"\x1b7", &mut sink);
 
     assert_eq!(sink.esc_dispatches.len(), 1);
@@ -45,7 +44,6 @@ fn parse_esc_with_intermediate() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // `ESC ( B` (set G0 to ASCII)
     parser.advance_fast(b"\x1b(B", &mut sink);
 
     assert_eq!(sink.esc_dispatches.len(), 1);
@@ -57,7 +55,6 @@ fn parse_osc_with_bel() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // OSC 0 ; title BEL (set window title)
     parser.advance_fast(b"\x1b]0;My Title\x07", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
@@ -72,7 +69,6 @@ fn parse_osc_with_esc_backslash() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // OSC 0 ; title ESC \ (string terminator)
     parser.advance_fast(b"\x1b]0;Title\x1b\\", &mut sink);
 
     assert_eq!(sink.osc_dispatches.len(), 1);
@@ -88,7 +84,6 @@ fn parse_dcs_passthrough() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // DCS q data ST (Sixel graphics)
     parser.advance_fast(b"\x1bPqABC\x1b\\", &mut sink);
 
     assert_eq!(sink.dcs_hooks.len(), 1);
@@ -101,7 +96,6 @@ fn cancel_aborts_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // CAN (0x18) inside a CSI cancels it and is executed.
     parser.advance_fast(b"\x1b[31\x18Hello", &mut sink);
 
     assert!(sink.executes.contains(&0x18));
@@ -114,7 +108,6 @@ fn esc_interrupts_sequence() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // ESC inside a CSI starts a new sequence.
     parser.advance_fast(b"\x1b[31\x1b[32m", &mut sink);
 
     assert_eq!(sink.csi_dispatches.len(), 1);
@@ -126,23 +119,21 @@ fn reset_clears_state() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // Parse partial sequence
     parser.advance_fast(b"\x1b[31", &mut sink);
     assert_eq!(parser.state(), State::CsiParam);
 
     parser.reset();
 
     assert_eq!(parser.state(), State::Ground);
-    // Parse new sequence
     parser.advance_fast(b"\x1b[32m", &mut sink);
     assert_eq!(sink.csi_dispatches.len(), 1);
     assert_eq!(sink.csi_dispatches[0].0, vec![32]);
 }
 
 /// Every introducer ends where its terminator says, in both C1 modes:
-/// `ESC [` with every digit
-/// and every final byte (0x40..=0x7E), `ESC ]` with every printable data
-/// byte and BEL, and `ESC P q` with ST all leave the parser at `Ground`.
+/// `ESC [` with every digit and every final byte (0x40..=0x7E), `ESC ]` with
+/// every printable data byte and BEL, and `ESC P q` with ST all leave the
+/// parser at `Ground`.
 #[test]
 fn every_introducer_terminates() {
     let mut streams: Vec<Vec<u8>> = Vec::new();

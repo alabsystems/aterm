@@ -97,12 +97,7 @@ pub(crate) fn pin_input_clock(now: Option<std::time::Instant>) {
     INPUT_CLOCK.with(|clock| clock.set(now));
 }
 
-/// Where a predict test's timeline starts: ten seconds back, past the longest
-/// glitch window. A wall-clock read left on a render path's reconcile or paint
-/// then ages every guess past its window and fails the tests on that path on
-/// their first run; a press stamp read off the wall clock is caught only by
-/// the privacy rig (`app_input_predict_privacy_tests`), whose echoes then
-/// arrive before their presses, so its slow-link control measures no slow link.
+/// Where a predict test's timeline starts.
 #[cfg(test)]
 pub(crate) fn past_timeline_start() -> std::time::Instant {
     const BACK_MS: u64 = 10_000;
@@ -124,8 +119,7 @@ const ORDERED_EGRESS_WITNESS_GRACE: std::time::Duration = std::time::Duration::f
 #[derive(Default)]
 pub(crate) struct OutputEchoTracker {
     active_writes: AtomicUsize,
-    /// Every attempt to write input to the session (a key, a paste, a raw editor frame, a
-    /// controller's `send`).
+    /// Every attempt to write input to the session.
     sent: AtomicU64,
     published: Mutex<OutputEchoPublished>,
     /// The Enters among those writes that submitted something composed since the last
@@ -133,8 +127,7 @@ pub(crate) struct OutputEchoTracker {
     submit: crate::submit_count::SubmitCount,
 }
 
-/// How a paste's insert is priced for the cursor engine ([`DeliveryTicket::insert`]), from the text
-/// the formatter sends.
+/// How a paste's insert is priced for the cursor engine ([`DeliveryTicket::insert`]).
 pub(crate) fn paste_insert_width(text: &str, ambiguous_width_double: bool) -> InsertWidth {
     use aterm_core::terminal::Terminal;
     if let Some(cells) = Terminal::paste_insert_cells(text, ambiguous_width_double) {
@@ -152,11 +145,9 @@ pub(crate) fn paste_insert_width(text: &str, ambiguous_width_double: bool) -> In
 pub(crate) struct DeliveryTicket {
     /// A delivered insert's width.
     pub(crate) insert: Option<InsertWidth>,
-    /// The window that dispatched a key: the one whose engines banked the press, and the only one
-    /// the key class is re-stamped on.
+    /// The window that dispatched a key.
     pub(crate) window: Option<WindowId>,
-    /// The key's licence class, revoked at enqueue and re-stamped at delivery on [`Self::window`]
-    /// (`CursorGlow::note_delivered`).
+    /// The key's licence class ([`Self::window`]).
     pub(crate) key: Option<DeliveredClass>,
     /// When the bytes were dispatched at the input seam.
     pub(crate) dispatched_at: std::time::Instant,
@@ -168,32 +159,29 @@ impl DeliveryTicket {
     }
 }
 
-/// One completed delivery: the ticket, its serial (monotone per session), and when the sink
-/// accepted the bytes.
+/// One completed delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct DeliveryReceipt {
     pub(crate) serial: u64,
     delivered_us: u64,
     pub(crate) ticket: DeliveryTicket,
-    /// The write failed: nothing reached the PTY and nothing ever will.
+    /// The write failed.
     failed: bool,
 }
 
 /// How many delivery receipts the tracker keeps for the render prelude.
 pub(crate) const DELIVERY_RING: usize = 2 * aterm_effects::cursor_glow::TYPED_STAMP_DEPTH;
 
-/// The deliveries a window has not yet applied, in serial order
-/// ([`OutputEchoTracker::deliveries_after`]).
+/// The deliveries a window has not yet applied ([`OutputEchoTracker::deliveries_after`]).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Deliveries {
-    /// The newest resolved serial — what the window records as seen.
+    /// The newest resolved serial.
     pub(crate) latest: u64,
     /// `(delivery instant on the frame's clock, ticket)`, oldest first.
     pub(crate) items: [Option<(std::time::Instant, DeliveryTicket)>; DELIVERY_RING],
     /// The queued writes that failed, oldest first.
     pub(crate) failed: [Option<DeliveryTicket>; DELIVERY_RING],
-    /// Receipts newer than the reader's baseline that the ring had overwritten before this read,
-    /// reported once.
+    /// Receipts newer than the reader's baseline that the ring had overwritten before this read.
     pub(crate) evicted: u64,
 }
 
@@ -357,8 +345,7 @@ impl OutputEchoTracker {
         write
     }
 
-    /// How many input writes have been attempted on the session: keys, pastes, raw editor frames
-    /// and controller sends.
+    /// How many input writes have been attempted on the session.
     #[must_use]
     pub(crate) fn input_sent(&self) -> u64 {
         self.sent.load(Ordering::Acquire)
@@ -492,8 +479,7 @@ impl OutputEchoTracker {
         }
     }
 
-    /// Publish one state-affecting acceptance in sink order, and its delivery ticket if any, in one
-    /// `published` hold.
+    /// Publish one state-affecting acceptance in sink order.
     fn publish(
         &self,
         order: AcceptedOrder,
@@ -549,8 +535,7 @@ impl OutputEchoTracker {
         }
     }
 
-    /// Publish one ticketed write that failed: the writer thread's answer for a queued key whose
-    /// bytes never reached the PTY.
+    /// Publish one ticketed write that failed.
     fn publish_failed(&self, ticket: DeliveryTicket, stamp: u64) {
         let mut published = self
             .published
@@ -624,8 +609,7 @@ pub(crate) fn tracked_egress(
     tracked_egress_ticketed(term, modes, sink, tracker, ev, mode, None)
 }
 
-/// The one egress law: begin the echo write (kind derived from the event, ticket published as a
-/// [`DeliveryReceipt`] on acceptance).
+/// The one egress law ([`DeliveryReceipt`]).
 pub(crate) fn tracked_egress_ticketed(
     term: &Mutex<Terminal>,
     modes: &ModeMirror,
@@ -691,16 +675,15 @@ fn ime_compose_on_preedit(
 /// The surface that owns one window's in-flight IME composition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PreeditOwner {
-    /// No composition in flight — every splice is a zero-cost no-op.
+    /// No composition in flight.
     None,
-    /// A frontmost native view (Settings, editor): its own text-input pipeline paints the preedit
-    /// (`App::native_preedit_active`).
+    /// A frontmost native view (Settings, editor).
     Native,
     /// The inline tab-rename field.
     Rename,
-    /// The open find field: the composition belongs in the find bar's well.
+    /// The open find field.
     Find,
-    /// No field has focus: the composition splices into the grid at the caret.
+    /// No field has focus.
     Grid,
 }
 
@@ -752,8 +735,7 @@ pub(crate) fn keystroke_click_audible(
     .is_none()
 }
 
-/// What kind of glyph the key landed, for Rainbow Kitty's engine
-/// ([`aterm_effects::rainbow_kitty::TypedClass`]).
+/// What kind of glyph the key landed ([`aterm_effects::rainbow_kitty::TypedClass`]).
 #[inline]
 pub(crate) const fn typed_class_for(
     typed: Option<char>,
@@ -773,8 +755,7 @@ pub(crate) const fn typed_glyph_class(typed: Option<char>) -> u8 {
     aterm_effects::trail_sound::typed_glyph_class(typed)
 }
 
-/// What the keyed click says about its key: the gesture kind, the shift, the glyph class and the
-/// alphabet rank.
+/// What the keyed click says about its key.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct KeyClickStamp {
     pub(crate) kind: aterm_effects::trail_sound::SoundKind,
@@ -783,8 +764,7 @@ pub(crate) struct KeyClickStamp {
     pub(crate) rank: u8,
 }
 
-/// The keyed click's stamp: normally the key's own (spacebar or typed click, the capital's shift,
-/// the glyph's class and rank).
+/// The keyed click's stamp.
 pub(crate) fn key_click_stamp(
     secret: bool,
     spacebar: bool,
@@ -824,8 +804,7 @@ pub(crate) const fn typed_glyph_rank(typed: Option<char>) -> u8 {
     aterm_effects::trail_sound::typed_glyph_rank(typed)
 }
 
-/// Whether an input event carries fresh, discrete intent that may start one new bounded
-/// presentation-recovery episode.
+/// Whether an input event carries fresh.
 #[inline]
 pub(crate) const fn is_present_recovery_stimulus(ev: &InputEvent) -> bool {
     !matches!(
@@ -837,8 +816,7 @@ pub(crate) const fn is_present_recovery_stimulus(ev: &InputEvent) -> bool {
     )
 }
 
-/// Test-only observation of the real physical-release routing branch, compiled out of shipping
-/// builds.
+/// Test-only observation of the real physical-release routing branch.
 #[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PhysicalReleaseTrace {
@@ -973,8 +951,7 @@ const _: () = {
     assert!(!native_binding_allowed(Action::Copy));
 };
 
-/// Per-session ordered egress serializer, so pastes and keystrokes reach the PTY in submission
-/// order.
+/// Per-session ordered egress serializer.
 pub(crate) mod paste_order {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -1139,8 +1116,7 @@ pub(crate) mod paste_order {
     pub(super) enum Rejected {
         /// The queue is full now.
         Full,
-        /// The input's charge (owned capacity included) exceeds the queue even when it is empty —
-        /// waiting cannot help, splitting it can.
+        /// The input's charge (owned capacity included) exceeds the queue even when it is empty.
         TooLarge,
         Unavailable,
     }
@@ -1157,7 +1133,7 @@ pub(crate) mod paste_order {
             .ok()
     }
 
-    /// A deferred egress: run `seam_egress(term, sink, ev)` on the writer thread.
+    /// A deferred egress.
     struct Job {
         term: Arc<Mutex<Terminal>>,
         modes: Arc<ModeMirror>,
@@ -1167,14 +1143,14 @@ pub(crate) mod paste_order {
         ev: InputEvent,
         /// What this write's completion re-stamps on the cursor engines.
         ticket: Option<DeliveryTicket>,
-        /// The key-arrival stamp claimed at enqueue, so the writer books the true key→write slice.
+        /// The key-arrival stamp claimed at enqueue.
         key_ns: u64,
         /// A visible press queued behind this sink's paste, never the paste or a key release.
         hot_key: Option<(u64, Option<EventLoopProxy<Wake>>)>,
         /// A large paste's progress and stop.
         meter: Option<Arc<BulkMeter>>,
         completion: Option<crate::control_input_ack::InputCompletion>,
-        /// Who waits for this write's own receipt ([`Written`]): a control lane's reply.
+        /// Who waits for this write's own receipt ([`Written`]).
         written: Option<SyncSender<crate::input::EgressReceipt>>,
         /// Last field: payloads above are dropped before capacity is returned.
         _reservation: Reservation,
@@ -1255,8 +1231,7 @@ pub(crate) mod paste_order {
         SUBMITTED.with(std::cell::Cell::get)
     }
 
-    /// One session's serializer: the FIFO sender and a `Weak` to the session sink so a closed tab's
-    /// entry can be pruned.
+    /// One session's serializer.
     struct Serializer {
         tx: SyncSender<Job>,
         sink: Weak<SinkWriter>,
@@ -1279,8 +1254,7 @@ pub(crate) mod paste_order {
         })
     }
 
-    /// The writer thread body: drain jobs in FIFO order, writing each through the seam the inline
-    /// path uses.
+    /// The writer thread body.
     fn run(rx: Receiver<Job>, sink: Weak<SinkWriter>, idle_check: Duration) {
         loop {
             let job = match rx.recv_timeout(idle_check) {
@@ -1329,9 +1303,6 @@ pub(crate) mod paste_order {
             && let Some(wake) = completed_queued_key_wake(receipt, Some(session))
             && let Some(proxy) = proxy
         {
-            // Reconsider a content frame already deferred at the full,
-            // pre-key interval. A spill merely retires its FIFO job and
-            // preserves the original bounded arrival-time priority.
             let _ = proxy.send_event(wake);
         }
     }
@@ -1583,10 +1554,6 @@ pub(crate) mod paste_order {
             "aterm-egress-order",
             crate::qos::Role::Interactive,
             move || {
-                // macOS: this thread does the real PTY write for keys the UI thread
-                // handed off (`enqueue` transfers the key-arrival stamp), so it takes
-                // the UI thread's urgency rather than default QoS, or a key queued
-                // behind a paste would wait on an E-core-parked thread.
                 run(rx, weak_sink, Duration::from_secs(30));
             },
         )
@@ -1607,8 +1574,7 @@ pub(crate) mod paste_order {
         sink.ordered_egress_count() > 0
     }
 
-    /// Wait until this sink's ordered egress has drained: a hang detector
-    /// ([`aterm_spec::wait::MUST_HAPPEN`]).
+    /// Wait until this sink's ordered egress has drained ([`aterm_spec::wait::MUST_HAPPEN`]).
     #[cfg(test)]
     pub(crate) fn await_drain_for_test(sink: &SinkWriter) {
         let _ = aterm_spec::wait::within(
@@ -1820,8 +1786,7 @@ pub(crate) mod paste_order {
         )
     }
 
-    /// [`ordered_or_inline`] with the platform's routing fact explicit, so the
-    /// Windows arm — every key through the writer — runs under test on unix.
+    /// [`ordered_or_inline`] with the platform's routing fact explicit, so the Windows arm.
     #[allow(
         clippy::too_many_arguments,
         reason = "ordered_or_inline's handles plus the one routing fact it is parameterised on"
@@ -1943,7 +1908,7 @@ pub(crate) mod paste_order {
         }
     }
 
-    /// The report egress: mouse, wheel and focus reports from the App's arms.
+    /// The report egress.
     pub(crate) fn report_ordered_or_inline(
         term: &Arc<Mutex<Terminal>>,
         modes: &Arc<ModeMirror>,
@@ -1953,9 +1918,7 @@ pub(crate) mod paste_order {
         report_ordered_or_inline_routed(ui_writes_can_block(), term, modes, sink, ev)
     }
 
-    /// [`report_ordered_or_inline`] with the platform's routing fact explicit,
-    /// so the Windows arm — every report through the writer — runs under test
-    /// on unix.
+    /// [`report_ordered_or_inline`] with the platform's routing fact explicit.
     pub(super) fn report_ordered_or_inline_routed(
         ui_writes_can_block: bool,
         term: &Arc<Mutex<Terminal>>,
@@ -2012,8 +1975,7 @@ pub(crate) mod paste_order {
         }
     }
 
-    /// Test-only: holds this sink's FIFO occupied so the key path takes the ordered branch of
-    /// [`ordered_or_inline`].
+    /// Test-only: holds this sink's FIFO occupied ([`ordered_or_inline`]).
     #[cfg(all(test, unix))]
     pub(crate) struct OrderingPin {
         sink: Arc<SinkWriter>,
@@ -2219,8 +2181,7 @@ fn wheel_viewport_lines(notch_lines: i32, page_rows: u16, detent: bool) -> i32 {
     input::wheel_platform_lines(input::WheelPlatform::Host, notch_lines, page_rows, detent)
 }
 
-/// The modifier-independent (unshifted base) logical key of a winit event, for the keybinding
-/// lookup.
+/// The modifier-independent.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) fn base_logical_key(ev: &KeyEvent) -> Key {
     use aterm_window::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -2319,8 +2280,7 @@ struct FieldStroke<'a> {
     text: Option<&'a str>,
 }
 
-/// The field keymap ([`field_edit_action`] says what it binds), over either projection of a
-/// keystroke.
+/// The field keymap ([`field_edit_action`]).
 fn field_edit_for(stroke: FieldStroke<'_>) -> Option<crate::app_search::SearchEdit> {
     use crate::app_search::SearchEdit;
     use aterm_types::keyboard::NamedKey as TNamed;
@@ -2455,8 +2415,7 @@ fn tab_menu_chord(
     }
 }
 
-/// Whether an open find field suspends a configured `[keybindings]` action so the keystroke drives
-/// the query.
+/// Whether an open find field suspends a configured `[keybindings]` action.
 const fn find_suspends_action(action: keybinding::Action) -> bool {
     use keybinding::Action as A;
     matches!(
@@ -2571,14 +2530,13 @@ fn sampled_release_relevance(session: u64) -> Option<bool> {
     Some(packed & 1 == 1)
 }
 
-/// Mints a fresh App-wide kitty-summon ident: bump the shared sequence first, then namespace the
-/// value under `tag`.
+/// Mints a fresh App-wide kitty-summon ident.
 const fn next_kitty_summon_ident(seq: &mut u64, tag: u64) -> u64 {
     *seq = seq.wrapping_add(1);
     tag ^ *seq
 }
 
-/// What a press hands the predictor: a typed glyph, or an edit key (`Predictor::predict_edit`).
+/// What a press hands the predictor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PredictKey {
     Glyph(char),
@@ -2671,7 +2629,7 @@ fn committed_grapheme_cells_into(text: &str, ambiguous_width_double: bool, out: 
 pub(crate) struct ErasePriceMemory(Vec<u16>);
 
 impl ErasePriceMemory {
-    /// How many entries the memory keeps: the engine's press bank depth (`TYPED_STAMP_DEPTH`).
+    /// How many entries the memory keeps.
     pub(crate) const CAP: usize = crate::cursor_glow::TYPED_STAMP_DEPTH;
 
     /// One typed glyph's width, behind everything already priced.
@@ -2680,8 +2638,7 @@ impl ErasePriceMemory {
         self.trim();
     }
 
-    /// A committed Text/IME run, one width per grapheme in order, using the same width rule as
-    /// [`committed_text_cells`].
+    /// A committed Text/IME run ([`committed_text_cells`]).
     fn price_graphemes(&mut self, text: &str, ambiguous_width_double: bool) {
         if aterm_grapheme::str_width(text) == 0 {
             return;
@@ -2693,20 +2650,18 @@ impl ErasePriceMemory {
         }
     }
 
-    /// `n` priced zeros — a paste's graphemes, each an erase that retires nothing of the press
-    /// ring.
+    /// `n` priced zeros.
     fn push_zeros(&mut self, n: usize) {
         self.0.extend(std::iter::repeat_n(0u16, n));
         self.trim();
     }
 
-    /// The price of the glyph the newest Backspace erases: the newest entry, or `None` for the
-    /// engine's whole-press retire.
+    /// The price of the glyph the newest Backspace erases.
     fn pop(&mut self) -> Option<u16> {
         self.0.pop()
     }
 
-    /// Close the memory: a press that moved the erase point, took the row or banked nothing.
+    /// Close the memory.
     fn clear(&mut self) {
         self.0.clear();
     }
@@ -3065,8 +3020,6 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
     } else if navigation_key || tab_key {
         Some(PetInputKind::Navigate)
     } else if typed.is_some() || ime.is_some() {
-        // A committed IME bundle is one event, including a combining-only
-        // edit that changes a glyph without moving the caret.
         Some(PetInputKind::Text)
     } else {
         None
@@ -3100,14 +3053,13 @@ fn classify_press(ev: &InputEvent) -> PressClass<'_> {
 }
 
 impl PressClass<'_> {
-    /// A line-editing press: a plain Backspace, a navigation key, a kill.
+    /// A line-editing press.
     fn edits_the_line(&self) -> bool {
         self.typed_forward == Some(false) || self.navigation_key || self.kill_key
     }
 }
 
-/// The licence fence one input event draws before its dispatch, the one classification
-/// [`App::input`].
+/// The licence fence one input event draws before its dispatch ([`App::input`]).
 pub(crate) fn press_fence(ev: &InputEvent) -> Option<bool> {
     match ev {
         InputEvent::Key {
@@ -3178,7 +3130,7 @@ pub(crate) enum PressPhase {
 /// The four-way press classification the custody record carries.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum PressKind {
-    /// A byte-producing press landing for the first time: the one handover.
+    /// A byte-producing press landing for the first time.
     Typing,
     /// An auto-repeat tick of a hold whose press already took custody.
     Repeat,
@@ -3208,15 +3160,13 @@ impl PressKind {
     }
 }
 
-/// [`note_person_reaching`] for a gesture that reached the program (the seam's own calls name the
-/// class: [`note_person_event`]).
+/// [`note_person_reaching`] for a gesture that reached the program ([`note_person_event`]).
 #[cfg(test)]
 pub(crate) fn note_person(ctx: &crate::SessionCtx, gesture: crate::human_input::Gesture) -> bool {
     note_person_reaching(ctx, gesture, true)
 }
 
-/// A person's hands were on `ctx`'s session (typing, pasting, clicking, dragging, scrolling,
-/// composing).
+/// A person's hands were on `ctx`'s session.
 pub(crate) fn note_person_reaching(
     ctx: &crate::SessionCtx,
     gesture: crate::human_input::Gesture,
@@ -3351,8 +3301,7 @@ pub(crate) fn apply_press_custody(t: &mut Terminal, kind: PressKind) -> (bool, b
     (scrolled, cleared)
 }
 
-/// The bits of one classified press the kitty-command listener's cascade reads ([`PressClass`]'s
-/// line-editing subset plus the tty's echo verdict).
+/// The bits of one classified press the kitty-command listener's cascade reads ([`PressClass`]).
 #[derive(Clone, Copy)]
 struct TrickPress<'ev> {
     tty_swallows: bool,
@@ -3382,31 +3331,7 @@ impl TrickPress<'_> {
     }
 }
 
-/// Feed one key press through the kitty-command listener cascade:
-///
-/// ```text
-/// tty swallows the press      Enter: note_line_reset (the secret's line is
-///                             over) — anything else: note_no_echo (poison;
-///                             a passphrase must not move the cat)
-/// enter_like (⇧⏎ included)    note_submit: judge the open token, confirm a
-///                             tentative fire, report a pet-only line
-/// keyed_enter, not Enter      raw bytes ending CR/LF: note_line_reset —
-///                             the line that ran was never judged (`sit`
-///                             typed, `send 'xyz\n'`: the shell got `sitxyz`)
-/// ⌃C, ⌃J, ⌃M, ⌃U              note_line_reset
-/// ⌃Z, ⌃\                      note_job_chord: a provably empty line stays
-///                             fresh, any other is a break (at a prompt every
-///                             shell KEEPS the line; under a program the tty
-///                             flushed it: unknown either way)
-/// ⌃W / ⌥⌫ / ⌃⌫                note_word_kill
-/// ⌃K, ⌥D, forward Delete      nothing: on an unpoisoned line the caret is
-///                             at its end, so a forward kill removes nothing
-/// ⌃L                          nothing: the screen clear redraws the line
-///                             intact everywhere
-/// brk (Tab, Esc, arrows, …)   note_break (poison)
-/// Backspace                   note_backspace (may revoke)
-/// a glyph / an IME commit     note_char / note_ime
-/// ```
+/// Feed one key press through the kitty-command listener cascade:.
 fn feed_trick_listener<'w>(
     listener: &'w mut aterm_effects::typed_tricks::TrickListener,
     tricks: &aterm_lexicon::TrickLexicon,
@@ -3430,8 +3355,6 @@ fn feed_trick_listener<'w>(
         return listener.note_line_reset();
     }
     if press.job_chord {
-        // The price of never resetting a poisoned line: after Esc in an editor
-        // ⌃Z backgrounds, the prompt stays deaf until Enter, ⌃C or ⌃U.
         return listener.note_job_chord();
     }
     if press.kill_key {
@@ -3461,18 +3384,15 @@ fn feed_trick_listener<'w>(
     TrickFeed::NONE
 }
 
-/// What the host did with the last kitty-command fire on a window's current typed line
-/// (`WindowState::trick_fire`).
+/// What the host did with the last kitty-command fire on a window's current typed line.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub(crate) enum TrickLineFire {
     /// No fire on this line yet.
     #[default]
     None,
-    /// The fire was admitted: the flash noted (word engine permitting) and the pet told (if on
-    /// glass).
+    /// The fire was admitted.
     Admitted { session: u64, addressed: bool },
-    /// The fire was withheld — the feature is off, or the word is on
-    /// `[sparkle_words.tricks] ignore_words` (a real command of the user's).
+    /// The fire was withheld.
     Withheld { session: u64 },
 }
 
@@ -3490,8 +3410,7 @@ impl TrickLineFire {
     }
 }
 
-/// A tentative kitty command was taken back: the line turned into prose, was aborted, poisoned or
-/// backspaced into.
+/// A tentative kitty command was taken back.
 fn revoke_trick_line(ws: &mut crate::WindowState, now: std::time::Instant) {
     ws.fx.companion_mut().revoke_trick();
     if !matches!(
@@ -3545,14 +3464,12 @@ pub(crate) fn write_ui_report(
     note_refused_report(paste_order::report_ordered_or_inline(term, modes, sink, ev));
 }
 
-/// Why a person's input did not reach the session: the cause the "Couldn't send your input" row
-/// names, each with its one remedy.
+/// Why a person's input did not reach the session.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputRefusal {
     /// A paste larger than the ordered queue holds even when it is empty.
     PasteTooLarge,
-    /// Earlier input is still being written and the queue behind it is full (a paste, or a key
-    /// queued behind a draining paste).
+    /// Earlier input is still being written and the queue behind it is full.
     Busy,
     /// The session's input writer was gone.
     Unavailable,
@@ -3592,8 +3509,7 @@ impl App {
         self.pool.set_focus_arms_told(session, arms);
     }
 
-    /// A key or paste refused for `session` (the ordered queue could not admit it, the writer is
-    /// gone, or the interactive egress met the spill cap).
+    /// A key or paste refused for `session`.
     fn refuse_input(&mut self, session: u64, why: InputRefusal) {
         crate::metrics::note_input_refused();
         let key = format!("session.input-full.{session}");
@@ -3636,8 +3552,7 @@ impl App {
         }
     }
 
-    /// Whether a physical key press triggers a paste in this window (`⌘V` or a bound `paste`
-    /// chord).
+    /// Whether a physical key press triggers a paste in this window.
     fn press_pastes(
         &self,
         mods: ModifiersState,
@@ -3672,8 +3587,7 @@ impl App {
         }
     }
 
-    /// External OS command surfaces (native menu key equivalents, accessibility actions) can
-    /// consume input before `on_key`/`App::input`.
+    /// External OS command surfaces.
     pub(crate) fn clear_front_move_license(&mut self) {
         if let Some(wid) = self.frontmost_window {
             self.clear_move_license(wid);
@@ -3688,7 +3602,7 @@ impl App {
         }
     }
 
-    /// The `App::input` convergence seam: the sole policy site for input egress.
+    /// The `App::input` convergence seam.
     #[track_caller]
     pub(crate) fn input(&mut self, wid: WindowId, ev: InputEvent, src: Source) -> InputOutcome {
         self.input_to_session(wid, ev, src, None, crate::app_input::PressPhase::Initial)
@@ -3766,8 +3680,7 @@ impl App {
         .line())
     }
 
-    /// The `streak [status]` control verb: one line of prism wake state for the front window
-    /// ([`crate::Wake::StreakStatus`]).
+    /// The `streak [status]` control verb ([`crate::Wake::StreakStatus`]).
     pub(crate) fn streak_status(&self) -> Result<String, String> {
         let Some(wid) = self.frontmost_window else {
             return Err("no focused window".to_string());
@@ -3812,8 +3725,7 @@ impl App {
         ))
     }
 
-    /// Record a typed-"kitty" completion in the Kitty Log (detector:
-    /// [`aterm_effects::kitty_summon`]) as one synthetic `head_peek` sighting.
+    /// Record a typed-"kitty" completion in the Kitty Log ([`aterm_effects::kitty_summon`]).
     fn record_typed_kitty(&mut self, wid: WindowId, session: u64, now: std::time::Instant) {
         use aterm_effects::kitty_registry::{
             KittyMagic, KittyShownAs, KittySighting, KittyType, TRAIT_BOW, TRAIT_CROWN,
@@ -3924,8 +3836,7 @@ impl App {
         Ok(look)
     }
 
-    /// Wears the next cat in the collection (View ▸ Next Kitty), in the collection book's order
-    /// (first seen, then key), wrapping.
+    /// Wears the next cat in the collection.
     pub(crate) fn wear_next_kitty(
         &mut self,
         wid: WindowId,
@@ -3943,8 +3854,7 @@ impl App {
         self.wear_kitty(wid, &key, now)
     }
 
-    /// `kitty`: the wearable collection, one `key=` row per collected cat, with `worn=1` on the one
-    /// on the cursor.
+    /// `kitty`: the wearable collection.
     pub(crate) fn kitty_collection_rows(&mut self) -> Result<Vec<String>, String> {
         let (worn, rows) = self.kitty_log.wearable();
         Ok(rows
@@ -3959,8 +3869,7 @@ impl App {
             .collect())
     }
 
-    /// `kitty wear <key>`: puts on that cat on the frontmost window and says which cat is on the
-    /// cursor.
+    /// `kitty wear <key>`.
     pub(crate) fn wear_kitty_on_front(&mut self, key: &str) -> Result<String, String> {
         let Some(wid) = self.frontmost_window else {
             return Err("no window to dress".to_string());
@@ -3983,7 +3892,7 @@ impl App {
             .unwrap_or(self.launch_kitty)
     }
 
-    /// Delivers a typed-word reaction to the window's cursor companion: expression only.
+    /// Delivers a typed-word reaction to the window's cursor companion.
     fn react_typed_word(
         &mut self,
         wid: WindowId,
@@ -4008,8 +3917,7 @@ impl App {
         }
     }
 
-    /// Summon the typed-word dog cameo (the canine arm of [`aterm_effects::kitty_summon`], past the
-    /// typed-a-lot gate).
+    /// Summon the typed-word dog cameo ([`aterm_effects::kitty_summon`]).
     fn summon_typed_dog(&mut self, wid: WindowId, session: u64, now: std::time::Instant) {
         self.ensure_sparkle();
         let Some(rs) = self.sparkle.as_ref() else {
@@ -4121,20 +4029,18 @@ impl App {
         receipt_outcome(receipt)
     }
 
-    /// Stamps `session`'s person clock ([`crate::SessionCtx::human_input`]) when `ev` is a person's
-    /// gesture ([`crate::human_input::is_person_gesture`] from [`Source::Human`]).
+    /// Stamps `session`'s person clock ([`crate::SessionCtx::human_input`],
+    /// [`crate::human_input::is_person_gesture`], [`Source::Human`]).
     pub(crate) fn note_person_input(&self, session: u64, ev: &InputEvent, src: Source) {
         if matches!(src, Source::Human) && crate::human_input::is_person_gesture(ev) {
             self.spares.note_person(std::time::Instant::now());
             if let Some(owner) = self.pool.get(session) {
-                // An owed log wake rang the session's watchers in the mark's hold.
                 let _ = note_person_event(&owner.ctx, ev);
             }
         }
     }
 
-    /// Routes an input event through the convergence seam, pinning its terminal to
-    /// `target_session`.
+    /// Routes an input event through the convergence seam.
     #[track_caller]
     pub(crate) fn input_to_session(
         &mut self,
@@ -4183,8 +4089,6 @@ impl App {
         if is_present_recovery_stimulus(&ev)
             && let Some(ws) = self.windows.get_mut(&wid)
         {
-            // In no-echo or app-owned-keyboard modes this input may produce no pixel
-            // and no PTY output, so the recovery edge drives its attempt itself.
             ws.rearm_present(false);
         }
         if let InputEvent::Key {
@@ -4663,11 +4567,6 @@ impl App {
                             && (!enter_like || shift_enter_insert)
                             && !tty_swallows;
                         if typed_forward != Some(false) && !inert_modifier && !prices_typed_glyphs {
-                            // Any other press closes the memory, since a later Backspace
-                            // erases something this dispatch did not price. A typed press
-                            // keeps it and appends its widths, so the memory is the row's
-                            // erasable tail in order: `abc`, paste `yz`, `d`, ⌫⌫⌫⌫ retires
-                            // `d`, nothing for `z`, nothing for `y`, then `c`.
                             ws.erase_prices.clear();
                         }
                         if shift_enter_insert {
@@ -4687,8 +4586,6 @@ impl App {
                                 aterm_effects::cursor_momentum::MOMENTUM_GLOW_TAU_S,
                             );
                             if tty_swallows {
-                                // The tally is the only trace of a withheld press; taken
-                                // below once the write has landed.
                                 swallowed_press = true;
                             } else {
                                 if let Some(ch) =
@@ -4914,19 +4811,10 @@ impl App {
                                 }
                             };
                             if no_echo || tty_swallows || edit_swallowed {
-                                // A no-echo press arms nothing, but it is still sent,
-                                // and the program may echo it after all: an app can
-                                // leave the alternate screen before it reads the key,
-                                // and the shell behind it then echoes it on the main
-                                // screen. Unmodelled input owes that echo, so it
-                                // cannot prove a later guess for the same glyph, and
-                                // the flush is the stale-epoch hardening (a confirmed
-                                // epoch from before entering the app must not let the
-                                // first keystroke back on that row display).
+                                // Distinct branch.
                                 ws.predictor.note_unmodelled_input(now);
                             } else if chord_arrow {
                                 // A modified arrow (a lock in Kitty's modifier byte):
-                                // routed as an arrow was before predictive editing.
                                 ws.predictor.note_unmodelled_input(now);
                             } else {
                                 ws.predictor.set_mode(pmode);
@@ -4997,8 +4885,6 @@ impl App {
                             word: kill_word,
                         })
                     } else if (tab_key || paste_chord_key) && !tty_swallows {
-                        // The gesture half follows the tty's verdict too: a queued Tab
-                        // the kernel will not echo re-stamps nothing at delivery.
                         Some(DeliveredClass::Gesture)
                     } else {
                         None
@@ -5249,9 +5135,6 @@ impl App {
                     unreachable!()
                 };
                 if let Some(ws) = self.windows.get_mut(&wid) {
-                    // `last_mouse_cell` is the pane-local cell `on_cursor_moved` already
-                    // published; do not overwrite it with this event's window
-                    // coordinates, since a follow-up press or wheel reads it.
                     ws.last_mouse_side = side;
                 }
                 if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
@@ -5340,8 +5223,7 @@ impl App {
         }
     }
 
-    /// The `InputEvent::MouseButton` arm of [`App::input`]: with tracking on, a press reports
-    /// inside `seam_egress`.
+    /// The `InputEvent::MouseButton` arm of [`App::input`].
     fn input_mouse_button(
         &mut self,
         wid: WindowId,
@@ -5398,18 +5280,13 @@ impl App {
             if pressed {
                 self.seam_left_press(wid, row, col, click_count, block);
             } else if self.windows.get(&wid).is_some_and(|ws| ws.selecting) {
-                // The release carries the copy-on-select policy: a scoped-edge-injected
-                // gesture (`suppress_copy_on_select == true`) completes the selection
-                // without copying to the clipboard. Human and Owner gestures carry
-                // `false`.
                 self.finish_selection(wid, suppress_copy_on_select);
             }
         }
         receipt_outcome(receipt)
     }
 
-    /// The `InputEvent::Wheel` arm of [`App::input`]: with tracking on, per-line reports were
-    /// emitted in `seam_egress`.
+    /// The `InputEvent::Wheel` arm of [`App::input`].
     fn input_wheel(
         &mut self,
         wid: WindowId,
@@ -5478,15 +5355,12 @@ impl App {
             .get(&wid)
             .is_some_and(|ws| ws.wheel_precise_px.is_some())
         {
-            // The seam reported the delta (an app tracks the mouse, or DEC 1007 alt
-            // scroll), so a band still tracking the finger settles to its row now.
             self.release_scroll_track(wid);
         }
         receipt_outcome(receipt)
     }
 
-    /// Whether a precise delta of `dy_px` (+ = into history) pushes a band armed on `term` and
-    /// parked on a history end further past it (down at the live bottom, up at the top).
+    /// Whether a precise delta of `dy_px`.
     fn precise_push_past_parked_edge(
         &self,
         wid: WindowId,
@@ -5559,7 +5433,6 @@ impl App {
                 let landed = i64::try_from(term.grid().display_offset()).unwrap_or(i64::MAX);
                 if landed == current {
                     // The terminal's live clamp is authoritative if its history
-                    // changed between the bound read above and the scroll.
                     break;
                 }
             }
@@ -5583,7 +5456,7 @@ impl App {
     }
 
     /// Reconciles every retained window after a fact that can change the resolved SmoothScroll
-    /// policy (config `motion`, OS accessibility or focus).
+    /// policy.
     pub(crate) fn settle_reduced_scroll_motion(&mut self, now: std::time::Instant) {
         let retained: Vec<WindowId> = self
             .windows
@@ -5614,8 +5487,7 @@ impl App {
         true
     }
 
-    /// Test wrapper over [`Self::scroll_wheel_animated_at`] on the wall clock, with the engine
-    /// facts read under a short lock.
+    /// Test wrapper over [`Self::scroll_wheel_animated_at`] on the wall clock.
     #[cfg(test)]
     pub(crate) fn scroll_wheel_animated(
         &mut self,
@@ -5627,8 +5499,7 @@ impl App {
         self.scroll_wheel_animated_at(wid, term, delta_rows, None, None, now);
     }
 
-    /// Smooth scroll: moves the local viewport by `delta_rows` (positive = into history) through
-    /// the ~180 ms ease-out glide when the motion policy permits.
+    /// Smooth scroll: moves the local viewport by `delta_rows`.
     pub(crate) fn scroll_wheel_animated_with(
         &mut self,
         wid: WindowId,
@@ -5641,8 +5512,7 @@ impl App {
         self.scroll_wheel_animated_at(wid, term, delta_rows, viewport, precise, now);
     }
 
-    /// [`Self::scroll_wheel_animated_with`] on an injected clock: the whole reducer, with the delta
-    /// applied at `now`.
+    /// [`Self::scroll_wheel_animated_with`] on an injected clock.
     pub(crate) fn scroll_wheel_animated_at(
         &mut self,
         wid: WindowId,
@@ -5727,8 +5597,6 @@ impl App {
             }
             let (excess_px, edges) = ws.scroll_glide.as_mut().map_or((0, (false, false)), |st| {
                 if viewport.is_some() {
-                    // A seam-fed delta (a banked whole row) refreshes the clamp
-                    // bound the lock-free sub-row deltas reuse.
                     st.max_rows = max_rows;
                 }
                 let max_px = st.max_rows * cell_h;
@@ -5797,8 +5665,7 @@ impl App {
         }
     }
 
-    /// One deadline wake of an in-flight glide, from [`Self::service_due_scroll_motion`] when its
-    /// anchored tick is due.
+    /// One deadline wake of an in-flight glide ([`Self::service_due_scroll_motion`]).
     pub(crate) fn tick_scroll_glide(&mut self, wid: WindowId, now: std::time::Instant) {
         let animate = self.smooth_scroll_animates(wid);
         if !animate {
@@ -5988,7 +5855,7 @@ impl App {
         }
     }
 
-    /// The `InputEvent::ScrollView` arm of [`App::input`]: pure history navigation.
+    /// The `InputEvent::ScrollView` arm of [`App::input`].
     fn input_scroll_view(
         &mut self,
         wid: WindowId,
@@ -6154,8 +6021,7 @@ impl App {
         InputOutcome::Ok
     }
 
-    /// The [`InputEvent::ResizeWindowPx`] arm of [`App::input`]: asks the OS window for an inner
-    /// size and applies nothing.
+    /// The [`InputEvent::ResizeWindowPx`] arm of [`App::input`].
     fn input_resize_window_px(&mut self, wid: WindowId, width: u32, height: u32) -> InputOutcome {
         if width == 0 || height == 0 {
             return InputOutcome::RangeRejected;
@@ -6190,8 +6056,7 @@ impl App {
         InputOutcome::Ok
     }
 
-    /// Seam-internal left-press gesture dispatch for both sources (the tracking-off branch of
-    /// `InputEvent::MouseButton`).
+    /// Seam-internal left-press gesture dispatch for both sources.
     pub(crate) fn seam_left_press(
         &mut self,
         wid: WindowId,
@@ -6590,15 +6455,13 @@ impl App {
         true
     }
 
-    /// Closes a stale press episode before a fresh non-repeat press takes its physical key (the OS
-    /// lost the key-up during a focus epoch).
+    /// Closes a stale press episode before a fresh non-repeat press takes its physical key.
     fn retire_previous_physical_press_owner(
         &mut self,
         replacement_window: WindowId,
         physical_key: aterm_window::keyboard::PhysicalKey,
     ) {
         if self.physical_press_owners.contains_key(&physical_key) {
-            // The ordinary release seam carries every rule.
             self.release_physical_press(replacement_window, physical_key);
         }
     }
@@ -6629,8 +6492,7 @@ impl App {
         !self.physical_press_owners.contains_key(&physical_key)
     }
 
-    /// Resolves an OS auto-repeat from press-time physical ownership, at the top of [`on_key`]
-    /// before blink.
+    /// Resolves an OS auto-repeat from press-time physical ownership ([`on_key`]).
     fn route_physical_repeat(
         &mut self,
         arrival_window: WindowId,
@@ -7698,8 +7560,7 @@ impl App {
         false
     }
 
-    /// Pane chords (iTerm2 parity): Cmd-Opt-Arrow focuses a neighbour pane, Cmd-Shift-Enter toggles
-    /// zoom.
+    /// Pane chords (iTerm2 parity).
     fn on_key_pane_focus(&mut self, mods: ModifiersState, ev: &KeyEvent) -> bool {
         // Cmd-Shift-Enter (no Alt): toggle pane zoom.
         if mods.super_key()
@@ -7769,8 +7630,7 @@ impl App {
         Some((session, field_edit_action(mods, ev)?))
     }
 
-    /// Open a directed terminal search or repeat an already-open one, then bind the complete
-    /// physical hold to that local action.
+    /// Open a directed terminal search or repeat an already-open one.
     pub(crate) fn terminal_emacs_search_pressed(
         &mut self,
         wid: WindowId,
@@ -7985,8 +7845,7 @@ impl App {
         self.drop_front_scroll_motion(wid);
     }
 
-    /// Drop the window's wheel glide, its sub-row residual and its bounce when they are the front
-    /// pane's.
+    /// Drop the window's wheel glide.
     pub(crate) fn drop_front_scroll_motion(&mut self, wid: WindowId) {
         let front = self
             .front_terminal(wid)
@@ -8031,8 +7890,7 @@ impl App {
         }
     }
 
-    /// The modal-overlay key gate: if an overlay is open on `wid`, delegate to its handler and
-    /// swallow the key (`true`).
+    /// The modal-overlay key gate.
     fn on_key_overlay_mode(&mut self, wid: WindowId, mods: ModifiersState, ev: &KeyEvent) -> bool {
         use crate::overlay::OverlayKind;
         let kind = self
@@ -8050,8 +7908,7 @@ impl App {
         }
     }
 
-    /// While a tab context menu is open on `wid`, drive it from the keyboard and swallow every key
-    /// (`true`).
+    /// While a tab context menu is open on `wid`.
     fn on_key_tab_menu_mode(&mut self, wid: WindowId, ev: &KeyEvent) -> bool {
         if !self
             .windows
@@ -8073,8 +7930,7 @@ impl App {
         self.tab_menu_nav(wid, nav)
     }
 
-    /// Apply one [`MenuNav`](crate::tab_menu::MenuNav) to `wid`'s open card: the sole mutator
-    /// behind both routes.
+    /// Apply one [`MenuNav`](crate::tab_menu::MenuNav) to `wid`'s open card.
     fn tab_menu_nav(&mut self, wid: WindowId, nav: crate::tab_menu::MenuNav) -> bool {
         use crate::tab_menu::MenuNav;
         let Some((entries, highlight, limit)) = self.windows.get(&wid).and_then(|ws| {
@@ -8107,7 +7963,7 @@ impl App {
     }
 
     /// Whether the front terminal's application negotiated the keyboard enhancement that makes
-    /// `key` reportable, and so keeps it.
+    /// `key` reportable.
     #[cfg(not(target_os = "macos"))]
     pub(crate) fn front_defers_tab_menu_chord(
         &self,
@@ -8145,7 +8001,6 @@ impl App {
                     ..
                 } => {
                     // An untracked release belongs to a press that predates the card
-                    // and must still reach a Kitty `REPORT_EVENT_TYPES` app.
                     false
                 }
                 InputEvent::Key { key, .. } => {
@@ -8420,8 +8275,6 @@ impl App {
             && let Some(session) = self.focused_session_id(wid)
             && let Some(owner) = self.pool.get(session)
         {
-            // The preedit reaches no program: it can dismiss no box. An owed log
-            // wake rang the session's watchers in the mark's hold.
             let _ = note_person_reaching(&owner.ctx, crate::human_input::Gesture::Other, false);
         }
         if changed && let Some(w) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -8440,8 +8293,7 @@ impl App {
         }
     }
 
-    /// Tell the platform where the caret is (winit `set_ime_cursor_area`) so the candidate window
-    /// appears there rather than at the window origin.
+    /// Tell the platform where the caret is.
     pub(crate) fn report_ime_cursor_area(
         &mut self,
         wid: WindowId,
@@ -8459,8 +8311,7 @@ impl App {
         self.report_ime_cursor_area_frame(wid, frame_cell);
     }
 
-    /// [`Self::report_ime_cursor_area`]'s core, in frame cells (row 0 is the top strip row when a
-    /// strip is on).
+    /// [`Self::report_ime_cursor_area`]'s core.
     pub(crate) fn report_ime_cursor_area_frame(
         &mut self,
         wid: WindowId,
@@ -8637,7 +8488,7 @@ impl App {
     }
 
     /// Whether an Option chord pressed in window `wid` carries what Option composed
-    /// ([`crate::platform::option_composes`] of the setting the window was last given).
+    /// ([`crate::platform::option_composes`]).
     fn option_composes_in(&self, wid: WindowId) -> bool {
         crate::platform::option_composes(
             self.windows
@@ -8646,8 +8497,8 @@ impl App {
         )
     }
 
-    /// Where composed text on window `wid` lands, the one precedence [`Self::on_ime_commit`] and
-    /// [`Self::preedit_owner`] both read.
+    /// Where composed text on window `wid` lands ([`Self::on_ime_commit`],
+    /// [`Self::preedit_owner`]).
     fn ime_route(&self, wid: WindowId) -> PreeditOwner {
         let Some(ws) = self.windows.get(&wid) else {
             return PreeditOwner::None;
@@ -8676,8 +8527,7 @@ impl App {
         self.ime_route(wid)
     }
 
-    /// Current keyboard modifiers as a mouse-report modifier mask (shift/alt/ctrl bits the engine
-    /// ORs into the button byte).
+    /// Current keyboard modifiers as a mouse-report modifier mask.
     pub(crate) fn mouse_modifiers(&self, wid: WindowId) -> u8 {
         use aterm_types::mouse::{ALT_MASK, CTRL_MASK, SHIFT_MASK};
         let Some(mods) = self.windows.get(&wid).map(|ws| ws.mods) else {
@@ -8696,8 +8546,7 @@ impl App {
         m
     }
 
-    /// `invoke <action>`: fire a menu action by name ([`Self::dispatch_menu_action`]), gated by the
-    /// live palette row's `enabled`.
+    /// `invoke <action>` ([`Self::dispatch_menu_action`]).
     pub(crate) fn invoke_menu_action_by_name(
         &mut self,
         el: &ActiveEventLoop,
@@ -9074,8 +8923,7 @@ impl App {
         }
     }
 
-    /// Dispatch one tab context-menu action against the exact tab it was popped on
-    /// (`Wake::TabMenuAction`, from the macOS strip's `NSMenu`).
+    /// Dispatch one tab context-menu action against the exact tab it was popped on.
     pub(crate) fn dispatch_tab_menu_action(
         &mut self,
         el: &ActiveEventLoop,
@@ -9143,8 +8991,7 @@ impl App {
         }
     }
 
-    /// Dispatch one session-argument row of a tab's context menu —
-    /// `Wake::TabMenuConnection { window, tab, peer_sid, verb }`.
+    /// Dispatch one session-argument row of a tab's context menu.
     pub(crate) fn dispatch_tab_menu_connection(
         &mut self,
         window: WindowId,
@@ -9213,8 +9060,7 @@ impl App {
         }
     }
 
-    /// The registry `sid` string for the terminal session labeling tab `index` of `window`, or
-    /// `None` for a native tab / unregistered stub (the `Copy Session ID` payload).
+    /// The registry `sid` string for the terminal session labeling tab `index` of `window`.
     pub(crate) fn tab_session_id_text(&self, window: WindowId, index: usize) -> Option<String> {
         let session = self.tab_terminal_session(window, index)?;
         self.store
@@ -9235,8 +9081,7 @@ impl App {
             .map(|c| c.into_owned())
     }
 
-    /// The current position of the tab with stable id `tab` in `window`, or `None` when it no
-    /// longer exists there.
+    /// The current position of the tab with stable id `tab` in `window`.
     pub(crate) fn tab_index_for_id(
         &self,
         window: WindowId,
@@ -9246,8 +9091,7 @@ impl App {
         ws.tab_set.tabs().iter().position(|t| t.id == tab)
     }
 
-    /// The terminal session labeling tab `index` of `window` (its focused leaf, as `tab_titles`
-    /// resolves it), or `None` for a native tab / an out-of-range index.
+    /// The terminal session labeling tab `index` of `window`.
     pub(crate) fn tab_terminal_session(&self, window: WindowId, index: usize) -> Option<u64> {
         let ws = self.windows.get(&window)?;
         let tab = ws.tab_set.tabs().get(index)?;
@@ -9364,8 +9208,6 @@ mod forwarded_release_handoff_activity_tests {
     use crate::{App, WindowId};
     use aterm_window::keyboard::{KeyCode, PhysicalKey};
 
-    /// Arm a minimal pending overlap, so the revoking form (epoch bump, cancel poke) is observable
-    /// against the tolerated one.
     fn arm_pending_overlap(app: &mut App) -> std::sync::mpsc::Receiver<()> {
         let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
         app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
@@ -9398,7 +9240,6 @@ mod forwarded_release_handoff_activity_tests {
         cancelled
     }
 
-    /// A forwarded key release is tolerated key traffic like its press.
     #[test]
     fn forwarded_release_is_tolerated_while_overlap_pending() {
         use aterm_types::keyboard::{Key as TKey, Modifiers};
@@ -9472,7 +9313,6 @@ mod native_preferences_menu_tests {
     use crate::native_app::AppKind;
     use crate::{App, WindowId};
 
-    /// The App menu's "Open aterm.toml" opens the native editor on the isolated config file.
     #[test]
     fn open_aterm_toml_menu_command_is_the_native_manual_editor() {
         const ROOT: &str = "ATERM_NATIVE_PREFERENCES_MENU_ROOT";
@@ -9564,8 +9404,6 @@ mod menu_only_action_dispatch_tests {
             .current
     }
 
-    /// `find_next` / `find_prev` reach the same reducer Edit ▸ Find ▸ Find Next drives, in both
-    /// states.
     #[test]
     fn find_again_actions_step_an_open_bar_and_resume_a_closed_one() {
         let (mut app, wid) = app_with_three_matches();
@@ -9602,8 +9440,6 @@ mod menu_only_action_dispatch_tests {
         );
     }
 
-    /// `select_all` selects the visible screen and, like the `MenuAction::SelectAll` arm it
-    /// mirrors.
     #[test]
     fn select_all_action_selects_the_screen_and_defers_to_an_open_find() {
         let (mut app, wid) = app_with_three_matches();
@@ -9803,8 +9639,6 @@ mod keypad_press_class_tests {
         }
     }
 
-    /// KP_Enter is a submitted turn: turn boundary, `enter_like`, `keyed_enter`, the pet's Submit,
-    /// forward momentum, as for `Enter`.
     #[test]
     fn keypad_enter_is_a_plain_enter_and_a_turn_boundary() {
         let kp_enter = press(NamedKey::NumpadEnter, Modifiers::empty());
@@ -9822,8 +9656,6 @@ mod keypad_press_class_tests {
         assert!(classify_press(&shifted).enter_like);
     }
 
-    /// A keypad digit is a typed glyph: predictive-echo candidate, forward momentum, the cosmetic
-    /// `typed` witness, the pet's Text.
     #[test]
     fn keypad_digit_is_a_typed_glyph() {
         let five_ev = press(NamedKey::Numpad5, Modifiers::empty());
@@ -9844,7 +9676,6 @@ mod keypad_press_class_tests {
         assert_eq!(classify_press(&equal_ev).typed, Some('='));
     }
 
-    /// The edit keys the predictor models are a bare `←` or `→` and Backspace.
     #[test]
     fn only_bare_arrows_and_backspace_are_edit_keys() {
         let candidate = |key, mods| classify_press(&press(key, mods)).predict_candidate;
@@ -9907,7 +9738,6 @@ mod keypad_press_class_tests {
         assert_eq!(candidate(NamedKey::ArrowUp, Modifiers::empty()), None);
     }
 
-    /// The learned keys the predictor places at an authenticated prompt.
     #[test]
     fn home_end_delete_and_ctrl_a_e_are_learned_edit_keys() {
         let candidate = |key, mods| classify_press(&press(key, mods)).predict_candidate;
@@ -9975,7 +9805,6 @@ mod keypad_press_class_tests {
         assert_eq!(chord('b', Modifiers::CTRL), None, "Ctrl-B is not modelled");
     }
 
-    /// NumLock off, the keypad is a second navigation block.
     #[test]
     fn keypad_navigation_and_delete_classify_as_their_twins() {
         let left_ev = press(NamedKey::NumpadArrowLeft, Modifiers::empty());
@@ -9990,7 +9819,6 @@ mod keypad_press_class_tests {
         assert!(matches!(del.console_input, Some(PetInputKind::Delete)));
     }
 
-    /// The negative controls: KP_Begin has no main-block twin and classifies as nothing.
     #[test]
     fn keypad_begin_and_the_main_block_are_untouched() {
         let begin_ev = press(NamedKey::NumpadBegin, Modifiers::empty());
@@ -10017,8 +9845,6 @@ mod mouse_cell_clobber_tests {
     use crate::input::{InputEvent, PixelOffset, Source};
     use aterm_core::selection::SelectionSide;
 
-    /// A `MouseMove` reaching the seam keeps the pane-local `last_mouse_cell` that
-    /// `on_cursor_moved` published (a follow-up press or wheel reads it).
     #[test]
     fn mouse_move_does_not_clobber_pane_local_cell() {
         let mut app = App::headless_for_test();
@@ -10249,8 +10075,6 @@ mod tone_status_tests {
         }
     }
 
-    /// A muted build: the window still tracks typed text (so a later unmute classifies a coherent
-    /// window) but the classifier never ran.
     #[test]
     fn a_muted_build_reports_the_gate_that_stopped_the_classifier() {
         let mut app = App::headless_for_test();
@@ -10269,8 +10093,6 @@ mod tone_status_tests {
         );
     }
 
-    /// A live build: typing reports the classified mood, the same value on `effective=` (what the
-    /// synth is told).
     #[test]
     fn a_live_build_reports_the_classified_mood_and_that_the_model_ran() {
         let mut app = App::headless_for_test();
@@ -10287,7 +10109,6 @@ mod tone_status_tests {
         assert!(!line.contains("inferences=0"), "the model ran: {line}");
     }
 
-    /// A disabled knob over a live audio host.
     #[test]
     fn a_disabled_knob_separates_the_verdict_from_what_the_synth_hears() {
         let mut app = App::headless_for_test();
@@ -10303,7 +10124,6 @@ mod tone_status_tests {
         assert!(line.contains("active=false"), "{line}");
     }
 
-    /// No window to report on is a refusal, never a fabricated neutral row.
     #[test]
     fn a_windowless_app_refuses_rather_than_inventing_a_row() {
         let mut app = App::headless_for_test();
@@ -10311,7 +10131,6 @@ mod tone_status_tests {
         assert!(app.tone_status().is_err());
     }
 
-    /// The typed window text never reaches the wire.
     #[test]
     fn the_status_line_never_carries_the_typed_text() {
         let mut app = App::headless_for_test();
@@ -10339,7 +10158,6 @@ mod tone_status_tests {
         );
     }
 
-    /// One real frame through `cursor_frame`, then the real verb.
     fn seam_row_after_one_frame(app: &mut App) -> String {
         let wid = WindowId(0);
         let fx = crate::app_render::CursorFxInputs::sample_for_test(std::time::Instant::now());
@@ -10347,7 +10165,6 @@ mod tone_status_tests {
         app.tone_status().expect("the fixture window is focused")
     }
 
-    /// A trail-on, sounds-on window on a live audio host, before any per-test knob.
     fn audible_app(style: &str) -> App {
         let mut app = App::headless_for_test();
         app.trail_audio = TrailAudio::capturing_for_test();
@@ -10357,8 +10174,6 @@ mod tone_status_tests {
         app
     }
 
-    /// An aurora dimmed to zero is silent, and the verb names that gate rather than
-    /// `seam=closed:engine-silent trail=on`.
     #[test]
     fn a_dimmed_aurora_reads_trail_off_never_engine_silent() {
         let mut app = audible_app("rainbow kitty");
@@ -10370,7 +10185,6 @@ mod tone_status_tests {
         assert!(!line.contains("engine-silent"), "{line}");
     }
 
-    /// The verb reads the resolved config, never the folded one.
     #[test]
     fn a_reduce_motion_trail_is_dark_but_on_and_heard() {
         let mut app = audible_app("rainbow kitty");
@@ -10381,8 +10195,6 @@ mod tone_status_tests {
         assert!(line.contains("engine_sound=open"), "{line}");
     }
 
-    /// The classic wake through the real frame and verb: a fresh `classic` window clicks and the
-    /// verb does not read `engine-silent`.
     #[test]
     fn a_classic_window_is_heard_and_the_verb_says_so() {
         let mut app = audible_app("classic");
@@ -10473,7 +10285,6 @@ mod person_presence_tests {
         }
     }
 
-    /// What a person reads back or selects with: a click, a drag, a wheel notch, a view scroll.
     fn pointing() -> Vec<InputEvent> {
         vec![
             click(true),
@@ -10491,8 +10302,6 @@ mod person_presence_tests {
         ]
     }
 
-    /// Every typing or pointing event a control verb can produce leaves `human_ms=-` and records
-    /// nothing.
     #[test]
     fn a_window_keystroke_stamps_human_ms_and_a_control_write_never_does() {
         for event in typing().into_iter().chain(pointing()) {
@@ -10520,7 +10329,6 @@ mod person_presence_tests {
         }
     }
 
-    /// A burst of typing and pointing is one `human` event.
     #[test]
     fn a_burst_is_one_human_event_and_what_is_not_a_hand_stamps_nothing() {
         let (mut app, _reader) = app();
@@ -10735,8 +10543,6 @@ mod native_ime_selection_tests {
 mod refusal_row_tests {
     use super::{InputRefusal, paste_order};
 
-    /// A paste the ordered writer refused because its queue is full now answers
-    /// `ERR busy input-queue-full`.
     #[test]
     fn only_a_full_queue_refuses_a_paste_busy() {
         use crate::input::InputOutcome;

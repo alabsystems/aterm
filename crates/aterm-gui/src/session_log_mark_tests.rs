@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The session log's consumer half, host side (phase 3A): the `status`
-//! fields.
+//! The session log's consumer half, host side: the `status` fields.
 
 use aterm_slog::{Actor, Conf, Fields, Key, Kind, Mark, Src};
 
 use super::tests::{WALL0, opened, stamp, with_claude};
 use crate::App;
 
-/// `log_seq= log_ep= run= turn= step= need= need_since_ms=`: a fresh session
-/// names nothing open; an agent's turn with a Bash box names the run, the
-/// turn, the step and the observed need with its age.
 #[test]
 fn the_status_fields_name_the_open_path_and_the_observed_need() {
     let (tl, hand) = opened();
@@ -46,8 +42,6 @@ fn the_status_fields_name_the_open_path_and_the_observed_need() {
     );
 }
 
-/// NEGATIVE: a need only a claim raised is not `status`'s (it names no
-/// author); `brief` says it as `claim need`.
 #[test]
 fn a_claimed_need_is_never_the_status_need() {
     let (tl, _hand) = opened();
@@ -70,8 +64,6 @@ fn a_claimed_need_is_never_the_status_need() {
     );
 }
 
-/// While an update's carry fences the readers, `log_seq=` is the fence: a
-/// `since=` taken from `status` is one every read accepts.
 #[test]
 fn a_fenced_log_seq_is_the_fence() {
     let (tl, _hand) = opened();
@@ -94,8 +86,6 @@ fn a_fenced_log_seq_is_the_fence() {
     );
 }
 
-// ---- control input -------------------------------------------------------
-
 use super::InputVerb;
 
 fn input_marks(tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>) -> Vec<String> {
@@ -105,9 +95,6 @@ fn input_marks(tl: &std::sync::Mutex<crate::session_timeline::SessionTimeline>) 
         .collect()
 }
 
-/// `mark - input verb= by=` once per author's burst: two sends within 30 s
-/// write one, a third 30 s on writes another, and another author's input
-/// marks its own burst. The bytes are never recorded (the call has none).
 #[test]
 fn ctl_input_marks_one_burst_per_actor() {
     let (tl, hand) = opened();
@@ -140,9 +127,6 @@ fn ctl_input_marks_one_burst_per_actor() {
     );
 }
 
-/// R11: the burst table holds eight authors; every author past them shares
-/// one slot, so sixty-four authors rotating inside one window write at most
-/// nine marks, however fast they rotate.
 #[test]
 fn input_marks_from_many_authors_are_bounded() {
     let (tl, hand) = opened();
@@ -165,11 +149,6 @@ fn input_marks_from_many_authors_are_bounded() {
     );
 }
 
-/// R11 for the input marks: the trusted actors keep burst clocks of their
-/// own. Nine edges typing every 29 s hold the eight slots and the shared
-/// one, and still the harness's input, then `ctl`'s and the bridge's, each
-/// write their `mark - input` (the harness's again a burst later).
-/// NEGATIVE CONTROL: a tenth edge, in the same flood, writes none.
 #[test]
 fn a_flood_of_edges_never_silences_a_trusted_actors_input() {
     let (tl, hand) = opened();
@@ -212,12 +191,6 @@ fn a_flood_of_edges_never_silences_a_trusted_actors_input() {
     );
 }
 
-/// T1'S ACTED MARKS ARE BOUND: one control client's 3000 acted keys (`key
-/// act=deny`, no agent, no box) write the burst's mark, then one per mark
-/// token of the author's (twenty), the rest counted, not marked; a second on
-/// the next acted mark says how many (`dropped=`); and the need and the task
-/// marks written before the flood are still in the session's ring.
-/// NEGATIVE CONTROL (by scratch revert): unbounded, the flood evicts them.
 #[test]
 fn a_flood_of_acted_keys_keeps_the_sessions_records() {
     use crate::task_record::{TaskMark, TaskState};
@@ -279,12 +252,6 @@ fn a_flood_of_acted_keys_keeps_the_sessions_records() {
     }
 }
 
-/// T1'S DROPPED COUNT IS ITS OWN AUTHOR'S: edge A's 100 acted keys write the
-/// burst's mark and twenty more, 79 counted; edge B's one acted key then
-/// says nothing of them (no `dropped=`), and A's next acted key, a second
-/// on, says all 79. NEGATIVE CONTROL (by scratch revert): with one count
-/// for every author outside the trusted four, as 5D-2 kept it, B's mark
-/// reads `dropped=79` and A's none.
 #[test]
 fn an_edges_dropped_count_rides_only_its_own_mark() {
     let (tl, hand) = opened();
@@ -319,19 +286,6 @@ fn an_edges_dropped_count_rides_only_its_own_mark() {
     assert!(a.contains(&format!(" dropped={dropped} ")), "A's own: {a}");
 }
 
-/// U18'S OVERFLOWED AUTHORS: sixteen edges hold the
-/// named slots, each spent out by its acted keys (in debt for twenty
-/// seconds), so edges A and B, past them, share the overflow's tokens; A's
-/// fifty acted keys spend them, then A and B flood on. What each was short
-/// of is its own (an acted key is either marked or counted): a second on,
-/// A's next acted key says A's count and, a second later, B's says B's,
-/// neither as the pool's. Then thirty-three more edges past the slots are
-/// each short of their keys: the owed-only table keeps thirty-two, the
-/// first's count spills into the shared pool, and the first's next acted
-/// key says it as the pool's (`dropped=<n> pool=shared`); the second's says
-/// its own, plain. NEGATIVE CONTROL (by scratch revert of `aterm-slog`'s
-/// limiter to 5D-2/T1's one shared count past the slots): A's mark says A's
-/// and B's together, and B's says nothing.
 #[test]
 fn overflowed_edges_each_say_their_own_dropped_count() {
     let (tl, hand) = opened();
@@ -368,7 +322,6 @@ fn overflowed_edges_each_say_their_own_dropped_count() {
     for _ in 0..b_keys {
         key(b);
     }
-    // Every acted key is marked or counted.
     let a_short = a_keys - marks_by(a).len();
     let b_short = b_keys - marks_by(b).len();
     assert!(
@@ -394,7 +347,6 @@ fn overflowed_edges_each_say_their_own_dropped_count() {
         "B says its own: {b_mark}"
     );
 
-    // Past the owed-only table: the pool, said as the pool's.
     let past: Vec<Actor> = (0..=u32::try_from(aterm_slog::MARK_OWED_AUTHORS).expect("small"))
         .map(|i| edge(2000 + i))
         .collect();
@@ -421,9 +373,6 @@ fn overflowed_edges_each_say_their_own_dropped_count() {
     );
 }
 
-/// A turn is the last author's within five seconds: the harness's `send`
-/// then `busy` 4 s on opens `by=harness`; NEGATIVE at 6 s the turn is
-/// nobody's; a person's keys after the harness's input take the turn.
 #[test]
 fn a_turn_is_the_last_actors_within_five_seconds() {
     let turn_by = |gap: u64, person_after: bool| -> String {
@@ -466,7 +415,6 @@ fn a_turn_is_the_last_actors_within_five_seconds() {
     assert!(turn_by(3_000, true).contains(" by=human "));
 }
 
-/// A caused send names its turn: `cause=` and `cause_k=` on the turn's open.
 #[test]
 fn a_caused_send_names_its_turn() {
     let (tl, hand) = opened();
@@ -507,10 +455,6 @@ fn a_caused_send_names_its_turn() {
     );
 }
 
-// ---- the wake (design §2.2) -------------------------------------
-
-/// A registration on `session`'s watcher list, any ring already pending
-/// drained.
 fn watching(app: &App, session: u64) -> crate::session_watch::Subscription {
     let sub = crate::session_watch::Subscription::single(
         &app.pool.get(session).expect("a live session").ctx.watchers,
@@ -519,8 +463,6 @@ fn watching(app: &App, session: u64) -> crate::session_watch::Subscription {
     sub
 }
 
-/// The site woke `session`'s watchers (a one-minute hang detector: a site that
-/// forgot its wake leaves the watcher parked) and took the wake it owed.
 fn woke_and_took(
     sub: &crate::session_watch::Subscription,
     timeline: &std::sync::Mutex<crate::session_timeline::SessionTimeline>,
@@ -536,8 +478,6 @@ fn woke_and_took(
     );
 }
 
-/// The status sweep's pass (a failing command's run, closed at its D) wakes
-/// the session's watchers.
 #[test]
 fn the_sweep_wakes_the_logs_watchers() {
     use std::time::{Duration, Instant};
@@ -558,8 +498,6 @@ fn the_sweep_wakes_the_logs_watchers() {
     woke_and_took(&sub, &timeline, "the sweep");
 }
 
-/// The settle tick closes a turn with no output and nothing else to wake a
-/// reader: it wakes them.
 #[test]
 fn the_settle_tick_wakes_the_logs_watchers() {
     let mut app = crate::App::headless_for_test();
@@ -594,7 +532,6 @@ fn the_settle_tick_wakes_the_logs_watchers() {
     woke_and_took(&sub, &timeline, "the settle tick");
 }
 
-/// A person's burst (`mark - human`) wakes the watchers.
 #[test]
 fn a_persons_burst_wakes_the_logs_watchers() {
     let mut app = crate::App::headless_for_test();
@@ -617,8 +554,6 @@ fn a_persons_burst_wakes_the_logs_watchers() {
     woke_and_took(&sub, &timeline, "a person's burst");
 }
 
-/// A failure the person comes to look at (`note_session_seen`) and one an
-/// update carried as seen (`note_carried_exit`) wake the watchers.
 #[test]
 fn a_failure_seen_wakes_the_logs_watchers() {
     use std::time::{Duration, Instant};
@@ -683,8 +618,6 @@ fn a_lifted_fence_wakes_the_logs_watchers() {
     woke_and_took(&sub, &timeline, "a lifted fence");
 }
 
-/// Control input owes its wake exactly when it wrote (`mark - input` once a
-/// burst): the hook wakes then, and a second input in the burst owes none.
 #[test]
 fn control_input_owes_a_wake_only_when_it_wrote() {
     let (tl, _hand) = opened();
@@ -708,17 +641,6 @@ fn control_input_owes_a_wake_only_when_it_wrote() {
     );
 }
 
-// ---- the look (phase 3A review) --------------------------------------------
-
-/// THE ONE LOOK (`SessionLog::await_look`): an `await log` at an ended
-/// session reads the log past its cursor and whether the close is due in one
-/// borrow of the log, so in one hold of the timeline's lock, and the close
-/// clears the flag in the hold that writes it (`SessionLog::close_session`).
-/// Before the close the look is due with nothing yet; after it the look
-/// answers the close, never `(Wait, false)`, which is the `ERR exited` a
-/// waiter would give over the close it waited for. NEGATIVE CONTROL: an exit
-/// handling that ended with no retire (`take_close_due`) looks `(Wait,
-/// false)`, and the waiter answers `ERR exited`.
 #[test]
 fn the_await_look_reads_a_close_with_the_flag_it_cleared() {
     use super::{LogAwait, LogAwaitStep};
@@ -766,14 +688,6 @@ fn the_await_look_reads_a_close_with_the_flag_it_cleared() {
     );
 }
 
-// ---- a predicate list ------------------------------------
-
-/// `await log` TAKES A LIST: `close=turn,kind=note` is answered by a note
-/// (its second member), and by the first member's record too. NEGATIVE
-/// CONTROL: the list's first member alone, which is what a matcher that tests
-/// only the first member sees, leaves the note unanswered. The grammar: one
-/// list of up to four distinct members, each a predicate; a second list, a
-/// repeated or unknown member, an empty one or a fifth is the usage.
 #[test]
 fn an_await_log_list_answers_on_any_member() {
     use super::{AWAIT_LOG_USAGE, LogAwait, LogAwaitStep};

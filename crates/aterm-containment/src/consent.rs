@@ -2068,7 +2068,7 @@ pub fn tccutil_reset_command(subject: &ResetSubject, folder: Folder) -> Vec<Stri
 
 /// The `tccutil` binary, absolute.
 #[cfg(any(unix, test))]
-pub const TCCUTIL_PATH: &str = "/usr/bin/tccutil";
+pub const TCCUTIL_PATH: &str = aterm_uds::os_path!("tccutil");
 
 /// Whether [`TCCUTIL_PATH`] can be run at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -3350,7 +3350,7 @@ pub fn probe_devtool(gate: ProbeGate, subject: &str) -> DevToolProbe {
 pub const SYSTEM_TCC_DB: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
 /// The reader, named absolutely.
-pub const SQLITE_TOOL: &str = "/usr/bin/sqlite3";
+pub const SQLITE_TOOL: &str = aterm_uds::os_path!("sqlite3");
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const DEVTOOL_DB_QUERY: &str = "SELECT hex(client), client_type, auth_value, last_modified \

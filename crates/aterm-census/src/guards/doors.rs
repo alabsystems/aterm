@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! The door guards: an authority the tree reaches through exactly one door,
 //! where no type, visibility or clippy.toml row can say so (a public fn's
@@ -20,16 +19,12 @@ fn product<'a>(tree: &Tree<'a>) -> impl Iterator<Item = &'a SourceFile> {
         .filter(|f| !f.rel.starts_with(CENSUS_CRATE))
 }
 
-// devtools-door: docs/DESIGN-macos-debugger-access-2026-09-29.md §5.5.
-
 /// Where the change runner, the tool's path and its argv builders are defined.
 const DEVTOOLS_HOME: &str = "crates/aterm-containment/src/consent.rs";
 /// The file of the one function that may run a change.
 const DEVTOOLS_FLOW: &str = "crates/aterm-gui/src/debugger_access.rs";
 /// That function: the live arm that runs a change for the owner's yes in aterm's
-/// alert. Both ways the yes is given reach it through the App's one start
-/// (`App::run_debugger_change`): the owner's press in Settings ▸ Security, and the
-/// alert aterm raises once per Mac at first launch.
+/// alert.
 const DEVTOOLS_WORKER: &str = "spawn_devtools_worker";
 /// The runner: public, so aterm-gui can reach it.
 const DEVTOOLS_RUNNER: &str = "run_devtools_change";
@@ -170,9 +165,7 @@ fn names_the_tool(text: &str) -> bool {
         })
 }
 
-/// In consent.rs, may this line name the path constant? Its definition, the
-/// probe's `[PATH, "-status"]`, and `[PATH, "-enable"]` / `[PATH, "-disable"]`
-/// inside `devtools_enable_command` / `devtools_disable_command` alone.
+/// In consent.rs, may this line name the path constant?
 fn path_const_allowed(line: Line<'_>, func: &str) -> bool {
     if has(
         line.code,
@@ -218,9 +211,6 @@ fn bare_path(text: &str, defines: bool) -> Option<String> {
         })
     })
 }
-
-// ffi-door: a platform call declared in one file, whose callers its privacy
-// then bounds.
 
 /// The foreign functions a local `extern` block may declare in one file only:
 /// the name's prefix, that file (`None`: nowhere), and what the call opens.
@@ -292,13 +282,6 @@ fn declared(code: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-// boot-id-door: the macOS boot id (`kern.bootsessionuuid`) is read through a
-// sysctl FFI call in one place, astream's (`astream_sys::boot_session`,
-// vendor/astream, outside this corpus). The guard watches that call alone: a
-// read of Linux's `/proc/sys/kernel/random/boot_id` is a plain file read, and
-// the tree keeps two on purpose (aterm-update's steady clock, judged by
-// `astream_sys::parse_boot_id`; aterm-release's publisher fence).
-
 /// The macOS boot id's sysctl name.
 const BOOT_ID_SYSCTL: &str = "kern.bootsessionuuid";
 /// The calls that read a sysctl by its name: the read itself, and the name's
@@ -320,9 +303,6 @@ pub(super) const BOOT_ID_DOOR: Rule = Rule {
 /// call on the CODE view) and holds the boot id's name in a literal (the TEXT
 /// view, so a comment naming it is no read): each such literal, wherever the
 /// call takes its name from — inline, a `const`, a helper of the same file.
-/// The name in a literal of a file that makes no such call is left alone: a
-/// test's oracle that asks `sysctl -n kern.bootsessionuuid` (a process, not
-/// the FFI read) checks astream's reading from outside it.
 fn boot_id_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
     for file in product(tree) {
         if !file.mentions(&[BOOT_ID_SYSCTL]) || !file.mentions(SYSCTL_BY_NAME) {
@@ -349,9 +329,6 @@ fn boot_id_door(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
     }
 }
-
-// handoff-name: the live upgrade's handoff variables are authority, read and
-// handed on only as `HandoffName`s (crates/aterm-gui/src/handoff_env.rs).
 
 /// aterm-gui's source: the window crate's and its split-out libraries'
 /// (`crates/aterm-gui-*`).
@@ -394,9 +371,6 @@ fn handoff_name(tree: &Tree<'_>, out: &mut Vec<Finding>) {
         }
     }
 }
-
-// core-signal: the argument half of the clippy.toml `abort`/`raise` rows, and
-// every script's.
 
 /// The signals whose death makes macOS write a crash report (and, for an app
 /// bundle, put a "quit unexpectedly" dialog on the owner's screen).
@@ -460,8 +434,6 @@ fn core_signal(tree: &Tree<'_>, out: &mut Vec<Finding>) {
 }
 
 /// The first shape on `line` that ends a process by a core-dump signal, named.
-/// Read over a script's lines and a Rust file's text view (a script in a Rust
-/// string counts).
 fn core_shape(line: &str) -> Option<String> {
     if !CORE_WORDS.iter().any(|w| line.contains(w)) {
         return None;
@@ -794,11 +766,8 @@ mod tests {
         );
     }
 
-    /// The boot id is read by name only in astream: the two shapes that came back
-    /// (30ae1a1185's inline call, its literal a line below the call; a `const` name), a
-    /// `sysctlnametomib` lookup and a test's own read are found. NEGATIVE CONTROL: a test's
-    /// oracle that spawns `sysctl -n kern.bootsessionuuid`, a file that reads other sysctls
-    /// and names the boot id only in comments, and this crate's own tables are not.
+    /// The boot id is read by name only in astream: the two shapes that came back, a
+    /// `sysctlnametomib` lookup and a test's own read are found.
     #[test]
     fn the_boot_id_is_read_by_astream_alone() {
         let inline = "pub fn boot_session() -> Option<String> {\n    let rc = unsafe {\n        \

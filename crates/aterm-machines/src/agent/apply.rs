@@ -625,10 +625,7 @@ mod tests {
             b"pid=4242 run=1-5 start=Fri_Oct_16_22:36:10_2026\n",
         );
         fake.alive(4242);
-        fake.on(
-            "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 4242",
-            Ran::ok("Sat Oct 17 08:01:02 2026\n"),
-        );
+        fake.born(4242, 1_792_224_062);
         let mut out = Vec::new();
         let code = follow(&fake, &layout(), "1-5", &mut out, Duration::ZERO);
         assert_eq!(code, ExitCode::from(super::super::REFUSED));
@@ -700,10 +697,7 @@ mod tests {
     fn verifying_host(principal: &str) -> Fake {
         let mut fake = Fake::root();
         fake.next_pid = 4242;
-        fake.on(
-            "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 4242",
-            Ran::ok("known child birth\n"),
-        );
+        fake.born(4242, 1_792_190_170);
         let dir = Stat {
             uid: 0,
             gid: 0,
@@ -785,7 +779,7 @@ mod tests {
             Some(state::Holder {
                 pid: 4242,
                 run: run.clone(),
-                start: Some("known_child_birth".into()),
+                start: Some("Fri_Oct_16_22:36:10_2026".into()),
             })
         );
         let calls = fake.calls();
@@ -1022,10 +1016,7 @@ mod tests {
         let mut fake = Fake::root();
         fake.next_pid = 4242;
         fake.file("/A/state/run.lock", b"pid=17 run=1-5 start=parent\n");
-        fake.on(
-            "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 4242",
-            Ran::ok("known child birth\n"),
-        );
+        fake.born(4242, 1_792_190_170);
         let layout = layout();
         let mut owner = StartingRun::claim(&fake, &layout, "1-5", 17).unwrap();
         start(

@@ -71,7 +71,6 @@ fn the_pins_floor_refuses_a_fallen_pin_and_warns_of_a_vanished_one() {
             .contains("PIN DOWNGRADE on the channel: ay 10 -> 9 in index-8"),
         "{e}"
     );
-    // Resolved for other targets, the record is retired (said), never compared.
     let tx = Transcript::memory("t");
     s.check_pins(&[X86_64_UNKNOWN_LINUX_GNU], &pins(&[("ay", 1)]), 8, &tx)
         .expect("restamped, not believed");
@@ -86,7 +85,6 @@ fn the_shell_apple_lanes_unstamped_pins_still_floor_the_apple_pins() {
     let tmp = scratch("state-shell-pins");
     let s = LaneState::of(LaneKind::Alab, tmp.path());
     s.ensure().expect("state");
-    // What the shell-era Apple lane left: no stamp, resolved for aarch64 + x86_64 darwin.
     std::fs::write(&s.pins_seen, "ay 3\nclean 20\n").expect("write");
     let tx = Transcript::memory("t");
     let e = s
@@ -103,7 +101,6 @@ fn the_shell_apple_lanes_unstamped_pins_still_floor_the_apple_pins() {
         "{e}"
     );
     assert!(!tx.text().contains("was not recorded"), "{}", tx.text());
-    // The Linux lane's own records were always stamped: an unstamped one is retired.
     let l = LaneState::of(LaneKind::Linux, tmp.path());
     std::fs::write(&l.pins_seen, "ay 3\n").expect("write");
     let targets = [X86_64_UNKNOWN_LINUX_GNU];
@@ -120,7 +117,6 @@ fn attempts_count_up_clear_on_success_and_age_out() {
     assert_eq!(s.bump_attempts("ay", 4), 2);
     s.clear_attempts("ay", 4);
     assert_eq!(s.bump_attempts("ay", 4), 1);
-    // An attempt counter untouched for a month is swept.
     let file = s.attempts_file("ay", 4);
     let old = std::time::SystemTime::now() - std::time::Duration::from_secs(40 * 86_400);
     std::fs::File::options()
@@ -198,7 +194,6 @@ fn a_group_holds_where_a_member_is_not_ready_and_nowhere_else() {
         "per target"
     );
     assert!(!h.is_held("other", Some(AARCH64_UNKNOWN_LINUX_GNU)));
-    // A whole-group hold holds every target.
     let whole = of_members([
         ("rustc", "trust", None, false),
         ("rustc", "trust-ir", None, true),

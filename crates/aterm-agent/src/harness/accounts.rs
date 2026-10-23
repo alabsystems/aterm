@@ -15,22 +15,19 @@ use super::one_line;
 /// The roster's file name, beside `aterm.toml`.
 pub const ACCOUNTS_FILE: &str = "accounts.toml";
 
-/// The variable a relaunch line carries to choose the login: set, its value names the
-/// vendor's keychain item (empty: the default item), whatever the Claude home is.
+/// The variable a relaunch line carries to choose the login.
 pub const LOGIN_ENV: &str = "CLAUDE_SECURESTORAGE_CONFIG_DIR";
 
 /// The most rows one roster carries, and the most accounts a state keeps.
 pub const MAX_ACCOUNTS: usize = 32;
 
-/// The longest label: `[a-z0-9][a-z0-9._-]{0,63}`.
+/// The longest label.
 pub const LABEL_MAX: usize = 64;
 
-/// The one word of that grammar that is no label: the harness command's help word
-/// (`accounts use help` asks for help), so an account named so could never be named.
+/// The one word of that grammar that is no label.
 pub const RESERVED_LABEL: &str = "help";
 
-/// The longest `dir` a row may name, in bytes. A longer one is refused, not cut: the
-/// string is hashed as given, so a cut one names another login.
+/// The longest `dir` a row may name, in bytes.
 pub const DIR_MAX: usize = 512;
 
 /// The longest `email` a row may carry, in bytes (RFC 5321's path bound).
@@ -39,13 +36,13 @@ pub const EMAIL_MAX: usize = 254;
 /// The longest `browser` profile name a row may carry, in characters.
 pub const BROWSER_MAX: usize = 64;
 
-/// The most bytes of `accounts.toml` that are read; a larger file is refused.
+/// The most bytes of `accounts.toml` that are read.
 pub const MAX_ROSTER_BYTES: u64 = 256 * 1024;
 
-/// The most bytes of `state.json` that are read; a larger file is not ours.
+/// The most bytes of `state.json` that are read.
 pub const MAX_STATE_BYTES: u64 = 1024 * 1024;
 
-/// The state file's schema. A file of another one is refused.
+/// The state file's schema.
 pub const SCHEMA: u64 = 1;
 
 /// The most walls kept per account (the vendor names six limit types).
@@ -54,8 +51,7 @@ pub const MAX_WALLS: usize = 8;
 /// The most sessions kept, newest first.
 pub const MAX_SESSIONS: usize = 256;
 
-/// The most rotation times kept (the bound itself is at most twice
-/// [`MAX_ACCOUNTS`] an hour).
+/// The most rotation times kept (the bound itself is at most twice [`MAX_ACCOUNTS`] an hour).
 pub const MAX_ROTATIONS: usize = 128;
 
 /// The longest session id, machine id, window name and `held` word kept.
@@ -76,21 +72,16 @@ pub const LEDGER_KEEP_ROWS: usize = 1024;
 /// A percent above this is no figure (the vendor paints whole percents).
 pub const PCT_MAX: u32 = 1000;
 
-/// A wall that names its reset stands this long past it (the supervisor's
-/// own `reset_grace`: Claude Code's limits lift a little after the instant
-/// they print).
+/// A wall that names its reset stands this long past it.
 pub const RESET_GRACE_S: i64 = 150;
 
-/// A wall observed after its own reset stands this long from the observation: 10 minutes
-/// the first time, 30 from the second on.
+/// A wall observed after its own reset stands this long from the observation.
 pub const LATE_WALL_S: [i64; 2] = [10 * 60, 30 * 60];
 
-/// A wall that names no reset stands this long from the observation: 30
-/// minutes, then 2 hours, then 6 from the third observation on.
+/// A wall that names no reset stands this long from the observation.
 pub const NO_RESET_WALL_S: [i64; 3] = [30 * 60, 2 * 3600, 6 * 3600];
 
-/// A wall seen again more than this long after it stopped standing is a new
-/// wall, counted from one (the ladders' last rung).
+/// A wall seen again more than this long after it stopped standing is a new wall.
 pub const WALL_EPISODE_S: i64 = 6 * 3600;
 
 /// The session window's share at which an account is `low`.
@@ -99,42 +90,30 @@ pub const LOW_SESSION_PCT: u32 = 90;
 /// The week's share at which an account is `low`.
 pub const LOW_WEEK_PCT: u32 = 98;
 
-/// A session is not moved early ([`Sample::leave_early`]) off an account whose low window
-/// resets within this long; the account stays `low` until that window ends
-/// ([`Sample::low`]).
+/// A session is not moved early ([`Sample::leave_early`], [`Sample::low`]).
 pub const RESET_SOON_S: i64 = 15 * 60;
 
-/// A `low` account is moved into only when no account becomes usable within
-/// this long.
+/// A `low` account is moved into only when no account becomes usable within this long.
 pub const LOW_ONLY_AFTER_S: i64 = 15 * 60;
 
-/// A wait is for the earliest dedicated instant when that is within this long of the
-/// earliest instant of any account.
+/// A wait is for the earliest dedicated instant when that is within this long of the earliest
+/// instant of any account.
 pub const DEDICATED_WAIT_S: i64 = 15 * 60;
 
-/// An account holding a reset offer that expires within this long is not
-/// left early: resets are offered only at a wall.
+/// An account holding a reset offer that expires within this long is not left early.
 pub const OFFER_EXPIRING_S: i64 = 24 * 3600;
 
-/// A reset claim with no outcome is in flight this long ([`reset_in_flight`]) and no
-/// longer: the vendor bounds its own claim at 35 s (2.1.287 bundle), and the rest is the
-/// loop's waits and a person's grace.
+/// A reset claim with no outcome is in flight this long ([`reset_in_flight`]) and no longer.
 pub const RESET_CLAIM_S: i64 = 10 * 60;
 
-/// How long before a process's start no other login may have run for its reset to be
-/// allowed ([`reset_allowed`]): the vendor posts a reset to the home profile's
-/// organization, and the profile follows a process that started when it was over 24 h
-/// old (2.1.287 bundle), plus the hour a session's row may lag ([`Account::ran_at`]).
+/// How long before a process's start no other login may have run for its reset to be allowed
+/// ([`reset_allowed`], [`Account::ran_at`]).
 pub const RESET_PROFILE_S: i64 = 25 * 3600;
 
 /// The probe is due no sooner than this after the last sample or claim.
 pub const PROBE_MIN_S: i64 = 3 * 60;
 
-/// No account is probed within this long of any account's claim. The vendor answers a
-/// usage read, unmarked, from the home's snapshot while it is under 60 s old and the
-/// asker has had no response since, and tags the snapshot with the home profile's
-/// account whichever login fetched it (2.1.287 bundle): two accounts probed inside a
-/// minute could each be shown the other's figures.
+/// No account is probed within this long of any account's claim.
 pub const PROBE_APART_S: i64 = 90;
 
 /// The probe is due no later than this after the last sample.
@@ -146,59 +125,46 @@ pub const PROBE_DEFAULT_S: i64 = 10 * 60;
 /// The window the machine's rotation bound counts over.
 pub const ROTATION_WINDOW_S: i64 = 3600;
 
-/// How long the one session on an account that has not served a response
-/// yet holds every other session back ([`StayWhy::Canary`]).
+/// How long the one session on an account that has not served a response yet holds every other
+/// session back ([`StayWhy::Canary`]).
 pub const CANARY_HOLD_S: i64 = 10 * 60;
 
-/// The most rotations whose undo is kept ([`State::undo`]): one for each
-/// rotation in a row past an account that had not answered and could not be
-/// run on.
+/// The most rotations whose undo is kept ([`State::undo`]).
 pub const MAX_UNDO: usize = 8;
 
-/// How far ahead of the reader's clock an observation's `at` may stand. One
-/// stamped later is read as made then: a clock set back, or another
-/// machine's running ahead, must not make an observation newer than
-/// anything this machine will see.
+/// How far ahead of the reader's clock an observation's `at` may stand.
 pub const STAMP_SKEW_S: i64 = 5 * 60;
 
-/// The session window's length (the vendor's `five_hour`, `windowSeconds: 18000`): a
-/// figure whose reset was not read is void this long after it was sampled.
+/// The session window's length (the vendor's `five_hour`, `windowSeconds: 18000`).
 pub const SESSION_WINDOW_S: i64 = 5 * 3600;
 
 /// The week's length, for the same bound on a weekly figure.
 pub const WEEK_WINDOW_S: i64 = 7 * 24 * 3600;
 
-/// How far past its own row a wall's reset may stand and still be believed
-/// ([`note_wall`]): eight days, a day past the longest window the vendor
-/// names ([`WEEK_WINDOW_S`]).
+/// How far past its own row a wall's reset may stand and still be believed ([`note_wall`],
+/// [`WEEK_WINDOW_S`]).
 pub const RESET_BELIEVED_S: i64 = 8 * 24 * 3600;
 
-/// A session's row older than this is dropped when the state is saved
-/// ([`drop_stale_sessions`]): thirty days.
+/// A session's row older than this is dropped when the state is saved ([`drop_stale_sessions`]).
 pub const SESSION_KEEP_S: i64 = 30 * 24 * 3600;
 
-/// How often a session's loop says again what its screen says of usage while
-/// that shows unchanged (`supervise::run`'s usage watch): ten minutes.
+/// How often a session's loop says again what its screen says of usage while that shows unchanged.
 pub const CREDITS_RETELL_S: i64 = 10 * 60;
 
-/// HOW OLD AN ANSWER'S ROW MUST BE AS A SCREEN IS READ for the screen's
-/// usage notices to be stamped with it ([`UsageSaid::at`]): two whole
-/// seconds of the transcript's, so one at least.
+/// HOW OLD AN ANSWER'S ROW MUST BE AS A SCREEN IS READ ([`UsageSaid::at`]).
 pub const NOTICES_DRAWN_S: i64 = 2;
 
-/// Credits are taken as in use this long past the newest answer seen served
-/// on them ([`CreditsUse::stands`]): three of [`CREDITS_RETELL_S`].
+/// Credits are taken as in use this long past the newest answer seen served on them
+/// ([`CreditsUse::stands`], [`CREDITS_RETELL_S`]).
 pub const CREDITS_STALE_S: i64 = 3 * CREDITS_RETELL_S;
 
 /// The weekly window counts as NEARLY FULL from this figure ([`windows_full`]).
 pub const WINDOW_FULL_PCT: u32 = 90;
 
-/// ...while its reset is more than this far off: a day. A window that resets
-/// sooner is a wait with an end, and no line.
+/// ...while its reset is more than this far off.
 pub const WINDOW_FULL_AHEAD_S: i64 = 24 * 3600;
 
-/// THE BOUNDED WAIT FOR `accounts.lock` ([`Store::acquire_within`]): the
-/// pauses between one try and the next, two seconds in all.
+/// THE BOUNDED WAIT FOR `accounts.lock` ([`Store::acquire_within`]).
 pub const LOCK_LADDER: [std::time::Duration; 9] = {
     const fn ms(n: u64) -> std::time::Duration {
         std::time::Duration::from_millis(n)
@@ -216,45 +182,32 @@ pub const LOCK_LADDER: [std::time::Duration; 9] = {
     ]
 };
 
-/// What a bounded take answers when the lock stayed held
-/// ([`Store::transact_within`], [`Recorded::Refused`], [`record_gone`]):
-/// exactly this, so a caller can tell "ask again" from a state that is not
-/// ours to write ([`Recorded::lock_held`]).
+/// What a bounded take answers when the lock stayed held ([`Store::transact_within`],
+/// [`Recorded::Refused`], [`record_gone`], [`Recorded::lock_held`]).
 pub const LOCK_HELD: &str = "the accounts lock is held";
 
-/// The window name a candidate that failed with no wall of its own is
-/// struck under ([`Strike::Failed`]): a wall naming no reset.
+/// The window name a candidate that failed with no wall of its own is struck under
+/// ([`Strike::Failed`]).
 pub const STRUCK_WINDOW: &str = "struck";
 
-/// The window name a wall is recorded under when its row names no limit
-/// type and its text names none either ([`record_wall`]).
+/// The window name a wall is recorded under when its row names no limit type and its text names
+/// none either ([`record_wall`]).
 pub const UNNAMED_WINDOW: &str = "limit";
 
-/// The limit type of the five-hour window (`quotaLimits.rateLimitType`), the
-/// one Claude Code's `session limit` warning names ([`Account::warned_session`]).
+/// The limit type of the five-hour window ([`Account::warned_session`]).
 pub const SESSION_LIMIT: &str = "five_hour";
 
-/// The limit type of the week of all models, the one its `weekly limit`
-/// warning names ([`Account::warned_week`]); a model's own week
-/// (`seven_day_opus`, `seven_day_overage_included`: `Current week (Fable)`) is
-/// another window.
+/// The limit type of the week of all models ([`Account::warned_week`]).
 pub const WEEK_LIMIT: &str = "seven_day";
 
-/// The variable that moves a process's Claude home. READ in the vendor's
-/// bundle: set, it is the home, and — with [`LOGIN_ENV`] unset — the
-/// directory its keychain item is named by too.
+/// The variable that moves a process's Claude home ([`LOGIN_ENV`]).
 pub const HOME_ENV: &str = "CLAUDE_CONFIG_DIR";
 
-/// THE VARIABLE A CLAUDE CODE'S `os.homedir()` READS, which it joins
-/// `.claude` to where [`HOME_ENV`] is unset: `HOME`, and on Windows
-/// `USERPROFILE`.
+/// THE VARIABLE A CLAUDE CODE'S `os.homedir()` READS ([`HOME_ENV`]).
 pub const HOMEDIR_ENV: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
 
-/// THE VARIABLES THAT GIVE A PROCESS A CREDENTIAL OR A PROVIDER OF ITS OWN,
-/// so that it does not authenticate by its stored login — beside the ones
-/// that give it a route ([`super::netwatch::ROUTE_KEYS`]: a base URL, the
-/// three cloud providers, a unix socket, a proxy), which
-/// [`ProcessLogin::of_env`] reads from that list and does not copy.
+/// THE VARIABLES THAT GIVE A PROCESS A CREDENTIAL OR A PROVIDER OF ITS OWN
+/// ([`super::netwatch::ROUTE_KEYS`], [`ProcessLogin::of_env`]).
 pub const CREDENTIAL_KEYS: &[&str] = &[
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
@@ -271,9 +224,7 @@ pub const CREDENTIAL_KEYS: &[&str] = &[
     "CLAUDE_CODE_HOST_AUTH_ENV_VAR",
 ];
 
-/// The variables of the vendor's `profile` source, which its token chain asks ahead of
-/// the stored login (`… → apiKeyHelper → profile → claude.ai`; read in the 2.1.286 and
-/// 2.1.287 bundles).
+/// The variables of the vendor's `profile` source.
 pub const PROFILE_KEYS: &[&str] = &[
     "ANTHROPIC_PROFILE",
     "ANTHROPIC_FEDERATION_RULE_ID",
@@ -286,10 +237,10 @@ pub const PROFILE_KEYS: &[&str] = &[
 /// Contention class (`dedicated` or `shared`) of a Claude Code account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub enum Class {
-    /// This machine's alone: tried first.
+    /// This machine's alone.
     #[default]
     Dedicated,
-    /// Drawn on from elsewhere too: tried after every dedicated one.
+    /// Drawn on from elsewhere too.
     Shared,
 }
 
@@ -317,23 +268,17 @@ impl Class {
 /// Admitted `accounts.toml` row, optionally bound to a renewed login directory via [`bound`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Row {
-    /// The only name the account has anywhere: `[a-z0-9][a-z0-9._-]{0,63}`.
+    /// The only name the account has anywhere.
     pub label: String,
     /// Dedicated or shared.
     pub class: Class,
-    /// The login's directory NAME, VERBATIM as the file gave it (a trailing
-    /// slash and a space survive).
+    /// The login's directory NAME.
     pub dir: Option<String>,
-    /// THE ACCOUNT'S EMAIL (owner ruling R-2, design §4.5): the `--email`
-    /// hint a renewal's sign-in is opened with and the address its check
-    /// compares in memory ([`email_matches`]).
+    /// THE ACCOUNT'S EMAIL (owner ruling R-2, design §4.5) ([`email_matches`]).
     pub email: Option<String>,
-    /// The browser profile that holds the account's claude.ai session, by
-    /// its display name (`Claude m7-a`): where a renewal's page is opened.
+    /// The browser profile that holds the account's claude.ai session.
     pub browser: Option<String>,
-    /// The logins a renewal bound this row AWAY FROM on this machine, newest
-    /// first ([`Binding::was`]; `None` is the default login): filled by
-    /// [`bound`] alone, and empty as the file is read.
+    /// The logins a renewal bound this row AWAY FROM on this machine ([`Binding::was`], [`bound`]).
     pub was: Vec<Option<String>>,
 }
 
@@ -432,26 +377,16 @@ pub fn email_matches(row: &str, answered: &str) -> bool {
     row.eq_ignore_ascii_case(answered.trim())
 }
 
-/// A caller's text as it is quoted into a refusal: one bounded line.
+/// A caller's text as it is quoted into a refusal.
 fn shown(text: &str) -> String {
     one_line(text, 80)
 }
 
 impl Roster {
-    /// Parses and validates an `accounts.toml` document (whole-file, fail-closed).
+    /// Parses and validates an `accounts.toml` document ([`MAX_ACCOUNTS`], [`RESERVED_LABEL`],
+    /// [`DIR_MAX`], [`email_refusal`], [`browser_refusal`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// Each names the row and the reason: the text is not TOML; an unknown
-    /// top-level key or table; `account` is not `[[account]]` rows; more than
-    /// [`MAX_ACCOUNTS`] rows; a row with an unknown key, with no label, an
-    /// inadmissible one ([`RESERVED_LABEL`] by name) or a repeated one, with
-    /// no class or one that is neither `dedicated` nor `shared`, with a `dir`
-    /// that is not a string, is relative, holds a control character, is
-    /// longer than [`DIR_MAX`] bytes or repeats another row's; with an
-    /// `email` that is not one address ([`email_refusal`]; never quoted) or
-    /// repeats another row's, or a `browser` that is not a profile's name
-    /// ([`browser_refusal`]); or more than one row with no `dir`.
     pub fn parse(text: &str) -> Result<Roster, String> {
         let doc = aterm_toml::from_str::<aterm_toml::Value>(text).map_err(|e| {
             format!(
@@ -532,13 +467,9 @@ impl Roster {
         Ok(Roster { rows })
     }
 
-    /// Loads the roster at `path`, returning an empty [`Roster`] when the file is absent.
+    /// Loads the roster at `path` ([`Roster`], [`MAX_ROSTER_BYTES`], [`Roster::parse`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The file exists and cannot be read, is larger than
-    /// [`MAX_ROSTER_BYTES`], is not UTF-8, or does not admit
-    /// ([`Roster::parse`]).
     pub fn load(path: &Path) -> Result<Roster, String> {
         match roster_text(path)? {
             None => Ok(Roster::default()),
@@ -600,17 +531,14 @@ impl Roster {
     }
 }
 
-/// Reads the raw text of the roster file at `path`, or `Ok(None)` if absent.
+/// Reads the raw text of the roster file at `path` ([`MAX_ROSTER_BYTES`]).
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// The file exists and cannot be read, is larger than [`MAX_ROSTER_BYTES`]
-/// or is not UTF-8 — named with its path.
 pub fn roster_text(path: &Path) -> Result<Option<String>, String> {
     read_bounded(path, MAX_ROSTER_BYTES).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-/// One `[[account]]` item as a row; `n` is its 1-based place in the file.
+/// One `[[account]]` item as a row.
 fn row_of(item: &aterm_toml::Value, n: usize) -> Result<Row, String> {
     let Some(table) = item.as_table() else {
         return Err(format!(
@@ -725,10 +653,7 @@ pub fn login_env(row: &Row) -> (&'static str, String) {
     (LOGIN_ENV, row.dir.clone().unwrap_or_default())
 }
 
-/// Why `row` would not admit, as the reader names it — its label, its `dir`,
-/// its `email` (never quoted) or its `browser` — or `None` when it would: the
-/// reader's own checks, asked BEFORE a row is written, because a roster
-/// refuses whole.
+/// Why `row` would not admit, as the reader names it.
 fn row_refusal(row: &Row) -> Option<String> {
     let label = &row.label;
     if let Some(why) = label_refusal(label) {
@@ -790,13 +715,10 @@ pub fn row_inline(label: &str, class: Class, dir: Option<&str>) -> Option<String
     })
 }
 
-/// What a row's `email` is written as in a row to add by hand
-/// ([`row_inline_of`]): a refusal is printed, and an address is never.
+/// What a row's `email` is written as in a row to add by hand ([`row_inline_of`]).
 pub const EMAIL_BY_HAND: &str = "<the --email you gave>";
 
-/// [`row_inline`] of a whole row. Its `email`, where it has one, is written
-/// as [`EMAIL_BY_HAND`]: this text is printed in a refusal, never written to
-/// a file, and no address is ever printed.
+/// [`row_inline`] of a whole row ([`EMAIL_BY_HAND`]).
 fn row_inline_of(row: &Row) -> Option<String> {
     if row_refusal(row).is_some() {
         return None;
@@ -828,11 +750,10 @@ fn row_inline_of(row: &Row) -> Option<String> {
     Some(out)
 }
 
-/// Appends a new `(label, class, dir)` row to `existing` `accounts.toml` text and validates the result.
+/// Appends a new `(label, class, dir)` row to `existing` `accounts.toml` text and validates the
+/// result ([`append_rows`]).
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// As [`append_rows`], of which this is the one-row case.
 pub fn append_row(
     existing: &str,
     label: &str,
@@ -850,18 +771,10 @@ pub fn append_row(
     )
 }
 
-/// Appends `rows` in order to `existing` `accounts.toml` text and validates the result.
+/// Appends `rows` in order to `existing` `accounts.toml` text and validates the result
+/// ([`Roster::parse`], [`row_inline`], [`EMAIL_BY_HAND`]).
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// A row would not admit, `existing` does not admit, or the whole together
-/// does not (a repeated label, `dir` or `email`, a second row with no `dir`,
-/// a 33rd row) — each as [`Roster::parse`] names it, so nothing is written
-/// that the next read refuses. And a roster that admits but defines
-/// `account` INLINE (`account = [ { … } ]`, or the empty `account = []`): an
-/// `[[account]]` table cannot extend an array written that way, so the
-/// refusal says so and carries EVERY row to add by hand ([`row_inline`]), in
-/// order, an email written as [`EMAIL_BY_HAND`].
 pub fn append_rows(existing: &str, rows: &[Row]) -> Result<String, String> {
     if let Some(why) = rows.iter().find_map(row_refusal) {
         return Err(why);
@@ -914,8 +827,7 @@ pub fn login_made(dir: &Path) -> bool {
         .is_ok_and(|mut entries| entries.next().is_some_and(|entry| entry.is_ok()))
 }
 
-/// Whether `row` is enrolled given the caller's set: the row with no `dir`
-/// always is.
+/// Whether `row` is enrolled given the caller's set.
 fn is_enrolled(row: &Row, enrolled: &BTreeSet<String>) -> bool {
     row.dir.is_none() || enrolled.contains(&row.label)
 }
@@ -963,25 +875,21 @@ pub fn default_roster_path() -> Option<PathBuf> {
     roster_beside(&aterm_types::dirs::aterm_config_path()?)
 }
 
-/// Login directory and credential-override facts extracted from a process's environment and settings.
+/// Login directory and credential-override facts extracted from a process's environment and
+/// settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessLogin {
-    /// The value of [`LOGIN_ENV`] where it is set and not empty, verbatim (the vendor
-    /// hashes the string as given).
+    /// The value of [`LOGIN_ENV`] where it is set and not empty.
     pub login: Option<String>,
-    /// Its Claude home is the default one: [`HOME_ENV`] is unset or empty.
+    /// Its Claude home is the default one ([`HOME_ENV`]).
     pub default_home: bool,
-    /// It authenticates by a stored login: nothing in its environment gives it a
-    /// credential, provider, profile or route of its own ([`CREDENTIAL_KEYS`],
-    /// [`PROFILE_KEYS`], [`super::netwatch::ROUTE_KEYS`]), its login can be told
-    /// ([`ProcessLogin::of_env`]), and nothing the host handed over says otherwise.
+    /// It authenticates by a stored login ([`CREDENTIAL_KEYS`], [`PROFILE_KEYS`],
+    /// [`super::netwatch::ROUTE_KEYS`], [`ProcessLogin::of_env`]).
     pub stored_login: bool,
 }
 
-/// Whether the variable `name`, set, gives a process a way to authenticate that is not its
-/// stored login: a credential or provider ([`CREDENTIAL_KEYS`]), the vendor's profile
-/// source ([`PROFILE_KEYS`]), or a route of its own ([`super::netwatch::ROUTE_KEYS`],
-/// [`super::netwatch::ROUTE_PREFIXES`]).
+/// Whether the variable `name` ([`CREDENTIAL_KEYS`], [`PROFILE_KEYS`],
+/// [`super::netwatch::ROUTE_KEYS`], [`super::netwatch::ROUTE_PREFIXES`]).
 fn names_another_login(name: &str) -> bool {
     use super::netwatch::{ROUTE_KEYS, ROUTE_PREFIXES};
     CREDENTIAL_KEYS.contains(&name)
@@ -1124,12 +1032,10 @@ pub fn footer_label<'a>(roster: &'a Roster, who: &ProcessLogin) -> Option<&'a st
     judged_label(roster, who).filter(|_| roster.several())
 }
 
-/// The logins' file name, in the store beside `state.json`. Its own file:
-/// an older build saves `state.json` with the keys it knows ([`State::to_json`]),
-/// so a binding kept there would be lost at that build's first write.
+/// The logins' file name, in the store beside `state.json` ([`State::to_json`]).
 pub const LOGINS_FILE: &str = "logins.json";
 
-/// [`LOGINS_FILE`]'s schema. A file of another one is refused.
+/// [`LOGINS_FILE`]'s schema.
 pub const LOGINS_SCHEMA: u64 = 1;
 
 /// The most bytes of [`LOGINS_FILE`] that are read.
@@ -1138,41 +1044,28 @@ pub const MAX_LOGINS_BYTES: u64 = 256 * 1024;
 /// One day, in seconds.
 const DAY_S: i64 = 86_400;
 
-/// A login's lifetime before anything was learned of it: three weeks. The
-/// vendor's client default is 30 days (`nP=2592000000`, READ in the 2.1.300
-/// bundle) and field reports say one to four weeks; the server's figure is
-/// not on any record here until an end or a notice teaches it.
+/// A login's lifetime before anything was learned of it.
 pub const LIFETIME_START_S: i64 = 21 * DAY_S;
 
-/// The least a learned lifetime is taken as: a week. An end sooner than this
-/// after a renewal is no lifetime (a revocation, a sign-out elsewhere) and
-/// teaches nothing ([`note_login_end`]); a notice that implies less is read
-/// as this.
+/// The least a learned lifetime is taken as: a week ([`note_login_end`]).
 pub const LIFETIME_MIN_S: i64 = 7 * DAY_S;
 
 /// The most a learned lifetime is taken as: the client's own 30 days.
 pub const LIFETIME_MAX_S: i64 = 30 * DAY_S;
 
-/// A login whose forecast end is this near is DUE ([`LoginState::Due`]):
-/// five days, so one sitting a few days apart renews every due login before
-/// it ends.
+/// A login whose forecast end is this near is DUE ([`LoginState::Due`]).
 pub const DUE_S: i64 = 5 * DAY_S;
 
-/// A login with a served turn on record this recently is `ok`
-/// ([`LoginState::Ok`]).
+/// A login with a served turn on record this recently is `ok` ([`LoginState::Ok`]).
 pub const OK_FRESH_S: i64 = 6 * 3600;
 
-/// The most days the vendor's start-up notice `Your login expires in N days`
-/// names (READ in the 2.1.300 bundle: it is shown only while the refresh
-/// token's end is 3 days away or nearer, `Math.ceil` of the days): a reading
-/// of more is no such notice.
+/// The most days the vendor's start-up notice `Your login expires in N days` names.
 pub const NOTICE_DAYS_MAX: u32 = 3;
 
 /// The most superseded logins a binding remembers ([`Binding::was`]).
 pub const MAX_LEFT: usize = 4;
 
-/// Within this long of now, a machine whose every renewable login is gone or
-/// forecast to end has no working login soon ([`none_working_within`]).
+/// Within this long of now ([`none_working_within`]).
 pub const NONE_SOON_S: i64 = DAY_S;
 
 /// The longest subscription word kept.
@@ -1204,11 +1097,9 @@ impl RenewalCheckpoint {
 }
 
 /// Saves the bounded, private result of a successful fresh sign-in check before binding it.
-/// Callers must have checked the sign-in's exit and `status_facts(...).renews()`.
-///
 /// # Errors
-/// The scope is invalid, staging cannot be canonicalized, the reserved name already exists,
-/// or writing, publishing or flushing the private checkpoint fails.
+/// The scope is invalid, staging cannot be canonicalized, the reserved name already exists, or
+/// writing, publishing or flushing the private checkpoint fails.
 pub(super) fn write_renewal_checkpoint(
     label: &str,
     email: &str,
@@ -1221,8 +1112,6 @@ pub(super) fn write_renewal_checkpoint(
     let checkpoint = RenewalCheckpoint {
         label: label.to_owned(),
         email: email.to_owned(),
-        // The vendor's login identity hashes this exact spelling, even when
-        // another path reaches the same filesystem directory.
         dir: staging_text.to_owned(),
         checked_at,
         subscription: subscription.map(str::to_owned),
@@ -1256,14 +1145,11 @@ pub(super) fn write_renewal_checkpoint(
         .tempdir_in(staging)?;
     let candidate = stage.path().join("result");
     super::upgrade_models::write_atomic_mode(&candidate, &text, Some(0o600))?;
-    // A link publishes complete bytes exclusively, preserving every existing
-    // file, symlink or other obstruction at the reserved name.
     std::fs::hard_link(&candidate, staging.join(RENEWAL_CHECKPOINT_FILE))?;
     aterm_durable::durable_dir(staging)
 }
 
 /// Reads a bounded regular checkpoint without following a link or waiting on a FIFO.
-/// An absent, unknown, malformed, out-of-scope or future result grants no renewal.
 #[must_use]
 pub(super) fn read_renewal_checkpoint(
     staging: &Path,
@@ -1310,17 +1196,14 @@ pub(super) fn read_renewal_checkpoint(
 /// Machine-local login binding and learned renewal lifetime for one roster account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
-    /// The login directory a renewal bound the row to, VERBATIM: the
-    /// keychain item is named by a hash of this exact string, so it is
-    /// recorded and never rebuilt.
+    /// The login directory a renewal bound the row to, VERBATIM.
     pub dir: Option<String>,
     /// When the bound login was renewed (its staging check answered).
     pub renewed_at: Option<i64>,
-    /// The lifetime a renewal is forecast by, as learned ([`Binding::lifetime`]
-    /// reads it clamped to [`LIFETIME_MIN_S`]..=[`LIFETIME_MAX_S`]).
+    /// The lifetime a renewal is forecast by, as learned ([`Binding::lifetime`],
+    /// [`LIFETIME_MIN_S`], [`LIFETIME_MAX_S`]).
     pub lifetime_s: i64,
-    /// The latest end the vendor's notice allows, for the bound login
-    /// ([`note_login_notice`]).
+    /// The latest end the vendor's notice allows, for the bound login ([`note_login_notice`]).
     pub notice_end: Option<i64>,
     /// When the bound login was first seen ended ([`note_login_end`]).
     pub ended_at: Option<i64>,
@@ -1328,11 +1211,9 @@ pub struct Binding {
     pub served_at: Option<i64>,
     /// The `subscriptionType` its renewal's check answered (`max`, `pro`).
     pub subscription: Option<String>,
-    /// When a renewal last answered ANOTHER account than the row's
-    /// ([`note_wrong_account`]): nothing live changed then.
+    /// When a renewal last answered ANOTHER account than the row's ([`note_wrong_account`]).
     pub wrong_at: Option<i64>,
-    /// The logins this binding replaced, newest first, at most
-    /// [`MAX_LEFT`]; `None` is the default login.
+    /// The logins this binding replaced, newest first, at most [`MAX_LEFT`].
     pub was: Vec<Option<String>>,
 }
 
@@ -1359,8 +1240,7 @@ impl Binding {
         self.lifetime_s.clamp(LIFETIME_MIN_S, LIFETIME_MAX_S)
     }
 
-    /// Learn that the bound login ends no later than `end`: the lifetime is
-    /// LOWERED to what that end implies (never raised), within its bounds.
+    /// Learn that the bound login ends no later than `end`.
     fn lower_lifetime(&mut self, end: i64) {
         if let Some(renewed) = self.renewed_at
             && end > renewed
@@ -1388,8 +1268,7 @@ impl Logins {
         self.labels.get(label)
     }
 
-    /// The binding of `label`, made if absent; `None` for a label no roster
-    /// could carry, or a 33rd.
+    /// The binding of `label`, made if absent.
     fn entry(&mut self, label: &str) -> Option<&mut Binding> {
         if !admissible_label(label)
             || (!self.labels.contains_key(label) && self.labels.len() >= MAX_ACCOUNTS)
@@ -1431,12 +1310,10 @@ impl Logins {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
-    /// Deserializes and validates `logins.json` against `now`.
+    /// Deserializes and validates `logins.json` against `now` ([`State::from_json`],
+    /// [`Unread::Torn`], [`Unread::NotOurs`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// As [`State::from_json`]: [`Unread::Torn`] for text that is not JSON,
-    /// [`Unread::NotOurs`] for another schema or invalid identity structure.
     pub fn from_json(text: &str, now: i64) -> Result<Logins, Unread> {
         let doc: Value = aterm_json::from_str(text)
             .map_err(|e| Unread::Torn(format!("not JSON ({})", shown(&e.to_string()))))?;
@@ -1533,8 +1410,7 @@ pub fn bound(roster: &Roster, logins: &Logins) -> Roster {
 /// Derived renewal state of a roster account's login on this machine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoginState {
-    /// A login wall was seen on it ([`Auth::SignedOut`] on record): only a
-    /// renewal restores it.
+    /// A login wall was seen on it ([`Auth::SignedOut`] on record).
     Expired,
     /// Its forecast end ([`forecast`]) is within [`DUE_S`].
     Due {
@@ -1543,7 +1419,7 @@ pub enum LoginState {
     },
     /// A turn was served under it within [`OK_FRESH_S`].
     Ok,
-    /// None of the above: not a fault — the next turn under it is its check.
+    /// None of the above: not a fault.
     Idle,
 }
 
@@ -1618,7 +1494,8 @@ pub fn renew_due(
         .collect()
 }
 
-/// Returns whether the roster has renewable accounts enrolled here and none remain working past `now + within`.
+/// Returns whether the roster has renewable accounts enrolled here and none remain working past
+/// `now + within`.
 #[must_use]
 pub fn none_working_within(
     roster: &Roster,
@@ -1785,16 +1662,13 @@ pub struct Wall {
     pub at: i64,
     /// The machine that observed it.
     pub by: String,
-    /// How many times it was found standing with no reset ahead of it: `0`
-    /// for a wall observed before its own reset.
+    /// How many times it was found standing with no reset ahead of it.
     pub attempts: u32,
-    /// This window was cleared at `at`, rather than observed standing. The
-    /// record prevents an older transcript row from putting that wall back.
+    /// This window was cleared at `at`, rather than observed standing.
     pub cleared: bool,
 }
 
-/// The rung of `ladder` for the `attempts`th observation, the last one for
-/// ever after.
+/// The rung of `ladder` for the `attempts`th observation, the last one for ever after.
 fn rung(ladder: &[i64], attempts: u32) -> i64 {
     let i = usize::try_from(attempts.saturating_sub(1)).unwrap_or(usize::MAX);
     ladder
@@ -1838,9 +1712,7 @@ pub struct Sample {
     pub by: String,
 }
 
-/// A window's figure and the instant it stops counting, while that window still runs. A
-/// window whose reset has passed voids its figure; a figure whose reset was not read is
-/// void one window length after its sample.
+/// A window's figure and the instant it stops counting, while that window still runs.
 fn figure(
     pct: Option<u32>,
     reset: Option<i64>,
@@ -1853,7 +1725,8 @@ fn figure(
 }
 
 impl Sample {
-    /// Returns the 5-hour session utilization percentage and reset timestamp while the window is active.
+    /// Returns the 5-hour session utilization percentage and reset timestamp while the window is
+    /// active.
     #[must_use]
     pub fn session(&self, now: i64) -> Option<(u32, i64)> {
         figure(
@@ -1865,13 +1738,15 @@ impl Sample {
         )
     }
 
-    /// Returns the 7-day weekly utilization percentage and reset timestamp while the window is active.
+    /// Returns the 7-day weekly utilization percentage and reset timestamp while the window is
+    /// active.
     #[must_use]
     pub fn week(&self, now: i64) -> Option<(u32, i64)> {
         figure(self.week_pct, self.week_reset, self.at, WEEK_WINDOW_S, now)
     }
 
-    /// Returns the latest timestamp until which any running window in this sample is at or above its low threshold.
+    /// Returns the latest timestamp until which any running window in this sample is at or above
+    /// its low threshold.
     #[must_use]
     pub fn low_until(&self, now: i64) -> Option<i64> {
         let at = |figure: Option<(u32, i64)>, threshold: u32| {
@@ -1899,9 +1774,7 @@ impl Sample {
 /// Limit-reset offer observed at a usage wall.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
-    /// The kind `left` counts, where one was read: Claude Code 2.1.304
-    /// counts each kind apart (`1 weekly reset left`), so a count with a
-    /// kind is that kind's and never the account's whole.
+    /// The kind `left` counts, where one was read.
     pub kind: Option<ResetKind>,
     /// Resets left (of `kind`, where one is named).
     pub left: u32,
@@ -1920,8 +1793,7 @@ pub enum Credits {
     InUse(CreditsUse),
     /// Off, as a limit row said (`quotaLimits.overageStatus: rejected`).
     Off(CreditsOff),
-    /// On, as a limit row said (`allowed`, `allowed_warning`), at this
-    /// instant: no session was seen on them since.
+    /// On, as a limit row said (`allowed`, `allowed_warning`), at this instant.
     On(i64),
 }
 
@@ -1944,11 +1816,9 @@ pub struct CreditsUse {
     pub since: i64,
     /// The newest.
     pub seen: i64,
-    /// The reset of the window credits carried past, where the notice they
-    /// started on named it: they are taken as in use until it at least.
+    /// The reset of the window credits carried past, where the notice they started on named it.
     pub until: Option<i64>,
-    /// This episode raised the day's line ([`credits_noted`]): the first
-    /// episode of the local day did, a later one the same day does not.
+    /// This episode raised the day's line ([`credits_noted`]).
     pub told: bool,
 }
 
@@ -1972,8 +1842,7 @@ impl CreditsUse {
 /// Observation that an account's usage credits are disabled, with the vendor's reason word.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreditsOff {
-    /// The vendor's word for why (`overageDisabledReason`: `out_of_credits`,
-    /// `org_level_disabled`, …), or empty where the row named none.
+    /// The vendor's word for why.
     pub reason: String,
     /// When the row was written.
     pub at: i64,
@@ -1984,19 +1853,17 @@ pub struct CreditsOff {
 /// Warning utilization figure and reset timestamp read from a session screen outside `/usage`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowSaid {
-    /// Whole percent used; `None`: refilled at [`Self::at`], and no figure
-    /// said since.
+    /// Whole percent used ([`Self::at`]).
     pub pct: Option<u32>,
-    /// When the window resets, where the warning named it. With no figure,
-    /// the reset that came by itself (a limit that lifted on its own,
-    /// [`reset_outcome`]); `None` there: a limit reset used refilled it.
+    /// When the window resets, where the warning named it ([`reset_outcome`]).
     pub reset: Option<i64>,
     /// When it was true.
     pub at: i64,
 }
 
 impl WindowSaid {
-    /// Returns the utilization percentage and window end timestamp while the warning window is active.
+    /// Returns the utilization percentage and window end timestamp while the warning window is
+    /// active.
     #[must_use]
     pub fn figure(&self, window_s: i64, now: i64) -> Option<(u32, i64)> {
         figure(self.pct, self.reset, self.at, window_s, now)
@@ -2006,41 +1873,30 @@ impl WindowSaid {
 /// [`WindowFig::source`] of a usage tap's reading ([`note_reading`]).
 pub const SOURCE_TAP: &str = "tap";
 
-/// [`WindowFig::source`] of a figure the account's [`Sample`] held before
-/// any [`WindowFig`] was kept for its window: a `/usage` panel the probe
-/// read ([`note_sample`]), or a tap reading an older build recorded.
+/// [`WindowFig::source`] of a figure the account's [`Sample`] held before any [`WindowFig`] was
+/// kept for its window ([`note_sample`]).
 pub const SOURCE_SAMPLE: &str = "sample";
 
-/// The most windows one account keeps a [`WindowFig`] for: the vendor's two,
-/// its per-model weeks and its spend limit (the account-stats design's
-/// closed bucket ids, §7.2), with room.
+/// The most windows one account keeps a [`WindowFig`] for: the vendor's two.
 pub const MAX_WINDOWS: usize = 8;
 
-/// A drop smaller than this, in tenths of a percent, is no refill
-/// ([`WindowRead::refilled`]): the vendor's figure carries one decimal, and
-/// a tenth's wobble between two answers is not a reset used.
+/// A drop smaller than this, in tenths of a percent, is no refill ([`WindowRead::refilled`]).
 pub const REFILL_MIN_X10: u32 = 10;
 
 /// Single quota-window utilization reading held on an [`Account`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowFig {
-    /// Tenths of a percent used (`425` is 42.5%), at most `10 *`
-    /// [`PCT_MAX`].
+    /// Tenths of a percent used (`425` is 42.5%), at most `10 *` [`PCT_MAX`].
     pub pct_x10: u32,
-    /// The window's reset, the vendor's instant: the anchor readings merge
-    /// under ([`merge_fig`]).
+    /// The window's reset, the vendor's instant ([`merge_fig`]).
     pub reset: i64,
-    /// When the reading was served, as near as its source knows: the tap's
-    /// first report after the request it reports ([`TapRead::at`]).
+    /// When the reading was served, as near as its source knows ([`TapRead::at`]).
     pub at: i64,
     /// The machine that read it.
     pub by: String,
-    /// Where it came from: in the state, [`SOURCE_TAP`] or [`SOURCE_SAMPLE`];
-    /// the stats view merges its own sources' figures beside them
-    /// (`super::account_stats`).
+    /// Where it came from: in the state, [`SOURCE_TAP`] or [`SOURCE_SAMPLE`].
     pub source: String,
-    /// A limit reset used inside this window, as seen ([`WindowRead::refilled`],
-    /// [`reset_outcome`]): the vendor refilled it then, keeping its reset.
+    /// A limit reset used inside this window ([`WindowRead::refilled`], [`reset_outcome`]).
     pub epoch_at: Option<i64>,
 }
 
@@ -2097,16 +1953,12 @@ pub fn merge_fig(
 /// Single quota window from a usage-tap reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowRead {
-    /// Tenths of a percent used, as the vendor sent it (`used_percentage`
-    /// carries one decimal); a file an older tap wrote, whole percents
-    /// times ten.
+    /// Tenths of a percent used, as the vendor sent it (`used_percentage` carries one decimal).
     pub pct_x10: u32,
     /// The window's reset.
     pub reset: i64,
-    /// THE VENDOR REFILLED THE WINDOW FROM THIS FIGURE (tenths): the process
-    /// that wrote this reading was served since its own reading before it
-    /// ([`TapRead::seen_before`]), which held this figure under the same
-    /// reset, [`REFILL_MIN_X10`] or more above [`Self::pct_x10`].
+    /// THE VENDOR REFILLED THE WINDOW FROM THIS FIGURE ([`TapRead::seen_before`],
+    /// [`REFILL_MIN_X10`], [`Self::pct_x10`]).
     pub refilled: Option<u32>,
 }
 
@@ -2117,18 +1969,13 @@ pub struct TapRead {
     pub five_hour: Option<WindowRead>,
     /// The week.
     pub seven_day: Option<WindowRead>,
-    /// When its figures were served: the tap's first report of them after
-    /// the request that brought them.
+    /// When its figures were served.
     pub at: i64,
-    /// The host read this process's tap before and the process was served
-    /// since (the freshness rule's `api_ms` rose, or its figures moved).
+    /// The host read this process's tap before and the process was served since.
     pub seen_before: bool,
-    /// When the process began (its kernel start, Unix seconds), where the
-    /// host read it: a process begun after a reset used inside a window
-    /// holds no reply from before it, so its first reading is taken there.
+    /// When the process began (its kernel start, Unix seconds), where the host read it.
     pub born: Option<i64>,
-    /// The account's key, from the profile of the home the process runs in
-    /// (`super::profile::default_home_key`), where one was read.
+    /// The account's key.
     pub key: Option<super::profile::AccountKey>,
 }
 
@@ -2138,12 +1985,9 @@ pub enum Auth {
     /// Nothing is on record.
     #[default]
     Unseen,
-    /// The check after a sign-in, or a served response, said the login
-    /// works.
+    /// The check after a sign-in, or a served response, said the login works.
     Ok,
-    /// A login wall right after a session was moved onto it (before the
-    /// move served a turn: [`strike`]), a first login whose flow failed, or
-    /// the check after a sign-in said it is signed out.
+    /// A login wall right after a session was moved onto it ([`strike`]).
     SignedOut,
 }
 
@@ -2158,7 +2002,7 @@ impl Auth {
         }
     }
 
-    /// Parses an [`Auth`] status from its state-file word, defaulting unknown words to [`Auth::Unseen`].
+    /// Parses an [`Auth`] status from its state-file word ([`Auth::Unseen`]).
     #[must_use]
     pub fn parse(word: &str) -> Auth {
         match word {
@@ -2184,52 +2028,40 @@ pub struct Account {
     pub auth: Auth,
     /// Machine-local: when that word was learned.
     pub auth_at: Option<i64>,
-    /// MACHINE-LOCAL: the latest account-wide clearing. New writes come
-    /// from the owner's [`pin`] and from another account signed in to the
-    /// home ([`note_reading`]); older schema-1 states may also carry an
-    /// automated reset's stamp.
+    /// MACHINE-LOCAL: the latest account-wide clearing ([`pin`], [`note_reading`]).
     pub cleared_at: Option<i64>,
-    /// Machine-local: when a session was last read running on it ([`note_session`]). It
-    /// outlives the session's own row, which goes with its agent ([`forget_session`]):
-    /// what [`reset_allowed`] asks of every other account.
+    /// Machine-local: when a session was last read running on it ([`note_session`],
+    /// [`forget_session`], [`reset_allowed`]).
     pub ran_at: Option<i64>,
     /// OBSERVATION: the newest word on its usage credits ([`Credits`]).
     pub credits: Option<Credits>,
-    /// MACHINE-LOCAL: the local day (days since the epoch on this machine's
-    /// clock and zone) the last credits episode that raised the day's line
-    /// began on.
+    /// MACHINE-LOCAL: the local day.
     pub credits_day: Option<i64>,
-    /// OBSERVATION: the newest word on its five-hour window apart from a
-    /// `/usage` sample ([`WindowSaid`]).
+    /// OBSERVATION: the newest word on its five-hour window apart from a `/usage` sample
+    /// ([`WindowSaid`]).
     pub warned_session: Option<WindowSaid>,
-    /// OBSERVATION: the same of its week: what [`windows_full`] and
-    /// [`Self::week_low_until`] read of it.
+    /// OBSERVATION: the same of its week: what [`windows_full`] and [`Self::week_low_until`] read
+    /// of it.
     pub warned_week: Option<WindowSaid>,
-    /// OBSERVATION: the account this label's readings were last read of,
-    /// by its key (`super::profile::AccountKey`: a hash of the account's own
-    /// id, the same on every machine).
+    /// OBSERVATION: the account this label's readings were last read of, by its key.
     pub key: Option<super::profile::AccountKey>,
-    /// MACHINE-LOCAL: when a reading under another key than [`Self::key`]
-    /// held was recorded ([`note_reading`], the [`Kind::Epoch`] row's
-    /// instant): the home's login changed then or before it.
+    /// MACHINE-LOCAL: when a reading under another key than [`Self::key`] held was recorded
+    /// ([`note_reading`], [`Kind::Epoch`]).
     pub keyed_at: Option<i64>,
-    /// OBSERVATION: each window's figure, by bucket id (`five_hour`,
-    /// `seven_day`; the account-stats design §7.2), with its own `as_of`,
-    /// source and machine, and the reset used inside it ([`WindowFig`]):
-    /// what [`Self::sample`] is the whole-percent copy of, for the
-    /// usage-tap's windows.
+    /// OBSERVATION: each window's figure ([`WindowFig`], [`Self::sample`]).
     pub windows: BTreeMap<String, WindowFig>,
 }
 
 impl Account {
-    /// Returns whether a reading at `at` predates the adoption grace window after an account key change.
+    /// Returns whether a reading at `at` predates the adoption grace window after an account key
+    /// change.
     #[must_use]
     pub fn adopting(&self, at: i64) -> bool {
         self.keyed_at
             .is_some_and(|keyed| at < keyed.saturating_add(KEY_ADOPT_S))
     }
 
-    /// Returns whether any wall, sample, auth state, or window figure has been observed for this account.
+    /// Returns whether any wall.
     #[must_use]
     pub fn observed(&self) -> bool {
         !self.walls.is_empty()
@@ -2258,7 +2090,8 @@ impl Account {
             .max()
     }
 
-    /// Returns the timestamp until which the 5-hour session window marks this account `low` at `now`.
+    /// Returns the timestamp until which the 5-hour session window marks this account `low` at
+    /// `now`.
     #[must_use]
     pub fn session_low_until(&self, now: i64) -> Option<i64> {
         let refilled = self
@@ -2328,7 +2161,8 @@ impl Account {
         self.low_until(now).is_some()
     }
 
-    /// Returns whether a session on this account should proactively rotate off before hitting a wall.
+    /// Returns whether a session on this account should proactively rotate off before hitting a
+    /// wall.
     #[must_use]
     pub fn leave_early(&self, now: i64) -> bool {
         self.credits_until(now).is_some()
@@ -2337,7 +2171,8 @@ impl Account {
                 .is_some_and(|end| end.saturating_sub(now) > RESET_SOON_S)
     }
 
-    /// Returns the 7-day weekly reset timestamp for this account if known and in the future at `now`.
+    /// Returns the 7-day weekly reset timestamp for this account if known and in the future at
+    /// `now`.
     #[must_use]
     pub fn week_reset(&self, now: i64) -> Option<i64> {
         let refilled = self
@@ -2357,7 +2192,8 @@ impl Account {
         sample.or(warned)
     }
 
-    /// Returns the timestamp when `window` was cleared after `at` by a scoped reset or operator pin.
+    /// Returns the timestamp when `window` was cleared after `at` by a scoped reset or operator
+    /// pin.
     #[must_use]
     pub fn cleared_since(&self, window: &str, at: i64, now: i64) -> Option<i64> {
         self.cleared_at
@@ -2400,8 +2236,7 @@ pub struct SessionRow {
     pub account: String,
     /// When that was last read.
     pub at: i64,
-    /// Why it could not move, where a move was refused: `jobs`, `person`,
-    /// `line`.
+    /// Why it could not move, where a move was refused.
     pub held: Option<String>,
 }
 
@@ -2416,29 +2251,26 @@ pub struct ProbeClaim {
     pub at: i64,
 }
 
-/// Machine-local canary record holding other sessions back until a newly rotated account serves a response.
+/// Machine-local canary record holding other sessions back until a newly rotated account serves a
+/// response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Canary {
     /// The session that moved alone.
     pub sid: String,
-    /// When it did: the rotation's time, or the time it took a silent
-    /// canary's place.
+    /// When it did: the rotation's time, or the time it took a silent canary's place.
     pub at: i64,
-    /// It took the place of a canary that did not answer ([`take_canary`]),
-    /// rather than making the rotation itself: a relaunch it is refused
-    /// gives up its hold and undoes no rotation ([`Strike::NotMoved`]).
+    /// It took the place of a canary that did not answer ([`take_canary`], [`Strike::NotMoved`]).
     pub took: bool,
 }
 
-/// Rollback snapshot saved by [`begin_rotation`] so a failed canary strike can restore prior state.
+/// Rollback snapshot saved by [`begin_rotation`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Undo {
     /// [`State::previous`] as the rotation found it.
     pub previous: Option<String>,
     /// [`State::previous_proven`] as the rotation found it.
     pub previous_proven: bool,
-    /// [`State::canary`] as the rotation found it: the record of the session
-    /// on the account left, where that account had not answered either.
+    /// [`State::canary`] as the rotation found it.
     pub canary: Option<Canary>,
 }
 
@@ -2447,23 +2279,19 @@ pub struct Undo {
 pub struct ResetClaim {
     /// The account at the wall.
     pub account: String,
-    /// The wall's own reset: one attempt per (account, wall).
+    /// The wall's own reset.
     pub until: Option<i64>,
-    /// The vendor's raw limit type observed at this claim. An older claim
-    /// without this scope can record an outcome but cannot clear any wall.
+    /// The vendor's raw limit type observed at this claim.
     pub window: Option<String>,
     /// The session that takes the row.
     pub sid: String,
     /// When it was claimed.
     pub at: i64,
-    /// The process the claim was made for: its pid, and its kernel start as the host reads
-    /// it.
+    /// The process the claim was made for: its pid, and its kernel start as the host reads it.
     pub pid: u32,
     /// See `pid`.
     pub start: String,
-    /// The outcome's word once it was recorded ([`reset_outcome`],
-    /// [`ResetDone::word`]); `None` while the claim is in flight, and for
-    /// ever where nobody recorded one.
+    /// The outcome's word once it was recorded ([`reset_outcome`], [`ResetDone::word`]).
     pub done: Option<String>,
 }
 
@@ -2494,27 +2322,22 @@ impl PinRequest {
 pub struct State {
     /// [`SCHEMA`].
     pub schema: u64,
-    /// Machine-local: this machine's id, minted once and kept beside the
-    /// state ([`Store::machine_id`]): the `by` of every observation made
-    /// here.
+    /// Machine-local: this machine's id ([`Store::machine_id`]).
     pub machine: String,
-    /// The accounts, by label. Observations and the auth word.
+    /// The accounts, by label.
     pub accounts: BTreeMap<String, Account>,
     /// Machine-local: the one account this home runs on.
     pub active: Option<String>,
-    /// Machine-local: the account `active` was before the last rotation or
-    /// pin, which a [`strike`] goes back to.
+    /// Machine-local: the account `active` was before the last rotation or pin ([`strike`]).
     pub previous: Option<String>,
-    /// Machine-local: whether `previous` had served a response when it was
-    /// left.
+    /// Machine-local: whether `previous` had served a response when it was left.
     pub previous_proven: bool,
-    /// Machine-local: `active` has served a response since it was chosen;
-    /// only then is it followed.
+    /// Machine-local: `active` has served a response since it was chosen.
     pub proven: bool,
     /// Machine-local: the session on an `active` that is not proven yet.
     pub canary: Option<Canary>,
-    /// Machine-local: what each rotation that can still be gone back from wrote over,
-    /// newest last ([`Undo`], at most [`MAX_UNDO`]).
+    /// Machine-local: what each rotation that can still be gone back from wrote over, newest last
+    /// ([`Undo`], [`MAX_UNDO`]).
     pub undo: Vec<Undo>,
     /// Machine-local: `active` is the owner's word.
     pub pinned: bool,
@@ -2555,11 +2378,9 @@ impl Default for State {
 /// Reason `state.json` or `logins.json` failed deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unread {
-    /// It is not JSON: a file cut short. It holds nothing to lose, and the
-    /// next write may replace it.
+    /// It is not JSON: a file cut short.
     Torn(String),
-    /// It is JSON and it is not this build's: another schema, or none. It
-    /// is never written over.
+    /// It is JSON and it is not this build's.
     NotOurs(String),
 }
 
@@ -2573,9 +2394,7 @@ impl Unread {
     }
 }
 
-/// Whether the instant `t` is within the last `window` seconds at `now`. A stamp ahead of
-/// the clock (a clock set back, another machine's running fast) is not recent: read as
-/// one, it would stay recent for as long as the clock is behind it.
+/// Whether the instant `t` is within the last `window` seconds at `now`.
 fn recent(t: i64, now: i64, window: i64) -> bool {
     (0..window).contains(&now.saturating_sub(t))
 }
@@ -2584,13 +2403,12 @@ fn int(v: Option<&Value>) -> Option<i64> {
     v.and_then(Value::as_i64)
 }
 
-/// The latest instant an observation read at `now` may be stamped
-/// ([`STAMP_SKEW_S`]).
+/// The latest instant an observation read at `now` may be stamped ([`STAMP_SKEW_S`]).
 const fn stamp_cap(now: i64) -> i64 {
     now.saturating_add(STAMP_SKEW_S)
 }
 
-/// A stamp as it is read: no later than `cap`.
+/// A stamp as it is read.
 fn stamp(v: Option<&Value>, cap: i64) -> Option<i64> {
     int(v).map(|at| at.min(cap))
 }
@@ -2781,8 +2599,7 @@ fn fig_json(w: &WindowFig) -> Value {
     Value::Object(m)
 }
 
-/// [`WindowFig`] back, its stamps no later than `cap`; `None` without a
-/// figure, a reset and a time.
+/// [`WindowFig`] back, its stamps no later than `cap`.
 fn fig_of(v: &Value, cap: i64) -> Option<WindowFig> {
     Some(WindowFig {
         pct_x10: count(v.get("pct_x10")).filter(|p| *p <= 10 * PCT_MAX)?,
@@ -2794,8 +2611,7 @@ fn fig_of(v: &Value, cap: i64) -> Option<WindowFig> {
     })
 }
 
-/// [`Credits`] as the state keeps it: its `word` (`in-use`, `off`, `on`) and
-/// that word's own keys.
+/// [`Credits`] as the state keeps it.
 fn credits_json(c: &Credits) -> Value {
     let mut m = Map::new();
     match c {
@@ -2820,8 +2636,7 @@ fn credits_json(c: &Credits) -> Value {
     Value::Object(m)
 }
 
-/// [`Credits`] back, its stamps no later than `cap`; `None` for a word this
-/// build does not know.
+/// [`Credits`] back, its stamps no later than `cap`.
 fn credits_of(v: &Value, cap: i64) -> Option<Credits> {
     match v.get("word").and_then(Value::as_str)? {
         "in-use" => Some(Credits::InUse(CreditsUse {
@@ -2997,13 +2812,10 @@ impl State {
         aterm_json::to_string(&Value::Object(o)).unwrap_or_else(|_| String::from("{}"))
     }
 
-    /// Deserializes and sanitizes `state.json` against `now`.
+    /// Deserializes and sanitizes `state.json` against `now` ([`Unread::Torn`],
+    /// [`Unread::NotOurs`], [`SCHEMA`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// [`Unread::Torn`]: not JSON (a file cut short, which the next write may replace).
-    /// [`Unread::NotOurs`]: JSON but not an object, or naming no schema or one other than
-    /// [`SCHEMA`]: a file this build must not guess at or write over.
     pub fn from_json(text: &str, now: i64) -> Result<State, Unread> {
         let doc: Value = aterm_json::from_str(text)
             .map_err(|e| Unread::Torn(format!("not JSON ({})", shown(&e.to_string()))))?;
@@ -3127,7 +2939,7 @@ impl State {
         self.accounts.get(label).cloned().unwrap_or_default()
     }
 
-    /// Returns the timestamp when the active canary hold began, if a canary is currently unproven.
+    /// Returns the timestamp when the active canary hold began.
     #[must_use]
     pub fn canary_since(&self) -> Option<i64> {
         (self.active.is_some() && !self.proven)
@@ -3164,8 +2976,6 @@ impl State {
 /// Generates a fresh 16-hex-char machine identifier from OS entropy.
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// No OS entropy source answered.
 pub fn mint_machine() -> io::Result<String> {
     aterm_uds::rand::hex_token::<8>()
 }
@@ -3173,12 +2983,9 @@ pub fn mint_machine() -> io::Result<String> {
 /// Derived operational condition of a roster account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Condition {
-    /// No login was made for it on this machine: its login directory is
-    /// absent, or holds nothing yet ([`login_made`]).
+    /// No login was made for it on this machine ([`login_made`]).
     NotEnrolled,
-    /// Its login's last word on record is `signed-out` ([`Auth::SignedOut`]):
-    /// a login wall right after a session was moved onto it ([`strike`]), a
-    /// first login whose flow failed, or the check after a sign-in said so.
+    /// Its login's last word on record is `signed-out` ([`Auth::SignedOut`]) ([`strike`]).
     SignedOut,
     /// A wall stands, until this instant.
     Limited {
@@ -3264,7 +3071,8 @@ pub fn signed_out(
         .collect()
 }
 
-/// Returns the first signed-out roster row that would give a session on `me` a usable target if signed in.
+/// Returns the first signed-out roster row that would give a session on `me` a usable target if
+/// signed in.
 #[must_use]
 pub fn sign_in_next(
     roster: &Roster,
@@ -3287,6 +3095,35 @@ pub fn sign_in_next(
                 .is_some_and(|a| a.limited_until(now).is_some())
         })
         .map(|row| (row.label.clone(), row.email.is_some()))
+}
+
+/// Returns the first signed-out or un-enrolled roster row with an email.
+#[must_use]
+pub fn renew_next(
+    roster: &Roster,
+    state: &State,
+    enrolled: &BTreeSet<String>,
+    me: Option<&str>,
+    now: i64,
+) -> Option<String> {
+    for class in [Class::Dedicated, Class::Shared] {
+        for row in roster.rows.iter().filter(|r| r.class == class) {
+            if me == Some(row.label.as_str()) || row.email.is_none() {
+                continue;
+            }
+            if matches!(
+                condition(row, state, is_enrolled(row, enrolled), now),
+                Condition::NotEnrolled | Condition::SignedOut
+            ) && !state
+                .accounts
+                .get(&row.label)
+                .is_some_and(|a| a.limited_until(now).is_some())
+            {
+                return Some(row.label.clone());
+            }
+        }
+    }
+    None
 }
 
 /// `[harness] accounts` rotation policy mode.
@@ -3326,38 +3163,20 @@ impl Mode {
 /// Trigger point at which a session asks [`advise`] for account guidance.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Point {
-    /// The turn ended on a usage limit this process hit. From this instant the session's
-    /// account is limited, whether or not the wall is on record yet: [`advise`] reads it
-    /// so. The host records it ([`note_wall`], or the canary's own [`strike`]) in the same
-    /// transaction as the move it commits, and before it: [`begin_rotation`] reads the
-    /// state, not the point.
+    /// The turn ended on a usage limit this process hit ([`advise`], [`note_wall`], [`strike`],
+    /// [`begin_rotation`]).
     Wall {
         /// The vendor's limit type (`five_hour`, `seven_day`, …).
         window: String,
-        /// When the limit's row was written (Unix seconds, never ahead of
-        /// the caller's clock), as the host read it from the session's
-        /// transcript. `None` where there is no row to date (a caller that
-        /// asks for no session), and then nothing is said of the owner's
-        /// clearing ([`Advice::Resume`]).
+        /// When the limit's row was written ([`Advice::Resume`]).
         at: Option<i64>,
     },
-    /// A lost login right after the session's own move: a wall for the roster too (the
-    /// session cannot run where it is) with no usage wall behind it and no row to date.
-    /// Not a limit: [`advise`] reads the login's record, which is the account struck
-    /// signed out ([`strike`]) where the host was told of the lost login, or the word it
-    /// held before where it was not (a strike the store's lock kept out, a move answered
-    /// by a wall before). Where the record says the account runs again (its login's word
-    /// `ok` written after `seen`: the owner signed it back in), the session is relaunched
-    /// under it.
+    /// A lost login right after the session's own move ([`advise`], [`strike`]).
     LostLogin {
-        /// When the host first met this process's lost login (Unix seconds, its own
-        /// clock): a word about the login older than it, or of its own second, is one the
-        /// lost login has overruled.
+        /// When the host first met this process's lost login (Unix seconds, its own clock).
         seen: i64,
     },
-    /// A LOST LOGIN WITH NO MOVE BEHIND IT, in a session whose login is a
-    /// row a renewal can restore (one with an email): the login's own end,
-    /// recorded by the host before it asks ([`note_login_end`]).
+    /// A LOST LOGIN WITH NO MOVE BEHIND IT ([`note_login_end`]).
     LoginEnded,
     /// A turn that ended with none.
     TurnEnd,
@@ -3366,17 +3185,14 @@ pub enum Point {
 /// Session identity and login facts passed to [`advise`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Me<'a> {
-    /// The label its process's own environment names
-    /// ([`Roster::row_for_login`]), or `None` when no row does.
+    /// The label its process's own environment names ([`Roster::row_for_login`]).
     pub account: Option<&'a str>,
-    /// The label whose login a renewal on this machine moved AWAY FROM the
-    /// one its process holds ([`Roster::row_left`], through a [`bound`]
-    /// roster): the same account, on a superseded login.
+    /// The label whose login a renewal on this machine moved AWAY FROM the one its process holds
+    /// ([`Roster::row_left`], [`bound`]).
     pub left: Option<&'a str>,
     /// Its Claude home is the default one.
     pub default_home: bool,
-    /// Its process authenticates by a stored login: no API key or token in
-    /// its environment, no provider, no custom route.
+    /// Its process authenticates by a stored login.
     pub stored_login: bool,
 }
 
@@ -3401,24 +3217,19 @@ pub enum StayWhy {
     OtherHome,
     /// The process does not authenticate by a stored login.
     NotAStoredLogin,
-    /// `active` has not served a response yet: nobody follows it, and nobody
-    /// rotates past it — the session that chose it included, which is not
-    /// moved on from it ahead of a wall before it has answered.
+    /// `active` has not served a response yet: nobody follows it, and nobody rotates past it.
     Canary,
-    /// At a wall with no candidate and no instant of the roster's to wait
-    /// for: the wall is waited out as it would be with no roster.
+    /// At a wall with no candidate and no instant of the roster's to wait for: the wall is waited
+    /// out as it would be with no roster.
     NoCandidate,
-    /// The machine's rotation bound is spent: the wall is waited out.
+    /// The machine's rotation bound is spent.
     Breaker {
-        /// When the bound has room again ([`breaker_until`]): the instant to
-        /// decide again, with a candidate still there.
+        /// When the bound has room again ([`breaker_until`]).
         until: i64,
     },
-    /// An account to leave ahead of its wall (`low`, or `limited` by a wall
-    /// another tab recorded), and the owner's pin holds.
+    /// An account to leave ahead of its wall.
     Pinned,
-    /// An account to leave, and it holds a reset offer that expires within
-    /// a day: it is run to its wall, where the reset is offered.
+    /// An account to leave, and it holds a reset offer that expires within a day.
     OfferExpiring,
     /// An account to leave, and no fresh account to move to.
     NoFresh,
@@ -3458,15 +3269,12 @@ pub enum Advice {
     Move {
         /// The label to move to.
         to: String,
-        /// Ahead of the wall (deferred like the model's return) rather than
-        /// at it (held on the restart back-off).
+        /// Ahead of the wall.
         ahead: bool,
-        /// This move changes `active` and needs [`begin_rotation`] to win;
-        /// `false` moves onto the account that is already `active`.
+        /// This move changes `active` and needs [`begin_rotation`] to win.
         rotates: bool,
-        /// `active` has not served a response and the session that moved
-        /// onto it has been silent for [`CANARY_HOLD_S`]: this session takes
-        /// its place, and needs [`take_canary`] to win.
+        /// `active` has not served a response and the session that moved onto it has been silent
+        /// for [`CANARY_HOLD_S`] ([`take_canary`]).
         takes_canary: bool,
     },
     /// No account is usable before this instant.
@@ -3474,12 +3282,9 @@ pub enum Advice {
         /// When to decide again.
         until: i64,
     },
-    /// The owner lifted this wall: continue here, now. The session stands at a limit row
-    /// written before the owner cleared its account's walls (`accounts use`, [`pin`]), and
-    /// nothing has been recorded against the account since.
+    /// The owner lifted this wall ([`pin`]).
     Resume {
-        /// When the owner cleared the account ([`Account::cleared_at`], as the state was
-        /// read): the key of "once per clearing".
+        /// When the owner cleared the account ([`Account::cleared_at`], as the state was read).
         cleared_at: i64,
     },
 }
@@ -3537,9 +3342,7 @@ pub enum WhyNot {
     },
     /// `low`, and the point is not a wall.
     LowAheadOfAWall,
-    /// `low`, and an account — this one included, when the window that
-    /// makes it low is about to reset — becomes usable within
-    /// [`LOW_ONLY_AFTER_S`].
+    /// `low`, and an account ([`LOW_ONLY_AFTER_S`]).
     LowWhileOneIsNear {
         /// When that account is usable.
         at: i64,
@@ -3561,9 +3364,7 @@ impl WhyNot {
     }
 }
 
-/// The instant an account in condition `cond` is usable: `now` for a fresh
-/// one, the end of its last wall for a limited one, the end of the window
-/// that makes it low for a `low` one.
+/// The instant an account in condition `cond` is usable.
 fn usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> Option<i64> {
     match cond {
         Condition::Limited { until } => Some(until),
@@ -3576,7 +3377,7 @@ fn usable_at(row: &Row, state: &State, cond: Condition, now: i64) -> Option<i64>
     }
 }
 
-/// Ranks all roster rows as rotation candidates (best first, followed by excluded rows in roster order).
+/// Ranks all roster rows as rotation candidates.
 #[must_use]
 pub fn candidates(
     roster: &Roster,
@@ -3638,7 +3439,7 @@ pub fn candidates(
     out
 }
 
-/// Earliest timestamp at which any roster account (or a dedicated account sooner than `opening`) becomes usable.
+/// Earliest timestamp at which any roster account.
 #[must_use]
 pub fn next_usable(
     roster: &Roster,
@@ -3674,10 +3475,9 @@ pub fn hold_until(why: StayWhy, state: &State, opening: Option<i64>, now: i64) -
 /// Which of the roster's instants [`wait_instant`] counts.
 #[derive(Debug, Clone, Copy)]
 enum Instants<'a> {
-    /// Every account's: the report's question, which asks for no session.
+    /// Every account's.
     All,
-    /// Every account's, but only one ahead of `now` for this one: a session at its wall on
-    /// it.
+    /// Every account's, but only one ahead of `now` for this one.
     WalledOn(&'a str),
     /// Only the ones ahead of `now` ([`next_opening`]).
     Ahead,
@@ -3773,9 +3573,7 @@ pub fn probe_due(account: &Account, now: i64) -> bool {
         .is_none_or(|s| !recent(s.at, now, probe_interval(account)))
 }
 
-/// Whether `account` holds a reset offer that expires within
-/// [`OFFER_EXPIRING_S`]: a reset left, and a deadline that is read, ahead
-/// and that near.
+/// Whether `account` holds a reset offer that expires within [`OFFER_EXPIRING_S`].
 fn offer_expiring(account: &Account, now: i64) -> bool {
     account.offer.as_ref().is_some_and(|o| {
         o.left > 0
@@ -3812,8 +3610,7 @@ pub fn advise_past_probe(
     advise_with(roster, state, enrolled, me, point, mode, now, false)
 }
 
-/// [`advise`] (`probes`) and [`advise_past_probe`] (not): one body, so the two differ only
-/// at the probe's arm.
+/// [`advise`] (`probes`) and [`advise_past_probe`] (not): one body.
 #[allow(clippy::too_many_arguments)]
 fn advise_with(
     roster: &Roster,
@@ -3983,10 +3780,7 @@ fn advise_with(
     }
 }
 
-/// THE LOGIN LIFECYCLE'S ADVICE (design v2 §5.3), whatever the rotation's
-/// mode, at a point [`advise`] reads as the logins': a lost login with no
-/// move behind it ([`Point::LoginEnded`]), and any point but a usage wall of
-/// a session still on a login a renewal superseded ([`Me::left`]).
+/// THE LOGIN LIFECYCLE'S ADVICE ([`advise`], [`Point::LoginEnded`], [`Me::left`]).
 fn login_follow(mine: &Row, me: &Me<'_>, point: &Point, cond: Condition) -> Advice {
     let at_wall = !matches!(point, Point::TurnEnd);
     let signed_in = !matches!(cond, Condition::SignedOut | Condition::NotEnrolled);
@@ -4012,9 +3806,7 @@ pub enum Kind {
     Wall,
     /// A `/usage` sample was recorded.
     Sample,
-    /// `active` was rotated: one session moves alone. Also the row of a
-    /// session taking a silent canary's place ([`take_canary`]): `to` is
-    /// then the account itself, which did not change.
+    /// `active` was rotated ([`take_canary`]).
     Rotate,
     /// The rotated-to account served a response.
     Proven,
@@ -4036,29 +3828,21 @@ pub enum Kind {
     Use,
     /// The pin ended.
     Unpin,
-    /// A tapped session's usage tap went silent (`super::tap::Silence`): its
-    /// process served a turn and wrote no reading.
+    /// A tapped session's usage tap went silent (`super::tap::Silence`).
     NoTap,
     /// Usage credits began carrying an account's sessions ([`record_usage`]).
     Credits,
     /// Claude Code warned that a window is filling ([`record_usage`]).
     Warned,
-    /// A login was renewed: its check answered the row's account, and the
-    /// row is bound to the new login ([`note_renewed`]).
+    /// A login was renewed ([`note_renewed`]).
     Renewed,
-    /// A bound login was seen ended, at a login wall in a session on it
-    /// ([`note_login_end`]).
+    /// A bound login was seen ended, at a login wall in a session on it ([`note_login_end`]).
     LoginEnded,
-    /// A renewal's check answered another account than the row's; nothing
-    /// live changed ([`note_wrong_account`]).
+    /// A renewal's check answered another account than the row's ([`note_wrong_account`]).
     WrongAccount,
-    /// A limit reset was used inside a window, as the usage tap saw it: the
-    /// vendor refilled the window and kept its reset ([`note_reading`],
-    /// [`WindowRead::refilled`]).
+    /// A limit reset was used inside a window ([`note_reading`], [`WindowRead::refilled`]).
     Reset,
-    /// Another account signed in to the home: the tap's reading names
-    /// another key than the one held, and the account's figures start again
-    /// ([`note_reading`]).
+    /// Another account signed in to the home ([`note_reading`]).
     Epoch,
 }
 
@@ -4136,7 +3920,7 @@ pub struct Event {
     pub to: Option<String>,
     /// The session, where one is concerned.
     pub sid: Option<String>,
-    /// The reason, one bounded line. Empty when there is none.
+    /// The reason, one bounded line.
     pub why: String,
 }
 
@@ -4243,8 +4027,7 @@ impl Event {
     }
 }
 
-/// The record of `label`, made if absent. `None` for a label no roster
-/// could carry.
+/// The record of `label`, made if absent.
 fn account_mut<'a>(state: &'a mut State, label: &str) -> Option<&'a mut Account> {
     if !admissible_label(label) {
         return None;
@@ -4268,8 +4051,7 @@ fn end_pin(state: &mut State, account: &str, why: &str, t: i64, out: &mut Vec<Ev
     }
 }
 
-/// The record a ninth raw window replaces: the oldest scoped clear first,
-/// otherwise the observed wall that stops standing first.
+/// The record a ninth raw window replaces.
 fn most_lapsed(walls: &BTreeMap<String, Wall>) -> Option<String> {
     walls
         .iter()
@@ -4277,7 +4059,8 @@ fn most_lapsed(walls: &BTreeMap<String, Wall>) -> Option<String> {
         .map(|(k, _)| k.clone())
 }
 
-/// Filters a wall's reported reset timestamp `until`, discarding timestamps more than [`RESET_BELIEVED_S`] past `at`.
+/// Filters a wall's reported reset timestamp `until`, discarding timestamps more than
+/// [`RESET_BELIEVED_S`] past `at`.
 #[must_use]
 pub fn believed_reset(until: Option<i64>, at: i64) -> Option<i64> {
     until.filter(|until| until.saturating_sub(at) <= RESET_BELIEVED_S)
@@ -4381,22 +4164,14 @@ pub fn note_sample(state: &mut State, account: &str, sample: Sample, now: i64) -
     vec![event]
 }
 
-/// How long a usage tap's unchanged figure is held before it is written
-/// again ([`note_reading`]): the heartbeat that keeps a login read as served
-/// while its figures stand still, without a write per reply.
+/// How long a usage tap's unchanged figure is held before it is written again ([`note_reading`]).
 pub const READING_HEARTBEAT_S: i64 = 15 * 60;
 
-/// How long after another account signed in to the home a running Claude
-/// Code may still be served on the login it held ([`note_reading`],
-/// [`Account::keyed_at`]): a changed keychain item is adopted within about
-/// 30 s, even one holding another account (measured: the accounts v2
-/// design, `docs/DESIGN-claude-accounts-v2-2026-10-15.md` §5), and this is
-/// twice that.
+/// How long after another account signed in to the home a running Claude Code may still be served
+/// on the login it held ([`note_reading`], [`Account::keyed_at`]).
 pub const KEY_ADOPT_S: i64 = 60;
 
-/// The figure `sample` holds for one window as a [`WindowFig`] of
-/// [`SOURCE_SAMPLE`]: what an account recorded before it kept a figure per
-/// window.
+/// The figure `sample` holds for one window as a [`WindowFig`] of [`SOURCE_SAMPLE`].
 fn sample_fig(pct: Option<u32>, reset: Option<i64>, sample: &Sample) -> Option<WindowFig> {
     Some(WindowFig {
         pct_x10: pct.filter(|p| *p <= PCT_MAX)?.saturating_mul(10),
@@ -4426,9 +4201,7 @@ pub fn sample_window(
         .then_some(f)
 }
 
-/// What a write of a window's figure compares: its value, its reset and the
-/// reset used inside it — never its stamp, which a reading of the same
-/// figure moves.
+/// What a write of a window's figure compares: its value, its reset and the reset used inside it.
 fn fig_news(f: Option<&WindowFig>) -> Option<(u32, i64, Option<i64>)> {
     f.map(|f| (f.pct_x10, f.reset, f.epoch_at))
 }
@@ -4438,7 +4211,8 @@ pub fn note_reading(state: &mut State, account: &str, read: &TapRead, now: i64) 
     note_reading_held(state, account, read, now).0
 }
 
-/// Records a usage-tap [`TapRead`] and returns whether any part was held back during login adoption.
+/// Records a usage-tap [`TapRead`] and returns whether any part was held back during login
+/// adoption.
 pub fn note_reading_held(
     state: &mut State,
     account: &str,
@@ -4709,7 +4483,8 @@ pub fn drop_stale_sessions(state: &mut State, now: i64) -> usize {
     before - state.sessions.len()
 }
 
-/// Returns whether an existing probe claim prevents claiming a new `/usage` probe for `account` at `now`.
+/// Returns whether an existing probe claim prevents claiming a new `/usage` probe for `account` at
+/// `now`.
 #[must_use]
 pub fn probe_held(state: &State, account: &str, now: i64) -> bool {
     state.probe.as_ref().is_some_and(|c| {
@@ -4742,22 +4517,16 @@ pub fn claim_probe(state: &mut State, account: &str, sid: &str, now: i64) -> Opt
 /// Outcome of attempting to claim a limit-reset slot via [`claim_reset`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetClaimed {
-    /// The slot is this session's from now: it may take the row.
+    /// The slot is this session's from now.
     Taken,
-    /// It already was: this session and this process claimed this wall, and
-    /// the claim is still in flight.
+    /// It already was: this session and this process claimed this wall.
     Mine,
-    /// A claim is in flight that is not this session's own for this wall —
-    /// another session's, another process's of this session, or one for
-    /// another wall or account — until this instant at the latest
-    /// ([`RESET_CLAIM_S`] after it was made). Nothing was written.
+    /// A claim is in flight that is not this session's own for this wall ([`RESET_CLAIM_S`]).
     Held {
         /// When that claim lapses.
         until: i64,
     },
-    /// This wall was attempted already and is not attempted again: its claim
-    /// has an outcome, or lapsed with none, or the machine's last attempt
-    /// was at a wall that still stands past this one.
+    /// This wall was attempted already and is not attempted again.
     Attempted,
 }
 
@@ -4818,7 +4587,8 @@ pub fn claim_reset(
     ResetClaimed::Taken
 }
 
-/// Returns the claim expiration timestamp if a limit reset is currently in flight on `account` at `now`.
+/// Returns the claim expiration timestamp if a limit reset is currently in flight on `account` at
+/// `now`.
 #[must_use]
 pub fn reset_in_flight(state: &State, account: &str, now: i64) -> Option<i64> {
     state
@@ -4831,8 +4601,6 @@ pub fn reset_in_flight(state: &State, account: &str, now: i64) -> Option<i64> {
 /// Returns whether a process on `label` started at `started` is eligible to claim a limit reset.
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// The first check that fails, by its word.
 pub fn reset_allowed(
     roster: &Roster,
     state: &State,
@@ -4874,26 +4642,21 @@ pub fn reset_allowed(
 /// Outcome of a claimed limit-reset attempt passed to [`reset_outcome`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResetDone<'a> {
-    /// The vendor's own line said the limits were reset: a reset was spent. `left` is the
-    /// count that line named, where it named one.
+    /// The vendor's own line said the limits were reset.
     Used {
         /// The kind spent.
         kind: ResetKind,
         /// Resets of that kind left after this one.
         left: Option<u32>,
     },
-    /// The vendor's own line said a reset was SPENT and the walled limit
-    /// STILL STANDS (2.1.304's `<Kind> used · you're still at your …`, a
-    /// give-back grant at a wall it did not lift): recorded as spent, and
-    /// no wall ends.
+    /// The vendor's own line said a reset was SPENT and the walled limit STILL STANDS.
     Walled {
         /// The kind spent.
         kind: ResetKind,
         /// Resets of that kind left after this one.
         left: u32,
     },
-    /// The vendor said the limit had lifted by itself: nothing was spent,
-    /// and the wall is over all the same.
+    /// The vendor said the limit had lifted by itself.
     Lifted,
     /// The reset was kept, for this reason (one word of the caller's).
     Kept(&'a str),
@@ -4914,10 +4677,7 @@ impl ResetDone<'_> {
     }
 }
 
-/// The reason a kept or failed reset's row carries, from the caller's word: one line of at
-/// most [`WORD_MAX`] bytes, cut at the first ` · ` (a vendor line's head) and at the first
-/// character a path or an address is written with, so a line quoted from a screen or a
-/// transcript carries nothing else into the ledger.
+/// The reason a kept or failed reset's row carries, from the caller's word ([`WORD_MAX`]).
 fn reset_reason(why: &str) -> String {
     let line = one_line(why, WORD_MAX);
     let head = line.split(" · ").next().unwrap_or_default();
@@ -5041,29 +4801,23 @@ pub fn breaker_until(state: &State, roster: &Roster, now: i64) -> Option<i64> {
 /// Reason a compare-and-set rotation in [`begin_rotation`] was refused.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Lost {
-    /// `active` is not what the caller read: another session got there
-    /// first. Advise again on the state as it is now.
+    /// `active` is not what the caller read.
     Raced {
         /// What `active` is.
         active: Option<String>,
     },
-    /// `active` as read can be run on and is not rotated past: it has not
-    /// served a response yet (whoever asks), or it is another account that
-    /// is fresh or pinned (it is followed), or low with no fresh account
-    /// named to go to instead.
+    /// `active` as read can be run on and is not rotated past.
     Held {
         /// That account.
         active: String,
     },
     /// The owner's pin holds.
     Pinned,
-    /// `to` is not a row, is the session's own or the active account, or
-    /// cannot be run on now.
+    /// `to` is not a row, is the session's own or the active account, or cannot be run on now.
     NotACandidate,
     /// The machine's rotation bound is spent.
     Spent,
-    /// The mover has no session id: it could be no canary, and nobody could
-    /// answer, or be forgotten, for the account it chose.
+    /// The mover has no session id.
     NoSession,
 }
 
@@ -5076,11 +4830,10 @@ pub struct Mover<'a> {
     pub account: &'a str,
 }
 
-/// Commits an atomic compare-and-set rotation moving `mover` onto candidate account `to`.
+/// Commits an atomic compare-and-set rotation moving `mover` onto candidate account `to`
+/// ([`Lost`]).
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// A [`Lost`], with nothing changed.
 pub fn begin_rotation(
     state: &mut State,
     roster: &Roster,
@@ -5213,21 +4966,18 @@ pub fn prove(state: &mut State, account: &str, now: i64) -> Option<Event> {
 /// Failure reason when a canary session on a newly rotated account fails to serve a response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Strike {
-    /// It answered with a usage wall of its own: it is `limited`.
+    /// It answered with a usage wall of its own.
     Wall {
         /// The vendor's limit type.
         window: String,
         /// The reset it named.
         until: Option<i64>,
     },
-    /// It answered with a login wall: it is `signed-out`.
+    /// It answered with a login wall.
     SignedOut,
-    /// The move failed with no word about the account (`failed:no-resume`,
-    /// `failed:account-not-applied`): it is `limited` on the ladder of a
-    /// wall naming no reset, so it is not chosen again at once.
+    /// The move failed with no word about the account.
     Failed(String),
-    /// The move was never made: the host refused or deferred the relaunch
-    /// (`wait:changed` for the agent's jobs, `refused:line`).
+    /// The move was never made.
     NotMoved(String),
 }
 
@@ -5293,9 +5043,6 @@ pub fn strike(state: &mut State, account: &str, sid: &str, why: &Strike, now: i6
 /// Pins `label` as the active account (`accounts use <label>`) and clears its standing walls.
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// By name: a label the roster does not list, one not enrolled on this
-/// machine, one known signed out. Nothing is changed.
 pub fn pin(
     state: &mut State,
     roster: &Roster,
@@ -5358,7 +5105,6 @@ pub(super) fn complete_requested_pin(
     if state.pending_pin.as_ref() != Some(request) {
         return None;
     }
-    state.pending_pin = None;
     pin(state, roster, enrolled, request.label(), now).ok()
 }
 
@@ -5377,18 +5123,12 @@ const WAKE_FILE: &str = "wake";
 /// The kept machine id's file name ([`Store::machine_id`]).
 const MACHINE_FILE: &str = "machine";
 
-/// Whether `id` is a machine id as the store keeps one: 1 to [`WORD_MAX`]
-/// hex digits.
+/// Whether `id` is a machine id as the store keeps one ([`WORD_MAX`]).
 fn is_machine_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= WORD_MAX && aterm_codec::hex::is_hex(id, id.len())
 }
 
-/// Whether an open that found nothing at a name met an absent name, judged by
-/// `look`, the name's `symlink_metadata` taken after it: nothing there still,
-/// or a file put in place between the open and the look (another instance's
-/// machine id, linked in as eight keepers race in
-/// `the_machine_id_is_minted_once_and_kept`), which was not there when it was
-/// opened.
+/// Whether an open that found nothing at a name met an absent name.
 fn absent_at_open(look: io::Result<std::fs::Metadata>) -> bool {
     match look {
         Err(e) => e.kind() == io::ErrorKind::NotFound,
@@ -5436,14 +5176,13 @@ pub(crate) fn read_bounded(path: &Path, max: u64) -> io::Result<Option<String>> 
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
 }
 
-/// On-disk store (`<harness state>/accounts/`) for `state.json`, `logins.json`, `ledger.jsonl`, and locks.
+/// On-disk store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Store {
     /// The directory (0700).
     pub dir: PathBuf,
-    /// The bounded wait of the recorders' own takes of its lock
-    /// ([`record_wall`], [`record_usage`], [`record_gone`]): [`LOCK_LADDER`]
-    /// from [`Store::at`]; [`Store::bounded_by`] another.
+    /// The bounded wait of the recorders' own takes of its lock ([`record_wall`], [`record_usage`],
+    /// [`record_gone`], [`LOCK_LADDER`], [`Store::at`], [`Store::bounded_by`]).
     ladder: &'static [std::time::Duration],
 }
 
@@ -5478,8 +5217,6 @@ impl Store {
     /// Ensures the store directory exists with mode `0700` owned by the current user.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// It cannot be made, or it is not this user's private directory.
     pub fn ensure(&self) -> io::Result<()> {
         aterm_types::fs_restricted::ensure_private_dir(&self.dir)
     }
@@ -5499,8 +5236,6 @@ impl Store {
     /// Acquires `accounts.lock`, blocking until the lock is available.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The directory or the lock file cannot be made, or the lock failed.
     pub fn acquire(&self) -> io::Result<Lock> {
         let file: std::fs::File = self.lock_file()?;
         loop {
@@ -5517,17 +5252,14 @@ impl Store {
         }
     }
 
-    /// Attempts a non-blocking acquire of `accounts.lock`.
+    /// Attempts a non-blocking acquire of `accounts.lock` ([`Store::acquire`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// As [`Store::acquire`].
     pub fn try_acquire(&self) -> io::Result<Option<Lock>> {
         Ok(Self::try_take(self.lock_file()?)?.ok())
     }
 
-    /// One try at the lock on `file`: the guard, or the file handed back
-    /// while another holder has it.
+    /// One try at the lock on `file`.
     fn try_take(file: std::fs::File) -> io::Result<Result<Lock, std::fs::File>> {
         #[expect(
             clippy::disallowed_methods,
@@ -5541,11 +5273,9 @@ impl Store {
         }
     }
 
-    /// Attempts to acquire `accounts.lock`, retrying across the durations in `ladder`.
+    /// Attempts to acquire `accounts.lock` ([`Store::acquire`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// As [`Store::acquire`].
     pub fn acquire_within(&self, ladder: &[std::time::Duration]) -> io::Result<Option<Lock>> {
         let mut file = match Self::try_take(self.lock_file()?)? {
             Ok(lock) => return Ok(Some(lock)),
@@ -5597,12 +5327,9 @@ impl Store {
         self.dir.join(LOGINS_FILE)
     }
 
-    /// Creates and returns a fresh `0700` staging directory (`<logins>/<label>.renew-<n>`) for login renewal.
+    /// Creates and returns a fresh `0700` staging directory.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// A label no roster could carry; the logins directory or the staging
-    /// directory cannot be made; every name up to `<label>+9999` is taken.
     pub fn claim_staging_dir(&self, label: &str) -> io::Result<PathBuf> {
         if !admissible_label(label) {
             return Err(io::Error::new(
@@ -5630,12 +5357,9 @@ impl Store {
         Err(io::Error::other("every staging name is taken"))
     }
 
-    /// Loads `logins.json` as of `now`, failing closed if the file exists but is unreadable or corrupt.
+    /// Loads `logins.json` as of `now` ([`Store::load`], [`MAX_LOGINS_BYTES`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// As [`Store::load`]: a file that cannot be read, is larger than
-    /// [`MAX_LOGINS_BYTES`], or is JSON of another schema or of none.
     pub fn load_logins(&self, now: i64) -> Result<(Logins, Option<String>), String> {
         match read_bounded(&self.logins_file(), MAX_LOGINS_BYTES) {
             Ok(None) => Ok((Logins::default(), None)),
@@ -5660,8 +5384,6 @@ impl Store {
     /// Atomically writes `logins.json` (`0600`) via a sibling temporary file.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The directory cannot be made or the write or rename failed.
     pub fn save_logins(&self, logins: &Logins) -> io::Result<()> {
         self.ensure()?;
         let mut text = logins.to_json();
@@ -5672,23 +5394,14 @@ impl Store {
     /// Atomically replaces the `wake` marker file so watchers detect an inode change.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The directory cannot be made or the write or rename failed.
     pub fn touch_wake(&self) -> io::Result<()> {
         self.ensure()?;
         super::upgrade_models::write_atomic_ordered(&self.wake_path(), "")
     }
 
-    /// Loads `state.json` as of `now`, returning a fresh [`State`] and a diagnostic note if the file was corrupt.
+    /// Loads `state.json` as of `now` ([`State`], [`MAX_STATE_BYTES`], [`Unread::NotOurs`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// A file that is not ours to replace, by name: one that could not be read (a
-    /// permission, an I/O error, a directory in its place), one larger than
-    /// [`MAX_STATE_BYTES`], or JSON of another schema or none ([`Unread::NotOurs`]). It may
-    /// hold a pin, walls and signed-out words, so nothing is saved over it: a transaction
-    /// that gets this answer stops, and a read-only caller shows an empty state beside the
-    /// reason.
     pub fn load(&self, now: i64) -> Result<(State, Option<String>), String> {
         let (mut state, mut note) = match read_bounded(&self.state_file(), MAX_STATE_BYTES) {
             Ok(None) => (State::default(), None),
@@ -5736,8 +5449,6 @@ impl Store {
     /// The id the store keeps ([`Self::machine_file`]), where it keeps one.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The file is there and could not be read, or holds no id.
     fn kept_machine(&self) -> io::Result<Option<String>> {
         match read_bounded(&self.machine_file(), 64)? {
             None => Ok(None),
@@ -5752,9 +5463,6 @@ impl Store {
     /// Reads or mints and persists this machine's 16-hex-char identifier.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The directory cannot be made, the file holds no id, or the write or
-    /// the link failed.
     pub fn machine_id(&self, held: &str) -> io::Result<String> {
         if let Some(id) = self.kept_machine()? {
             return Ok(id);
@@ -5801,8 +5509,6 @@ impl Store {
     /// Atomically writes `state.json` (`0600`) via a sibling temporary file.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The directory cannot be made or the write or rename failed.
     pub fn save(&self, state: &State) -> io::Result<()> {
         self.ensure()?;
         let mut text = state.to_json();
@@ -5810,11 +5516,9 @@ impl Store {
         super::upgrade_models::write_atomic(&self.state_file(), &text)
     }
 
-    /// Appends `events` to `ledger.jsonl` (`0600`) and trims the file when it exceeds [`LEDGER_MAX_BYTES`].
+    /// Appends `events` to `ledger.jsonl` ([`LEDGER_MAX_BYTES`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The directory cannot be made or the append or the cut failed.
     pub fn append(&self, events: &[Event]) -> io::Result<()> {
         use std::io::Write as _;
         if events.is_empty() {
@@ -5843,8 +5547,6 @@ impl Store {
     /// Reads the newest `max` events from `ledger.jsonl` in chronological order.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// The ledger exists and cannot be read.
     pub fn tail(&self, max: usize) -> io::Result<Vec<Event>> {
         Ok(super::cli::tail_lines(&self.ledger_path(), max)?
             .iter()
@@ -5852,12 +5554,10 @@ impl Store {
             .collect())
     }
 
-    /// Runs an atomic read-modify-write transaction on `state.json` and `ledger.jsonl` under `accounts.lock`.
+    /// Runs an atomic read-modify-write transaction on `state.json` and `ledger.jsonl` under
+    /// `accounts.lock`.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// That refusal, naming the file; `edit`'s own, with nothing written; or
-    /// the file that could not be locked or written, by path.
     pub fn transact(
         &self,
         now: i64,
@@ -5870,12 +5570,9 @@ impl Store {
         self.transact_held(&held, now, note, edit)
     }
 
-    /// Runs [`Store::transact`] with a bounded lock wait over `ladder`.
+    /// Runs [`Store::transact`] with a bounded lock wait over `ladder` ([`LOCK_HELD`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// As [`Store::transact`]; and exactly [`LOCK_HELD`] when the lock stayed held past the
-    /// ladder: nothing was read, `edit` did not run, and the caller asks again later.
     pub fn transact_within(
         &self,
         ladder: &[std::time::Duration],
@@ -5893,8 +5590,6 @@ impl Store {
     /// Saves an explicit selection before its login worker starts.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// Invalid label, unavailable entropy, or a bounded state transaction refusal.
     pub fn request_pin(&self, label: &str, now: i64) -> Result<PinRequest, String> {
         if let Some(why) = label_refusal(label) {
             return Err(why.to_owned());
@@ -5913,8 +5608,6 @@ impl Store {
     /// Cancels this request after startup or login failure, preserving a newer choice.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// A bounded state transaction refusal.
     pub fn cancel_pin_request(&self, request: &PinRequest, now: i64) -> Result<(), String> {
         self.transact_within(&LOCK_LADDER, now, &mut None, |state| {
             if state.pending_pin.as_ref() == Some(request) {
@@ -5925,11 +5618,10 @@ impl Store {
         Ok(())
     }
 
-    /// Runs an atomic transaction over both `state.json` and `logins.json` under `accounts.lock`.
+    /// Runs an atomic transaction over both `state.json` and `logins.json` under `accounts.lock`
+    /// ([`Store::transact`]).
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// As [`Store::transact`], for either file.
     pub fn transact_logins(
         &self,
         now: i64,
@@ -5945,8 +5637,6 @@ impl Store {
     /// Runs [`Store::transact_logins`] with the bounded [`Store::transact_within`] lock wait.
     /// # Errors
     /// As [`Self::load_logins`].
-    ///
-    /// As [`Store::transact_within`].
     pub fn transact_logins_within(
         &self,
         ladder: &[std::time::Duration],
@@ -5961,10 +5651,7 @@ impl Store {
         self.transact_logins_held(&held, now, note, edit)
     }
 
-    /// The logins' transaction itself, under the lock its caller took: the
-    /// state's ([`Store::transact_held`]) with `logins.json` read and saved
-    /// beside it — the logins FIRST, so a session the wake marker sends to
-    /// decide again reads the binding the same transaction made.
+    /// The logins' transaction itself ([`Store::transact_held`]).
     pub(super) fn transact_logins_held(
         &self,
         held: &Lock,
@@ -6035,50 +5722,35 @@ impl Store {
 /// Outcome of a [`record_wall`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recorded {
-    /// The session is on record on `account`, and the wall is: written now,
-    /// or already there from another session at the same wall.
+    /// The session is on record on `account`.
     Wall {
         /// The account the session runs on ([`Me::label`]).
         account: String,
-        /// The window it is recorded under: the row's limit type, or
-        /// [`UNNAMED_WINDOW`].
+        /// The window it is recorded under: the row's limit type, or [`UNNAMED_WINDOW`].
         window: String,
         /// The reset it names.
         until: Option<i64>,
-        /// The ledger rows this call appended: the `wall` row (none when
-        /// the same wall was on record and still standing), a `move` row
-        /// when the session was last read on another account, an `unpin`
-        /// row when the wall is on the pinned account.
+        /// The ledger rows this call appended.
         events: usize,
     },
-    /// No roster, or the process's login is no row's of it, nor one a
-    /// renewal moved a row off ([`Me::label`]): there is no account to
-    /// record for.
+    /// No roster, or the process's login is no row's of it, nor one a renewal moved a row off
+    /// ([`Me::label`]).
     NotListed,
-    /// The process's home is not the default one, or it does not
-    /// authenticate by a stored login: its wall is not an account's of this
-    /// roster.
+    /// The process's home is not the default one, or it does not authenticate by a stored login.
     NotStored,
-    /// The row is older than the process: the previous process's wall, still standing in
-    /// the transcript after a relaunch (under rotation, the account that was left).
+    /// The row is older than the process.
     NotThisProcess,
-    /// The row was written before the owner cleared this account's walls
-    /// (`accounts use`, [`pin`]): it is the wall the owner cleared, still
-    /// standing in the transcript of a session that has taken no turn
-    /// since.
+    /// The row was written before the owner cleared this account's walls ([`pin`]).
     Cleared,
-    /// What a session's screen said of the account's usage — credits in use,
-    /// a window filling — is on record now ([`record_usage`]), with `events`
-    /// ledger rows.
+    /// What a session's screen said of the account's usage ([`record_usage`]).
     Usage {
         /// The account the session runs on ([`Me::label`]).
         account: String,
         events: usize,
     },
-    /// Everything this call would write is on record. Nothing was written.
+    /// Everything this call would write is on record.
     Unchanged,
-    /// The state is not this build's to write, or a file could not be locked or written:
-    /// the reason, for the owner's own log.
+    /// The state is not this build's to write, or a file could not be locked or written.
     Refused(String),
 }
 
@@ -6177,10 +5849,7 @@ pub fn record_wall(
     }
 }
 
-/// What the limit row `word`, written at `at`, says of `account`'s usage
-/// credits, kept by [`Credits`]' rule: it replaces a word no newer than the
-/// row — at the same second, a screen's — and an older row, or one that says
-/// nothing, changes nothing.
+/// What the limit row `word` ([`Credits`]).
 fn note_credits_word(
     state: &mut State,
     account: &str,
@@ -6216,8 +5885,7 @@ fn note_credits_word(
 /// Screen observation that usage credits are carrying the session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreditsRead {
-    /// The reset of the window they carry past, where the notice they started
-    /// on named it (placed by the caller).
+    /// The reset of the window they carry past.
     pub until: Option<i64>,
 }
 
@@ -6235,12 +5903,9 @@ pub struct WarningRead {
 /// Combined screen usage observations (`credits` and `warning`) passed to [`record_usage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct UsageSaid {
-    /// When it was true: the newest answer in the session's transcript
-    /// written [`NOTICES_DRAWN_S`] or more before the screen was read (an
-    /// API response's row, unix seconds).
+    /// When it was true ([`NOTICES_DRAWN_S`]).
     pub at: i64,
-    /// The local day of [`Self::at`] (days since the epoch on this machine's
-    /// clock and zone), for the credits' once-a-day line.
+    /// The local day of [`Self::at`].
     pub day: i64,
     /// Credits carry the session.
     pub credits: Option<CreditsRead>,
@@ -6248,7 +5913,8 @@ pub struct UsageSaid {
     pub warning: Option<WarningRead>,
 }
 
-/// Records screen-observed usage credits and quota warnings for a session under a bounded store lock.
+/// Records screen-observed usage credits and quota warnings for a session under a bounded store
+/// lock.
 pub fn record_usage(
     store: &Store,
     roster: &Roster,
@@ -6296,8 +5962,7 @@ pub fn record_usage(
     }
 }
 
-/// [`record_usage`]' word that credits carried the answer at `at`, on the
-/// local day `day`: its ledger row where it began an episode.
+/// [`record_usage`]' word that credits carried the answer at `at`, on the local day `day`.
 fn note_in_use(
     record: &mut Account,
     account: &str,
@@ -6329,8 +5994,8 @@ fn note_in_use(
     Some(Event::new(now, Kind::Credits, account).because("in use"))
 }
 
-/// [`record_usage`]' word that the warning's window stood at its figure at
-/// `at`: its ledger row where the figure or the reset moved.
+/// [`record_usage`] ' word that the warning's window stood at its figure at `at`: its ledger row
+/// where the figure or the reset moved.
 fn note_warning(
     record: &mut Account,
     account: &str,
@@ -6374,7 +6039,8 @@ pub fn credits_noted(roster: &Roster, state: &State, now: i64) -> Vec<String> {
         .collect()
 }
 
-/// Returns `(label, reason)` pairs in roster order for accounts with a nearly full weekly window and credits off.
+/// Returns `(label, reason)` pairs in roster order for accounts with a nearly full weekly window
+/// and credits off.
 #[must_use]
 pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<(String, String)> {
     roster
@@ -6395,14 +6061,10 @@ pub fn windows_full(roster: &Roster, state: &State, now: i64) -> Vec<(String, St
         .collect()
 }
 
-/// Removes an ended session `sid` from the store under a bounded lock wait.
+/// Removes an ended session `sid` from the store under a bounded lock wait
+/// ([`Store::transact_within`], [`LOCK_HELD`], [`drop_stale_sessions`]).
 /// # Errors
 /// As [`Self::load_logins`].
-///
-/// As [`Store::transact_within`]: the state is not this build's to write, a file could not
-/// be locked or written, or the lock stayed held (exactly [`LOCK_HELD`]). Nothing was
-/// forgotten; a row left behind is dropped by its age ([`drop_stale_sessions`]), and a
-/// canary's hold lapses by its own clock.
 pub fn record_gone(store: &Store, sid: &str, now: i64) -> Result<bool, String> {
     if !store.state_file().exists() {
         return Ok(false);

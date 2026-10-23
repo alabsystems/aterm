@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Conformance for `AsymmetricPadLayout`: the derived model's executable actions,
-//! driven against the shipping `Renderer` layout and CPU cache.
+//! Conformance for `AsymmetricPadLayout`: the derived model's executable actions driven against `Renderer` layout and CPU cache.
 
 use aterm_core::terminal::Terminal;
 use aterm_models_render::asymmetric_pad_layout_model;
@@ -56,9 +55,6 @@ fn asymmetric_pad_layout_model_conforms_to_shipping_cpu_geometry_and_cache() {
             );
         }
 
-        // Stutter: re-applying the same base padding is idempotent and must keep every
-        // modeled ApplyInitialTop variable; an unconditional override clear fails at
-        // every point with pad_top != pad.
         renderer.set_pad(pad);
         let after_same_pad = project_asymmetric_pad_layout(&renderer, &window, rows);
         assert_eq!(after_same_pad.pad_top, layout.pad_top);
@@ -77,7 +73,6 @@ fn asymmetric_pad_layout_model_conforms_to_shipping_cpu_geometry_and_cache() {
             Some(primed["cached_grid_top"] as usize)
         );
 
-        // The identical-layout arm is real too: the just-primed cache must gate-hit.
         let steady = renderer
             .render_input_cached(&mut window, &input)
             .pixels()
@@ -130,8 +125,6 @@ fn asymmetric_pad_layout_model_conforms_to_shipping_cpu_geometry_and_cache() {
             assert_eq!(window.last_damage(), DamageOutcome::Full);
             assert_ne!(second, first, "visible row zero must move with grid_top");
 
-            // Negative control: a cache key of dimensions and content alone would
-            // falsely hit here, where the model requires a full repaint.
             let dimension_only_mutant_hit = renderer.frame_size(rows, cols) == frame_size;
             assert!(dimension_only_mutant_hit);
             assert_eq!(decided["cache_hit"], 0);

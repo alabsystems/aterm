@@ -20,7 +20,7 @@ use crate::runtime::{ClassPtr, Id};
 pub unsafe trait ClassType: Sized {
     /// The Objective-C class name, as registered.
     const NAME: &'static str;
-    /// The registered class object. Registers on first call.
+    /// The registered class object.
     fn class() -> ClassPtr;
 }
 
@@ -61,7 +61,7 @@ impl<T: ClassType> Retained<T> {
         unsafe { Self::from_owned(owned.into_raw()) }
     }
 
-    /// The raw `id`, borrowed. Does not transfer ownership.
+    /// The raw `id`, borrowed.
     #[inline]
     #[must_use]
     pub const fn as_id(&self) -> Id {

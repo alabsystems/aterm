@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE WINDOW'S CRASH-RESTORE JOURNAL — the exact screen and scrollback after an unplanned window death (increments 4 and 5 of the crash-restore plan; the headless half is `aterm-restore`, the keeper's custody is `aterm-keeper`'s companions).
+//! Window crash-restore journal.
 
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
@@ -35,8 +35,7 @@ use aterm_restore::{
 #[cfg(unix)]
 use crate::temporal::{SpineMark, SpinePre, SpineResize, SpineSink, SpineWatermark};
 
-/// The store a window journals through: its read-write mapping, counting the pages it makes
-/// resident, shared by the threads that write it.
+/// Shared read-write region mapping counting resident pages.
 #[cfg(unix)]
 pub(crate) type Store = Shared<Touched<aterm_uds::shm::Region>>;
 
@@ -46,7 +45,7 @@ fn resident_meter() -> &'static Arc<AtomicU64> {
     METER.get_or_init(|| Arc::new(AtomicU64::new(0)))
 }
 
-/// `metrics journal_resident_bytes=`: the RAM this window's crash-restore regions cost it, every page their writers touched (the plan's increment 6).
+/// Resident bytes touched across this window's crash-restore regions (`metrics journal_resident_bytes=`).
 pub(crate) fn resident_bytes() -> u64 {
     #[cfg(unix)]
     {
@@ -182,7 +181,7 @@ impl RungCounts {
     }
 }
 
-/// What a keeper recovery's restores came to: the rungs (the band row's [`RungCounts`]) and the fields `status` reports for each recovered session, summed, for the recovery census's ledger row (`aterm_update::recovery_ledger::Restores`), so the ledger shows which loss real crashes hit, the signal the plan's follow-up work waits for.
+/// Aggregate restore counts and loss metrics across a keeper recovery.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RestoreTally {
     pub(crate) counts: RungCounts,
@@ -314,7 +313,7 @@ impl JournalSlot {
         self.restored.get()
     }
 
-    /// The `status` words: `journal=live` with `journal_tail=` (the tail a restore now would replay; 0 once an idle session's quiet keyframe has caught up), `journal_ring_lag=` (history lines the history ring has not exported yet; 0 once the journal worker has caught the history up), `journal_ring=<live|shedding|shed>` (`shed`: memory pressure took the history ring away, so a crash brings back the screen and the keyframe's few hundred lines of history and counts the rest lost, until the pressure has eased a minute and the ring is exported again; `shedding`: the shed's old region, the ring's pages and the lines they hold, is still in memory, since it still waits to be replaced or the keeper link has not taken its replacement's custody yet, whether or not the pressure has eased since), `journal_bytes=` (the RAM the session's region costs this window, every page written) and `journal_ledger_lag=` (turn records of the session's ledger the region's control slot does not hold: taken since its last carry, at most two seconds, or shed from it to fit, [`SessionJournal::ledger_lag`]; 0 once it holds every record the ledger does), or `journal=off` with a `journal_off=` reason when the session has none (the keeper off: `journal_off=keeper-off`), then a recovered session's [`RestoreReport::status_words`].
+    /// Format the `status` journal and restore words for this session.
     pub(crate) fn status_words(&self) -> String {
         #[cfg(unix)]
         let live: Option<JournalSample> = self.journal.get().map(|j| {
@@ -860,7 +859,6 @@ impl SessionJournal {
 
     pub(crate) fn bind_recovery_count(&self, accepted: Option<Arc<AtomicBool>>) {
         if let Some(accepted) = accepted {
-            // A duplicate binding cannot grant either observer any authority.
             let _ = self.recovery_count.set(accepted);
         }
     }
@@ -1008,8 +1006,6 @@ impl SessionJournal {
         if self.replace_parked.load(Ordering::Relaxed)
             && self.replace_parked.swap(false, Ordering::AcqRel)
         {
-            // A shed region's replacement waited for bytes that could end the sequence
-            // that deferred it (K5): these may have.
             self.notify_worker();
         }
         if cleared {
@@ -1062,8 +1058,6 @@ impl SessionJournal {
             let mut guard = self.lock();
             let w = &mut *guard;
             if w.region_gen != captured.region_gen {
-                // The memory shed replaced the region between the capture and this write,
-                // and keyframed the engine itself, later: this capture is stale there.
                 return;
             }
             if w.writer.tail_commit() != captured.tail_at {
@@ -1112,9 +1106,7 @@ impl SessionJournal {
         }
     }
 
-    /// Whether the session has tail past its keyframe that a quiet wait can keyframe (the parse
-    /// loop then waits for its next batch with a [`QUIET`] timeout, and otherwise blocks): not
-    /// while a K5 deferral parks it, until the next slice or resize reaches the tail.
+    /// Whether the session has unkeyframed tail eligible for a quiet keyframe wait.
     pub(crate) fn dirty(&self) -> bool {
         self.broken.get().is_none() && {
             let w = self.lock();
@@ -1378,7 +1370,6 @@ impl SessionJournal {
         if !held {
             self.nudge_ring();
         } else if self.ledger_moved.load(Ordering::Acquire) {
-            // A record that landed before the worker had the session told nobody.
             self.notify_worker();
         }
     }
@@ -1446,7 +1437,7 @@ impl SessionJournal {
         earliest(export, custody)
     }
 
-    /// One export tick of this session's history ring (the plan's increment 5, step 1).
+    /// Run one export tick of this session's history ring.
     pub(crate) fn export_tick(&self, term: &Mutex<Terminal>) {
         if self.broken.get().is_some() {
             return;
@@ -1671,7 +1662,7 @@ fn enlist_turn_ids(journal: &Arc<SessionJournal>) {
     journal.hold_turn_ids(crate::control::turn_ids_minted());
 }
 
-/// THE TURN-ID COUNT RIDES EVERY REGION (the plan's increment 7): the process's turn-id count moved (`control::mint_turn_id`, `control::raise_turn_ids`), so every live journal's region is given it (its `ctl_count` word, which no control write touches).
+/// Update the turn-id count across every live journal's region (`ctl_count`).
 #[cfg(unix)]
 pub(crate) fn note_turn_ids() {
     let journals: Vec<Arc<SessionJournal>> = TURN_ID_HOLDERS
@@ -1728,7 +1719,7 @@ impl SessionJournal {
 
 #[cfg(unix)]
 impl SessionJournal {
-    /// CARRY THE SESSION'S TURN LEDGER into its region's control slot (the plan's increment 7), so a crash restore brings back the turns driven into the session (`handoff_carry::CrashLedger`): watch `turns`, whose every record wakes the journal worker ([`Self::ledger_moved`]), and when it already carries anything (an adopted session's carried ledger, or the floor of one that could not be carried) write it now, on the spawning thread, before the session's registration hands the keeper the region: a crash right after an update or a recovery then still carries it.
+    /// Watch `turns` and carry the session's turn ledger into its region's control slot.
     pub(crate) fn carry_ledger(
         self: &Arc<Self>,
         turns: &Arc<Mutex<crate::turn_ledger::TurnLedger>>,
@@ -1844,7 +1835,7 @@ impl SessionJournal {
         }
     }
 
-    /// `status journal_ledger_lag=`: the session's turn records its region's control slot does not hold: those the ledger took since the slot's last carry (each carried at most two seconds after it lands), and the oldest ones that carry left out because the whole ledger did not fit the slot (they stay out while the ledger is that long: a few hundred records of long prompts fill it). 0 only once the slot holds every record the ledger holds: a crash now restores them all.
+    /// Turn records of the session's ledger not yet held in its region's control slot (`status journal_ledger_lag=`).
     pub(crate) fn ledger_lag(&self) -> u64 {
         let Some(turns) = self.ledger.get().and_then(std::sync::Weak::upgrade) else {
             return 0;
@@ -1968,7 +1959,7 @@ impl SessionJournal {
         self.history_shed.load(Ordering::Acquire)
     }
 
-    /// Whether the shed's old region is still in memory (`status journal_ring=shedding`): the shed ring's region still waits to be replaced, its pages still this window's, or it was replaced but the keeper link has not taken the fresh region's custody yet, so the keeper still holds the old one and this window keeps it mapped ([`OwedCustody`]), whether or not the pressure has eased since.
+    /// Whether the shed's old region is still in memory (`status journal_ring=shedding`).
     pub(crate) fn ring_shedding(&self) -> bool {
         (self.ring_shed() && self.replace_owed.load(Ordering::Acquire))
             || self.custody_owed.load(Ordering::Acquire)
@@ -1992,7 +1983,7 @@ impl SessionJournal {
         self.regions_replaced.load(Ordering::Relaxed)
     }
 
-    /// SHED the history ring (the journal worker, on [`ShedPolicy`]'s word): nothing more is exported, and from the parse thread's next keyframe on every keyframe carries its own bridge of history (up to 512 lines, as a region with no ring does), since there is no ring to meet.
+    /// Shed the history ring so subsequent keyframes carry only their own bridge history.
     pub(crate) fn request_shed(&self) {
         if self.history_shed.swap(true, Ordering::AcqRel) {
             return;
@@ -2056,8 +2047,6 @@ impl SessionJournal {
                 self.replace_owed.store(false, Ordering::Release);
             }
             Replaced::Deferred => {
-                // A parser carry parks until its next bytes; a pending keeper receipt
-                // remains pollable. Neither case starts another mapping before K1's quiet.
                 ring.replace_due = Some(now.saturating_add(aterm_restore::policy::QUIET_MS));
             }
             Replaced::Unavailable(why) => {
@@ -2079,8 +2068,6 @@ impl SessionJournal {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .waiting_for_read()
         {
-            // One queued predecessor is the bound. Busy intermediate regions were never
-            // offered to the keeper and may still be replaced below.
             return Ok(Replaced::Deferred);
         }
         let (region, custody) = match ring.spare.take().map_or_else(new_region, Ok) {
@@ -2446,7 +2433,7 @@ pub(crate) struct ShedPlan {
     pub(crate) back: Option<u64>,
 }
 
-/// THE MEMORY SHED POLICY (the plan's increment 6): which history rings memory pressure takes away, and when they come back.
+/// Memory shed policy governing which history rings memory pressure sheds and when they return.
 #[cfg(unix)]
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ShedPolicy {
@@ -2519,7 +2506,7 @@ impl ShedPolicy {
     }
 }
 
-/// THE JOURNAL WORKER: one thread per window process that exports every session's history ring (the plan's increment 5, step 1), at `qos::Role::Responsive` because it takes the term lock the UI thread contends (the rule at `qos.rs`'s `Role`).
+/// Background worker thread that exports every session's history ring and control slot.
 #[cfg(unix)]
 pub(crate) struct HistoryWorker {
     ring_queue: Mutex<WorkerState>,
@@ -2632,7 +2619,7 @@ impl HistoryWorker {
         self.wake.notify_one();
     }
 
-    /// The OS reported memory pressure `level`: the next pass applies [`ShedPolicy`] to it, then answers `applied` (when given), after the regions it shed were replaced (a replacement the parser defers waits for the program's next bytes, then is tried no sooner than K1's quiet after its last try, [`SessionJournal::shed_tick`]).
+    /// Apply memory pressure `level` via [`ShedPolicy`] on the next pass, then signal `applied`.
     pub(crate) fn note_shed_pressure(
         &self,
         level: PressureLevel,
@@ -2653,7 +2640,7 @@ impl HistoryWorker {
         self.shed_clock.now_ms()
     }
 
-    /// Move the shed policy's clock on by `ms` and wake the worker (a test reaches the hold before shed rings come back without sleeping).
+    /// Advance the shed policy's clock by `ms` and wake the worker.
     #[cfg(test)]
     pub(crate) fn pass_shed_ms(&self, ms: u64) {
         self.shed_clock.pass(ms);
@@ -2814,7 +2801,7 @@ static REPORTED_PRESSURE: PressureCell = std::sync::Mutex::new((None, false));
 
 type PressureCell = std::sync::Mutex<(Option<PressureLevel>, bool)>;
 
-/// The OS reported memory pressure `level` (the main thread's `Wake::MemoryPressure` arm, beside the scrollback's own shed): it is kept as the window's level, and the window's journal worker runs [`ShedPolicy`] on it at its next pass.
+/// Record OS memory pressure `level` and notify the window's journal worker.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub(crate) fn note_memory_pressure(
     level: PressureLevel,
@@ -2871,7 +2858,7 @@ fn seed_pressure_in(pressure_cell: &PressureCell, worker: &HistoryWorker) {
     }
 }
 
-/// The `pressure` verb's line: `level=<-|normal|warn|critical> journals=<n> rings_shed=<n> journal_resident_bytes=<n> rings_back_in_ms=<-|n>`: the level the OS last reported (`-`: none since launch), the sessions the journal worker exports for and how many of their history rings memory pressure shed, the RAM every region of this window costs it ([`resident_bytes`]), and in how many milliseconds the next shed ring comes back (`-` while none waits to).
+/// Format the `pressure` verb's status line.
 pub(crate) fn pressure_words() -> String {
     let level = REPORTED_PRESSURE
         .lock()
@@ -2990,7 +2977,7 @@ pub(crate) unsafe fn restore_offered(
     }
 }
 
-/// What a keeper recovery made of one offered session's region ([`restore_offered`]): its screen, or the META rung's report, and, apart from either, read once the region's header held, whatever the screen's rung: its turn ledger's crash carry (the control slot, increment 7) and the dead window's turn-id count (the `ctl_count` word, [`note_turn_ids`]).
+/// Outcome of restoring one offered session's region ([`restore_offered`]).
 #[cfg(unix)]
 pub(crate) struct Restoration {
     pub(crate) screen: Result<Restore, RestoreReport>,
@@ -3074,8 +3061,6 @@ unsafe fn restore_screen(
     )
     .is_err()
     {
-        // The screen goes blank, and with it every history line the region held: read,
-        // so counted (`status history_lost=`, the ledger), not left at 0.
         return Err(RestoreReport {
             history_lost: history_held(&restored),
             ..RestoreReport::meta("cells", attempts)
@@ -3160,7 +3145,7 @@ fn history_held(restored: &aterm_restore::Restored) -> u64 {
     }
 }
 
-/// The history of a session on the META rung (`keeper_link`'s `admit_recovered_journaled`): nothing to import, and the lines its report counts lost (`status history_lost=` from its registration on, as a restored session's join counts its own).
+/// Adopted history for a session on the META rung.
 #[cfg(unix)]
 pub(crate) fn meta_history(report: &RestoreReport) -> crate::handoff_history::AdoptedHistory {
     crate::handoff_history::AdoptedHistory {
@@ -3216,7 +3201,7 @@ fn control_carry<V: aterm_restore::RegionView + ?Sized>(
     }
 }
 
-/// The control carry a recovered session is adopted with ([`Restoration`]): the slot's, its turn-id count raised to the region's `ctl_count` word, which a mint stores before its id is anyone's ([`note_turn_ids`]) and no control write touches.
+/// Control carry for an adopted session ([`Restoration`]), with its turn-id count raised to `turn_ids`.
 #[cfg(unix)]
 pub(crate) fn counted_carry(
     control: Option<crate::handoff_carry::ControlCarry>,
@@ -3235,7 +3220,7 @@ pub(crate) fn counted_carry(
     }
 }
 
-/// TURN IDS GO ON AFTER A CRASH (increment 7), at the keeper recovery's boot, before this process mints a turn id: the turn-id count continues above every recovered session's count ([`counted_carry`]: its region's count word, which its process stored at every mint, its carry's own count and its highest record) plus the update's reserve (`control::TURN_ID_RESERVE`), and every carried ledger stops vouching for the ids below where the count goes on (its `unheld_below` raised there).
+/// Raise the process turn-id counter past every recovered session's carried count plus reserve.
 #[cfg(unix)]
 pub(crate) fn continue_carried_turns(adopted: &mut [crate::spawn::Adopted]) {
     let mut carries: Vec<&mut crate::handoff_carry::ControlCarry> = adopted
@@ -3280,8 +3265,6 @@ const fn first_loss(restored: &aterm_restore::Restored, attempts: u8) -> &'stati
     if attempts > 0 {
         "keyframe-only"
     } else if l.superseded {
-        // The memory shed had moved the session to a fresh region, and the window died
-        // before the keeper took its COMPANION: this is the region it left.
         "superseded"
     } else if l.tail_overflow {
         "tail-overflow"
@@ -3308,9 +3291,6 @@ const fn first_loss(restored: &aterm_restore::Restored, attempts: u8) -> &'stati
     } else if l.config_moved {
         "config-moved"
     } else {
-        // Nothing lost: the tail was recorded under another config than this window
-        // runs (a tab with a theme of its own that was writing when it died, or a
-        // config edited between the two windows).
         "config"
     }
 }

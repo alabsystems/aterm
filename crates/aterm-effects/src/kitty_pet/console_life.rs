@@ -340,7 +340,6 @@ pub(super) struct ConsoleLife {
     pub(super) rest_seated: std::cell::Cell<bool>,
     row_sig: Vec<u64>,
     row_sig_prev: Vec<u64>,
-    row_sig_next: Vec<u64>,
 }
 
 #[inline]
@@ -376,15 +375,12 @@ impl ConsoleLife {
             .or_else(|| self.spare_world.take());
         let mut row_sig = core::mem::take(&mut self.row_sig);
         let mut row_sig_prev = core::mem::take(&mut self.row_sig_prev);
-        let mut row_sig_next = core::mem::take(&mut self.row_sig_next);
         row_sig.clear();
         row_sig_prev.clear();
-        row_sig_next.clear();
         Self {
             spare_world,
             row_sig,
             row_sig_prev,
-            row_sig_next,
             ..Self::default()
         }
     }
@@ -649,23 +645,34 @@ impl PetBrain {
             return;
         };
         let rows = pane.rows.min(input.cells.len().saturating_sub(pane.row));
-        console.row_sig_next.clear();
-        console.row_sig_next.reserve(rows);
-        for r in pane.row..pane.row + rows {
-            let row = &input.cells[r];
-            let end = (pane.col + pane.cols).min(row.len());
-            console
-                .row_sig_next
-                .push(row_signature(row.get(pane.col..end).unwrap_or(&[])));
-        }
-        let same_grid = prior.is_some_and(|p| p.surface == stamp.surface)
-            && console.row_sig.len() == console.row_sig_next.len();
+        let same_grid =
+            prior.is_some_and(|p| p.surface == stamp.surface) && console.row_sig.len() == rows;
         if !same_grid {
             console.row_sig_prev.clear();
-            std::mem::swap(&mut console.row_sig, &mut console.row_sig_next);
-        } else if console.row_sig != console.row_sig_next {
-            std::mem::swap(&mut console.row_sig_prev, &mut console.row_sig);
-            std::mem::swap(&mut console.row_sig, &mut console.row_sig_next);
+            console.row_sig.clear();
+            console.row_sig.reserve(rows);
+            for row in &input.cells[pane.row..pane.row + rows] {
+                let end = (pane.col + pane.cols).min(row.len());
+                console
+                    .row_sig
+                    .push(row_signature(row.get(pane.col..end).unwrap_or(&[])));
+            }
+            return;
+        }
+        let mut swapped = false;
+        for (i, row) in input.cells[pane.row..pane.row + rows].iter().enumerate() {
+            let end = (pane.col + pane.cols).min(row.len());
+            let sig = row_signature(row.get(pane.col..end).unwrap_or(&[]));
+            if !swapped {
+                if console.row_sig[i] == sig {
+                    continue;
+                }
+                std::mem::swap(&mut console.row_sig_prev, &mut console.row_sig);
+                console.row_sig.resize(rows, 0);
+                console.row_sig[..i].copy_from_slice(&console.row_sig_prev[..i]);
+                swapped = true;
+            }
+            console.row_sig[i] = sig;
         }
     }
 
@@ -723,16 +730,14 @@ impl PetBrain {
         }
         let r = row.round() as usize;
         let mut seen = false;
-        let mut last = None;
-        for c in first..end {
-            if let Some(letter) = world.letter_at(r, c) {
-                seen = true;
-                if letter {
-                    last = Some(c);
-                }
+        for c in (first..end).rev() {
+            match world.letter_at(r, c) {
+                Some(true) => return Some(Some(c)),
+                Some(false) => seen = true,
+                None => {}
             }
         }
-        seen.then_some(last)
+        seen.then_some(None)
     }
 
     /// Exact locomotion occupancy where the map covers the whole footprint.

@@ -106,7 +106,6 @@ fn deserialize_identifier(
         .iter()
         .flat_map(|field| {
             let ident = &field.ident;
-            // `aliases` also contains a main name
             field.aliases.iter().map(move |alias| {
                 q!(
                     "#alias => _serde::__private::Ok(#this_value::#ident),",
@@ -121,7 +120,6 @@ fn deserialize_identifier(
         .iter()
         .flat_map(|field| {
             let ident = &field.ident;
-            // `aliases` also contains a main name
             field.aliases.iter().map(move |alias| {
                 let alias = Literal::byte_string(alias.value.as_bytes());
                 q!(

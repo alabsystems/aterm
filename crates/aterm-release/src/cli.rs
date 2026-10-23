@@ -80,6 +80,14 @@ USAGE
       architectures and hand the directory to the cutter (--linux-artifacts), or
       let the cutter drive the hosts (--linux-worker).
 
+  targo --unverified ship pin-verifier dist/aterm-bootstrap-verify-pin.toml
+      Once a release is public: write the static bootstrap verifiers its cut froze
+      (the receipts its sign step wrote into dist/) into this checkout as
+      tools/install.sh's pin and crates/aterm-bootstrap-verify/pinned.toml, for you
+      to commit together. Refuses a release this checkout's RELEASES.ledger does
+      not claim, or one whose verifiers speak another interface than this tree's
+      install.sh; then nothing is written.
+
   targo --unverified ship cut [--dry-run] [--resume] [--abandon vX.Y.Z]
                  [--min-build N] [--rehearse OWNER/REPO]
                  [--release-credentials <profile.toml>]
@@ -310,6 +318,9 @@ pub enum Cmd {
         commit: String,
         out: std::path::PathBuf,
     },
+    /// `pin-verifier <record>`: install.sh's verifier pin from a cut's receipts
+    /// ([`crate::buildplan::linux::pin_verifier`]).
+    PinVerifier(std::path::PathBuf),
     /// `build`: the release bundle, or HEAD's provisional bundle ([`crate::artifact::run_build`]).
     Build,
     Cut {
@@ -453,6 +464,15 @@ pub fn parse(args: &[String]) -> std::result::Result<Cmd, String> {
             )),
         },
         "release" => parse_release(&mut it).map(Cmd::Release),
+        "pin-verifier" => match (it.next(), it.next()) {
+            (Some(record), None) if !record.starts_with('-') => {
+                Ok(Cmd::PinVerifier(std::path::PathBuf::from(record)))
+            }
+            _ => Err(format!(
+                "pin-verifier takes the one record a cut wrote (dist/{})",
+                crate::buildplan::linux::PIN_RECORD
+            )),
+        },
         "linux-build" => {
             let mut values = std::collections::BTreeMap::new();
             while let Some(flag) = it.next() {
@@ -953,6 +973,19 @@ fn dispatch(cmd: Cmd) -> ledger::Result<()> {
             out,
         } => crate::buildplan::linux::run_worker(&repo_root()?, &out, &version, build, &commit)
             .map_err(Error::new),
+        Cmd::PinVerifier(record) => {
+            let root = repo_root()?;
+            let pin = crate::buildplan::linux::pin_verifier(&root, &record).map_err(Error::new)?;
+            println!(
+                "pinned {}'s bootstrap verifier from {} into tools/install.sh and {}; commit \
+                 both:\n{}",
+                pin.tag,
+                pin.repo,
+                aterm_bootstrap_verify::pin::RECORD,
+                pin.lines()
+            );
+            Ok(())
+        }
         Cmd::Build => crate::artifact::run_build(&repo_root()?),
         Cmd::Cut {
             abandon: Some(v), ..
@@ -1032,7 +1065,7 @@ fn own_code(cmd: &Cmd) -> Option<i32> {
 }
 
 fn repo_root() -> ledger::Result<std::path::PathBuf> {
-    let out = Command::new("git")
+    let out = Command::new(aterm_uds::os_path!("git"))
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .map_err(|e| Error::new(format!("failed to run git rev-parse --show-toplevel: {e}")))?;

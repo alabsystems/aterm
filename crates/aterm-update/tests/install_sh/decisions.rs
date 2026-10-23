@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The installer's pure decisions: the manifest's identity fields, the
-//! official channel's signing-team pin, the app half's idempotence and its
-//! signature gate, the container election, which repository a checkout
-//! installs from, and the Linux candidate's identity line.
+//! The installer's pure decisions: the manifest's identity fields, the official channel's signing-team pin, the app half's idempotence and its signature gate, the container election, which repository a checkout installs from, and the Linux candidate's identity line.
 
 use crate::support::{Lib, Scratch, q, root, s};
 
-/// A required identity field occurs exactly once as a one-line string; an
-/// optional one at most once.
+/// A required identity field occurs exactly once as a one-line string; an optional one at most once.
 #[test]
 fn a_manifest_identity_field_is_one_plain_string() {
     let scratch = Scratch::new();
@@ -48,9 +44,7 @@ fn a_manifest_identity_field_is_one_plain_string() {
     }
 }
 
-/// On the official repository the Developer-ID team is pinned in the script:
-/// a manifest that omits or contradicts it is refused. An explicit
-/// ATERM_TEAM_ID outranks everything; a fork keeps its manifest's pin.
+/// On the official repository the Developer-ID team is pinned in the script: a manifest that omits or contradicts it is refused.
 #[test]
 fn the_official_channel_pins_its_signing_team() {
     let scratch = Scratch::new();
@@ -84,8 +78,7 @@ fn the_official_channel_pins_its_signing_team() {
     }
 }
 
-/// An unpinned re-run against the installed elected version downloads
-/// nothing; a pin always reinstalls; a foreign bundle never short-circuits.
+/// An unpinned re-run against the installed elected version downloads nothing; a pin always reinstalls; a foreign bundle never short-circuits.
 #[test]
 fn only_an_unpinned_rerun_of_the_installed_release_is_a_no_op() {
     let scratch = Scratch::new();
@@ -107,14 +100,11 @@ fn only_an_unpinned_rerun_of_the_installed_release_is_a_no_op() {
     }
 }
 
-/// The idempotence gate blesses only a bundle the fresh install would have
-/// accepted, and tells a verifier that did not answer (124 codesign, 125
-/// Gatekeeper) from one that declined (1).
+/// The idempotence gate blesses only a bundle the fresh install would have accepted, and tells a verifier that did not answer (124 codesign, 125 Gatekeeper) from one that declined (1).
 #[test]
 fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
     let scratch = Scratch::new();
     let mut lib = Lib::new();
-    // The seal check carries no -R; the team requirement check does.
     lib.step(
         "codesign() {
 			local arg
@@ -144,7 +134,6 @@ fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
             )
         })
         .collect();
-    // A codesign that never returns is stopped by the hang detector.
     lib.step("codesign() { sleep 60; }; VERIFY_WAIT_SECS=1");
     let hung = lib.call(format!("installed_bundle_verified {app} ''"), &[]);
     let recs = lib.run(&scratch);
@@ -154,8 +143,7 @@ fn the_installed_bundle_gate_verifies_like_a_fresh_install() {
     assert_eq!(recs[hung].rc, 124);
 }
 
-/// One digest, two spellings: equality is case-blind, and an empty operand
-/// never matches.
+/// One digest, two spellings: equality is case-blind, and an empty operand never matches.
 #[test]
 fn digests_compare_case_blind_and_never_empty() {
     let scratch = Scratch::new();
@@ -179,16 +167,10 @@ fn digests_compare_case_blind_and_never_empty() {
     }
 }
 
-/// The authenticated Linux candidate is the release it was elected as when
-/// the FIRST line of its `--version` says so: `aterm --version` prints the
-/// origin line, the build, which copy runs and the trust roots under the
-/// identity, and the lane compared that whole report, refusing every release.
-/// A version on a later line is not the identity; a candidate that cannot run
-/// is a different refusal from one that names another release.
+/// The authenticated Linux candidate is the release it was elected as when the FIRST line of its `--version` says so: `aterm --version` prints the origin line, the build, which copy runs and the trust roots under the identity, and the lane compared that whole report, refusing every release.
 #[test]
 fn the_linux_candidate_is_judged_by_its_identity_line() {
     let scratch = Scratch::new();
-    // aterm-cli's version_text: identity, origin, build, which copy, trust roots.
     let report = |identity: &str| {
         format!(
             "#!/bin/sh\nprintf '%s\\n' '{identity}' '{}' 'build: 1792175575' \
@@ -256,14 +238,11 @@ fn the_linux_candidate_is_judged_by_its_identity_line() {
 const SHA_DMG: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 const SHA_ZIP: &str = "2222222222222222222222222222222222222222222222222222222222222222";
 
-/// The container election: the lean zip whenever the release ships one (the
-/// toolset deferred to first launch, or excluded), else the bare DMG a
-/// pre-lean release was cut for; half a pair or a malformed one refuses.
+/// The container election: the lean zip whenever the release ships one (the toolset deferred to first launch, or excluded), else the bare DMG a pre-lean release was cut for; half a pair or a malformed one refuses.
 #[test]
 fn the_container_election_matrix() {
     let scratch = Scratch::new();
     let (dmg, zip) = ("aterm-0.48.0.dmg", "aterm-0.48.0-mac.zip");
-    // (toolchain, zip, zip digest) -> (status, kind, asset, digest, lean reason, deferred)
     type Input<'a> = (u8, &'a str, &'a str);
     type Elected<'a> = (i32, &'a str, &'a str, &'a str, &'a str, &'a str);
     let rows: &[(Input, Elected)] = &[
@@ -306,14 +285,7 @@ fn the_container_election_matrix() {
     }
 }
 
-/// The lean default's deferral is a function of who owns this Mac's console
-/// (docs/DESIGN-init-system-2026-10-20.md §4.2, "The SSH install"): the toolset
-/// waits for the window only when the installing user is at the screen, and is
-/// seeded here for any other owner (another login, loginwindow's root) or one
-/// that cannot be read. Under `sudo` the installing user is `$SUDO_UID`, and a
-/// root run never seeds: one for the console's own user is the ordinary
-/// deferral, any other stays deferred and says so (`TOOLSET_AS_ROOT`). A run
-/// that deferred nothing (--no-toolchain, a pinned DMG) is left as it was.
+/// The lean default's deferral is a function of who owns this Mac's console (docs/DESIGN-init-system-2026-10-20.md §4.2, "The SSH install"): the toolset waits for the window only when the installing user is at the screen, and is seeded here for any other owner (another login, loginwindow's root) or one that cannot be read.
 #[test]
 fn the_toolsets_deferral_is_a_function_of_the_console_owner() {
     let scratch = Scratch::new();
@@ -329,11 +301,8 @@ fn the_toolsets_deferral_is_a_function_of_the_console_owner() {
         ((1, zip, "502", "501", ""), ("0", "1", "0")),
         ((1, zip, "0", "501", ""), ("0", "1", "0")),
         ((1, zip, "", "501", ""), ("0", "1", "0")),
-        // A $SUDO_UID left in a user's environment names nobody: only root's is read.
         ((1, zip, "502", "501", "502"), ("0", "1", "0")),
-        // `sudo` by the person at the screen: their own window seeds it.
         ((1, zip, "501", "0", "501"), ("1", "0", "0")),
-        // `sudo` by someone else, and root at the loginwindow: never seeded as root.
         ((1, zip, "502", "0", "501"), ("1", "0", "1")),
         ((1, zip, "", "0", "501"), ("1", "0", "1")),
         ((1, zip, "501", "0", ""), ("1", "0", "1")),
@@ -367,9 +336,7 @@ fn the_toolsets_deferral_is_a_function_of_the_console_owner() {
     }
 }
 
-/// The one step the plan and the install both run (`elect_install_lane`) decides
-/// over the console's real owner, or `ATERM_INSTALL_CONSOLE_UID`'s stand-in: the
-/// election, then the deferral, in that order (the election resets the deferral).
+/// The one step the plan and the install both run (`elect_install_lane`) decides over the console's real owner, or `ATERM_INSTALL_CONSOLE_UID`'s stand-in: the election, then the deferral, in that order (the election resets the deferral).
 #[test]
 fn the_install_lane_defers_by_the_console_owner_after_the_election() {
     let scratch = Scratch::new();
@@ -423,8 +390,7 @@ fn the_console_owner_is_dev_consoles_uid() {
     assert_eq!(recs[call].out.trim(), owner.to_string());
 }
 
-/// The manifest parse reads the current keys; the retired Intel pair's keys
-/// are neither required nor read, so they can never masquerade as a zip.
+/// The manifest parse reads the current keys; the retired Intel pair's keys are neither required nor read, so they can never masquerade as a zip.
 #[test]
 fn the_manifest_parse_ignores_the_retired_intel_pair() {
     let scratch = Scratch::new();
@@ -476,8 +442,7 @@ fn the_manifest_parse_ignores_the_retired_intel_pair() {
     );
 }
 
-/// A run from a checkout installs from the channel its manifest declares — the
-/// shipped binary's compiled-in channel — never from `repository` alone.
+/// A run from a checkout installs from the channel its manifest declares — the shipped binary's compiled-in channel — never from `repository` alone.
 #[test]
 fn a_checkout_installs_from_its_update_channel() {
     let scratch = Scratch::new();

@@ -1793,8 +1793,6 @@ fn cmd_reroute(rest: &[String]) -> ExitCode {
         return ExitCode::from(2);
     };
     let Some(layout) = layout() else {
-        // No resolvable store (`layout` has said why): the upstream copy on PATH runs
-        // after one line; `[reroute] strict = true` refuses instead, exit 2.
         return crate::reroute::run_storeless(upstream, args);
     };
     crate::reroute::run(&layout, upstream, args)
@@ -3492,12 +3490,13 @@ fn lease_and_run(
         &args.dir,
         &lease_run_name(args),
     ));
+    let forwarding = crate::platform::arm_forwarding();
     let mut command = aterm_uds::spawnfd::transparent(&args.command[0]);
     let mut child = match command.args(&args.command[1..]).spawn() {
         Ok(child) => child,
         Err(e) => return LeaseRun::NotStarted(e),
     };
-    let status = crate::platform::wait_standing_aside(&mut child);
+    let status = crate::platform::wait_standing_aside(&mut child, forwarding);
     drop(hold);
     match status {
         Ok(status) => LeaseRun::Ran(status),

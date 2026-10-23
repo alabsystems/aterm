@@ -502,7 +502,7 @@ pub(super) fn at_second<R>(now: u64, f: impl FnOnce() -> R) -> R {
 
 #[cfg(any(not(target_os = "macos"), test))]
 fn ps(args: &[&str]) -> Option<String> {
-    let mut cmd = aterm_uds::spawnfd::command("ps");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"));
     cmd.args(args).env("LC_ALL", "C").env("TZ", "UTC");
     let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
         .ok()?;
@@ -758,7 +758,6 @@ fn terminal_owner(pid: u32, t: &[(u32, u32, String, String)]) -> Option<(u32, &s
     let row = |p: u32| t.iter().find(|(q, _, _, _)| *q == p);
     let tty = row(pid)?.2.as_str();
     if !tty.chars().any(|c| c.is_ascii_digit()) {
-        // Distinct branch.
         return None; // `??`, `?`, `-`: no controlling terminal at all.
     }
     let mut p = pid;
@@ -819,7 +818,6 @@ fn ps_opener(agent: u32, parent: u32) -> Option<String> {
     let row = |p: u32| rows.iter().find(|(q, _, _)| *q == p);
     let (_, tty, _) = row(agent)?;
     if !tty.chars().any(|c| c.is_ascii_digit()) {
-        // Distinct branch.
         return None; // `??`, `?`, `-`: no controlling terminal at all.
     }
     let (_, parent_tty, name) = row(parent)?;
@@ -1191,172 +1189,34 @@ pub(super) fn exe_of(pid: u32) -> Option<PathBuf> {
     aterm_sysprobe::process_path(pid)
 }
 
+/// Every file `pid` holds open through a descriptor, `None` when unreadable or exited, read in
+/// process ([`aterm_uds::holders::open_files`]).
 pub(super) fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
-    match aterm_uds::holders::open_files(pid) {
-        Ok(files) => Some(files),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(_) => lsof_open_files(pid),
-    }
+    aterm_uds::holders::open_files(pid).ok()
 }
 
-pub(super) fn lsof_open_files(pid: u32) -> Option<Vec<PathBuf>> {
-    let mut cmd = aterm_uds::spawnfd::command("lsof");
-    cmd.args(["-n", "-P", "-w", "-p", &pid.to_string(), "-Fn"]);
-    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.strip_prefix('n').map(PathBuf::from))
-            .collect(),
-    )
-}
-
+/// Returns `scan.holders` when `scan.unreadable` is empty; sealed tables (`HolderScan::sealed`) do not make the scan incomplete.
 fn complete_file_holders(scan: aterm_uds::holders::HolderScan) -> Option<Vec<u32>> {
     scan.unreadable.is_empty().then_some(scan.holders)
 }
 
+/// Every process holding `file` open through a descriptor, `None` when unknown: only a
+/// complete in-process scan ([`aterm_uds::holders::scan_file_holders`]) is an answer.
 pub(super) fn file_holders(file: &Path) -> Option<Vec<u32>> {
-    holder_census(
-        aterm_uds::holders::scan_file_holders(file, &[]),
-        |pids| lsof_holders_among(file, pids),
-        || lsof_holders(file),
-    )
+    complete_file_holders(aterm_uds::holders::scan_file_holders(file, &[]).ok()?)
 }
 
-fn holder_census(
-    scan: std::io::Result<aterm_uds::holders::HolderScan>,
-    among: impl FnOnce(&[u32]) -> Option<Vec<u32>>,
-    whole: impl FnOnce() -> Option<Vec<u32>>,
-) -> Option<Vec<u32>> {
-    match scan {
-        Ok(scan) if scan.unreadable.is_empty() => complete_file_holders(scan),
-        Ok(scan) => {
-            let mut holders = scan.holders;
-            holders.extend(among(&scan.unreadable)?);
-            holders.sort_unstable();
-            holders.dedup();
-            Some(holders)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => whole(),
-        Err(_) => None,
-    }
-}
-
-#[cfg(unix)]
-fn lsof_holders_among(file: &Path, pids: &[u32]) -> Option<Vec<u32>> {
-    use std::os::unix::fs::MetadataExt as _;
-    let meta = std::fs::metadata(file).ok()?;
-    let list: Vec<String> = pids.iter().map(u32::to_string).collect();
-    let mut cmd = aterm_uds::spawnfd::command("lsof");
-    cmd.args(["-n", "-P", "-p", &list.join(","), "-F", "0pftDin"]);
-    let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
-        .ok()?;
-    let key = (meta.dev() & u64::from(u32::MAX), meta.ino());
-    lsof_fd_holders(&out, pids, key, aterm_uds::process::pid_alive)
-}
-
-#[cfg(not(unix))]
-fn lsof_holders_among(_file: &Path, _pids: &[u32]) -> Option<Vec<u32>> {
-    None
-}
-
-#[cfg(unix)]
-const LSOF_FD_CLOSED: &[u8] = b"vnode: FD unavailable";
-
-#[cfg(unix)]
-fn lsof_fd_holders(
-    out: &std::process::Output,
-    pids: &[u32],
-    key: (u64, u64),
-    alive: impl Fn(u32) -> bool,
-) -> Option<Vec<u32>> {
-    #[derive(Default)]
-    struct Fd<'a> {
-        numbered: bool,
-        kind: Option<&'a str>,
-        dev: Option<u64>,
-        ino: Option<u64>,
-        closed: bool,
-    }
-    fn settle(
-        fd: Option<Fd<'_>>,
-        listed: &[u32],
-        key: (u64, u64),
-        holders: &mut Vec<u32>,
-    ) -> Option<()> {
-        let (Some(fd), Some(&pid)) = (fd, listed.last()) else {
-            return Some(());
-        };
-        let held = match (fd.dev, fd.ino) {
-            _ if !fd.numbered => false,
-            (Some(dev), Some(ino)) => (dev, ino) == key,
-            _ if fd.closed => false,
-            _ if matches!(fd.kind, None | Some("REG")) => return None,
-            _ => false,
-        };
-        if held && holders.last() != Some(&pid) {
-            holders.push(pid);
-        }
-        Some(())
-    }
-    if !out.stderr.is_empty() || !matches!(out.status.code(), Some(0 | 1)) {
-        return None;
-    }
-    let mut listed: Vec<u32> = Vec::new();
-    let mut holders: Vec<u32> = Vec::new();
-    let mut fd: Option<Fd<'_>> = None;
-    for field in out.stdout.split(|b| *b == 0) {
-        let field = field.strip_prefix(b"\n").unwrap_or(field);
-        let Some((&tag, value)) = field.split_first() else {
-            continue;
-        };
-        let text = || std::str::from_utf8(value).ok();
-        match tag {
-            b'p' => {
-                settle(fd.take(), &listed, key, &mut holders)?;
-                let pid: u32 = text()?.parse().ok()?;
-                if !pids.contains(&pid) || listed.contains(&pid) {
-                    return None;
-                }
-                listed.push(pid);
-            }
-            b'f' => {
-                settle(fd.take(), &listed, key, &mut holders)?;
-                listed.last()?;
-                fd = Some(Fd {
-                    numbered: text()?.parse::<u32>().is_ok(),
-                    ..Fd::default()
-                });
-            }
-            b't' => fd.as_mut()?.kind = Some(text()?),
-            b'D' => {
-                let hex = text()?.strip_prefix("0x")?;
-                fd.as_mut()?.dev = Some(u64::from_str_radix(hex, 16).ok()?);
-            }
-            b'i' => fd.as_mut()?.ino = Some(text()?.parse().ok()?),
-            b'n' => fd.as_mut()?.closed = value == LSOF_FD_CLOSED,
-            _ => {}
-        }
-    }
-    settle(fd, &listed, key, &mut holders)?;
-    if pids.iter().any(|p| !listed.contains(p) && alive(*p)) {
-        return None;
-    }
-    Some(holders)
-}
-
+/// `lsof -t`'s holders of `file`: the oracle [`file_holders`] is held to.
+#[cfg(all(test, target_os = "macos"))]
 pub(super) fn lsof_holders(file: &Path) -> Option<Vec<u32>> {
-    let mut cmd = aterm_uds::spawnfd::command("lsof");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"));
     cmd.args(["-n", "-P", "-t"]).arg(file);
     let out = aterm_uds::deadline::output_until(&mut cmd, Instant::now() + Duration::from_secs(10))
         .ok()?;
     lsof_holder_pids(&out)
 }
 
+#[cfg(all(test, unix))]
 fn lsof_holder_pids(out: &std::process::Output) -> Option<Vec<u32>> {
     if !out.stderr.is_empty() {
         return None;
@@ -2687,10 +2547,8 @@ fn agent_settings(
                 continue;
             };
             if in_managed(&source.name) {
-                // The drop-ins, in order, over the file.
                 managed_said.insert(key.to_string(), value.clone());
             } else if !said_below.contains_key(key) {
-                // The first below the managed tier is the highest.
                 said_below.insert(key.to_string(), value.clone());
             }
         }
@@ -3811,10 +3669,6 @@ impl St {
                     && st.pending_since < st.salt
                     && st.pending_since < who.started_s
                 {
-                    // A record an older build wrote whose age predates both its
-                    // own minting and the process now holding the conversation:
-                    // the age begins at the later of the salt and the process's
-                    // start.
                     st.pending_since = st.salt.max(who.started_s);
                 }
                 if !who.start.is_empty() && (same || st.phase == Phase::Pending) {
@@ -5130,7 +4984,6 @@ fn prune_states(opts: &Opts, files: &[SessionFile], now: u64) {
                 .session_files()
                 .is_none_or(|files| conversation_live(&files, id));
         if driven_here(st.agent) && settled(&st) && !held_elsewhere {
-            // Through the one remover: the move it carried stays.
             remove(opts, id);
         }
     }
@@ -5982,7 +5835,7 @@ pub fn supervisor_typed(opts: &Opts, tab: &str) -> Vec<approvals::Typed> {
 
 pub(super) const EARLIER_TABS: usize = 8;
 
-/// WHAT THE HARNESS TYPED INTO A CONVERSATION, keyed to the conversation and not to the tab it is in now.
+/// What the harness typed into a conversation, keyed to the conversation rather than its current tab.
 #[must_use]
 pub fn conversation_typed(
     opts: &Opts,
@@ -6199,7 +6052,7 @@ pub fn lefts_of(body: &str, sid: Option<&str>, earlier: &[(String, String)]) -> 
     keys
 }
 
-/// THE EARLIER TABS' LEDGERS beside the loop ledger at `ledger` of session `sid`.
+/// The earlier tabs' ledgers beside the loop ledger at `ledger` of session `sid`.
 #[must_use]
 pub fn earlier_ledgers_in(
     ledger: &Path,
@@ -6255,7 +6108,7 @@ fn noted_earlier_tabs_read(
         .unwrap_or_default()
 }
 
-/// A COLD RESTORE REOPENED TAB `tab` FROM TAB `was` (the decision review's RR-LC-3).
+/// Note that a cold restore reopened tab `tab` from tab `was`.
 pub fn note_earlier_tab(opts: &Opts, tab: &str, was: &str) {
     if let Some(root) = opts.aterm_state.as_deref() {
         note_earlier_tab_under(root, tab, was);
@@ -6381,7 +6234,7 @@ impl Tasked {
     }
 }
 
-/// WHETHER CONVERSATION `session`'S TASK IS FINISHED BY ITS OWN RECORD ([`upgrade::FinishedScan`]).
+/// Whether conversation `session`'s task is finished by its own record ([`upgrade::FinishedScan`]).
 #[derive(Clone, Debug, Default)]
 pub struct Finished {
     session: String,
@@ -6531,7 +6384,7 @@ fn writes_note_path(opts: &Opts, session: &str) -> PathBuf {
     state_dir(opts).join(format!("{session}.writes"))
 }
 
-/// THE DIRECTORY A MOVED AGENT WRITES ITS CONVERSATION IN, NOTED WHILE IT LIVES (the decision review's RR-LC-5).
+/// Record the directory a moved agent writes its conversation in while it lives.
 pub fn note_writes(opts: &Opts, snap: &super::relaunch::Snapshot, dir: &Path) {
     let Some(session) = snap.session.as_deref() else {
         return;
@@ -7938,7 +7791,7 @@ pub fn log_settles(step: &str) -> bool {
     matches!(step, "wait:turn-open" | "wait:queued-work")
 }
 
-/// AN OWED RELEASE WAITING OUT THE SETTLE AT ITS POINT (`wait:release:settling`, `…:not-idle`, `…:busy`, `…:status-stale`).
+/// Whether `step` is an owed release waiting out the settle at its point (`wait:release:settling`, `…:not-idle`, `…:busy`, `…:status-stale`).
 #[must_use]
 pub fn release_settles(step: &str) -> bool {
     step.strip_prefix("wait:release:")
@@ -8084,7 +7937,7 @@ pub(super) fn codex_alab_snapshot(
     codex_alab_drive::snapshot(opts, tab, pid, start, shell, args, &Live)
 }
 
-/// THE CRASH RULE'S RELAUNCH of a proven self-claimed codex-alab (the self-claim contract, §4).
+/// Relaunch a proven self-claimed codex-alab after exit.
 #[must_use]
 pub fn self_claimed_after_exit(
     opts: &Opts,
@@ -8197,7 +8050,7 @@ pub(super) fn gemini_after_exit(
     gemini::after_exit(opts, snap, left, upgrade, cause, &Live)
 }
 
-/// THE LINE A PERSON IS TOLD for `snap`'s Gemini CLI ([`gemini::told`]).
+/// The resume line a person is told for `snap`'s Gemini CLI ([`gemini::told`]).
 #[must_use]
 pub fn gemini_told_line(snap: &super::relaunch::Snapshot) -> Option<String> {
     gemini::told(snap)
@@ -8568,8 +8421,6 @@ fn visit_models(
         .map(|claim| claim.tab.clone())
         .or_else(|| args.env_var("ATERM_PARENT_SESSION_ID").map(str::to_owned))
     else {
-        // macOS may yield argv without env for another process. The unscoped
-        // CLI has no PTY roster claim and must wait rather than guess a tab.
         return said(r, "wait:no-aterm-tab");
     };
     if args
@@ -9082,9 +8933,6 @@ fn visit_models(
                 st.model_list = model_to.clone().unwrap_or_default();
             }
             if !fresh {
-                // What the agent ran, from the tail that just proved READY, and
-                // where that read ended (the resumed session's turns come
-                // after it); a restart that waits instead takes both again.
                 (st.model_before, st.mark) = model_and_mark(recent.as_ref());
             }
             st.launch_model = launch_kept(opts, &sf.session_id, &args.argv).unwrap_or_default();
@@ -9686,7 +9534,6 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
             continue;
         }
         if conversation_live(files, &session) {
-            // Distinct branch.
             continue; // `visit` has it.
         }
         if opts.only_sid.as_ref().is_some_and(|s| *s != st.tab) {
@@ -9700,7 +9547,6 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
             registered_since(&fresh, &opts.home, &session)
         };
         if held {
-            // Distinct branch.
             continue; // `visit` has it, or the loop's `resume`.
         }
         let r = Report {

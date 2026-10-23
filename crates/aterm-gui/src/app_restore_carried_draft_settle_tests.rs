@@ -7,8 +7,6 @@ use crate::restore::{
 };
 use crate::{App, WindowId};
 
-/// A window holding one Settings tab that carries `drafts`, as a seamless
-/// successor's restore receives it.
 fn settings_window(drafts: &[(&str, &str)]) -> WindowLayout {
     let mut leaf = NativeLeafRestore::settings(
         crate::native_settings::SettingsRoute::TextFonts
@@ -44,7 +42,6 @@ fn settings_window(drafts: &[(&str, &str)]) -> WindowLayout {
     }
 }
 
-/// Every live loss row for carried Settings drafts.
 fn loss_rows(app: &App) -> Vec<aterm_messages::Message> {
     app.messages
         .live_rows()
@@ -53,8 +50,6 @@ fn loss_rows(app: &App) -> Vec<aterm_messages::Message> {
         .collect()
 }
 
-/// Two Settings views, each losing a draft (a row the new build does not have): one row names
-/// both, with their text, rather than the second replacing the first under the update's key.
 #[test]
 fn every_lost_draft_of_the_update_is_said_in_one_row() {
     let mut app = App::headless_for_test();
@@ -85,13 +80,8 @@ fn every_lost_draft_of_the_update_is_said_in_one_row() {
     assert_eq!(loss_rows(&app).len(), 1, "a second settle says nothing new");
 }
 
-/// The loss row cannot hold the carried text (each line is cut to the band's width with
-/// newlines and tabs gone, and drafts past the 16th are only counted), so every lost draft is
-/// saved whole beside messages.log, and the row says where.
 #[test]
 fn every_lost_draft_is_saved_whole_and_the_row_says_where() {
-    // Short: the row's line holds the path whole only under 240 characters,
-    // whatever `$TMPDIR` is.
     let scratch = crate::test_scratch::short_dir("the saved drafts");
     let folder = scratch.path().to_path_buf();
     let long = format!("{}\n\tsecond line", "a".repeat(1000));
@@ -147,8 +137,6 @@ fn every_lost_draft_is_saved_whole_and_the_row_says_where() {
 #[cfg(unix)]
 #[test]
 fn a_successor_saves_and_says_its_lost_drafts_only_at_commit() {
-    // Short: the row's line holds the path whole only under 240 characters,
-    // whatever `$TMPDIR` is.
     let scratch = crate::test_scratch::short_dir("the saved drafts");
     let folder = scratch.path().to_path_buf();
     let saved_sets = |folder: &std::path::Path| -> Vec<std::path::PathBuf> {
@@ -177,7 +165,6 @@ fn a_successor_saves_and_says_its_lost_drafts_only_at_commit() {
     );
     assert!(loss_rows(&app).is_empty(), "…and nothing is said");
 
-    // The Commit wake: the freeze lifts, and the loss is this process's now.
     app.incoming_handoff_pending = false;
     app.release_successor_commit_freeze();
     let saved = saved_sets(&folder);
@@ -198,9 +185,6 @@ fn a_successor_saves_and_says_its_lost_drafts_only_at_commit() {
     drop(app);
 }
 
-/// A draft that landed in a view the restore then closed (the native-only window arm's answer
-/// to a window the OS would not attach: `close_window_logical`) is lost with the view and said
-/// with its text. Control: the same view left standing holds its draft, and nothing is said.
 #[test]
 fn a_draft_whose_view_the_restore_closed_is_said_with_its_text() {
     let field = crate::prefs::EDIT_FONT_FAMILY;
@@ -234,13 +218,9 @@ fn a_draft_whose_view_the_restore_closed_is_said_with_its_text() {
     }
 }
 
-/// A draft for a row the new build shows as a slider is said, not taken: the slider can neither
-/// show nor edit free text, and the next config snapshot would discard it (`replace_snapshot`
-/// keeps only drafts `field_accepts_text_input` admits).
 #[test]
 fn a_draft_for_a_slider_row_is_said_not_taken() {
     let mut app = App::headless_for_test();
-    // A numeric font size: the row is a slider in this build.
     app.native_config_service =
         crate::native_config_service::VersionedConfigService::new("font_px = 14\n".into())
             .expect("the config parses");
@@ -268,8 +248,6 @@ fn a_draft_for_a_slider_row_is_said_not_taken() {
     );
 }
 
-/// The drafts of a layout the successor could not place ride the ledger it starts with, and
-/// are said, never dropped with the layout.
 #[test]
 fn an_unplaced_layouts_drafts_are_said_with_their_text() {
     let mut app = App::headless_for_test();

@@ -3,7 +3,6 @@
 
 //! Usage-limit reset time parser and timezone-aware timestamp resolver.
 
-use std::path::Path;
 use std::time::Duration;
 
 /// Parsed reset specification from a usage-limit notice.
@@ -436,14 +435,7 @@ pub fn unix_now_ms() -> i64 {
 
 /// Local timezone offset from UTC in seconds.
 pub fn tz_offset_s() -> i64 {
-    let mut cmd = aterm_uds::spawnfd::command("date");
-    cmd.arg("+%z");
-    let out = aterm_uds::deadline::output_within(&mut cmd, Duration::from_secs(10)).ok();
-    let text = out
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    parse_zone(&text).unwrap_or(0)
+    aterm_uds::zone::local_offset_now().unwrap_or(0)
 }
 
 /// UTC offset in seconds for IANA `zone` at Unix timestamp `unix`.
@@ -453,79 +445,21 @@ pub fn zone_offset_at(zone: &str, unix: i64) -> Option<i64> {
 
 /// UTC offset in seconds for `zone` (or local time when `None`) at Unix timestamp `unix`.
 pub fn offset_at(zone: Option<&str>, unix: i64) -> Option<i64> {
-    if zone.is_some_and(|z| !zone_known(z)) {
-        return None;
+    read_offset(zone, unix)
+}
+
+/// [`offset_at`]'s look at the machine, the one `fn` here that reads a zone (the
+/// census's `supervise-fx` home for it).
+fn read_offset(zone: Option<&str>, unix: i64) -> Option<i64> {
+    match zone {
+        Some(zone) => aterm_uds::zone::zone_offset_at(zone, unix),
+        None => aterm_uds::zone::local_offset_at(unix),
     }
-    date_offset(zone.map_or(DateZone::Inherited, DateZone::Named), unix)
 }
 
 /// Local timezone offset from UTC in seconds at Unix timestamp `unix`.
 pub fn local_offset_at(unix: i64) -> Option<i64> {
     offset_at(None, unix)
-}
-
-/// Whose zone `date` reads ([`date_offset`]).
-enum DateZone<'a> {
-    /// This process's own (its `TZ`, else the machine's).
-    Inherited,
-    /// `TZ=<zone>`.
-    Named(&'a str),
-}
-
-/// `date +%z` at the instant `unix` in `zone`: the one subprocess behind
-/// [`offset_at`].
-fn date_offset(zone: DateZone<'_>, unix: i64) -> Option<i64> {
-    if !cfg!(unix) {
-        return None;
-    }
-    let mut date = aterm_uds::spawnfd::command("date");
-    match zone {
-        DateZone::Inherited => {}
-        DateZone::Named(zone) => {
-            date.env("TZ", zone);
-        }
-    }
-    if cfg!(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    )) {
-        date.arg("-r").arg(unix.to_string());
-    } else {
-        date.arg("-d").arg(format!("@{unix}"));
-    }
-    date.arg("+%z");
-    let out = aterm_uds::deadline::output_within(&mut date, Duration::from_secs(10))
-        .ok()
-        .filter(|o| o.status.success())?;
-    parse_zone(String::from_utf8_lossy(&out.stdout).trim())
-}
-
-/// Whether `zone` is a plain zone name `/usr/share/zoneinfo` has.
-fn zone_known(zone: &str) -> bool {
-    let plain = !zone.is_empty()
-        && !zone.contains("..")
-        && !zone.starts_with('/')
-        && zone
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'));
-    plain && Path::new("/usr/share/zoneinfo").join(zone).is_file()
-}
-
-/// Parse a `+hhmm` or `-hh:mm` timezone offset into seconds east of UTC.
-pub fn parse_zone(text: &str) -> Option<i64> {
-    let (negative, rest) = match text.strip_prefix('+') {
-        Some(rest) => (false, rest),
-        None => (true, text.strip_prefix('-')?),
-    };
-    let digits: String = rest.chars().filter(char::is_ascii_digit).collect();
-    if digits.len() != 4 {
-        return None;
-    }
-    let h: u8 = digits.get(..2)?.parse().ok()?;
-    let m: u8 = digits.get(2..)?.parse().ok()?;
-    let v = i64::from(h) * 3600 + i64::from(m) * 60;
-    Some(if negative { -v } else { v })
 }
 
 /// Whether `c` is a control character or Unicode line/paragraph separator.
@@ -886,7 +820,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_zones_offset_is_read_at_the_instant() {
-        if !Path::new("/usr/share/zoneinfo/America/Los_Angeles").is_file() {
+        if !std::path::Path::new("/usr/share/zoneinfo/America/Los_Angeles").is_file() {
             aterm_spec::host::could_not_run("this machine has no zoneinfo for America/Los_Angeles");
         }
         assert_eq!(
@@ -925,27 +859,11 @@ mod tests {
         assert_eq!(one_line("   "), "");
     }
 
-    /// The zone `date +%z` prints, in both spellings, as seconds; anything
-    /// else is no zone (and the times that read it fall back to UTC).
+    /// The local zone is the C library's (`tm_gmtoff`, held to `date +%z` in
+    /// `aterm_uds::zone`'s tests), within a day whatever this machine's zone is;
+    /// a zone no machine has is none.
     #[test]
-    fn the_local_zone_is_read_from_date() {
-        for (text, want) in [
-            ("+0000", Some(0)),
-            ("+0200", Some(7200)),
-            ("-0700", Some(-25_200)),
-            ("+0530", Some(19_800)),
-            ("-07:00", Some(-25_200)),
-            ("", None),
-            ("UTC", None),
-            ("0200", None),
-            ("0700", None),
-            ("+07", None),
-            ("+070000", None),
-            ("x+0700", None),
-            ("+1\u{e9}1", None),
-        ] {
-            assert_eq!(parse_zone(text), want, "{text:?}");
-        }
+    fn the_local_zone_is_the_c_librarys_and_no_zone_is_made_up() {
         assert!(tz_offset_s().abs() < 86_400);
         for unix in [0, 1_790_000_000] {
             assert_eq!(zone_offset_at("Mars/Olympus", unix), None);

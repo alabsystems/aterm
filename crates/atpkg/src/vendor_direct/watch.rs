@@ -170,15 +170,11 @@ struct Watched {
 }
 
 impl Watched {
-    /// Due at `now`; a schedule materially further out than [`CADENCE`] is a wall
-    /// clock set back.
     fn due(&self, now: SystemTime) -> bool {
         self.next_check_at
             .is_none_or(|at| at <= now || at > now + CADENCE + WAKE_GAP)
     }
 
-    /// Offer `head` unless it is the head last offered, less than [`REOFFER_AFTER`] ago:
-    /// `None` when not, else whether it is that head offered again.
     fn offer(&mut self, head: Version, now: SystemTime) -> Option<bool> {
         let again = match self.offered {
             Some((offered, at)) if offered == head => {
@@ -367,7 +363,6 @@ impl HeadWatch {
         exclude.iter().any(|p| p == program)
     }
 
-    /// The production watch shares each vendor's check and validator across windows.
     fn shared(exclude: &[String]) -> Self {
         let mut watch = Self::new(exclude);
         watch.shared = true;
@@ -382,10 +377,6 @@ impl HeadWatch {
         watch
     }
 
-    /// Whether this watch's host may start a round now. Refused, every head due is asked
-    /// again when the rendezvous says to — a slice for a window behind a session's round,
-    /// a minute for a session behind a window or another session — so a caller whose
-    /// park runs no wait while [`Self::due`] never spins on a refusal.
     fn admitted(&mut self, layout: &Layout, now: SystemTime) -> bool {
         let Some(kind) = self.host else {
             return true;
@@ -423,9 +414,6 @@ impl HeadWatch {
             .is_some_and(host::HostClaim::seated_session)
     }
 
-    /// This session holds the seat but a window has the rendezvous. Its next
-    /// update look should retry after a park slice, not the minute a second
-    /// session waits for the seat.
     fn session_behind_window(&self) -> bool {
         self.claim
             .as_ref()
@@ -437,10 +425,6 @@ impl HeadWatch {
         self.claim.as_ref().map_or(0, host::HostClaim::admit_calls)
     }
 
-    /// Re-admit a session for a held toolchain move or published-index look. A
-    /// window may have arrived since the last vendor round or while an index
-    /// HEAD was in flight; the session must hold the exclusive rendezvous for
-    /// the update decision.
     fn begin_session_update_look(&mut self, layout: &Layout, now: SystemTime) -> bool {
         self.host == Some(Host::Session)
             && layout.prefix.is_dir()
@@ -448,8 +432,6 @@ impl HeadWatch {
             && self.seated_session()
     }
 
-    /// Release the update look's rendezvous after its launch decision. A vendor
-    /// round still in flight retains its claim until its workers are harvested.
     fn end_session_update_look(&mut self) {
         if self.host == Some(Host::Session)
             && !self.has_pending()
@@ -534,21 +516,14 @@ impl HeadWatch {
         *self.parker.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread::current());
         self.take_notices();
         if self.ready_notices.is_empty() {
-            // park_timeout retains an unpark that races the call. A notifier
-            // cannot be lost between the channel check and this wait.
             thread::park_timeout(slice);
         }
         *self.parker.lock().unwrap_or_else(|p| p.into_inner()) = None;
         if self.take_notices() || !self.ready_notices.is_empty() {
-            // The completion's unpark can race the channel read and leave a
-            // token behind. Consume that vendor token now so a later park for
-            // another still-pending head does not return before it finishes.
             thread::park_timeout(Duration::ZERO);
         }
     }
 
-    /// Move the workers' completion notices off the channel, keeping only those whose head
-    /// is still pending; whether any arrived.
     fn take_notices(&mut self) -> bool {
         let mut arrived = false;
         while let Ok(index) = self.completed_rx.try_recv() {
@@ -561,9 +536,7 @@ impl HeadWatch {
         arrived
     }
 
-    /// One slice of the caller's park, over which the wall clock moved `wall` (`None`:
-    /// backwards) and the monotonic clock `mono`. A wake schedules every head
-    /// [`AFTER_WAKE`] from `now`; answers whether this slice was one.
+    /// One slice of the caller's park, over which the wall clock moved `wall` (`None`: backwards) and the monotonic clock `mono`.
     pub fn note_slice(&mut self, now: SystemTime, wall: Option<Duration>, mono: Duration) -> bool {
         let woke = wall.is_some_and(|w| w > mono.saturating_add(WAKE_GAP));
         if woke {
@@ -899,8 +872,6 @@ fn check_one(
     (outcome, notes)
 }
 
-/// The per-vendor decision, over process-local state (a test, or the read-only-store
-/// fallback) or the state read under the store-scoped watch lock.
 fn check_watched(
     spec: &VendorSpec,
     watched: &mut Watched,
@@ -1108,7 +1079,6 @@ fn check_shared(
         )
         .is_ok()
     {
-        // The latest-known label lasts 24 h; an hourly refresh is ample.
         state.last_record_at = Some(checked_at);
     }
     state.remember(&shared_watched);
@@ -1143,14 +1113,12 @@ pub fn for_host(
     })
 }
 
-/// Whether the heads may be watched: the manager is on (not an unpinned root), and the
-/// pass's fetcher is the network's — a development build's `dir:` registry never reaches a
-/// vendor ([`crate::cli::dir_registry`]).
 fn admitted(manager_enabled: bool, registry: Option<&OsStr>) -> bool {
     manager_enabled && crate::cli::dir_registry(registry).is_none()
 }
 
 /// The production GET.
+///
 /// # Errors
 /// As [`crate::flow::Fetcher::vendor_get`].
 pub fn network_get(
@@ -1167,9 +1135,6 @@ pub(crate) fn follows_vendor(layout: &Layout, spec: &VendorSpec) -> bool {
     installed(layout, spec).is_some()
 }
 
-/// What `layout` has installed of `spec`'s program through its `store/<program>/current`
-/// link, or `None` when the watch leaves it alone: not installed, removed, held by a local
-/// pin, dev-linked, or an ALab build.
 fn installed(layout: &Layout, spec: &VendorSpec) -> Option<Installed> {
     let program = spec.program;
     if layout.removed_programs().contains(program)
@@ -1214,8 +1179,6 @@ mod tests {
     /// release).
     pub(super) const HANG: Duration = Duration::from_secs(60);
 
-    /// A park of two minutes, woken at 100 ms, returns inside [`HANG`]: the
-    /// wake and the slice running out are told apart whatever the load.
     #[test]
     fn an_independent_package_hint_interrupts_an_idle_vendor_park() {
         let mut watch = HeadWatch::new(&[]);
@@ -1234,7 +1197,6 @@ mod tests {
         Version::parse(text).unwrap()
     }
 
-    /// The wall clock, `secs` after a fixed origin.
     fn at(secs: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_790_000_000 + secs)
     }
@@ -1243,9 +1205,6 @@ mod tests {
         crate::testdir::layout(&format!("atpkg-watch-{label}-"))
     }
 
-    /// A window with no vendor head to ask must defer its held-move look while
-    /// a session owns the exclusive launch decision, then take the watch on
-    /// its next slice after that decision ends.
     #[test]
     fn a_window_sit_waits_for_a_sessions_held_move_look() {
         let l = layout("sit-handoff");
@@ -1267,7 +1226,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Point `store/<program>/current` at `build`'s directory, creating it.
     fn activate(layout: &Layout, program: &str, build: u64) -> PathBuf {
         let dir = layout.build_dir(program, build);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -1431,8 +1389,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The notice/harvest race ([`HeadWatch::take_notices`]) leaves a notice for a head no
-    /// longer pending; the test sets that state directly.
     #[test]
     fn a_stale_completion_never_cuts_a_park_short() {
         let mut watch = HeadWatch::new(&[]);
@@ -1524,8 +1480,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A single installed vendor's GET runs off the package lane: a blocked host must not
-    /// hold it for the hint's 15-second network bound, past a bump or full-pass deadline.
     #[test]
     fn one_blocked_vendor_is_owned_without_blocking_the_package_lane() {
         let l = layout("one-blocked-head");
@@ -1811,8 +1765,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Separate window processes get distinct HeadWatch values but the same store. Only
-    /// one makes each minute's request, and a newly launched one inherits its validator.
     #[test]
     fn independent_watches_share_one_request_and_validator_per_store() {
         let l = layout("shared");
@@ -1866,8 +1818,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A child can finish while another window holds the short watch lock. Its
-    /// result must be written before the next check's not-due early return.
     #[test]
     fn a_result_deferred_by_the_shared_lock_is_reconciled_before_early_return() {
         let l = layout("busy-result");
@@ -1901,8 +1851,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A result from an older offer of the *same version* must not clear a newer
-    /// offer another process made while the lock was busy.
     #[test]
     fn a_deferred_result_does_not_clear_a_newer_offer_of_the_same_version() {
         let l = layout("stale-result");
@@ -1989,8 +1937,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A pass that did not reach the offered head gets one five-minute retry. A
-    /// persistently refused version then waits an hour, even across process changes.
     #[test]
     fn failed_targeted_pass_gets_one_short_retry_then_hourly_offers() {
         let l = layout("failed-pass-retry");
@@ -2019,8 +1965,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// Writing the offer precedes spawning the child. If that window exits in between,
-    /// another window gets a bounded five-minute recovery instead of a one-hour silence.
     #[test]
     fn an_unacknowledged_offer_recovers_after_five_minutes() {
         let l = layout("unacknowledged-offer");
@@ -2043,8 +1987,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// If a window repeatedly disappears before reporting its pass, the first two
-    /// offers recover at five minutes, then the unchanged head falls back to hourly.
     #[test]
     fn an_unacknowledged_head_uses_two_short_leases_then_hourly_304s() {
         let l = layout("not-landed");
@@ -2074,8 +2016,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// The watch runs only where the pass it hints for reaches a vendor: the manager is
-    /// on, and the registry is the network's, not a `dir:` mirror.
     #[test]
     fn the_watch_runs_only_where_the_pass_reaches_a_vendor() {
         let dir = OsStr::new("dir:/mirror");
@@ -2266,8 +2206,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// `[packages].exclude` is read live: a program excluded after the watch started is
-    /// neither due nor asked from the next slice, and one taken off the list is asked at once.
     #[test]
     fn an_exclusion_edited_mid_watch_is_heard_at_the_next_check() {
         let l = layout("live-exclude");

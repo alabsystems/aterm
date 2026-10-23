@@ -1,11 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// The one-future, one-thread executor native GPU init runs on (wgpu's
-// adapter/device acquisition is `async` for the browser's sake). A future Ready on
-// its first poll never touches the condvar. A wake from another thread (wgpu's
-// driver callbacks) or from inside `poll` sets a latch the waiter consumes, so a
-// wake that lands before the wait is not lost.
 
 use std::future::Future;
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -27,16 +21,11 @@ impl Signal {
         }
     }
 
-    /// Latch a wake and release the waiter (if any). Called from arbitrary
-    /// threads, including this one, including re-entrantly from inside `poll`.
+    /// Latch a wake and release the waiter (if any).
     fn notify(&self) {
-        // Nothing panics while this guard is held, and poison cannot corrupt a
-        // `bool`, so poison is ignored.
         let mut woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
         *woken = true;
         drop(woken);
-        // Exactly one thread ever waits on this condvar (the one inside
-        // `block_on`), so a targeted wake is enough.
         self.cv.notify_one();
     }
 
@@ -44,7 +33,6 @@ impl Signal {
     fn wait(&self) {
         let mut woken = self.woken.lock().unwrap_or_else(PoisonError::into_inner);
         while !*woken {
-            // Condvar waits may return spuriously.
             woken = self.cv.wait(woken).unwrap_or_else(PoisonError::into_inner);
         }
         *woken = false;
@@ -62,13 +50,7 @@ impl Wake for Signal {
 }
 
 /// Drive `fut` to completion on the calling thread and return its output.
-///
-/// Blocks, so it is native-only; the wasm renderer awaits the same futures
-/// (see [`crate::GpuContext::from_instance`]). Between polls the thread
-/// sleeps on a condvar rather than spinning.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
-    // Pinned to this stack frame; `pin!` makes the future unreachable by name
-    // afterwards, so it cannot be moved while polled and no `unsafe` is needed.
     let mut fut = std::pin::pin!(fut);
     let signal = Arc::new(Signal::new());
     let waker = Waker::from(Arc::clone(&signal));
@@ -132,8 +114,6 @@ mod tests {
         let shared = Arc::new(Mutex::new(Shared::default()));
         let remote = Arc::clone(&shared);
         let joiner = std::thread::spawn(move || {
-            // Spin until the main thread has registered a waker, so this test
-            // exercises the sleep-then-wake path rather than the fast path.
             loop {
                 let mut s = remote.lock().expect("test mutex");
                 if let Some(w) = s.waker.take() {

@@ -64,7 +64,7 @@ const LIFELINE: &str = "band.lifeline";
 const PID_FILE: &str = "band.pid";
 const PLIST: &str = "band.plist";
 
-const LAUNCHCTL: &str = "/bin/launchctl";
+const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
 /// An instance running as its own launchd job.
 pub struct Job {

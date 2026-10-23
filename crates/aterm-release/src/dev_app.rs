@@ -241,7 +241,7 @@ struct Stamp {
 }
 
 fn git(root: &Path, args: &[&str]) -> Result<String, String> {
-    let out = aterm_uds::spawnfd::command("git")
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
         .current_dir(root)
         .args(args)
         .output()

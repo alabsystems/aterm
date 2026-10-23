@@ -42,10 +42,7 @@ pub(super) enum Outcome {
 }
 
 impl Outcome {
-    /// What came of the slot is final for the batch's landing. A collided
-    /// slot's is not: its record is not on the bus until its re-pin is sent,
-    /// and a batch landed past it would move the endpoint's cursor over a
-    /// hole nobody said.
+    /// What came of the slot is final for the batch's landing.
     const fn concluded(self) -> bool {
         !matches!(self, Outcome::Owed | Outcome::Sending | Outcome::Collided)
     }
@@ -58,8 +55,7 @@ pub(super) struct MirrorRun {
     /// The endpoint answered the hello's `log=turns`.
     acked: bool,
     /// The pin is not judged yet: the recovery an unclean stop owes, which
-    /// reconciles it, is not complete (sim item S7,
-    /// [`Bridge::mirror_hello_answered`]).
+    /// reconciles it, is not complete ([`Bridge::mirror_hello_answered`]).
     awaiting: bool,
     /// An `auto` mirror over a broker that retains nothing, said once a
     /// change (`link mirror unretained`).
@@ -87,7 +83,7 @@ pub(super) struct MirrorRun {
     sent_inc: u64,
     /// A collision re-pins once the connection is back.
     repin: bool,
-    /// The rate bucket (§8.1) and its clock's origin.
+    /// The rate bucket and its clock's origin.
     bucket: Bucket,
     clock: Instant,
     /// The alias key, in hex for the take (empty: none, every
@@ -103,7 +99,7 @@ pub(super) struct MirrorRun {
     floored: bool,
     /// Sessions whose `ev` face the budget refused, said once.
     noticed: BTreeSet<String>,
-    /// Recovery counts (§12 M6): slots republished from a pin this process
+    /// Recovery counts: slots republished from a pin this process
     /// did not take, and how many of those the broker deduped.
     recovered: u64,
     recovered_deduped: u64,
@@ -360,9 +356,6 @@ impl Bridge {
              them anyway, up to a total)"
         );
         if acked {
-            // `mirror_asks` is false now, so this hello says `log=auto`, and
-            // its answer leaves the mirror unacknowledged until a retaining
-            // attach asks again.
             self.introduce();
         }
         if self.endpoint_lane >= LINK_MIRROR_WAIT_LANE {

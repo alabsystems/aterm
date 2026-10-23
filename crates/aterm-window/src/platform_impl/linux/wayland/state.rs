@@ -4,15 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/state.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// LOCAL PATCH (aterm): the globals are bound through first-party `aterm-wayland`'s registry, at
-// the versions smithay-client-toolkit 0.19.2 bound them, and the state applies what the loop's
-// dispatch heard in the order it heard it (`WinitState::drain`): one `Inbox` holds the backend's
-// own objects' events and, through sinks, the seats', the drags', the selection sources' and the
-// outputs' `done`s. sctk's `CompositorHandler`, `WindowHandler`, `SeatHandler`, device handlers
-// and output scale watchers are the `Wire` arms here; the per-surface scale is the backend's own
-// `SurfaceScale`, as sctk's `SurfaceData` kept it, and an output's scale is the one its last
-// applied `done` gave, as sctk's `OutputData` kept it.
-
 use std::cell::RefCell;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -139,48 +130,33 @@ pub struct WinitState {
 
     /// Where the backend's own objects record their events.
     pub(crate) inbox: Inbox,
-
     /// Data device manager used to create a `wl_data_device` per seat.
     pub(crate) data_device_manager: Option<Manager>,
-
     /// Primary selection device manager, one device per seat.
     pub(crate) primary_selection_manager: Option<Manager>,
-
     /// The text-input-v3 manager.
     pub(crate) text_input_manager: Option<Owned>,
-
     /// cursor-shape-v1's manager.
     pub(crate) cursor_shape_manager: Option<Owned>,
-
     /// Xdg activation.
     pub(crate) xdg_activation: Option<Arc<Owned>>,
-
     /// Viewporter (bound only beside fractional scaling, as upstream bound it).
     pub(crate) viewporter: Option<Owned>,
-
     /// Fractional scaling manager.
     pub(crate) fractional_scaling_manager: Option<Owned>,
-
     /// The XDG shell that is used for windows.
     pub(crate) xdg_shell: Arc<Shell>,
-
     shm: Arc<Owned>,
-
     /// The `wl_subcompositor`, for the shadow margin's border parts (`None`: no shadow).
     pub(crate) subcompositor: Option<Arc<Owned>>,
-
     /// The compositor, which is used to create new surfaces and regions.
     pub(crate) compositor: Arc<Owned>,
-
     /// Seats and their devices shared with windows for move, resize, and menu serials.
     pub(crate) seats_book: Arc<Seats>,
-
     /// The outputs.
     pub(crate) outputs: Outputs,
-
     registry_generation: u64,
     registry: Registry,
-
     /// The connection; dropped last.
     pub(crate) connection: Arc<Connection>,
 }
@@ -200,9 +176,6 @@ impl WinitState {
             // destructor (or `Proxy::destroy` for one with none).
             proxy.map(|proxy| unsafe { Owned::new(proxy, destroy) })
         };
-        // LOCAL PATCH (aterm): `wl_subcompositor` is bound for the shadow margin's border parts,
-        // where upstream bound it for sctk-adwaita's frame; a compositor without one shows windows
-        // with no shadow.
         let subcompositor = owned(
             bind(c"wl_subcompositor", &wl_subcompositor::INTERFACE, 1),
             wl_subcompositor::destroy,

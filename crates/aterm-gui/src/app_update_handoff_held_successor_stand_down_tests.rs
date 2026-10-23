@@ -9,26 +9,16 @@ use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
 use std::io::Read as _;
 
-/// What [`hold`] hands a test: the held claim, the stand-in, the dialer's end of the
-/// stream, and the private directory the rendezvous was bound in where production
-/// had none (held as long as the test runs).
 type Held = (
     HeldSuccessor,
     aterm_uds::spawnfd::Child,
     aterm_uds::CtlStream,
 );
 
-/// Binds a rendezvous (where production binds it: in this test binary, a private
-/// directory of its own, so the test runs on every host), dials it from a test
-/// thread, accepts and holds the claim, and spawns `script` as the process the
-/// claim stands for.
 fn hold(script: &str) -> Held {
     hold_with_stdin(script, aterm_uds::spawnfd::Stdio::null())
 }
 
-/// [`hold`] with the stand-in's stdin chosen by the caller: a pipe lets the test
-/// decide when the stand-in exits (`read` returns on EOF), forcing an
-/// interleaving.
 fn hold_with_stdin(script: &str, stdin: aterm_uds::spawnfd::Stdio) -> Held {
     let nonce = aterm_uds::rand::hex_token::<16>().expect("a rendezvous nonce");
     let rendezvous =
@@ -72,23 +62,14 @@ fn hold_with_stdin(script: &str, stdin: aterm_uds::spawnfd::Stdio) -> Held {
     )
 }
 
-/// The candidate is our fork child here, so someone must reap it or its pid
-/// never becomes vacant (launchd reaps the real one).
 fn reap_in_background(
     mut child: aterm_uds::spawnfd::Child,
 ) -> std::thread::JoinHandle<std::process::ExitStatus> {
     std::thread::spawn(move || child.wait().expect("reap the stand-in"))
 }
 
-/// Replays the steps the real stand-down emitted against the derived overlap
-/// model from the launched-but-ungranted state — dialled and held, or
-/// never dialled — requiring each to be enabled. A stand-down
-/// that skipped the kill or retired before the reap has no admitted trace.
 fn project_onto_the_model(model: &Model, steps: &[StandDownStep], dialled: bool) -> State {
     let mut state = model.init_state();
-    // Launched before the park, dialled or not, nothing granted, and the
-    // stand-down begun: the main thread's announcement answered
-    // (`answer_prelaunched_stand_down`), or the dial wait ended without a dial.
     let dial = dialled.then_some("SuccessorDials");
     for action in ["LaunchSuccessorBeforePark"]
         .into_iter()
@@ -99,7 +80,6 @@ fn project_onto_the_model(model: &Model, steps: &[StandDownStep], dialled: bool)
         assert_eq!(next.len(), 1, "{action} must be enabled at {state:?}");
         state = next[0].clone();
     }
-    // `Revoke` is that step; the rest are what the code chose.
     assert_eq!(
         steps.first(),
         Some(&StandDownStep::Revoke),
@@ -115,8 +95,6 @@ fn project_onto_the_model(model: &Model, steps: &[StandDownStep], dialled: bool)
         );
         state = next[0].clone();
     }
-    // And only now may the attempt retire — the completion the worker sends
-    // next is what clears the record.
     let retired = model.successors("RetireUngrantedAttempt", &state);
     assert_eq!(
         retired.len(),
@@ -138,9 +116,6 @@ fn project_onto_the_model(model: &Model, steps: &[StandDownStep], dialled: bool)
     retired
 }
 
-/// Negative control: retiring while the successor is live is executable only in
-/// the mutant, and the invariant catches it — dialled or not: the undialled
-/// trace is the dial-deadline arm as it shipped before lead U41.
 fn assert_a_live_successor_cannot_retire(model: &Model, dialled: bool) {
     let mut state = model.init_state();
     let dial = dialled.then_some("SuccessorDials");
@@ -169,14 +144,9 @@ fn reads_eof(stream: &aterm_uds::CtlStream) -> bool {
     matches!((&*stream).read(&mut byte), Ok(0))
 }
 
-/// A successor that exits on the EOF within the grace is proven gone without a
-/// signal and its own exit status witnessed, so the parent does not also give
-/// back the trial launch.
+/// A successor that exits on the EOF within the grace is proven gone without a signal and its own exit status is witnessed.
 #[test]
 fn a_successor_that_exits_on_eof_is_proven_gone_without_a_signal() {
-    // The stand-in exits when the hook below closes its stdin, once the stand-down has revoked
-    // and found it running: forced inside the grace, with no timing for the exit watch to beat
-    // (a timed stand-in could exit before `CandidateExitWatch::watch` attached under load).
     let (held, mut child, stream) =
         hold_with_stdin(EXIT_ON_STDIN_EOF, aterm_uds::spawnfd::Stdio::piped());
     let mut stdin = Some(child.stdin.take().expect("piped stdin"));
@@ -198,7 +168,6 @@ fn a_successor_that_exits_on_eof_is_proven_gone_without_a_signal() {
     );
     assert!(reads_eof(&stream), "the dialer read the stand-down as EOF");
     assert_eq!(reaper.join().expect("reaper").code(), Some(0));
-    // The order taken, against the model: revoke, its own exit, the proof.
     assert_eq!(
         stood.steps,
         vec![
@@ -214,14 +183,9 @@ fn a_successor_that_exits_on_eof_is_proven_gone_without_a_signal() {
     assert_a_live_successor_cannot_retire(&model, true);
 }
 
-/// A stand-in that exits `0` exactly when the test closes its stdin, and never before, so
-/// the losing interleavings below are forced, not waited for.
 const EXIT_ON_STDIN_EOF: &str = "read line; exit 0";
 
-/// The losing interleaving, forced: the loop reads the witness (the stand-in is
-/// blocked on stdin), then the stand-in exits and is reaped before the pid
-/// probe. The stand-down must still name the candidate's own exit, because XNU
-/// queued the knote before the pid fell vacant.
+/// An exit and reap occurring between the witness read and the pid probe still records the candidate's own exit.
 #[test]
 fn the_exit_between_the_witness_read_and_the_pid_probe_is_still_witnessed() {
     let (held, mut child, stream) =
@@ -233,8 +197,6 @@ fn the_exit_between_the_witness_read_and_the_pid_probe_is_still_witnessed() {
     let stood =
         super::stand_down_held_successor_between(held, aterm_spec::wait::MUST_HAPPEN, &mut || {
             misses += 1;
-            // Only the first miss exits it; a second would mean the probe failed to see a
-            // reaped pid as gone.
             if let Some(stdin) = stdin.take() {
                 drop(stdin);
                 reaped = Some(reaper.take().expect("one reaper").join().expect("reaper"));
@@ -274,9 +236,7 @@ fn the_exit_between_the_witness_read_and_the_pid_probe_is_still_witnessed() {
     assert_eq!(retired["group_signaled"], 0);
 }
 
-/// The hold loop's "did it exit?" check reads the one-shot witness and the
-/// stand-down reads the queue again; the candidate has exited and been reaped
-/// before either read. The exit must still be witnessed.
+/// A witness already read by the hold loop still reports the candidate's exit during stand-down.
 #[test]
 fn a_witness_the_hold_loop_already_read_still_names_the_exit_at_the_stand_down() {
     let (held, mut child, stream) =
@@ -318,8 +278,7 @@ fn a_witness_the_hold_loop_already_read_still_names_the_exit_at_the_stand_down()
     );
 }
 
-/// A successor ignoring the EOF for the whole grace is killed and proven gone;
-/// the kill is ours, so the death is `Unobserved`.
+/// A successor ignoring the EOF for the whole grace is killed and proven gone; the kill is ours, so the death is `Unobserved`.
 #[test]
 fn a_successor_that_ignores_eof_is_killed_after_the_grace_and_proven_gone() {
     let (held, child, stream) = hold("sleep 30");
@@ -338,8 +297,6 @@ fn a_successor_that_ignores_eof_is_killed_after_the_grace_and_proven_gone() {
     assert!(reads_eof(&stream), "the dialer read the stand-down as EOF");
     use std::os::unix::process::ExitStatusExt as _;
     assert_eq!(reaper.join().expect("reaper").signal(), Some(libc::SIGKILL));
-    // The order taken, against the model: revoke, kill, the proof
-    // (`UngrantedRetireRequiresReap`).
     assert_eq!(
         stood.steps,
         vec![
@@ -355,9 +312,7 @@ fn a_successor_that_ignores_eof_is_killed_after_the_grace_and_proven_gone() {
     assert_a_live_successor_cannot_retire(&model, true);
 }
 
-/// A held successor killed by the machine (a SIGKILL not ours) never ran its
-/// EOF-rule exit, so the parent gives its counted launch back, as the pre-dial
-/// arm does (`send_pre_dial_death`).
+/// A held successor killed by the machine has its counted trial launch forgiven by the parent.
 #[test]
 fn a_held_successor_the_machine_killed_has_its_counted_launch_given_back() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -382,14 +337,11 @@ fn a_held_successor_the_machine_killed_has_its_counted_launch_given_back() {
     );
 }
 
-/// A bound rendezvous, where production binds it (in this test binary, a
-/// private directory of its own: `handoff_rendezvous::rendezvous_dir_candidate`).
 fn bind_rendezvous() -> crate::handoff_rendezvous::Rendezvous {
     let nonce = aterm_uds::rand::hex_token::<16>().expect("a rendezvous nonce");
     crate::handoff_rendezvous::Rendezvous::bind(&nonce).expect("bind a rendezvous")
 }
 
-/// A launched successor that never dials: alive until killed.
 fn never_dials() -> aterm_uds::spawnfd::Child {
     aterm_uds::spawnfd::command("/bin/sh")
         .args(["-c", "sleep 60"])
@@ -400,8 +352,6 @@ fn never_dials() -> aterm_uds::spawnfd::Child {
         .expect("spawn the undialled stand-in")
 }
 
-/// The stand-down of an undialled successor, checked against the overlap model
-/// from the launched-but-undialled state, and its own negative control.
 fn assert_the_undialled_stand_down_licenses_the_retire(steps: &[StandDownStep]) {
     let model = native_update_overlap_handoff_model();
     let retired = project_onto_the_model(&model, steps, false);
@@ -409,17 +359,7 @@ fn assert_the_undialled_stand_down_licenses_the_retire(steps: &[StandDownStep]) 
     assert_a_live_successor_cannot_retire(&model, false);
 }
 
-/// The dial budget runs out with the launched successor
-/// alive and undialled — inside its boot on a loaded desk, or wedged — and the
-/// deadline arm retired the attempt over it, killing nothing: a retry launched
-/// beside it, a wedged one lived on window-less, and one the machine killed
-/// later kept its counted launch. Now it is named (here by the pid LaunchServices
-/// named, as the wait first saw it), killed after the grace and proven gone,
-/// and our kill gives its counted launch back, all before the retire.
-///
-/// FAILS WITHOUT THE FIX: the arm as it shipped is the state checked below
-/// right after the wait, the stand-in still running, and its model trace
-/// (retire straight after the revoke) breaks `UngrantedRetireRequiresReap`.
+/// An undialled successor alive at the dial deadline is killed, proven gone, and has its counted trial launch forgiven before retiring.
 #[test]
 fn a_successor_undialled_at_the_dial_deadline_is_killed_and_proven_gone_before_the_retire() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -495,15 +435,7 @@ fn a_successor_undialled_at_the_dial_deadline_is_killed_and_proven_gone_before_t
     assert_the_undialled_stand_down_licenses_the_retire(&steps);
 }
 
-/// BOTH ARMS, AS THE LAUNCHED LANE RUNS THEM: the cancel and the dial deadline are
-/// filed by [`super::file_undialled_retire`], the one call both arms make, and its
-/// rollback is made only once the successor is proven gone — here a live stand-in
-/// LaunchServices named, killed and reaped by the time the rollback exists — with
-/// the counted launch our kill ended given back by its name.
-///
-/// FAILS WITHOUT THE FIX: the arms published the rollback at once, the stand-in
-/// still running and its launch kept; a filing that skips the stand-down gives
-/// nothing back here.
+/// Both undialled termination arms (`Cancelled` and `Deadline`) retire via [`super::file_undialled_retire`] only after the successor is proven gone.
 #[test]
 fn the_undialled_ends_retire_only_over_a_successor_proven_gone() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -570,10 +502,7 @@ fn the_undialled_ends_retire_only_over_a_successor_proven_gone() {
     }
 }
 
-/// The cancel before the dial, LaunchServices not yet answered: the successor is
-/// named by the launch it stamped beside the rendezvous (its pid and birth
-/// stamp), killed and proven gone. FAILS WITHOUT THE FIX as the deadline case
-/// does: the arm retired at once over the running stand-in.
+/// An undialled successor cancelled before LaunchServices answers is identified by its launch stamp, killed, and proven gone.
 #[test]
 fn a_successor_undialled_at_the_cancel_is_named_by_its_launch_stamp() {
     let rendezvous = bind_rendezvous();
@@ -581,7 +510,6 @@ fn a_successor_undialled_at_the_cancel_is_named_by_its_launch_stamp() {
     let pid = child.id();
     let birth = super::read_candidate_birth(pid).expect("a live child's birth stamp");
     let reaper = reap_in_background(child);
-    // What the successor's `stamp_this_launch` writes before its boot apply.
     std::fs::write(
         crate::handoff_rendezvous::launch_stamp_path(rendezvous.path()),
         format!("{pid} {} {}\n", birth.seconds, birth.microseconds),
@@ -623,10 +551,7 @@ fn a_successor_undialled_at_the_cancel_is_named_by_its_launch_stamp() {
     assert_the_undialled_stand_down_licenses_the_retire(&steps);
 }
 
-/// LaunchServices' word that the successor terminated before it checked in is
-/// the proof itself: nothing is signalled, and its stamped launch is the name
-/// its counted launch is settled by. With no word and no stamp, nothing names it
-/// and nothing is claimed.
+/// An undialled successor reported terminated by LaunchServices is not signalled, while an unnamed one returns `Unnamed`.
 #[test]
 fn an_undialled_successor_reported_gone_is_not_signalled_and_an_unnamed_one_is_not_claimed() {
     let rendezvous = bind_rendezvous();
@@ -638,7 +563,6 @@ fn an_undialled_successor_reported_gone_is_not_signalled_and_an_unnamed_one_is_n
             i32::try_from(std::process::id()).expect("a pid fits pid_t"),
         ),
     );
-    // A stamp naming a launch whose process is gone: it names the counted launch.
     let gone = never_dials();
     let (pid, birth) = (
         gone.id(),

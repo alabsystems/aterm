@@ -1303,17 +1303,7 @@ mod tests {
             .expect("this process's executable is named");
         assert!(!image.deleted, "{image:?}");
         assert!(!is_aterm(&image.path), "{}", image.path.display());
-        assert_eq!(
-            LiveKernel.held(me),
-            at_program_check_here(),
-            "this process runs"
-        );
-    }
-
-    /// What [`LiveKernel::held`] answers for a running process here: not held on macOS, unread
-    /// elsewhere.
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    fn at_program_check_here() -> Option<bool> {
-        cfg!(target_os = "macos").then_some(false)
+        // Not held: on macOS by its reading, on Linux because it has no program check.
+        assert_eq!(LiveKernel.held(me), Some(false), "this process runs");
     }
 }

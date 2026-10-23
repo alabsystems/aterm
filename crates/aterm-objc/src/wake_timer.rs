@@ -14,7 +14,7 @@ use crate::cf::{
 };
 use crate::declare::MainThread;
 
-/// The repeat interval handed to CoreFoundation, in seconds: one Julian year.
+/// The repeat interval handed to CoreFoundation, in seconds.
 pub const WAKE_TIMER_REPEAT_SECS: f64 = 31_557_600.0;
 
 /// How the waker was last armed, as the event loop asked for it.
@@ -62,14 +62,13 @@ impl WakePlan {
         self.armed
     }
 
-    /// Whether the timer fired since it was last armed, i.e. is parked a year
-    /// out until the next arm.
+    /// Whether the timer fired since it was last armed.
     #[must_use]
     pub const fn spent(&self) -> bool {
         self.spent
     }
 
-    /// The timer's callout ran: whatever it was armed for is used up.
+    /// The timer's callout ran.
     pub const fn fired(&mut self) {
         if self.armed.is_some() {
             self.spent = true;
@@ -146,9 +145,7 @@ unsafe extern "C" {
 /// The callout ([`Cell`], [`WakeTimer`]).
 extern "C" fn wake_timer_fired(_timer: CFRunLoopTimerRef, info: *mut c_void) {
     if !info.is_null() {
-        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag,
-        // which outlives the timer (see `Drop`); a `Cell` is written through a
-        // shared reference on the one thread the timer's run loop runs on.
+        // SAFETY: `info` is `Rc::as_ptr` of the owning `WakeTimer`'s flag.
         unsafe { (*info.cast::<Cell<bool>>()).set(true) };
     }
 }
@@ -172,11 +169,10 @@ impl std::fmt::Debug for WakeTimer {
 }
 
 impl WakeTimer {
-    /// The event loop's waker: the main run loop, in every common mode.
+    /// The event loop's waker.
     #[must_use]
     pub fn main(_mtm: MainThread) -> Self {
-        // SAFETY: plain CoreFoundation getters; the common-modes constant is
-        // a static CFString CoreFoundation owns.
+        // SAFETY: plain CoreFoundation getters.
         unsafe { Self::on(CFRunLoopGetMain(), kCFRunLoopCommonModes) }
     }
 
@@ -187,8 +183,7 @@ impl WakeTimer {
         unsafe { Self::on(CFRunLoopGetCurrent(), kCFRunLoopDefaultMode) }
     }
 
-    /// `run_loop` and `mode` are a live run loop and run-loop mode name.
-    ///
+    /// Creates a wake timer on `run_loop` in `mode`.
     /// # Safety
     /// `run_loop` and `mode` are a live run loop and run-loop mode name.
     unsafe fn on(run_loop: CFRunLoopRef, mode: CFStringRef) -> Self {
@@ -200,10 +195,7 @@ impl WakeTimer {
             release: None,
             copy_description: None,
         };
-        // SAFETY: CoreFoundation copies `context`; the flag it points at lives
-        // as long as `Self` (the timer is invalidated in `Drop` first). The
-        // first fire date is beyond CoreFoundation's limit, so the timer starts
-        // disarmed, matching `WakePlan::new`.
+        // SAFETY: CoreFoundation copies `context`.
         let timer = unsafe {
             CFRunLoopTimerCreate(
                 std::ptr::null(),
@@ -270,8 +262,7 @@ impl WakeTimer {
             WakeArm::Disarm => f64::MAX,
         };
         self.armed_date = (arm != WakeArm::Disarm).then_some(date);
-        // SAFETY: `self.timer` is live until `Drop`; a finite or MAX date is
-        // accepted (CoreFoundation clamps the latter to its own limit).
+        // SAFETY: `self.timer` is live until `Drop`.
         unsafe { CFRunLoopTimerSetNextFireDate(self.timer, date) };
     }
 
@@ -288,8 +279,7 @@ impl WakeTimer {
         self.armed_date
     }
 
-    /// Whether the timer will fire within `horizon` — i.e. is armed and not
-    /// spent, as CoreFoundation itself reports it.
+    /// Whether the timer will fire within `horizon`.
     #[must_use]
     pub fn fires_within(&self, horizon: Duration) -> bool {
         // SAFETY: A plain getter.
@@ -300,9 +290,7 @@ impl WakeTimer {
 
 impl Drop for WakeTimer {
     fn drop(&mut self) {
-        // SAFETY: the timer is live; invalidating removes it from every run
-        // loop, so the callout can no longer reach `self.fired`, which drops
-        // after this body.
+        // SAFETY: the timer is live.
         unsafe {
             CFRunLoopTimerInvalidate(self.timer);
             CFRelease(self.timer.cast_const());

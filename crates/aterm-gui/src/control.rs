@@ -537,8 +537,6 @@ fn argument_escalation(verb: &str, rest: &str) -> Option<Need> {
                     | aterm_types::app_inspection::OpenAppRequest::SystemState)
             ) =>
         {
-            // The native setup/config apps are the same capability as `open prefs`;
-            // classify it here, before the main-thread hop.
             Some(Need::Op(Op::ConfigWrite))
         }
         "act"
@@ -2698,8 +2696,6 @@ pub(crate) fn attach_fabric_bridge(
         "aterm-fabric-bridge".to_string(),
         crate::qos::Role::Responsive,
         move || {
-            // Same QoS floor as the pooled lanes: this thread serves the same verbs
-            // and then stays for the push loop, holding the terminal mutex.
             context.serve_bridge(stream, generation);
         },
     )
@@ -2724,7 +2720,7 @@ pub(crate) fn attach_fleet_connection(
     .is_ok()
 }
 
-/// Serve one DRIVE connection the fleet listener admitted (the step-in, `docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5.1).
+/// Serve one DRIVE connection the fleet listener admitted.
 #[cfg(unix)]
 pub(crate) fn attach_fleet_drive(
     stream: CtlStream,
@@ -3192,7 +3188,6 @@ pub(crate) fn spawn(
                 return;
             }
             if handoff.is_some() {
-                // Empty queues park these already allocated workers through Commit.
                 preparation_guard.ready();
             }
             let binding = match handoff.as_ref() {
@@ -3262,7 +3257,6 @@ pub(crate) fn spawn(
                     "aterm-build-signature",
                     crate::qos::Role::Responsive,
                     || {
-                        // A lane may be waiting on this result: never below the lanes.
                         let _ = crate::build_info::binary_signature();
                     },
                 );
@@ -3372,7 +3366,6 @@ fn resolve_sibling(sid: Sid<'_>, sock_dir: &std::path::Path) -> Option<String> {
     let (sock_path, _nonce) = crate::proxy::read_graph_entry(sock_dir, sid)?;
     let sock_path = crate::control_auth::confine_proxy_sock(sock_dir, &sock_path)?;
     if crate::proxy::self_sock_path().as_deref() == Some(sock_path.as_str()) {
-        // Distinct branch.
         return None; // stale entry for a session we no longer host — never self-dial
     }
     Some(sock_path)
@@ -4728,7 +4721,6 @@ fn dispatch_session(head: &Head<'_>, form: &Resolved, cx: &DispatchCx<'_>) -> Co
     };
     let Some(target) = target else {
         return if selector.is_some_and(|s| !s.is_self()) {
-            // It closed between the route and the resolve.
             closed_session_reply(selector, head.verb, head.rest, cx.store, cx.scope)
         } else {
             NO_ACTIVE_TERMINAL.to_string()
@@ -5831,7 +5823,6 @@ fn authenticate_connection(
     // borrows this stream rather than duplicating the fd (a duplicated AF_UNIX
     // fd's close can block on macOS). Cleared after authentication.
     if stream.set_read_timeout(Some(AUTH_READ_TIMEOUT)).is_err() {
-        // Distinct branch.
         return None; // cannot bound pre-auth: fail closed
     }
     let mut writer = stream;
@@ -6996,8 +6987,6 @@ fn authenticated_poll_event(revents: libc::c_short) -> std::io::Result<()> {
         return Err(std::io::Error::from_raw_os_error(libc::EBADF));
     }
     if revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
-        // Read even on HUP/ERR: queued bytes (including a final unterminated
-        // line) must be drained before EOF is observed.
         return Ok(());
     }
     Err(std::io::Error::other(
@@ -7977,7 +7966,6 @@ fn ambiguous_sid_refusal(sel: &Selector<'_>) -> Option<String> {
 /// Whether a cross-session call (target != the connection's own session) is authorized for `verb`.
 pub(crate) fn cross_session_authorized(scope: Scope, verb: &str, target_ctx: &SessionCtx) -> bool {
     let Some(need) = required_op(verb) else {
-        // No op class (privilege/identity/unknown verb): never cross-session.
         return false;
     };
     scope_holds_op(scope, need, target_ctx)

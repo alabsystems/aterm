@@ -461,7 +461,7 @@ mod tests {
         assert_eq!(booking.cwd.as_deref(), folder.to_str());
         assert!(booking.raise);
         let git = |dir: &std::path::Path, args: &[&str]| {
-            let out = aterm_uds::spawnfd::command("git")
+            let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
                 .args([
                     "-c",
                     "user.name=Andrew Yates",

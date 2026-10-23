@@ -6,28 +6,7 @@
 // `deserialize_with` or `skip`, no `expecting`, no partially untagged enums).
 // See ../../LICENSE-MIT and ../../LICENSE-APACHE for the upstream licenses.
 
-//! Deserialization for untagged enums:
-//!
-//! ```
-//! # extern crate aterm_serde as serde;
-//! #[derive(aterm_serde_derive::Deserialize)]
-//! #[serde(untagged)]
-//! enum Value {
-//!     Number(u32),
-//!     Text(String),
-//! }
-//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
-//! # assert_deserializable::<Value>();
-//! ```
-//! # extern crate aterm_serde as serde;
-//! #[derive(aterm_serde_derive::Deserialize)]
-//! #[serde(untagged)]
-//! enum Value {
-//!     Number(u32),
-//!     Text(String),
-//! }
-//! # fn assert_deserializable<T: for<'de> serde::Deserialize<'de>>() {}
-//! # assert_deserializable::<Value>();
+//! Deserialization for untagged enums.
 
 use aterm_macro_support::{q, q_spanned};
 use proc_macro::{Ident, Literal, TokenStream};
@@ -39,7 +18,7 @@ use crate::de::tuple;
 use crate::de::{Parameters, StructForm, TupleForm, effective_style, expr_is_missing};
 use crate::fragment::{Expr, Fragment};
 
-/// Generates `Deserialize::deserialize` body for an `enum Enum {...}` with `#[serde(untagged)]` attribute
+/// Generates `Deserialize::deserialize` body for an `enum Enum {...}` with `#[serde(untagged)]` attribute.
 pub(super) fn deserialize(
     params: &Parameters,
     variants: &[Variant],
@@ -57,12 +36,6 @@ pub(super) fn deserialize(
             )
         })
         .collect();
-    // TODO this message could be better by saving the errors from the failed
-    // attempts. The heuristic used by TOML was to count the number of fields
-    // processed before an error, and use the error that happened after the
-    // largest number of fields. I'm not sure I like that. Maybe it would be
-    // better to save all the errors and combine them into one message that
-    // explains why none of the variants matched.
     let fallthrough_msg = format!(
         "data did not match any variant of untagged enum {}",
         params.type_name()
@@ -127,7 +100,6 @@ fn deserialize_variant(
     }
 }
 
-// Also used by internally tagged enums
 pub(super) fn deserialize_newtype_variant(
     variant_ident: &Ident,
     params: &Parameters,

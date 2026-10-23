@@ -7,7 +7,7 @@ use super::*;
 use crate::stats_paint::HitKind;
 use crate::stats_paint::tests::{job_row, zombies};
 use aterm_vitals::explain::WhyFacts;
-use aterm_vitals::explain::fixtures::spotlight_1032;
+use aterm_vitals::explain::fixtures::{self, spotlight_1032};
 use aterm_vitals::jobs::{Findings, JobsView, Verdict};
 use aterm_vitals::model::{
     AccountIx, Busiest, CapBasis, ClusterView, CoreView, CpuView, DiskFacts, GpuSample, GpuView,
@@ -597,16 +597,17 @@ pub(crate) fn scene(sc: Scene) -> Snapshot {
 /// The cause engine's facts on RD's 10:32 scene (`explain::fixtures`) after
 /// four of its windows, so the Deck's clause holds: Spotlight, after start-up
 /// (RD §4.1), the troubled scenes' CPU cause, with the open episode and the
-/// split it stands on. Read once: a sweep draws thousands of scenes.
+/// split it stands on, its one tab the scenes' front tab. Read once: a sweep
+/// draws thousands of scenes.
 pub(crate) fn spotlight_after_start_up() -> Arc<WhyFacts> {
     static FACTS: std::sync::OnceLock<Arc<WhyFacts>> = std::sync::OnceLock::new();
     Arc::clone(FACTS.get_or_init(|| {
         let mut vitals = aterm_vitals::Vitals::new();
-        let mut snaps: Vec<Snapshot> = spotlight_1032()
-            .series(4)
-            .iter()
-            .map(|r| vitals.absorb(r))
-            .collect();
+        let scene = fixtures::Scene {
+            tabs: vec![fixtures::tab(FRONT, 1200)],
+            ..spotlight_1032()
+        };
+        let mut snaps: Vec<Snapshot> = scene.series(4).iter().map(|r| vitals.absorb(r)).collect();
         snaps.pop().and_then(|s| s.why).expect("the scene's facts")
     }))
 }
@@ -625,6 +626,7 @@ pub(crate) fn scene_input(snap: &Snapshot, form: DeckForm) -> DeckInput<'_> {
     DeckInput {
         snap: Some(snap),
         tab_key: Some(FRONT),
+        tab_panes: vec![FRONT],
         tab_label: if long { LONG_TAB } else { "Tab 2" }.into(),
         tab_count: 2,
         inks: super::tests::dark_inks(),

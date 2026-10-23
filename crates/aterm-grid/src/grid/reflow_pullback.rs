@@ -171,7 +171,6 @@ impl Grid {
         let cols = self.storage.cols;
         for (i, line) in lines.iter().enumerate() {
             if let Some(r) = self.row_mut(row_u16(i)) {
-                // Recycled blank rows must not leak a stale DECDWL flag.
                 r.set_line_size(LineSize::SingleWidth);
             }
             self.fill_row_from_line(row_u16(i), line, cols);
@@ -187,7 +186,6 @@ impl Grid {
             && let Some(scrollback) = self.storage.scrollback.as_mut()
             && let Err(error) = scrollback.remove_newest(from_tiered)
         {
-            // Lines remain duplicated in history rather than lost.
             aterm_log::warn!("deficit fill: failed to remove {from_tiered} history lines: {error}");
         }
 
@@ -253,7 +251,6 @@ impl Grid {
             && let Some(store) = self.storage.scrollback.as_mut()
             && let Err(error) = store.remove_newest(from_store)
         {
-            // Lines remain duplicated in history rather than lost.
             aterm_log::warn!("rows grow: failed to remove {from_store} history lines: {error}");
         }
         let cols = self.storage.cols;

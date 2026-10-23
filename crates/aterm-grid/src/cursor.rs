@@ -29,6 +29,6 @@ pub struct SavedCursor {
     pub cursor: Cursor,
     /// Whether a saved cursor exists.
     pub valid: bool,
-    /// Pending wrap state at time of save (xterm saves wrapnext with DECSC).
+    /// Pending wrap state at time of save.
     pub pending_wrap: bool,
 }

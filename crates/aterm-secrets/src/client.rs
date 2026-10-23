@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Client flows (`join`, `sync`, `watch`) and admin workflows (`create`, `edit`, `publish`).
-//! Every function takes [`Paths`], storing `source.toml`, `identity`, `state.toml`, and
-//! `vault` in `~/.config/aterm/secrets` (`0700`).
+//! Client flows and admin workflows for `aterm` secrets.
 
 use crate::age::{self, Identity, Recipient};
 use crate::envelope::{self, Envelope, Floor, Locker, Pin, Retired, Unsigned, Verdict};
@@ -168,7 +166,6 @@ enum ExpectedConfig<'a> {
 }
 
 impl ExpectedConfig<'_> {
-    /// Called with the state lock held before reading a snapshot or replacing its source.
     fn check(self, paths: &Paths) -> crate::Result<()> {
         if let Self::Read(expected) = self
             && config(paths)?.as_ref() != expected
@@ -243,7 +240,6 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     aterm_digest::Sha256::digest(bytes)
 }
 
-/// A TOML basic string.
 fn toml_str(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
     out.push('"');
@@ -267,8 +263,6 @@ fn decode_key32(text: &str) -> Option<[u8; 32]> {
     crate::b64::decode_padded(text).and_then(|bytes| <[u8; 32]>::try_from(bytes.as_slice()).ok())
 }
 
-/// The largest state.toml read or written: names and digests, for up to two versions' entries
-/// while a pass is pending.
 const MAX_STATE: usize = 4 * text::MAX_TEXT;
 
 fn read_toml(path: &Path, what: &str, max: usize) -> crate::Result<Option<aterm_toml::Table>> {
@@ -287,8 +281,6 @@ fn read_toml(path: &Path, what: &str, max: usize) -> crate::Result<Option<aterm_
     }
 }
 
-/// Serialises state writers and coherent readiness observations. An advisory
-/// lock released by `LOCK_UN` on drop (clippy.toml: the flock release rule).
 struct StateLock(std::fs::File);
 
 impl StateLock {
@@ -311,8 +303,6 @@ impl StateLock {
         Ok(StateLock(file))
     }
 
-    /// Observe only an existing regular lockfile, without changing the state
-    /// directory or waiting behind a subscriber's materialization pass.
     fn observe(paths: &Paths) -> crate::Result<Option<StateLock>> {
         use std::os::unix::fs::OpenOptionsExt;
         let path = paths.lock_file();
@@ -478,8 +468,6 @@ pub fn machine_identity(paths: &Paths) -> crate::Result<Identity> {
     install_identity(paths, Identity::generate()?)
 }
 
-/// Publish a generated key only into an empty name. A concurrent creator's admitted key
-/// wins: every caller must return the key that remains on disk, never its losing one.
 fn install_identity(paths: &Paths, identity: Identity) -> crate::Result<Identity> {
     let secret = identity.to_bech32();
     let mut file = format!(
@@ -531,11 +519,6 @@ pub fn config(paths: &Paths) -> crate::Result<Option<Config>> {
             );
         }
     } else if let Some(pin) = &signer {
-        // No list: none was reached (a source.toml leaves an empty one out), or an aterm
-        // before `followed` wrote the file. Either way the cached version, which that pin
-        // signs, carries the keys it was reached through, as a server reads them off the
-        // version it holds: a machine that followed the removed admin's fork under such a
-        // build is pulled back too once a build retires the key the fork came from.
         followed = cached_chain(paths, pin);
     }
     let host = get("host").unwrap_or("machine").to_string();
@@ -773,8 +756,6 @@ fn source_bound(config: &Config, state: &State) -> bool {
         && (config.signer.is_none() || state.digest.is_some())
 }
 
-/// Invalidate old materialization durably before publishing a new source or
-/// authority.
 fn prepare_materialization(paths: &Paths, state: &mut State) -> crate::Result<()> {
     state.failed = true;
     state.source_identity = None;
@@ -842,11 +823,8 @@ fn materialization_ready_with(
         && intact(paths, &state))
 }
 
-/// The plaintext admin locker: the signing seed and the whole text.
 const ADMIN_MAGIC: &str = "alab-vault-admin/1";
 
-/// Built in one buffer sized up front, the seed's base64 wiped, so no copy of the seed is
-/// freed unwiped.
 fn admin_plaintext(seed: &[u8; 32], doc: &Document) -> SecretBytes {
     let rendered = doc.render();
     let mut seed_text = crate::b64::encode_padded(seed);
@@ -860,7 +838,6 @@ fn admin_plaintext(seed: &[u8; 32], doc: &Document) -> SecretBytes {
     SecretBytes::new(out)
 }
 
-/// An opened admin locker: the signing seed (wiped on drop) and the whole text.
 struct AdminText {
     seed: [u8; 32],
     doc: Document,
@@ -891,8 +868,6 @@ fn parse_admin(plain: &SecretBytes) -> crate::Result<AdminText> {
     Ok(AdminText { seed, doc })
 }
 
-/// The entries this machine's identity opens, merged: `[everyone]` first, then host
-/// sections over it by name.
 fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Option<Vec<Entry>>> {
     let identities = std::slice::from_ref(identity);
     let mut everyone: BTreeMap<String, Entry> = BTreeMap::new();
@@ -934,8 +909,6 @@ fn open_lockers(envelope: &Envelope, identity: &Identity) -> crate::Result<Optio
     Ok(Some(everyone.into_values().collect()))
 }
 
-/// A plain file's entries for this host. The file must be this user's with no group or other
-/// bits: it holds the secrets in the clear.
 fn plain_entries(config: &Config, path: &Path) -> crate::Result<Vec<Entry>> {
     let bytes = fsx::read_private(path, text::MAX_TEXT)?
         .ok_or_else(|| Error::new(format!("{}: no such file", path.display())))?;
@@ -959,20 +932,14 @@ pub enum Look {
     NoVault(String),
 }
 
-/// How long [`look`] waits between tries that fail [`transport::Unheard::held`].
 const LOOK_PAUSE: Duration = Duration::from_secs(2);
 
-/// What [`look`] reads and waits on: the network and the clock, or a test's.
 trait Tries {
-    /// One GET of the vault at `url` ([`transport::get_bounded`] within [`transport::LOOK_CONNECT`]).
     fn get(&mut self, url: &str, wait: Duration) -> Result<transport::Answer, transport::Unheard>;
-    /// Now.
     fn now(&mut self) -> Instant;
-    /// Wait `pause`.
     fn pause(&mut self, pause: Duration);
 }
 
-/// The network and the clock.
 struct LiveTries;
 
 impl Tries for LiveTries {
@@ -989,12 +956,7 @@ impl Tries for LiveTries {
     }
 }
 
-/// Probe whether a vault answers at `source` within `wait` without modifying local state. A
-/// URL whose tries fail [`transport::Unheard::held`] is tried every few seconds for up to
-/// `patience` (the last try may run `wait` past it): a new app's lookups and LAN connects wait
-/// on the Local Network question macOS asks a person, and the try after the answer reaches the
-/// vault. `held` hears the first such failure's reason, before the first pause. Any other
-/// answer ends the look at once.
+/// Probe whether a vault answers at `source` within `wait` without modifying local state.
 pub fn look(source: &Source, wait: Duration, patience: Duration, held: &dyn Fn(&str)) -> Look {
     look_with(source, wait, patience, held, &mut LiveTries)
 }
@@ -1060,7 +1022,6 @@ pub fn keep_config(paths: &Paths, into: &Path) -> crate::Result<()> {
 }
 
 /// Keep only the configuration the caller read, refusing a different or unreadable one.
-/// The comparison and snapshot read share the state lock; the copy is never reused.
 /// # Errors
 /// As [`keep_config`], or the current configuration differs from `expected`.
 pub fn keep_config_if_unchanged(
@@ -1107,8 +1068,6 @@ fn keep_config_with(paths: &Paths, into: &Path, expected: ExpectedConfig<'_>) ->
     Ok(())
 }
 
-/// Write `entries`, judged against what the vault wrote, resuming the pass `state.pending`
-/// names ([`materialize::apply_resuming`]).
 fn apply_entries(paths: &Paths, state: &mut State, entries: &[Entry]) -> crate::Result<Report> {
     let resumed = std::mem::take(&mut state.pending);
     let applied = materialize::apply_resuming(
@@ -1150,9 +1109,6 @@ fn names_of(report: &Report) -> Vec<String> {
     names
 }
 
-/// The rollback floor for a vault named `name` under the pin `config` holds: the version
-/// state.toml holds, or, when it holds none (a reset, or a corrupt file moved aside), the
-/// cached envelope's, if the cache verifies under the same pin.
 fn floor(paths: &Paths, state: &State, name: &str, config: &Config) -> Option<Floor> {
     let pin = config.signer?;
     let cached = fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
@@ -1165,9 +1121,6 @@ fn floor(paths: &Paths, state: &State, name: &str, config: &Config) -> Option<Fl
     };
     if state.membership != Stored::None {
         let Some(digest) = state.digest else {
-            // No digest beside a membership: a pass whose pin gave way forgot what it held and
-            // was cut short, perhaps after it cached the version that replaces it, which must
-            // not floor itself as already applied, nor let an older one in.
             return Some(Floor::below(&verified(cached?)?));
         };
         let held = cached
@@ -1181,16 +1134,12 @@ fn floor(paths: &Paths, state: &State, name: &str, config: &Config) -> Option<Fl
     Some(Floor::of(&verified(cached?)?))
 }
 
-/// Whether the pin `config` holds gives way to the key this build names ([`Pin::Replaced`]):
-/// what this machine holds under it may be the removed admin's, so its seq asks no long-poll.
 fn pin_gives_way(config: &Config) -> bool {
     config
         .signer
         .is_some_and(|pin| Retired::compiled().gives_way(&pin, &config.followed))
 }
 
-/// The keys the cached version's signer was reached from ([`Envelope::reached_from`]), when
-/// `pin` signs it.
 fn cached_chain(paths: &Paths, pin: &[u8; 32]) -> Vec<[u8; 32]> {
     fsx::read_private(&paths.cache_file(), envelope::MAX_ENVELOPE)
         .ok()
@@ -1201,13 +1150,10 @@ fn cached_chain(paths: &Paths, pin: &[u8; 32]) -> Vec<[u8; 32]> {
         .unwrap_or_default()
 }
 
-/// The keys an envelope's handoff chain passes through, oldest first.
 fn chain_keys(envelope: &Envelope) -> Vec<[u8; 32]> {
     envelope.handoff.iter().map(|(key, _)| *key).collect()
 }
 
-/// Whether the last apply wrote everything (none failed, and none was cut short with writes
-/// pending) and every file the manifest says the vault wrote still holds what it wrote.
 fn files_intact(paths: &Paths, state: &State) -> bool {
     !state.failed
         && state.pending.is_empty()
@@ -1219,7 +1165,6 @@ fn files_intact(paths: &Paths, state: &State) -> bool {
         })
 }
 
-/// Where `source` is, as a line names it: a URL without its query or fragment, or a path.
 fn place(source: &Source) -> String {
     match source {
         Source::Url(url) => transport::describe(url),
@@ -1227,9 +1172,6 @@ fn place(source: &Source) -> String {
     }
 }
 
-/// This machine's cached envelope, when it is the version state.toml holds for `config`'s
-/// vault (its seq and digest), that version let this machine in, and it verifies under the
-/// pin: what [`sync`] gives back to a source that holds none, or an older one.
 fn held_copy(paths: &Paths, config: &Config, state: &State) -> Option<Vec<u8>> {
     let pin = config.signer?;
     let elsewhere = state
@@ -1287,8 +1229,6 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
     };
     let lock = StateLock::take(paths)?;
     if self::config(paths)?.as_ref() != Some(&config) {
-        // A join moved this machine to another source while the fetch was out: the next pass
-        // reads that one.
         return Ok(SyncOutcome::Unchanged { seq: before.seq });
     }
     let mut state = load_state(paths)?;
@@ -1321,15 +1261,6 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
             });
         }
         Fetched::Missing => {
-            // A server that holds nothing for the vault lost its store, or moved to a Mac with
-            // an empty one: a machine its version let in gives its copy back, signed as it is,
-            // whether or not it is an admin and whatever the vault approves, as an admin
-            // command would (§8). The server takes it from another Mac than its own only for a
-            // name it pins: a refusal, like having no copy to give, is the missing error, which
-            // the subscriber's backoff paces. A machine that slept through versions since may
-            // be first: one that holds a newer version puts it back at its next long-poll (the
-            // arm above). A path is left to an admin command: a file gone from a shared folder
-            // may be one not synced or mounted yet.
             let copy = match config.source {
                 Source::Url(_) => held_copy(paths, &config, &state),
                 Source::Path(_) => None,
@@ -1356,8 +1287,6 @@ pub fn sync(paths: &Paths, wait: Option<Duration>) -> crate::Result<SyncOutcome>
         && state.seq > before.seq
         && envelope::parse(&bytes).is_ok_and(|parsed| parsed.seq <= state.seq)
     {
-        // Another command applied a version while this fetch was out: nothing to do, and no
-        // rollback to report.
         return Ok(SyncOutcome::Unchanged { seq: state.seq });
     }
     let Some(pin) = config.signer else {
@@ -1440,14 +1369,12 @@ pub fn watch(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     })
 }
 
-/// This process's executable as it is now: device, inode, size and modification time.
 fn program_stamp() -> Option<(u64, u64, u64, i64)> {
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(std::env::current_exe().ok()?).ok()?;
     Some((meta.dev(), meta.ino(), meta.size(), meta.mtime()))
 }
 
-/// Sleep `total`, waking early once `stop` is set.
 fn nap(stop: &AtomicBool, total: Duration) {
     let deadline = Instant::now() + total;
     while !stop.load(Ordering::Relaxed) {
@@ -1459,24 +1386,12 @@ fn nap(stop: &AtomicBool, total: Duration) {
     }
 }
 
-/// The subscriber's first pause after a pass that left an entry failed ([`pause_after`]).
 const FIRST_RETRY: Duration = Duration::from_secs(5);
-/// The longest the subscriber waits between passes that leave an entry failed ([`pause_after`]).
 const LONGEST_RETRY: Duration = Duration::from_secs(300);
 
-/// The longest the subscriber waits between passes that err ([`retry_after`]): a server back
-/// after however long away, its store maybe lost, is asked again within a minute, so it gets
-/// its vault back from a machine in it, and a waiting machine's request again, that soon.
 const LONGEST_ERROR_RETRY: Duration = Duration::from_secs(60);
-/// How often a subscriber waiting after a pass that failed looks whether this machine's
-/// network changed ([`nap_unless_moved`]).
 const MOVED_STEP: Duration = Duration::from_secs(5);
 
-/// Wait `total` after a pass that failed, in steps of [`MOVED_STEP`], ending early once
-/// `moved` says this machine's network changed since (the addresses its traffic leaves by):
-/// a vault that did not answer on the last network may answer on this one at once, so an
-/// approval made while this machine was away is applied once it is back, not up to
-/// [`LONGEST_ERROR_RETRY`] later.
 fn nap_unless_moved(
     total: Duration,
     moved: &mut dyn FnMut() -> bool,
@@ -1494,9 +1409,6 @@ fn nap_unless_moved(
     false
 }
 
-/// The subscriber's wait after a pass that erred, given its wait after the pass before
-/// (`backoff`, 5 s after one that did not err): twice that, up to [`LONGEST_ERROR_RETRY`],
-/// or 5 s again once this machine's network changed (`moved`, [`nap_unless_moved`]).
 fn retry_after(backoff: Duration, moved: bool) -> Duration {
     if moved {
         Duration::from_secs(5)
@@ -1505,9 +1417,6 @@ fn retry_after(backoff: Duration, moved: bool) -> Duration {
     }
 }
 
-/// How long the subscriber waits after a pass that ended in `outcome` from `source`. A source
-/// that answers a long-poll at once with nothing new (one that does not hold, or a stale
-/// copy) is asked again only after a pause.
 fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -> Duration {
     let pause = match (source, outcome) {
         (Source::Path(_), _) => Duration::from_secs(60),
@@ -1524,10 +1433,6 @@ fn pause_after(source: &Source, outcome: &SyncOutcome, failing: &mut Duration) -
     pause
 }
 
-/// What the subscriber logs for a pass that ended in `outcome`, if anything. A pass the next
-/// may do again, one that left an entry failed or put this machine's copy back where the
-/// source held none ([`pause_after`]), is kept in `repeated`, so the next one that ends the
-/// same way says nothing new; any other pass clears it.
 fn pass_line(
     paths: &Paths,
     config: &Config,
@@ -1580,11 +1485,6 @@ fn pass_line(
     line.filter(|line| *line != last)
 }
 
-/// Whether the subscriber's next pass is to fetch and apply the version this machine holds
-/// again, instead of long-polling for a newer one: it is in, its last apply wrote everything,
-/// and a file the manifest says the vault wrote no longer holds it (deleted or edited by hand,
-/// or, for an ` if-absent` entry, rewritten by a program, which the apply then leaves the
-/// machine's own), so [`materialization_ready`] says not ready until an apply.
 fn repair_due(paths: &Paths, repaired: &mut Option<([u8; 32], u64)>) -> bool {
     let Ok(state) = load_state(paths) else {
         return false;
@@ -1604,8 +1504,6 @@ fn repair_due(paths: &Paths, repaired: &mut Option<([u8; 32], u64)>) -> bool {
     due
 }
 
-/// The subscriber's passes. Returns when this program was replaced on disk (an update), so
-/// launchd or systemd starts the new build: a job keeps the image it started with.
 fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<()> {
     let mut backoff = Duration::from_secs(5);
     let mut failing = FIRST_RETRY;
@@ -1650,8 +1548,6 @@ fn subscriber_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync)) -> crate::Result<
     }
 }
 
-/// One of the subscriber's passes: long-poll a URL for a newer version, or fetch and apply the
-/// one held when a repair is due ([`repair_due`]) or the source is a path.
 fn subscriber_pass(
     paths: &Paths,
     repaired: &mut Option<([u8; 32], u64)>,
@@ -1679,10 +1575,6 @@ fn subscriber_pass(
     }
 }
 
-/// A machine still waiting for approval re-queues its request every hour (the queue keeps
-/// requests seven days), with the proof it made when the person typed the password, and at
-/// once after a request that was never queued ([`request_join`]) or after a pass that failed,
-/// as one does at a server that lost its store and the queue with it ([`subscriber_pass`]).
 fn ask_again_if_due(paths: &Paths, config: &Config, log: &dyn Fn(&str)) {
     let due = || -> crate::Result<Option<(Config, Option<String>)>> {
         let _lock = StateLock::take(paths)?;
@@ -1724,8 +1616,6 @@ impl Approval {
         doc.join_password().map(|_| Approval::Password)
     }
 
-    /// Whether the approver reads `request` at all: every one on an open vault, only one that
-    /// carries a proof on a vault with a password.
     const fn reads(self, request: &Request) -> bool {
         match self {
             Approval::Password => request.proof.is_some(),
@@ -1734,8 +1624,6 @@ impl Approval {
     }
 }
 
-/// Decode policy only from the configured authority's cached envelope at the recorded
-/// sequence and digest.
 fn admin_here_approving(
     paths: &Paths,
     config: &Config,
@@ -1777,8 +1665,6 @@ struct ApprovalCheck {
     approval: Option<Approval>,
 }
 
-/// Read one coherent local source/version, retaining its decoded policy for at most five
-/// minutes.
 fn approval_here(
     paths: &Paths,
     checked: &mut Option<ApprovalCheck>,
@@ -1831,9 +1717,6 @@ pub fn approving_here(paths: &Paths) -> crate::Result<Option<Approval>> {
         .map(|(_, _, approval)| approval))
 }
 
-/// The approver half of an admin's subscriber: while this machine is an admin of a vault with
-/// a join password or an open one, read the join queue every 2 s and approve what proves the
-/// password, or (open) what comes from a machine not in the vault.
 fn approver_loop(paths: &Paths, log: &(dyn Fn(&str) + Sync), stop: &AtomicBool) {
     let mut approver = Approver::default();
     while !stop.load(Ordering::Relaxed) {
@@ -1849,7 +1732,6 @@ struct Approver {
     checked: Option<ApprovalCheck>,
 }
 
-/// One of the approver's passes ([`approver_loop`]): how long to wait before the next.
 fn approver_pass(paths: &Paths, log: &dyn Fn(&str), approver: &mut Approver) -> Duration {
     let (config, seq, approval) = match approval_here(paths, &mut approver.checked) {
         Ok(Some(held)) => held,
@@ -2076,8 +1958,6 @@ enum Asker {
     Again,
 }
 
-/// Queue this machine's join request (a URL; a path has no queue) and record it, as `asker`
-/// records.
 fn request_join(
     paths: &Paths,
     config: &Config,
@@ -2114,8 +1994,6 @@ fn request_join(
     posted.and(recorded).map(|()| code)
 }
 
-/// Change, under the lock, the join request state of the vault `config` names, saved only
-/// when `change` says it changed it.
 fn change_request(
     paths: &Paths,
     config: &Config,
@@ -2136,7 +2014,6 @@ fn change_request(
     save_state(paths, &state)
 }
 
-/// The compiled-in pin for a source: the ALab key for the ALab URL.
 fn default_pin(source: &Source) -> Option<[u8; 32]> {
     match source {
         Source::Url(url) if url == crate::ALAB_DEFAULT_URL => decode_key32(crate::ALAB_SIGNER),
@@ -2151,8 +2028,7 @@ pub fn join(paths: &Paths, options: &JoinOptions<'_>) -> crate::Result<JoinOutco
     })
 }
 
-/// Join only over the configuration the caller read. Fetching holds no state lock; each
-/// source replacement checks `expected` under its write lock before changing local state.
+/// Join only over the configuration the caller read.
 /// # Errors
 /// As [`join`], or the current configuration differs from `expected`.
 pub fn join_if_unchanged(
@@ -2195,8 +2071,6 @@ fn join_with(
             identity.recipient().to_bech32()
         ));
     };
-    // An explicit join keeps its existing key-creation and progress behavior. A conditional
-    // one creates no key until its actual write lock admits the configuration it may replace.
     let identity = match expected {
         ExpectedConfig::Any => {
             let identity = machine_identity(paths)?;
@@ -2404,9 +2278,6 @@ fn join_with(
     Ok(JoinOutcome::Pending { code, host })
 }
 
-/// What a join that asked with the join password says as the request is queued. Nothing tells
-/// a machine its proof was refused (the approver leaves it queued), so the person is told the
-/// way out before any wait, which a Ctrl-C may end: a join again sends a new proof.
 fn mistyped_hint(options: &JoinOptions<'_>, source: &Source, host: &str) -> String {
     let mut again = String::from("aterm secrets join");
     let other = !matches!(source, Source::Url(url) if url == crate::ALAB_DEFAULT_URL);
@@ -2433,7 +2304,6 @@ fn mistyped_hint(options: &JoinOptions<'_>, source: &Source, host: &str) -> Stri
     )
 }
 
-/// A machine already in whose sync found nothing newer.
 fn already_in(paths: &Paths) -> crate::Result<Option<JoinOutcome>> {
     let state = load_state(paths)?;
     Ok(
@@ -2586,8 +2456,6 @@ pub fn admin_open(paths: &Paths) -> crate::Result<Admin> {
     let plain = match age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()) {
         Ok(plain) => plain,
         Err(age::AgeError::NoMatch) => {
-            // By its code, never the name it asked for: that one may be another machine's
-            // (it was admitted under a free name), and `admins add` would reach that key.
             return Err(Error::new(format!(
                 "this machine is not an admin of {}: an admin can run aterm secrets admins add {}",
                 config.name,
@@ -2637,8 +2505,6 @@ fn recipients_of(names: &[String], doc: &Document) -> crate::Result<Vec<Recipien
     Ok(out)
 }
 
-/// Encrypt and sign `doc` as version `seq`, carrying `handoff`: the chain from the vault's
-/// first key to `seed`'s public half, empty until the first rotation.
 fn seal(
     name: &str,
     seq: u64,
@@ -2712,10 +2578,6 @@ pub struct AlabRelease {
     pub retired: Vec<String>,
 }
 
-/// What a rotation to `signer`, whose chain is now `handoff`, calls for in aterm's next
-/// release: nothing unless it is the ALab vault, which a build knows by its keys (`retired`:
-/// what it carries), not by the URL, since an admin may reach the vault at any address (the
-/// server's own Mac by loopback, another by its host name).
 fn alab_release(
     retired: &Retired,
     handoff: &[([u8; 32], [u8; 64])],
@@ -2816,8 +2678,6 @@ fn publish_as(
     })
 }
 
-/// Keep a local source change from passing an admin publication admitted for the source it
-/// left.
 fn configured_admin(paths: &Paths, expected: &Config) -> crate::Result<StateLock> {
     let lock = StateLock::take(paths)?;
     if config(paths)?.as_ref() != Some(expected) {
@@ -2828,8 +2688,6 @@ fn configured_admin(paths: &Paths, expected: &Config) -> crate::Result<StateLock
     Ok(lock)
 }
 
-/// The keys of `old`'s machines that `doc` lets go: their lines deleted, or their keys
-/// replaced.
 fn let_go(old: &Document, doc: &Document) -> Vec<String> {
     let kept: Vec<String> = doc.machines().into_iter().map(|m| m.recipient).collect();
     old.machines()
@@ -2839,9 +2697,6 @@ fn let_go(old: &Document, doc: &Document) -> Vec<String> {
         .collect()
 }
 
-/// What `doc`, published over `old`, leaves to approval by code when it is open: a
-/// `code-only` line for each key of `old`'s machines it lets go, and, when it opens the vault,
-/// for each key whose request is already waiting and is not one of its machines.
 fn code_only_for(
     config: &Config,
     old: &Document,
@@ -2879,10 +2734,6 @@ fn code_only_for(
     Ok((Some(held), !gone.is_empty(), waiting))
 }
 
-/// `doc` with a new join password, when it lets a machine of `old` go (revoked, or its key
-/// replaced) or drops an admin of `old` (the diff that rotates the vault key in
-/// [`admin_publish`]), and keeps `old`'s password unchanged; `None` when nothing calls for
-/// one.
 fn renew_join_password(old: &Document, doc: &Document) -> crate::Result<Option<Document>> {
     let let_go = !let_go(old, doc).is_empty();
     let admins = recipients_of(&doc.admins(), doc)?;
@@ -3214,8 +3065,6 @@ pub fn keep_admitted(
     Ok(kept)
 }
 
-/// Whether two texts' `[join]` say the same: the same join password or none, and both open
-/// or neither.
 fn same_join(a: &Document, b: &Document) -> bool {
     a.open() == b.open()
         && match (a.join_password(), b.join_password()) {
@@ -3224,12 +3073,9 @@ fn same_join(a: &Document, b: &Document) -> bool {
         }
 }
 
-/// An advisory lock on a file, released by `LOCK_UN` on drop (clippy.toml: the flock release
-/// rule): what marks an edit directory as live.
 struct HeldLock(std::fs::File);
 
 impl HeldLock {
-    /// Take the lock on `path` without waiting; `None` when someone holds it.
     fn try_take(path: &Path) -> crate::Result<Option<HeldLock>> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -3327,11 +3173,8 @@ impl Scratch {
 mod tests {
     use super::*;
 
-    /// The bound on a wait for what must happen: a hang detector, never a latency budget.
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-    /// A subscriber waiting after a failed pass asks again as soon as this machine's network
-    /// changes, an approval made while it was away among what it then applies.
     #[test]
     fn a_wait_after_an_error_ends_once_the_network_changes() {
         let mut slept = Duration::ZERO;
@@ -3361,10 +3204,6 @@ mod tests {
         assert_eq!(steps, [Duration::from_secs(2)]);
     }
 
-    /// A pass that errs (a server gone, or one that holds no vault and takes no copy back) is
-    /// tried again after 5 s, doubling to a minute however long it keeps erring: a server back
-    /// after five minutes away, its store lost, is asked again within a minute, and the first
-    /// machine in the vault to ask puts the vault back. A new network starts the waits again.
     #[test]
     fn a_pass_that_errs_is_tried_again_within_a_minute() {
         let mut backoff = Duration::from_secs(5);
@@ -3379,8 +3218,6 @@ mod tests {
         assert_eq!(retry_after(backoff, true), Duration::from_secs(5));
     }
 
-    /// The look before a join tells a vault that answers from nothing answering and from an
-    /// answer that holds no vault, and makes nothing: no key, no source, no state.
     #[test]
     fn a_look_tells_an_answering_vault_from_none_and_makes_nothing() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3419,8 +3256,6 @@ mod tests {
         assert!(!reader.dir.exists(), "a look makes nothing");
     }
 
-    /// A look's network and clock, scripted: each GET takes `took` and answers the next of
-    /// `answers`, and a pause passes on the clock.
     struct ScriptedTries {
         answers: std::collections::VecDeque<Result<transport::Answer, transport::Unheard>>,
         now: Instant,
@@ -3489,11 +3324,6 @@ mod tests {
         Source::Url("http://alab-secrets.local:7484/v1/alab".into())
     }
 
-    /// While macOS holds a new app's lookups for a person's answer to its Local Network
-    /// question, the look tries again every few seconds and hears the vault on the first try
-    /// after the answer, saying the first held reason once. Negative controls: with no
-    /// patience a held try is the only one, and a failure that is not held (a definite "no
-    /// such name") ends the look at once.
     #[test]
     fn a_look_held_for_the_local_network_answer_hears_the_vault_after_it() {
         let said = std::cell::RefCell::new(Vec::new());
@@ -3568,8 +3398,6 @@ mod tests {
         assert!(said.borrow().is_empty());
     }
 
-    /// Held tries stop once the next could not start within `patience`, answering the last
-    /// reason; a held look that meets something other than a vault server ends there.
     #[test]
     fn a_held_look_ends_with_its_patience_or_at_a_foreign_answer() {
         let patience = Duration::from_secs(60);
@@ -3599,9 +3427,6 @@ mod tests {
         assert_eq!(tries.gets, 2);
     }
 
-    /// A kept copy of this machine's vault files, copied back with a sync after, puts it in
-    /// the vault it read before a join to another (what the setup's revert of that join
-    /// says).
     #[test]
     fn a_kept_config_copied_back_reads_the_vault_this_machine_read_before() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -3687,8 +3512,6 @@ mod tests {
         assert_eq!(std::fs::read_dir(&into).unwrap().count(), 0);
         assert!(!fresh.dir.exists());
 
-        // A setup join's fetch can yield to a terminal join. Its admitted configuration
-        // must still own the actual write lock, for both plain and signed sources.
         let signed = root.path().join("signed.vault");
         let admin = Paths::for_home(&root.path().join("admin"));
         let created = create(&admin, signed.to_str().unwrap(), None, Some("admin")).unwrap();
@@ -3767,7 +3590,6 @@ mod tests {
                     assert_eq!(config_bytes(&kept), before);
                 }
 
-                // A fresh matching read admits the same shipping join and snapshot.
                 let current = config(&reader).unwrap();
                 let admitted = root.path().join(format!("admitted-{kind}-{had_config}"));
                 keep_config_if_unchanged(&reader, &admitted, current.as_ref()).unwrap();
@@ -3779,7 +3601,6 @@ mod tests {
                     transport::parse_source(&target, &reader.home).unwrap().0
                 );
 
-                // Explicit unconditional joins retain their existing choice semantics.
                 join_with(&reader, &options, ExpectedConfig::Any, |source| {
                     let fetched = transport::fetch(source, None, Duration::from_secs(30))?;
                     join_pinned(&reader, second.to_str().unwrap(), "reader");
@@ -3837,14 +3658,10 @@ mod tests {
         assert_eq!(pause_after(&path, &applied(1), &mut failing).as_secs(), 60);
     }
 
-    /// A loopback socket on a free port, which a test that moves its vault's server keeps:
-    /// each server it starts there listens on a copy ([`serve`]), so the port stays bound
-    /// between servers and no other test is handed it.
     fn bound() -> std::net::TcpListener {
         std::net::TcpListener::bind("127.0.0.1:0").expect("bind")
     }
 
-    /// A server for `store` listening on `socket` (a copy of it: the caller keeps its own).
     fn serve(store: &Path, socket: &std::net::TcpListener) -> crate::server::Running {
         crate::server::start(
             socket.try_clone().expect("a copy of the socket"),
@@ -3860,8 +3677,6 @@ mod tests {
         .expect("server starts")
     }
 
-    /// A server gone from the address of `socket`, which the test keeps: each connection is
-    /// closed unanswered, as a client finds a server that stopped, until [`Unserved::end`].
     struct Unserved {
         stop: std::sync::Arc<AtomicBool>,
         addr: std::net::SocketAddr,
@@ -3885,7 +3700,6 @@ mod tests {
             Unserved { stop, addr, closer }
         }
 
-        /// Close no more: the connection this makes wakes the closer to see it.
         fn end(self) {
             self.stop.store(true, Ordering::SeqCst);
             std::net::TcpStream::connect(self.addr).expect("the closer is woken");
@@ -3893,7 +3707,6 @@ mod tests {
         }
     }
 
-    /// Run `flow` on this thread as a build that retired `keys` for `current` would.
     fn retiring<T>(keys: Vec<[u8; 32]>, current: [u8; 32], flow: impl FnOnce() -> T) -> T {
         let set = |retired: Option<Retired>| {
             envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = retired);
@@ -3907,7 +3720,6 @@ mod tests {
         out
     }
 
-    /// An unattended join that asks nobody anything.
     fn join_pinned(paths: &Paths, source: &str, host: &str) -> JoinOutcome {
         join(
             paths,
@@ -4410,7 +4222,6 @@ mod tests {
         assert!(!materialization_ready(&reader).expect("changed file"));
     }
 
-    /// Admit every machine that asked to join the vault `admin` opens.
     fn approve(admin: &Paths) {
         let opened = admin_open(admin).expect("admin opens");
         let mut doc = opened.doc.clone();
@@ -4519,7 +4330,6 @@ mod tests {
 
     #[test]
     fn a_reader_the_removed_admin_led_off_follows_the_vault_once_its_build_retires_the_key() {
-        // Each case is its own store, socket and homes, and waits out its polls: side by side.
         std::thread::scope(|scope| {
             for (fork, rejoin, bare) in [
                 (true, false, false),
@@ -4675,9 +4485,6 @@ mod tests {
         assert_eq!(std::fs::read(stale.join("alab.vault")).ok(), Some(cached));
     }
 
-    /// A pass is cut short after it wrote the release identity's next value and before it
-    /// saved what it wrote; the version after that still finds the set the vault's, and
-    /// updates it, rather than leaving it the machine's own for good.
     #[test]
     fn a_pass_cut_short_after_its_writes_leaves_its_files_the_vaults() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4736,10 +4543,6 @@ mod tests {
         assert!(next.pending.is_empty());
     }
 
-    /// A pass cut short after its early save, whose anchored entries stay away from a machine
-    /// with its anchor of its own: neither the gap it left nor a file the vault once wrote and
-    /// the person changed since is pending, so what a person later puts there, even the
-    /// vault's very value, stays theirs and is never taken back.
     #[test]
     fn a_pass_cut_short_leaves_no_entry_it_keeps_away_pending() {
         use std::os::unix::fs::PermissionsExt;
@@ -4793,8 +4596,6 @@ mod tests {
         }
     }
 
-    /// What a pass cut short was writing, found in place, is the vault's: taken back with its
-    /// anchor, and removed when the vault drops it, as if the pass had saved it.
     #[test]
     fn a_cut_pass_resumes_as_the_vaults_and_writes_only_what_it_pended() {
         use std::os::unix::fs::PermissionsExt;
@@ -4923,8 +4724,6 @@ mod tests {
         assert!(!told.contains_key(linked), "{told:?}");
     }
 
-    /// A pass cut short with writes pending is not done though the version is the same and
-    /// every file the manifest names is intact: the next fetch of that version applies again.
     #[test]
     fn a_pass_cut_short_is_applied_again_at_the_same_version() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -4973,9 +4772,6 @@ mod tests {
         assert!(materialization_ready(&reader).expect("resumed write completed"));
     }
 
-    /// A plain entry whose target was a directory when the pass looked, and is a gap by the
-    /// time it would write: written, it would be nothing `ahead` was told of, so it fails and
-    /// the next pass places it.
     #[test]
     fn a_target_that_changed_since_the_look_is_not_written_unannounced() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5008,10 +4804,6 @@ mod tests {
         assert!(manifest.files.is_empty(), "{manifest:?}");
     }
 
-    /// A pass whose pin gave way forgot what it held, cached the version that replaces it,
-    /// and was cut short: the floor is that version unapplied, so the next pass applies it,
-    /// and refuses every version older than it, another at its seq, and a next one that
-    /// drops its handoff chain.
     #[test]
     fn a_membership_with_no_digest_floors_on_its_cache_unapplied() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5076,9 +4868,6 @@ mod tests {
         assert!(floor(&admin, &state, &config.name, &config).is_some());
     }
 
-    /// A vault of thousands of long names (valid, and far under MAX_TEXT) makes a manifest past
-    /// 4 MiB, which reads back; a state past MAX_STATE is never written, so the one held still
-    /// reads.
     #[test]
     fn a_large_manifest_reads_back_and_one_past_the_bound_is_never_written() {
         let home = aterm_tempfile::tempdir().expect("tempdir");
@@ -5107,9 +4896,6 @@ mod tests {
         );
     }
 
-    /// The subscriber asks again for the vault it read, while a person's join moves the
-    /// machine to another: the request for the vault it left changes nothing of the state the
-    /// join made for the one it went to.
     #[test]
     fn a_request_for_a_vault_this_machine_left_leaves_its_state_alone() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5303,9 +5089,6 @@ mod tests {
         assert_eq!(body(&current.source), before_b);
     }
 
-    /// A join to another vault forgets the join-password proof made for the vault it left:
-    /// sent to the new one, it would let whoever runs or watches that server test guesses at
-    /// the old vault's password offline.
     #[test]
     fn a_join_to_another_vault_forgets_the_proof_made_for_the_last() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5370,11 +5153,6 @@ mod tests {
         server.stop();
     }
 
-    /// A join cut off before its request is queued (the server gone once the person trusted
-    /// the vault's key, so the join's own sync fails, or while they were asked for the join
-    /// password, so its request fails) leaves the Mac waiting with nothing queued: the
-    /// subscriber's next pass asks, rather than an hour on, so an open vault does not keep it
-    /// out that long.
     #[test]
     fn a_join_cut_off_before_its_request_is_queued_is_asked_for_by_the_next_pass() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5434,8 +5212,6 @@ mod tests {
         server.borrow_mut().take().expect("running").stop();
     }
 
-    /// A join to another vault cut off before its request is queued makes the re-ask due at
-    /// once, with a proof made for that vault.
     #[test]
     fn a_reask_begun_on_the_vault_left_never_sends_the_new_ones_proof_there() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5489,9 +5265,6 @@ mod tests {
         team_server.stop();
     }
 
-    /// A subscriber pass begun before its person joined the same vault again under another
-    /// name, a join whose request was cut off too, asks again under the name source.toml holds
-    /// now: the one the proof it sends was made for, and the approver checks it against.
     #[test]
     fn a_reask_asks_under_the_name_source_toml_holds_now() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5538,9 +5311,6 @@ mod tests {
         server.borrow_mut().take().expect("running").stop();
     }
 
-    /// A join of the same vault under another name drops the proof made for the old one, as it
-    /// saves the new name: a proof is made for the host name its request carries, and the
-    /// approver refuses one made for another.
     #[test]
     fn a_join_under_another_name_drops_the_old_names_proof() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5627,9 +5397,6 @@ mod tests {
         server.borrow_mut().take().expect("running").stop();
     }
 
-    /// A re-ask records only when it asked, and only while the state still holds the proof it
-    /// read: a person's join between its read and its record (the password typed again)
-    /// recorded a newer proof, which the re-ask, whatever its own request met, never undoes.
     #[test]
     fn a_reask_never_puts_back_a_proof_a_join_replaced() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5673,10 +5440,6 @@ mod tests {
         gone.end();
     }
 
-    /// A Mac waiting for approval whose request the server lost with its store (moved to a Mac
-    /// with an empty one) asks again at its first pass once the vault is back, not an hour on:
-    /// also when another Mac in the vault put it back before that pass, so the Mac, whose
-    /// passes failed only while the server was gone, never saw the vault missing.
     #[test]
     fn a_request_the_server_lost_with_its_store_is_asked_again_once_the_vault_is_back() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5731,9 +5494,6 @@ mod tests {
         server.stop();
     }
 
-    /// A path checks no signature, so a version of the vault's name there that the admin does
-    /// not verify, however high its seq, must not floor the admin's copy: the removed admin's
-    /// old key writing on after a rotation, or a version signed by no key of the vault's.
     #[test]
     fn an_admin_gives_a_path_its_copy_back_over_a_version_it_does_not_verify() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -5901,7 +5661,6 @@ mod tests {
         assert_eq!(pinned(&late).signer, Some(next));
     }
 
-    /// Only a request that carried a password proof can have had its password mistyped.
     #[test]
     fn only_a_request_with_a_proof_was_asked_with_a_password() {
         let home = aterm_tempfile::tempdir().expect("tempdir");
@@ -5918,8 +5677,6 @@ mod tests {
         assert!(asked_with_password(&paths));
     }
 
-    /// A host that posts a new proof every few seconds makes the approver judge each one, but
-    /// what it remembers stays the listing's size.
     #[test]
     fn the_approver_remembers_only_what_is_still_listed() {
         let key = crate::transport::test_recipient(1);
@@ -5961,9 +5718,6 @@ mod tests {
         assert_eq!(settled.judged.len(), 1);
     }
 
-    /// [`serve`] as a server on another Mac than the test's machines (every connection is
-    /// another Mac's): a name its store holds nothing for takes a first version only under
-    /// `pins`.
     fn serve_apart(
         store: &Path,
         socket: &std::net::TcpListener,
@@ -5983,9 +5737,6 @@ mod tests {
         .expect("server starts")
     }
 
-    /// The vault `team` served at `socket` from a store under `root`: made by the admin `ma`,
-    /// with the machine `mb` in it and synced at seq 2, which holds one entry. The server, the
-    /// URL, the admin and the machine.
     fn a_vault_with_a_member(
         root: &Path,
         socket: &std::net::TcpListener,
@@ -6015,7 +5766,6 @@ mod tests {
         (server, url, admin, member)
     }
 
-    /// What `source` serves: `None` when it holds no vault.
     fn served_at(source: &Source) -> Option<Vec<u8>> {
         match transport::fetch(source, None, Duration::from_secs(30)) {
             Ok(Fetched::Body(bytes)) => Some(bytes),
@@ -6024,16 +5774,11 @@ mod tests {
         }
     }
 
-    /// The `--pin` a server gives the vault `paths` is configured for: its name and signer.
     fn pin_of(paths: &Paths) -> Vec<(String, [u8; 32])> {
         let config = pinned(paths);
         vec![(config.name, config.signer.expect("signed"))]
     }
 
-    /// A server that lost the vault (its Mac's store gone, or the server moved to a Mac with an
-    /// empty one) and pins its name gets it back from the next pass of the subscriber of any
-    /// machine in it, admin or not: its copy of the version it holds, put back as it is, which
-    /// the pass says; the next pass, 5 s later, long-polls.
     #[test]
     fn a_machine_in_the_vault_puts_back_a_vault_its_server_lost() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -6089,11 +5834,6 @@ mod tests {
         server.stop();
     }
 
-    /// A source that takes this machine's copy back and holds none again at the next pass (a
-    /// GET that reaches no vault server, as through a proxy that keeps a 404) is given it again
-    /// 5 s later, doubling to five minutes while it keeps none, and the log says so once; a
-    /// pass that finds the vault there starts both again. An entry that keeps failing logs its
-    /// retries once the same way.
     #[test]
     fn a_put_back_the_source_keeps_no_more_backs_off_and_is_logged_once() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -6154,10 +5894,6 @@ mod tests {
         assert_eq!(pass(&failed).1, None);
     }
 
-    /// A server that takes no first version of the vault from another Mac (a name it does not
-    /// pin) refuses the copy: the pass is the missing error with the refusal in it, and the
-    /// next pass the same error, which the subscriber logs once and backs off from, so it never
-    /// asks in a tight loop. The store stays empty.
     #[test]
     fn a_server_that_does_not_pin_the_vault_refuses_its_copy_and_the_pass_errs() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -6187,11 +5923,6 @@ mod tests {
         server.stop();
     }
 
-    /// A machine its version keeps out (one waiting for approval) gives a server that lost the
-    /// vault nothing back, nor does a machine whose cached copy is not the version it holds or
-    /// does not verify: each pass is the missing error alone and the store stays empty, and the
-    /// waiting machine's request falls due at once, as the server lost its queue too. The same
-    /// server takes the machine's own copy once it is back.
     #[test]
     fn a_machine_kept_out_or_without_a_verified_copy_puts_nothing_back() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -6204,7 +5935,6 @@ mod tests {
             join_pinned(&waiting, &format!("{url}#{signer}"), "mc"),
             JoinOutcome::Pending { .. }
         ));
-        // A version the member never synced.
         let opened = admin_open(&admin).expect("open");
         let mut doc = opened.doc.clone();
         doc.set_entry(&Audience::Everyone, "later", b"inert-later")
@@ -6228,7 +5958,6 @@ mod tests {
             "asked again at once"
         );
 
-        // The signature line ends `…xx==` and a LF: a character well inside it changed.
         let mut forged = copy.clone();
         let at = forged.len() - 10;
         forged[at] = if forged[at] == b'A' { b'B' } else { b'A' };
@@ -6269,9 +5998,6 @@ mod tests {
         server.stop();
     }
 
-    /// A signed vault at a path whose file is gone (a volume not mounted, a shared folder not
-    /// synced yet) is left to an admin command: a machine in the vault writes nothing there,
-    /// and its pass is the missing error alone. The admin's next command puts its copy back.
     #[test]
     fn a_machine_in_the_vault_writes_nothing_to_a_path_that_holds_no_vault() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -6309,9 +6035,6 @@ mod tests {
         );
     }
 
-    /// An admin of a vault closed to joins (no join password, not open), for which no approver
-    /// reads the queue, puts back a vault its server lost all the same: its subscriber's next
-    /// pass does, as any machine in the vault's does.
     #[test]
     fn an_admin_of_a_vault_closed_to_joins_puts_back_a_vault_its_server_lost() {
         let root = aterm_tempfile::tempdir().expect("tempdir");
@@ -6344,10 +6067,6 @@ mod tests {
         server.stop();
     }
 
-    /// A server that lost its store and took an older copy back (an admin Mac that slept
-    /// through the versions since put its own back) answers a long-poll from a machine holding
-    /// a newer version with nothing newer, naming the seq it holds: that machine, which the
-    /// newer version let in, puts its copy back over the older one.
     #[test]
     fn a_machine_puts_its_newer_copy_back_over_an_older_one_a_server_took() {
         let root = aterm_tempfile::tempdir().expect("tempdir");

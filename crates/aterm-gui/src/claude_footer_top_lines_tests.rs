@@ -400,10 +400,12 @@ fn a_slab_left_by_a_theme_change_keeps_its_letters_readable() {
         "the quiet label reads {:.2}",
         reads(quiet)
     );
-    let before = brand_letter_fg(CardPalette::Cruise, 0.0, slab);
+    let letter = CardPalette::Cruise.letter(0.0, true);
+    let letter = [(letter >> 16) as u8, (letter >> 8) as u8, letter as u8];
+    let before = mix(letter, slab.fg, 0.25);
     assert!(
         reads(before) < aterm_effects::cli_marks::NAME_CONTRAST,
-        "CONTROL: the slab's own ink leaves the letter at {:.2}",
+        "CONTROL: the slab's own ink, unfloored, leaves the letter at {:.2}",
         reads(before)
     );
 }

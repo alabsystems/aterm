@@ -164,10 +164,7 @@ struct IObjectCollection {
     vtbl: *const IObjectCollectionVtbl,
 }
 
-/// `IShellLinkW` (shobjidl_core.h). The setters a row needs and
-/// `GetWorkingDirectory` (a removed row's directory) are called; every slot
-/// keeps the documented method order so those land on the right vtable entries
-/// (checked against `windows` 0.62's `IShellLinkW_Vtbl`).
+/// `IShellLinkW` (shobjidl_core.h).
 #[repr(C)]
 struct IShellLinkWVtbl {
     query_interface:
@@ -1075,10 +1072,8 @@ mod acceptance {
     /// rows carry `new-window -d "<dir>"`, the directory as working directory
     /// and tooltip, the folder icon and the row's title in the link's property
     /// store (`PKEY_Title`); then the tasks, `new-tab` and `new-window`, with the
-    /// exe's icon, their tooltips and titles. That reads back every vtable slot
-    /// the commit calls. `DeleteList` then removes the identity's file. With
-    /// Windows' recent items off the shell refuses the category and the store
-    /// holds the tasks alone.
+    /// exe's icon, their tooltips and titles.
+    ///
     /// # Errors
     /// Returns a setup failure when APPDATA or the current executable is unavailable.
     pub fn the_shell_keeps_what_a_commit_puts_in_a_test_identitys_jump_list(

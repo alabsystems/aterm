@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Start a child that inherits exactly what it is handed (two descriptors at fixed numbers plus its stdio, or its stdio alone, [`command`]), on Darwin without a fork, and, for the spawns that must still fork, the strip that keeps everything else out.
+//! Child process spawning with explicit descriptor inheritance ([`command`]).
 
 #![cfg(unix)]
 
@@ -22,17 +22,16 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::ExitStatus;
 
-/// The two descriptor numbers the fabric bridge inherits: a verb connection and a push (`subscribe`) connection.
+/// The two descriptor numbers the fabric bridge inherits.
 pub const BRIDGE_VERB_FD: RawFd = 3;
 pub const BRIDGE_PUSH_FD: RawFd = 4;
 
 const _: () = assert!(BRIDGE_VERB_FD == 3 && BRIDGE_PUSH_FD == 4);
 
 /// The composing executable's startup admission of the bridge's two inherited lanes, [`BRIDGE_VERB_FD`] then [`BRIDGE_PUSH_FD`], each by [`adopt_inherited_socket`].
+///
 /// # Safety
-/// Each eligible lane at [`BRIDGE_VERB_FD`] and [`BRIDGE_PUSH_FD`] must have been transferred exclusively to this call: no Rust or foreign owner may retain it.
-/// No thread or callback may close or replace either lane during adoption. The call consumes
-/// each eligible lane, including on a later failure.
+/// Each eligible lane at [`BRIDGE_VERB_FD`] and [`BRIDGE_PUSH_FD`] must have been transferred exclusively to this call: no Rust or foreign owner may retain it. No thread or callback may close or replace either lane during adoption. The call consumes each eligible lane, including on a later failure.
 pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
     static TAKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if TAKEN.swap(true, std::sync::atomic::Ordering::SeqCst) {
@@ -41,11 +40,7 @@ pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
             "the bridge's inherited lanes were already taken by this process",
         ));
     }
-    // SAFETY: on the GUI route these are the launcher's unclaimed lanes;
-    // a hand-started process may have neither, which is a checked refusal.
-    // This startup route takes each eligible descriptor once (`TAKEN`) before
-    // bridge threads; neither has another Rust owner or concurrent
-    // close/replacement.
+    // SAFETY: on the GUI route these are the launcher's unclaimed lanes; a hand-started process may have neither, which is a checked refusal. This startup route takes each eligible descriptor once (`TAKEN`) before bridge threads; neither has another Rust owner or concurrent close/replacement.
     let verb = unsafe { adopt_inherited_socket(BRIDGE_VERB_FD) }?;
     // SAFETY: the same startup ownership admission for the distinct push lane.
     let push = unsafe { adopt_inherited_socket(BRIDGE_PUSH_FD) }?;
@@ -53,10 +48,9 @@ pub unsafe fn adopt_startup_bridge_lanes() -> io::Result<(OwnedFd, OwnedFd)> {
 }
 
 /// Adopt an inherited socket as a close-on-exec copy, closing the original number after duplication.
+///
 /// # Safety
-/// The descriptor number must not be closed or replaced by another thread or callback during this call.
-/// If it names a socket eligible for adoption, no other owner may hold it: its ownership must
-/// have been given up to this call. Once taken, it is closed even if duplication fails.
+/// The descriptor number must not be closed or replaced by another thread or callback during this call. If it names a socket eligible for adoption, no other owner may hold it: its ownership must have been given up to this call. Once taken, it is closed even if duplication fails.
 pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
     use std::os::unix::fs::FileTypeExt as _;
     let meta = descriptor_metadata(fd).map_err(|e| {
@@ -91,22 +85,18 @@ pub unsafe fn adopt_inherited_socket(fd: RawFd) -> io::Result<OwnedFd> {
             ),
         ));
     }
-    // SAFETY: the caller admitted exclusive, stable ownership; the checks
-    // above only diagnose type/flags. This is the number's one owner, dropped
-    // immediately after its close-on-exec copy is made.
+    // SAFETY: the caller admitted exclusive, stable ownership; the checks above only diagnose type/flags. This is the number's one owner, dropped immediately after its close-on-exec copy is made.
     let inherited = unsafe { OwnedFd::from_raw_fd(fd) };
     inherited.try_clone()
 }
 
-/// What descriptor `fd` refers to, read from the descriptor itself: an `fstat` of the number as it stands, never copied and never closed.
+/// What descriptor `fd` refers to, read from the descriptor itself.
 pub fn descriptor_metadata(fd: RawFd) -> io::Result<std::fs::Metadata> {
     // SAFETY: `F_GETFD` reads one descriptor's flags and touches no memory.
     if unsafe { fcntl(fd, F_GETFD) } < 0 {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: `fd` is open (just answered), and the `File` is never dropped
-    // (`ManuallyDrop`): it names the number for one `fstat`, which changes nothing.
-    // Closed by another thread in between, the `fstat` answers `EBADF`.
+    // SAFETY: `fd` is open (just answered), and the `File` is never dropped (`ManuallyDrop`): it names the number for one `fstat`, which changes nothing. Closed by another thread in between, the `fstat` answers `EBADF`.
     let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
     file.metadata()
 }
@@ -150,7 +140,7 @@ pub struct LaneCommand {
 }
 
 impl LaneCommand {
-    /// `program` with no arguments, this process's environment, and stdio inherited — `Command::new`'s defaults.
+    /// `program` with no arguments, this process's environment, and stdio inherited.
     #[must_use]
     pub fn new(program: impl AsRef<OsStr>) -> Self {
         Self {
@@ -259,7 +249,7 @@ impl LaneChild {
         }
     }
 
-    /// `SIGCONT` the child: a child started stopped ([`Command::start_suspended`]) runs; a running one carries on.
+    /// `SIGCONT` the child: a child started stopped ([`Command::start_suspended`]) runs.
     pub fn resume(&mut self) -> io::Result<()> {
         if self.status.is_some() {
             return Ok(());
@@ -314,7 +304,7 @@ pub fn spawn_with_two_fds(
     launch(cmd, &lanes)
 }
 
-/// Spawn `cmd` holding its stdio and nothing else: no descriptor of this process above stdio reaches it, whatever this process holds without close-on-exec (Metal's shader-cache files; another thread's `socketpair` or `pipe` caught before its `F_SETFD`).
+/// Spawn `cmd` holding its stdio and nothing else.
 pub fn spawn(cmd: LaneCommand) -> io::Result<LaneChild> {
     launch(cmd, &[])
 }
@@ -671,7 +661,7 @@ mod platform {
         Ok(unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(found) })
     }
 
-    /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`: the child holds stdio and the lanes and nothing else.
+    /// `posix_spawn` with `POSIX_SPAWN_CLOEXEC_DEFAULT`.
     pub(super) fn spawn(image: &Image, place: &Placement<'_>) -> io::Result<i32> {
         let argv = Image::pointers(&image.argv);
         let envp = Image::pointers(&image.envp);
@@ -699,10 +689,7 @@ mod platform {
         if place.suspended {
             flags |= POSIX_SPAWN_START_SUSPENDED;
         }
-        // SAFETY: each call takes an object `Objects::new` initialised and a
-        // live local or C string; none retains a pointer past the call. The
-        // disclaim setter is the SPI `disclaimer` resolved, called with its
-        // own prototype on that same attribute object.
+        // SAFETY: each call takes an object `Objects::new` initialised and a live local or C string; none retains a pointer past the call. The disclaim setter is the SPI `disclaimer` resolved, called with its own prototype on that same attribute object.
         unsafe {
             check(posix_spawnattr_setflags(&mut objects.attr, flags))?;
             if !place.inherit_all {
@@ -995,8 +982,7 @@ mod platform {
     }
 
     /// # Safety
-    /// Only between `fork` and `exec`, with `sources[..placed]` at 5 or above
-    /// (or `INHERIT`), `null` and `report` open, and `exec`'s pointers live.
+    /// Only between `fork` and `exec`, with `sources[..placed]` at 5 or above (or `INHERIT`), `null` and `report` open, and `exec`'s pointers live.
     unsafe fn child(
         strip: Option<InheritStrip>,
         sources: &[RawFd; 5],
@@ -1068,14 +1054,14 @@ mod platform {
     }
 }
 
-/// The strip, for a spawn that must fork (a PTY child: `setrlimit` and a controlling terminal are not `posix_spawn` file actions).
+/// The strip, for a spawn that must fork.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InheritStrip {
     bound: RawFd,
 }
 
 impl InheritStrip {
-    /// Read [`descriptor_bound`] in the parent, before the fork, and pass libnotify's once-gate ([`pass_libnotify_gate`]), so no fork that strips (aterm-pty's spawn, [`InheritNothing`], the update hand-off's fork lane) loses its child inside `fork()`.
+    /// Read [`descriptor_bound`] in the parent, before the fork, and pass libnotify's once-gate.
     #[must_use]
     pub fn prepare() -> Self {
         pass_libnotify_gate();
@@ -1109,7 +1095,7 @@ impl InheritStrip {
     }
 }
 
-/// A `std::process::Command` whose child inherits nothing of this process above stdio: [`InheritStrip`] in a `pre_exec` hook, for a spawn that must fork anyway.
+/// A `std::process::Command` whose child inherits nothing of this process above stdio.
 pub trait InheritNothing {
     /// Install the strip.
     fn inherit_nothing(&mut self) -> &mut Self;
@@ -1126,9 +1112,7 @@ impl InheritNothing for StdCommand {
     fn inherit_nothing(&mut self) -> &mut Self {
         use std::os::unix::process::CommandExt as _;
         let strip = InheritStrip::prepare();
-        // SAFETY: the hook runs between fork and exec (or right before an exec of this
-        // process) and calls only `InheritStrip::apply`: raw syscalls over integers, no
-        // allocation, no lock. `strip` is a plain integer copied into the closure.
+        // SAFETY: the hook runs between fork and exec (or right before an exec of this process) and calls only `InheritStrip::apply`: raw syscalls over integers, no allocation, no lock. `strip` is a plain integer copied into the closure.
         unsafe {
             self.pre_exec(move || {
                 strip.apply();
@@ -1163,7 +1147,7 @@ fn past_text_busy<T>(
     }
 }
 
-/// A spawn this module does not make — a `std::process::Command` built with [`InheritNothing`] — tried again while the kernel refuses its exec as `ETXTBSY`, as this module's own are ([`past_text_busy`]): for up to a second off Darwin, once on Darwin.
+/// A spawn this module does not make.
 pub fn spawn_past_text_busy<T>(spawn: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     #[cfg(not(target_vendor = "apple"))]
     {
@@ -1196,7 +1180,7 @@ thread_local! {
 mod no_fork;
 pub use no_fork::{Child, Command, Rusage, Stdio};
 
-/// A [`Command`] for `program`: its child holds its stdio and nothing else, and on Darwin it starts without a fork.
+/// A [`Command`] for `program`.
 #[must_use]
 pub fn command(program: impl AsRef<OsStr>) -> Command {
     Command::new(program)
@@ -1212,7 +1196,7 @@ mod darwin_strip {
     use std::os::fd::RawFd;
 
     const PROC_PIDLISTFDS: i32 = 1;
-    /// How many descriptors one listing holds: `struct proc_fdinfo` is 8 bytes, so 16 KiB of the forking thread's stack.
+    /// How many descriptors one listing holds.
     pub(super) const SLOTS: usize = 2048;
 
     #[repr(C)]
@@ -1239,7 +1223,7 @@ mod darwin_strip {
         ) -> i32;
     }
 
-    /// Mark every descriptor from 3 up that this process's table lists, and return the numbers the listing does not vouch for: none when it listed the whole table; from one past its last entry (the kernel lists in ascending order) to [`table_end`] when it filled the buffer; `3..bound` when it failed.
+    /// Mark every descriptor from 3 up that this process's table lists, and return the numbers the listing does not vouch for: none when it listed the whole table.
     pub(super) fn mark_listed(bound: RawFd) -> core::ops::Range<RawFd> {
         let mut listed = [FdInfo { fd: -1, _kind: 0 }; SLOTS];
         // SAFETY: `listed` is `LISTING_BYTES` writable bytes of `proc_fdinfo` slots, which the kernel fills and does not retain; `getpid` takes nothing.
@@ -1287,7 +1271,7 @@ mod darwin_strip {
     }
 }
 
-/// One more than the highest descriptor number this process can ever hold, by a limit no thread of an unprivileged process can raise, so a number read before a fork still bounds the child's whole table.
+/// One more than the highest descriptor number this process can ever hold, by a limit no thread of an unprivileged process can raise.
 #[must_use]
 pub fn descriptor_bound() -> RawFd {
     const FALLBACK: RawFd = 1 << 20;
@@ -1362,7 +1346,7 @@ mod linux_strip {
         fn close(fd: RawFd) -> i32;
     }
 
-    /// `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)`: Linux 5.11+. 436 on every architecture of the unified syscall table.
+    /// `close_range(3, ~0U, CLOSE_RANGE_CLOEXEC)`.
     pub(super) fn close_range_cloexec() -> bool {
         const SYS_CLOSE_RANGE: c_long = 436;
         const CLOSE_RANGE_CLOEXEC: c_long = 1 << 2;
@@ -1377,7 +1361,7 @@ mod linux_strip {
         }
     }
 
-    /// Mark every number `/proc/self/fd` lists (but its own directory's), read with raw `getdents64` into a stack buffer — what CPython's `_posixsubprocess` does in the same place, for the same reason.
+    /// Mark every number `/proc/self/fd` lists (but its own directory's), read with raw `getdents64` into a stack buffer.
     pub(super) fn proc_self_fd() -> bool {
         #[cfg(target_arch = "x86_64")]
         const SYS_GETDENTS64: c_long = 217;
@@ -1513,7 +1497,7 @@ mod command_tests;
 #[path = "spawnfd_transparent_tests.rs"]
 mod transparent_tests;
 
-/// Test-only, deliberately leaky spawns that owe nothing to std's: the control arm of every inheritance test here (and in [`crate::pspawn`]).
+/// Test-only, deliberately leaky spawns that owe nothing to std's.
 #[cfg(test)]
 #[path = "spawnfd_test_support.rs"]
 pub(crate) mod test_support;

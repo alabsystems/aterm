@@ -101,7 +101,6 @@ impl Link {
         if self.tx.send(msg).is_ok()
             && let Some(wake) = &self.wake
         {
-            // Non-blocking: a full socket already holds a wake.
             let _ = (&**wake).write(&[1]);
         }
     }
@@ -244,7 +243,7 @@ impl Publisher {
         }
     }
 
-    /// A new window's adapter. Its handlers run on the publisher thread.
+    /// A new window's adapter.
     pub fn adapter(
         &self,
         activation_handler: impl 'static + ActivationHandler + Send,
@@ -434,8 +433,7 @@ impl Worker {
         }
     }
 
-    /// Asks `IsEnabled` and attaches or detaches to match. `Err` when the
-    /// session bus is gone.
+    /// Asks `IsEnabled` and attaches or detaches to match.
     fn refresh_status(&mut self) -> Result<(), ()> {
         let enabled = match proxies::is_enabled(&mut self.session) {
             Ok(enabled) => enabled,
@@ -560,7 +558,7 @@ impl Worker {
         let _ = self.refresh_status();
     }
 
-    /// Everything the windows queued. `false` once the publisher is dropped.
+    /// Everything the windows queued.
     fn drain_channel(&mut self) -> bool {
         loop {
             let msg = match self.rx.try_recv() {

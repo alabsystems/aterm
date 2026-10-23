@@ -1,12 +1,7 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Bounded cost of the rows-only resize. It changes no line's width, so only the live/history
-//! boundary moves inside the ring; evacuating the ring into the tiered store would cost
-//! O(history) under the terminal lock and strand bump-allocated `PageStore` pages.
-//! `count_rows_only_resize_migrated_rows` counts the rows it evacuates: a grow evacuates none,
-//! and a shrink leaves the whole history ring-resident. `cost_bound` covers the width rewrap.
+//! Bounded cost of the rows-only resize.
 
 use super::super::super::*;
 use crate::test_counters::take_rows_only_resize_migrated_rows;
@@ -77,8 +72,7 @@ fn rows_only_resize_leaves_history_in_the_ring() {
     grid.assert_invariants();
 }
 
-/// On a tiered grid, ring-history extras (a hyperlink on a scrolled-off line) survive a rows-only
-/// resize. `rows_only_ring_retention` pins the ring-only shape.
+/// On a tiered grid, ring-history extras survive a rows-only resize.
 #[test]
 fn rows_only_resize_keeps_tiered_ring_history_extras() {
     use std::sync::Arc;

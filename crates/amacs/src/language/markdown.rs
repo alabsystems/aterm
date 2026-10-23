@@ -5,17 +5,12 @@
 //! quotes, list markers, thematic breaks, inline code, link targets,
 //! autolinks and HTML comments (open across lines); and list and quote
 //! continuation for line breaks and indentation.
-//!
-//! Emphasis is left plain: its flanking rules need more than one pass, and
-//! a code span that never closes runs to the end of its line for the same
-//! reason.
 
 use super::{
     Cursor, FillPrefix, IndentStyle, LexState, Mode, Spans, SyntaxClass, decimal_push, leading,
     leading_blanks, line_space,
 };
 
-/// The largest number an ordered list marker may carry (nine digits).
 const MAX_LIST_NUMBER: u32 = 999_999_999;
 
 pub(super) fn lex(state: LexState, line: &str, out: &mut Spans) -> LexState {
@@ -24,8 +19,6 @@ pub(super) fn lex(state: LexState, line: &str, out: &mut Spans) -> LexState {
         Mode::Fence(mark, length, quotes) => {
             match fenced(state, &mut cur, mark, length, quotes, out) {
                 Some(next) => return next,
-                // The quote the fence was opened in ended on this line, and the
-                // fence with it: the line is read afresh.
                 None => block(&mut cur, out),
             }
         }
@@ -40,10 +33,6 @@ pub(super) fn lex(state: LexState, line: &str, out: &mut Spans) -> LexState {
     LexState { mode, ..state }
 }
 
-/// A line inside a fence opened under `quotes` quote markers: code, or the
-/// fence that closes it. The line's own quote markers come first; a line
-/// with fewer has left the quote, which ends the fence too (CommonMark §5.1),
-/// and is `None`, with the cursor back at the start and nothing pushed.
 fn fenced(
     state: LexState,
     cur: &mut Cursor<'_>,
@@ -77,9 +66,6 @@ fn fenced(
     Some(state)
 }
 
-/// Where the text after `quotes` quote markers (`>`, each after optional
-/// blanks) starts in `line`, the blank after the last marker included;
-/// `None` when the line has fewer markers. Zero markers is offset 0.
 fn quote_prefix(line: &str, quotes: u8) -> Option<usize> {
     let mut cur = Cursor::new(line);
     let mut seen = 0u8;
@@ -96,12 +82,7 @@ fn quote_prefix(line: &str, quotes: u8) -> Option<usize> {
     Some(cur.pos())
 }
 
-/// The block-level start of a line outside a fence: a fence, a heading, a
-/// thematic break, quote markers, a list marker. Returns the mode the rest of
-/// the line is in: [`Mode::Code`] when inline text follows.
 fn block(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
-    // The quote markers read so far: a fence opened after them is in the
-    // quote, and its lines carry them too.
     let mut quotes = 0u8;
     loop {
         cur.eat_while(line_space);
@@ -112,14 +93,12 @@ fn block(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
         match byte {
             b'`' | b'~' => {
                 let run = cur.eat_while(|next| next == byte);
-                // A backtick fence's info string holds no backtick.
                 let fence = run >= 3 && !(byte == b'`' && cur.rest().contains('`'));
                 if fence {
                     cur.finish();
                     out.push(start, cur.pos(), SyntaxClass::Meta);
                     return Mode::Fence(byte, u8::try_from(run).unwrap_or(u8::MAX), quotes);
                 }
-                // Not a fence: inline code, read from its first backtick.
                 *cur = rewind(cur, start);
                 return Mode::Code;
             }
@@ -166,7 +145,6 @@ fn block(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
     }
 }
 
-/// A cursor over the same line, back at `pos`.
 const fn rewind<'a>(cur: &Cursor<'a>, pos: usize) -> Cursor<'a> {
     Cursor {
         line: cur.line,
@@ -174,15 +152,11 @@ const fn rewind<'a>(cur: &Cursor<'a>, pos: usize) -> Cursor<'a> {
     }
 }
 
-/// Whether `rest` is a setext underline of `mark`: the mark repeated, then
-/// only blanks.
 fn setext_underline(rest: &str, mark: u8) -> bool {
     let body = rest.trim_end_matches([' ', '\t', '\r']);
     !body.is_empty() && body.bytes().all(|byte| byte == mark)
 }
 
-/// Whether `rest` is a thematic break: three or more of one of `-`, `*`,
-/// `_`, with blanks between them allowed.
 fn thematic_break(rest: &str) -> bool {
     let mut mark = None;
     let mut count = 0usize;
@@ -199,15 +173,12 @@ fn thematic_break(rest: &str) -> bool {
     count >= 3
 }
 
-/// Inline text: code spans, escapes, HTML comments, autolinks, link
-/// targets, table pipes.
 fn inline(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
     while let Some(byte) = cur.peek() {
         let start = cur.pos();
         match byte {
             b'`' => {
                 let run = cur.eat_while(|next| next == b'`');
-                // The span closes on a run of exactly as many backticks.
                 while !cur.done() {
                     if cur.peek() == Some(b'`') {
                         if cur.eat_while(|next| next == b'`') == run {
@@ -260,8 +231,6 @@ fn inline(cur: &mut Cursor<'_>, out: &mut Spans) -> Mode {
     Mode::Code
 }
 
-/// The rest of an HTML comment from `start` (its `<!--` read): closed on
-/// this line, or open to the next.
 fn html_comment(cur: &mut Cursor<'_>, start: usize, out: &mut Spans) -> Mode {
     while !cur.done() {
         if cur.looking_at(b"-->") {
@@ -296,9 +265,6 @@ enum Marker {
     Ordered { number: u32, delimiter: u8 },
 }
 
-/// The list item `line` starts, if it starts one: a bullet (`-`, `*`, `+`)
-/// or a number of one to nine digits and `.` or `)`, then a blank or the end
-/// of the line. A thematic break (`- - -`) is not an item.
 fn list_item(line: &str) -> Option<ListItem> {
     let indent = leading_blanks(line);
     let mut cur = Cursor::new(line);
@@ -349,14 +315,11 @@ fn list_item(line: &str) -> Option<ListItem> {
 }
 
 impl ListItem {
-    /// Whether the item has no text after its marker.
     fn is_empty(self, line: &str) -> bool {
         line.get(self.content..)
             .is_none_or(|rest| rest.bytes().all(line_space))
     }
 
-    /// The marker the next item of the same list starts with, with one blank
-    /// after it (and an open task box after a task).
     fn next_marker(self) -> String {
         let mut marker = match self.marker {
             Marker::Bullet(bullet) => char::from(bullet).to_string(),
@@ -380,12 +343,6 @@ impl ListItem {
 /// A line break after `before` (a line starting in `state`), outside a
 /// string: the bytes of `before` that stay (out of `keep`, all of it but its
 /// trailing blanks) and the new line's prefix.
-///
-/// Inside a fence or an HTML comment the new line keeps the indentation
-/// (after the fence's quote markers). Otherwise a list item with text gets
-/// the next item's marker, a quoted line its quote markers, and an empty
-/// item or an empty quote line ends the list or the quote: its marker is
-/// taken off the line above (the quote around an ended item stays).
 pub(super) fn line_break(state: LexState, before: &str, keep: usize) -> (usize, String) {
     if let Mode::Fence(_, _, quotes) = state.mode {
         let markers = quote_prefix(before, quotes).unwrap_or(0);

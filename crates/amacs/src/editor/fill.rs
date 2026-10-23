@@ -3,14 +3,6 @@
 
 //! `fill-paragraph` (M-q): refill the paragraph at the primary caret so its
 //! lines run as close to the fill column as their words allow.
-//!
-//! A paragraph is the run of non-blank lines around the caret that share
-//! one comment leader (`//`, `#`, `>` and the rest of [`LEADERS`]), so a
-//! comment block fills as a comment and a commit message's body fills as
-//! prose. A list item (`- `, `* `, `+ `) starts a paragraph of its own, and
-//! its later lines hang under its text. Words are separated by one space;
-//! nothing inside a word changes. The refill is one edit, so one undo takes
-//! it back, and the caret stays on the character it was on.
 
 use std::ops::Range;
 
@@ -33,13 +25,7 @@ const fn room(line_width: u64, fill_column: u64) -> u64 {
 }
 
 trust_contract_fn! {
-    /// Whether a word `word_width` columns wide fits in the `room` a line
-    /// has left before the fill column ([`room`]), after the one space that
-    /// separates it from the word before: it needs `word_width + 1`
-    /// columns, so it fits exactly when it is narrower than the room. With
-    /// `room = fill_column - line_width` that is
-    /// `line_width + 1 + word_width <= fill_column`, decided without the
-    /// addition, which could overflow.
+    /// Whether a word `word_width` columns wide plus its separating space fits in `room`.
     #[must_use]
     pub(super) fn word_fits(room: u64, word_width: u64) -> bool
     clauses [ensures result == (word_width < room) by word_fits_is_narrower_than_the_room]
@@ -50,10 +36,6 @@ trust_contract_fn! {
 
 // Spec `word-fits` (SPECS.md): a word joins a line exactly when it is
 // narrower than the room the line has left, its separating space included.
-// Kernel-checked against the compiled body. (The comparison takes the room,
-// not the line and the column: E6 mints no kernel import for a body with a
-// checked subtraction's overflow assert, so the subtraction stays in
-// `room`, which saturates.)
 verify_island! {
     clean {
         theorem word_fits_is_narrower_than_the_room (room word_width : UInt64) :
@@ -63,10 +45,7 @@ verify_island! {
     }
 }
 
-/// One line of a paragraph: its byte range in the document (up to its
-/// `\n`), its leader (indent, comment marker and the spaces after it) and
-/// where its body ends: before the `\r` of a CRLF ending, so a CRLF file's
-/// `\r` never reads as a space between words.
+/// One line of a paragraph: its byte range, leader range, and body end before any `\r`.
 #[derive(Clone, Debug)]
 struct ParagraphLine {
     range: Range<usize>,
@@ -92,8 +71,6 @@ impl ParagraphLine {
         Self {
             range: start..end,
             leader: start..start + indent + marker + spaces,
-            // A leader is spaces, tabs and a marker, never `\r`, so it
-            // ends at or before the body's end.
             body_end: if line.ends_with('\r') {
                 end.saturating_sub(1)
             } else {
@@ -163,8 +140,6 @@ impl EditorWorkspace {
                 "No paragraph to fill here".into(),
             )]);
         }
-        // Up to the paragraph's first line, collected bottom up and turned
-        // over once, so a paragraph of many lines costs one pass.
         let mut lines = Vec::new();
         let mut first = here;
         while first.bullet(text).is_none() && first.range.start > 0 {
@@ -185,15 +160,11 @@ impl EditorWorkspace {
             }
             lines.push(below);
         }
-        // The lines break as the paragraph's own do (CRLF stays CRLF), or
-        // as the document's, for a last line with no ending.
         let line_break = lines
             .iter()
             .find_map(|line| line.ending(text))
             .unwrap_or_else(|| document_line_break(text));
 
-        // The first line keeps its leader (and its bullet); the lines after it
-        // take the second line's leader, or hang under a bullet's text.
         let first = &lines[0];
         let bullet = first.bullet(text);
         let first_prefix = format!(
@@ -260,8 +231,6 @@ impl EditorWorkspace {
             return Ok(Vec::new());
         }
 
-        // The caret stays on its character: the word it is in (or the next
-        // one, from the space before it) at the same offset.
         let caret_at = words
             .iter()
             .zip(&placed)

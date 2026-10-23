@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! Waits (design §12): conditions, backoff, heartbeats and the poller. Every clock read and
-//! sleep is the client's `Fx`, so a test's wait takes no real time and a replay's none at all.
+//! Waits (design §12): conditions, backoff, heartbeats and the poller.
 
 use std::time::Duration;
 
@@ -83,9 +82,7 @@ pub enum WaitEvent<'a> {
     Heartbeat {
         /// Time waited so far.
         elapsed: Duration,
-        /// The not-yet conditions, as `{slug}:{observed}` joined by `; `, passed through the
-        /// client's redactor whole and then cut to 200 characters, so no cut can split a
-        /// secret the redactor knows only whole.
+        /// The not-yet conditions, as `{slug}:{observed}` joined by `; `, redacted whole and cut to 200 characters.
         last: &'a str,
     },
     /// An observation changed.
@@ -95,8 +92,7 @@ pub enum WaitEvent<'a> {
     },
 }
 
-/// How a wait ended. `Held` and `TimedOut` carry the state object
-/// `{"conditions":[{"cond","holds","observed"}],"elapsed_s"}`.
+/// How a wait ended.
 pub enum WaitEnd {
     /// Every condition holds.
     Held(aterm_json::Value),
@@ -114,8 +110,7 @@ pub enum WaitEnd {
     Impossible(Error),
 }
 
-/// The poller. Time and sleeps are its client's `Fx` (`gh.fx()`), so a test's wait takes no
-/// real time and a replay's takes none at all.
+/// The poller.
 pub struct Poller<'a> {
     /// The effect seam.
     pub fx: &'a Fx,
@@ -129,13 +124,10 @@ pub struct Poller<'a> {
     pub blind_limit: Duration,
 }
 
-/// The longest `last` a heartbeat line prints, in characters, cut after redaction.
 const LAST_MAX: usize = 200;
 
-/// One condition's latest observation: whether it held, and what was observed.
 type Seen = Option<(bool, Value)>;
 
-/// The state object: each condition with its latest observation, and the seconds waited.
 fn state(conditions: &[Box<dyn Condition>], seen: &[Seen], elapsed: Duration) -> Value {
     let listed: Vec<Value> = conditions
         .iter()
@@ -148,8 +140,6 @@ fn state(conditions: &[Box<dyn Condition>], seen: &[Seen], elapsed: Duration) ->
     json!({"conditions": listed, "elapsed_s": elapsed.as_secs()})
 }
 
-/// The unmet conditions as `{slug}:{observed}`, joined by `; `, uncut (the poller redacts,
-/// then cuts).
 fn unmet(conditions: &[Box<dyn Condition>], seen: &[Seen]) -> String {
     let parts: Vec<String> = conditions
         .iter()
@@ -166,8 +156,6 @@ fn unmet(conditions: &[Box<dyn Condition>], seen: &[Seen]) -> String {
 }
 
 impl Poller<'_> {
-    /// A heartbeat: the unmet conditions redacted whole by the client's redactor, then cut
-    /// to [`LAST_MAX`] characters.
     fn beat(
         gh: &Github,
         conditions: &[Box<dyn Condition>],
@@ -187,12 +175,7 @@ impl Poller<'_> {
         });
     }
 
-    /// Poll `conditions` until they all hold, one is impossible, the poller is blind, or the
-    /// timeout passes (plan §11.4).
-    ///
-    /// A retriable error, a rate limit included, is no observation: rounds with none for
-    /// `blind_limit` end the wait `Blind`, carrying the last failure (its reset and
-    /// `Retry-After` with it), and the pacing is the backoff's alone.
+    /// Poll `conditions` until they all hold, one is impossible, the poller is blind, or the timeout passes.
     pub fn run(
         &self,
         gh: &Github,
@@ -207,10 +190,6 @@ impl Poller<'_> {
         let mut last_success = start;
         let mut last_heartbeat = start;
         let mut last_error: Option<Error> = None;
-        // `seen` is each condition's latest observation, which the state shows (plan §11.4 step
-        // 3). A retriable failure is no observation (plan §4.6.22): it leaves `seen` as it was, so
-        // a timeout prints the last observed state (design §12), and a failure and a recovery
-        // to the same value are no change. It still withholds `Held` for its round.
         let mut seen: Vec<Seen> = vec![None; conditions.len()];
         let mut first_round = true;
         loop {
@@ -231,9 +210,6 @@ impl Poller<'_> {
                     }
                 };
                 observed_any = true;
-                // Any observation that differs from the condition's previous one is a change
-                // (plan §11.4 step 5); a first round's observations all are, so its sleep is
-                // `backoff.start`, and a first round that observed nothing grows the interval.
                 if seen.as_ref().map(|(_, before)| before) != Some(&value) {
                     changed = true;
                     if !first_round {
@@ -311,7 +287,6 @@ pub enum ReleaseCond {
     Gone,
 }
 
-/// The conditions `parse` reads, for its usage error's next.
 const CONDITIONS: &str = "conditions: exists, published, prerelease, latest, not-latest, \
                           assets=N, asset=NAME[,NAME…], digest=NAME:sha256:HEX, \
                           anon-visible=NAME, gone";
@@ -326,10 +301,6 @@ fn asset_name(name: &str) -> bool {
 
 /// `path::refuse_bad_tag` for a wait on `tag` of `slug`, given before any request: no round
 /// could ever observe such a tag.
-///
-/// # Errors
-///
-/// That usage, with next `agh help release wait`.
 pub(crate) fn refuse_tag(tag: &str, slug: &Slug) -> Result<()> {
     crate::path::refuse_bad_tag(tag).map_err(|e| {
         e.with_next("agh help release wait")
@@ -407,7 +378,6 @@ impl ReleaseCond {
     }
 }
 
-/// How one condition reads its release, with its own validator and last answer.
 struct Observer {
     slug: Slug,
     tag: String,
@@ -418,14 +388,6 @@ struct Observer {
 }
 
 impl Observer {
-    /// The release with the tag, or `None` when there is none.
-    ///
-    /// Under Read: `GET /repos/{o}/{r}/releases/tags/{tag}` with `If-None-Match` on the last
-    /// ETag; a 304 reuses the last answer, and a probe-confirmed NotFound is "no release".
-    /// Under WriterRead: `objects_for_tag`, where two releases with the tag are Conflict
-    /// `AmbiguousTag`, which no later round can change. For `gone` (`for_gone`), which asks
-    /// only whether a published release has the tag (design §12), several are no conflict:
-    /// the answer is a published one when there is one, else a draft.
     fn release(&mut self, gh: &Github, for_gone: bool) -> Result<Option<ReleaseObject>> {
         refuse_tag(&self.tag, &self.slug)?;
         if self.how.access != Access::Read {
@@ -486,7 +448,6 @@ impl Observer {
     }
 }
 
-/// `{"assets","draft","id","prerelease","tag_name"}`, or null.
 fn summary(release: Option<&ReleaseObject>) -> Value {
     release.map_or(Value::Null, |r| {
         json!({
@@ -509,7 +470,6 @@ const fn verdict(holds: bool, observed: Value) -> Verdict {
     }
 }
 
-/// One polled release condition.
 struct ReleaseCondition {
     cond: ReleaseCond,
     observer: Observer,
@@ -521,8 +481,6 @@ impl Condition for ReleaseCondition {
     }
 
     fn check(&mut self, gh: &Github) -> Result<Verdict> {
-        // Before any condition's request, `anon-visible`'s probe included: a tag that names
-        // no release path is usage, which ends the wait at once.
         refuse_tag(&self.observer.tag, &self.observer.slug)?;
         if let ReleaseCond::AnonVisible(name) = &self.cond {
             let observer = &self.observer;
@@ -587,8 +545,6 @@ impl Condition for ReleaseCondition {
                     .is_some_and(|d| d == *digest);
                 verdict(holds, got.map_or(Value::Null, Value::from))
             }
-            // No published release has the tag: under --include-drafts a draft is no release
-            // for `gone` (design §12), and a Read never sees one.
             ReleaseCond::Gone => verdict(r.is_none_or(|r| r.draft), summary(r)),
             ReleaseCond::AnonVisible(_) => verdict(false, Value::Null),
         };

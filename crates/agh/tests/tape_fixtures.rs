@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! The fixture tapes in `tapes/` (design §21.3): each was recorded by hand from live,
-//! read-only, anonymous calls to the public `alabsystems/aterm`. Each parses, holds nothing
-//! but the public repository's own answers, and replays offline to the output it recorded.
+//! The fixture tapes in `tapes/` (design §21.3): each was recorded by hand from live, read-only, anonymous calls to the public `alabsystems/aterm`.
 
 use std::sync::Arc;
 
@@ -17,8 +15,7 @@ use astream_effects::EffectRecord;
 
 use crate::common::{self, run_cli, scratch};
 
-/// Each tape's name and text. `release-list` is not here: its first page's body is over the
-/// 1 MiB a tape holds, so it is taped by digest only and cannot replay.
+/// Each tape's name and text.
 const FIXTURES: &[(&str, &str)] = &[
     ("repo-view", include_str!("tapes/repo-view.atape")),
     ("release-latest", include_str!("tapes/release-latest.atape")),
@@ -34,8 +31,7 @@ const FIXTURES: &[(&str, &str)] = &[
     ),
 ];
 
-/// The private development owner's name, in halves as `aterm-release`'s transforms spell it,
-/// so neither the export's rewrite nor its guard touches this file.
+/// The private development owner's name, in halves as `aterm-release`'s transforms spell it, so neither the export's rewrite nor its guard touches this file.
 const PRIVATE_ORG: &str = concat!("andrew", "yatesai");
 
 /// The developer account word, in halves for the same reason.
@@ -153,11 +149,6 @@ fn tape_fixtures_replay_offline() {
     }
 }
 
-// A bare `--replay` of a tape that can be read once (a pipe, as `cat T | agh --replay
-// /dev/stdin` hands one over): `cli::run` reads it for its command line and hands the same
-// tape to the run, so the replay never opens the pipe again, which would read it empty and
-// refuse the tape. The pipe is this process's own (`std::io::pipe`), named by `/dev/fd/N`,
-// so no child is spawned (plan §1, rule 4); the hang detector bounds a read that never ends.
 #[cfg(unix)]
 #[test]
 fn a_fixture_replays_from_a_pipe_with_a_bare_replay() {
@@ -171,7 +162,6 @@ fn a_fixture_replays_from_a_pipe_with_a_bare_replay() {
     let root = scratch("fixture-pipe");
     let (reader, mut writer) = std::io::pipe().expect("a pipe");
     std::thread::spawn(move || {
-        // One writer, once: its drop is the reader's EOF.
         writer.write_all(text.as_bytes()).expect("the tape");
     });
     let (tx, rx) = mpsc::channel();

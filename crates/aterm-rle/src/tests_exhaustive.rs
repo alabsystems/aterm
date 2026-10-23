@@ -4,7 +4,6 @@
 
 use super::*;
 
-/// Index<u32> valid access via `rle[i]` syntax.
 #[test]
 fn rle_index_trait_valid_access() {
     let rle = Rle::from_iter([10u8, 20, 20, 30]);
@@ -14,7 +13,6 @@ fn rle_index_trait_valid_access() {
     assert_eq!(rle[3], 30);
 }
 
-/// Index<u32> panics on out-of-bounds access.
 #[test]
 #[should_panic(expected = "index out of bounds")]
 fn rle_index_trait_oob_panics() {
@@ -22,7 +20,6 @@ fn rle_index_trait_oob_panics() {
     let _ = rle[3]; // OOB: valid indices are 0..3
 }
 
-/// ExactSizeIterator reports correct remaining count after partial iteration.
 #[test]
 fn rle_exact_size_iter_after_partial_iteration() {
     let rle = Rle::from_iter([1u8, 1, 2, 3, 3, 3]);
@@ -41,14 +38,10 @@ fn rle_exact_size_iter_after_partial_iteration() {
     iter.next(); // consume 6th (last)
     assert_eq!(iter.len(), 0);
 
-    // Exhausted — still reports 0
     assert_eq!(iter.next(), None);
     assert_eq!(iter.len(), 0);
 }
 
-/// Exhaustive small-domain test for `set` correctness (value written,
-/// other values preserved, structural invariants). Covers len 1..=4,
-/// all valid indices, and representative new_val values.
 #[test]
 fn rle_set_correctness_exhaustive() {
     for len in 1u8..=4 {
@@ -58,19 +51,16 @@ fn rle_set_correctness_exhaustive() {
                 let original_len = rle.len();
                 rle.set(idx as u32, new_val);
 
-                // Value correctness
                 assert_eq!(
                     rle.get(idx as u32),
                     Some(new_val),
                     "set({idx},{new_val}) on len={len}: wrong value",
                 );
-                // Length preservation
                 assert_eq!(
                     rle.len(),
                     original_len,
                     "set({idx},{new_val}) on len={len}: length changed",
                 );
-                // Other values preserved
                 for other in 0..len {
                     if other != idx {
                         assert_eq!(
@@ -80,7 +70,6 @@ fn rle_set_correctness_exhaustive() {
                         );
                     }
                 }
-                // Structural invariants
                 for run in rle.runs() {
                     assert!(run.length > 0, "zero-length run");
                 }
@@ -99,10 +88,6 @@ fn rle_set_correctness_exhaustive() {
     }
 }
 
-/// Exhaustive small domain for `set_range`: every `(len, start, end)` with
-/// len 1..=4, over a uniform sequence and one whose first cell differs. The
-/// range reads back the new value, every cell outside it is unchanged, the
-/// length holds, and the runs stay non-empty, compact and exactly summed.
 #[test]
 fn rle_set_range_exhaustive() {
     for len in 1u8..=4 {

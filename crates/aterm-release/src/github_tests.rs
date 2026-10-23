@@ -608,7 +608,7 @@ fn a_real_sigterm_reaches_a_post_cut_reads_curl_and_nothing_more_is_asked() {
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let sent = command("kill")
+        let sent = command(aterm_uds::os_path!("kill"))
             .args(["-TERM", &probe.id().to_string()])
             .status()
             .unwrap();

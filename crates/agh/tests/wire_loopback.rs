@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 // Author: Andrew Yates
 
-//! `HttpTransport::direct` on agh-fake: headers, the credential's origin, hops, moves.
+//! `HttpTransport::direct` on agh-fake: headers, credential origin, hops, moves.
 
 use std::io::Read;
 use std::sync::Arc;
@@ -21,27 +21,22 @@ use agh_fake::{AssetSpec, FakeGithub, FakeOrigin, Fault, Match, ReleaseSpec, Rep
 
 use crate::common;
 
-/// A body limit for the transport-level requests.
 const LIMIT: u64 = 1 << 20;
 
 fn read_of(text: &str) -> RouteRequest {
     RouteRequest::read(RouteTarget::Repo(common::slug(text)))
 }
 
-/// A fake holding the public `fixture-dev/repo`.
 fn fake_with_repo() -> FakeGithub {
     let fake = FakeGithub::start();
     fake.add_repo("fixture-dev/repo", RepoSpec::public());
     fake
 }
 
-/// An anonymous client over `HttpTransport::direct` on `fake`.
 fn anonymous(fake: &FakeGithub) -> agh::Github {
     common::github(Router::empty(), fake)
 }
 
-/// Every request `fake` saw carried no `Content-Length` (each test's requests are reads), and
-/// the fake recorded no breach of its wire rules.
 fn assert_clean(fake: &FakeGithub) {
     for seen in fake.seen() {
         assert_eq!(seen.header("content-length"), None, "{seen:?}");
@@ -49,7 +44,6 @@ fn assert_clean(fake: &FakeGithub) {
     fake.assert_clean();
 }
 
-/// Deadlines whose idle is 200 ms.
 fn short_idle() -> Deadlines {
     Deadlines {
         idle: Duration::from_millis(200),
@@ -57,13 +51,11 @@ fn short_idle() -> Deadlines {
     }
 }
 
-/// A published release with one asset on `repo`; the asset's id.
 fn one_asset(fake: &FakeGithub, repo: &str) -> u64 {
     let release = fake.add_release(repo, ReleaseSpec::published("v1", "2026-10-01T00:00:00Z"));
     fake.add_asset(release, AssetSpec::uploaded("a.bin", b"the asset bytes"))
 }
 
-/// The asset download as `call_stream` makes it: Accept octet-stream, one hop.
 fn asset_call(repo: &str, id: u64) -> Call {
     Call::get(format!("/repos/{repo}/releases/assets/{id}"), read_of(repo))
         .accept(Accept::OctetStream)
@@ -219,10 +211,6 @@ fn an_asset_past_the_call_limit_is_too_large_after_the_hop() {
     assert_clean(&fake);
 }
 
-/// A whole 2xx past the call's limit, over the shipped transport: under the 64 KiB wire floor
-/// (`limit(100)`) and over it (`limit(70_000)`), the refusal keeps the status, the fake's
-/// request id and the rate, and its why names the call's own limit. aterm-http, held to the
-/// call's limit itself, would refuse the declared length before the cut and drop the head.
 #[test]
 fn a_whole_read_past_the_call_limit_keeps_its_head() {
     let fake = fake_with_repo();
@@ -465,8 +453,6 @@ fn a_spent_primary_limit_is_recorded_and_the_next_call_pre_refused() {
     assert_clean(&fake);
 }
 
-/// A transport-level GET of `path` on `role`'s origin of `fake`, with the headers the fake
-/// requires, and no credential.
 fn bare_request<'a>(
     fake: &FakeGithub,
     role: OriginRole,
@@ -524,8 +510,6 @@ fn direct_transport_refuses_writes() {
     assert_clean(&fake);
 }
 
-/// `round_trip` of a bare GET to `url` through `HttpTransport::new` over `env`, which reads
-/// the proxy variables.
 fn through_the_environment(env: agh::identity::MapEnv, url: &str) -> WireError {
     let transport = HttpTransport::new(Arc::new(env));
     let request = WireRequest::new(
@@ -542,8 +526,6 @@ fn through_the_environment(env: agh::identity::MapEnv, url: &str) -> WireError {
 
 #[test]
 fn an_unusable_proxy_variable_is_a_proxy_failure_before_any_connection() {
-    // aterm-http refuses both values while it resolves the proxy, before it opens a socket,
-    // so port 9 is never dialled.
     for value in ["https://proxy.invalid:1", "socks5://x"] {
         let env = common::env().with("HTTP_PROXY", value);
         let error = through_the_environment(env, "http://127.0.0.1:9/x");

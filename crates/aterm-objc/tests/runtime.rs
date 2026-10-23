@@ -45,9 +45,7 @@ fn ns_string_round_trips_every_rust_string_exactly() {
 fn an_unpaired_surrogate_reads_as_a_replacement_character() {
     autoreleasepool(|_| {
         let units: [u16; 4] = [0x61, 0xD83C, 0x62, 0xDF0A];
-        // SAFETY: `+alloc` returns a +1 instance that
-        // `-initWithCharacters:length:` (`@32@0:8r^S16Q24`) consumes, reading
-        // `units.len()` code units during the call and returning +1 or nil.
+        // SAFETY: `+alloc` returns a +1 instance that `-initWithCharacters:length:` (`@32@0:8r^S16Q24`) consumes, reading `units.len()` code units and returning +1 or nil.
         let obj = unsafe {
             let alloc: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
             let raw = alloc(class(c"NSString"), sel!(alloc));
@@ -68,8 +66,7 @@ fn an_unpaired_surrogate_reads_as_a_replacement_character() {
 #[test]
 fn owned_and_retained_balance_exactly() {
     autoreleasepool(|_| {
-        // SAFETY: `+alloc`/`-init` on NSObject return a +1 instance this `Obj`
-        // adopts and releases exactly once.
+        // SAFETY: `+alloc`/`-init` on NSObject return a +1 instance this `Obj` adopts and releases once.
         let obj = unsafe {
             let alloc: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = msg();
             let raw = alloc(class(c"NSObject"), sel!(alloc));
@@ -93,8 +90,7 @@ fn owned_and_retained_balance_exactly() {
 
 #[test]
 fn from_owned_and_retain_reject_nil() {
-    // SAFETY: null is the one value both constructors are documented to accept
-    // and to map to `None`.
+    // SAFETY: null is the one value both constructors are documented to accept and map to `None`.
     unsafe {
         assert!(Obj::from_owned(Id::NIL).is_none());
         assert!(Obj::retain(Id::NIL).is_none());
@@ -105,8 +101,7 @@ fn from_owned_and_retain_reject_nil() {
 fn an_error_description_is_read_out_of_a_real_nserror() {
     autoreleasepool(|_| {
         let domain = ns_string("ATermTestDomain").expect("NSString");
-        // SAFETY: `+errorWithDomain:code:userInfo:` is a documented Foundation
-        // constructor returning an autoreleased NSError; the pool above owns it.
+        // SAFETY: `+errorWithDomain:code:userInfo:` returns an autoreleased NSError owned by the pool above.
         let err: Id = unsafe {
             let f: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel, Id, isize, Id) -> Id =
                 msg();
@@ -119,8 +114,7 @@ fn an_error_description_is_read_out_of_a_real_nserror() {
             )
         };
         assert!(!err.is_null());
-        // SAFETY: `err` is the live, autoreleased NSError built above; the pool
-        // opened at the top of this test outlives the read.
+        // SAFETY: `err` is the live autoreleased NSError built above, outlived by the test's pool.
         let text = unsafe { aterm_objc::ns_error_string(err) };
         assert!(
             text.contains("ATermTestDomain") && text.contains("42"),

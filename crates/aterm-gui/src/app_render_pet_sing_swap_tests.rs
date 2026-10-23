@@ -9,8 +9,6 @@ use aterm_effects::cursor_glow::{
 use aterm_effects::kitty_pet::PetSense;
 use std::time::{Duration, Instant};
 
-/// The grid the hit-box cases below resolve against — the same 10x20 cell on
-/// an 80x30 surface their `PetSense` uses, so the rect and the brain agree.
 fn hit_geom() -> aterm_effects::word_decorations::EffectGeom {
     aterm_effects::word_decorations::EffectGeom {
         cell_w: 10,
@@ -62,7 +60,6 @@ fn reduced_motion_first_resident_pet_frame_is_opaque_without_a_frame_train() {
         None,
         "an opaque reduced still owes no follow-up frame train"
     );
-    // The same brain must report actual motion again when it is enabled.
     let _ = crate::app_render::pet_tick_for_test(
         ws,
         aterm_effects::host::CaptureMode::Present,
@@ -86,9 +83,6 @@ fn reduced_motion_first_resident_pet_frame_is_opaque_without_a_frame_train() {
     );
 }
 
-/// Real pet ticks and the shipping sprite emitter, with a moving caret through
-/// the held song and its tail: the full body stays emitted and hit-testable,
-/// and a stale head cannot claim a second companion.
 #[test]
 fn singing_pet_keeps_its_body_hit_target_and_cursor_home() {
     let geom = hit_geom();
@@ -234,8 +228,6 @@ fn pet_mode_builds_real_song_tenure_without_an_invisible_ordinary_flight() {
         );
     }
 
-    // The idle pet-mode render path calls this every drained frame. Hidden
-    // tenure is intentionally retained, so the song can still spend it.
     cat.retire_unowned_cursor_motion();
     let song_at = t0 + Duration::from_millis(6_500);
     cat.set_singing(
@@ -320,10 +312,6 @@ fn hot_owner_or_style_change_grounds_an_invisible_ordinary_flight() {
     );
 }
 
-/// The cursor-viewport lifecycle: charged Glow/Trail and cursor-body state
-/// retire on the first history snapshot. The resident pet's half is
-/// `aterm_effects::companion`'s
-/// `the_brain_ticks_even_when_undrawable_so_the_lane_is_released`.
 #[test]
 fn history_retires_cursor_pixels_and_cursor_bodies() {
     let mut app = App::headless_for_test();
@@ -370,8 +358,6 @@ fn history_retires_cursor_pixels_and_cursor_bodies() {
     let mut history = CursorFxInputs::sample_for_test(t0 + Duration::from_millis(3));
     history.live_viewport = false;
     history.cur = None;
-    // Even a stale DECTCEM-visible bit cannot restore an active-grid cursor
-    // body over history.
     history.cursor_visible = true;
     let history_tick = app.cursor_frame(wid, history).expect("history tick");
     let ws = app.windows.get(&wid).expect("window");

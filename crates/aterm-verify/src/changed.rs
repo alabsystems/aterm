@@ -679,7 +679,7 @@ const GIT_REDIRECTS: [&str; 8] = [
 /// Build a `git --no-optional-locks` command in `dir`.
 #[must_use]
 pub fn git(dir: &Path, path_env: &OsStr) -> Command {
-    let mut c = Command::new("git");
+    let mut c = Command::new(aterm_uds::os_path!("git"));
     c.current_dir(dir)
         .env("PATH", path_env)
         .arg("--no-optional-locks")

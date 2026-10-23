@@ -1,5 +1,4 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 //! CSI sequence tests: parameter parsing, private markers, overflow clamping,
@@ -14,7 +13,6 @@ fn parse_csi_many_params() {
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
-    // 26 parameters: the first MAX_PARAMS (24) are kept.
     parser.advance_fast(
         b"\x1b[1;2;3;4;5;6;7;8;9;10;11;12;13;14;15;16;17;18;19;20;21;22;23;24;25;26m",
         &mut sink,
@@ -33,8 +31,6 @@ fn parse_csi_many_params() {
 
 #[test]
 fn parse_csi_kakoune_sgr() {
-    // Kakoune's 17-parameter SGR (reset, underline, truecolor fg and bg,
-    // attributes): a cap of 16 would drop the last.
     let mut parser = Parser::new();
     let mut sink = RecordingSink::default();
 
@@ -59,8 +55,6 @@ fn parse_csi_kakoune_sgr() {
 
 #[test]
 fn csi_single_sequences_dispatch_once() {
-    // One sequence -> exactly one CSI dispatch of (params, intermediates,
-    // final).
     let rows: &[(&str, &[u8], &[u16], &[u8], u8)] = &[
         ("simple SGR", b"\x1b[31m", &[31], &[], b'm'),
         ("two params", b"\x1b[1;31m", &[1, 31], &[], b'm'),
@@ -116,9 +110,6 @@ fn csi_fast_path_interleaved_with_text() {
     assert_eq!(sink.csi_dispatches[1].0, vec![0]);
 }
 
-/// `input` fed whole (the CSI fast path) and one byte per read (the per-byte
-/// state machine, since the fast path needs the whole sequence in one read)
-/// yield the same actions.
 fn assert_whole_read_matches_per_byte(input: &[u8]) {
     let mut parser_per_byte = Parser::new();
     let mut sink_per_byte = RecordingSink::default();
@@ -179,7 +170,6 @@ fn assert_whole_read_matches_per_byte(input: &[u8]) {
 
 #[test]
 fn csi_fast_path_falls_back_when_sequence_exceeds_64_bytes() {
-    // Longer than the fast path's 65-byte scan window, so it falls back.
     let mut input = Vec::from(&b"\x1b["[..]);
     for _ in 0..33 {
         input.extend_from_slice(b"1;");
@@ -191,23 +181,18 @@ fn csi_fast_path_falls_back_when_sequence_exceeds_64_bytes() {
 
 #[test]
 fn csi_fast_path_falls_back_on_unknown_byte_in_param_scan() {
-    // DEL (0x7F) is rejected by the fast parser param scanner.
-    // Ensure fallback path handles the sequence exactly like the per-byte path.
     let input = b"\x1b[1\x7fmZ";
     assert_whole_read_matches_per_byte(input);
 }
 
 #[test]
 fn csi_fast_path_falls_back_on_unexpected_byte_after_intermediate() {
-    // '$' enters intermediate collection, then '2' is unexpected in that phase.
     let input = b"\x1b[1$2mZ";
     assert_whole_read_matches_per_byte(input);
 }
 
 #[test]
 fn csi_fast_path_trailing_empty_colon_subparam_matches_per_byte() {
-    // A trailing ':' before the final byte (or an intermediate) opens no
-    // subparameter on either path.
     let trailing_cases = [
         b"\x1b[1;2:m".as_slice(),
         b"\x1b[1;4:m",
@@ -218,8 +203,6 @@ fn csi_fast_path_trailing_empty_colon_subparam_matches_per_byte() {
         assert_whole_read_matches_per_byte(input);
     }
 
-    // Controls: an empty colon value with a separator after it is a
-    // subparameter on both paths.
     let mid_cases = [
         b"\x1b[1;2:;3m".as_slice(),
         b"\x1b[1;4:3m",
@@ -231,12 +214,6 @@ fn csi_fast_path_trailing_empty_colon_subparam_matches_per_byte() {
     }
 }
 
-/// A parameter accumulates with saturating arithmetic and is clamped to
-/// `u16::MAX` when it closes: `ESC [ <digits> m` dispatches exactly
-/// `min(value, 65535)` for every digit repeated up to 24 times
-/// (far past `u32::MAX`), and for the values past `u32::MAX` that a wrapping
-/// accumulator would bring back small (`2^32` would read as 0, `2^32 + 5` as
-/// 5, `10 * 2^32` as 0).
 #[test]
 fn parameter_digits_saturate_and_finalize_clamps() {
     let mut runs: Vec<String> = (0..=9u8)
@@ -267,12 +244,6 @@ fn parameter_digits_saturate_and_finalize_clamps() {
     }
 }
 
-/// `add_param_digit` and `finalize_param` over the edges of the accumulator:
-/// a digit multiplies and adds with saturation (exactly at and around
-/// `u32::MAX / 10`, where it starts to saturate), a `;` or `:` closes the
-/// parameter as `min(value, 65535)` and resets the accumulator, and
-/// `finalize_param` clamps every value from 0 to 70,000 and `u32::MAX` — and
-/// still resets when the list is full and the value is dropped.
 #[test]
 fn add_param_digit_saturates_and_finalize_param_clamps() {
     let clamp = |value: u32| u16::try_from(value.min(u32::from(u16::MAX))).unwrap();

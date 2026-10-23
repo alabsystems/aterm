@@ -264,12 +264,12 @@ impl Tools for HostTools {
             args.extend(["-x".into(), "-S".into()]);
         }
         args.push(file.into());
-        self.checked(&Run::new("strip", args).bounded())
+        self.checked(&Run::new(aterm_uds::os_path!("strip"), args).bounded())
     }
 
     fn resign(&self, file: &Path) -> Result<(), String> {
         let run = Run::new(
-            "codesign",
+            aterm_uds::os_path!("codesign"),
             [OsString::from("-f"), "-s".into(), "-".into(), file.into()],
         )
         .bounded();
@@ -300,7 +300,11 @@ impl Tools for HostTools {
         std::fs::copy(b, &cb).map_err(|e| e.to_string())?;
         for c in [&ca, &cb] {
             self.checked(
-                &Run::new("codesign", [OsString::from("--remove-signature"), c.into()]).bounded(),
+                &Run::new(
+                    aterm_uds::os_path!("codesign"),
+                    [OsString::from("--remove-signature"), c.into()],
+                )
+                .bounded(),
             )?;
         }
         Ok(std::fs::read(&ca).map_err(|e| e.to_string())?
@@ -310,7 +314,7 @@ impl Tools for HostTools {
     fn thin(&self, file: &Path, arch: &str, out: &Path) -> Result<(), String> {
         self.checked(
             &Run::new(
-                "lipo",
+                aterm_uds::os_path!("lipo"),
                 [
                     file.as_os_str().to_owned(),
                     "-thin".into(),

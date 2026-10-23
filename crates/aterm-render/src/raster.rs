@@ -24,19 +24,13 @@ const fn lerp(t: f32, p0: Point, p1: Point) -> Point {
     point(p0.x + t * (p1.x - p0.x), p0.y + t * (p1.y - p0.y))
 }
 
-/// Maximum sagitta error (in grid cells) when flattening curves (`1.0 / 255.0`).
+/// Maximum sagitta error in grid cells when flattening curves.
 pub const FLATTEN_SAGITTA_PX: f32 = 1.0 / 255.0;
 
-/// `(4·t)²` — the squared second difference at which a quadratic's own chord
-/// already meets [`FLATTEN_SAGITTA_PX`], so it flattens to a single line.
 const ONE_LINE_DEVSQ: f32 = (4.0 * FLATTEN_SAGITTA_PX) * (4.0 * FLATTEN_SAGITTA_PX);
 
-/// `1/(4·t)` — the factor that turns a second difference into the square of the
-/// segment count that meets [`FLATTEN_SAGITTA_PX`].
 const INV_FOUR_SAGITTA: f32 = 1.0 / (4.0 * FLATTEN_SAGITTA_PX);
 
-/// Hard ceiling on the segments one curve may flatten to, so a hostile outline costs a
-/// wrong shape rather than a hung frame.
 const MAX_FLATTEN_SEGMENTS: usize = 4096;
 
 /// Signed-area coverage accumulation grid of `width` by `height` cells.
@@ -83,7 +77,6 @@ impl Rasterizer {
         let dxdy = (p1.x - p0.x) / (p1.y - p0.y);
         let mut x = p0.x;
         if p0.y < 0.0 {
-            // Entered the grid partway down: advance x to the y = 0 crossing.
             x -= p0.y * dxdy;
         }
         let y_first = p0.y as usize;
@@ -100,8 +93,6 @@ impl Rasterizer {
             let x1i = x1ceil as i32;
             let linestart_x0i = linestart as isize + x0i as isize;
             if linestart_x0i < 0 {
-                // Deliberately without advancing `x`, so the march does not
-                // reinterpret the segment.
                 continue;
             }
             if x1i <= x0i + 1 {
@@ -116,8 +107,6 @@ impl Rasterizer {
                 let am = 0.5 * s * x1f * x1f;
                 self.add(linestart_x0i, d * a0);
                 if x1i == x0i + 2 {
-                    // Exactly two interior-free columns: the middle takes
-                    // whatever the two corners did not.
                     self.add(linestart_x0i + 1, d * (1.0 - a0 - am));
                 } else {
                     let a1 = s * (1.5 - x0f);
@@ -194,7 +183,7 @@ impl Rasterizer {
         self.draw_line(p, p3);
     }
 
-    /// Calls `f(flat_index, coverage)` for every cell in row-major order with coverage in `0.0..=1.0`.
+    /// Calls `f(flat_index, coverage)` for every cell in row-major order.
     #[inline]
     pub fn for_each_pixel<F: FnMut(usize, f32)>(&self, mut f: F) {
         let mut acc = 0.0f32;

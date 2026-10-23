@@ -2,16 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The ARENA lanes: real-window measurements of the one shipped `aterm`, and
-//! head-to-heads against the pinned ghostty tip. The protocol every one of
-//! them follows (rule zero: the bench box, thermal state, interleaving,
-//! config parity, pinned harnesses) is `docs/measured/arena/README.md`; the
-//! pins are `crates/aterm-verify/perf/arena/manifest.toml`; each run that compares
-//! terminals writes a ledger entry under `docs/measured/arena/`.
-//!
-//! What this module holds is what every lane shares: the typed options, the
-//! pins, the bench-box preflight, the release build of the aterm under test,
-//! the scratch and socket directories, and the report socket the in-terminal
-//! halves ([`inner`]) answer on. What an interrupt must retire is [`live`].
+//! head-to-heads against the pinned ghostty tip.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -65,8 +56,7 @@ impl From<&str> for Halt {
     }
 }
 
-/// An arena lane's outcome. A lane that measured has no floor to hold its
-/// numbers to, so it is MEASURED (with where the numbers went), never a pass.
+/// An arena lane's outcome.
 pub(crate) fn outcome(result: Result<String, Halt>) -> LaneRun {
     match result {
         Ok(at) => LaneRun::measured(at),
@@ -84,8 +74,7 @@ fn spawn_halt(what: &str, e: &std::io::Error, fix: &str) -> Halt {
     }
 }
 
-/// The arena lanes' options, parsed and range-checked. A lane applies its own
-/// default to anything left `None`.
+/// The arena lanes' options, parsed and range-checked.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub(crate) struct Args {
     pub binary: Option<PathBuf>,
@@ -122,9 +111,7 @@ fn positive<T: std::str::FromStr + PartialOrd + Default>(
 }
 
 impl Args {
-    /// Parse the options the arena lanes read: `super::main` hands this only
-    /// those (`super::options_for`), so a flag with no arm here is one
-    /// [`super::OPTIONS`] gives an arena lane and this parser forgot.
+    /// Parse the options the arena lanes read.
     pub(crate) fn from_options(options: &BTreeMap<&'static str, String>) -> Result<Args, String> {
         let mut a = Args::default();
         for (flag, raw) in options {
@@ -172,8 +159,6 @@ impl Args {
                 "--allow-legacy-metric" => a.allow_legacy_metric = true,
                 "--warm" => a.warm = true,
                 "--dev-smoke" => a.dev_smoke = true,
-                // The run's switch, which `super::main` reads; it names every
-                // lane, so every lane's parser is handed it.
                 "--no-windows" => {}
                 other => return Err(format!("internal: `{other}` has no parser")),
             }
@@ -182,10 +167,7 @@ impl Args {
     }
 }
 
-/// The arena's cache — pre-generated corpora, the verified ghostty copy, the
-/// pinned vtebench — reused across runs, OUTSIDE the checkout: cargo builds
-/// the vtebench checkout in place, and under this workspace's root it would
-/// refuse a package that believes it is in a workspace it is not a member of.
+/// The arena's cache directory reused across runs outside the checkout.
 pub(crate) fn arena_dir() -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join("aterm-arena");
     if dir.starts_with(workspace_root()) {
@@ -201,7 +183,6 @@ pub(crate) fn arena_dir() -> Result<PathBuf, String> {
 }
 
 /// The longest unix-socket path the kernel takes (`sun_path` less its NUL).
-/// aterm refuses a longer `--control-sock` and runs with no socket at all.
 pub(crate) const MAX_SUN_PATH: usize = 103;
 
 /// Where a run's sockets live, whatever `$TMPDIR` is: macOS's per-user
@@ -289,7 +270,7 @@ pub(crate) fn stdout_of(cmd: &mut Command) -> Option<String> {
 
 /// The CPU, as `sysctl` names it (the architecture where it cannot).
 pub(crate) fn chip() -> String {
-    stdout_of(command("sysctl").args(["-n", "machdep.cpu.brand_string"]))
+    stdout_of(command(aterm_uds::os_path!("sysctl")).args(["-n", "machdep.cpu.brand_string"]))
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| std::env::consts::ARCH.to_string())
 }
@@ -346,8 +327,7 @@ pub(crate) fn bench_box(chip: &str, dev_smoke: bool) -> Result<Machine, Halt> {
 }
 
 /// [`bench_box`] for this machine and the ledger its entry goes to, with the
-/// thermal reading and the manual rule-zero reminders printed. The
-/// head-to-heads open macOS windows.
+/// thermal reading and the manual rule-zero reminders printed.
 pub(crate) fn preflight(dev_smoke: bool) -> Result<(Machine, LedgerBook), Halt> {
     if !cfg!(target_os = "macos") {
         return Err(Halt::skip(
@@ -431,7 +411,7 @@ pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Ha
             if !d.is_file() {
                 eprintln!("downloading {}", tip.artifact);
                 let part = d.with_extension("part");
-                let out = command("curl")
+                let out = command(aterm_uds::os_path!("curl"))
                     .args(["-sSfL", "-o"])
                     .arg(&part)
                     .arg(&tip.artifact)
@@ -463,26 +443,24 @@ pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Ha
     }
     let app = arena.join(format!("Ghostty-tip-{}.app", tip.bundle_version));
     if !app.is_dir() {
-        // Copied beside, then renamed: an interrupted copy is never taken for
-        // the installed app.
         let part = app.with_extension("part");
         let _ = std::fs::remove_dir_all(&part);
         let mount = Scratch::new("ghostty-dmg")?;
         run_ok(
-            command("hdiutil")
+            command(aterm_uds::os_path!("hdiutil"))
                 .args(["attach", "-nobrowse", "-quiet", "-readonly", "-mountpoint"])
                 .arg(mount.path())
                 .arg(&dmg),
             "hdiutil attach",
         )?;
         let copied = run_ok(
-            command("cp")
+            command(aterm_uds::os_path!("cp"))
                 .arg("-R")
                 .arg(mount.path().join("Ghostty.app"))
                 .arg(&part),
             "cp",
         );
-        let _ = command("hdiutil")
+        let _ = command(aterm_uds::os_path!("hdiutil"))
             .args(["detach", "-quiet"])
             .arg(mount.path())
             .status();
@@ -492,7 +470,7 @@ pub(crate) fn ghostty_tip(pins: &Pins, dmg: Option<&Path>) -> Result<Ghostty, Ha
     }
     let plist = app.join("Contents/Info.plist");
     let version = stdout_of(
-        command("defaults")
+        command(aterm_uds::os_path!("defaults"))
             .arg("read")
             .arg(&plist)
             .arg("CFBundleShortVersionString"),
@@ -572,12 +550,12 @@ pub(crate) fn build_aterm() -> Result<Aterm, String> {
 /// have changes, `unknown` when git cannot say.
 pub(crate) fn git_provenance(dir: &Path) -> String {
     let sha = stdout_of(
-        command("git")
+        command(aterm_uds::os_path!("git"))
             .args(["rev-parse", "--short=12", "HEAD"])
             .current_dir(dir),
     )
     .unwrap_or_else(|| "unknown".into());
-    let clean = command("git")
+    let clean = command(aterm_uds::os_path!("git"))
         .args(["diff", "--quiet"])
         .current_dir(dir)
         .status()
@@ -600,7 +578,6 @@ pub(crate) fn target_dir() -> Result<PathBuf, String> {
 pub(crate) fn without_aterm_env(cmd: &mut Command) -> &mut Command {
     for (key, _) in std::env::vars_os() {
         let name = key.to_string_lossy();
-        // The verify run's mark is no setting and stays (`VERIFY_RUN_VAR`).
         if name.starts_with("ATERM_") && name != aterm_uds::process::VERIFY_RUN_VAR {
             cmd.env_remove(key);
         }
@@ -609,9 +586,7 @@ pub(crate) fn without_aterm_env(cmd: &mut Command) -> &mut Command {
 }
 
 /// Wait for a launched instance's control socket: `Ok` once the path exists,
-/// an error if the leader exits first or `timeout` passes. A readiness poll —
-/// a socket's creation raises no event this process can wait on — that also
-/// watches the leader's exit on every turn.
+/// an error if the leader exits first or `timeout` passes.
 pub(crate) fn await_socket(
     group: &mut Group,
     sock: &Path,
@@ -656,9 +631,7 @@ fn verb_timeout(verb: &[&str]) -> Duration {
         .map_or(Duration::ZERO, Duration::from_millis)
 }
 
-/// Run one `ctl` verb and return its stdout, or the failure. Bounded by the
-/// verb's own timeout plus [`CTL_HUNG`]: a wedged client is killed and named,
-/// never waited on forever.
+/// Run one `ctl` verb and return its stdout, or the failure.
 pub(crate) fn ctl_out(bin: &Path, sock: &Path, verb: &[&str]) -> Result<String, String> {
     let deadline = Instant::now() + verb_timeout(verb) + CTL_HUNG;
     let out = aterm_uds::deadline::output_until(ctl(bin, sock).args(verb), deadline)
@@ -719,7 +692,6 @@ impl Inbox {
 
 impl Drop for Inbox {
     fn drop(&mut self) {
-        // Wake an acceptor nobody reported to, so its thread ends.
         let _ = UnixStream::connect(&self.path);
     }
 }
@@ -746,7 +718,7 @@ pub(crate) struct Ledger<'a> {
     pub competitors: &'a str,
 }
 
-/// The template with its `{{…}}` fields filled. Pure (unit-tested).
+/// The template with its `{{…}}` fields filled.
 pub(crate) fn fill_template(template: &str, l: &Ledger<'_>) -> String {
     template
         .replace("{{DATE}}", l.date)
@@ -757,9 +729,7 @@ pub(crate) fn fill_template(template: &str, l: &Ledger<'_>) -> String {
         .replace("{{COMPETITORS}}", l.competitors)
 }
 
-/// The append-only arena ledger, `docs/measured/arena/`. Its template is
-/// read before any trial, so a checkout without it (the public snapshot
-/// carries no docs/) skips at once rather than after minutes of measuring.
+/// The append-only arena ledger, `docs/measured/arena/`.
 pub(crate) struct LedgerBook {
     dir: PathBuf,
     template: String,
@@ -806,7 +776,8 @@ impl LedgerBook {
 }
 
 pub(crate) fn macos_version() -> String {
-    stdout_of(command("sw_vers").arg("-productVersion")).unwrap_or_else(|| "unknown".into())
+    stdout_of(command(aterm_uds::os_path!("sw_vers")).arg("-productVersion"))
+        .unwrap_or_else(|| "unknown".into())
 }
 
 #[cfg(test)]
@@ -856,8 +827,6 @@ mod tests {
     #[test]
     fn the_bench_box_is_the_m4_class_or_a_labelled_dev_smoke() {
         assert!(!bench_box("Apple M4 Max", false).expect("bench").dev_smoke);
-        // Another box is a fact about the box, not a failure: a SKIP naming
-        // the switch that measures there anyway.
         match bench_box("Apple M5 Max", false) {
             Err(Halt::Skip { fix, .. }) => assert!(fix.contains("--dev-smoke"), "{fix}"),
             other => panic!("expected a skip, got {other:?}"),

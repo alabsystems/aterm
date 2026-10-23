@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Panic-freedom fuzz for the CPU render path: drive the engine with input biased toward
-//! shaping, emoji, combining marks, wide CJK, procedural glyphs, random SGR styling and DEC
-//! line sizing, plus garbage bytes, then render every frame and assert the rasterizer never
-//! panics and returns a non-degenerate framebuffer. Deterministic LCG, so reproducible.
+
+//! Panic-freedom fuzz test for the CPU render path.
 
 use aterm_core::terminal::Terminal;
 use aterm_render::{Renderer, Theme};
@@ -17,8 +14,6 @@ fn next(state: &mut u64) -> u32 {
     (*state >> 33) as u32
 }
 
-/// A run of random SGR parameters, including the truecolor `38;2`/`48;2`/`58;2;r;g;b` and
-/// `4:n` underline-style forms, then `m`.
 fn emit_sgr(s: &mut u64, buf: &mut Vec<u8>) {
     buf.extend_from_slice(b"\x1b[");
     let np = 1 + next(s) % 5;
@@ -36,7 +31,6 @@ fn emit_sgr(s: &mut u64, buf: &mut Vec<u8>) {
             6 => buf.push(b'2'),               // dim
             7 => buf.push(b'0'),               // reset
             8 => {
-                // 4:n curly/dotted/dashed underline style
                 buf.extend_from_slice(b"4:");
                 buf.extend_from_slice((next(s) % 6).to_string().as_bytes());
             }
@@ -67,7 +61,6 @@ fn render_adversarial_engine_states_never_panics() {
     let mut s = 0x5EED_1337_C0DE_FACEu64;
     let mut term = Terminal::new(24, 80);
 
-    // Byte samples for the render paths under test.
     let samples: &[&[u8]] = &[
         "🚀".as_bytes(),
         "❤\u{fe0f}".as_bytes(),              // VS16 colour
@@ -88,8 +81,6 @@ fn render_adversarial_engine_states_never_panics() {
         "\u{1fb00}\u{1fb1e}\u{1fb3b}".as_bytes(), // sextants
         "\u{1cd00}\u{1cd73}\u{1cde5}".as_bytes(), // octants
         "\u{e0b0}\u{e0b1}\u{e0b2}\u{e0bc}".as_bytes(), // Powerline
-        // Symbol-tier glyphs whose raster overruns the cell and is condensed and
-        // column-clamped.
         "\u{27F5}\u{27F6}\u{27F7}\u{27F8}\u{27F9}\u{27FA}\u{27FB}\u{27FC}".as_bytes(),
         "\u{21D2}\u{21D4}\u{2261}\u{27F0}\u{2A7D}".as_bytes(),
         b"\x1b#3",
@@ -105,7 +96,6 @@ fn render_adversarial_engine_states_never_panics() {
     ];
 
     let mut buf: Vec<u8> = Vec::with_capacity(256);
-    // 700 frames × up to 8 feature chunks keeps the debug suite fast.
     for _ in 0..700u32 {
         buf.clear();
         let chunks = 1 + next(&mut s) % 8;
@@ -114,7 +104,6 @@ fn render_adversarial_engine_states_never_panics() {
                 0 | 1 => buf.extend_from_slice(samples[(next(&mut s) as usize) % samples.len()]),
                 2 => emit_sgr(&mut s, &mut buf),
                 3 => {
-                    // a CSI cursor/edit op with random params
                     buf.extend_from_slice(b"\x1b[");
                     let np = next(&mut s) % 4;
                     for _ in 0..np {
@@ -130,8 +119,6 @@ fn render_adversarial_engine_states_never_panics() {
         }
         term.process(&buf);
 
-        // Occasionally resize (and reflow) at modest sizes; large grids dominate render
-        // cost.
         if next(&mut s).is_multiple_of(96) {
             let rr = (1 + next(&mut s) % 32) as u16;
             let cc = (1 + next(&mut s) % 100) as u16;

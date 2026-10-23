@@ -59,7 +59,6 @@ mod unix {
     static WAKE_WR: AtomicI32 = AtomicI32::new(-1);
     /// A [`SignalWake`] is installed.
     static INSTALLED: AtomicBool = AtomicBool::new(false);
-    // SIGTSTP remains ignored if it was ignored when the wake was installed.
     /// SIGTSTP was ignored when the wake was installed (a parent with no job control
     /// arranged it): it stays ignored, and [`suspend`] does not stop.
     static TSTP_IGNORED: AtomicBool = AtomicBool::new(false);
@@ -140,10 +139,7 @@ mod unix {
         was
     }
 
-    // SA_RESTART keeps blocking syscalls running; `poll` never restarts.
-    /// Route `sig` to [`on_signal`], returning the disposition it replaced. SA_RESTART
-    /// keeps the process's other blocking calls running through it; the loop's `poll`
-    /// is never restarted, and the pipe holds the byte by then anyway.
+    /// Route `sig` to [`on_signal`] with `SA_RESTART`, returning the previous disposition.
     fn catch(sig: libc::c_int) -> libc::sigaction {
         // SAFETY: an all-zero `sigaction` is a valid value; filled in below.
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -159,8 +155,7 @@ mod unix {
         was
     }
 
-    /// SIGWINCH, SIGTSTP and SIGCONT routed to the wake pipe while it lives; their
-    /// dispositions put back when it is dropped. One per process at a time.
+    /// Routes `SIGWINCH`, `SIGTSTP`, and `SIGCONT` to the wake pipe until dropped.
     #[derive(Debug)]
     pub struct SignalWake {
         rd: RawFd,
@@ -221,8 +216,7 @@ mod unix {
             drain(self.rd);
         }
 
-        /// The signals caught since the last take. The pipe is emptied first, so a
-        /// signal caught meanwhile is either taken now or wakes the next `poll`.
+        /// Drain the wake pipe and return the signals caught since the last take.
         #[inline]
         pub fn take(&self) -> Signals {
             drain(self.rd);
@@ -259,8 +253,7 @@ mod unix {
         guard.reenter(modes)
     }
 
-    /// SIGTSTP at its default disposition, unblocked and raised: the process stops here
-    /// until SIGCONT. The caught disposition is put back afterwards.
+    /// Raise `SIGTSTP` under its default disposition and restore the caught disposition after `SIGCONT`.
     fn stop_self() {
         // SAFETY: an all-zero `sigaction` is a valid value (empty mask, no flags).
         let mut default: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -294,8 +287,7 @@ mod unix {
 mod tests {
     use super::{SignalWake, Signals};
 
-    /// A SIGWINCH sent to this process wakes the pipe and is taken once. SIGWINCH's
-    /// default is to be ignored, so it is safe to send in the test process.
+    /// Sending `SIGWINCH` to this process wakes the pipe and is taken once.
     #[test]
     fn a_resize_wakes_the_pipe() {
         let _alone = crate::raw::TEST_TERMINAL

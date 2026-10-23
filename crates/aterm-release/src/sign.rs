@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const CODESIGN: &str = "/usr/bin/codesign";
-const SPCTL: &str = "/usr/sbin/spctl";
-const XCRUN: &str = "/usr/bin/xcrun";
-const SECURITY: &str = "/usr/bin/security";
-const DITTO: &str = "/usr/bin/ditto";
-const ID_TOOL: &str = "/usr/bin/id";
+const CODESIGN: &str = aterm_uds::os_path!("codesign");
+const SPCTL: &str = aterm_uds::os_path!("spctl");
+const XCRUN: &str = aterm_uds::os_path!("xcrun");
+const SECURITY: &str = aterm_uds::os_path!("security");
+const DITTO: &str = aterm_uds::os_path!("ditto");
+const ID_TOOL: &str = aterm_uds::os_path!("id");
 
 /// How long `notarytool submit --wait` may run before the cut gives up.
 pub const NOTARY_SUBMIT_TIMEOUT: Duration = Duration::from_secs(40 * 60);

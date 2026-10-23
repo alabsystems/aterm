@@ -4,18 +4,6 @@
 //! Platform clock facade: re-exports `std::time` on native targets and
 //! bridges to browser clocks (`performance.now()` / `Date.now()`) on
 //! `wasm32-unknown-unknown`, where `std::time::Instant::now()` panics.
-//!
-//! * [`Instant`], [`SystemTime`], and [`Duration`] provide a unified clock API.
-//! * [`since_epoch`], [`unix_secs`], and [`unix_millis`] read wall-clock Unix
-//!   timestamps on both targets.
-//! * On `wasm32-unknown-unknown`, `f64` millisecond readings clamp negative or
-//!   non-finite values to zero and split whole milliseconds from the
-//!   fractional part before scaling to preserve sub-microsecond resolution.
-//! * Wasm cdylib crates define the link-time symbols
-//!   `aterm_wasm_performance_now` and `aterm_wasm_date_now` via
-//!   [`wasm_clock_host!`].
-// A clock needs no unsafe; on the wasm arm the one `unsafe` is the extern
-// block naming the two clock symbols.
 #![cfg_attr(
     not(all(target_arch = "wasm32", target_os = "unknown")),
     forbid(unsafe_code)
@@ -25,9 +13,6 @@
 /// so callers need only one import.
 pub use core::time::Duration;
 
-// The arm predicate is exactly `wasm32-unknown-unknown`, not `target_arch =
-// "wasm32"`: `wasm32-wasip1` and `wasm32-unknown-emscripten` have a working
-// `std::time` and no `performance` object.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod native {
     /// The platform monotonic clock: `std::time::Instant` itself.
@@ -48,30 +33,6 @@ pub use shim::{Instant, SystemTime, SystemTimeError, UNIX_EPOCH};
 /// Define the two browser clocks this crate reads on `wasm32-unknown-unknown`,
 /// from the wasm module's own bindings of `performance.now()` and
 /// `Date.now()`, each a `fn() -> f64`.
-///
-/// Invoke it once, in the crate that builds the `.wasm` (the cdylib). It
-/// expands to two `#[unsafe(no_mangle)] extern "C"` functions named
-/// `aterm_wasm_performance_now` and `aterm_wasm_date_now`. Each is gated to
-/// `wasm32-unknown-unknown`, so the invocation compiles to nothing on every
-/// other target, natively included. Being `no_mangle` in a cdylib, both are
-/// also exports of the module.
-///
-/// ```
-/// fn performance_now() -> f64 {
-///     0.0
-/// }
-/// fn date_now() -> f64 {
-///     0.0
-/// }
-/// aterm_time::wasm_clock_host!(performance_now, date_now);
-/// ```
-/// fn performance_now() -> f64 {
-///     0.0
-/// }
-/// fn date_now() -> f64 {
-///     0.0
-/// }
-/// aterm_time::wasm_clock_host!(performance_now, date_now);
 #[macro_export]
 macro_rules! wasm_clock_host {
     ($performance_now:path, $date_now:path $(,)?) => {
@@ -93,11 +54,6 @@ macro_rules! wasm_clock_host {
 
 /// The wall clock's distance past the Unix epoch, or `None` when it reads
 /// before 1970.
-///
-/// `SystemTime::now().duration_since(UNIX_EPOCH)` through this crate's
-/// [`SystemTime`], so it is also correct on `wasm32-unknown-unknown`. A clock
-/// before the epoch has no one right answer, so each caller writes its own
-/// fallback.
 #[must_use]
 #[inline]
 pub fn since_epoch() -> Option<Duration> {
@@ -183,8 +139,7 @@ pub const fn duration_from_canonical_parts(secs: u64, subsec_nanos: u32) -> Opti
 }
 
 /// Encode a canonical `(secs: u64, subsec_nanos: u32)` duration/timestamp into
-/// a 12-byte little-endian wire representation. Returns `None` if
-/// `subsec_nanos >= 1_000_000_000`.
+/// a 12-byte little-endian wire representation.
 #[must_use]
 #[inline]
 pub const fn encode_timestamp_96_le(secs: u64, subsec_nanos: u32) -> Option<[u8; 12]> {
@@ -231,8 +186,7 @@ pub const fn decode_timestamp_96_le(wire: &[u8; 12]) -> Option<(u64, u32)> {
 }
 
 /// Encode a canonical `(secs: u64, subsec_nanos: u32)` duration/timestamp into
-/// a 12-byte big-endian wire representation. Returns `None` if
-/// `subsec_nanos >= 1_000_000_000`.
+/// a 12-byte big-endian wire representation.
 #[must_use]
 #[inline]
 pub const fn encode_timestamp_96_be(secs: u64, subsec_nanos: u32) -> Option<[u8; 12]> {

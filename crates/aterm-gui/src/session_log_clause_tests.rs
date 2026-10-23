@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The session log's clause in a tab's tooltip and context menu (phase 3B,
-//! plan §5; addendum A12, A30), behind
-//! `[session_log] clause`, on by default since D6:
-//! `clause = false`, the chrome is as it was before the clause, byte
-//! for byte, and no lock is taken for it; on, a move of the clause
-//! recomposes the tab once, a shown label leaves at its `until` and names
-//! its author, a `ctl` label neither shows nor hides the step beneath it,
-//! and an open need comes before any label.
+//! Tests for the session log's clause in a tab's tooltip and context menu (`[session_log] clause`).
 
 use std::sync::{Arc, Mutex};
 
@@ -119,13 +112,7 @@ fn tooltip(ext: &crate::session_chrome::TabChromeExt) -> &str {
     ext.tooltip.as_deref().unwrap_or_default()
 }
 
-/// OFF IS TODAY'S CHROME: with the switch off a
-/// log that moves (a turn, a step, a person's label) leaves the tooltip, the
-/// menu and the expiry exactly what they were, even recomposed from
-/// nothing, and the timeline is not acquired for a clause: a held timeline
-/// enlists no retry.
-///
-/// NEGATIVE CONTROL: the same log with the switch on shows the step.
+/// With `[session_log] clause = false`, log activity leaves tooltip, menu, and expiry unchanged without locking the timeline.
 #[test]
 fn the_clause_off_leaves_the_tooltip_and_menu_byte_identical() {
     let (mut app, timeline, _hand) = hand_app(false);
@@ -151,20 +138,13 @@ fn the_clause_off_leaves_the_tooltip_and_menu_byte_identical() {
             "off: no acquisition, so no contention"
         );
     }
-    // Negative control.
     set_clause(&mut app, true);
     let on = chrome(&mut app);
     assert!(tooltip(&on).contains("\nnow: compiling"), "{on:?}");
     assert_ne!(on, before);
 }
 
-/// A MOVE OF THE CLAUSE RECOMPOSES THE TAB (addendum A12 items 1 and 4): a
-/// log append moves none of the cache's other keys, so the clause key is
-/// what misses it; a loop producer that sees the key move refreshes the tab
-/// once, and an unmoved clause is a hit.
-///
-/// NEGATIVE CONTROL: the hit gate without the clause key would serve the
-/// composition from before the step.
+/// A log move recomposes the tab's clause once when `[session_log] clause` is enabled.
 #[test]
 fn a_log_move_recomposes_the_tabs_clause_with_the_switch_on() {
     let (mut app, timeline, hand) = hand_app(true);
@@ -184,23 +164,16 @@ fn a_log_move_recomposes_the_tabs_clause_with_the_switch_on() {
         "{:?}",
         menu_words(&ext)
     );
-    // The clock alone moves nothing: the key holds no age.
     hand.advance(120_000);
     assert!(!app.clause_moved(0), "an older step is the same clause");
     assert_eq!(chrome(&mut app), ext);
-    // The next step is another clause; the turn under it after the close.
     close_step(&timeline, step);
     open_step(&timeline, turn, "edit");
     let edit = chrome(&mut app);
     assert!(tooltip(&edit).contains("\nnow: editing"), "{edit:?}");
 }
 
-/// D6 ON: an app on the default config,
-/// with no `[session_log]` table, shows the clause in the tooltip and the
-/// menu; the tab's label stays its identity title.
-///
-/// NEGATIVE CONTROL: the old default (`unwrap_or(false)`) composes no
-/// `now:` line.
+/// The default config shows the clause in the tooltip and menu while keeping the tab title unchanged.
 #[test]
 fn the_default_config_shows_the_clause() {
     let mut app = App::headless_for_test();
@@ -225,14 +198,7 @@ fn the_default_config_shows_the_clause() {
     );
 }
 
-/// a shown label leaves at its `until`, and the composition's
-/// expiry is that instant (no upgrade on the tab), so the scheduler's due
-/// batch recomposes the tab there and the step beneath shows again. The
-/// label names its author while it shows: the harness's
-/// says `by the harness`.
-///
-/// NEGATIVE CONTROL: a `ClauseLine` without its author fails the author
-/// assertion.
+/// A shown label expires at its `until` timestamp and names its author while visible.
 #[test]
 fn a_shown_label_leaves_the_chrome_at_its_until() {
     let (mut app, timeline, hand) = hand_app(true);
@@ -274,11 +240,7 @@ fn a_shown_label_leaves_the_chrome_at_its_until() {
     );
 }
 
-/// a `ctl` client's label is absent from the tooltip and the
-/// menu, present in `log`, and the step beneath it shows; the harness's
-/// label shows, attributed by being shown at all.
-///
-/// NEGATIVE CONTROL: the person's label over the same step shows.
+/// A `ctl` label is recorded in the log without appearing in the tooltip or menu.
 #[test]
 fn a_ctl_label_is_absent_from_the_chrome_and_present_in_the_log() {
     let (mut app, timeline, _hand) = hand_app(true);
@@ -300,7 +262,6 @@ fn a_ctl_label_is_absent_from_the_chrome_and_present_in_the_log() {
         "the label is the log's: {:?}",
         super::tests::lines_of(&timeline)
     );
-    // Negative control.
     label(&app, Actor::Human, "humanwords", 60);
     let ext = chrome(&mut app);
     assert!(
@@ -309,13 +270,7 @@ fn a_ctl_label_is_absent_from_the_chrome_and_present_in_the_log() {
     );
 }
 
-/// §7.3'S ORDER STANDS: a harness label written while a
-/// usage wall is open is the log's and not the chrome's: the wall's need
-/// row comes first, `now: limit · <its detail>`, and a need row names no
-/// author. Once the wall closes, the label shows, attributed.
-///
-/// NEGATIVE CONTROL: a clause that puts the label row before the need rows
-/// shows the label under the wall.
+/// An open usage wall takes precedence over a harness label until the wall closes.
 #[test]
 fn a_harness_label_under_an_open_usage_wall_shows_the_wall() {
     let (mut app, timeline, _hand) = hand_app(true);
@@ -358,7 +313,6 @@ fn a_harness_label_under_an_open_usage_wall_shows_the_wall() {
         "the label is the log's: {:?}",
         super::tests::lines_of(&timeline)
     );
-    // The wall closes: the label shows, attributed.
     close_step(&timeline, wall);
     let ext = chrome(&mut app);
     assert!(
@@ -367,13 +321,7 @@ fn a_harness_label_under_an_open_usage_wall_shows_the_wall() {
     );
 }
 
-/// ONLY A LABEL NAMES ITS AUTHOR: a turn a person prompted
-/// (`by=human`), a step a person's turn ran and a wall the harness raised
-/// each show in the tooltip and the menu with no `· by` suffix, though each
-/// record has an author a label row would print.
-///
-/// NEGATIVE CONTROL: a clause that names every row's author shows `by you`
-/// on the turn and the step, and `by the harness` on the wall.
+/// Need and work rows in the tooltip and menu omit the author suffix.
 #[test]
 fn a_need_or_work_row_names_no_author() {
     let (mut app, timeline, _hand) = hand_app(true);
@@ -443,9 +391,7 @@ fn a_need_or_work_row_names_no_author() {
     no_author(&mut app, "limit \u{b7} resets 14:05");
 }
 
-/// THE CLAUSE IS THE TOOLTIP'S AND THE MENU'S ALONE (D6): a move of it adds
-/// no timeline row (the timeline's high id holds) and leaves the tab's label
-/// its identity title.
+/// Updating the clause adds no timeline row and leaves the tab label unchanged.
 #[test]
 fn the_clause_moves_no_row_and_no_label() {
     let (mut app, timeline, _hand) = hand_app(true);

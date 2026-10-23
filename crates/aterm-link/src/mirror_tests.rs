@@ -18,11 +18,6 @@ fn slot(pseq: u64, sid: &str, ms: u64) -> PinSlot {
     }
 }
 
-/// D4, RULED: the mode reads its three
-/// words, and the default is `auto`, the turn class on over a broker that
-/// retains it (the bridge's half is `bridge_mirror_tests.rs`'s
-/// `an_auto_mirror_runs_only_over_a_broker_that_retains_it`). NEGATIVE CONTROL, run:
-/// the old `off` default fails it.
 #[test]
 fn the_mode_reads_its_three_words_and_defaults_to_turns_on_a_retaining_broker() {
     assert_eq!(LogMode::default(), LogMode::Auto);
@@ -33,9 +28,6 @@ fn the_mode_reads_its_three_words_and_defaults_to_turns_on_a_retaining_broker() 
     assert_eq!(LogMode::parse("TURNS"), None);
 }
 
-/// the take's frame round-trips — the header's byte count is the
-/// body's (what a Bytes reader counts), each line a sid, a cursor and a body
-/// with spaces in it.
 #[test]
 fn a_take_frame_reads_back_its_slots() {
     let body = "s-a 4:2:1 v=2 t=1 ep=4 seq=2 ms=1 op=open node=- k=spawn src=aterm conf=exact\n\
@@ -59,8 +51,6 @@ fn a_take_frame_reads_back_its_slots() {
     }
 }
 
-/// The pin is its batch exactly: rendered, read back, and refused whole when
-/// any line of it does not read.
 #[test]
 fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
     let pin = Pin {
@@ -83,9 +73,6 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
         "{text}"
     );
     assert_eq!(Pin::parse(&text), Ok(pin.clone()));
-    // An older build's pin (`v=1`, before the durable copies) reads the same;
-    // it is told from this build's, whole or cut short, and a prefix too short
-    // to name its version is neither's.
     let older = text.replacen("v=2", "v=1", 1);
     assert_eq!(Pin::parse(&older), Ok(pin.clone()));
     for (bytes, older_build, this_build) in [
@@ -103,8 +90,6 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
             String::from_utf8_lossy(bytes)
         );
     }
-    // A pin written before the key reads with none; a key that does not
-    // read, or a word past it, is damage.
     let keyless = Pin {
         key: None,
         ..pin.clone()
@@ -131,11 +116,6 @@ fn a_pin_round_trips_and_a_damaged_one_reads_as_damage() {
     assert!(Pin::parse("").is_err());
 }
 
-/// A PIN A POWER CUT CUT SHORT NEVER READS: every pin ends at the newline of
-/// its last line, so a prefix of one is damage — never a pin with a lower
-/// total and no key (count and key reset) nor a slot whose
-/// body lost its tail (republished cut). The mirror then stops, keeping the
-/// pin on disk, rather than mint a fresh key.
 #[test]
 fn a_pin_cut_anywhere_short_of_its_last_byte_does_not_read() {
     let pin = Pin {
@@ -164,13 +144,6 @@ fn a_pin_cut_anywhere_short_of_its_last_byte_does_not_read() {
     }
 }
 
-/// THE WINDOW LEDGER rides the
-/// pin as `win=` after the key and reads back exactly, with or without a key;
-/// one that does not read is damage. The window from `oldest=` counts every
-/// batch whose highest offset is at or above it, a cut forgets the batches it
-/// passed whole, and past its bound the two oldest merge into one that loses
-/// no byte and counts no shorter. NEGATIVE CONTROL, run: a window that counts
-/// a batch only ABOVE `oldest=` fails it.
 #[test]
 fn the_window_ledger_rides_the_pin_and_counts_what_the_broker_keeps() {
     let mut pin = Pin {
@@ -219,14 +192,6 @@ fn the_window_ledger_rides_the_pin_and_counts_what_the_broker_keeps() {
     assert_eq!(Pin::parse(&full.render()), Ok(full));
 }
 
-/// A FULL LEDGER GIVES ITS BYTES UP AS THE CUT PASSES THEM.
-/// A busy node fills its window in far more
-/// batches than the ledger keeps entries, evenly and unevenly: at every cut
-/// the ledger counts at least the bytes truly at or above it, and at most one
-/// merged entry more (1/32 of what it holds), so a window filled in 1024
-/// small batches opens again once the cut has passed half of them. NEGATIVE
-/// CONTROL, run: merging the two oldest counts the whole window until the
-/// cut has passed nearly all of it.
 #[test]
 fn a_full_ledger_gives_its_bytes_up_as_the_cut_passes_them() {
     const N: usize = 1024;
@@ -280,11 +245,6 @@ fn a_full_ledger_gives_its_bytes_up_as_the_cut_passes_them() {
     }
 }
 
-/// one landing names every session's last cursor once in each
-/// seq space, in the order they first appear, and its answer is one word a
-/// pair. A take holding an uncarried update's old-space `why=reset` cover
-/// before the new space's records lands both spaces: naming only
-/// the session's last cursor left the cover owed, taken again every take.
 #[test]
 fn a_landing_names_each_sessions_last_cursor_and_reads_a_word_a_pair() {
     let slots = [slot(1, "s-a", 1), slot(2, "s-b", 1), slot(3, "s-a", 2)];
@@ -333,7 +293,6 @@ fn a_landing_names_each_sessions_last_cursor_and_reads_a_word_a_pair() {
     assert!(!LandedWord::Fenced.settled() && !LandedWord::Adopting.settled());
 }
 
-/// The bucket on a stepped clock: a full burst, then the sustained rate.
 #[test]
 fn the_bucket_spends_its_burst_then_refills_at_its_rate() {
     let mut b = Bucket::full(0);
@@ -349,8 +308,6 @@ fn the_bucket_spends_its_burst_then_refills_at_its_rate() {
     assert_eq!(b.room(10_000_000), RATE_BURST, "never past the burst");
 }
 
-/// the alias key is minted, 16 random bytes, never a function of
-/// the node's caps: two mints differ, and none is all zeros.
 #[test]
 fn the_alias_key_is_minted_never_derived() {
     let a = mint_alias_key().expect("entropy");

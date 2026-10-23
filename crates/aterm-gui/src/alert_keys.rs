@@ -14,13 +14,8 @@ pub(crate) enum ConfirmKey {
     PassThrough,
 }
 
-/// `kVK_Return`. Key codes are layout-independent: the fallback when
-/// `charactersIgnoringModifiers` is unusable.
 const KVK_RETURN: u16 = 0x24;
-/// `kVK_ANSI_KeypadEnter` — the numeric keypad's Enter, which AppKit's default button
-/// also answers to, so aterm must too.
 const KVK_KEYPAD_ENTER: u16 = 0x4c;
-/// `kVK_Escape`.
 const KVK_ESCAPE: u16 = 0x35;
 
 /// What a keystroke means to a native confirmation alert.
@@ -66,9 +61,9 @@ mod macos {
 
     impl Drop for ConfirmKeyWatch {
         fn drop(&mut self) {
-            // SAFETY: `+[NSEvent removeMonitor:]` is `-(void)(id)` called once with the owned monitor token.
-            // Main thread: the monitor is installed from a main-thread path and this value holds an
-            // `Obj`, which is `!Send`.
+            // SAFETY: `+[NSEvent removeMonitor:]` is `-(void)(id)` called once with the owned
+            // monitor token. Main thread: the monitor is installed from a main-thread path and
+            // this value holds an `Obj`, which is `!Send`.
             unsafe {
                 appkit::send_v_id(
                     aterm_objc::class(c"NSEvent").as_id(),
@@ -79,14 +74,10 @@ mod macos {
         }
     }
 
-    /// Whether `window_a` and `window_b` are the same AppKit window object (identity, not
-    /// `isEqual:`).
     fn same_window(window_a: Id, window_b: Id) -> bool {
         !window_a.is_null() && window_a == window_b
     }
 
-    /// Whether `event` belongs to the confirmation `panel` and that confirmation is still on
-    /// screen.
     fn confirmation_owns_event(event: Id, panel: Id, parent: Option<Id>, _mtm: MainThread) -> bool {
         // SAFETY: plain property reads on a live event and live retained windows, on
         // the main thread (`_mtm` proves it). `-[NSEvent window]` and
@@ -111,9 +102,6 @@ mod macos {
         }
     }
 
-    /// Click one of the alert's own buttons with `performClick:`, the mouse path, so the
-    /// answer travels the alert's normal action path (ending the sheet or the modal session)
-    /// with no response-code plumbing of our own.
     fn click(button: Id) {
         // SAFETY: `-performClick:` is `-(void)(id)` on an `NSButton` this watch
         // retains — one of the two buttons added to the alert that is currently on
@@ -122,8 +110,6 @@ mod macos {
         unsafe { appkit::send_v_id(button, sel!(performClick:), Id::NIL) };
     }
 
-    /// The monitor's decision for one keyDown: the event itself to let AppKit carry
-    /// on, nil to swallow it (after clicking the button it stood for).
     fn decide(
         event: Id,
         panel: &Obj,
@@ -159,7 +145,8 @@ mod macos {
         }
     }
 
-    /// Install the key interceptor for confirmation alert `panel` with `accept` and `cancel` buttons.
+    /// Install the key interceptor for confirmation alert `panel` with `accept` and `cancel`
+    /// buttons.
     pub(crate) fn watch_alert_keys(
         panel: Obj,
         parent: Option<Obj>,
@@ -181,17 +168,16 @@ mod macos {
                 Err(_) => pass_through,
             }
         };
-        // SAFETY: `+addLocalMonitorForEventsMatchingMask:handler:` calls the block
-        // as `NSEvent *(^)(NSEvent *)` — the event to carry on with, or nil to
-        // swallow it — which is exactly the `(id) -> id` prototype `new1` builds
-        // here (`Id` is `Encode`-`"@"` on both sides); nothing unwinds out of its
-        // `invoke`.
+        // SAFETY: `+addLocalMonitorForEventsMatchingMask:handler:` calls the block as `NSEvent
+        // *(^)(NSEvent *)` — the event to carry on with, or nil to swallow it — which is exactly
+        // the `(id) -> id` prototype `new1` builds here (`Id` is `Encode`-`"@"` on both sides);
+        // nothing unwinds out of its `invoke`.
         let handler = unsafe { RcBlock::new1(handler) }?;
-        // SAFETY: `+[NSEvent addLocalMonitorForEventsMatchingMask:handler:]` is `@@:Q@?` taking a 64-bit mask and a `BlockPtr`.
-        // AppKit copies the block, so `handler` may drop at the end of this frame; the copy
-        // lives until `removeMonitor:` releases the token. The result is +0 (autoreleased: the
-        // selector is not `new`/`alloc`/`copy`), so it is retained into `Obj`, not adopted;
-        // adopting would over-release when the pool pops.
+        // SAFETY: `+[NSEvent addLocalMonitorForEventsMatchingMask:handler:]` is `@@:Q@?` taking a
+        // 64-bit mask and a `BlockPtr`. AppKit copies the block, so `handler` may drop at the end
+        // of this frame; the copy lives until `removeMonitor:` releases the token. The result is
+        // +0 (autoreleased: the selector is not `new`/`alloc`/`copy`), so it is retained into
+        // `Obj`, not adopted; adopting would over-release when the pool pops.
         let monitor = unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr) -> Id =
                 aterm_objc::checked_msg();
@@ -213,8 +199,8 @@ mod macos {
         field: &Obj,
         input: std::sync::Arc<crate::askpass::PasswordInput>,
     ) -> Option<ConfirmKeyWatch> {
-        // SAFETY: these are retained live native objects borrowed on the main
-        // thread; the block needs independent owners for its full lifetime.
+        // SAFETY: these are retained live native objects borrowed on the main thread; the block
+        // needs independent owners for its full lifetime.
         let (panel, parent, field) = unsafe {
             (
                 Obj::retain(panel.id())?,
@@ -231,8 +217,8 @@ mod macos {
             }
             match aterm_objc::contain("password input monitor", || {
                 let owns = confirmation_owns_event(event, panel.id(), Some(parent.id()), mtm);
-                // SAFETY: NSEvent accessors run in a native local monitor on
-                // the main thread; the mask admits only mouseDown/keyDown.
+                // SAFETY: NSEvent accessors run in a native local monitor on the main thread; the
+                // mask admits only mouseDown/keyDown.
                 unsafe {
                     let kind = appkit::send_usize(event, sel!(type));
                     if owns && kind == 1 && appkit::send_id(event, sel!(window)) == panel.id() {
@@ -273,8 +259,8 @@ mod macos {
                 Err(_) => Id::NIL,
             }
         };
-        // SAFETY: the local monitor's block is NSEvent *(^)(NSEvent *), matching
-        // this guarded (Id)->Id closure; AppKit copies it and returns +0 token.
+        // SAFETY: the local monitor's block is NSEvent *(^)(NSEvent *), matching this guarded
+        // (Id)->Id closure; AppKit copies it and returns +0 token.
         let handler = unsafe { RcBlock::new1(handler) }?;
         let monitor = unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, usize, BlockPtr) -> Id =
@@ -297,7 +283,7 @@ mod macos {
 
     /// The one outstanding multi-line-paste confirmation sheet.
     pub(crate) struct PasteConfirm {
-        /// Monotonic id, echoed back by `Wake::PasteConfirmed`, so an answer clears only its own sheet's entry ([`next_confirm_id`]).
+        /// Monotonic id echoed back by `Wake::PasteConfirmed`.
         pub(crate) id: u64,
         /// The logical window the sheet hangs off.
         pub(crate) wid: crate::WindowId,
@@ -329,9 +315,9 @@ mod macos {
 
         /// Whether this sheet is still on screen, per AppKit.
         pub(crate) fn is_attached(&self) -> bool {
-            // SAFETY: `-attachedSheet` is `-(NSWindow *)`, a plain property read on a
-            // retained window, borrowed only for the comparison; `PasteConfirm` lives
-            // on the main thread with `App` (it holds `Obj`s, which are `!Send`).
+            // SAFETY: `-attachedSheet` is `-(NSWindow *)`, a plain property read on a retained
+            // window, borrowed only for the comparison; `PasteConfirm` lives on the main thread
+            // with `App` (it holds `Obj`s, which are `!Send`).
             let sheet = unsafe { appkit::send_id(self.parent.id(), sel!(attachedSheet)) };
             same_window(sheet, self.panel.id())
         }
@@ -342,32 +328,21 @@ mod macos {
 mod tests {
     use super::{ConfirmKey, confirm_key};
 
-    /// `NSEventModifierFlagShift`.
     const SHIFT: u64 = 1 << 17;
-    /// `NSEventModifierFlagControl`.
     const CONTROL: u64 = 1 << 18;
-    /// `NSEventModifierFlagOption`.
     const OPTION: u64 = 1 << 19;
-    /// `NSEventModifierFlagCommand` (0x100000).
     const COMMAND: u64 = 1 << 20;
-    /// `NSEventModifierFlagFunction` (the keypad's Enter carries it).
     const FUNCTION: u64 = 1 << 23;
 
-    /// Return, `kVK_Return`.
     const RETURN: (Option<&str>, u16) = (Some("\r"), 0x24);
-    /// Keypad Enter, `kVK_ANSI_KeypadEnter`.
     const KEYPAD_ENTER: (Option<&str>, u16) = (Some("\u{3}"), 0x4c);
-    /// Escape, `kVK_Escape`.
     const ESCAPE: (Option<&str>, u16) = (Some("\u{1b}"), 0x35);
-    /// An ordinary character: `a`, `kVK_ANSI_A` (0x00, so the key-code fallback must not read
-    /// "no code" as Return).
     const LETTER_A: (Option<&str>, u16) = (Some("a"), 0x00);
 
     fn action(attached: bool, mods: u64, key: (Option<&str>, u16)) -> ConfirmKey {
         confirm_key(attached, mods, key.0, key.1)
     }
 
-    /// The modifiers include those a ⌘V/⌘Q gesture can leave down mid-release.
     #[test]
     fn every_modifier_combination_still_accepts_return() {
         for mods in [
@@ -402,7 +377,6 @@ mod tests {
         }
     }
 
-    /// A leaked interceptor is benign: with no confirmation attached nothing is intercepted.
     #[test]
     fn nothing_is_intercepted_when_no_confirmation_is_attached() {
         for key in [RETURN, KEYPAD_ENTER, ESCAPE, LETTER_A] {

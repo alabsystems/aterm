@@ -4,7 +4,7 @@
 //! Autonomous headless browser OAuth authorizer over Chrome DevTools Protocol (CDP) pipes.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -111,6 +111,17 @@ impl MailboxConfig {
             || self.webmail_url.is_some()
             || self.password.is_some()
             || !self.passwords.is_empty()
+    }
+
+    /// True when a mailbox source is configured that can serve `target_email`.
+    #[must_use]
+    pub fn is_configured_for(&self, target_email: Option<&str>) -> bool {
+        self.dir.is_some()
+            || self.http_url.is_some()
+            || self.imap_url.is_some()
+            || self.webmail_url.is_some()
+            || self.password_for(target_email).is_some()
+            || (target_email.is_none() && !self.passwords.is_empty())
     }
 
     /// Look up the password for `target_email` (falling back to the default `password`).
@@ -416,6 +427,38 @@ pub fn discover_mailbox_config_files(
     cfg.is_configured().then_some(cfg)
 }
 
+/// Interpret an explicit mailbox override without changing local path bytes.
+#[must_use]
+pub(super) fn mailbox_config_from_override(value: &OsStr, home: Option<&Path>) -> MailboxConfig {
+    let mut cfg = MailboxConfig::default();
+    if value.is_empty() {
+        return cfg;
+    }
+    if let Some(url) = value.to_str().map(str::trim) {
+        if url.starts_with("imap://") || url.starts_with("imaps://") {
+            cfg.imap_url = Some(url.to_owned());
+            return cfg;
+        }
+        if url.starts_with("http://") || url.starts_with("https://") {
+            cfg.http_url = Some(url.to_owned());
+            return cfg;
+        }
+    }
+    let path = PathBuf::from(value);
+    if path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|ext| ext.trim_end() == "toml")
+        && let Ok(text) = std::fs::read_to_string(&path)
+        && let Some(parsed) = MailboxConfig::from_toml_str(&text, home)
+    {
+        cfg.merge_from(parsed);
+    } else {
+        cfg.dir = Some(path);
+    }
+    cfg
+}
+
 /// Discover any configured mailbox source.
 #[must_use]
 pub fn discover_mailbox_config(
@@ -431,22 +474,8 @@ pub fn discover_mailbox_config(
             .filter(|v| !v.is_empty())
     };
 
-    if let Some(val) = non_empty_env(MAILBOX_ENV) {
-        if val.starts_with("imap://") || val.starts_with("imaps://") {
-            cfg.imap_url = Some(val);
-        } else if val.starts_with("http://") || val.starts_with("https://") {
-            cfg.http_url = Some(val);
-        } else {
-            let path = PathBuf::from(&val);
-            if path.extension().is_some_and(|ext| ext == "toml")
-                && let Ok(text) = std::fs::read_to_string(&path)
-                && let Some(parsed) = MailboxConfig::from_toml_str(&text, home)
-            {
-                cfg.merge_from(parsed);
-            } else {
-                cfg.dir = Some(path);
-            }
-        }
+    if let Some(value) = std::env::var_os(MAILBOX_ENV) {
+        cfg.merge_from(mailbox_config_from_override(&value, home));
     }
     if let Some(url) = non_empty_env(MAILBOX_URL_ENV) {
         if url.starts_with("imap://") || url.starts_with("imaps://") {
@@ -662,6 +691,38 @@ pub fn has_browser_profile(store_dir: &Path, label: &str, email: Option<&str>) -
         return true;
     }
     email.is_some_and(|em| browser_profile_dir(store_dir, Some(em)).is_dir())
+}
+
+/// Infer the account label from `CLAUDE_CONFIG_DIR` (`<store>/logins/<label>[+<seq>]`) when set.
+#[must_use]
+pub fn infer_account_label_from_env() -> Option<String> {
+    let dir = std::env::var_os(super::accounts::HOME_ENV)?;
+    let name = Path::new(&dir).file_name()?.to_str()?;
+    let label = name.rsplit_once('+').map_or(name, |(l, _)| l).trim();
+    (!label.is_empty()).then(|| label.to_owned())
+}
+
+/// Resolve the persistent browser profile directory under `store_dir`, reusing an existing
+/// `<store_dir>/browsers/<email>` or `<store_dir>/browsers/<label>` directory when present.
+#[must_use]
+pub fn resolve_browser_profile_dir(
+    store_dir: &Path,
+    label: Option<&str>,
+    email: Option<&str>,
+) -> PathBuf {
+    if let Some(em) = email {
+        let dir = browser_profile_dir(store_dir, Some(em));
+        if dir.is_dir() {
+            return dir;
+        }
+    }
+    if let Some(lbl) = label {
+        let dir = browser_profile_dir(store_dir, Some(lbl));
+        if dir.is_dir() {
+            return dir;
+        }
+    }
+    browser_profile_dir(store_dir, email.or(label))
 }
 
 /// Build the command-line arguments for launching `browser` with `profile_dir`.
@@ -1172,7 +1233,7 @@ fn fetch_imaps_curl_credential(
         parsed.port,
         percent_encode(&parsed.mailbox)
     );
-    let mut search_cmd = aterm_uds::spawnfd::command("curl");
+    let mut search_cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"));
     search_cmd.args([
         "--disable",
         "--globoff",
@@ -1211,7 +1272,7 @@ fn fetch_imaps_curl_credential(
             parsed.port,
             percent_encode(&parsed.mailbox)
         );
-        let mut msg_cmd = aterm_uds::spawnfd::command("curl");
+        let mut msg_cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"));
         msg_cmd.args([
             "--disable",
             "--globoff",
@@ -1328,7 +1389,7 @@ fn fetch_http_mailbox_credential(
     let body = if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
         fetch_loopback_http_body(&url, cfg.bearer_token.as_deref())?
     } else if url.starts_with("https://") || url.starts_with("http://") {
-        let mut cmd = aterm_uds::spawnfd::command("curl");
+        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("curl"));
         cmd.args([
             "--disable",
             "--globoff",
@@ -1918,13 +1979,18 @@ pub fn generate_totp_at(secret_base32: &str, unix_secs: u64) -> Option<String> {
 }
 
 fn webmail_step_js(
-    email: Option<&str>,
-    password: Option<&str>,
-    mailbox_password: Option<&str>,
-    totp_code: Option<&str>,
-    login_submitted: bool,
-    totp_submitted: bool,
-    mailbox_pw_submitted: bool,
+    (email, password, mailbox_password, totp_code): (
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+        Option<&str>,
+    ),
+    (user_submitted, login_submitted, totp_submitted, mailbox_pw_submitted): (
+        bool,
+        bool,
+        bool,
+        bool,
+    ),
 ) -> String {
     let email_json = aterm_json::to_string(&Value::from(email.unwrap_or(""))).unwrap_or_default();
     let pw_json = aterm_json::to_string(&Value::from(password.unwrap_or(""))).unwrap_or_default();
@@ -1951,12 +2017,20 @@ fn webmail_step_js(
 {SUBMIT_INPUT_HELPERS_JS}
   const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], input[type='image']"));
   const clickSubmit = (input) => submitInput(input, buttons,
-    /sign in|log in|authenticate|unlock|verify|continue|submit/i);
+    /sign in|log in|authenticate|unlock|verify|continue|next|submit/i);
 
   const userEl = document.querySelector("input#username, input[name='username'], input[autocomplete='username'], input[type='email']");
   const passEl = document.querySelector("input#password, input[name='password'], input[type='password']:not(#mailboxPassword)");
   const emailVal = {email_json};
   const pwVal = {pw_json};
+  if (userEl && !passEl && emailVal && !{user_submitted}) {{
+    if (!pwVal) {{
+      return {{ state: "needs_password", url: href }};
+    }}
+    setNativeValue(userEl, emailVal);
+    if (!clickSubmit(userEl)) return {{ state: "loading", url: href }};
+    return {{ state: "submitted_user", url: href }};
+  }}
   if (passEl && !{login_submitted}) {{
     if (!pwVal) {{
       return {{ state: "needs_password", url: href }};
@@ -2082,6 +2156,7 @@ pub fn poll_webmail_via_cdp(
             step_timeout(),
         )?;
 
+        let mut user_submitted = false;
         let mut login_submitted = false;
         let mut last_submitted_totp: Option<String> = None;
         let mut mailbox_pw_submitted = false;
@@ -2104,13 +2179,18 @@ pub fn poll_webmail_via_cdp(
                 .as_deref()
                 .and_then(|s| generate_totp_at(s, now_secs));
             let expr = webmail_step_js(
-                target_email,
-                password.as_deref(),
-                mailbox_password.as_deref(),
-                totp_code.as_deref(),
-                login_submitted,
-                totp_code.is_some() && totp_code == last_submitted_totp,
-                mailbox_pw_submitted,
+                (
+                    target_email,
+                    password.as_deref(),
+                    mailbox_password.as_deref(),
+                    totp_code.as_deref(),
+                ),
+                (
+                    user_submitted,
+                    login_submitted,
+                    totp_code.is_some() && totp_code == last_submitted_totp,
+                    mailbox_pw_submitted,
+                ),
             );
             let eval = cdp.call(
                 Some(&session),
@@ -2136,6 +2216,9 @@ pub fn poll_webmail_via_cdp(
                         "webmail sign-in requires a password in mailbox.toml or ai-mailbox.toml",
                     );
                 }
+                "submitted_user" => {
+                    user_submitted = true;
+                }
                 "submitted_login" => {
                     login_submitted = true;
                 }
@@ -2160,8 +2243,19 @@ pub fn poll_webmail_via_cdp(
                             && let Some(cred) =
                                 extract_credential_from_email(&synthetic, target_email)
                         {
-                            record_seen_digest(cfg.seen_file.as_deref(), seen_digests, &digest);
-                            return Ok(cred);
+                            let cred_digest = fnv1a_hex(match &cred {
+                                MailboxCredential::MagicLink(u) => u.as_str(),
+                                MailboxCredential::Otp(c) => c.as_str(),
+                            });
+                            if !seen_digests.contains(&cred_digest) {
+                                record_seen_digest(cfg.seen_file.as_deref(), seen_digests, &digest);
+                                record_seen_digest(
+                                    cfg.seen_file.as_deref(),
+                                    seen_digests,
+                                    &cred_digest,
+                                );
+                                return Ok(cred);
+                            }
                         }
                     }
                 }
@@ -2508,9 +2602,10 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
         .map(str::to_owned)
         .or_else(|| extract_login_hint(authorize_url));
 
+    let label = infer_account_label_from_env();
     let temp_dir;
     let profile_dir = if let Some(store) = store_dir {
-        let dir = browser_profile_dir(store, email.as_deref());
+        let dir = resolve_browser_profile_dir(store, label.as_deref(), email.as_deref());
         let _ = aterm_types::fs_restricted::ensure_private_dir(dir.parent().unwrap_or(store));
         let _ = aterm_types::fs_restricted::ensure_private_dir(&dir);
         dir
@@ -2550,7 +2645,7 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
         Duration::from_millis(200),
         |cdp_inner, em| {
             let mb = mailbox_cfg
-                .filter(|c| c.is_configured())
+                .filter(|c| c.is_configured_for(em))
                 .ok_or("headless browser requires sign-in, but no mailbox is configured")?;
             poll_mailbox_or_pending_credential(
                 &mut pending_credential,

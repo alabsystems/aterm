@@ -2,8 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-0 of `TrickListenerPurity` (`aterm_models_effects::trick_listener_purity_model`):
-//! proved at `Buggy = 0`, caught at `Buggy = 1`, every action live. Tier-1 is
-//! `aterm-effects/tests/conformance_trick_listener.rs`.
+//! proved at `Buggy = 0`, caught at `Buggy = 1`, every action live.
 
 use aterm_models_effects::trick_listener_purity_model;
 use aterm_spec::interp;
@@ -19,7 +18,6 @@ fn trick_listener_purity_has_no_dead_action() {
         "every action fires: {fired:?}"
     );
 
-    // `sit␣` alone is tentative; after `kitty␣`, or `kitty,`, it is final.
     let bare = walk(&model, &["Letter", "EdgeFire"]);
     assert_eq!((bare["said"], bare["named"]), (1, 0));
     let named = walk(&model, &["Letter", "EdgeName", "Letter", "EdgeFire"]);
@@ -27,7 +25,6 @@ fn trick_listener_purity_has_no_dead_action() {
     let marked = walk(&model, &["Letter", "MarkName", "Letter", "EdgeFire"]);
     assert_eq!((marked["said"], marked["named"]), (2, 1));
 
-    // `猫咪坐下␣` says nothing; Enter, or the name after it, makes it final.
     let parked = walk(&model, &["Letter", "EdgeGlued"]);
     assert_eq!((parked["said"], parked["named"]), (0, 0));
     let entered = walk(&model, &["Letter", "EdgeGlued", "SubmitFinal"]);
@@ -35,9 +32,6 @@ fn trick_listener_purity_has_no_dead_action() {
     let vouched = walk(&model, &["Letter", "EdgeGlued", "Letter", "EdgeNameFires"]);
     assert_eq!((vouched["said"], vouched["named"]), (2, 1));
 
-    // The mutant's `site` fires on the completing letter, its `npm run sit`
-    // fires on a line that is prose, and its `猫咪坐下␣` says the guess at the
-    // run's own edge, or at an edge after it: each breaks its own law.
     let buggy = interp::with_buggy(&model, 1);
     for (path, broken) in [
         (&["Letter", "Letter"][..], "APrefixNeverSpeaks"),

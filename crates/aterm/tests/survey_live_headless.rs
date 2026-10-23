@@ -13,7 +13,6 @@ use crate::headless_boot;
 
 use headless_boot::{Instance, boot_session, ctl, ctl_ok, type_line};
 
-/// Boot a 24×100 headless instance via `headless_boot::boot_with`.
 fn boot() -> Instance {
     headless_boot::boot_with(
         "asrv",
@@ -24,7 +23,6 @@ fn boot() -> Instance {
     )
 }
 
-/// The sid a `spawn` minted.
 fn spawn(inst: &Instance) -> String {
     let body = ctl_ok(inst, &["spawn"]);
     body.split_whitespace()
@@ -33,14 +31,12 @@ fn spawn(inst: &Instance) -> String {
         .to_string()
 }
 
-/// `aterm ctl survey <args…>`'s stdout, which must succeed.
 fn survey(inst: &Instance, args: &[&str]) -> String {
     let mut all = vec!["survey"];
     all.extend_from_slice(args);
     ctl_ok(inst, &all)
 }
 
-/// The `  <key>: <value>` field of a `--sid` record.
 fn sid_field<'a>(record: &'a str, key: &str) -> Option<&'a str> {
     let prefix = format!("  {key}: ");
     record.lines().find_map(|l| l.strip_prefix(prefix.as_str()))
@@ -52,7 +48,6 @@ fn the_survey_reads_every_session_of_an_instance() {
     let (_, a) = boot_session(&inst);
     let b = spawn(&inst);
     type_line(&inst, &b, "echo survey-marker; sleep 600");
-    // Hostile OSC title containing a bidi override (U+202E).
     type_line(&inst, &a, r"printf '\033]2;build \342\200\256gnp.exe\007'");
 
     let record = until_within(MUST_HAPPEN, "b running `sleep`, its rows read", || {
@@ -90,14 +85,12 @@ fn the_survey_reads_every_session_of_an_instance() {
     for line in &lines[1..] {
         assert!(line.chars().count() <= 110, "{line}");
     }
-    // The running shell is listed before the one at its prompt.
     assert!(
         lines[1].starts_with(&format!("{b} running sleep")),
         "{text}"
     );
     assert!(lines[2].starts_with(&format!("{a} ")), "{text}");
     assert!(lines[2].contains(" idle typed by "), "{text}");
-    // The engine strips the bidi override from the stored title.
     assert!(lines[2].contains(" ago | build "), "{text}");
     assert!(
         !text.contains('\u{202e}'),
@@ -119,14 +112,12 @@ fn the_survey_reads_every_session_of_an_instance() {
     );
 }
 
-/// The `key=` field of a one-line reply.
 fn wire_field(line: &str, key: &str) -> Option<String> {
     line.split_whitespace()
         .find_map(|kv| kv.strip_prefix(&format!("{key}=")))
         .map(str::to_string)
 }
 
-/// The `"needs"` field of session `sid`'s record in `survey --json`.
 fn json_needs(json: &str, sid: &str) -> Option<String> {
     let at = json.find(&format!("\"sid\":\"{sid}\""))?;
     let rest = &json[at..];
@@ -135,8 +126,6 @@ fn json_needs(json: &str, sid: &str) -> Option<String> {
     Some(rest[start..start + end].to_string())
 }
 
-/// Keyed `kind=ask` attention publishes `needs=ask` across `status`, `survey`, and `chrome`, while
-/// `kind=wait` publishes no need once an older bare ask is cleared.
 #[test]
 fn a_kind_ask_attention_is_a_need_every_reader_names_and_a_wait_is_none() {
     let inst = headless_boot::boot_with(
@@ -189,7 +178,6 @@ fn a_kind_ask_attention_is_a_need_every_reader_names_and_a_wait_is_none() {
         Some("ask"),
         "the older ask stands"
     );
-    // The survey excerpt reflects the older ask rather than the newer wait.
     let record = survey(&inst, &["--sid", &waiter]);
     assert_eq!(sid_field(&record, "attention"), Some("lunch"), "{record}");
     meta(&waiter, &["unset", "attention"]);
@@ -212,7 +200,6 @@ fn a_kind_ask_attention_is_a_need_every_reader_names_and_a_wait_is_none() {
     assert_eq!(wire_field(line, "stuck").as_deref(), Some("0"), "{line}");
 }
 
-/// Fake agent run via `exec -a claude` as the PTY leader; writes its pid to `$1`, waits for `$2`, then reads lines.
 const FAKE_LEADER: &str = r#"#!/bin/sh
 echo $$ > "$1"
 printf 'fake agent up\n'
@@ -220,7 +207,6 @@ while [ ! -e "$2" ]; do sleep 0.1; done
 while IFS= read -r line; do printf 'read %s\n' "$line"; done
 "#;
 
-/// SIGKILLs the fake process on drop so a stopped child does not outlive terminal hangup.
 struct KillOnDrop(i32);
 
 impl Drop for KillOnDrop {
@@ -230,8 +216,6 @@ impl Drop for KillOnDrop {
     }
 }
 
-/// A stalled task publishes `status needs=stalled` until marked working, and a stopped PTY-leader
-/// agent with queued input publishes `needs=stopped` (`wall:unresponsive`, `stopped`) until `signal cont`.
 #[test]
 fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
     let inst = headless_boot::boot_with(
@@ -265,7 +249,6 @@ fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
     );
     until_needs(&worker, "-");
 
-    // `aterm_pty::input_queue_len` requires macOS (Linux master FIONREAD counts the opposite direction).
     if !cfg!(target_os = "macos") {
         return;
     }
@@ -311,7 +294,6 @@ fn a_stalled_task_and_a_stopped_agent_are_needs_on_the_wire() {
         Some("-"),
         "stopped with nothing queued is no stall"
     );
-    // Send the line and newline in one write before queued input blocks a second write.
     ctl_ok(&inst, &[&at(&agent), "feed", "780a"]);
     let stopped = until_needs(&agent, "stopped");
     assert_eq!(

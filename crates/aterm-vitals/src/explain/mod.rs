@@ -175,6 +175,19 @@ pub struct Lead {
     pub team: Option<String>,
 }
 
+impl Lead {
+    /// Its team id where it reads as one (ten capitals or digits): the only
+    /// form `team=` and the lens's chip print.
+    #[must_use]
+    pub fn team_id(&self) -> Option<&str> {
+        self.team.as_deref().filter(|t| {
+            t.len() == 10
+                && t.bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+        })
+    }
+}
+
 /// Where a coalition's work counts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Part {

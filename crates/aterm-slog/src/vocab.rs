@@ -226,13 +226,6 @@ kinds! {
     Program => "program",
     MailFetch => "mail-fetch",
     Shown => "shown",
-    // Appended so no kind moves: a timeline row the log
-    // holds as its row alone (`row row=<kind> row_text=<payload>`), a fact
-    // no other mark names, which the timeline, read from the log, prints
-    // as its ring did: a job's verdict moved (`job-change`), a
-    // warm spare adopted, a dev build's measurement rows. Its writer writes
-    // it in the ring row's hold. Local: no bus class, no `brief` line, and
-    // the fold reads none. A reader without it maps it to `unknown`.
     Row => "row",
 }
 
@@ -358,7 +351,7 @@ pub enum Src {
     Aterm,
     /// A `mark` written back by a consumer.
     Mark,
-    /// Reserved for a later ruling (§4.2).
+    /// Reserved hook source.
     Hook,
     /// A word this reader does not know.
     Unknown,
@@ -508,7 +501,6 @@ impl ShortId {
     /// Identifier as a string slice.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        // Every byte passed `is_id_byte` (ASCII), so this never fails.
         std::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("-")
     }
 }
@@ -545,9 +537,7 @@ pub fn is_reserved_actor_word(word: &str) -> bool {
 pub enum Actor {
     /// The window's input path.
     Human,
-    /// Any other Owner client: whoever presents the instance token — the
-    /// owner's own `aterm ctl`, and equally ANY process running inside an
-    /// aterm session (the supervised agent itself among them).
+    /// Any other Owner client presenting the instance token.
     Ctl,
     /// The in-GUI harness.
     Harness,

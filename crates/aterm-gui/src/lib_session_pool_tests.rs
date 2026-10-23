@@ -3,8 +3,6 @@
 
 use super::*;
 
-/// A minimal `Session` for pool tests: a real `Terminal` and `SessionCtx` with
-/// `master = -1`, so `Session::drop` is a no-op.
 fn test_session(id: u64) -> Session {
     let self_id = SessionId::generate();
     let term = Arc::new(Mutex::new(Terminal::new(24, 80)));
@@ -38,6 +36,7 @@ fn test_session(id: u64) -> Session {
         crash_journal: Default::default(),
         typed: Default::default(),
         bells: Default::default(),
+        screen_moves: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -80,9 +79,6 @@ fn test_session(id: u64) -> Session {
     }
 }
 
-/// Dropping the last pool view drops the `Session`, whose `Drop` raises `reflow_cancel`
-/// for an in-flight `aterm-reflow` worker (`drive_reflow_job`). Every mid-run close path
-/// funnels through this.
 #[test]
 fn dropping_last_view_raises_reflow_cancel() {
     let s = test_session(1);
@@ -104,10 +100,7 @@ fn dropping_last_view_raises_reflow_cancel() {
 fn detach_drops_session_exactly_when_last_view_leaves() {
     let mut pool = SessionPool::default();
     pool.insert(test_session(1));
-    // A second window now views the one session (views = 2).
     pool.attach(1);
-    // First detach: a view remains, so the session lives on (one session in two
-    // windows, detach with no PTY churn).
     assert!(
         !pool.detach(1),
         "detach with a remaining view must not drop"
@@ -116,26 +109,15 @@ fn detach_drops_session_exactly_when_last_view_leaves() {
         pool.get(1).is_some(),
         "session still owned while a view remains"
     );
-    // Last detach: refcount hits 0, the session is dropped (its PTY would close).
     assert!(pool.detach(1), "the last detach drops the session");
     assert!(
         pool.get(1).is_none(),
         "a dropped session no longer resolves"
     );
-    // Detaching an already-gone id is a fail-closed no-op, not a panic.
     assert!(!pool.detach(1));
     assert_eq!(pool.iter().count(), 0);
 }
 
-/// Tier-1 conformance of the real session lifecycle to `proxy_registry_model`
-/// (`ProxyRegistry`): the parent never retains more child edge-token files than live
-/// sessions. `Spawn` is `spawn::provision_child_proxy` (scratch socket dir) plus the pool
-/// taking a session holding its `ChildProxy` (stored by hand, since `spawn_session` needs
-/// an event loop); `Close` is the last detach. `registered` counts the children whose
-/// 0600 file still exists. Every step of a fill-and-drain script must be a model step.
-///
-/// Negative control: `Buggy = 1` (a `Drop` that forgets to remove the file) rejects the
-/// real `Close` steps.
 #[test]
 fn session_close_conforms_to_proxy_registry_no_leak() {
     use aterm_spec::verify::validate_transition_tiered;
@@ -144,7 +126,6 @@ fn session_close_conforms_to_proxy_registry_no_leak() {
     let dir = std::env::temp_dir().join(format!("aterm-s1-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch socket dir");
     let mut pool = SessionPool::default();
-    // (pool id, edge-token file) for every child provisioned.
     let mut children: Vec<(u64, std::path::PathBuf)> = Vec::new();
     let project = |pool: &SessionPool, children: &[(u64, std::path::PathBuf)]| {
         std::collections::BTreeMap::from([

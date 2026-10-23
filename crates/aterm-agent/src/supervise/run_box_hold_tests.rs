@@ -3,13 +3,9 @@
 
 use aterm_phase::prompt::fixtures as f;
 
-/// How long before the box came up the person typed, in the incident.
 const TYPED_BEFORE_MS: u64 = 22_000;
-/// The incident's grace: `[harness] human_grace_s`'s default.
 const GRACE_S: u32 = 120;
 
-/// `rows` with every row equal to `from` replaced by the rows `to` — each
-/// replacement asserted to have happened once.
 fn swapped(rows: &[String], edits: &[(&str, &[&str])]) -> Vec<String> {
     let mut out = rows.to_vec();
     for (from, to) in edits {
@@ -25,8 +21,6 @@ fn swapped(rows: &[String], edits: &[(&str, &[&str])]) -> Vec<String> {
     out
 }
 
-/// `rows` with the countdown's `M:SS` made `left` (any text: a form the
-/// reader does not read, too).
 fn at_left(rows: &[String], left: &str) -> Vec<String> {
     let mut n = 0;
     let out = rows
@@ -46,30 +40,18 @@ fn at_left(rows: &[String], left: &str) -> Vec<String> {
     out
 }
 
-/// `secs` as the countdown draws it (`1:44`).
 fn mss(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
 }
 
-/// `reads` reads of the box `box_at` draws, its countdown TICKING from
-/// `from` seconds — one second lower each read, as Claude Code redraws it
-/// every second and the loop reads it a second apart.
 fn ticking(from: u64, reads: u64, box_at: impl Fn(&str) -> Vec<String>) -> Vec<Vec<String>> {
     (0..reads).map(|k| box_at(&mss(from - k))).collect()
 }
 
-/// `screens` as a loop watching the worker reads them: the worker busy
-/// first — the read before the box's first, which the touch rule counts a
-/// person's gestures from — then the box, then the worker busy again.
 fn watched(screens: Vec<Vec<String>>) -> Vec<Vec<String>> {
     [vec![busy_screen()], screens, vec![busy_screen()]].concat()
 }
 
-/// THE INCIDENT'S BOX, COMPOSED from the measured 2.1.301 rm box (the lab,
-/// 2026-10-15: its dashed layout, its two blank rows under the countdown):
-/// the call, the command and the breaker's note made the incident's (`rm -f
-/// "$O"/*`, the note in the words 2.1.301's breaker builds for it), its
-/// countdown at `left`.
 fn incident(left: &str) -> Vec<String> {
     let measured = f::screen(f::BOX_RM_AUTO_DENY_2_1_301);
     let rows = swapped(
@@ -103,7 +85,6 @@ fn incident(left: &str) -> Vec<String> {
     at_left(&rows, left)
 }
 
-/// The incident's box with its focus moved to `2. No`, as a Down leaves it.
 fn moved_to_no(rows: &[String]) -> Vec<String> {
     swapped(
         rows,
@@ -111,9 +92,6 @@ fn moved_to_no(rows: &[String]) -> Vec<String> {
     )
 }
 
-/// The incident's box with NO countdown of the vendor's, its Bash call's
-/// description written by the worker to read as one at `left` — `⚠` and all
-/// (a prompt-injected worker, or one writing about this very feature).
 fn faked(left: &str) -> Vec<String> {
     let rows: Vec<String> = incident("1:50")
         .into_iter()
@@ -131,9 +109,6 @@ fn faked(left: &str) -> Vec<String> {
     )
 }
 
-/// `rows` with a row of the transcript above the box's echo printed over, as
-/// the main thread prints over a subagent's box (`⏺ Agent "lint"
-/// finished`): outside the box's span.
 fn printed_over(rows: &[String]) -> Vec<String> {
     swapped(
         rows,
@@ -144,8 +119,6 @@ fn printed_over(rows: &[String]) -> Vec<String> {
     )
 }
 
-/// The incident's box is read as the incident's: an rm breaker's Bash box,
-/// its command and note, and its countdown's 1:44.
 #[test]
 fn the_incidents_box_is_read_as_drawn() {
     let p = aterm_phase::parse_prompt_v2(&incident("1:44")).expect("the box");
@@ -165,12 +138,6 @@ fn the_incidents_box_is_read_as_drawn() {
     assert!(p.description.contains("deny this request in 0:14"), "{p:?}");
 }
 
-/// A COUNTDOWN IS BELIEVED ONCE SEEN TICKING (`approval_loop::Countdown`), on
-/// the loop's clock (instants made up here, a read's `asked`): seen once it
-/// is not believed, but may still tick; a second on, a second lower, it is,
-/// the deny placed by that read; the same time read again within its second
-/// keeps that placing; a time standing past the slack has stopped, and is
-/// believed no longer.
 #[test]
 fn a_countdown_is_believed_once_seen_ticking() {
     let t0 = Instant::now();
@@ -231,11 +198,6 @@ enum Build {
     EpisodePerBox,
 }
 
-/// One `watch` over `screens` under full power, built `build`, a person who
-/// typed `typed_ms` before every read and `status` (`None`: nobody), the
-/// server's person count `0` on every read unless `tweak` moves it, each
-/// hold looked at again at once ([`Session::set_person_hold_wait`]) and an
-/// outage probed again within milliseconds.
 fn held_watch(
     screens: Vec<Vec<String>>,
     typed_ms: Option<u64>,
@@ -246,7 +208,6 @@ fn held_watch(
     (m, journal)
 }
 
-/// [`held_watch`], and the approval ledger's rows.
 fn held_watch_ledgered(
     screens: Vec<Vec<String>>,
     typed_ms: Option<u64>,
@@ -283,7 +244,6 @@ fn held_watch_ledgered(
     (m, records.into_iter().map(|r| r.line).collect(), rows)
 }
 
-/// `s` built as `build` says.
 fn built<C: Ctl>(s: &mut Session<'_, C>, build: Build) {
     match build {
         Build::Shipped => {}
@@ -293,17 +253,14 @@ fn built<C: Ctl>(s: &mut Session<'_, C>, build: Build) {
     }
 }
 
-/// The digit presses a run made (`key … 1`).
 fn ones(m: &Mock) -> usize {
     m.presses().iter().filter(|p| p.ends_with(" 1")).count()
 }
 
-/// The journal's `HELD` lines.
 fn held_lines(journal: &[String]) -> Vec<&String> {
     journal.iter().filter(|l| l.starts_with("HELD ")).collect()
 }
 
-/// The `HELD` lines that hold a box as its toucher's: held as ever.
 fn theirs(journal: &[String]) -> Vec<&String> {
     held_lines(journal)
         .into_iter()
@@ -311,13 +268,10 @@ fn theirs(journal: &[String]) -> Vec<&String> {
         .collect()
 }
 
-/// Whether the journal said a hold's end.
 fn ended(journal: &[String]) -> bool {
     journal.iter().any(|l| l.starts_with("HOLD-ENDED "))
 }
 
-/// The UTC stamps a `HELD` line names: its hold's end and, on a box with a
-/// countdown, the vendor's deny.
 fn held_times(line: &str) -> (String, Option<String>) {
     let until = line
         .split_once("hands off until ")
@@ -330,7 +284,6 @@ fn held_times(line: &str) -> (String, Option<String>) {
     (until, deny)
 }
 
-/// The keys a run pressed, by their last word (`down`, `enter`, `1`).
 fn key_names(m: &Mock) -> Vec<&str> {
     m.presses()
         .iter()
@@ -338,10 +291,6 @@ fn key_names(m: &Mock) -> Vec<&str> {
         .collect()
 }
 
-/// THE INCIDENT: a person who typed 22 s before the box came up (their
-/// grace, 120 s, runs 98 s past it), the loop watching the busy worker when
-/// it did — so their keystroke is before the read before the box's first,
-/// and the box is untouched.
 #[test]
 fn the_incident_box_is_pressed_before_the_vendor_denies_it() {
     let (m, journal) = held_watch(
@@ -423,13 +372,6 @@ fn the_incident_box_is_pressed_before_the_vendor_denies_it() {
     assert!(!ended(&journal), "{journal:#?}");
 }
 
-/// NO TEXT OF THE WORKER'S ENDS A HOLD: under the person's hand, a box whose
-/// countdown is the worker's own description (`⚠ Claude Code will
-/// automatically deny this request in 0:14, …`, the vendor's own countdown
-/// absent) is read as no countdown at all, and held as ever — no
-/// `HOLD-ENDED`, no press, no deny named; a countdown at the vendor's place
-/// that stands still at 0:14 read after read is never believed — held, the
-/// box read again to see it tick, never pressed.
 #[test]
 fn no_countdown_the_worker_drew_or_one_standing_still_ends_a_hold() {
     let run = |screens: Vec<Vec<String>>| {
@@ -465,12 +407,6 @@ fn no_countdown_the_worker_drew_or_one_standing_still_ends_a_hold() {
     assert_eq!(ones(&m), 1, "{:#?}", m.requests);
 }
 
-/// A STALL BETWEEN TWO READS CHANGES NOTHING: the scripted server's clock is
-/// its reads (`Session::set_read_clock`: every read a second after the one
-/// before it), so the incident's box read at 0:15 and then, the run held up
-/// 4.5 s on its clock ([`Mock::stall_after_read`]), at 0:14 is seen ticking
-/// as on an idle machine — `HOLD-ENDED`, and `1` before the deny — and no
-/// test of the hold rests on how long its thread took between two reads.
 #[test]
 fn a_stall_between_two_reads_changes_nothing() {
     let (m, journal) = held_watch(
@@ -478,8 +414,6 @@ fn a_stall_between_two_reads_changes_nothing() {
         Some(TYPED_BEFORE_MS),
         Build::Shipped,
         |m, _| {
-            // The box's first read is the second read: the busy screen's is
-            // the first.
             m.stall_after_read.insert(2, Duration::from_millis(4_500));
         },
     );
@@ -487,14 +421,6 @@ fn a_stall_between_two_reads_changes_nothing() {
     assert!(ended(&journal), "{journal:#?}");
 }
 
-/// A BOX A PERSON TOUCHED SINCE IT APPEARED IS THEIRS, HELD AS EVER: the
-/// incident's box ticking into the margin under the person's grace, and a
-/// gesture of theirs the server counted after the read before the box's
-/// first (`human_seq` 0, then 1) — every look holds it to their grace's end
-/// (`HELD … (the box's answer; a person's gesture was counted on the session
-/// since it appeared: held as ever, and the vendor denies it at …)`): no
-/// `HOLD-ENDED`, no key, and the vendor's deny stands for their unfinished
-/// answer.
 #[test]
 fn a_box_a_person_touched_is_held_as_ever() {
     let down: Vec<Vec<String>> = watched(vec![
@@ -630,13 +556,6 @@ fn a_box_a_person_touched_is_held_as_ever() {
     assert_eq!(ones(&m), 1, "their grace over: {:#?}", m.requests);
 }
 
-/// OPERATOR.md's lease flow, come and gone BEFORE the box `screens` reads:
-/// the worker's turn ends after work, nobody at the keyboard, and the
-/// harness's turn-end look reads `status` under an operator's lease
-/// (`hand=lease:operator`: the continuation is held); the operator sends work
-/// and lets the lease go, and the worker runs busy, read with no `status`; a
-/// person types (the box's reads carry their stamp, [`TYPED_BEFORE_MS`] old:
-/// give it to [`held_watch`]); then the box, the worker busy again after it.
 fn lease_before(screens: Vec<Vec<String>>) -> Vec<Vec<String>> {
     let mut worked = rows(&[
         "⏺ Fixed the parser; the suite is green.",
@@ -648,10 +567,6 @@ fn lease_before(screens: Vec<Vec<String>>) -> Vec<Vec<String>> {
     [vec![busy_screen(), worked], watched(screens)].concat()
 }
 
-/// The world of [`lease_before`]: the continue policy on; the lease on every
-/// `status` until the third read (the worker busy again), gone from it on;
-/// the person's last keystroke ten minutes old on every read and `status`
-/// until then.
 fn let_go_before(m: &mut Mock, opts: &mut SuperviseOpts) {
     opts.policy.continue_policy = true;
     m.hand_from.insert(0, "lease:operator");
@@ -663,10 +578,6 @@ fn let_go_before(m: &mut Mock, opts: &mut SuperviseOpts) {
     m.status_human_from.insert(3, TYPED_BEFORE_MS);
 }
 
-/// ANOTHER DRIVER'S HAND ON THE SESSION IS A TOUCH: a drive lease on the
-/// session (`status hand=lease:operator`), nobody's keystroke counted, the
-/// box ticking into the margin as it opened — the driver's keys carry no
-/// count, so their hand is the fact the server records.
 #[test]
 fn another_drivers_hand_on_the_session_is_a_touch() {
     let at_margin = || watched(ticking(17, 5, incident));
@@ -762,9 +673,6 @@ fn another_drivers_hand_on_the_session_is_a_touch() {
     assert!(theirs(&journal).is_empty(), "{journal:#?}");
 }
 
-/// The incident's box as Claude Code redraws it in a narrower pane (100
-/// columns, a split or a resize): its rules shortened to the width, its note
-/// and its countdown each wrapped onto a second row.
 fn rewrapped(rows: &[String]) -> Vec<String> {
     const NOTE: &str = " │ Dangerous rm operation on possibly-empty variable path: \"$O\"/* in `rm -f \
                         \"$O\"/*` (rewrite it as \"${O:?}\"/* or use a literal path)";
@@ -799,10 +707,6 @@ fn rewrapped(rows: &[String]) -> Vec<String> {
     )
 }
 
-/// A REDRAW IS NO TOUCH (the box's face — its letters and focus, its footer
-/// among them — read as a touch when it changed with no key of the loop's,
-/// and Claude Code redraws it by itself, so an untouched box was held as
-/// touched and denied).
 #[test]
 fn a_redraw_is_no_touch() {
     let p = aterm_phase::parse_prompt_v2(&rewrapped(&incident("0:14"))).expect("the box");
@@ -869,10 +773,6 @@ fn a_redraw_is_no_touch() {
     }
 }
 
-/// The incident's box with its countdown wrapped as Ink wraps it in a pane
-/// 48 columns wide, through its very words: `deny this` ends the `⚠` row,
-/// `request in M:SS, …` and `an unattended session` each a row of their own
-/// at its column.
 fn narrowed(rows: &[String]) -> Vec<String> {
     let countdown = rows
         .iter()
@@ -898,9 +798,6 @@ fn narrowed(rows: &[String]) -> Vec<String> {
     )
 }
 
-/// A COUNTDOWN A NARROW PANE WRAPS THROUGH ITS WORDS ENDS THE HOLD TOO (its
-/// words were once looked for whole on one row, so in a pane narrower than
-/// ~55 cells no countdown was read, and the hold ran into the vendor's deny).
 #[test]
 fn a_countdown_a_narrow_pane_wraps_ends_the_hold_too() {
     let narrow = |left: &str| narrowed(&incident(left));
@@ -923,13 +820,6 @@ fn a_countdown_a_narrow_pane_wraps_ends_the_hold_too() {
     assert!(!ended(&journal), "{journal:#?}");
 }
 
-/// PAST THE HOLD A PERSON STILL WINS THE RACE, AND THE BOX IS THEIRS: the
-/// press that goes although a person's hand is on the session carries the
-/// person fence (`key if-human=<the episode's baseline count> …`), so a person who keys
-/// between the read and the press skips it (`OK skipped reason=person`,
-/// ledgered `decided again after their quiet`) — and that key came after the
-/// box appeared, so the box is theirs from the next read on: held as ever,
-/// never pressed again.
 #[test]
 fn a_press_past_the_hold_is_fenced_on_the_person() {
     let digits = |m: &Mock| -> Vec<String> {
@@ -987,9 +877,6 @@ fn a_press_past_the_hold_is_fenced_on_the_person() {
     assert!(presses[0].starts_with("key if-human=0 "), "{presses:#?}");
 }
 
-/// `rows` with the box's options drawn without their numbers, as an
-/// unnumbered (arrows-and-Enter) box draws them — HAND-BUILT: no Claude Code
-/// box measured today is both unnumbered and carries a countdown.
 fn unnumbered(rows: &[String]) -> Vec<String> {
     swapped(
         rows,
@@ -997,7 +884,6 @@ fn unnumbered(rows: &[String]) -> Vec<String> {
     )
 }
 
-/// The mock fences on the generation and the person, as a current host.
 fn fenced_on(m: &mut Mock) {
     m.gen_fence = true;
     m.sends_gen = true;
@@ -1005,9 +891,6 @@ fn fenced_on(m: &mut Mock) {
     m.human_seq = Some(0);
 }
 
-/// PAST THE HOLD A FOCUS PRESS IS FENCED ON THE PERSON TOO: the incident's
-/// box unnumbered (its answer `Yes` by the focus and Enter, `Choice::Focus`),
-/// ticking at the margin, a person's hand on the session.
 #[test]
 fn a_focus_press_past_the_hold_is_fenced_on_the_person() {
     let yes = |left: &str| unnumbered(&incident(left));
@@ -1054,10 +937,6 @@ fn a_focus_press_past_the_hold_is_fenced_on_the_person() {
     );
 }
 
-/// The irreversible tool's default-No `Tool use` box (unnumbered, `No`
-/// first and focused, as Claude Code opens it) with an auto-deny countdown
-/// at `left` over its question — HAND-BUILT — its focus on `Yes` when
-/// `on_yes`, where the loop's own `down` leaves it.
 fn default_no(left: &str, on_yes: bool) -> Vec<String> {
     let rows = swapped(
         &f::screen(f::BOX_TOOL_DEFAULT_NO),
@@ -1079,9 +958,6 @@ fn default_no(left: &str, on_yes: bool) -> Vec<String> {
     }
 }
 
-/// A PERSON'S KEY AFTER THE LOOP'S OWN ARROW MAKES THE BOX THEIRS (review a
-/// person's move back onto the box's first option after the loop's arrow
-/// moved it away was once pressed over).
 #[test]
 fn a_persons_key_after_the_loops_own_arrow_makes_the_box_theirs() {
     let run = |build: Build| {
@@ -1121,9 +997,6 @@ fn a_persons_key_after_the_loops_own_arrow_makes_the_box_theirs() {
     );
 }
 
-/// A GESTURE BETWEEN A FOCUS PRESS'S ARROW AND ITS ENTER SKIPS THE ENTER (the
-/// test above scripts the Enter's skip, so none would fail if the Enter lost
-/// its fence).
 #[test]
 fn a_gesture_between_a_focus_press_arrow_and_its_enter_skips_the_enter() {
     let (m, journal) = held_watch(
@@ -1157,13 +1030,6 @@ fn a_gesture_between_a_focus_press_arrow_and_its_enter_skips_the_enter() {
     );
 }
 
-/// A BOX ASKED AGAIN AFTER A READ WITHOUT ONE IS ANOTHER EPISODE: box A, the
-/// incident's, ticking into the margin under a person's grace and untouched,
-/// gets its `1` at `HOLD-ENDED`; the worker works (a busy read: no box, the
-/// episode over), and asks the very same again — box B, its countdown seen
-/// ticking afresh, its episode's baseline the busy read's count — and the
-/// person presses Down on it, their gesture counted: B is theirs, held as
-/// ever, no second `1`; B left as it opened gets its own `1`.
 #[test]
 fn a_box_asked_again_after_a_read_without_one_is_another_episode() {
     let screens = |moved: bool| {
@@ -1205,8 +1071,6 @@ fn a_box_asked_again_after_a_read_without_one_is_another_episode() {
     assert!(ended(&journal), "B's hold ended: {journal:#?}");
 }
 
-/// The incident's box with another command in it, its countdown at `left`:
-/// the next request of parallel tool calls.
 fn next_request(left: &str) -> Vec<String> {
     swapped(
         &incident(left),
@@ -1225,12 +1089,6 @@ fn next_request(left: &str) -> Vec<String> {
     )
 }
 
-/// A TOUCHED BOX RELABELLED, OR REPLACED, STAYS THEIRS (a box was once
-/// re-judged afresh when it asked otherwise, and Claude Code's stacked-asks
-/// label on its title row — `1 of 2` once a second ask stacks behind it, `2
-/// of 2` once the other settles — made it ask otherwise, so the touched box
-/// was judged from a count that already held the gesture, and `1` was pressed
-/// over it).
 #[test]
 fn a_touched_box_relabelled_or_replaced_stays_theirs() {
     let p = aterm_phase::parse_prompt_v2(&stacked(&incident("0:14"), "1 of 2")).expect("the box");
@@ -1312,9 +1170,6 @@ fn a_touched_box_relabelled_or_replaced_stays_theirs() {
     assert!(ended(&journal), "{journal:#?}");
 }
 
-/// AN EPISODE RUNS FROM THE FIRST READ THAT SHOWS A BOX TO THE FIRST THAT
-/// SHOWS NONE, ITS TOUCH LATCHED (`Session::keep_episode`), read by read over
-/// reads made up here.
 #[test]
 fn an_episode_runs_from_the_first_box_to_the_first_read_without_one() {
     let read = |rows: Vec<String>, count: Option<u64>, human: HumanInput| Screen {
@@ -1437,9 +1292,6 @@ fn an_episode_runs_from_the_first_box_to_the_first_read_without_one() {
     );
 }
 
-/// A PERSON COUNT THAT STARTED OVER IS A TOUCH (a gesture was once read as a
-/// touch only on a count higher than the one before the box, and a session
-/// adopted across a seamless update counts from 0 again).
 #[test]
 fn a_person_count_that_started_over_is_a_touch() {
     let (m, journal) = held_watch(
@@ -1463,11 +1315,6 @@ fn a_person_count_that_started_over_is_a_touch() {
     assert!(!ended(&journal), "{journal:#?}");
 }
 
-/// A QUESTION DIALOG'S TABS ARE ONE EPISODE: a four-question dialog on its
-/// last question tab under a person's grace, their gesture counted on the
-/// tab's second read; they answer it, and Claude Code draws the review tab,
-/// with a countdown, in the tab's place — no read between without a box, so
-/// the same episode, touched: held as ever, never submitted.
 #[test]
 fn a_question_dialog_s_tabs_are_one_episode() {
     let keys = |lease: bool, counted: bool, build: Build| {
@@ -1538,20 +1385,6 @@ fn a_question_dialog_s_tabs_are_one_episode() {
     assert!(ended(&journal), "{journal:#?}");
 }
 
-/// One world of the Tier-1 bind ([`box_hold_violations`]): the reads of the
-/// box (the worker busy before them when `watched`; else the loop's first
-/// read is the box), the person's last keystroke before every read and
-/// `status` (`None`: nobody), another driver's lease on the session, a lease
-/// come and gone before the box ([`lease_before`], which the model sees as
-/// no hand on the box), whether the policy answers the box (`false`:
-/// `approve = "none"`, it escalates), the person counts the server gives
-/// from a read on (`human_seq`; none at all when `no_count`), the read from
-/// which their grace is over (`status human_ms=` past it), and the world as
-/// the model sees it at the deciding look: the vendor's countdown there (its
-/// seconds; `None`: none of the vendor's ever ticks there — the worker's own
-/// text, or one standing still), whether the loop knows the deny there (read
-/// and seen ticking), and the facts of the episode — a gesture counted past
-/// its baseline, and whether its touch cannot be told.
 struct World {
     name: &'static str,
     screens: Vec<Vec<String>>,
@@ -1569,19 +1402,6 @@ struct World {
     blind: bool,
 }
 
-/// The worlds: the incident's box ticking at 1:44, 0:29 (two margins: held,
-/// 13 s short of the margin) and 0:15 under a person's grace, untouched; at
-/// 1:44 with nobody about (pressed on its first read); escalated at 0:15
-/// under the person; its countdown in the screen-reader form (`in about 2
-/// minutes`, which the reader does not read); the worker's own text for a
-/// countdown; a countdown standing still at 0:14; touched at 0:15 by a
-/// person's gesture counted on its second read, and in the gap before its
-/// first; touched, their grace then over; the box the loop's first read
-/// showed; reads with no person count, the box unnumbered (no digit goes on
-/// such a read, whatever the hold says: its focus and Enter do); a count that
-/// started over; under a lease, its focus moved by the driver, and as it
-/// opened; touched, then relabelled `1 of 2`; a subagent's box resized, its
-/// footer re-cut, untouched; a lease let go before the box came up.
 fn worlds() -> Vec<World> {
     let person = Some(TYPED_BEFORE_MS);
     let ticks = |name, from: u64, typed_ms, answers| World {
@@ -1707,8 +1527,6 @@ fn worlds() -> Vec<World> {
     ]
 }
 
-/// Whether the loop built `build` pressed the world's box at its look: any
-/// key on it.
 fn pressed_in(w: &World, build: Build) -> bool {
     let screens = if w.lease_before {
         lease_before(w.screens.clone())
@@ -1749,16 +1567,6 @@ fn pressed_in(w: &World, build: Build) -> bool {
     !m.presses().is_empty()
 }
 
-/// TIER-1 for `SupervisorBoxHold` (aterm-spec `supervisor_box_hold_model`):
-/// each world's deciding look projected onto the model — the episode up; the
-/// vendor's countdown in margins (`ceil(left / DENY_MARGIN)`; a box with
-/// none that ticks is projected with the whole window); whether the loop
-/// knows the deny; whether the policy answers it; a person's grace (their
-/// keystroke within [`GRACE_S`] and not over) and another driver's hand (a
-/// lease); the episode's facts — a gesture counted, the driver's hand on it,
-/// a touch that cannot be told — and the latch they set — and checked
-/// against it: a look that PRESSED must find `Press` enabled, a look that
-/// held must find time free to pass (`Tick`).
 fn box_hold_violations(build: Build) -> (Vec<String>, Vec<bool>) {
     let model = aterm_models_harness::supervisor_box_hold_model();
     let window = model
@@ -1803,17 +1611,6 @@ fn box_hold_violations(build: Build) -> (Vec<String>, Vec<bool>) {
     (bad, presses)
 }
 
-/// The shipped loop goes only where the model allows: it holds the untouched
-/// box above the margin under the person's grace (1:44, 0:29), presses it at
-/// the margin with their grace still running (0:15, the subagent's box
-/// resized, its footer re-cut, and the box a lease let go before it came
-/// up), presses at once with nobody about, presses no
-/// box it escalates, keeps the hold on a countdown it does not read, on the
-/// worker's own text and on a countdown standing still, holds every touched
-/// episode as ever — touched on its second read, in the gap before its first,
-/// the box its first read showed, reads with no count, a count started over,
-/// a driver's lease, the box relabelled `1 of 2` once touched — and presses
-/// the touched box once their grace is over.
 #[test]
 fn tier1_a_hold_goes_only_where_the_model_allows() {
     let names = |bad: &[String]| -> Vec<String> {
@@ -1872,18 +1669,10 @@ fn tier1_a_hold_goes_only_where_the_model_allows() {
     assert!(bad.iter().all(|b| b.contains(": Press at ")), "{bad:#?}");
 }
 
-/// The measured review tab of a four-question dialog (2.1.282) with an
-/// auto-deny countdown at `left` over its `Ready to submit your answers?` —
-/// HAND-BUILT where 2.1.301 draws it: the review tab renders the permission
-/// reason block the countdown is drawn in (between its answers and that
-/// row; read in its code), and auto mode can give a question the timed
-/// fallback (`classifyAskUserQuestion`).
 fn review_ticking(left: &str) -> Vec<String> {
     review_with_countdown(f::QUESTION_REVIEW, left)
 }
 
-/// The review tab `fixture` with the countdown at `left` (as
-/// [`review_ticking`]).
 fn review_with_countdown(fixture: &str, left: &str) -> Vec<String> {
     let rows = f::screen(fixture);
     let at = rows
@@ -1904,12 +1693,6 @@ fn review_with_countdown(fixture: &str, left: &str) -> Vec<String> {
     out
 }
 
-/// A QUESTION DIALOG WITH A COUNTDOWN (its review tab), a person 22 s past
-/// their keystroke, the dialog untouched: at 1:44 its answer is held for
-/// them, and at the margin — its countdown seen ticking, past the hold's end
-/// — it is answered (Enter on `Submit answers`, the person's quiet no longer
-/// waited for: neither the hold's `status` nor the dialog's own wait, R1, nor
-/// the press's stamps).
 #[test]
 fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
     let p = aterm_phase::parse_prompt_v2(&review_ticking("0:14")).expect("the dialog");
@@ -2011,9 +1794,6 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
     );
 }
 
-/// A PERSON'S GESTURE COUNTED INSIDE THE ANSWER STOPS IT PAST THE HOLD: the
-/// review tab ticking into the margin on `Cancel` under a person's grace,
-/// untouched, so its answer goes — `up` onto `Submit answers`, then Enter.
 #[test]
 fn a_gesture_counted_inside_the_answer_past_the_hold_stops_it() {
     let cancel = |left: &str| focused_on(&review_ticking(left), "2. Cancel");
@@ -2054,9 +1834,6 @@ fn a_gesture_counted_inside_the_answer_past_the_hold_stops_it() {
     assert!(!theirs(&journal).is_empty(), "{journal:#?}");
 }
 
-/// [`tall_states`] with an auto-deny countdown at `left` over the question
-/// of each — HAND-BUILT (the measured decline states draw it there, above
-/// the tall box's foot), the screen kept at its 48 rows.
 fn tall_ticking(left: &str) -> [Vec<String>; 4] {
     tall_states("$S").map(|mut s| {
         let q = s
@@ -2077,11 +1854,6 @@ fn tall_ticking(left: &str) -> [Vec<String>; 4] {
     })
 }
 
-/// The decline of the tall rm box under the safe rules, in its bypass
-/// session, its countdown a second lower each screen served from `from`:
-/// `states` the decline state each serves — two a look, as the loop asks for
-/// the box's last rows and then, its head cut by them, the whole screen,
-/// the one read of the two it keeps — the busy screen before and after.
 fn tall_decline(
     from: u64,
     states: &[usize],
@@ -2123,14 +1895,6 @@ fn tall_decline(
     )
 }
 
-/// A DECLINE THE POLICY OWES A BOX WITH A COUNTDOWN (the tall rm box, under
-/// the safe rules in its bypass session), a person 22 s past their
-/// keystroke, the box untouched: each of its states served twice a look (its
-/// last rows, then the whole screen, which alone the loop keeps), the
-/// countdown a second lower each from 0:18 — the one countdown kept, the
-/// whole read's, seen once on the first look, which holds to read it again,
-/// then ticking on every look, past the hold's end — so the decline goes,
-/// all four keystrokes, Enter last: the person's quiet is not waited for.
 #[test]
 fn a_decline_goes_before_the_countdown_runs_out() {
     let states = [0usize, 0, 0, 0, 1, 1, 2, 2, 3, 3];
@@ -2147,8 +1911,6 @@ fn a_decline_goes_before_the_countdown_runs_out() {
     assert!(w.is_empty(), "the hold outlasts the countdown: {w:#?}");
 }
 
-/// A PERSON'S KEY DURING THE LOOP'S DECLINE MAKES THE BOX THEIRS (review the
-/// decline once re-arrowed over a person's move back onto `Yes`).
 #[test]
 fn a_persons_key_during_the_loops_decline_makes_the_box_theirs() {
     let states = [0usize, 0, 0, 0, 1, 1, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3];
@@ -2169,9 +1931,6 @@ fn a_persons_key_during_the_loops_decline_makes_the_box_theirs() {
     );
 }
 
-/// A PERSON'S GESTURE COUNTED INSIDE THE DECLINE STOPS IT PAST THE HOLD: the
-/// tall rm box declined at the hold's end under a person's grace, nothing
-/// scripted at the server.
 #[test]
 fn a_gesture_counted_inside_the_decline_past_the_hold_stops_it() {
     let states = [0usize, 0, 0, 0, 2, 2, 3, 3, 3, 3];
@@ -2189,9 +1948,6 @@ fn a_gesture_counted_inside_the_decline_past_the_hold_stops_it() {
     );
 }
 
-/// The `await idle` waits among `requests` that a screen redrawn every
-/// `tick_ms` runs out ([`Mock::tick_ms`]): each a whole wait (its `timeout`)
-/// in a real run, spent while the countdown runs.
 fn idle_run_out(requests: &[String], tick_ms: u64) -> Vec<&String> {
     requests
         .iter()
@@ -2206,9 +1962,6 @@ fn idle_run_out(requests: &[String], tick_ms: u64) -> Vec<&String> {
         .collect()
 }
 
-/// A dialog `supervise` answers in one look under a manager: `rows`, its
-/// countdown ticking a second a read ([`Mock::countdown_ticks`]) and the
-/// screen redrawn every `tick` ms.
 fn supervised_ticking(rows: Vec<String>, tick: Option<u64>) -> (Mock, Vec<String>) {
     let book = Book::new("box-hold-retry");
     let mut m = questioned(vec![rows]);
@@ -2223,10 +1976,6 @@ fn supervised_ticking(rows: Vec<String>, tick: Option<u64>) -> (Mock, Vec<String
     (m, lines)
 }
 
-/// A KEY THE TICKING DIALOG DID NOT TAKE IS SENT AGAIN BEFORE ITS DENY: the
-/// review tab at 0:14 under a manager, the Enter not taken (the dialog drawn
-/// as keyed), its countdown ticking, the screen redrawn every second (the
-/// mock's `await idle` latches only under 1000 ms of quiet).
 #[test]
 fn a_key_the_ticking_dialog_did_not_take_is_sent_again_before_its_deny() {
     let enters = |m: &Mock| m.presses().iter().filter(|r| r.ends_with(" enter")).count();
@@ -2255,9 +2004,6 @@ fn a_key_the_ticking_dialog_did_not_take_is_sent_again_before_its_deny() {
     assert_eq!(enters(&m), 2, "{:#?}", m.requests);
 }
 
-/// The waits for a still screen `m` made after its first Enter, the retry's
-/// premise, as `(quiet ms, timeout ms)` — the press's own settle after a
-/// read (`await idle 500 timeout 1500`) is no such wait.
 fn still_waits(m: &Mock) -> Vec<(u64, u64)> {
     let first = m
         .requests
@@ -2274,9 +2020,6 @@ fn still_waits(m: &Mock) -> Vec<(u64, u64)> {
         .collect()
 }
 
-/// ABOVE THE MARGIN THE RETRY'S PREMISE IS TWO SECONDS OF QUIET, AS EVER,
-/// WAITED FOR NO LATER THAN THE MARGIN'S START: the same review tab ticking,
-/// the Enter not taken.
 #[test]
 fn above_the_margin_a_ticking_dialog_waits_two_seconds_of_quiet() {
     for (left, cap) in [("1:44", 20_000), ("0:30", 15_000)] {
@@ -2298,7 +2041,6 @@ fn above_the_margin_a_ticking_dialog_waits_two_seconds_of_quiet() {
     }
 }
 
-/// The timeout `await … timeout <ms>` asks for.
 fn timeout_ms(request: &str) -> u64 {
     request
         .rsplit_once(" timeout ")
@@ -2306,10 +2048,6 @@ fn timeout_ms(request: &str) -> u64 {
         .unwrap_or_else(|| panic!("no timeout: {request}"))
 }
 
-/// A PRESS NEAR THE DENY THAT THE BOX DID NOT TAKE IS PRESSED AGAIN BEFORE
-/// IT: the incident's box, nobody about, pressed on its first read (its
-/// countdown seen once, nothing believed yet), drawn after its `1` as it was
-/// before, its countdown ticking.
 #[test]
 fn a_press_near_the_deny_the_box_did_not_take_is_pressed_again_before_it() {
     let leave = |left: &str| -> (usize, u64, u64) {
@@ -2342,17 +2080,11 @@ fn a_press_near_the_deny_the_box_did_not_take_is_pressed_again_before_it() {
     assert!(ms > 9_000, "1:44: {ms}");
 }
 
-/// `rows` with the vendor's position label `label` (`1 of 2`) closing the
-/// incident box's title row at the pane's edge (144 columns), as Claude Code
-/// draws it once another ask stacks behind the box (2.1.286 on;
-/// `claude-2.1.292-box-bash-background-agent-stacked-72col.txt`).
 fn stacked(rows: &[String], label: &str) -> Vec<String> {
     let title = format!(" Bash command{label:>131}");
     swapped(rows, &[(" Bash command", &[&title])])
 }
 
-/// `text` cut to `cols` cells as Ink's `wrap="truncate"` cuts a row that
-/// does not fit: its first `cols - 1` cells and `…`.
 fn truncated(text: &str, cols: usize) -> String {
     if text.chars().count() <= cols {
         return text.to_string();
@@ -2363,7 +2095,6 @@ fn truncated(text: &str, cols: usize) -> String {
     out
 }
 
-/// `text` word-wrapped to `cols` cells, its continuation rows at column 1.
 fn wrapped_at(text: &str, cols: usize) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut row = String::new();
@@ -2378,13 +2109,6 @@ fn wrapped_at(text: &str, cols: usize) -> Vec<String> {
     out
 }
 
-/// A BACKGROUND SUBAGENT'S BOX with the vendor's countdown at `left`
-/// (HAND-BUILT on the measured 72-column box,
-/// `claude-2.1.292-box-bash-background-agent-stacked-72col.txt`: the rm
-/// safety check's countdown is drawn on a subagent's box too) as Claude Code
-/// redraws it in a pane `cols` wide: its rules the pane's width, its
-/// countdown wrapped to it, and its footer's note cut by it (`wrap="truncate"`:
-/// `… twice to stop background…` at 72 columns, whole from 78).
 fn subagent(cols: usize, left: &str) -> Vec<String> {
     const FOOTER: &str =
         " Esc to cancel · Tab to amend · ctrl+x ctrl+k twice to stop background agents";
@@ -2420,7 +2144,6 @@ fn subagent(cols: usize, left: &str) -> Vec<String> {
     out
 }
 
-/// THE FIRST KEY AFTER A TAB'S FIRST-KEY WAIT GOES ON A READ MADE AFTER IT.
 #[test]
 fn the_first_key_after_a_ticking_dialogs_wait_is_fenced_on_a_read_after_it() {
     let screens = watched(vec![
@@ -2445,11 +2168,6 @@ fn the_first_key_after_a_ticking_dialogs_wait_is_fenced_on_a_read_after_it() {
     assert_eq!(key_names(&m), ["enter"], "{:#?}", m.requests);
 }
 
-/// A COUNTDOWN IS THE COUNTDOWN WHATEVER CLAUDE CODE REDRAWS OF ITS BOX: a
-/// read placing the deny in step with the last read's is the same countdown
-/// ticking, its box relabelled (`1 of 2`, another ask stacked behind it),
-/// re-wrapped, or edited by the loop's own decline — so no hold looks again
-/// to see it tick, and its hold's end is said once.
 #[test]
 fn a_countdown_ticks_on_through_its_box_s_redraws() {
     let at_margin = watched(vec![
@@ -2491,9 +2209,6 @@ fn a_countdown_ticks_on_through_its_box_s_redraws() {
     assert_eq!(ends(&journal), 1, "{journal:#?}");
 }
 
-/// A HOLD LOOKS AGAIN WHEN IT ENDS, NOT AT THE GRACE'S END (every other test
-/// of the hold looks again at once, `Session::set_person_hold_wait`, so when
-/// its look was owed went unchecked).
 #[test]
 fn a_hold_is_looked_at_again_when_it_ends() {
     let mut m = fenced(vec![busy_screen(), incident("1:44"), incident("1:43")]);
@@ -2529,12 +2244,6 @@ fn a_hold_is_looked_at_again_when_it_ends() {
     assert!((87..=88).contains(&look.as_secs()), "{look:?}");
 }
 
-/// A LEASE TAKEN DURING A TAB'S FIRST-KEY WAIT IS A TOUCH, AND NO KEY GOES
-/// UNDER IT: the review tab ticking into the margin under a person's grace,
-/// untouched, so its answer goes past the hold — but another driver takes a
-/// cooperative lease while the loop waits for the tab to stand still before
-/// its first key (`await idle 1000`, O4), which the server lets the loop's
-/// keys through.
 #[test]
 fn a_lease_taken_during_the_first_key_wait_stops_the_answer() {
     let run = |lease: bool| {
@@ -2589,11 +2298,6 @@ fn a_lease_taken_during_the_first_key_wait_stops_the_answer() {
     assert_eq!(key_names(&m), ["enter"], "{:#?}", m.requests);
 }
 
-/// A BOX THAT LEFT BETWEEN THE LEAVE-WAIT'S END AND THE READ AFTER IT LEFT:
-/// the incident's box, nobody about, its `1` pressed and taken, but Claude
-/// Code takes the box down just after the wait for it to leave ran out
-/// (`await seq … OK timeout`), so the read after that wait shows the worker
-/// busy again.
 #[test]
 fn a_box_that_left_after_its_leave_wait_ran_out_left() {
     let (m, journal) = held_watch(
@@ -2611,9 +2315,6 @@ fn a_box_that_left_after_its_leave_wait_ran_out_left() {
     );
 }
 
-/// `rows` with the countdown wiped as Claude Code wipes it when a key
-/// reaches the box (2.1.283, measured: within 5 ms of a taken `1`): its row
-/// and one of the two blank rows under it gone, the box still drawn.
 fn wiped(rows: &[String]) -> Vec<String> {
     let at = rows
         .iter()
@@ -2624,10 +2325,6 @@ fn wiped(rows: &[String]) -> Vec<String> {
     out
 }
 
-/// A BOX WHOSE COUNTDOWN A KEY WIPED IS WAITED ON TO LEAVE: the incident's
-/// box, nobody about, its countdown seen ticking 14 s from the deny, so the
-/// wait for it to leave after its `1` is the short one near the deny
-/// (`LEAVE_NEAR_DENY`).
 #[test]
 fn a_box_whose_countdown_a_key_wiped_is_waited_on_to_leave() {
     let box_at = |left: &str| incident(left);
@@ -2657,12 +2354,6 @@ fn a_box_whose_countdown_a_key_wiped_is_waited_on_to_leave() {
     );
 }
 
-/// A COUNTDOWN THAT STOOD STILL IS LOOKED AT AGAIN UNTIL IT TICKS: the
-/// incident's box under a person's grace, untouched, its countdown standing
-/// at 1:50 for five reads a second apart (Claude Code's redraw stalled on a
-/// loaded machine) — past `TICK_SLACK`, so it is no deny the loop believes —
-/// then drawn at 1:45, the time the vendor's own deadline gives once it
-/// redraws.
 #[test]
 fn a_countdown_that_stood_still_is_looked_at_again_until_it_ticks() {
     let mut screens = vec![busy_screen()];
@@ -2708,10 +2399,6 @@ fn a_countdown_that_stood_still_is_looked_at_again_until_it_ticks() {
     }
 }
 
-/// NO WAIT FOR A STILL SCREEN RUNS PAST THE DENY IT RACES: the review tab at
-/// 0:14 under a manager, its Enter not taken, on a screen that never holds
-/// still half a second (Claude Code's tool row blinking over the dialog as
-/// well as its countdown ticking, [`Mock::idle_never`]).
 #[test]
 fn no_still_wait_runs_past_the_deny_it_races() {
     let book = Book::new("box-hold-blink");

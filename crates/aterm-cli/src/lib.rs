@@ -52,8 +52,6 @@ pub use windowing::{
     window_verb_usage,
 };
 
-/// `--help`'s title. [`help_text`] assembles the rest: USAGE, OPTIONS,
-/// SUBCOMMANDS, VERBS, TOOLCHAIN and EXAMPLES.
 const HELP_TITLE: &str = "aterm — a transparent, introspecting terminal\n";
 /// What a plain `aterm` session runs, per platform, for `--help` ([`HELP_SESSION_LINE`]) and `aterm help aterm`.
 #[cfg(not(windows))]
@@ -338,7 +336,6 @@ impl Verb {
             Verb::Agents => "aterm agents [<cmd>]",
             Verb::Ai => "aterm ai [<cmd>]",
             Verb::Machines => "aterm machines <cmd>",
-            // Longer than the synopsis column: it prints on a line of its own.
             Verb::Init => {
                 "aterm init [--plan|--check] [--json] [--develop|--no-develop] [--only <items>]"
             }
@@ -472,18 +469,13 @@ impl Verb {
     }
 }
 
-/// The description column `--help` aligns verb blurbs to.
 const VERB_BLURB_COLUMN: usize = 30;
 
-/// Render one verb's `--help` entry: the synopsis, then its blurb lines aligned
-/// under a single column.
 fn verb_help_block(verb: Verb) -> String {
     let mut out = String::new();
     let mut lines = verb.blurb().iter();
     let width = VERB_BLURB_COLUMN - 4;
     if verb.usage().len() >= width {
-        // A synopsis wider than its column gets a line of its own, rather than running
-        // into its blurb.
         out.push_str(&format!("    {}\n", verb.usage()));
     } else {
         let first = lines.next().unwrap_or(&"");
@@ -495,8 +487,6 @@ fn verb_help_block(verb: Verb) -> String {
     out
 }
 
-/// `--help`, assembled. The VERBS section is rendered from [`Verb::ALL`] rather
-/// than written out, which is what makes "advertised" and "exists" the same fact.
 fn help_text() -> String {
     let mut out = format!(
         "{HELP_TITLE}{}\n\n{HELP_SESSION_LINE}{HELP_HEAD}",
@@ -510,7 +500,6 @@ fn help_text() -> String {
     out
 }
 
-/// The remainder of `--help`, from TOOLCHAIN on.
 const HELP_TAIL: &str = concat!(
     "\n",
     "TOOLCHAIN (`aterm help pkg` has the manual):\n",
@@ -558,8 +547,6 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-/// `aterm <diag> --help`'s usage line for a diagnostic subcommand: its operand or
-/// flag where it takes one.
 fn diag_usage(cmd: &str) -> String {
     match cmd {
         "show-face" => format!("aterm {cmd} <family>"),
@@ -569,12 +556,9 @@ fn diag_usage(cmd: &str) -> String {
     }
 }
 
-/// The refusal for `aterm show-face` with no family (exit 2).
 const SHOW_FACE_NEEDS_FAMILY: &str =
     "aterm show-face: needs a font family — usage: aterm show-face <family>";
 
-/// The `(report, exit_code)` for diagnostic subcommand `cmd` (with an optional positional
-/// `arg`), or `None` if `cmd` is not one.
 fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
     match cmd {
         "show-config" => Some((show_config_report(), 0)),
@@ -587,8 +571,6 @@ fn diag_report(cmd: &str, arg: Option<&str>) -> Option<(String, i32)> {
     }
 }
 
-/// `aterm show-config`: this session's shell, TERM, size and containment default as
-/// `key=value` lines.
 fn show_config_report() -> String {
     let (rows, cols) = driver::host_winsize();
     let env = |k: &str| std::env::var(k).unwrap_or_default();
@@ -613,9 +595,6 @@ fn show_config_report() -> String {
     out
 }
 
-/// `aterm explain-config` — where aterm.toml is on this machine and what beats
-/// it, how the containment mode is chosen, the modes (least → most capability),
-/// then the platform's own keys.
 fn explain_config_report() -> String {
     let mut out = String::new();
     out.push_str("aterm configuration resolution\n\n");
@@ -649,9 +628,6 @@ fn explain_config_report() -> String {
     out
 }
 
-/// The first paragraph of `explain-config`, on every platform: the aterm.toml
-/// this machine resolves (`aterm_types::dirs::aterm_config_path`, the file the
-/// window loads) and what beats it.
 fn config_path_paragraph() -> String {
     let path = match aterm_types::dirs::aterm_config_path() {
         Some(path) => path.display().to_string(),
@@ -780,8 +756,6 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20 Settings \u{25b8} Security \u{25b8} Ask Again clears macOS's saved refusals for the folders it\n\
      \x20 lists, after you confirm. No key in this section needs anything beyond saving the file.\n";
 
-/// `aterm list-fonts` — available font families (file stems), one per line, sorted
-/// and deduplicated for scriptable output.
 fn list_fonts_report() -> String {
     let fonts = aterm_render::list_fonts();
     if fonts.is_empty() {
@@ -795,9 +769,6 @@ fn list_fonts_report() -> String {
     out
 }
 
-/// `aterm show-face <family>`: the resolved path + cell metrics for a font
-/// family as `key=value` lines; `px=` is the probe size
-/// ([`aterm_render::FaceInfo::PROBE_PX`]).
 fn show_face_report(family: Option<&str>) -> (String, i32) {
     let Some(family) = family else {
         return (format!("{SHOW_FACE_NEEDS_FAMILY}\n"), 2);
@@ -825,12 +796,8 @@ fn show_face_report(family: Option<&str>) -> (String, i32) {
     }
 }
 
-/// How much of `messages.log`'s tail the reader takes, across the file and its rotated `.1`:
-/// the window's launch load (`aterm-gui`'s `messages_store::TAIL_BYTES`), about 150 days at
-/// the measured 7 KB a day.
 const EXCEPTIONS_TAIL_BYTES: u64 = 1024 * 1024;
 
-/// What the reader found in `messages.log`.
 struct ExceptionsRead {
     /// The replayed records.
     log: aterm_messages::MessageLog,
@@ -843,7 +810,6 @@ struct ExceptionsRead {
     unreadable: Option<Unreadable>,
 }
 
-/// A log path that exists but was not read.
 struct Unreadable {
     path: std::path::PathBuf,
     /// A symlink or a folder (never followed), rather than a file that would not open.
@@ -851,7 +817,6 @@ struct Unreadable {
 }
 
 impl Unreadable {
-    /// What the report says about it.
     fn why(&self) -> String {
         let shown = self.path.display();
         if self.not_a_file {
@@ -861,7 +826,6 @@ impl Unreadable {
         }
     }
 
-    /// The file's own name, for `doctor`'s one-line reason.
     fn name(&self) -> String {
         self.path.file_name().map_or_else(
             || self.path.display().to_string(),
@@ -870,13 +834,10 @@ impl Unreadable {
     }
 }
 
-/// `<logs>/messages.log`; `None` when no log folder resolves.
 fn exceptions_log_path() -> Option<std::path::PathBuf> {
     aterm_types::dirs::logs_dir().map(|dir| dir.join("messages.log"))
 }
 
-/// The last `tail` bytes of one regular file as text (never followed through a
-/// symlink), with the partial first line of a cut dropped.
 fn read_log_tail(path: &std::path::Path, tail: u64) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let meta = std::fs::symlink_metadata(path).ok()?;
@@ -900,9 +861,6 @@ fn read_log_tail(path: &std::path::Path, tail: u64) -> Option<String> {
     })
 }
 
-/// Read and replay `path` and its rotated `.1` (oldest first, so a `posted` in the
-/// older copy meets its `retired` in the current file), exactly as the window's
-/// launch load does.
 fn read_exceptions_log(path: &std::path::Path) -> ExceptionsRead {
     let rotated = {
         let mut name = path.as_os_str().to_owned();
@@ -956,57 +914,14 @@ fn read_exceptions_log(path: &std::path::Path) -> ExceptionsRead {
     }
 }
 
-/// The local zone's offset from UTC in seconds at `unix_s` ([`local_offset_at`]),
-/// `0` where `date` cannot say (Windows, or no `date`): the times then read as UTC.
 fn local_offset_s(unix_s: i64) -> i64 {
     local_offset_at(unix_s).unwrap_or(0)
 }
 
-/// The local zone's offset from UTC in seconds at `unix_s`, from `date +%z` (the
-/// offset daylight saving gave THAT instant), or `None` where `date` cannot say.
-#[cfg(unix)]
 fn local_offset_at(unix_s: i64) -> Option<i64> {
-    let mut date = aterm_uds::spawnfd::command("/bin/date");
-    if cfg!(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "openbsd"
-    )) {
-        date.arg("-r").arg(unix_s.to_string());
-    } else {
-        date.arg("-d").arg(format!("@{unix_s}"));
-    }
-    date.arg("+%z")
-        .stdin(aterm_uds::spawnfd::Stdio::null())
-        .stderr(aterm_uds::spawnfd::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| parse_zone_offset(String::from_utf8_lossy(&o.stdout).trim()))
+    aterm_uds::zone::local_offset_at(unix_s)
 }
 
-#[cfg(not(unix))]
-fn local_offset_at(_unix_s: i64) -> Option<i64> {
-    None
-}
-
-/// `+0100` / `-0530` (what `date +%z` prints) as seconds east of UTC.
-#[cfg(any(unix, test))]
-fn parse_zone_offset(z: &str) -> Option<i64> {
-    let (sign, digits) = match z.as_bytes().first()? {
-        b'+' => (1, &z[1..]),
-        b'-' => (-1, &z[1..]),
-        _ => return None,
-    };
-    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let (h, m): (i64, i64) = (digits[..2].parse().ok()?, digits[2..].parse().ok()?);
-    (h < 24 && m < 60).then_some(sign * (h * 3600 + m * 60))
-}
-
-/// `aterm exceptions [--all]`: what needs a look but not now, and what was filed, read from
-/// `messages.log` with no window running.
 fn exceptions_report(all: bool) -> String {
     let Some(path) = exceptions_log_path() else {
         return "exceptions: none to read (no log folder)\n".to_string();
@@ -1018,7 +933,6 @@ fn exceptions_report(all: bool) -> String {
     exceptions_report_at(&path, all, now_ms, offset)
 }
 
-/// [`exceptions_report`] over one log path, a clock and a zone: the testable core.
 fn exceptions_report_at(path: &std::path::Path, all: bool, now_ms: u64, offset_s: i64) -> String {
     let read = read_exceptions_log(path);
     if let Some(unreadable) = &read.unreadable {
@@ -1054,11 +968,8 @@ fn exceptions_report_at(path: &std::path::Path, all: bool, now_ms: u64, offset_s
     out
 }
 
-/// The `exceptions:` fact `doctor` reads: how many entries the log leaves open, or
-/// why nothing was counted (no log folder, or a log that cannot be read).
 type ExceptionsFacts = Result<usize, String>;
 
-/// How many exceptions are open in `messages.log` (0 when there is no file yet).
 fn exceptions_facts() -> ExceptionsFacts {
     let path = exceptions_log_path().ok_or_else(|| "no log folder".to_string())?;
     let read = read_exceptions_log(&path);
@@ -1072,8 +983,6 @@ fn exceptions_facts() -> ExceptionsFacts {
         .count())
 }
 
-/// The `exceptions:` row, pure over the count. A NOTE when something waits for a look
-/// (a fact for a person, never a reason for `doctor` to fail), OK when nothing does.
 fn exceptions_row(facts: &ExceptionsFacts) -> (Mark, String) {
     match facts {
         Err(why) => (Mark::Note, format!("not measured ({why})")),
@@ -1106,7 +1015,6 @@ pub enum Mark {
 }
 
 impl Mark {
-    /// The mark column's text.
     const fn render(self) -> &'static str {
         match self {
             Self::Ok => "ok",
@@ -1116,19 +1024,15 @@ impl Mark {
         }
     }
 
-    /// `true` for the one mark that moves the exit code.
     const fn is_fail(self) -> bool {
         matches!(self, Self::Fail)
     }
 
-    /// The mark for the two-valued shell check.
     const fn from_ok(ok: bool) -> Self {
         if ok { Self::Ok } else { Self::Fail }
     }
 }
 
-/// One `doctor` row: the label, its verdict, and the detail line (which carries
-/// its own `key: …` prefix).
 struct DoctorRow {
     /// The row's left column, e.g. `shell:`.
     label: &'static str,
@@ -1160,7 +1064,6 @@ struct PrivacyFacts {
 }
 
 impl PrivacyFacts {
-    /// What every host that measured nothing reports: no state, no claim.
     const fn not_measured(label: ProbeLabel) -> Self {
         Self {
             fda: FdaState::Unknown,
@@ -1171,7 +1074,6 @@ impl PrivacyFacts {
     }
 }
 
-/// Gather the consent facts for the `privacy:` row.
 fn privacy_facts() -> PrivacyFacts {
     let probe = aterm_containment::probe_fda(ProbeGate::on());
     if probe.label.refused() {
@@ -1217,8 +1119,6 @@ fn designated_requirement_class() -> DrClass {
     DrClass::Unknown
 }
 
-/// Why a probe reports what it does, in an actionable sentence. Every label is
-/// spelled so a new variant cannot render as an empty reason.
 fn probe_reason(label: ProbeLabel) -> String {
     match label {
         ProbeLabel::Pending => "the access check is pending".to_string(),
@@ -1236,7 +1136,6 @@ fn probe_reason(label: ProbeLabel) -> String {
     }
 }
 
-/// The `privacy:` row: mark + detail, pure over [`PrivacyFacts`].
 fn privacy_row(facts: &PrivacyFacts) -> (Mark, String) {
     let who = facts.responsible.as_deref().unwrap_or("unknown");
     let churns = matches!(facts.dr, DrClass::Cdhash | DrClass::Unsigned);
@@ -1288,7 +1187,6 @@ impl DebuggerFacts {
     }
 }
 
-/// Gather the facts for the `debugger:` row behind the in-bundle fence.
 fn debugger_facts() -> DebuggerFacts {
     let probe = aterm_containment::consent::probe_debugger(ProbeGate::on());
     if probe.label.refused() {
@@ -1318,7 +1216,6 @@ const fn debugger_probe_reason(label: DebuggerProbeLabel) -> &'static str {
     }
 }
 
-/// Format the `debugger:` row from [`DebuggerFacts`]. Never returns [`Mark::Fail`].
 fn debugger_row(facts: &DebuggerFacts) -> (Mark, String) {
     let probe = &facts.probe;
     if probe.label.refused() || probe.mode == DebuggerMode::Unknown {
@@ -1392,8 +1289,6 @@ fn debugger_row(facts: &DebuggerFacts) -> (Mark, String) {
     }
 }
 
-/// The Developer Tools list as `doctor` reads it ([`atpkg::devtools::facts`]), read after
-/// anything this run did about it, and what this run did toward the switch.
 struct DevtoolsFacts {
     facts: Option<atpkg::devtools::Facts>,
     did: Option<String>,
@@ -1401,7 +1296,6 @@ struct DevtoolsFacts {
 
 #[cfg(test)]
 impl DevtoolsFacts {
-    /// No Developer Tools list here: no row.
     const fn absent() -> Self {
         Self {
             facts: None,
@@ -1439,9 +1333,6 @@ fn unix_shell(
     (program.to_string_lossy().into_owned(), label)
 }
 
-/// `aterm doctor`'s own facts (the shell, the macOS consent posture, unreachable instances,
-/// the fabric's broker, the recovery ledger and open exceptions) as [`doctor_rows`] makes
-/// them; the stale copies are left to their item ([`doctor::Gathered`]).
 fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
     let program_check = program_check_fact();
     let withheld = args_read_withheld(program_check.as_ref());
@@ -1524,9 +1415,6 @@ fn doctor_report(fix: bool) -> (String, i32) {
     doctor::render(&gathered, &rows, &[])
 }
 
-/// The stale copies of aterm as `doctor` reads them ([`atpkg::copies`]), with
-/// what this run did about them, the console host a new window's tab runs
-/// in, and the fabric's broker.
 struct MachineFacts {
     /// What the stale-copy prune found and did.
     copies: Option<atpkg::copies::Pruned>,
@@ -1543,7 +1431,6 @@ struct MachineFacts {
 }
 
 impl MachineFacts {
-    /// Nothing to say here: no row at all.
     const fn absent() -> Self {
         Self {
             copies: None,
@@ -1555,8 +1442,6 @@ impl MachineFacts {
     }
 }
 
-/// Gather [`MachineFacts`]: the console host and the fabric's broker, whose process table
-/// is not read while `withheld` says why ([`args_read_withheld`]).
 fn machine_facts(withheld: Option<&str>) -> MachineFacts {
     MachineFacts {
         console_host: console_host_fact(),
@@ -1565,14 +1450,11 @@ fn machine_facts(withheld: Option<&str>) -> MachineFacts {
     }
 }
 
-/// Read the program check's pool for its row (`None` off macOS): one bounded `ps`.
 fn program_check_fact() -> Option<aterm_uds::program_check::Look> {
     cfg!(target_os = "macos")
         .then(|| aterm_uds::program_check::look(aterm_uds::program_check::PS_HANG))
 }
 
-/// Why doctor lists no program's command line now, while `look` reads `syspolicyd`'s pool
-/// at the kernel's limit; else `None`.
 fn args_read_withheld(look: Option<&aterm_uds::program_check::Look>) -> Option<String> {
     let Some(aterm_uds::program_check::Look::Read(r)) = look else {
         return None;
@@ -1589,11 +1471,6 @@ fn args_read_withheld(look: Option<&aterm_uds::program_check::Look>) -> Option<S
     })
 }
 
-/// The `syspolicyd:` row (macOS), pure over one look: `ok` while
-/// `syspolicyd`'s pool has room or none runs, a `warn` while the kernel holds
-/// it at its limit (held there it is deadlocked, which only a restart ends;
-/// one reading cannot say how long it has stood, which a window's `status`
-/// does), a `note` when it could not be read.
 fn program_check_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     use aterm_uds::program_check::Look;
     let Some(look) = &facts.program_check else {
@@ -1646,8 +1523,6 @@ fn program_check_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     }]
 }
 
-/// Probe the fabric broker for the `fabric:` row (`None` off Unix), its process table not
-/// read while `withheld` says why.
 fn fabric_fact(withheld: Option<&str>) -> Option<(Mark, String, bool)> {
     #[cfg(unix)]
     {
@@ -1685,7 +1560,6 @@ fn fabric_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         .collect()
 }
 
-/// Probe the Windows console host for a new window's tab (`None` off Windows).
 fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     #[cfg(windows)]
     {
@@ -1699,9 +1573,6 @@ fn console_host_fact() -> Option<aterm_pty::ConsoleHostReport> {
     }
 }
 
-/// Read the Developer Tools list and, when `fix` is set and aterm is `NotGranted`
-/// on a local session whose program check has room (`check_full` false), hand over the
-/// System Settings pane via [`devtools_hand_over`].
 fn devtools_facts(fix: bool, check_full: bool) -> DevtoolsFacts {
     let (facts, did) = devtools_read_and_hand_over(fix, check_full);
     DevtoolsFacts { facts, did }
@@ -1743,13 +1614,6 @@ fn devtools_read_and_hand_over(
     (Some(facts), did)
 }
 
-/// The fix-mode hand-over over the facts read: nothing without `fix` or when aterm is not
-/// missing from the list, a sentence over ssh or while macOS's program check is at its
-/// thread limit (`check_full`: `spctl` asks syspolicyd, which answers nothing while it
-/// stays there, and the switch is tccd's, which a deadlock holds; one reading cannot say
-/// whether it drains), else [`devtools_hand_over`] — the window
-/// first, doctor's own open at most once per [`atpkg::devtools::REOPEN_AFTER_S`] — and
-/// the list read again (`reread`) when this run opened the page.
 fn devtools_hand_over_when(
     fix: bool,
     facts: atpkg::devtools::Facts,
@@ -1806,9 +1670,6 @@ enum WindowAnswer {
     Reply(String),
 }
 
-/// Ask the aterm instance this shell reaches (`aterm ctl`'s flagless rule, a
-/// live socket) for the Developer Tools hand-over: `devtools hand-over`, or with
-/// `now` for a person at this terminal.
 fn ask_window_for_devtools(now: bool) -> WindowAnswer {
     let Some(sock) = aterm_ctl::front_door_instance() else {
         return WindowAnswer::Unreachable;
@@ -1821,10 +1682,6 @@ fn ask_window_for_devtools(now: bool) -> WindowAnswer {
     window_answer(aterm_ctl::front_door_send(&sock, request))
 }
 
-/// What one [`aterm_ctl::front_door_send`] of the hand-over came to. A line the
-/// connect phase returned in place of an answer (`ERR auth; …`, `ERR control
-/// server busy; retry`) means the request never went out, so nothing was
-/// decided about it: no instance answered, as when the connect itself failed.
 fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
     match sent {
         Ok(reply) if aterm_ctl::front_door_refused(&reply) => WindowAnswer::Unreachable,
@@ -1836,9 +1693,6 @@ fn window_answer(sent: std::io::Result<String>) -> WindowAnswer {
     }
 }
 
-/// What `aterm doctor`'s Developer Tools hand-over reaches beyond the facts it
-/// read: the window, atpkg's two acts, the shared markers, the wait and the
-/// terminal.
 struct DevtoolsReach<'a> {
     /// Ask the running aterm window ([`ask_window_for_devtools`]); the argument
     /// is `now` (a person at this terminal).
@@ -1869,12 +1723,9 @@ struct DevtoolsReach<'a> {
     say: &'a dyn Fn(&str),
 }
 
-/// The line printed while doctor waits for the switch. ctrl-c ends doctor, not
-/// only the wait (doctor installs no handler), so it says that.
 const DEVTOOLS_WAIT_LINE: &str = "aterm doctor: waiting up to 2 min for aterm's switch to read on \
                                   in Developer Tools (ctrl-c stops doctor)\u{2026}";
 
-/// Coordinate the Developer Tools hand-over with any running aterm window.
 fn devtools_hand_over(
     facts: &atpkg::devtools::Facts,
     person: bool,
@@ -1963,7 +1814,6 @@ fn devtools_hand_over(
     (did, false)
 }
 
-/// Open the Developer Tools pane directly from `doctor` and optionally wait for the switch.
 fn devtools_open_here(
     facts: &atpkg::devtools::Facts,
     person: bool,
@@ -2033,9 +1883,6 @@ fn devtools_open_here(
     (did, true)
 }
 
-/// The calendar day `at` (unix seconds) fell on in the local zone, for a
-/// did-line: `YYYY-MM-DD` at `offset_s` east of UTC, or the UTC day marked
-/// `(UTC)` when the zone could not be read.
 fn local_day_words(at: u64, offset_s: Option<i64>) -> String {
     let shifted = |offset: i64| {
         let at = i64::try_from(at).unwrap_or(i64::MAX).saturating_add(offset);
@@ -2049,7 +1896,6 @@ fn local_day_words(at: u64, offset_s: Option<i64>) -> String {
     day
 }
 
-/// How long ago aterm opened the pane, `ago` seconds back, for a did-line.
 fn opened_ago_words(ago: u64) -> String {
     if ago < 60 {
         "under a minute ago".to_string()
@@ -2058,7 +1904,6 @@ fn opened_ago_words(ago: u64) -> String {
     }
 }
 
-/// Format the stderr banner printed when `doctor` opens System Settings.
 fn devtools_banner(facts: &atpkg::devtools::Facts, full: bool, listed_terminal: bool) -> String {
     use atpkg::devtools as dt;
     let skips = aterm_containment::SpikeEvidence::MEASURED.devtool_skips_first_run_check;
@@ -2093,10 +1938,6 @@ fn config_conpty_from_text(text: &str) -> Option<String> {
     table.get("conpty")?.as_str().map(str::to_string)
 }
 
-/// The `conpty:` row (Windows): `ok` for OpenConsole and for the Windows
-/// console host the choice asked for (`inbox`), a `note` when the OpenConsole
-/// the choice named (the bundled default, `auto` or a path) fell back — never a
-/// failure: every tab opens either way.
 fn console_host_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     let Some(host) = &facts.console_host else {
         return Vec::new();
@@ -2109,9 +1950,6 @@ fn console_host_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     }]
 }
 
-/// The `spotlight:` row, pure over the count ([`spotlight::row`]): `ok` when Spotlight
-/// indexes none of it, a `note` naming the folders and the remedy otherwise; none off
-/// macOS.
 fn spotlight_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     facts
         .spotlight
@@ -2129,9 +1967,6 @@ fn spotlight_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
         .collect()
 }
 
-/// The `copies:` row, pure over the facts: atpkg's words and weights, never a
-/// failure (a `warn` moves no exit code: nothing in it stops a shell from
-/// starting).
 fn copies_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     let Some(pruned) = &facts.copies else {
         return Vec::new();
@@ -2153,7 +1988,6 @@ fn copies_rows(facts: &MachineFacts) -> Vec<DoctorRow> {
     }]
 }
 
-/// atpkg's row weight in this report's marks.
 const fn mark_of_level(level: atpkg::doctor::Level) -> Mark {
     match level {
         atpkg::doctor::Level::Ok => Mark::Ok,
@@ -2162,12 +1996,8 @@ const fn mark_of_level(level: atpkg::doctor::Level) -> Mark {
     }
 }
 
-/// The recovery ledger as `doctor` reads it: its rows and path, or why the history
-/// could not be read (`aterm_update::recovery_ledger`).
 type RecoveryFacts = Result<(Vec<aterm_update::recovery_ledger::Row>, std::path::PathBuf), String>;
 
-/// Read the recovery ledger — the rows the window's recovery census writes at each
-/// windowed launch of the installed app.
 fn recovery_facts() -> RecoveryFacts {
     let path = aterm_update::recovery_ledger::default_ledger_path()
         .ok_or_else(|| "no log folder, so there is no ledger".to_owned())?;
@@ -2176,8 +2006,6 @@ fn recovery_facts() -> RecoveryFacts {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
-/// The `recovery:` row, pure over the ledger: how the runs before each recorded
-/// windowed launch ended, with the last unexpected end in detail.
 fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
     if cfg!(windows) {
         return (Mark::Note, "not recorded on Windows".to_string());
@@ -2191,9 +2019,6 @@ fn recovery_row(facts: &RecoveryFacts) -> (Mark, String) {
     (mark, lines.join("\n"))
 }
 
-/// What the front door does with `word` in argv[1] (`aterm <word>`), for the census: a windowing
-/// verb opens a window; any other verb, a diagnostic, `help` and the `hook` the front door hands
-/// to `aterm link` run as the program `aterm <word>`; another word is no verb.
 fn front_door_verb(word: &str) -> Option<aterm_ctl::census::Verb> {
     use aterm_ctl::census::Verb as Census;
     match Verb::from_operand(word) {
@@ -2205,14 +2030,8 @@ fn front_door_verb(word: &str) -> Option<aterm_ctl::census::Verb> {
     }
 }
 
-/// The most program names the `instances:` row lists before it cuts the list.
 const PROGRAM_GROUPS: usize = 6;
 
-/// The `instances:` row, pure over [`aterm_ctl::census`]: aterm windows and
-/// headless instances of this user that no published control socket reaches
-/// (invisible to `aterm ctl ls`), then the other aterm programs, each one whose
-/// launcher exited named. Only an unreached instance makes it a note: an adopted
-/// program may be a pass aterm detached on purpose.
 fn instances_row(census: &Result<aterm_ctl::census::Census, String>) -> (Mark, String) {
     let census = match census {
         Ok(census) => census,
@@ -2464,9 +2283,6 @@ fn doctor_checks_with_origin(
     doctor::render(&gathered, &rows, &[])
 }
 
-/// The report's lines, the version and the health line, from one mark and fact per
-/// row ([`doctor::render`] reads them off the rows the engine returned): only
-/// [`Mark::Fail`] fails, and the health line names every `warn`.
 fn render_doctor_lines(checks: &[DoctorRow]) -> (String, i32) {
     let all_ok = !checks.iter().any(|row| row.mark.is_fail());
     let warned: Vec<&str> = checks
@@ -2493,7 +2309,6 @@ fn render_doctor_lines(checks: &[DoctorRow]) -> (String, i32) {
     (out, i32::from(!all_ok))
 }
 
-/// Facts and version, before the caller's health/readiness assessment.
 fn render_doctor_rows(checks: &[DoctorRow]) -> String {
     const LABEL: usize = "exceptions: ".len();
     let mut out = String::new();
@@ -2551,8 +2366,6 @@ enum CliAction {
     },
 }
 
-/// Pure argument-decision core: the argv tail to a [`CliAction`]; [`parse_args`] is the
-/// effectful wrapper.
 fn decide_args<I: Iterator<Item = String>>(args: I) -> CliAction {
     let mut args = args.peekable();
     if args.peek().map(String::as_str) == Some("help") {
@@ -2712,8 +2525,6 @@ fn running_build() -> Option<u64> {
     (build > 0).then_some(build)
 }
 
-/// Hook run when the session's shell first writes output (used by the launcher
-/// to confirm a replaced Linux executable's trial).
 static FIRST_SHELL_OUTPUT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
 /// Register the [`FIRST_SHELL_OUTPUT`] hook; returns `false` if already set.
@@ -2735,8 +2546,6 @@ fn trust_anchors_line() -> String {
     )
 }
 
-/// Write `text` to stdout without panicking on `EPIPE` and exit with `code`
-/// (or `1` on non-pipe write errors).
 fn answer_and_exit(text: &str, code: i32) -> ! {
     let written = aterm_uds::stdout::write_all(cli_text::for_stdout(text).as_bytes());
     std::process::exit(
@@ -2834,13 +2643,10 @@ pub struct SessionFlags {
 
 static SESSION_FLAGS: std::sync::OnceLock<SessionFlags> = std::sync::OnceLock::new();
 
-/// This process's session flags (the defaults when [`parse_args`] recorded none).
 fn session_flags() -> SessionFlags {
     SESSION_FLAGS.get().cloned().unwrap_or_default()
 }
 
-/// The `("PATH", value)` pair that puts `dir` first on the child's PATH;
-/// `None` when already present.
 fn prepend_path(dir: &str, inherited: Option<&str>) -> Option<(String, String)> {
     let sep = if cfg!(windows) { ';' } else { ':' };
     match inherited {
@@ -2850,8 +2656,6 @@ fn prepend_path(dir: &str, inherited: Option<&str>) -> Option<(String, String)> 
     }
 }
 
-/// aterm's own binary directory, handed to the child shell so `aterm` and every
-/// `aterm <verb>` resolve even when launched by absolute path.
 fn front_door_bin_dir() -> Option<String> {
     let exe = std::fs::canonicalize(std::env::current_exe().ok()?).ok()?;
     let dir = exe.parent()?;
@@ -2864,14 +2668,9 @@ fn front_door_bin_dir() -> Option<String> {
     dir.to_str().map(str::to_owned)
 }
 
-/// `atpkg::reroute::REROUTE_DIR_ENV` and `PASSTHROUGH_ENV`, restated;
-/// `reroute_env_names_match_atpkg` pins both.
 const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
 const PASSTHROUGH_ENV: &str = "__ATERM_REROUTE_PASSTHROUGH";
 
-/// The session's reroute directory from `$ATERM_REROUTE_DIR`, which the front
-/// door (`crates/aterm/src/main.rs`) resolves, lays stubs into and exports
-/// before `session_main` runs.
 fn reroute_dir_from_env() -> Option<String> {
     reroute_dir_from_values(
         std::env::var(PASSTHROUGH_ENV).ok().as_deref(),
@@ -2879,9 +2678,6 @@ fn reroute_dir_from_env() -> Option<String> {
     )
 }
 
-/// [`reroute_dir_from_env`] over explicit values, so the rule is testable without a
-/// process environment: `no_reroute` is `$__ATERM_REROUTE_PASSTHROUGH`, `dir` is
-/// `$ATERM_REROUTE_DIR`.
 fn reroute_dir_from_values(no_reroute: Option<&str>, dir: Option<&str>) -> Option<String> {
     if aterm_types::control_socket::env_flag_engaged(no_reroute) {
         return None;
@@ -2890,38 +2686,20 @@ fn reroute_dir_from_values(no_reroute: Option<&str>, dir: Option<&str>) -> Optio
         .map(str::to_owned)
 }
 
-/// Whether `dir` is a non-empty absolute path naming an existing directory — the one
-/// shape either managed directory may have before it goes first on a child's PATH.
 fn is_absolute_existing_dir(dir: &str) -> bool {
     let path = std::path::Path::new(dir);
     !dir.is_empty() && path.is_absolute() && path.is_dir()
 }
 
-/// [`is_absolute_existing_dir`] and not a symlink, the shape of the front
-/// door's `$ATERM_AGENTS_DIR` handoff.
 fn is_absolute_real_dir(dir: &str) -> bool {
     is_absolute_existing_dir(dir)
         && std::fs::symlink_metadata(dir).is_ok_and(|md| !md.file_type().is_symlink())
 }
 
-/// `ATPKG_AGENTS`, atpkg's spelling restated (pinned by
-/// `reroute_env_names_match_atpkg`): the managed `<prefix>/agents/` as an
-/// enclosing shell that sourced the hook names it.
 const HOOK_AGENTS_ENV: &str = "ATPKG_AGENTS";
 
-/// `atpkg::reroute::AGENTS_DIR_ENV` restated (pinned by
-/// `reroute_env_names_match_atpkg`): the managed `<prefix>/agents/` as the
-/// front door hands it on every lane, absolute and ensured to exist.
 const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 
-/// Resolve the managed `agents/` directory for a TTY session:
-///
-/// 1. `handed` (`$ATERM_AGENTS_DIR` from the front door) when it is an absolute
-///    existing real directory;
-/// 2. `<prefix>/agents` alongside `reroute_dir` (`$ATERM_REROUTE_DIR`), ensured
-///    via [`ensure_agents_dir`];
-/// 3. `enclosing_agents` (`$ATPKG_AGENTS` from an enclosing hook-sourced shell)
-///    when it is an absolute existing directory.
 fn managed_agents_dir(
     handed: Option<&str>,
     reroute_dir: Option<&str>,
@@ -3025,8 +2803,6 @@ fn ensure_agents_dir(_prefix: &std::path::Path, dir: &std::path::Path) -> Result
     }
 }
 
-/// The one `("PATH", value)` pair the session hands its shell (the pty seam's
-/// `build_child_env` overwrites by key).
 fn session_path_env(
     reroute_dir: Option<&str>,
     agents_dir: Option<&str>,
@@ -3065,10 +2841,6 @@ pub fn is_tool_candidate(first: Option<&str>) -> bool {
     }
 }
 
-/// Map a containment mode to the [`aterm_sandbox::Limits`] handed to the spawn seam:
-/// `User` inherits the parent's limits (`no job caps` on Windows), `Safety` applies
-/// soft caps ([`aterm_sandbox::Limits::shell_default`]), and `Containment` applies
-/// hard caps ([`aterm_sandbox::Limits::contained`]).
 const fn session_limits(mode: aterm_containment::ContainmentMode) -> aterm_sandbox::Limits {
     use aterm_containment::ContainmentMode as Cm;
     match mode {
@@ -3199,8 +2971,8 @@ mod tests {
         agents_dir_mode, config_conpty_from_text, decide_args, diag_report, doctor_checks,
         doctor_checks_with_origin, exceptions_report_at, explain_config_report, front_door_verb,
         help_text, is_tool_candidate, list_fonts_report, list_themes_alias, managed_agents_dir,
-        parse_zone_offset, prepend_path, read_exceptions_log, reroute_dir_from_values,
-        session_limits, session_path_env, show_face_report, version_text,
+        prepend_path, read_exceptions_log, reroute_dir_from_values, session_limits,
+        session_path_env, show_face_report, version_text,
     };
     #[cfg(unix)]
     use super::{args_read_withheld, fabric_mark, machine_facts, unix_shell};
@@ -3350,8 +3122,6 @@ mod tests {
         }
     }
 
-    /// Diagnostics reject unknown flags (e.g. `aterm show-config --json`)
-    /// instead of ignoring them at exit 0.
     #[test]
     fn a_diag_subcommand_refuses_an_argument_it_would_have_swallowed() {
         for cmd in [
@@ -3374,8 +3144,6 @@ mod tests {
         }
     }
 
-    /// `<diag> --help` describes the subcommand instead of running it (so `-h`
-    /// is never taken as a `show-face` family).
     #[test]
     fn a_diag_help_request_describes_and_never_runs() {
         for argv in [
@@ -3391,7 +3159,6 @@ mod tests {
         }
     }
 
-    /// The diagnostic edge passes doctor's full grammar to the typed parser.
     #[test]
     fn doctor_operand_grammar_is_enforced_at_the_edge() {
         const USAGE: &str = "usage: aterm doctor [--read-only | --check | --apply | --restore] [--json] [--only <id,...>]";
@@ -3426,8 +3193,6 @@ mod tests {
         assert_eq!(super::diag_usage("list-fonts"), "aterm list-fonts");
     }
 
-    /// `aterm exceptions` takes one optional flag, `--all`; anything else is a
-    /// usage error naming the grammar, never silently dropped.
     #[test]
     fn exceptions_operand_grammar_is_enforced_at_the_edge() {
         assert_eq!(decide(&["exceptions"]), diag("exceptions", None));
@@ -3456,18 +3221,6 @@ mod tests {
         }
     }
 
-    /// `date +%z` output is read as seconds east of UTC, and only that shape.
-    #[test]
-    fn the_zone_offset_reads_date_plus_z() {
-        assert_eq!(parse_zone_offset("+0100"), Some(3_600));
-        assert_eq!(parse_zone_offset("-0530"), Some(-19_800));
-        assert_eq!(parse_zone_offset("+0000"), Some(0));
-        for bad in ["", "0100", "+01:00", "+2500", "+0160", "UTC", "+01000"] {
-            assert_eq!(parse_zone_offset(bad), None, "{bad:?}");
-        }
-    }
-
-    /// A scratch folder for the reader's files, removed when dropped.
     struct Scratch(std::path::PathBuf);
 
     impl Scratch {
@@ -3498,9 +3251,6 @@ mod tests {
         }
     }
 
-    /// The lines a real center writes for two exceptions and one dismissal, from
-    /// the engine's own encoder: `(posted x2, retired x1)` for the first batch and
-    /// `retired` for the second, so a test can put them in either file.
     fn exception_lines() -> Vec<String> {
         use aterm_messages::need::{Fingerprint, Reason, Resurface, Then, Why};
         use aterm_messages::{
@@ -3575,8 +3325,6 @@ mod tests {
         lines
     }
 
-    /// Replays `messages.log` (and its rotated `.1` pair) without a window running,
-    /// rendering open and filed entries while counting torn lines.
     #[test]
     fn the_exceptions_reader_replays_the_log_without_a_window() {
         let dir = Scratch::new();
@@ -3684,8 +3432,6 @@ mod tests {
         assert!(unreadable.not_a_file);
     }
 
-    /// The `exceptions:` row: ok with nothing open, a note naming the command when something
-    /// is (never a fail), and "not measured" with no log folder.
     #[test]
     fn the_doctor_exceptions_row_counts_the_open_entries_and_never_fails() {
         let row = |facts: ExceptionsFacts| {
@@ -3721,8 +3467,6 @@ mod tests {
         );
     }
 
-    /// `show-face` keeps its one operand; a flag-shaped or surplus operand is a
-    /// usage error naming the grammar, never a family lookup.
     #[test]
     fn show_face_operand_grammar_is_enforced_at_the_edge() {
         assert_eq!(
@@ -3744,7 +3488,6 @@ mod tests {
         }
     }
 
-    /// [`Verb::is_windowing`] is exactly the set the windowing grammar parses.
     #[test]
     fn the_windowing_verbs_are_exactly_the_ones_the_grammar_parses() {
         for verb in Verb::ALL {
@@ -3764,7 +3507,6 @@ mod tests {
         );
     }
 
-    /// Every registry command is both advertised in `--help` and dispatchable.
     #[test]
     fn diag_commands_advertised_and_dispatchable() {
         assert!(!DIAG_COMMANDS.is_empty(), "registry must not be empty");
@@ -3790,9 +3532,6 @@ mod tests {
         assert!(diag_report("definitely-not-a-command", None).is_none());
     }
 
-    /// `aterm list-kitty-commands` prints the listener's vocabulary: every
-    /// trick has an English row, and every line is one `key=value` row with no
-    /// banner.
     #[test]
     fn list_kitty_commands_prints_one_row_per_line_and_every_trick() {
         let (report, code) =
@@ -3870,8 +3609,6 @@ mod tests {
         assert!(!is_tool_candidate(Some("agents")));
     }
 
-    /// A synopsis wider than its column (init's flags) is printed on a line of its own, so
-    /// no synopsis runs into its blurb; the rest keep the blurb on their line.
     #[test]
     fn no_synopsis_runs_into_its_blurb() {
         assert!(Verb::Init.usage().len() >= crate::VERB_BLURB_COLUMN - 4);
@@ -3891,8 +3628,6 @@ mod tests {
         }
     }
 
-    /// The front-door roster gate: every verb is advertised, well-formed and
-    /// shielded from toolchain shadowing.
     #[test]
     fn front_door_verbs_are_the_one_command_surface() {
         assert!(!Verb::ALL.is_empty(), "roster must not be empty");
@@ -3960,10 +3695,6 @@ mod tests {
         assert_eq!(prepend_path(bin, Some(&already)), None);
     }
 
-    /// The composed session PATH: the reroute dir first (moved from wherever
-    /// the inherited PATH listed it, exactly once), then the front door, then
-    /// the rest; idempotent; with no reroute dir, exactly `prepend_path`'s
-    /// answer.
     #[test]
     fn session_path_puts_the_reroute_dir_first_by_move_to_front_and_is_idempotent() {
         let sep = if cfg!(windows) { ';' } else { ':' };
@@ -4012,9 +3743,6 @@ mod tests {
         assert_eq!(session_path_env(None, None, None, Some("/usr/bin")), None);
     }
 
-    /// The managed `agents/` goes in front in the window's order (reroute,
-    /// agents, front door, inherited) by move-to-front: a `~/.local/bin` or
-    /// `/opt/homebrew/bin` listed earlier ends up behind it, idempotently.
     #[test]
     fn session_path_puts_the_agents_dir_second_by_the_same_move_to_front_rule() {
         let sep = if cfg!(windows) { ';' } else { ':' };
@@ -4062,10 +3790,6 @@ mod tests {
         );
     }
 
-    /// The derived agents dir is atpkg's `Layout::agents_dir` for the prefix of
-    /// `$ATERM_REROUTE_DIR` (pinned against the real layout), and the
-    /// derivation ensures it exists (`0700`), so a fresh machine's first
-    /// session has it on PATH.
     #[test]
     fn the_agents_dir_is_the_reroute_dirs_sibling_in_atpkgs_layout() {
         let scratch = std::env::temp_dir().join(format!(
@@ -4105,8 +3829,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// The reroute and agents variables this crate reads match atpkg's
-    /// spellings, and the front door's agents handoff is not the hook's export.
     #[test]
     fn reroute_env_names_match_atpkg() {
         assert_eq!(REROUTE_DIR_ENV, atpkg::reroute::REROUTE_DIR_ENV);
@@ -4115,10 +3837,6 @@ mod tests {
         assert_ne!(AGENTS_DIR_ENV, HOOK_AGENTS_ENV);
     }
 
-    /// Precedence: a valid `$ATERM_AGENTS_DIR` (absolute, existing, real dir)
-    /// wins with or without a reroute handle and over `$ATPKG_AGENTS`, and
-    /// nothing is created for it; an invalid one falls through to the sibling
-    /// derivation (ensured), then `$ATPKG_AGENTS`, then none.
     #[test]
     fn managed_agents_dir_prefers_the_front_doors_handoff_then_the_sibling_then_the_hook() {
         let scratch = scratch_dir("agents-precedence");
@@ -4191,7 +3909,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// A fresh scratch directory for one test, named by pid and nanos.
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "aterm-cli-{tag}-{}-{}",
@@ -4202,9 +3919,6 @@ mod tests {
         dir
     }
 
-    /// `$ATERM_REROUTE_DIR` is taken only as a non-empty absolute path to an
-    /// existing directory, and never while the `--no-reroute` marker is engaged
-    /// (by `env_flag_engaged`: `0` and empty do not engage it).
     #[test]
     fn reroute_dir_from_values_takes_only_an_absolute_existing_dir() {
         let scratch = scratch_dir("reroute-values");
@@ -4244,10 +3958,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&scratch);
     }
 
-    /// `agents_dir_mode` matches `Layout::ensure_dir` (`0700` for the `$HOME`
-    /// shape, `0755` for a root-owned system prefix) and refuses a prefix owned
-    /// by another user: under `sudo aterm`, root gets `0755` over a system
-    /// prefix and creates nothing in a user's `$HOME` prefix.
     #[test]
     fn agents_dir_mode_restates_layout_ensure_dirs_rule() {
         assert_eq!(agents_dir_mode(501, 0o700, 501), Some(0o700));
@@ -4261,9 +3971,6 @@ mod tests {
         assert_eq!(agents_dir_mode(501, 0o700, 502), None);
     }
 
-    /// `managed_agents_dir` creates nothing from a relative reroute handle,
-    /// refuses a symlink or regular file at `agents/`, and without a derivable
-    /// directory falls back to an absolute existing `$ATPKG_AGENTS`.
     #[test]
     fn managed_agents_dir_refuses_relative_handles_and_links_and_falls_back_to_the_enclosing_shell()
     {
@@ -4407,7 +4114,6 @@ mod tests {
         assert!(msg.contains("aterm list-fonts"), "{msg}");
     }
 
-    /// The mark of the `doctor` row labelled `label` — the row's second word.
     fn mark_of(report: &str, label: &str) -> String {
         report
             .lines()
@@ -4417,9 +4123,6 @@ mod tests {
             .to_string()
     }
 
-    /// `doctor`'s console-host row reads the top-level `conpty` the window
-    /// reads; anything else (no key, a commented example, a key in a table, a
-    /// non-string, a file that does not parse) is the window's default.
     #[test]
     fn config_conpty_reads_the_top_level_key_the_window_reads() {
         assert_eq!(config_conpty_from_text(""), None);
@@ -4433,10 +4136,6 @@ mod tests {
         );
     }
 
-    /// The Windows `conpty:` row lands with the machine rows, in the rows'
-    /// columns: `ok` for OpenConsole (the default) and for the inbox host
-    /// `conpty = "inbox"` asked for, a `note` when a named OpenConsole fell
-    /// back, and the verdict untouched either way.
     #[test]
     fn the_conpty_row_is_ok_for_the_default_and_a_note_for_a_fallback() {
         let report_with = |host: Option<aterm_pty::ConsoleHostReport>| {
@@ -4613,8 +4312,6 @@ mod tests {
         assert_eq!(driver::shell_check("/etc/hosts/zsh"), ShellCheck::Missing);
     }
 
-    /// Off macOS the privacy and debugger probes do not exist, so their rows are
-    /// left out instead of printing `note  not measured (macOS only)` every run.
     #[test]
     fn doctor_leaves_out_rows_for_probes_this_platform_lacks() {
         let (r, code) = doctor_checks(
@@ -4632,8 +4329,6 @@ mod tests {
         assert!(r.contains("instances:"), "{r}");
     }
 
-    /// The `shell:` row can carry where the shell came from; without a label it
-    /// is the unlabelled Unix row.
     #[test]
     fn doctor_shell_row_carries_an_origin_label_only_when_given() {
         let shell_row = |report: &str| -> String {
@@ -4749,8 +4444,6 @@ mod tests {
         }
     }
 
-    /// `explain-config` names this machine's resolved aterm.toml first, on
-    /// every platform.
     #[test]
     fn explain_config_names_the_resolved_config_path() {
         let r = explain_config_report();
@@ -4764,8 +4457,6 @@ mod tests {
         );
     }
 
-    /// The four `privacy:` states: a `note` never moves the exit code, while a real `Fail`
-    /// elsewhere still exits 1.
     #[test]
     fn the_privacy_row_is_a_note_and_never_moves_the_exit_code() {
         let ok = |privacy: &PrivacyFacts| {
@@ -4879,9 +4570,6 @@ mod tests {
         assert_eq!(r.matches("recovery:").count(), 1, "{r}");
     }
 
-    /// The `instances:` row in every state: a note that names each unreached
-    /// instance, counts the other aterm programs and names each one launchd
-    /// adopted, and never moves the exit code.
     #[test]
     fn the_instances_row_names_what_nothing_reaches_and_never_fails() {
         use aterm_ctl::census::{Census, Program, Unreached};
@@ -5015,9 +4703,6 @@ mod tests {
         assert!(!r.contains("aterm v6"), "{r}");
     }
 
-    /// The census names a program by the front door's own words: its verbs, its
-    /// diagnostics, `help` and `hook`, never a flag or an unknown word; a windowing verb
-    /// opens a window.
     #[test]
     fn the_front_door_verbs_name_a_program() {
         use aterm_ctl::census::Verb as Census;
@@ -5061,8 +4746,6 @@ mod tests {
         );
     }
 
-    /// The `spotlight:` row reports indexed build/doc folders as `note` (exit 0),
-    /// clean state as `ok`, and omits the row when `spotlight` is `None`.
     #[test]
     fn the_spotlight_row_is_a_note_at_worst() {
         let report = |spotlight| {
@@ -5101,9 +4784,6 @@ mod tests {
         assert!(!r.contains("spotlight:"), "{r}");
     }
 
-    /// The `syspolicyd:` row is `ok` with room or with none running, a counted
-    /// `warn` while the kernel holds the pool at its limit (exit 0: a restart is
-    /// the person's), a `note` when unread, and absent off macOS.
     #[test]
     fn the_syspolicyd_row_warns_while_the_pool_is_full() {
         let report = |program_check| {
@@ -5156,8 +4836,6 @@ mod tests {
         assert!(!r.contains("syspolicyd:"), "{r}");
     }
 
-    /// The `fabric:` row renders after `instances:`, counts warnings on the health
-    /// line without failing exit status, and is omitted when `fabric` is `None`.
     #[test]
     fn the_fabric_row_is_a_counted_warning_never_a_failure() {
         let report = |fabric: Option<(Mark, String)>| {
@@ -5258,9 +4936,6 @@ mod tests {
         }
     }
 
-    /// The `devtools:` and `copies:` rows: aterm not on the Developer Tools list is a counted
-    /// `warn` (exit stays 0) that says the cost and the owner's fix, then what this run did;
-    /// on the list is `ok`; a copy moved to the Trash is named.
     #[test]
     fn the_devtools_row_is_a_counted_warning_and_says_what_doctor_did() {
         use aterm_containment::consent::{
@@ -5328,10 +5003,6 @@ mod tests {
         assert!(!r.contains("devtools:"), "{r}");
     }
 
-    /// A scripted [`super::DevtoolsReach`] for doctor's Developer Tools hand-over:
-    /// the window answers `answer`, the opened marker reads `opened_ago`, a decline
-    /// on record dates `declined_at`, and every act is logged in order instead of
-    /// done (nothing is asked, run, opened, written, waited for or printed).
     struct Scripted {
         answer: super::WindowAnswer,
         opened_ago: Option<u64>,
@@ -5352,15 +5023,12 @@ mod tests {
             }
         }
 
-        /// Run the hand-over for `facts` with a person at the terminal or not:
-        /// `(did, opened, log)`.
         fn run(&self, facts: &atpkg::devtools::Facts, person: bool) -> (String, bool, Vec<String>) {
             let ((did, opened), log) =
                 self.with(|reach| super::devtools_hand_over(facts, person, reach));
             (did, opened, log)
         }
 
-        /// `act` over this script's reach, and the log of what it did.
         fn with<R>(&self, act: impl FnOnce(&super::DevtoolsReach<'_>) -> R) -> (R, Vec<String>) {
             let note = |entry: String| self.log.borrow_mut().push(entry);
             let reach = super::DevtoolsReach {
@@ -5395,11 +5063,6 @@ mod tests {
         }
     }
 
-    /// THE PANE THROTTLE HOLDS IN THE DOCTOR'S OWN PATH (S5). Bare `aterm doctor`
-    /// gathers its facts with `fix`, which hands the owner to the Developer Tools pane
-    /// ([`super::devtools_hand_over_when`]): within ten minutes of the last opening, with
-    /// no window and no person here, it opens nothing, and the doctor's `devtools:` row
-    /// says why.
     #[test]
     fn the_doctors_devtools_hand_over_keeps_the_ten_minute_throttle() {
         use super::WindowAnswer;
@@ -5476,7 +5139,6 @@ mod tests {
         }
     }
 
-    /// Facts for aterm not on the list: `list` as read, tccd's log silent.
     fn devtools_facts_with(list: aterm_containment::DevToolList) -> atpkg::devtools::Facts {
         use aterm_containment::consent::{DevToolProbe, DevToolProbeLabel};
         atpkg::devtools::Facts {
@@ -5487,7 +5149,6 @@ mod tests {
         }
     }
 
-    /// A list read whole, `rows` long, with aterm's row `listing`.
     fn read_list(
         listing: aterm_containment::DevToolListing,
         rows: u32,
@@ -5500,9 +5161,6 @@ mod tests {
         }
     }
 
-    /// `devtools_hand_over` asks the running window first and opens System Settings
-    /// directly only when no window answers, the window is older than the verb, or
-    /// `now` left the page open to `doctor`.
     #[test]
     fn doctor_asks_the_window_first_and_opens_only_where_the_window_leaves_it() {
         use super::{DEVTOOLS_WAIT_LINE, WindowAnswer};
@@ -5709,9 +5367,6 @@ mod tests {
         }
     }
 
-    /// A line the front door's CONNECT PHASE returned in place of the window's
-    /// answer (`ERR auth`, `ERR control server busy`) means the request never
-    /// went out: no window answered, so doctor takes the no-window path.
     #[test]
     fn a_refused_connect_is_no_window_and_a_reply_is_the_windows() {
         use super::{WindowAnswer, window_answer};
@@ -5748,8 +5403,6 @@ mod tests {
         );
     }
 
-    /// The day a decline is dated: the local calendar day, or the UTC one said
-    /// to be UTC when the zone could not be read.
     #[test]
     fn a_decline_is_dated_by_the_local_day() {
         let at = 1_790_812_800;
@@ -5762,10 +5415,6 @@ mod tests {
         assert_eq!(super::local_day_words(at, None), "2026-10-01 (UTC)");
     }
 
-    /// The banner's words follow what doctor read and did: on an empty list
-    /// `spctl` runs first and the banner says whose Terminal row that is; for an
-    /// aterm listed switched off it asks for the switch, never a drag; and with
-    /// the list unreadable (tccd's answer decided) nothing is waited for.
     #[test]
     fn the_doctor_banner_follows_the_list_it_read() {
         use super::WindowAnswer;
@@ -5824,8 +5473,6 @@ mod tests {
         );
     }
 
-    /// The `debugger:` row is never a `FAIL`, and the one command it prints is the undo
-    /// (the consent module's constant), only once the rule is on.
     #[test]
     fn the_debugger_row_never_fails_and_prints_the_undo_only_when_on() {
         use DebuggerMember::{Admin, Developer, NotMember};
@@ -5878,8 +5525,6 @@ mod tests {
         }
     }
 
-    /// `Note` renders as its own word and is not a failure; the other two keep
-    /// the spellings every script and screenshot already knows.
     #[test]
     fn the_three_marks_render_and_only_one_fails() {
         assert_eq!(Mark::Ok.render(), "ok");
@@ -5967,11 +5612,6 @@ mod tests {
         }
     }
 
-    /// The launch flags, as `decide` reads them: the containment mode is
-    /// carried through as typed (an empty or unknown one fails closed in the
-    /// init funnel, never here), `--sandbox`/`--no-sandbox` are its two
-    /// spellings, the last containment flag on the line wins, `-q`/`--verbose`
-    /// compose with it, and a lone `--` ends the options.
     #[test]
     fn launch_flags_decide_the_run() {
         let run = |containment: Option<&str>, quiet: bool, verbose: bool| CliAction::Run {
@@ -6018,10 +5658,6 @@ mod tests {
         }
     }
 
-    /// A launch line `decide` cannot read is a usage error (exit 2), never a
-    /// silent run: a trailing `--containment`, an unknown flag, an operand (a
-    /// `-`-prefixed one after `--` included), and a diagnostic word after a
-    /// flag (subcommands are first-operand only, git-style).
     #[test]
     fn malformed_launch_argv_is_a_usage_error() {
         for argv in [
@@ -6049,8 +5685,6 @@ mod tests {
         }
     }
 
-    /// `--version`: identity line first (install.sh greps `^aterm `), then the
-    /// origin line, then which copy runs in the updater's own words.
     #[test]
     fn version_text_names_the_running_copy_and_any_other() {
         use aterm_update::which_copy::{OtherCopy, Running, WhichCopy};
@@ -6090,8 +5724,6 @@ mod tests {
         assert!(version_text(Some(&copy)).starts_with("aterm "));
     }
 
-    /// Per-mode limits: daily-driver modes inherit, confinement modes cap (the
-    /// rule shared with `aterm-gui`'s spawn and the seam's `limits` contract).
     #[test]
     fn the_session_inherits_rlimits_in_user_and_caps_in_safety_and_containment() {
         use aterm_containment::ContainmentMode as Cm;
@@ -6157,7 +5789,6 @@ mod tests {
                     Err(_) => {
                         let errno = std::io::Error::last_os_error().raw_os_error();
                         if errno != Some(libc::EAGAIN) && errno != Some(libc::EINTR) {
-                            // EIO: the slave side is gone
                             break;
                         }
                     }

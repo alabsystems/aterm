@@ -57,7 +57,7 @@ pub fn remove_world(root: &Path) {
 /// The instance's descendants as `ps` shows them now (pid, parent, state, wait channel, age, command), for failure diagnostics.
 #[cfg(unix)]
 pub fn process_tree(inst: &Instance) -> String {
-    let out = std::process::Command::new("ps")
+    let out = std::process::Command::new(aterm_uds::os_path!("ps"))
         .args(["-axo", "pid=,ppid=,stat=,wchan=,etime=,command="])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

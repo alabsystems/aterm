@@ -1400,23 +1400,38 @@ impl CursorGlow {
             } else {
                 (0, 0)
             };
+            let mut letter_memo = None;
             for i in 0..span {
                 let col = c_lo + i as i32;
                 if col < 0 || col >= geom.cols as i32 {
                     continue;
                 }
                 let letter = self.flame_dark_letter(cfg, &text, ledger, (row, col));
+                let caps = match letter {
+                    None => [air_cap; LEVELS],
+                    Some((ink, ground, lift)) => {
+                        let key = (ink, ground, lift.map(f32::to_bits));
+                        match letter_memo {
+                            Some((prev, cached)) if prev == key => cached,
+                            _ => {
+                                let solved = std::array::from_fn(|level| {
+                                    flame_dark_letter_cap(
+                                        flame_level_light(level),
+                                        ink,
+                                        ground,
+                                        lift,
+                                        Self::FIRE_DARK_ROW_BAR,
+                                    )
+                                    .min(air_cap)
+                                });
+                                letter_memo = Some((key, solved));
+                                solved
+                            }
+                        }
+                    }
+                };
                 for (level, table) in held.iter_mut().enumerate() {
-                    table[i] = letter.map_or(air_cap, |(ink, ground, lift)| {
-                        flame_dark_letter_cap(
-                            flame_level_light(level),
-                            ink,
-                            ground,
-                            lift,
-                            Self::FIRE_DARK_ROW_BAR,
-                        )
-                        .min(air_cap)
-                    });
+                    table[i] = caps[level];
                 }
                 free_low[i] = self.flame_cell_glyph(&text, row_i, col).free_below();
             }
@@ -1917,6 +1932,19 @@ impl CursorGlow {
                 continue;
             }
             let knots = (((x_hi - x_lo) / knot).ceil() as usize).max(1);
+            #[cfg(test)]
+            let yellow_cov = if kept && !self.fire_kept_core_from_base {
+                Self::FIRE_DARK_KEPT_CORE_YELLOW_COV
+            } else {
+                Self::FIRE_DARK_CORE_YELLOW_COV
+            };
+            #[cfg(not(test))]
+            let yellow_cov = if kept {
+                Self::FIRE_DARK_KEPT_CORE_YELLOW_COV
+            } else {
+                Self::FIRE_DARK_CORE_YELLOW_COV
+            };
+            let mut slab_cores = [(0.0f32, 0.0f32, 0.0f32, 0.0f32); MAX_CORES];
             let mut y = (base - foot - peak_h).floor().max(geom.fx_top() as f32);
             while y < base {
                 if under.len() >= Self::MAX_QUADS {
@@ -1924,53 +1952,67 @@ impl CursorGlow {
                 }
                 let h = slab.min(base - y);
                 let ym = y + 0.5 * h;
+                if ym >= base {
+                    break;
+                }
+                let root_in = smooth((base - ym) / root_px);
+                let mut n_slab = 0usize;
+                for &(xc, half, th, peak) in cores {
+                    let rise = (base - foot - ym) / th;
+                    if rise >= 1.0 {
+                        continue;
+                    }
+                    let rise = rise.max(0.0);
+                    let xc = xc + lean * rise * rise;
+                    let k = (rise / 0.2).clamp(0.0, 1.0);
+                    let hw =
+                        half * (0.62 + 0.38 * k * k * (3.0 - 2.0 * k)) * (1.0 - rise).powf(0.7);
+                    if hw < 0.3 {
+                        continue;
+                    }
+                    let peak_ym = peak * root_in * (1.0 - rise).powf(0.8);
+                    #[cfg(test)]
+                    let rise_base = if self.fire_core_uncooled {
+                        rise
+                    } else {
+                        rise.max(1.0 - root_in)
+                    };
+                    #[cfg(not(test))]
+                    let rise_base = rise.max(1.0 - root_in);
+                    slab_cores[n_slab] = (xc, hw, peak_ym, rise_base);
+                    n_slab += 1;
+                }
+                let active_cores = &slab_cores[..n_slab];
+                if active_cores.is_empty() {
+                    y += h;
+                    continue;
+                }
                 let at = |x: f32| -> (u32, u32) {
                     let mut best = (0.0f32, 0.0f32);
-                    for &(xc, half, th, peak) in cores {
-                        let rise = (base - foot - ym) / th;
-                        if rise >= 1.0 || ym >= base {
-                            continue;
-                        }
-                        let rise = rise.max(0.0);
-                        let xc = xc + lean * rise * rise;
-                        let k = (rise / 0.2).clamp(0.0, 1.0);
-                        let hw =
-                            half * (0.62 + 0.38 * k * k * (3.0 - 2.0 * k)) * (1.0 - rise).powf(0.7);
-                        if hw < 0.3 {
-                            continue;
-                        }
+                    for &(xc, hw, peak_ym, rise_base) in active_cores {
                         let d = ((x - xc) / hw).abs();
                         if d >= 1.0 {
                             continue;
                         }
-                        let root_in = smooth((base - ym) / root_px);
-                        let cov = peak * (1.0 - d * d).powf(1.6) * root_in * (1.0 - rise).powf(0.8);
+                        let cov = peak_ym * (1.0 - d * d).powf(1.6);
                         if cov > best.0 {
                             #[cfg(test)]
                             let rise = if self.fire_core_uncooled {
-                                rise
+                                rise_base
                             } else {
-                                rise.max(1.0 - root_in).max(d * d)
+                                rise_base.max(d * d)
                             };
                             #[cfg(not(test))]
-                            let rise = rise.max(1.0 - root_in).max(d * d);
+                            let rise = rise_base.max(d * d);
                             best = (cov, rise);
                         }
                     }
-                    let cov = if kept { best.0 * cap_at(x, ym) } else { best.0 };
+                    let cov = if kept && best.0 > 0.0 {
+                        best.0 * cap_at(x, ym)
+                    } else {
+                        best.0
+                    };
                     let cov = cov.min(255.0);
-                    #[cfg(test)]
-                    let yellow_cov = if kept && !self.fire_kept_core_from_base {
-                        Self::FIRE_DARK_KEPT_CORE_YELLOW_COV
-                    } else {
-                        Self::FIRE_DARK_CORE_YELLOW_COV
-                    };
-                    #[cfg(not(test))]
-                    let yellow_cov = if kept {
-                        Self::FIRE_DARK_KEPT_CORE_YELLOW_COV
-                    } else {
-                        Self::FIRE_DARK_CORE_YELLOW_COV
-                    };
                     let thin = Self::FIRE_DARK_CORE_AMBER * smooth((yellow_cov - cov) / 38.0);
                     #[cfg(test)]
                     let thin = if self.fire_core_uncooled { 0.0 } else { thin };
@@ -2088,11 +2130,13 @@ impl CursorGlow {
                 .ceil()
                 .max(0.0) as i32;
             let (c_lo, c_hi) = (u_lo.floor() as i32 - 1, u_hi.ceil() as i32 + 1);
+            let unknown_cap = std::cell::Cell::new(None::<f32>);
+            let pair_memo = std::cell::Cell::new(None::<((u32, u32), f32)>);
             let caps = |r: i32, c: i32| -> f32 {
                 if r < 0 || c < 0 || r >= geom.rows as i32 || c >= geom.cols as i32 {
                     return Self::FIRE_LIGHT_ALPHA;
                 }
-                self.flame_light_cap(cfg, &text, r, c, paints)
+                self.flame_light_cap(cfg, &text, r, c, paints, &unknown_cap, &pair_memo)
             };
             let mut grid = [[0.0f32; 40]; 4];
             let span = ((c_hi - c_lo + 1) as usize).min(40);
@@ -2236,6 +2280,10 @@ impl CursorGlow {
         f32::INFINITY
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "config, text view, cell coordinates, paint bounds and per-pass memo slots"
+    )]
     fn flame_light_cap(
         &self,
         cfg: &GlowConfig,
@@ -2243,6 +2291,8 @@ impl CursorGlow {
         row: i32,
         col: i32,
         paints: (u32, u32),
+        unknown_cap: &std::cell::Cell<Option<f32>>,
+        pair_memo: &std::cell::Cell<Option<((u32, u32), f32)>>,
     ) -> f32 {
         let (fg, bg) = (cfg.theme_fg & 0x00FF_FFFF, cfg.theme_bg & 0x00FF_FFFF);
         if (text.knows_row(row) && !text.covers_cell(row, col)) || self.light_body_unsolved() {
@@ -2270,13 +2320,13 @@ impl CursorGlow {
                 let bound = |sh: u32| {
                     let c = (extreme >> sh) & 0xff;
                     if dark_ink {
-                        c.saturating_sub(4)
+                        c.saturating_sub(4) as usize
                     } else {
-                        (c + 4).min(255)
+                        (c + 4).min(255) as usize
                     }
                 };
-                let rgb = (bound(16) << 16) | (bound(8) << 8) | bound(0);
-                let luma = crate::color_math::relative_luminance_with(table, rgb);
+                let luma =
+                    crate::color_math::relative_luminance_rgb(table, bound(16), bound(8), bound(0));
                 if dark_ink {
                     luma + 0.05 >= bar * (ink_luma + 0.05)
                 } else {
@@ -2298,12 +2348,27 @@ impl CursorGlow {
             lo
         };
         if !text.knows_row(row) {
-            return hold(fg, bg, 4.5).min(hold(Self::FIRE_LIGHT_REF_RED, bg, 3.0));
+            return match unknown_cap.get() {
+                Some(cap) => cap,
+                None => {
+                    let cap = hold(fg, bg, 4.5).min(hold(Self::FIRE_LIGHT_REF_RED, bg, 3.0));
+                    unknown_cap.set(Some(cap));
+                    cap
+                }
+            };
         }
-        match self.frame_text.pair(row, col) {
-            Some((Some(ink), ground)) => hold(ink, ground, 4.5),
-            Some((None, ground)) => hold(fg, ground, 4.5),
-            None => hold(fg, bg, 4.5),
+        let pair = match self.frame_text.pair(row, col) {
+            Some((Some(ink), ground)) => (ink, ground),
+            Some((None, ground)) => (fg, ground),
+            None => (fg, bg),
+        };
+        match pair_memo.get() {
+            Some((prev, cap)) if prev == pair => cap,
+            _ => {
+                let cap = hold(pair.0, pair.1, 4.5);
+                pair_memo.set(Some((pair, cap)));
+                cap
+            }
         }
     }
 
@@ -3918,8 +3983,8 @@ impl CursorGlow {
         let ref_ink = unpack(Self::STREAK_REF_INK);
         let ref_ground = unpack(Self::STREAK_REF_GROUND);
         let lifted = |base: [f32; 3], cov: f32| {
-            let ch = |c: usize| (base[c] + cov * lift[c]).min(255.0) as u32;
-            crate::color_math::relative_luminance_with(table, (ch(0) << 16) | (ch(1) << 8) | ch(2))
+            let ch = |c: usize| (base[c] + cov * lift[c]).min(255.0) as usize;
+            crate::color_math::relative_luminance_rgb(table, ch(0), ch(1), ch(2))
         };
         let holds = |cov: f32| {
             let (ink, ground) = (lifted(ref_ink, cov), lifted(ref_ground, cov));
@@ -4115,17 +4180,17 @@ fn flame_heat<'a>(cells: impl Iterator<Item = &'a (u16, u16, f32)>, u: f32) -> f
 
 fn flame_dark_letter_cap(hot: u32, ink: u32, ground: u32, lift: [f32; 3], bar: f32) -> f32 {
     let table = crate::color_math::relative_luminance_table();
-    let lum = |c: u32| crate::color_math::relative_luminance_with(table, c);
-    let lifted = |base: u32, cov: u32| -> u32 {
+    let lift = lift.map(|l| l.max(0.0).ceil() as u32);
+    let lifted = |base: u32, cov: u32| -> f32 {
         let ch = |sh: u32, i: usize| {
-            let b = ((base >> sh) & 0xff) + lift[i].max(0.0).ceil() as u32;
-            (b + (((hot >> sh) & 0xff) * cov + 127) / 255).min(255)
+            let b = ((base >> sh) & 0xff) + lift[i];
+            (b + (((hot >> sh) & 0xff) * cov + 127) / 255).min(255) as usize
         };
-        (ch(16, 0) << 16) | (ch(8, 1) << 8) | ch(0, 2)
+        crate::color_math::relative_luminance_rgb(table, ch(16, 0), ch(8, 1), ch(0, 2))
     };
-    let ink_l = lum(lifted(ink, 0));
+    let ink_l = lifted(ink, 0);
     let reads = |cov: u32| {
-        let g = lum(lifted(ground, cov));
+        let g = lifted(ground, cov);
         (g < ink_l).then(|| (ink_l + 0.05) / (g + 0.05))
     };
     let Some(own) = reads(0) else {

@@ -4,10 +4,7 @@
 //! The tar writer, proven by the client: every archive it writes extracts through
 //! `atpkg::extract_tar_zst` under the client's own caps, to a tree whose `tree_root` is
 //! the stage's, with hard links kept as one file; and the signed `disk_installed` covers
-//! a small-file tree whose structure outweighs its content. The packs compress through
-//! aterm-zstd's raw-block writer ([`RawFrames`]), so no zstd CLI runs; the CLI's own path
-//! ([`tarwrite::ZstdCli`]) runs stand-ins that write known frames, and one test packs
-//! through the real zstd CLI a publish host packs with (COULD NOT RUN without one).
+//! a small-file tree whose structure outweighs its content.
 
 use std::path::Path;
 
@@ -15,8 +12,6 @@ use atpkg_publish::artifact::tarwrite::{self, RawFrames, ZstdCli};
 
 use super::fixture::{put, put_exe, scratch, set_mode};
 
-/// The client's extraction cap for a signed `disk_installed` (`atpkg::install`'s
-/// `size_cap`) and its entry ceiling.
 fn client_cap(disk_installed: u64) -> u64 {
     disk_installed.saturating_mul(2).max(1 << 20)
 }
@@ -35,10 +30,6 @@ fn ino(p: &Path) -> u64 {
     std::fs::metadata(p).expect("stat").ino()
 }
 
-/// A stage with everything a sysroot carries: nested dirs, an executable and a data
-/// file at odd modes, a three-name hard-link group, a path past ustar's 100 bytes that
-/// splits into prefix/name, one whose last component alone is past 100 (a PAX record),
-/// and an empty directory.
 fn stage(root: &Path) {
     put(&root.join("bin/trustc"), b"\x7fELF compiler bytes");
     set_mode(&root.join("bin/trustc"), 0o700);
@@ -95,7 +86,6 @@ fn what_it_writes_the_client_extracts_to_the_same_tree_root_with_links_kept() {
     assert!(out.join("libexec").is_dir(), "an empty directory survives");
     assert_eq!(packed.sha256, atpkg::sha256_file(&asset).expect("hash"));
     assert_eq!(packed.size, std::fs::metadata(&asset).expect("stat").len());
-    // A stream over many frames (the CLI writes one per window) reads back the same.
     let framed = tmp.path().join("framed.tar.zst");
     let many = tarwrite::write_with(&root, &framed, &RawFrames { frame_max: 4096 })
         .expect("pack in 4 KiB frames");
@@ -138,11 +128,6 @@ fn a_symlink_or_an_empty_tree_is_refused() {
     assert!(err.to_string().contains("no file"), "{err}");
 }
 
-/// 500 × 100 B is 50 kB of content in a ~1.3 MB stream: content alone would sign a
-/// 1 MiB cap (the floor), under the structure the client must read. Each file's 561-byte
-/// path is a two-block PAX record, so a file carries 2,560 stream bytes where a short
-/// name carries 1,024: the same structure from a third as many files, each of which is a
-/// create, a read, an extract and an unlink.
 #[test]
 fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content() {
     let tmp = scratch("tar-size");
@@ -179,12 +164,6 @@ fn a_small_file_tree_is_signed_by_its_stream_and_an_ordinary_one_by_its_content(
     assert_eq!(packed.disk_installed, 400_001);
 }
 
-/// The compressor every real pack runs, [`HostTools`]' (the zstd CLI on `PATH`, as
-/// [`tarwrite::write`] runs it too), packs what aterm-zstd's raw-block writer packs: the
-/// same tree root, extracted by the client, the same bytes from a second pack, and a stream
-/// actually compressed. NEGATIVE CONTROL: the raw-block writer's asset is no smaller than
-/// its stream, so the size check tells a real compressor from raw frames. Without a zstd
-/// on `PATH` the test ends COULD NOT RUN naming the `zstd` row's provider.
 #[test]
 #[cfg(unix)]
 fn the_hosts_compressor_is_the_zstd_cli_and_packs_what_raw_frames_pack() {
@@ -235,10 +214,6 @@ fn the_hosts_compressor_is_the_zstd_cli_and_packs_what_raw_frames_pack() {
     );
 }
 
-/// The pack trusts no compressor's word: one that fails, or exits 0 having written a
-/// stream other than the archive (or one without the content checksum), fails the pack.
-/// The control: a CLI stand-in that writes the archive's own frames, run with the flags
-/// every pack passes, packs the same tree through the same entry point.
 #[test]
 #[cfg(unix)]
 fn a_compressor_that_fails_or_writes_another_stream_fails_the_pack() {
@@ -317,9 +292,6 @@ fn a_compressor_that_fails_or_writes_another_stream_fails_the_pack() {
     extract(&asset, &tmp.path().join("out"), packed.disk_installed);
 }
 
-/// The probe a lane runs before any build ([`atpkg_publish::api::Packer::can_pack`]): an
-/// unset or empty `PATH`, or one whose `zstd` is not executable, has no compressor; a
-/// directory holding an executable `zstd` has that one.
 #[test]
 #[cfg(unix)]
 fn the_compressor_probe_finds_only_an_executable_zstd() {
@@ -341,9 +313,6 @@ fn the_compressor_probe_finds_only_an_executable_zstd() {
     );
 }
 
-/// A compressor that fills its stderr pipe before it reads a stream larger than its stdin
-/// pipe still packs: the pack drains stderr while it writes, rather than waiting on a
-/// compressor that waits on it. One minute is the hang detector.
 #[test]
 #[cfg(unix)]
 fn a_compressor_loud_on_stderr_before_it_reads_still_packs() {
@@ -351,9 +320,6 @@ fn a_compressor_loud_on_stderr_before_it_reads_still_packs() {
     const TEST: &str =
         "artifact::tarwrite::a_compressor_loud_on_stderr_before_it_reads_still_packs";
     let Some(path) = std::env::var_os(CHILD) else {
-        // The parent owns the scratch directory even if the child must be killed.
-        // `output_until` owns a new process group, kills the complete group at the
-        // minute hang detector, and reaps the libtest child before returning.
         let tmp = scratch("tar-loud");
         let mut command =
             aterm_uds::spawnfd::command(std::env::current_exe().expect("test binary"));
@@ -379,7 +345,6 @@ fn a_compressor_loud_on_stderr_before_it_reads_still_packs() {
     let tmp = std::path::PathBuf::from(path);
     let root = tmp.join("stage");
     put(&root.join("share/blob"), &vec![7u8; 1 << 20]);
-    // What it writes once it has read the stream: the archive's own frames.
     let frames = tmp.join("frames.zst");
     tarwrite::write_with(&root, &frames, &RawFrames::WHOLE).expect("the archive's frames");
     let loud = put_exe(

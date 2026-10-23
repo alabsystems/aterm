@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Hand-written verdict sequences through the real tracker (design §2.4,
-//! §10). Every sequence goes through `conformance_turn::drive`, so
-//! each step is also checked against the derived `TurnTracker` model; the
-//! assertions here are about the tree the log ends up holding. Every host
-//! call is a checked [`Step`], so each test's path is its `.seq` twin's
-//! (`seq_twins`, plan 5B-3, T29).
+//! Hand-written verdict sequences through the real tracker.
 
 use aterm_slog::{
     Actor, BoxWord, Close, Conf, Key, Kind, Lvl, Op, Out, Rec, RunOut, ShortId, Src, TurnOut,
@@ -121,8 +116,6 @@ pub(crate) fn usage_wall_at_rest_closes_the_turn_and_holds_its_need() {
     assert_eq!(on_run.par.map(|p| p.lvl), Some(Lvl::Run));
     assert_eq!(on_run.f.get_u(Key::Orphan), Some(1));
     assert_eq!(on_run.f.get_str(Key::Detail), Some("3:15pm"));
-    // The run's wall continues the turn's: one wall, its need dated when
-    // it first showed.
     let in_turn = walls.first().expect("the turn's wall");
     assert_eq!(
         on_run.f.get_str(Key::Cont),
@@ -138,7 +131,6 @@ pub(crate) fn usage_wall_at_rest_closes_the_turn_and_holds_its_need() {
     assert_eq!(words(&rig), "limit · 3:15pm");
     assert_eq!(rig.log.state().totals.steps, 1, "one wall, counted once");
 
-    // The limit resets: busy lifts the wall and opens the next turn.
     apply_on(&mut rig, See(Verdict::Busy));
     assert!(rig.log.state().top_need().is_none());
     assert_eq!(opens(&rig, Kind::Turn).len(), 2);
@@ -190,8 +182,6 @@ pub(crate) fn a_settled_turn_is_dated_at_its_rest() {
 }
 
 /// A late wake: the idle held past its settle and the next verdict is busy.
-/// The idle's turn closes first and the busy opens the next: two
-/// exchanges, never one.
 #[test]
 pub(crate) fn a_late_wake_never_merges_two_turns() {
     let rig = drive(&[
@@ -313,7 +303,7 @@ pub(crate) fn ctl_turn_and_input_attribute_the_opening_turn() {
 
 /// A harness answering a prose question within the settle: the asked turn
 /// closes at once, dated when the agent asked, and the harness's exchange
-/// is a turn of its own carrying its `by=` and `ledger=` (probe P8a).
+/// is a turn of its own carrying its `by=` and `ledger=`.
 #[test]
 pub(crate) fn ctl_turn_while_resting_starts_its_own_turn() {
     let mut rig = drive(&[See(Verdict::Busy), See(Verdict::Question)]);
@@ -338,7 +328,6 @@ pub(crate) fn ctl_turn_while_resting_starts_its_own_turn() {
     }
     assert_eq!(closes(&rig, Lvl::Turn).len(), 2, "two exchanges, two turns");
 
-    // An hour later the human types: that turn carries no ledger (P8b).
     checked(&mut rig, Step::Pass(3_600_000));
     checked(&mut rig, Step::Input(Actor::Human));
     checked(&mut rig, See(Verdict::Busy));
@@ -348,7 +337,7 @@ pub(crate) fn ctl_turn_while_resting_starts_its_own_turn() {
 
 /// A `ctl turn` queued while the agent is busy labels only a turn that
 /// opens within the attribution window, from its sender: an hour later, a
-/// human's turn never carries it (probe P8c).
+/// human's turn never carries it.
 #[test]
 pub(crate) fn a_stale_ledger_labels_no_later_turn() {
     let mut rig = drive(&[See(Verdict::Busy)]);
@@ -363,7 +352,6 @@ pub(crate) fn a_stale_ledger_labels_no_later_turn() {
     let later = opens(&rig, Kind::Turn).pop().expect("the human's turn");
     assert_eq!((later.by, later.f.get_u(Key::Ledger)), (Actor::Human, None));
 
-    // Nor does a harness turn opened past the window, though by the sender.
     let mut rig = drive(&[See(Verdict::Busy)]);
     checked(&mut rig, Step::Ctl);
     for s in [See(Verdict::Idle), Half, Half] {
@@ -381,7 +369,6 @@ fn clause_words_fit_their_bytes() {
     let w = Words::fit(&"é".repeat(40), "4m");
     assert!(w.as_str().len() <= 48);
     assert!(w.as_str().ends_with(" · 4m"), "{:?}", w.as_str());
-    // A combining accent is never cut from its base.
     let combining = "e\u{301}".repeat(20);
     let w = Words::fit(&combining, "12m");
     let head = w.as_str().trim_end_matches(" · 12m");

@@ -59,14 +59,11 @@ pub(crate) mod queue_ffi_census {
 /// schedule in commit order.
 #[derive(Debug)]
 pub(crate) struct EncodeSession {
-    /// The one `MTLCommandQueue` of the encode and present path. Lent only to
-    /// the blocking one-shot helpers via [`Self::one_shot_queue`].
+    /// The one `MTLCommandQueue` of the encode and present path.
     queue: Obj,
     /// The process device-loss latch every submission answers to.
     latch: Arc<loss::LossLatch>,
-    /// The present being timed (`crate::gpu_time`), between
-    /// [`Self::open_gpu_frame`] and [`Self::seal_gpu_frame`]: every command
-    /// buffer committed meanwhile reports its GPU span to it.
+    /// The present being timed (`crate::gpu_time`) between [`Self::open_gpu_frame`] and [`Self::seal_gpu_frame`].
     gpu_frame: std::cell::Cell<Option<crate::gpu_time::FrameToken<'static>>>,
 }
 
@@ -144,8 +141,6 @@ impl EncodeSession {
 
 impl Drop for EncodeSession {
     fn drop(&mut self) {
-        // Free the latch's session slot so a rebuild (the device-loss path)
-        // can construct a successor. The queue itself is released by `Obj`.
         self.latch.unbind_encode_session();
     }
 }
@@ -784,9 +779,7 @@ unsafe impl Send for CbProbe {}
 pub(crate) struct Submitted {
     cb: Obj,
     latch: Arc<loss::LossLatch>,
-    /// The classified terminal outcome once one exists. The first terminal
-    /// wait or poll feeds the latch and fills this; later calls answer from it,
-    /// so each command buffer feeds the latch exactly once.
+    /// The classified terminal outcome once one exists, cached so each command buffer feeds the latch once.
     settled: std::cell::Cell<Option<loss::CbOutcome>>,
 }
 
@@ -857,8 +850,7 @@ mod tests {
         tex
     }
 
-    /// Read a texture back through the session (begin, copy, commit, wait),
-    /// returning tight-stride bytes; asserts `Completed`.
+    /// Read a texture back through the session into tight-stride bytes.
     fn read_texture(
         session: &EncodeSession,
         dev: &Device,
@@ -876,10 +868,7 @@ mod tests {
         unsafe { ffi::buffer_bytes(&rb, row * h) }
     }
 
-    /// Texture copies: a full copy reproduces every texel; a sub-rect copy with
-    /// distinct origins moves exactly the named bytes and leaves sentinels
-    /// outside the destination rect untouched; a Unorm-to-sRGB-view copy moves
-    /// raw bytes 1:1.
+    /// Full, sub-rect, and Unorm-to-sRGB-view texture copies move exact texel bytes.
     #[test]
     fn texture_copies_move_exactly_the_named_bytes() {
         let dev = device();
@@ -970,10 +959,7 @@ mod tests {
         );
     }
 
-    /// The copy validators refuse, with a reason, out-of-bounds rects, empty
-    /// regions, overlapping same-texture rects, incompatible format pairs, an understated readback stride and
-    /// a short readback buffer, before any encoder exists, so the command buffer
-    /// stays committable (the final commit proves it).
+    /// Copy validators refuse out-of-bounds, empty, overlapping, incompatible, or undersized copies before opening an encoder.
     #[test]
     fn the_copy_validators_refuse_what_metal_would_corrupt() {
         let dev = device();

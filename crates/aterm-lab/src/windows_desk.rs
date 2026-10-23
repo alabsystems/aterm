@@ -16,32 +16,6 @@ pub const HELPER_PATH: &str = r"C:\lane\desk\desk.ps1";
 /// The desk helper (`desk.ps1 <verb> ...`), Windows PowerShell 5.1 with C#
 /// compiled by `Add-Type`, per-monitor-v2 aware so every rectangle is in
 /// physical pixels:
-///
-/// - `windows <pid>`: a `window ...` line per visible top-level window of
-///   `pid`;
-/// - `monitors`: a `monitor ...` line per monitor;
-/// - `primary <name>`: that monitor primary at (0,0), every other to its
-///   right, saved; then `monitors`;
-/// - `scale <name> <steps>`: that monitor's display scaling set to `steps`
-///   above its recommended one (Settings' list, 25 % apart from 100 %); then
-///   `monitors`;
-/// - `launch <bin-dir> <dir> <config-base64> [word]...`: `aterm-gui
-///   --control-sock <dir>\aterm.sock [word]... -e powershell.exe -NoLogo
-///   -NoProfile` with `XDG_CONFIG_HOME` and `ATERM_STATE_HOME` in `<dir>`,
-///   its stdout and stderr kept there; its pid written to `<dir>\pid`, then
-///   its exit status to `<dir>\exit` when it ends;
-/// - `readback <pid> <class> <ppm>`: the client area of `pid`'s window of
-///   `class` as its DC holds it (`BitBlt` into a bitmap, then `GetDIBits`),
-///   written as a binary PPM: the pixels a CPU present put on the window;
-/// - `watch <pid> <class> <ms> <path>`: for `ms`, a line per change written to `path`: the
-///   foreground window and its focus, the layout, IME status and conversion mode of `pid`'s
-///   window of `class`, the keys held down, and the visible top-level windows that come and go;
-/// - `place <pid> <class>`: a `place ...` line: that window's client size, its top-left on the
-///   virtual screen, and the virtual screen's rectangle;
-/// - `move <pid> <class> <top>`: that window moved so its client area's top is at screen row
-///   `top`, its size and z-order kept, not activated; then its `place` line;
-/// - `lift <pid> <class> <rows>`: that window moved up until its client area's top `rows` rows
-///   are above the virtual screen's top edge; then its `place` line.
 pub const HELPER: &str = r##"$ErrorActionPreference = 'Stop'
 $verb = $args[0]
 if ($verb -eq 'launch') {
@@ -515,9 +489,7 @@ pub struct Place {
 }
 
 impl Place {
-    /// The part of the client area inside the virtual screen, in client
-    /// coordinates (`l..r` columns, `t..b` rows), or `None` when none of it
-    /// is.
+    /// The part of the client area inside the virtual screen, in client coordinates (`l..r` columns, `t..b` rows), or `None` when none of it is.
     #[must_use]
     pub fn on_screen(&self) -> Option<Rect> {
         let (w, h) = (
@@ -666,8 +638,7 @@ pub fn key_command(keys: &[&str], hold_ms: u32) -> String {
 /// The USB tablet's range on each axis: QEMU scales it to Windows' primary monitor.
 pub const TABLET_MAX: i64 = 32767;
 
-/// QMP's `input-send-event` that moves the tablet to `(x, y)` on a primary monitor `width` x
-/// `height` pixels (clamped to it).
+/// QMP's `input-send-event` that moves the tablet to `(x, y)` on a primary monitor `width` x `height` pixels (clamped to it).
 #[must_use]
 pub fn tablet_move(x: i32, y: i32, width: i32, height: i32) -> String {
     let axis = |v: i32, extent: i32| {
@@ -683,8 +654,7 @@ pub fn tablet_move(x: i32, y: i32, width: i32, height: i32) -> String {
     )
 }
 
-/// QMP's `input-send-event` that presses (`down`) or releases the tablet's
-/// left button.
+/// QMP's `input-send-event` that presses (`down`) or releases the tablet's left button.
 #[must_use]
 pub fn tablet_button(down: bool) -> String {
     format!(
@@ -693,8 +663,7 @@ pub fn tablet_button(down: bool) -> String {
     )
 }
 
-/// QMP's `screendump` of `device`'s console (the first, ramfb's, when
-/// `None`) to `path` as PNG.
+/// QMP's `screendump` of `device`'s console (the first, ramfb's, when `None`) to `path` as PNG.
 #[must_use]
 pub fn screendump_command(path: &str, device: Option<&str>) -> String {
     let quoted = aterm_json::to_string(&aterm_json::Value::String(path.to_string()))

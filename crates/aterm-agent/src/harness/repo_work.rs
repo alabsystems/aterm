@@ -979,7 +979,7 @@ fn git_as(dir: &Path, args: &[&str], reads: &Reads<'_>, global: bool) -> Option<
         return None;
     }
     let path = std::env::var_os("PATH")?;
-    let mut cmd = aterm_uds::spawnfd::command("git");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     cmd.arg("--no-pager")
         .arg("-c")
         .arg("core.fsmonitor=false")

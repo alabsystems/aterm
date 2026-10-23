@@ -5,14 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Wayland window state shared with the event loop.
-//!
-//! LOCAL PATCH (aterm): no client-side frame. Upstream drew sctk-adwaita's or sctk's fallback frame
-//! around the surface under client-side decorations; here the application draws its own header
-//! inside the surface and drives its gestures through `drag_window`, `drag_resize_window` and
-//! `show_window_menu`, and only sctk-adwaita's shadow margin ([`super::frame::ShadowFrame`]) is
-//! drawn outside it. The window's objects are first-party `aterm-wayland` proxies and the configure
-//! is the backend's own [`WindowConfigure`], where upstream used smithay-client-toolkit; custom
-//! cursors, cursor grabs, `set_cursor_position` and KWin blur are gone.
 
 use std::ffi::CString;
 use std::num::NonZeroU32;
@@ -45,7 +37,7 @@ use super::frame::{FrameGlobals, ShadowFrame};
 const MIN_WINDOW_SIZE: LogicalSize<u32> = LogicalSize::new(2, 1);
 
 aterm_types::bitflags! {
-    /// `xdg_toplevel.state` flags carried by a configure event.
+    /// Toplevel state flags carried by a configure event.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct XdgWindowState: u16 {
         const MAXIMIZED = 1 << 0;
@@ -65,7 +57,7 @@ aterm_types::bitflags! {
 }
 
 impl XdgWindowState {
-    /// Parses `xdg_toplevel.state` flags from wire values, ignoring unknown states.
+    /// Parses toplevel state flags from wire values, ignoring unknown states.
     pub fn from_wire(states: &[u32]) -> XdgWindowState {
         use xdg_toplevel::state;
         states.iter().fold(XdgWindowState::empty(), |mut acc, value| {
@@ -88,7 +80,7 @@ impl XdgWindowState {
 }
 
 aterm_types::bitflags! {
-    /// Compositor capabilities advertised via `xdg_toplevel.wm_capabilities`.
+    /// Compositor capabilities advertised on a toplevel.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct WindowManagerCapabilities: u16 {
         const WINDOW_MENU = 1 << 0;
@@ -312,7 +304,6 @@ impl WindowState {
         self.objects.toplevel.proxy()
     }
 
-    /// Apply closure on the given pointer.
     fn apply_on_pointer<F: FnMut(&WinitPointer)>(&self, mut callback: F) {
         self.pointers.iter().filter_map(Weak::upgrade).for_each(|pointer| callback(&pointer))
     }
@@ -328,7 +319,6 @@ impl WindowState {
 
         let stateless = Self::is_stateless(&configure);
 
-        // LOCAL PATCH (aterm): no frame borders to subtract; the configure's size is the surface's.
         let (mut new_size, constrain) = match configure.new_size {
             (Some(width), Some(height)) => ((width.get(), height.get()).into(), false),
             _ if stateless => (self.stateless_size, true),
@@ -368,9 +358,6 @@ impl WindowState {
         let new_state = configure.state;
         let old_state = self.last_configure.as_ref().map(|configure| configure.state);
 
-        // LOCAL PATCH (aterm): a change of decoration mode or compositor capabilities counts too,
-        // so the application hears it (a `Resized`, perhaps of the same size) and re-reads
-        // `client_decorations`.
         let decorations_moved = self.last_configure.as_ref().is_some_and(|last| {
             last.decoration_mode != configure.decoration_mode
                 || last.capabilities != configure.capabilities
@@ -396,7 +383,6 @@ impl WindowState {
         resized
     }
 
-    /// Compute the bounds for the inner size of the surface.
     fn inner_size_bounds(
         &self,
         configure: &WindowConfigure,
@@ -468,9 +454,6 @@ impl WindowState {
     }
 
     /// Returns whether the compositor provides server-side decorations.
-    ///
-    /// LOCAL PATCH (aterm): `false` under client-side decorations, where upstream answered `true`
-    /// while its own frame showed.
     #[inline]
     pub fn is_decorated(&self) -> bool {
         match self.last_configure.as_ref() {
@@ -545,7 +528,6 @@ impl WindowState {
         logical_to_physical_rounded(self.inner_size(), self.scale_factor())
     }
 
-    /// Resize the window to the new inner size.
     fn resize(&mut self, inner_size: LogicalSize<u32>) {
         self.size = inner_size;
 
@@ -580,9 +562,6 @@ impl WindowState {
         self.refresh_frame();
     }
 
-    /// How the shadow margin looks now, or `None` where it is hidden: under server-side
-    /// decorations, with decorations off, before the first configure, and while maximized or
-    /// fullscreen (sctk-adwaita hid its borders then).
     fn frame_look(&self) -> Option<Look> {
         let decorations = self.client_decorations()?;
         if decorations.maximized || decorations.fullscreen {
@@ -783,8 +762,6 @@ impl WindowState {
 
     /// Sets the window title, truncating at 1024 bytes.
     pub fn set_title(&mut self, mut title: String) {
-        // Truncate the title to at most 1024 bytes, so that it does not blow up the protocol
-        // messages
         if title.len() > 1024 {
             let mut new_len = 1024;
             while !title.is_char_boundary(new_len) {
@@ -832,7 +809,6 @@ pub(crate) fn protocol_string(s: &str) -> CString {
     CString::new(&s[..end]).unwrap_or_default()
 }
 
-/// `xdg_toplevel.resize`'s edge for `direction`.
 fn resize_edge(direction: ResizeDirection) -> u32 {
     use xdg_toplevel::resize_edge as edge;
     match direction {

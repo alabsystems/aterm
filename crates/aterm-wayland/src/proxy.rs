@@ -604,8 +604,7 @@ impl Proxy {
     }
 }
 
-/// The argument kinds of `msg`'s signature, in order (its version digits
-/// and `?` marks left out).
+/// The argument kinds of `msg`'s signature, in order (version digits and `?` marks left out).
 fn arg_kinds(msg: &Message) -> impl Iterator<Item = u8> + '_ {
     msg.signature()
         .to_bytes()
@@ -706,16 +705,14 @@ mod tests {
     use super::*;
     use crate::iface::{NULLS, TypeRef};
 
-    /// A socket pair: the far end's descriptor for an event, and the near
-    /// end, which reads end-of-file once the far end is closed.
+    /// A socket pair: the far end's descriptor for an event, and the near end.
     fn pair() -> (c_int, UnixStream) {
         let (near, far) = UnixStream::pair().expect("socketpair");
         near.set_nonblocking(true).expect("nonblocking");
         (far.into_raw_fd(), near)
     }
 
-    /// Whether the far end of `near` is closed (it reads end-of-file; an
-    /// open, idle far end would block).
+    /// Whether the far end of `near` is closed.
     fn far_closed(near: &mut UnixStream) -> bool {
         match near.read(&mut [0u8; 1]) {
             Ok(0) => true,

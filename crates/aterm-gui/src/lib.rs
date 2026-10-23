@@ -5200,6 +5200,8 @@ pub(crate) struct SessionCtx {
     pub(crate) crash_journal: crash_restore::JournalSlot,
     pub(crate) typed: typed_by::TypedStamp,
     pub(crate) bells: bell_ledger::BellLedger,
+    /// The PTY reader's count of feeds that moved the screen, for the output wake to read without the term lock.
+    pub(crate) screen_moves: Arc<vitals_host::ScreenMoves>,
 }
 
 struct Session {
@@ -26148,6 +26150,7 @@ fn ptyless_session(id: u64, self_id: SessionId, term: Terminal, sink: Arc<SinkWr
         crash_journal: Default::default(),
         typed: Default::default(),
         bells: Default::default(),
+        screen_moves: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),

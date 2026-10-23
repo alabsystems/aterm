@@ -1489,9 +1489,6 @@ fn write_snapshot_artifacts_with_hook(
         .map_err(|_| "snapshot generation fence is poisoned".to_string())?;
     let latest = generations.get(&target.path).copied().unwrap_or(0);
     if snapshot_commit_plan(generation, latest) == SnapshotCommitPlan::DiscardStale {
-        // This job has not touched the shared payload paths. In particular, do
-        // not clean them: they may already belong to the current generation
-        // whose transaction completed while this worker waited for the lock.
         return Err(format!(
             "snapshot generation {generation} was superseded by {latest}"
         ));
@@ -3342,10 +3339,6 @@ impl App {
             .get(&wid)
             .is_none_or(|window| window.os_window.is_none());
         if exact_focus.session != capture_front_session || !exact_focus.damage_consumed {
-            // A one-pane headless decoration pass is admitted only by the
-            // exact extraction that consumed its own damage session. Missing
-            // or mismatched custody fails closed instead of re-locking a
-            // possibly newer synchronized-output episode.
             return;
         }
         let output_echo = self
@@ -3472,11 +3465,7 @@ impl App {
         let pet = ws.fx.companion_mut().tick(pet_tick);
         let words_suspended = exact_focus.alternate_screen && suppress_alt;
         if load_shed || words_suspended || sparkle.is_none() {
-            // The word field freezes under load or alternate-screen suppression;
-            // an explicit feature disable resets it. The full resident retains
-            // its independent surface and its motion (the shed takes only its
-            // frame train). The flying head's existing load gate already denies
-            // its pixels and pauses its hello.
+            // The word field freezes under load or alternate-screen suppression; an explicit feature disable resets it.
             if load_shed || words_suspended {
                 ws.fx.decos_mut().freeze(now);
             } else {
@@ -4652,7 +4641,6 @@ impl App {
     #[cfg(unix)]
     pub(crate) fn snapshot(&mut self) {
         let Some(path) = snapshot_path::resolve() else {
-            // Distinct branch.
             return; // refusal already logged by resolve()
         };
         self.snapshot_at_path(path);
@@ -4748,20 +4736,14 @@ impl App {
 
     /// Hand a capture to the single PNG encode/write worker, spawning it lazily on first use (a run that never screenshots pays nothing).
     pub(crate) fn submit_encode_job(&mut self, mut job: EncodeJob) {
-        // A video dump can hold a worker for seconds to minutes (hundreds of
-        // full-frame PNG encodes), so it runs on its own one-shot lane and no
-        // `image`/`window`/`snapshot` reply queues behind it. At most one recording
-        // exists at a time. A failed spawn falls through to the shared worker. A
-        // dump is byte-budgeted at capture, so it takes no capture permit.
+        // A video dump can hold a worker for seconds to minutes (hundreds of full-frame PNG encodes), so it runs on its own one-shot lane and no `image`/`window`/`snapshot` reply queues behind it.
         if matches!(&job, EncodeJob::VideoDump { .. }) {
             let (vtx, vrx) = std::sync::mpsc::channel::<EncodeJob>();
             let spawned = crate::qos::spawn_lane_thread(
                 "aterm-video-encode".to_string(),
                 crate::qos::Role::Background,
                 move || {
-                    // Background QoS: a recording encode is cosmetic work no
-                    // keystroke waits on, so it never takes P-core time from the
-                    // UI thread on a saturated machine.
+                    // Background QoS: a recording encode is cosmetic work no keystroke waits on, so it never takes P-core time from the UI thread on a saturated machine.
                     if let Ok(j) = vrx.recv() {
                         run_encode_job(j, None);
                     }
@@ -5444,8 +5426,6 @@ impl App {
                 .copied()
                 .and_then(crate::tab_model::View::terminal_session)
             else {
-                // The tree said all-terminal; a leaf that resolves to no session
-                // is a stale plan. Fail closed, never a guess.
                 return Vec::new();
             };
             let (rows, cols) = self.pane_target_grid(sid, Self::leaf_grid_cells(&leaf.rect));
@@ -5687,8 +5667,7 @@ impl App {
                     (!window.is_null()).then_some(window)
                 });
 
-            // SAFETY: side-effect-free AppKit toolbar accessors on live main-thread receivers; each
-            // answer is +0, borrowed for the pool above.
+            // SAFETY: side-effect-free AppKit toolbar accessors on live main-thread receivers; each answer is +0, borrowed for the pool above.
             unsafe {
                 let toolbar = ns_window
                     .map(|w| appkit::send_id(w, sel!(toolbar)))
@@ -5744,8 +5723,6 @@ impl App {
                 }
                 out.extend(self.apprt.read_toolbar_tab_menus(handle));
             } else if let Some(line) = self.stripless_tab_chrome() {
-                // No native strip (a headless instance): the line its strip
-                // would show, so a tab's marks stay readable there too.
                 out.push(line);
             }
 
@@ -6212,9 +6189,7 @@ impl App {
         if !macos_rect_is_finite(bounds) || bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
             return Err("window capture found invalid AppKit chrome bounds".to_string());
         }
-        // SAFETY: `-convertRect:toView:` is `-(NSRect)(NSRect, NSView *)` and
-        // `-convertRectToBacking:` `-(NSRect)(NSRect)`, side-effect-free on live main-thread
-        // receivers; `Id::NIL` is the documented "window base coordinates" argument.
+        // SAFETY: `-convertRect:toView:` is `-(NSRect)(NSRect, NSView *)` and `-convertRectToBacking:` `-(NSRect)(NSRect)`, side-effect-free on live main-thread receivers; `Id::NIL` is the documented "window base coordinates" argument.
         let window_rect = unsafe {
             appkit::send_rect_rect_id(chrome_root, sel!(convertRect:toView:), bounds, Id::NIL)
         };
@@ -6245,9 +6220,7 @@ impl App {
                 bitmap,
             );
         }
-        // SAFETY: `+[NSColorSpace sRGBColorSpace]` is +0 and process-lifetime;
-        // `-bitmapImageRepByConvertingToColorSpace:renderingIntent:` takes the intent as an
-        // NSInteger, on a live bitmap rep.
+        // SAFETY: `+[NSColorSpace sRGBColorSpace]` is +0 and process-lifetime; `-bitmapImageRepByConvertingToColorSpace:renderingIntent:` takes the intent as an NSInteger, on a live bitmap rep.
         let srgb = unsafe { appkit::send_id(class(c"NSColorSpace").as_id(), sel!(sRGBColorSpace)) };
         if srgb.is_null() {
             return Err("window capture could not reach the sRGB color space".to_string());
@@ -6752,8 +6725,7 @@ fn macos_view_is_ancestor_of(
     if ancestor == descendant {
         return Ok(true);
     }
-    // SAFETY: side-effect-free `superview` reads on live main-thread `NSView`s; each +0 answer is
-    // only compared, never kept.
+    // SAFETY: side-effect-free `superview` reads on live main-thread `NSView`s; each +0 answer is only compared, never kept.
     let mut current = unsafe { crate::appkit::send_id(descendant, sel!(superview)) };
     for _ in 0..64 {
         if current.is_null() {
@@ -6791,8 +6763,7 @@ fn chrome_pixels_of(rep: aterm_objc::Id) -> Result<(ChromePixels, u32, u32), Str
     if image.is_null() {
         return Err("window capture could not read the AppKit chrome bitmap".to_string());
     }
-    // SAFETY: side-effect-free accessors on the live `CGImage`; its colour space is +0, owned by
-    // the image.
+    // SAFETY: side-effect-free accessors on the live `CGImage`; its colour space is +0, owned by the image.
     let desc = unsafe {
         let space = CGImageGetColorSpace(image);
         BitmapDesc {
@@ -6871,8 +6842,7 @@ fn chrome_png_of(rep: aterm_objc::Id) -> Result<Vec<u8>, String> {
     let png_len = unsafe { appkit::send_usize(png, sel!(length)) };
     let mut png_bytes = vec![0_u8; png_len];
     if png_len != 0 {
-        // SAFETY: `-getBytes:length:` writes `png_len` bytes, the receiver's own length, into the
-        // `Vec` sized to it.
+        // SAFETY: `-getBytes:length:` writes `png_len` bytes, the receiver's own length, into the `Vec` sized to it.
         unsafe {
             appkit::send_v_ptr_usize(
                 png,
@@ -6946,8 +6916,6 @@ pub(crate) fn capture_window_pixels(window_id: u32) -> Result<(Vec<u8>, u32, u32
         )
     };
     if image.is_null() {
-        // Not a permission failure (see the doc comment), and the message must not
-        // say it is: NULL means the window is not on screen.
         return Err(
             "window capture failed (the window is not on screen: minimized, on another \
              Space, not yet painted, or zero-sized; bring it on screen and retry — no \
@@ -11070,7 +11038,6 @@ mod encode_worker_tests {
         let held = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         for case in ["encoded", "cancelled", "unencodable", "republished"] {
             let (width, height) = if case == "unencodable" {
-                // No pixels, and a width no PNG header can hold.
                 (usize::try_from(u64::from(u32::MAX) + 1).expect("64-bit"), 0)
             } else {
                 (64_usize, 64_usize)

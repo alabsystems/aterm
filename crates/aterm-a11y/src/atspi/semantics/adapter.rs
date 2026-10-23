@@ -2,13 +2,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from accesskit_atspi_common 0.19.0 (MIT OR Apache-2.0, used under
-// Apache-2.0) src/adapter.rs, and changed by the aterm project in 2026.
-//
-// Derived from Chromium's accessibility abstraction.
-// Copyright 2017 The Chromium Authors. All rights reserved.
-// Use of this source code is governed by a BSD-style license that can be
-// found in the LICENSE-CHROMIUM file.
+// Derived from accesskit_atspi_common 0.19.0 (Apache-2.0) src/adapter.rs
+// and Chromium's accessibility abstraction (Copyright 2017 The Chromium Authors,
+// governed by LICENSE-CHROMIUM).
 
 //! Window accessibility tree adapter for AT-SPI.
 
@@ -382,7 +378,7 @@ impl ChangeHandler for AdapterChangeHandler<'_> {
 
 static NEXT_ADAPTER_ID: AtomicUsize = AtomicUsize::new(0);
 
-/// A fresh adapter id. Only one adapter at a time may have a given id.
+/// A fresh adapter id.
 pub(crate) fn next_adapter_id() -> usize {
     NEXT_ADAPTER_ID.fetch_add(1, Ordering::Relaxed)
 }

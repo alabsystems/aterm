@@ -1,17 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `gen_pet_glyphs` — regenerate the checked-in pet-pose const drawlists.
-//!
-//! Reads every full-body pose asset TOML under `crates/aterm-effects/art/pet/` and
-//! writes `crates/aterm-effects/src/pet_glyphs_gen.rs`. Run it after touching any pose;
-//! the `pet_glyphs_gen_matches_assets` drift test fails until the checked-in file
-//! matches. Same parser as `gen_cat_glyphs`, separate roster: the pet must never land
-//! in the collectible `GLYPHS` table.
-//!
-//! ```text
-//! targo --unverified run -p aterm-effects --example gen_pet_glyphs
-//! ```
+//! Regenerates `crates/aterm-effects/src/pet_glyphs_gen.rs` from `art/pet/*.toml`.
 
 use std::path::Path;
 use std::process::ExitCode;

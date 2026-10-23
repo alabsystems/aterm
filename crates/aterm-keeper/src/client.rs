@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's side of AKP1: [`KeeperClient`], one blocking connection, and [`KeeperLink`], the worker thread with a bounded queue a window drives it through (§5.3 step 1: the main thread makes no socket call; the queue holds duplicates, never descriptor numbers, so recycling cannot misroute a PTY).
+//! The window's side of AKP1: [`KeeperClient`] and [`KeeperLink`].
 
 use std::cell::Cell;
 use std::io;
@@ -19,20 +19,20 @@ use crate::wire::{
     MarkerRef, MasterHeader, PROTO, PeerClass,
 };
 
-/// One OFFER as the window receives it: the master, its fixed header, the two opaque blobs, and (to a window that journals) the session's journal region and the keeper's poison brake.
+/// One OFFER as the window receives it.
 #[derive(Debug)]
 pub struct Offered {
     pub master: OwnedFd,
     pub header: MasterHeader,
     pub tag: Vec<u8>,
     pub meta: Vec<u8>,
-    /// The crash-restore region offered with the master (a COMPANION_OFFER), only to a HELLO that stated [`CAP_JOURNAL`].
+    /// Crash-restore region offered with the master.
     pub companion: Option<OfferedCompanion>,
-    /// The keeper's poison brake (`JournalOffer::attempts`), as the OFFER stated it: 0 when the region is the dead reader's own and its tail may be replayed, 1 for its keyframe alone (from 2 no region comes). 0 from a keeper that stated none.
+    /// Keeper poison brake (`JournalOffer::attempts`).
     pub attempts: u8,
 }
 
-/// A crash-restore journal region a keeper offered: its read-only descriptor, which the window maps with `aterm_uds::shm::Region::map_readonly(region, len)`.
+/// Crash-restore journal region offered by a keeper.
 #[derive(Debug)]
 pub struct OfferedCompanion {
     pub region: OwnedFd,
@@ -40,7 +40,7 @@ pub struct OfferedCompanion {
     pub len: u64,
 }
 
-/// A keeper that answered but failed this build's identity check (§5.7), or whose WELCOME states a weaker policy than the window's own: the payload of the `PermissionDenied` error [`KeeperClient::connect`] and the HELLOs return, so a caller can tell it from a socket it may not open ([`refused_identity`]).
+/// Error payload when a keeper fails this build's identity check or states a weaker policy.
 #[derive(Debug)]
 pub struct NotThisBuild(pub String);
 
@@ -52,15 +52,12 @@ impl std::fmt::Display for NotThisBuild {
 
 impl std::error::Error for NotThisBuild {}
 
-/// Whether `e` is [`KeeperClient::connect`] refusing a keeper that answered but is not this build's.
+/// Whether `e` is [`KeeperClient::connect`] refusing a keeper that is not this build's.
 #[must_use]
 pub fn refused_identity(e: &io::Error) -> bool {
     e.get_ref().is_some_and(|inner| inner.is::<NotThisBuild>())
 }
 
-/// The error [`KeeperClient::connect`] returns for a failed identity check:
-/// a refusal is a [`NotThisBuild`] inside `PermissionDenied`; a check that
-/// could not run keeps its own words.
 fn check_failed(e: CheckError) -> io::Error {
     match e {
         CheckError::Refused(why) => {
@@ -70,24 +67,9 @@ fn check_failed(e: CheckError) -> io::Error {
     }
 }
 
-/// How long a HELLO waits for the keeper's answer (the WELCOME, a boot HELLO's OFFERs, a status
-/// client's STATUS): the keeper reads no frame of a connection before its check of the dialer's
-/// code ([`crate::identity::PEER_CHECK_HANG`], a hang detector with room for a loaded cold
-/// launch), and answers under its own per-frame budget after it ([`FRAME_BUDGET`]). It was the
-/// frame's two seconds: a window's boot HELLO cut there came back with no keeper, and the
-/// sessions a crashed window left in the keeper's custody were not taken (measured: a keeper
-/// three seconds late, the signature of `keeper_restore_live_headless` under four parallel
-/// suites at load 300 and more, `born=cold` and `keeper=absent`).
-///
-/// It covers ONE check, the dialer's own: the keeper runs the checks of the dials queued at its
-/// socket at once (up to its server's `DIAL_CHECKS_MAX`), each under its own hang detector from
-/// its accept, and keeps serving every other connection meanwhile, so a HELLO behind another
-/// dial whose check `trustd` answers slowly waits only for its own. Not a minute: a window's
-/// boot dial waits on it in line.
+/// Maximum wait for a HELLO's answer from the keeper.
 pub const WELCOME_WAIT: Duration = crate::identity::PEER_CHECK_HANG.saturating_add(FRAME_BUDGET);
 
-/// The keeper's budget for a frame once it has begun to arrive, or to be taken (its server's
-/// `IO_TIMEOUT`): the part of [`WELCOME_WAIT`] past the keeper's check of the dialer.
 const FRAME_BUDGET: Duration = Duration::from_secs(2);
 
 /// One connection to a keeper.
@@ -112,7 +94,7 @@ pub struct KeeperClient {
 }
 
 impl KeeperClient {
-    /// Dial `path`, check the keeper's identity (within `timeout`: the check waits on macOS's trustd), and set a read timeout.
+    /// Dial `path`, check the keeper's identity within `timeout`, and set a read timeout.
     /// # Errors
     /// The dial failing, the keeper failing the identity check (a [`NotThisBuild`] inside `PermissionDenied`), or the check not running (trustd not answering within `timeout` among the reasons).
     pub fn connect(path: &Path, identity: &Identity, timeout: Duration) -> io::Result<Self> {
@@ -142,7 +124,7 @@ impl KeeperClient {
         self.keeper_caps.get() & CAP_SYNC != 0
     }
 
-    /// SYNC: ask the keeper to say when it has read every frame written so far.
+    /// Ask the keeper to confirm when it has read every frame written so far.
     /// # Errors
     /// The keeper did not state SYNC support, the sequence is exhausted, or the write failed.
     pub fn sync(&self) -> io::Result<u64> {
@@ -162,22 +144,18 @@ impl KeeperClient {
         Ok(seq)
     }
 
-    /// The highest SYNC number the keeper answered on this connection (0 before any).
+    /// The highest SYNC number the keeper answered on this connection.
     #[must_use]
     pub const fn synced(&self) -> u64 {
         self.synced.get()
     }
 
-    /// Read a WELCOME's policy and caps: the policy must serve this window ([`Self::served`]),
-    /// and the caps say whether companions may be sent here.
     fn welcomed(&self, identity: Option<IdentityPolicy>, caps: Option<u8>) -> io::Result<()> {
         self.served(identity)?;
         self.keeper_caps.set(caps.unwrap_or(0));
         Ok(())
     }
 
-    /// Whether a keeper whose WELCOME stated `served` may be handed this window's masters: under
-    /// [`IdentityPolicy::Designated`], only one that requires the same of its peers (§5.7).
     fn served(&self, served: Option<IdentityPolicy>) -> io::Result<()> {
         match (self.policy, served) {
             (IdentityPolicy::SameUid, _) | (_, Some(IdentityPolicy::Designated)) => Ok(()),
@@ -197,22 +175,20 @@ impl KeeperClient {
         }
     }
 
-    /// Send a frame (with its descriptor, for REGISTER).
+    /// Send a frame and optional descriptor.
     /// # Errors
     /// The write failing.
     pub fn send(&self, frame: &Frame, fd: Option<&OwnedFd>) -> io::Result<()> {
         write_frame(&self.stream, frame, fd.map(|f| f.as_fd()))
     }
 
-    /// Read the next frame; `None` at EOF.
+    /// Read the next frame, returning `None` at EOF.
     /// # Errors
     /// A malformed frame, the timeout, or the socket's errors.
     pub fn recv(&self) -> io::Result<Option<Incoming>> {
         read_frame(&self.stream)
     }
 
-    /// `read` of a HELLO's answer, under [`WELCOME_WAIT`] where the connection's frame wait
-    /// ([`Self::frame_wait`]) is shorter, and that wait set back after it, whatever `read` says.
     fn answer<T>(&self, read: impl FnOnce(&Self) -> io::Result<T>) -> io::Result<T> {
         self.stream
             .set_read_timeout(Some(WELCOME_WAIT.max(self.frame_wait)))?;
@@ -221,14 +197,14 @@ impl KeeperClient {
         answer
     }
 
-    /// HELLO as a window, and collect the WELCOME's offers.
+    /// Send HELLO as a window and collect the WELCOME's offers.
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
     pub fn hello_app(&self, build: &str) -> io::Result<Vec<Offered>> {
         self.hello_app_marked(build, None, false)
     }
 
-    /// [`Self::hello_app`], naming this window's crash marker (§5.4 row 3's cross-check): the keeper then reads a lost BYE with the marker gone and `exit(0)` as the quit it was.
+    /// Send [`Self::hello_app`] naming this window's crash marker.
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
     pub fn hello_app_marked(
@@ -250,7 +226,6 @@ impl KeeperClient {
         self.answer(|c| c.welcome_offers(journal))
     }
 
-    /// The WELCOME a window's boot HELLO is answered with, and each OFFER it announces.
     fn welcome_offers(&self, journal: bool) -> io::Result<Vec<Offered>> {
         let n = match self.recv()?.map(|i| i.frame) {
             Some(Frame::Welcome {
@@ -300,7 +275,6 @@ impl KeeperClient {
         Ok(offers)
     }
 
-    /// The COMPANION_OFFER an OFFER of `rdev` said follows it.
     fn companion_offer(&self, rdev: u64) -> io::Result<OfferedCompanion> {
         match self.recv()? {
             Some(Incoming {
@@ -318,7 +292,7 @@ impl KeeperClient {
         }
     }
 
-    /// HELLO as a window's link ([`CAP_LINK`]): registered masters only, no offers, not a launch.
+    /// Send HELLO as a window's link ([`CAP_LINK`]).
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
     pub fn hello_link(
@@ -350,7 +324,7 @@ impl KeeperClient {
         })
     }
 
-    /// HELLO as a status client of build `build`, then ask for the status text.
+    /// Send HELLO as a status client and ask for the status text.
     /// # Errors
     /// The exchange failing or the keeper answering out of protocol.
     pub fn status(&self, build: &str) -> io::Result<String> {
@@ -374,15 +348,13 @@ impl KeeperClient {
             },
             None,
         )?;
-        // The keeper reads the STATUS on a later step, after the checks of any dial queued
-        // since: an answer to the HELLO's exchange, as the WELCOME is.
         self.answer(|c| match c.recv()?.map(|i| i.frame) {
             Some(Frame::Status { text }) => Ok(text),
             other => Err(protocol(format!("expected STATUS, got {other:?}"))),
         })
     }
 
-    /// Read every frame already waiting, keeping only a SYNC's answer ([`Self::synced`]; a link acts on nothing else); `false` once the keeper has gone (EOF, a malformed frame).
+    /// Read every frame already waiting, keeping only a SYNC answer; returns `false` once the keeper is gone.
     #[must_use]
     pub fn drain(&self) -> bool {
         self.drain_with_refusals(|_| {})
@@ -419,14 +391,14 @@ impl KeeperClient {
         }
     }
 
-    /// REGISTER a master (a duplicate the caller made for the keeper).
+    /// Register a master duplicate with the keeper.
     /// # Errors
     /// The write failing.
     pub fn register(&self, master: &OwnedFd, header: MasterHeader, tag: Vec<u8>) -> io::Result<()> {
         self.send(&Frame::Register { header, tag }, Some(master))
     }
 
-    /// COMPANION: the read-only custody descriptor of `rdev`'s journal region, `len` bytes, beside a master this connection claimed.
+    /// Send the read-only custody descriptor of `rdev`'s journal region.
     /// # Errors
     /// The write failing.
     pub fn companion(&self, rdev: u64, region: &OwnedFd, len: u64) -> io::Result<()> {
@@ -440,7 +412,7 @@ impl KeeperClient {
         )
     }
 
-    /// COMPANION_RELEASE: this connection's claim on `rdev` has no journal region.
+    /// Tell the keeper that this connection's claim on `rdev` has no journal region.
     /// # Errors
     /// The write failing.
     pub fn companion_release(&self, rdev: u64) -> io::Result<()> {
@@ -518,7 +490,7 @@ fn confirm_companion(read: &mut Option<CompanionRead>, synced: u64, refused: boo
 /// One message to the keeper, queued by the window.
 #[derive(Debug)]
 pub enum LinkOp {
-    /// A fresh or adopted master: the queue owns this duplicate.
+    /// Register a fresh or adopted master duplicate.
     Register {
         master: OwnedFd,
         header: MasterHeader,
@@ -532,7 +504,7 @@ pub enum LinkOp {
     Pending { pid: u32 },
     /// The quit, written on the final-exit path just before `exit(0)`.
     Bye,
-    /// The journal region of a master already queued for REGISTER: the queue owns this read-only custody descriptor, and the link keeps it with the master, telling a restarted keeper again after the master's REGISTER.
+    /// Attach the journal region of a master already queued for registration.
     Companion {
         rdev: u64,
         region: OwnedFd,
@@ -540,11 +512,11 @@ pub enum LinkOp {
         /// Optional read confirmation for a region that replaces a live predecessor.
         receipt: Option<std::sync::Arc<CompanionReceipt>>,
     },
-    /// The master `rdev` has no journal region (any more): the link drops the one it kept and tells the keeper, again after a restart too.
+    /// Release any journal region held for `rdev`.
     CompanionRelease { rdev: u64 },
 }
 
-/// The queue's bound for ordinary ops: a window never blocks on the keeper.
+/// Queue bound for ordinary ops.
 pub const LINK_QUEUE: usize = 256;
 
 /// Extra channel capacity for waited ops, which ordinary offers cannot fill.
@@ -556,7 +528,6 @@ pub const WAITED_ROOM: usize = 4;
 struct Room(std::sync::atomic::AtomicUsize);
 
 impl Room {
-    /// Claim a place for an ordinary op: `false` when all [`LINK_QUEUE`] are taken.
     fn claim(&self) -> bool {
         self.0
             .try_update(
@@ -567,8 +538,6 @@ impl Room {
             .is_ok()
     }
 
-    /// Give `n` places back: ordinary ops the worker took, or a claim whose op the queue
-    /// did not take.
     fn give_back(&self, n: usize) {
         let _ = self.0.try_update(
             std::sync::atomic::Ordering::AcqRel,
@@ -577,14 +546,11 @@ impl Room {
         );
     }
 
-    /// Every place back: the worker ended, so its queue takes nothing it would write, and an
-    /// offer finds it gone ([`Refused::Gone`]), never full.
     fn clear(&self) {
         self.0.store(0, std::sync::atomic::Ordering::Release);
     }
 }
 
-/// Clears the [`Room`] when the worker that owns it ends, a panic included.
 struct Ended(std::sync::Arc<Room>);
 
 impl Drop for Ended {
@@ -596,13 +562,13 @@ impl Drop for Ended {
 /// Why [`KeeperLink::offer`] queued nothing, with the op it hands back.
 #[derive(Debug)]
 pub enum Refused {
-    /// The queue is full: the worker has not taken [`LINK_QUEUE`] ops yet (a keeper slow to read, its socket's buffer full).
+    /// The queue is full.
     Full(LinkOp),
-    /// The worker has ended (the link was shut down, or its thread is gone): nothing queued on this link would be written.
+    /// The worker has ended.
     Gone(LinkOp),
 }
 
-/// The far end of a [`KeeperLink::stalled`] link: a test's stand-in for a worker that does not read.
+/// The far end of a [`KeeperLink::stalled`] link.
 #[cfg(any(test, debug_assertions))]
 #[derive(Debug)]
 pub struct Stalled {
@@ -614,7 +580,7 @@ pub struct Stalled {
 
 #[cfg(any(test, debug_assertions))]
 impl Stalled {
-    /// Take every op queued so far, in order (the keeper caught up).
+    /// Take every op queued so far, in order.
     #[must_use]
     pub fn drain(&self) -> Vec<LinkOp> {
         self.drain_at(std::time::Instant::now())
@@ -639,14 +605,11 @@ impl Stalled {
 
 #[cfg(any(test, debug_assertions))]
 impl Drop for Stalled {
-    /// Ends as a worker that ended does: an offer finds it gone.
     fn drop(&mut self) {
         self.room.clear();
     }
 }
 
-/// One queued op, and who waits for it to be written (PENDING before the
-/// grant, BYE before `exit(0)`).
 type Queued = (LinkOp, Option<Waited>);
 
 /// Cancellation belongs to one queued wait, never to the link or another op.
@@ -691,7 +654,6 @@ impl Waited {
     }
 }
 
-/// The production worker and captured receiver use the same queued-wait admission.
 fn claim_queued(queued: Queued, now: std::time::Instant) -> Option<Queued> {
     if let Some(waited) = &queued.1
         && !waited.claim_at(now)
@@ -702,7 +664,7 @@ fn claim_queued(queued: Queued, now: std::time::Instant) -> Option<Queued> {
     Some(queued)
 }
 
-/// The window's link: a worker thread that owns the connection, reconnects after a keeper restart and re-registers every master it still holds a duplicate of (§5.3 step 9), then tells the keeper every RELEASE of a registered master no keeper confirmed it read ([`Owed`]).
+/// Worker thread that owns the keeper connection and reconnects after a keeper restart.
 #[derive(Debug)]
 pub struct KeeperLink {
     /// Bounded at [`LINK_QUEUE`] ordinary ops plus [`WAITED_ROOM`] waited ones.
@@ -733,7 +695,7 @@ impl KeeperLink {
         Self::start_on(path, identity, build, None)
     }
 
-    /// [`Self::start`], naming this window's crash marker in every link HELLO (each connection is judged on its own, §5.4).
+    /// Start the worker naming this window's crash marker in every link HELLO.
     /// # Errors
     /// The thread failing to spawn.
     pub fn start_marked(
@@ -767,7 +729,7 @@ impl KeeperLink {
         })
     }
 
-    /// Start the worker on a connection that already said the window's boot HELLO ([`KeeperClient::hello_app`]): the masters it was offered are claimed on that same connection, so the keeper sees one window, whose end it judges once.
+    /// Start the worker on a connection that already sent the window's boot HELLO.
     /// # Errors
     /// The thread failing to spawn.
     pub fn start_on(
@@ -779,14 +741,14 @@ impl KeeperLink {
         Self::start_marked(path, identity, build, None, booted, false)
     }
 
-    /// Queue `op`; `false` when the queue is full or the worker is gone (the window carries on: custody is insurance, not state).
+    /// Queue `op`, returning `false` when the queue is full or the worker is gone.
     pub fn enqueue(&self, op: LinkOp) -> bool {
         self.offer(op).is_ok()
     }
 
-    /// Queue `op`, or hand it back with why it was not queued: a caller whose op carries what nothing else would tell the keeper (a fresh region's only custody descriptor) keeps it and offers it again.
+    /// Queue `op`, or return it with the reason it was refused.
     /// # Errors
-    /// [`Refused::Full`] while the queue holds [`LINK_QUEUE`] ordinary ops the worker has not taken (a keeper slow to read; the [`WAITED_ROOM`] past them is not an ordinary op's), [`Refused::Gone`] once the worker has ended.
+    /// [`Refused::Full`] while the queue holds [`LINK_QUEUE`] ordinary ops, or [`Refused::Gone`] once the worker has ended.
     pub fn offer(&self, op: LinkOp) -> Result<(), Refused> {
         if !self.room.claim() {
             return Err(Refused::Full(op));
@@ -800,7 +762,7 @@ impl KeeperLink {
         })
     }
 
-    /// A link with no worker: what is queued stays there until the test takes it ([`Stalled::drain`]), so [`LINK_QUEUE`] ordinary ops fill it, as a keeper too slow to read fills a real one.
+    /// Create a link with no worker whose queued ops stay until [`Stalled::drain`] takes them.
     #[cfg(any(test, debug_assertions))]
     #[must_use]
     pub fn stalled() -> (Self, Stalled) {
@@ -894,20 +856,15 @@ enum HeldJournal {
 
 type Held = std::collections::BTreeMap<u64, HeldMaster>;
 
-/// The registered masters whose RELEASE no keeper has confirmed it read, by rdev: `None` owed to
-/// the next connection (the write failed, or the connection ended before an answer), `Some(n)`
-/// written on this connection ahead of its SYNC `n`, and dropped once the keeper answers that
-/// SYNC.
 type Owed = std::collections::BTreeMap<u64, Option<u64>>;
 
-/// What one queued op sends once connected.
 enum Send {
     Register(u64),
     Companion(u64),
     Frame(Frame),
 }
 
-/// How often an idle link looks at its connection: it drains what the keeper sent (an unread socket would stall the keeper's writes) and notices a keeper that went away, so a restarted keeper is told what this window holds without waiting for its next op (§5.3 step 9).
+/// Poll interval for an idle link connection.
 pub const LINK_POLL: Duration = Duration::from_millis(500);
 
 fn link_worker(peer: &LinkPeer, rx: Receiver<Queued>, booted: Option<KeeperClient>, room: &Room) {
@@ -1084,30 +1041,23 @@ fn link_worker(peer: &LinkPeer, rx: Receiver<Queued>, booted: Option<KeeperClien
             owe(&mut owed, must_reach);
         }
         if bye {
-            // Nothing follows a quit: the window is about to `exit(0)`, and the
-            // keeper reads the BYE, then this connection's end.
             return;
         }
     }
 }
 
-/// Keep the RELEASE of `rdev`, a master this link registered, for the next
-/// connection.
 fn owe(owed: &mut Owed, rdev: Option<u64>) {
     if let Some(rdev) = rdev {
         keep(owed, rdev, None);
     }
 }
 
-/// Keep the RELEASE of `rdev` until `sync` is answered (`None`: until the next connection).
 fn keep(owed: &mut Owed, rdev: u64, sync: Option<u64>) {
     if owed.len() < LINK_QUEUE || owed.contains_key(&rdev) {
         owed.insert(rdev, sync);
     }
 }
 
-/// The connection ended: every RELEASE it carried that the keeper did not confirm is owed to
-/// the next one.
 fn unconfirm(owed: &mut Owed) {
     for sync in owed.values_mut() {
         *sync = None;
@@ -1212,13 +1162,9 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::time::Instant;
 
-    /// `trustd` going silent after the one probe refuses every later check
-    /// through the process's gate: the machine's moment, never the code's.
     const TRUSTD_SILENT: &str =
         "the process trustd gate was silent — the machine's, not the code's";
 
-    /// Whether `why` is the identity check's words for a gate that refused it
-    /// unanswered (`identity::unanswered`).
     fn trustd_silent(why: &str) -> bool {
         why.starts_with("macOS's code-signing service (trustd) is not answering")
     }
@@ -1242,7 +1188,6 @@ mod tests {
         }
     }
 
-    /// The REGISTER of a duplicate of `path` (a character device, as a master is), and its rdev.
     fn register_op(path: &str, local_id: u64) -> (u64, LinkOp) {
         let master = std::fs::File::open(path).expect("open");
         let rdev = master.metadata().expect("stat").rdev();
@@ -1259,7 +1204,6 @@ mod tests {
         (rdev, op)
     }
 
-    /// Apple's `nc` listening on the socket fails the designated check ([`refused_identity`]).
     #[test]
     fn a_listener_of_other_code_is_refused_as_not_this_build() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1316,8 +1260,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// §5.7: though the keeper's code (this very build) passes, the link and the boot HELLO are
-    /// both refused.
     #[test]
     fn a_keeper_at_the_uid_floor_is_refused_by_a_window_that_checks_code() {
         aterm_uds::deadline::require_trust_service();
@@ -1380,7 +1322,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A check that could not run (no audit token, the peer's code not found) keeps its words.
     #[test]
     fn only_a_refused_check_is_not_this_build() {
         let refused = check_failed(CheckError::Refused("OSStatus -67050".into()));
@@ -1401,8 +1342,6 @@ mod tests {
         assert_eq!(unanswered.kind(), io::ErrorKind::Other, "{unanswered}");
     }
 
-    /// §5.3 step 9: a restarted keeper is told again what the window holds without waiting for
-    /// the window's next op.
     #[test]
     fn a_restarted_keeper_is_told_again_without_a_new_op() {
         let base = std::env::temp_dir();
@@ -1434,10 +1373,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The crash-restore plan §5, "K restart": a link that journals tells a restarted keeper each
-    /// master's region again right behind its REGISTER, and a released one as released; a
-    /// master whose region the window has not said yet is told nothing, so its claim stays
-    /// unsettled until the window settles it.
     #[test]
     fn a_restarted_keeper_is_told_each_region_again() {
         let base = std::env::temp_dir();
@@ -1507,11 +1442,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A REPLACEMENT'S RECEIPT IS THE KEEPER'S READ, NOT THE LINK'S WRITE (R9 (b)). A window
-    /// whose memory shed replaced a session's region keeps the old one (and erases it on a
-    /// clear) until the keeper holds the fresh one, so the link must say when that is: the
-    /// worker writes a SYNC behind the COMPANION and confirms its receipt only once the
-    /// keeper's answer, which it writes after reading every frame before it, is read back.
     #[test]
     fn a_replacement_companion_is_confirmed_only_once_the_keeper_has_read_it() {
         let scratch = aterm_tempfile::Builder::new()
@@ -1594,8 +1524,6 @@ mod tests {
         drop(server);
     }
 
-    /// A live keeper drops the link and a tab closes while no reconnect can succeed: the RELEASE
-    /// still reaches the keeper once one does (the reconnect registers only what is held).
     #[test]
     fn a_release_the_link_could_not_write_is_told_to_the_next_connection() {
         let base = std::env::temp_dir();
@@ -1627,8 +1555,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A live keeper drops the link with a RELEASE the link wrote still unread (a malformed frame or
-    /// a stalled one ends a connection there).
     #[test]
     fn a_release_the_keeper_dropped_unread_is_told_to_the_next_connection() {
         let base = std::env::temp_dir();
@@ -1657,15 +1583,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A WELCOME later than a frame's budget still answers each HELLO ([`KeeperClient::answer`],
-    /// [`WELCOME_WAIT`]): the keeper reads no frame of a connection before its check of the
-    /// dialer's code ([`crate::identity::PEER_CHECK_HANG`], seconds on a loaded machine), and a
-    /// window's boot HELLO cut at the frame's budget came back with no keeper, the sessions a
-    /// crashed window left in its custody not taken (`keeper_restore_live_headless` under load).
-    /// The same for a link's HELLO, and for a status client's WELCOME and its STATUS, which the
-    /// keeper reads on a later step, after any dial queued since. Negative control: once each
-    /// answer is read the connection's frame wait stands again, so a link's later frames keep
-    /// their budget.
     #[test]
     fn a_welcome_later_than_a_frame_still_answers_the_hello() {
         #[derive(Clone, Copy, Debug)]
@@ -1674,8 +1591,6 @@ mod tests {
             Link,
             Status,
         }
-        // The connection's frame wait, and how late the keeper answers: past that wait. The
-        // three dials are independent, so they run at once.
         let frame = Duration::from_millis(100);
         let late = Duration::from_millis(400);
         let dials: Vec<(usize, Hello)> = [Hello::App, Hello::Link, Hello::Status]
@@ -1690,14 +1605,11 @@ mod tests {
             let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind");
             let keeper = std::thread::spawn(move || {
                 let (stream, _) = listener.accept().expect("accept");
-                // A hang detector, not a latency budget.
                 stream
                     .set_read_timeout(Some(Duration::from_secs(60)))
                     .expect("timeout");
                 let hello = read_frame(&stream).expect("read").expect("a frame").frame;
                 assert!(matches!(hello, Frame::Hello { .. }), "{hello:?}");
-                // The check of the dialer's code, slow: the window has waited past its frame's
-                // wait when the WELCOME comes.
                 std::thread::sleep(late);
                 let welcome = Frame::Welcome {
                     proto: PROTO,
@@ -1716,7 +1628,6 @@ mod tests {
                 ) {
                     let ask = read_frame(&stream).expect("read").expect("a frame").frame;
                     assert!(matches!(ask, Frame::Status { .. }), "{ask:?}");
-                    // Another dial's check ahead of the STATUS's step.
                     std::thread::sleep(late);
                     let status = Frame::Status {
                         text: "late".into(),
@@ -1743,7 +1654,6 @@ mod tests {
                     "late"
                 ),
             }
-            // Negative control.
             assert_eq!(
                 client.stream.read_timeout().expect("its wait"),
                 Some(frame),
@@ -1754,9 +1664,6 @@ mod tests {
         });
     }
 
-    /// A keeper whose WELCOME states no CAP_SYNC (an older one, which refuses an unknown kind and
-    /// drops the connection with every frame behind it) is sent no SYNC: the link's frames reach
-    /// it as they always did.
     #[test]
     fn a_keeper_that_answers_no_sync_is_sent_none() {
         use crate::wire::Kind;
@@ -1806,8 +1713,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// PENDING (the update worker gates the grant on it) and BYE (written before `exit(0)`) are
-    /// acknowledged only once written to a live keeper, arrive in order, and nothing follows a BYE.
     #[test]
     fn pending_and_bye_are_acknowledged_once_written() {
         let base = std::env::temp_dir();
@@ -1855,8 +1760,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// With no keeper at all, a waited op says so promptly rather than
-    /// holding the window's update or exit for the whole wait.
     #[test]
     fn a_waited_op_with_no_keeper_is_refused_promptly() {
         let base = std::env::temp_dir();
@@ -1892,10 +1795,6 @@ mod tests {
 mod offer_tests {
     use super::*;
 
-    /// A FULL QUEUE HANDS THE OP BACK. `enqueue` drops an op its queue cannot take, and an
-    /// op that carries a descriptor nothing else holds (a fresh region's custody) is lost
-    /// with it: `offer` returns it, so the caller keeps it and offers it again once the
-    /// keeper has read.
     #[test]
     fn a_full_queue_hands_an_offered_op_back_and_a_gone_worker_does_too() {
         let (link, far) = KeeperLink::stalled();
@@ -2005,7 +1904,6 @@ mod offer_tests {
         assert!(answer.try_recv().expect("live wait answered"));
     }
 
-    /// A WAITED OP FINDS ROOM IN A QUEUE ITS ORDINARY OPS FILLED (R9 review).
     #[test]
     fn a_waited_op_finds_room_in_a_queue_its_ordinary_ops_filled() {
         let (link, far) = KeeperLink::stalled();

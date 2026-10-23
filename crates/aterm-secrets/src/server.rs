@@ -91,9 +91,9 @@ pub const MAX_VAULTS: usize = 64;
 /// The mDNS service type advertised.
 pub const SERVICE_TYPE: &str = "_alab-vault._tcp";
 /// macOS's mDNS command.
-pub const DNS_SD: &str = "/usr/bin/dns-sd";
+pub const DNS_SD: &str = aterm_uds::os_path!("dns-sd");
 /// macOS's sleep assertion command.
-pub const CAFFEINATE: &str = "/usr/bin/caffeinate";
+pub const CAFFEINATE: &str = aterm_uds::os_path!("caffeinate");
 /// How often the advertised address is checked.
 const ADVERTISE_EVERY: Duration = Duration::from_secs(30);
 /// What a closing connection drains so its answer is not lost to a reset.

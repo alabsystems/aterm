@@ -65,16 +65,16 @@ pub(crate) fn need_clt_git() {
 pub const CLT_ITEM: &str = "developer.command-line-tools";
 
 /// `ssh-keygen`, a real binary on every macOS (not a shim).
-pub const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
+pub const SSH_KEYGEN: &str = aterm_uds::os_path!("ssh-keygen");
 
 /// Reads a user's file.
-const CAT: &str = "/bin/cat";
+const CAT: &str = aterm_uds::os_path!("cat");
 
 /// Makes `~/.ssh`.
-const MKDIR: &str = "/bin/mkdir";
+const MKDIR: &str = aterm_uds::os_path!("mkdir");
 
 /// Removes the key, for the revert line.
-const RM: &str = "/bin/rm";
+const RM: &str = aterm_uds::os_path!("rm");
 
 /// The git config key that rewrites `https://github.com/` to SSH.
 const SSH_URL_KEY: &str = "url.git@github.com:.insteadOf";

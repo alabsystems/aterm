@@ -219,8 +219,8 @@ impl InkLedger {
         floor: f32,
     ) -> bool {
         let lum = |base: [f32; 3]| {
-            let ch = |c: usize| (base[c] + lift[c]).min(255.0) as u32;
-            crate::color_math::relative_luminance_with(table, (ch(0) << 16) | (ch(1) << 8) | ch(2))
+            let ch = |c: usize| (base[c] + lift[c]).min(255.0) as usize;
+            crate::color_math::relative_luminance_rgb(table, ch(0), ch(1), ch(2))
         };
         let (ink, ground) = (lum(ink), lum(ground));
         ink.max(ground) + 0.05 >= floor * (ink.min(ground) + 0.05)
@@ -278,10 +278,15 @@ impl InkLedger {
         let Some(base) = self.slot(i32::from(row), i32::from(col)) else {
             return cov;
         };
-        let share = (0..Self::BANDS)
-            .filter(|&b| lifts[b] != [0.0; 3])
-            .map(|b| self.room(base + b, lifts[b].map(|l| l * cov), Self::STEADY_FLOOR))
-            .fold(1.0f32, f32::min);
+        let mut share = 1.0f32;
+        for (b, lift) in lifts.iter().enumerate() {
+            if *lift != [0.0; 3] {
+                share = share.min(self.room(base + b, lift.map(|l| l * cov), Self::STEADY_FLOOR));
+                if share <= 0.0 {
+                    return 0.0;
+                }
+            }
+        }
         for (b, lift) in lifts.iter().enumerate() {
             if *lift != [0.0; 3] {
                 for (laid, l) in self.laid[base + b].iter_mut().zip(lift) {
@@ -335,7 +340,7 @@ impl InkLedger {
             (row, cols)
         };
         let mut share = 1.0f32;
-        for line in self.lines.iter().flatten().copied() {
+        'probe: for line in self.lines.iter().flatten().copied() {
             let (row, cols) = reached(line);
             if cols.is_empty() {
                 continue;
@@ -348,6 +353,9 @@ impl InkLedger {
                 for (band, w) in weights(col, &dy2).into_iter().enumerate() {
                     if let Some(w) = w {
                         share = share.min(self.room(base + band, peak.map(|p| p * w), floor));
+                        if share <= 0.0 {
+                            break 'probe;
+                        }
                     }
                 }
             }
@@ -496,11 +504,14 @@ impl InkLedger {
             return 1.0;
         }
         let mut share = 1.0f32;
-        for (k, &cell) in self.reached.iter().enumerate() {
+        'probe: for (k, &cell) in self.reached.iter().enumerate() {
             for band in 0..Self::BANDS {
                 let add = self.peaks[k * Self::BANDS + band];
                 if add != [0.0; 3] {
                     share = share.min(self.room(cell * Self::BANDS + band, add, floor));
+                    if share <= 0.0 {
+                        break 'probe;
+                    }
                 }
             }
         }
@@ -542,12 +553,17 @@ impl InkLedger {
                 let add = self.peaks[k * Self::BANDS + band];
                 if add != [0.0; 3] {
                     share = share.min(self.room(cell * Self::BANDS + band, add, floor));
+                    if share <= 0.0 {
+                        break;
+                    }
                 }
             }
-            for band in 0..Self::BANDS {
-                let add = self.peaks[k * Self::BANDS + band];
-                for (laid, a) in self.laid[cell * Self::BANDS + band].iter_mut().zip(add) {
-                    *laid += share * a;
+            if share > 0.0 {
+                for band in 0..Self::BANDS {
+                    let add = self.peaks[k * Self::BANDS + band];
+                    for (laid, a) in self.laid[cell * Self::BANDS + band].iter_mut().zip(add) {
+                        *laid += share * a;
+                    }
                 }
             }
             if share < 1.0 {
@@ -815,12 +831,17 @@ impl InkLedger {
                 for (band, w) in weights.into_iter().enumerate() {
                     if let Some(w) = w {
                         share = share.min(self.room(base + band, peak.map(|p| p * w), floor));
+                        if share <= 0.0 {
+                            break;
+                        }
                     }
                 }
-                for (band, w) in weights.into_iter().enumerate() {
-                    if let Some(w) = w {
-                        for (laid, p) in self.laid[base + band].iter_mut().zip(peak) {
-                            *laid += share * p * w;
+                if share > 0.0 {
+                    for (band, w) in weights.into_iter().enumerate() {
+                        if let Some(w) = w {
+                            for (laid, p) in self.laid[base + band].iter_mut().zip(peak) {
+                                *laid += share * p * w;
+                            }
                         }
                     }
                 }
@@ -1096,12 +1117,10 @@ impl CursorGlow {
             k * k * (3.0 - 2.0 * k)
         };
         let inked = |row: i32, col: i32| {
-            row >= 0
-                && view.knows_row(row)
-                && (view.covers_cell(row, col)
-                    || self.frame_text.pair(row, col).is_some_and(|(ink, ground)| {
-                        ink.is_some() || !super::emit::reads_as_page(ground, page)
-                    }))
+            view.covers_cell(row, col)
+                || self.frame_text.pair(row, col).is_some_and(|(ink, ground)| {
+                    ink.is_some() || !super::emit::reads_as_page(ground, page)
+                })
         };
         let cr = i32::from(cr);
         let mut print = 0u64;
@@ -1121,7 +1140,7 @@ impl CursorGlow {
                 across
             };
             let hold = smooth((inside + fy) / (fi + fy));
-            if hold >= 1.0 {
+            if hold >= 1.0 || row < 0 || !view.knows_row(row) {
                 continue;
             }
             let (x0, x1) = (f32::from(q.x), f32::from(q.x) + f32::from(q.w));
@@ -1129,13 +1148,17 @@ impl CursorGlow {
                 ((x0 - fx - ox) / cw).floor() as i32,
                 ((x1 + fx - ox) / cw).floor() as i32,
             );
-            let near = (c_lo.max(0)..=c_hi)
-                .filter(|&c| inked(row, c))
-                .map(|c| {
-                    let (a, b) = (ox + c as f32 * cw, ox + (c + 1) as f32 * cw);
-                    (a - x1).max(x0 - b).max(0.0)
-                })
-                .fold(f32::INFINITY, f32::min);
+            let mut near = f32::INFINITY;
+            for c in c_lo.max(0)..=c_hi {
+                if !inked(row, c) {
+                    continue;
+                }
+                let (a, b) = (ox + c as f32 * cw, ox + (c + 1) as f32 * cw);
+                near = near.min((a - x1).max(x0 - b).max(0.0));
+                if near == 0.0 {
+                    break;
+                }
+            }
             if !near.is_finite() {
                 continue;
             }

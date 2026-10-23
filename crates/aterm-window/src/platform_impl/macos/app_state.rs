@@ -10,24 +10,18 @@ use std::rc::Weak;
 use std::sync::OnceLock;
 use std::time::Instant;
 
-// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
-// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
-// and its framework bindings.
 use aterm_objc::send::{
     send_bool, send_bool_isize, send_id, send_id_usize, send_usize, send_v_bool, send_v_id,
 };
 use aterm_objc::{autoreleasepool, class, sel, Bool, Id, MainThread};
 
-/// An optional handler consulted from `applicationShouldTerminate:` — see
-/// [`set_quit_confirm_hook`].
 static QUIT_CONFIRM_HOOK: OnceLock<fn() -> bool> = OnceLock::new();
 
-/// Register a handler consulted before the app terminates via AppKit's `terminate:` (Dock-icon "Quit", AppleScript `quit`, logout/restart/shutdown — gestures that do NOT pass through the app menu's Quit item).
+/// Registers a handler consulted before the app terminates via AppKit's `terminate:`.
 pub(crate) fn set_quit_confirm_hook(hook: fn() -> bool) {
     let _ = QUIT_CONFIRM_HOOK.set(hook);
 }
 
-/// Consult the registered quit-confirmation hook; `true` (allow) when none is set.
 fn quit_confirm_allows() -> bool {
     QUIT_CONFIRM_HOOK.get().is_none_or(|hook| hook())
 }
@@ -69,11 +63,8 @@ pub(super) struct AppState {
     wake_armed: wake_queue::Armed,
 }
 
-// LOCAL PATCH (aterm): declared by `aterm_objc::declare_class!`, where upstream used objc2's. All
-// three rows are `@optional`, which AppKit reaches by `-respondsToSelector:`, so a row that failed
-// to register would fail silently; the live-class audit reads them back.
 aterm_objc::declare_class! {
-    /// The `NSApplicationDelegate` this backend installs on `NSApp`, and the owner of the whole event-loop state machine.
+    /// The `NSApplicationDelegate` installed on `NSApp` and owner of the event-loop state.
     #[derive(Debug)]
     pub(super) struct ApplicationDelegate: NSObject {
         const NAME: &str = "WinitApplicationDelegate";
@@ -166,8 +157,6 @@ impl ApplicationDelegate {
             );
         }
 
-        // LOCAL PATCH (aterm): always; `with_default_menu` is gone. aterm replaces the main menu,
-        // but this one registers the Services menu.
         // SAFETY: `ns_app` is the live shared `NSApplication`.
         unsafe { menu::initialize(ns_app, mtm) };
 
@@ -196,7 +185,8 @@ impl ApplicationDelegate {
         // SAFETY: `-delegate` is `@16@0:8` on `NSApplication` and answers +0.
         let delegate = unsafe { send_id(app(), sel!(delegate)) };
         assert!(!delegate.is_null(), "a delegate was not configured on the application");
-        // SAFETY: `delegate` is the live object `-[NSApplication delegate]` just answered, and `-isKindOfClass:` is `B@:#` on every Apple runtime.
+        // SAFETY: `delegate` is the live object `-[NSApplication delegate]` just answered, and
+        // `-isKindOfClass:` is `B@:#` on every Apple runtime.
         let is_ours = unsafe {
             let send: unsafe extern "C-unwind" fn(
                 Id,
@@ -213,7 +203,8 @@ impl ApplicationDelegate {
             is_ours.as_bool(),
             "tried to get a delegate that was not the one Winit has registered"
         );
-        // SAFETY: just checked that the delegate is an instance of `ApplicationDelegate`; `retain` takes the borrowed reference to +1.
+        // SAFETY: just checked that the delegate is an instance of `ApplicationDelegate`; `retain`
+        // takes the borrowed reference to +1.
         unsafe { aterm_objc::Retained::retain(delegate) }.expect("a non-null delegate retains")
     }
 
@@ -226,9 +217,10 @@ impl ApplicationDelegate {
         )
     }
 
-    /// A +1 handle to this delegate — objc2's `NSObjectProtocol::retain`, which this class no longer inherits.
+    /// Returns a retained `+1` handle to this delegate.
     pub(super) fn retained(&self) -> aterm_objc::Retained<Self> {
-        // SAFETY: `self` borrows a live instance of this class, so `as_id()` is a live non-null receiver for `objc_retain`.
+        // SAFETY: `self` borrows a live instance of this class, so `as_id()` is a live non-null
+        // receiver for `objc_retain`.
         unsafe { aterm_objc::Retained::retain(self.as_id()) }
             .expect("retaining a live ApplicationDelegate")
     }
@@ -238,7 +230,8 @@ impl ApplicationDelegate {
         let id = self.as_id();
         debug_assert!(
             {
-                // SAFETY: `id` is a live instance of this class; `-conformsToProtocol:` is `B24@0:8@16` on `NSObject`.
+                // SAFETY: `id` is a live instance of this class; `-conformsToProtocol:` is
+                // `B24@0:8@16` on `NSObject`.
                 unsafe {
                     let f: unsafe extern "C-unwind" fn(
                         Id,
@@ -267,7 +260,7 @@ impl ApplicationDelegate {
         self.ivars().event_handler.set(handler, closure)
     }
 
-    /// If `pump_events` is called to progress the event loop then we bootstrap the event loop via `-[NSApplication run]` but will use `CFRunLoopRunInMode` for subsequent calls to `pump_events`.
+    /// Stops the initial `-[NSApplication run]` pass once launching finishes.
     pub fn set_stop_on_launch(&self) {
         self.ivars().stop_on_launch.set(true);
     }
@@ -360,7 +353,6 @@ impl ApplicationDelegate {
 
     #[track_caller]
     fn maybe_queue_event(&self, event: Event<HandlePendingUserEvents>) {
-        // Most programmer actions in AppKit (e.g. change window fullscreen, set focused, etc.)
         if !self.ivars().event_handler.in_use() {
             self.handle_event(event);
         } else {
@@ -375,17 +367,12 @@ impl ApplicationDelegate {
         self.ivars().event_handler.handle_event(event, &ActiveEventLoop::new_root(self.retained()))
     }
 
-    /// dispatch `NewEvents(Init)` + `Resumed`
+    /// Dispatches `NewEvents(Init)` and `Resumed`.
     pub fn dispatch_init_events(&self) {
         self.handle_event(Event::NewEvents(StartCause::Init));
         self.handle_event(Event::Resumed);
     }
 
-    /// LOCAL PATCH (aterm): a NESTED run loop inside the handler (an
-    /// app-modal `NSAlert runModal`) turns the observers with the handler
-    /// borrowed, so nothing re-arms the waker, and a past-due `WaitUntil` left
-    /// it firing at its 0.1 µs interval in every common mode: 88 % CPU for as
-    /// long as the dialog stood.
     fn stop_waker_in_nested_loop(&self) {
         if self.ivars().event_handler.in_use() {
             self.ivars().waker.borrow_mut().stop();
@@ -435,9 +422,6 @@ impl ApplicationDelegate {
             return;
         }
 
-        // LOCAL PATCH (aterm): each dispatch below is contained on its own, so a raise in the
-        // application's handling of one still lets the rest of the turn run (redraws,
-        // `AboutToWait`, the exit checks, the waker re-arm).
         let _ = aterm_objc::contain("CFRunLoop observer: UserEvent", || {
             self.handle_event(Event::UserEvent(HandlePendingUserEvents));
         });
@@ -488,9 +472,6 @@ impl ApplicationDelegate {
         };
         self.ivars().waker.borrow_mut().start_at(min_timeout(wait_timeout, app_timeout));
 
-        // LOCAL PATCH (aterm): a send armed after this turn's drain signalled only once; if a
-        // nested run loop handled that signal, nothing would bring the drain it is owed, so wake
-        // once more (`wake_queue.rs`, COALESCED WAKES).
         if self.ivars().wake_armed.is_set() {
             self.ivars().run_loop.wakeup();
         }
@@ -500,23 +481,16 @@ impl ApplicationDelegate {
 #[derive(Debug)]
 pub(crate) struct HandlePendingUserEvents;
 
-/// Returns the minimum `Option<Instant>`, taking into account that `None`
-/// equates to an infinite timeout, not a zero timeout (so can't just use
-/// `Option::min`)
 fn min_timeout(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
     a.map_or(b, |a_timeout| b.map_or(Some(a_timeout), |b_timeout| Some(a_timeout.min(b_timeout))))
 }
 
-/// A hack to make activation of multiple windows work when creating them before
-/// `applicationDidFinishLaunching:` / `Event::NewEvents(StartCause::Init)`.
-///
-/// # Safety
-/// `app` must be the live shared `NSApplication`.
 unsafe fn window_activation_hack(app: Id) {
-    // LOCAL PATCH (aterm): the array is walked by index, in an explicit pool (`-windows` is +0
-    // autoreleased).
     autoreleasepool(|_| {
-        // SAFETY: `-windows` is `@16@0:8` on `NSApplication`; `-count` is `Q16@0:8` and `-objectAtIndex:` is `@24@0:8Q16` on `NSArray`, and no index below the count is out of range; `-isVisible` is `B16@0:8` and `-makeKeyAndOrderFront:` is `v24@0:8@16` on `NSWindow`, whose argument is the `nil` sender upstream passed as `None`.
+        // SAFETY: `-windows` is `@16@0:8` on `NSApplication`; `-count` is `Q16@0:8` and
+        // `-objectAtIndex:` is `@24@0:8Q16` on `NSArray`, and no index below the count is out of
+        // range; `-isVisible` is `B16@0:8` and `-makeKeyAndOrderFront:` is `v24@0:8@16` on
+        // `NSWindow`, whose argument is the `nil` sender upstream passed as `None`.
         unsafe {
             let windows = send_id(app, sel!(windows));
             let n = send_usize(windows, sel!(count));
@@ -533,8 +507,8 @@ unsafe fn window_activation_hack(app: Id) {
     });
 }
 
-/// `+[NSApplication sharedApplication]`, the process-lifetime singleton.
 fn app() -> Id {
-    // SAFETY: `+sharedApplication` is `@16#0:8` on `NSApplication` and creates the instance on first call.
+    // SAFETY: `+sharedApplication` is `@16#0:8` on `NSApplication` and creates the instance on
+    // first call.
     unsafe { send_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) }
 }

@@ -12,7 +12,7 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
 use std::time::Duration;
 
 /// Apple's Bonjour client.
-pub const DNS_SD: &str = "/usr/bin/dns-sd";
+pub const DNS_SD: &str = aterm_uds::os_path!("dns-sd");
 
 /// Remote Login's service type.
 pub const SSH_SERVICE: &str = "_ssh._tcp";
@@ -31,7 +31,7 @@ pub const RESOLVE_BUDGET: Duration = Duration::from_secs(2);
 const RESOLVE_PARALLEL: usize = 32;
 
 /// Apple's host-key scanner.
-pub const SSH_KEYSCAN: &str = "/usr/bin/ssh-keyscan";
+pub const SSH_KEYSCAN: &str = aterm_uds::os_path!("ssh-keyscan");
 
 /// The widest subnet [`subnet`] sweeps: a /22, 1024 addresses.
 pub const WIDEST_PREFIX: u8 = 22;

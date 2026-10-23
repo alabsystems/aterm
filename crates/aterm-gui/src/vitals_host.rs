@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -245,7 +245,9 @@ pub(crate) struct TtyWord {
     /// `ECHO`.
     pub(crate) echo: bool,
     output_seen: u64,
-    output: Arc<AtomicU64>,
+    /// The reader's count of feeds that moved the screen ([`ScreenMoves`]): a write that moves no
+    /// cell leaves the word standing (`docs/measured/vitals-3-2026-10-22.md`, V1).
+    output: Arc<ScreenMoves>,
     input_seen: aterm_session::sink::DrivenInput,
     input: aterm_session::sink::DrivenInputWatch,
 }
@@ -255,7 +257,7 @@ impl TtyWord {
     pub(crate) fn read(
         key: u64,
         sink: &aterm_session::sink::SinkWriter,
-        output: &Arc<AtomicU64>,
+        output: &Arc<ScreenMoves>,
     ) -> Option<Self> {
         Self::read_seamed(key, sink, output, || {})
     }
@@ -263,10 +265,10 @@ impl TtyWord {
     fn read_seamed(
         key: u64,
         sink: &aterm_session::sink::SinkWriter,
-        output: &Arc<AtomicU64>,
+        output: &Arc<ScreenMoves>,
         between: impl FnOnce(),
     ) -> Option<Self> {
-        let output_seen = output.load(Ordering::Acquire);
+        let output_seen = output.count();
         let input = sink.driven_input_watch();
         let input_seen = input.get();
         between();
@@ -297,16 +299,16 @@ impl TtyWord {
 
     /// Returns the engine's word for the tick at `at_ms`, if output and input are unchanged.
     pub(crate) fn current(&self, at_ms: u64) -> Option<(u64, aterm_vitals::jobs::TtyMode)> {
-        (self.output.load(Ordering::Acquire) == self.output_seen
-            && self.input.get() == self.input_seen)
-            .then_some((
+        (self.output.count() == self.output_seen && self.input.get() == self.input_seen).then_some(
+            (
                 self.key,
                 aterm_vitals::jobs::TtyMode {
                     canonical: self.canonical,
                     echo: self.echo,
                     stamped_ms: at_ms,
                 },
-            ))
+            ),
+        )
     }
 }
 
@@ -390,6 +392,57 @@ impl Parked {
     }
 }
 
+/// HOW MANY OF THE PTY READER'S FEEDS MOVED THE SCREEN (design §6.1, "What brings job demand
+/// back"): counted by the reader under its own hold of the term lock, after each feed, where the
+/// screen's generation ([`crate::control::screen_gen`]) is not the one it saw after its last feed.
+/// The output wake reads it WITHOUT the term lock ([`crate::App::vitals_output_kind`]), and a
+/// reading's terminal mode word holds while it stands ([`TtyWord`]). The wake used to read the
+/// generation itself and, meeting the lock held (a control worker's `text` or `status`, a watcher
+/// the same burst rang), counted the write as moved; the word used to fall to any read. Either way
+/// Muse Code's colour reset at rest, which moves no cell, armed `system_vitals`
+/// (`docs/measured/vitals-3-2026-10-22.md`, V1).
+#[derive(Debug, Default)]
+pub(crate) struct ScreenMoves {
+    /// The generation the reader saw after its last feed; only the feeding side takes it.
+    seen: Mutex<Option<crate::control::ScreenGen>>,
+    moves: AtomicU64,
+}
+
+impl ScreenMoves {
+    /// A feed left the screen at `now` (the reader, holding the term lock).
+    pub(crate) fn fed(&self, now: crate::control::ScreenGen) {
+        let moved = self
+            .seen
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .replace(now)
+            != Some(now);
+        if moved {
+            self.moves.fetch_add(1, Ordering::Release);
+            // THE WAKE PROTOCOL'S STORE-BUFFER PAIR, with [`Self::count_after_clear`]: the reader
+            // counts this move, then reads the session's wake latch to post or coalesce its wake;
+            // the output wake clears that latch, then reads this count. Without a fence on each
+            // side both reads may take the value from before the other's write (the store-buffer
+            // outcome, which Release and Acquire allow): the reader coalesces into a wake whose
+            // pass reads the old count, and the move is no edge until the next one. The term lock
+            // the wake took to read the screen used to order the two.
+            fence(Ordering::SeqCst);
+        }
+    }
+
+    /// How many feeds moved the screen so far.
+    pub(crate) fn count(&self) -> u64 {
+        self.moves.load(Ordering::Acquire)
+    }
+
+    /// [`Self::count`], read by the output wake after it cleared the session's wake latch
+    /// ([`crate::App::vitals_output_kind`]; the fence pairs with [`Self::fed`]'s).
+    pub(crate) fn count_after_clear(&self) -> u64 {
+        fence(Ordering::SeqCst);
+        self.count()
+    }
+}
+
 /// What one write of a session is to the stuck engine with no window showing the bars.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputEdge {
@@ -430,7 +483,8 @@ pub(crate) struct VitalsHost {
     disk_pull: bool,
     edge: bool,
     last_edge_read: Option<Instant>,
-    screens: std::collections::HashMap<u64, crate::control::ScreenGen>,
+    /// Each session's [`ScreenMoves::count`] at its last output wake.
+    screens: std::collections::HashMap<u64, u64>,
     parked: std::collections::HashMap<u64, Parked>,
     job_events: Vec<aterm_vitals::events::Event>,
     job_revs: std::collections::HashMap<u64, u64>,
@@ -2217,18 +2271,16 @@ impl crate::App {
         let Some(s) = self.pool.get(session) else {
             return OutputEdge::Edge;
         };
-        let moved = match crate::term_try_lock(&s.term).map(|t| crate::control::screen_gen(&t)) {
-            None => true,
-            Some(screen) => match self.vitals.screens.insert(session, screen) {
-                Some(before) => before != screen,
-                None => {
-                    let pool = &self.pool;
-                    self.vitals
-                        .screens
-                        .retain(|key, _| pool.get(*key).is_some());
-                    true
-                }
-            },
+        let moves = s.ctx.screen_moves.count_after_clear();
+        let moved = match self.vitals.screens.insert(session, moves) {
+            Some(before) => before != moves,
+            None => {
+                let pool = &self.pool;
+                self.vitals
+                    .screens
+                    .retain(|key, _| pool.get(*key).is_some());
+                true
+            }
         };
         if !moved {
             return OutputEdge::Quiet;
@@ -2513,10 +2565,8 @@ impl crate::App {
                 };
                 let focused = terminal(tab.focus);
                 let in_front = Some(*wid) == front && active == Some(i);
-                let panes = std::iter::once(tab.focus)
-                    .chain(tab.root.leaves().into_iter().filter(|v| *v != tab.focus));
                 let first = tabs.len();
-                for pane in panes.filter_map(terminal) {
+                for pane in self.tab_sessions(tab) {
                     let Some(s) = self.pool.get(pane) else {
                         continue;
                     };
@@ -2592,7 +2642,7 @@ impl crate::App {
             .iter()
             .filter_map(|t| {
                 let s = self.pool.get(t.key)?;
-                TtyWord::read(t.key, &s.ctx.sink, &s.latest_output_activity_ns)
+                TtyWord::read(t.key, &s.ctx.sink, &s.ctx.screen_moves)
             })
             .collect();
         let now = aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(i64::MAX));
@@ -2629,6 +2679,28 @@ impl crate::App {
                     _ => None,
                 });
         (key, label)
+    }
+
+    /// The sessions of this window's front tab ([`Self::tab_sessions`]): the
+    /// tab Why now takes as "this tab", as `sys why` takes its caller's
+    /// (a tab split into panes is one, [`aterm_vitals::model::TabRoot::tab`]).
+    pub(crate) fn deck_tab_panes(&self, wid: crate::WindowId) -> Vec<u64> {
+        self.windows
+            .get(&wid)
+            .and_then(|ws| ws.tab_set.active_index().and_then(|i| ws.tab_set.tab_at(i)))
+            .map_or_else(Vec::new, |tab| self.tab_sessions(tab))
+    }
+
+    /// The terminal sessions of `tab`, its focused pane first, then the rest
+    /// in layout order: the panes the vitals request sends as one tab.
+    fn tab_sessions(&self, tab: &crate::tab_model::Tab) -> Vec<u64> {
+        std::iter::once(tab.focus)
+            .chain(tab.root.leaves().into_iter().filter(|v| *v != tab.focus))
+            .filter_map(|view| match self.view_store.get(view).copied() {
+                Some(crate::tab_model::View::Terminal(view)) => Some(view.session),
+                _ => None,
+            })
+            .collect()
     }
 }
 

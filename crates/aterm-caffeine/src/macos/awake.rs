@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Keeping the Mac awake: an `NSProcessInfo` activity that disables idle system and display
-//! sleep while it lives.
-//!
-//! Measured 2026-10-19: these options make powerd list `PreventUserIdleSystemSleep` and
-//! `PreventUserIdleDisplaySleep` under this pid (`pmset -g assertions`), and `-endActivity:`
-//! drops both. The kernel drops them too when the process dies, so a crash or a `SIGTERM`
-//! never leaves the Mac held awake. Foundation only: no WindowServer, no IOKit.
+//! `NSProcessInfo` activity wrapper that disables idle system and display sleep.
 
 use aterm_objc::send::{send_id, send_id_usize_id, send_v_id};
 use aterm_objc::{Id, Obj, autoreleasepool, class, sel};
@@ -15,12 +9,8 @@ use aterm_objc::{Id, Obj, autoreleasepool, class, sel};
 /// What `pmset -g assertions` names the activity: the mug's, and a bridge's across an update
 /// restart ([`super::bridge`]).
 pub(super) const AWAKE_REASON: &str = "aterm Caffeine is keeping this Mac awake";
-/// `NSActivityIdleDisplaySleepDisabled` (`NSProcessInfo.h`, `1ULL << 40`).
 const IDLE_DISPLAY_SLEEP_DISABLED: usize = 1 << 40;
-/// `NSActivityUserInitiated` (`0x00FFFFFF | NSActivityIdleSystemSleepDisabled`): includes
-/// `NSActivityIdleSystemSleepDisabled` (`1 << 20`) and keeps App Nap away.
 const USER_INITIATED: usize = 0x00FF_FFFF;
-/// What the mug asks for.
 const OPTIONS: usize = IDLE_DISPLAY_SLEEP_DISABLED | USER_INITIATED;
 
 /// A held keep-awake activity; dropping it ends the activity.
@@ -31,7 +21,6 @@ pub(super) struct Awake {
 
 impl Awake {
     /// Begin keeping the Mac awake, `reason` being what `pmset -g assertions` names it by.
-    /// `None` when Foundation refuses.
     pub(super) fn begin(reason: &str) -> Option<Self> {
         let reason = aterm_objc::ns_string(reason)?;
         autoreleasepool(|_| {
@@ -87,7 +76,6 @@ pub(super) mod tests {
     #[test]
     fn the_options_are_display_and_system_sleep_off_user_initiated() {
         assert_eq!(OPTIONS, 0x100_00FF_FFFF);
-        // `NSActivityIdleSystemSleepDisabled` is inside `NSActivityUserInitiated`.
         assert_ne!(OPTIONS & (1 << 20), 0);
     }
 
@@ -118,10 +106,6 @@ pub(super) mod tests {
             .collect()
     }
 
-    /// What the mug is for, read from powerd: both idle-sleep assertions under this pid
-    /// while the activity is held, none once it ended. Run 90 times on 2026-10-19 (alone, and
-    /// beside the crate's other tests) with no failure: `pmset`, run right after the
-    /// begin or the end returns, showed the state it left every time.
     #[test]
     fn powerd_lists_both_assertions_while_held_and_none_after() {
         let reason = format!("aterm caffeine pmset test {}", std::process::id());

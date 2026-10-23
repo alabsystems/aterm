@@ -1112,6 +1112,30 @@ fn discover_local_fleet_with_min(env: &Env, min_accounts: usize) -> Option<Fleet
             record_email(key);
         }
     }
+    if let Ok(entries) = fs::read_dir(accounts::Store::at(&env.state).logins_dir()) {
+        for entry in entries.flatten() {
+            if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
+                continue;
+            }
+            let dir_path = entry.path();
+            if let Ok(text) = read_local_source_text(&dir_path.join(".claude.json"))
+                && let Ok(v) = aterm_json::from_str::<Value>(&text)
+                && let Some(em) = v
+                    .get("oauthAccount")
+                    .and_then(|o| o.get("emailAddress"))
+                    .and_then(Value::as_str)
+            {
+                record_email(em);
+            }
+            if let Ok(text) =
+                read_local_source_text(&dir_path.join(accounts::RENEWAL_CHECKPOINT_FILE))
+                && let Ok(v) = aterm_json::from_str::<Value>(&text)
+                && let Some(em) = v.get("email").and_then(Value::as_str)
+            {
+                record_email(em);
+            }
+        }
+    }
     if let Some(claude_dir) = env.claude_dir() {
         if let Ok(backups) = fs::read_dir(claude_dir.join("backups")) {
             for entry in backups.flatten() {
@@ -1462,7 +1486,14 @@ fn persist_accounts_sync(
                 .map_err(|why| format!("could not write {}: {why}", fleet_write_to.display()))?;
             let mut events = Vec::new();
             if let Some(label) = &default_row_label {
-                if default_matched {
+                let unseen_default = state
+                    .accounts
+                    .get(label)
+                    .is_none_or(|a| a.auth == accounts::Auth::Unseen)
+                    && logins.get(label).is_none_or(|b| {
+                        b.served_at.is_none() && b.renewed_at.is_none() && b.ended_at.is_none()
+                    });
+                if default_matched && unseen_default {
                     accounts::note_served_login(logins, label, now);
                     events.extend(accounts::note_auth(state, label, accounts::Auth::Ok, now));
                 }
@@ -1614,7 +1645,20 @@ fn run_accounts_sync_with(
     if let Some(note) = note {
         let _ = writeln!(err, "aterm harness accounts: {note}");
     }
-    let enrolled = accounts::enrolled(&roster);
+    let (state, bound) =
+        if recover_interrupted_staging_renewals(&store, &roster, &AUTO_RENEW_GUARD, env.now) {
+            let state = store.load(env.now).map(|(s, _)| s).unwrap_or(state);
+            let bound = store
+                .bound(&roster, env.now)
+                .unwrap_or_else(|_| roster.clone());
+            (state, bound)
+        } else {
+            let bound = store
+                .bound(&roster, env.now)
+                .unwrap_or_else(|_| roster.clone());
+            (state, bound)
+        };
+    let enrolled = accounts::enrolled(&bound);
     let needs_renew: Vec<String> = roster
         .rows
         .iter()
@@ -2315,9 +2359,14 @@ pub(super) fn resolve_mailbox_dir(home: Option<&Path>, store: &accounts::Store) 
     None
 }
 
-pub(super) fn has_configured_mailbox(home: Option<&Path>, store: &accounts::Store) -> bool {
+pub(super) fn has_configured_mailbox_for(
+    home: Option<&Path>,
+    store: &accounts::Store,
+    target_email: Option<&str>,
+) -> bool {
     resolve_mailbox_dir(home, store).is_some()
-        || super::headless_oauth::discover_mailbox_config(home, Some(&store.dir)).is_some()
+        || super::headless_oauth::discover_mailbox_config(home, Some(&store.dir))
+            .is_some_and(|cfg| cfg.is_configured_for(target_email))
 }
 
 fn latest_mailbox_mtime(
@@ -2348,12 +2397,12 @@ fn latest_mailbox_mtime(
         .max()
 }
 
-pub(super) fn next_auto_renew_target(
+pub(super) fn auto_renew_candidates(
     file_roster: &Roster,
     state: &accounts::State,
     logins: &accounts::Logins,
     now: i64,
-) -> Option<accounts::Row> {
+) -> Vec<accounts::Row> {
     let roster = accounts::bound(file_roster, logins);
     let enrolled = accounts::enrolled(&roster);
     let is_walled_or_low = |label: &str| {
@@ -2379,6 +2428,8 @@ pub(super) fn next_auto_renew_target(
             .sessions
             .values()
             .any(|s| is_walled_or_low(&s.account));
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
     if any_walled {
         let wall_point = accounts::Point::Wall {
             window: String::new(),
@@ -2389,13 +2440,13 @@ pub(super) fn next_auto_renew_target(
                 .iter()
                 .any(|(_, verdict)| verdict.is_ok());
         if !has_ready_candidate {
-            if let Some(next_row) = roster
+            for next_row in roster
                 .rows
                 .iter()
                 .filter(|r| r.class == Class::Dedicated)
                 .chain(roster.rows.iter().filter(|r| r.class == Class::Shared))
                 .filter(|row| me != Some(row.label.as_str()) && row.email.is_some())
-                .find(|row| {
+                .filter(|row| {
                     let is_enr = row.dir.is_none() || enrolled.contains(&row.label);
                     matches!(
                         accounts::condition(row, state, is_enr, now),
@@ -2405,9 +2456,10 @@ pub(super) fn next_auto_renew_target(
                         .get(&row.label)
                         .is_some_and(|a| a.limited_until(now).is_some())
                 })
-                .cloned()
             {
-                return Some(next_row);
+                if seen.insert(next_row.label.clone()) {
+                    out.push(next_row.clone());
+                }
             }
             if let Some(me_label) = me
                 && state.accounts.get(me_label).is_some_and(|a| {
@@ -2415,25 +2467,40 @@ pub(super) fn next_auto_renew_target(
                 })
                 && let Some(me_row) = roster.row(me_label).cloned()
                 && me_row.email.is_some()
+                && seen.insert(me_row.label.clone())
             {
-                return Some(me_row);
+                out.push(me_row);
             }
         }
     }
-    accounts::renew_due(&roster, logins, state, &enrolled, now)
+    for label in accounts::renew_due(&roster, logins, state, &enrolled, now) {
+        if state
+            .accounts
+            .get(&label)
+            .is_some_and(|a| a.limited_until(now).is_some())
+        {
+            continue;
+        }
+        if let Some(row) = roster.row(&label)
+            && row.email.is_some()
+            && seen.insert(row.label.clone())
+        {
+            out.push(row.clone());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+pub(super) fn next_auto_renew_target(
+    file_roster: &Roster,
+    state: &accounts::State,
+    logins: &accounts::Logins,
+    now: i64,
+) -> Option<accounts::Row> {
+    auto_renew_candidates(file_roster, state, logins, now)
         .into_iter()
-        .find_map(|label| {
-            if state
-                .accounts
-                .get(&label)
-                .is_some_and(|a| a.limited_until(now).is_some())
-            {
-                return None;
-            }
-            let row = roster.row(&label)?.clone();
-            row.email.as_ref()?;
-            Some(row)
-        })
+        .next()
 }
 
 #[expect(
@@ -2450,6 +2517,18 @@ fn complete_staging_renewal(
     status_got: &super::align::Captured,
     now_done: i64,
 ) -> bool {
+    let (fresh_state, _) = store.load(now_done).unwrap_or_default();
+    let (fresh_logins, _) = store.load_logins(now_done).unwrap_or_default();
+    let fresh_bound = accounts::bound(file_roster, &fresh_logins);
+    let enrolled = accounts::enrolled(&fresh_bound);
+    let target_facts = next_row
+        .email
+        .as_deref()
+        .and_then(|email| super::cli::status_facts(status_got, email));
+    let wrong_account = target_facts
+        .as_ref()
+        .is_some_and(|f| f.signed_in && f.claude_ai && !f.email_matches);
+
     let matched = std::iter::once(next_row)
         .chain(roster.rows.iter().filter(|r| r.label != next_row.label))
         .find_map(|row| {
@@ -2458,21 +2537,51 @@ fn complete_staging_renewal(
             if !facts.renews() {
                 return None;
             }
+            if fresh_state
+                .accounts
+                .get(&row.label)
+                .is_some_and(|a| a.limited_until(now_done).is_some())
+            {
+                return None;
+            }
+            if row.label != next_row.label {
+                let is_enr = row.dir.is_none() || enrolled.contains(&row.label);
+                let cond = accounts::condition(row, &fresh_state, is_enr, now_done);
+                let lstate = accounts::login_state(row, &fresh_logins, &fresh_state, now_done);
+                let unobserved_unbound = !fresh_logins.labels.contains_key(&row.label)
+                    && fresh_state
+                        .accounts
+                        .get(&row.label)
+                        .is_none_or(|a| !a.observed());
+                let eligible_fallback = unobserved_unbound
+                    || matches!(
+                        cond,
+                        accounts::Condition::NotEnrolled | accounts::Condition::SignedOut
+                    )
+                    || matches!(
+                        lstate,
+                        accounts::LoginState::Expired | accounts::LoginState::Due { .. }
+                    );
+                if !eligible_fallback {
+                    return None;
+                }
+            }
             Some((row.label.clone(), email.to_owned(), facts.subscription))
         });
     let Some((matched_label, matched_email, subscription)) = matched else {
         let _ = fs::remove_dir_all(staging);
+        if wrong_account {
+            let mut note = None;
+            let _ = store.transact_logins(now_done, &mut note, |_, logins| {
+                Ok(accounts::note_wrong_account(
+                    logins,
+                    &next_row.label,
+                    now_done,
+                ))
+            });
+        }
         return false;
     };
-    let (fresh_state, _) = store.load(now_done).unwrap_or_default();
-    if fresh_state
-        .accounts
-        .get(&matched_label)
-        .is_some_and(|a| a.limited_until(now_done).is_some())
-    {
-        let _ = fs::remove_dir_all(staging);
-        return false;
-    }
     if let Err(why) = accounts::write_renewal_checkpoint(
         &matched_label,
         &matched_email,
@@ -2697,20 +2806,30 @@ fn auto_renew_next_account(
     let Ok((logins, _)) = store.load_logins(now) else {
         return recovered;
     };
-    let Some(next_row) = next_auto_renew_target(&file_roster, &state, &logins, now) else {
-        return recovered;
-    };
-    spawn_row_renewal(
-        home,
-        state_dir,
-        file_roster,
-        &logins,
-        next_row,
-        (None, false),
-        now,
-        fx.renew_guard,
-        fx.spawn_renewal,
-    ) || recovered
+    for next_row in auto_renew_candidates(&file_roster, &state, &logins, now) {
+        if spawn_row_renewal(
+            home,
+            state_dir,
+            file_roster.clone(),
+            &logins,
+            next_row,
+            (None, false),
+            now,
+            fx.renew_guard,
+            fx.spawn_renewal,
+        ) {
+            return true;
+        }
+    }
+    recovered
+}
+
+pub(super) fn recover_staging_renewals(
+    store: &accounts::Store,
+    file_roster: &Roster,
+    now: i64,
+) -> bool {
+    recover_interrupted_staging_renewals(store, file_roster, &AUTO_RENEW_GUARD, now)
 }
 
 /// Start an interactive non-blocking staging login for the next un-enrolled successor at a wall.
@@ -2727,26 +2846,30 @@ pub fn auto_renew_next_account_interactive(
         return false;
     }
     let store = accounts::Store::at(state_dir);
+    let recovered =
+        recover_interrupted_staging_renewals(&store, &file_roster, &AUTO_RENEW_GUARD, now);
     let Ok((state, _)) = store.load(now) else {
-        return false;
+        return recovered;
     };
     let Ok((logins, _)) = store.load_logins(now) else {
-        return false;
+        return recovered;
     };
-    let Some(next_row) = next_auto_renew_target(&file_roster, &state, &logins, now) else {
-        return false;
-    };
-    spawn_row_renewal(
-        home,
-        state_dir,
-        file_roster,
-        &logins,
-        next_row,
-        (None, true),
-        now,
-        &AUTO_RENEW_GUARD,
-        &spawn_renewal_thread,
-    )
+    for next_row in auto_renew_candidates(&file_roster, &state, &logins, now) {
+        if spawn_row_renewal(
+            home,
+            state_dir,
+            file_roster.clone(),
+            &logins,
+            next_row,
+            (None, true),
+            now,
+            &AUTO_RENEW_GUARD,
+            &spawn_renewal_thread,
+        ) {
+            return true;
+        }
+    }
+    recovered
 }
 
 /// Starts a staging login for a saved explicit selection.
@@ -2761,10 +2884,32 @@ pub fn auto_renew_account_by_label(
         return false;
     };
     let store = accounts::Store::at(state_dir);
+    let recovered =
+        recover_interrupted_staging_renewals(&store, &file_roster, &AUTO_RENEW_GUARD, now);
     let Ok((logins, _)) = store.load_logins(now) else {
         return false;
     };
     let roster = accounts::bound(&file_roster, &logins);
+    if recovered {
+        let enrolled = accounts::enrolled(&roster);
+        let mut note = None;
+        if store
+            .transact_within(&accounts::LOCK_LADDER, now, &mut note, |st| {
+                let mut probe = st.clone();
+                if accounts::pin(&mut probe, &roster, &enrolled, request.label(), now).is_err() {
+                    return Ok(Vec::new());
+                }
+                Ok(
+                    accounts::complete_requested_pin(st, &roster, &enrolled, &request, now)
+                        .into_iter()
+                        .collect(),
+                )
+            })
+            .is_ok_and(|events| !events.is_empty())
+        {
+            return true;
+        }
+    }
     let Some(next_row) = roster.row(request.label()).cloned() else {
         return false;
     };
@@ -2798,7 +2943,8 @@ fn spawn_row_renewal(
 ) -> bool {
     let store = accounts::Store::at(state_dir);
     let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
-    let has_mailbox = mailbox_dir.is_some() || has_configured_mailbox(Some(home), &store);
+    let has_mailbox = mailbox_dir.is_some()
+        || has_configured_mailbox_for(Some(home), &store, next_row.email.as_deref());
     let has_headless_profile = super::headless_oauth::has_browser_profile(
         &store.dir,
         &next_row.label,
@@ -3352,12 +3498,14 @@ fn render_dashboard_html(
         &mut report_err,
     );
     let report_text = String::from_utf8_lossy(&report_out);
-    let roster = env
+    let raw_roster = env
         .accounts_roster()
         .and_then(|p| Roster::load(&p).ok())
         .unwrap_or_default();
+    let store = env.accounts_store();
+    let roster = store.bound(&raw_roster, env.now).unwrap_or(raw_roster);
     let enrolled = accounts::enrolled(&roster);
-    let (state, _) = env.accounts_store().load(env.now).unwrap_or_default();
+    let (state, _) = store.load(env.now).unwrap_or_default();
 
     let mut rows_html = String::new();
     for row in &roster.rows {
@@ -5901,6 +6049,614 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         assert_eq!(
             store.load(UPKEEP_NOW + 40).unwrap().0.accounts["m27-2"].auth,
             accounts::Auth::SignedOut
+        );
+    }
+
+    #[test]
+    fn recovering_another_login_keeps_a_pending_pin_until_its_account_is_eligible() {
+        let w = World::new();
+        let store = accounts::Store::at(&w.state);
+        store.machine_id("0123456789abcdef").unwrap();
+        let roster = Roster {
+            rows: [
+                ("m27", "sol-m27@example.test"),
+                ("m27-2", "sun.m27.2@example.test"),
+            ]
+            .into_iter()
+            .map(|(label, email)| Row {
+                label: label.into(),
+                class: Class::Dedicated,
+                dir: Some(store.logins_dir().join(label).to_str().unwrap().into()),
+                was: Vec::new(),
+                email: Some(email.into()),
+                browser: None,
+            })
+            .collect(),
+        };
+        let request = store.request_pin("m27", UPKEEP_NOW).unwrap();
+        let staging = store.claim_staging_dir("m27-2").unwrap();
+        fs::write(staging.join(".credentials.json"), b"private login fixture").unwrap();
+        accounts::write_renewal_checkpoint(
+            "m27-2",
+            "sun.m27.2@example.test",
+            staging.to_str().unwrap(),
+            Some("max"),
+            UPKEEP_NOW - 5,
+        )
+        .unwrap();
+        let guard = std::sync::Arc::new(std::sync::Mutex::new(AutoRenewGuard::default()));
+        assert!(recover_interrupted_staging_renewals(
+            &store, &roster, &guard, UPKEEP_NOW
+        ));
+        assert_eq!(
+            store.load_logins(UPKEEP_NOW).unwrap().0.labels["m27-2"]
+                .dir
+                .as_deref(),
+            staging.to_str()
+        );
+
+        let complete = |request: &accounts::PinRequest, now| {
+            let bound = store.bound(&roster, now).unwrap();
+            let enrolled = accounts::enrolled(&bound);
+            store
+                .transact_within(&accounts::LOCK_LADDER, now, &mut None, |state| {
+                    Ok(
+                        accounts::complete_requested_pin(state, &bound, &enrolled, request, now)
+                            .into_iter()
+                            .collect(),
+                    )
+                })
+                .unwrap()
+        };
+        let before = store.load(UPKEEP_NOW).unwrap().0;
+        assert_eq!(before.pending_pin.as_ref(), Some(&request));
+        assert!(complete(&request, UPKEEP_NOW).is_empty());
+        assert_eq!(
+            accounts::Store::at(&w.state).load(UPKEEP_NOW).unwrap().0,
+            before,
+            "recovering m27-2 cannot consume the still-unenrolled m27 selection"
+        );
+
+        let requested_home = Path::new(roster.rows[0].dir.as_deref().unwrap());
+        fs::create_dir_all(requested_home).unwrap();
+        fs::write(
+            requested_home.join(".credentials.json"),
+            b"private login fixture",
+        )
+        .unwrap();
+        store
+            .transact(UPKEEP_NOW + 1, &mut None, |state| {
+                Ok(accounts::note_auth(
+                    state,
+                    "m27",
+                    accounts::Auth::SignedOut,
+                    UPKEEP_NOW + 1,
+                ))
+            })
+            .unwrap();
+        let signed_out = store.load(UPKEEP_NOW + 1).unwrap().0;
+        assert!(complete(&request, UPKEEP_NOW + 1).is_empty());
+        assert_eq!(
+            accounts::Store::at(&w.state)
+                .load(UPKEEP_NOW + 1)
+                .unwrap()
+                .0,
+            signed_out,
+            "a signed-out account also keeps its pending request"
+        );
+        store
+            .transact(UPKEEP_NOW + 2, &mut None, |state| {
+                Ok(accounts::note_auth(
+                    state,
+                    "m27",
+                    accounts::Auth::Ok,
+                    UPKEEP_NOW + 2,
+                ))
+            })
+            .unwrap();
+        let events = complete(&request, UPKEEP_NOW + 2);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, accounts::Kind::Use);
+        let pinned = store.load(UPKEEP_NOW + 2).unwrap().0;
+        assert_eq!(pinned.active.as_deref(), Some("m27"));
+        assert!(pinned.pinned);
+        assert!(pinned.pending_pin.is_none());
+        assert!(complete(&request, UPKEEP_NOW + 2).is_empty());
+        assert_eq!(store.load(UPKEEP_NOW + 2).unwrap().0, pinned);
+
+        let newer = store.request_pin("m27-2", UPKEEP_NOW + 3).unwrap();
+        let superseded = store.load(UPKEEP_NOW + 3).unwrap().0;
+        assert!(complete(&request, UPKEEP_NOW + 3).is_empty());
+        assert_eq!(store.load(UPKEEP_NOW + 3).unwrap().0, superseded);
+        let events = complete(&newer, UPKEEP_NOW + 3);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, accounts::Kind::Use);
+        let pinned = accounts::Store::at(&w.state)
+            .load(UPKEEP_NOW + 3)
+            .unwrap()
+            .0;
+        assert_eq!(pinned.active.as_deref(), Some("m27-2"));
+        assert!(pinned.pinned);
+        assert!(pinned.pending_pin.is_none());
+    }
+
+    #[test]
+    fn sync_use_and_renew_due_honor_bound_staging_logins_and_recover_checkpoints() {
+        let dir = aterm_tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let home = root.join("home");
+        let cfg_dir = home.join(".config").join("aterm");
+        let state_dir = root.join("state");
+        fs::create_dir_all(&cfg_dir).unwrap();
+        fs::write(cfg_dir.join("aterm.toml"), "[fleet]\nmachine = \"m27\"\n").unwrap();
+        let source_path = root.join("accounts.csv");
+        fs::write(
+            &source_path,
+            concat!(
+                "email,computer,claude,notes\n",
+                "sol-m27@example.test,m27,1,usable\n",
+                "sun.m27.2@example.test,m27,1,usable\n",
+                "solar.m27.3@example.test,m27,1,usable\n",
+            ),
+        )
+        .unwrap();
+
+        let store = accounts::Store::at(&state_dir);
+        let staged_m27 = store.claim_staging_dir("m27").unwrap();
+        fs::write(staged_m27.join(".credentials.json"), b"{}").unwrap();
+        accounts::write_renewal_checkpoint(
+            "m27",
+            "sol-m27@example.test",
+            staged_m27.to_str().unwrap(),
+            Some("max"),
+            UPKEEP_NOW - 10,
+        )
+        .unwrap();
+
+        let env = Env {
+            state: state_dir.clone(),
+            aterm_state: Some(root.join("aterm-state")),
+            cwd: root.to_path_buf(),
+            home: Some(home.clone()),
+            claude_dir: Some(home.join(".claude")),
+            claude_config_unusable: None,
+            claude_profile: Some(home.join(".claude.json")),
+            claude_custom_oauth: false,
+            claude_session: None,
+            claude_pid: None,
+            codex_thread: None,
+            codex_home: None,
+            now: UPKEEP_NOW,
+            tz_s: 0,
+            sid: String::new(),
+            sock: None,
+            config: Some(cfg_dir.join("aterm.toml")),
+            claude_tmp: None,
+            claude_running: None,
+        };
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = run_accounts_sync(
+            &env,
+            Some(source_path.to_str().unwrap()),
+            Some("m27"),
+            true,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            code,
+            ExitCode::SUCCESS,
+            "stderr: {}",
+            String::from_utf8_lossy(&err)
+        );
+        let sync_json: Value =
+            aterm_json::from_str(&String::from_utf8_lossy(&out)).expect("sync json");
+        let m27_entry = sync_json["machine_accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["label"].as_str() == Some("m27"))
+            .expect("m27 row in sync output");
+        assert_eq!(m27_entry["enrolled"].as_bool(), Some(true));
+        assert_eq!(m27_entry["condition"].as_str(), Some("usable"));
+        let needs_renew: Vec<&str> = sync_json["needs_renew"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        assert!(
+            !needs_renew.contains(&"m27"),
+            "recovered and bound staging login m27 must not be in needs_renew: {needs_renew:?}"
+        );
+
+        // `accounts use m27` succeeds even though `logins/m27` is empty and the login is in `m27+1`.
+        out.clear();
+        err.clear();
+        let use_code = super::super::cli::run_accounts(
+            &super::super::cli::AccountsCmd::Use {
+                label: "m27".to_owned(),
+            },
+            &env,
+            &super::super::cli::LiveAccounts,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            use_code,
+            ExitCode::SUCCESS,
+            "accounts use m27 failed: {}",
+            String::from_utf8_lossy(&err)
+        );
+
+        // Now write a staging checkpoint for m27-2 while m27-3 is limited and m27 is limited,
+        // and verify `accounts renew --due` recovers m27-2 without needing an interactive renew flow.
+        store
+            .transact(UPKEEP_NOW, &mut None, |st| {
+                let mut ev = accounts::note_wall(
+                    st,
+                    "m27-3",
+                    "seven_day",
+                    Some(UPKEEP_NOW + 3600),
+                    UPKEEP_NOW,
+                    UPKEEP_NOW,
+                );
+                ev.extend(accounts::note_wall(
+                    st,
+                    "m27",
+                    "seven_day",
+                    Some(UPKEEP_NOW + 3600),
+                    UPKEEP_NOW,
+                    UPKEEP_NOW,
+                ));
+                Ok(ev)
+            })
+            .unwrap();
+        let staged_m27_2 = store.claim_staging_dir("m27-2").unwrap();
+        fs::write(staged_m27_2.join(".credentials.json"), b"{}").unwrap();
+        accounts::write_renewal_checkpoint(
+            "m27-2",
+            "sun.m27.2@example.test",
+            staged_m27_2.to_str().unwrap(),
+            Some("max"),
+            UPKEEP_NOW,
+        )
+        .unwrap();
+        out.clear();
+        err.clear();
+        let renew_code = super::super::cli::run_accounts(
+            &super::super::cli::AccountsCmd::Renew {
+                labels: Vec::new(),
+                due: true,
+                on: None,
+            },
+            &env,
+            &super::super::cli::LiveAccounts,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            renew_code,
+            ExitCode::SUCCESS,
+            "renew --due failed: {}",
+            String::from_utf8_lossy(&err)
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("nothing is due on this machine"),
+            "stdout: {}",
+            String::from_utf8_lossy(&out)
+        );
+        let (logins_after, _) = store.load_logins(UPKEEP_NOW).unwrap();
+        assert_eq!(
+            logins_after.get("m27-2").and_then(|b| b.dir.as_deref()),
+            staged_m27_2.to_str(),
+            "renew --due should recover interrupted staging checkpoint for m27-2"
+        );
+
+        // Verify `discover_local_fleet` finds emails from `<store>/logins/` checkpoints and `.claude.json`.
+        fs::write(
+            home.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"solar.m27.3@example.test"}}"#,
+        )
+        .unwrap();
+        let discovered = discover_local_fleet(&env).expect("discover local fleet from logins_dir");
+        let discovered_emails: BTreeSet<&str> = discovered
+            .accounts
+            .iter()
+            .map(|a| a.email.as_str())
+            .collect();
+        assert!(discovered_emails.contains("sol-m27@example.test"));
+        assert!(discovered_emails.contains("sun.m27.2@example.test"));
+        assert!(discovered_emails.contains("solar.m27.3@example.test"));
+
+        // Mark default row `m27-3` as SignedOut, then re-sync: `SignedOut` must not be overwritten
+        // merely because `~/.claude.json` still contains `solar.m27.3@example.test`.
+        store
+            .transact_logins(UPKEEP_NOW + 5, &mut None, |st, lg| {
+                Ok(accounts::note_login_end(st, lg, "m27-3", UPKEEP_NOW + 5))
+            })
+            .unwrap();
+        out.clear();
+        err.clear();
+        assert_eq!(
+            run_accounts_sync(
+                &env,
+                Some(source_path.to_str().unwrap()),
+                Some("m27"),
+                false,
+                &mut out,
+                &mut err,
+            ),
+            ExitCode::SUCCESS
+        );
+        let (state_resynced, _) = store.load(UPKEEP_NOW + 5).unwrap();
+        assert_eq!(
+            state_resynced.accounts["m27-3"].auth,
+            accounts::Auth::SignedOut,
+            "re-syncing must not overwrite a SignedOut default row with Auth::Ok"
+        );
+    }
+
+    #[test]
+    fn complete_staging_renewal_records_wrong_account_and_auto_renew_advances_past_cooldown_or_unconfigured_row()
+     {
+        let w = World::new();
+        let store = accounts::Store::at(&w.state);
+        let m27_dir = store.logins_dir().join("m27");
+        fs::create_dir_all(&m27_dir).unwrap();
+        fs::write(
+            m27_dir.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"sol-m27@example.test\"}}\n",
+        )
+        .unwrap();
+
+        let roster = Roster {
+            rows: vec![
+                Row {
+                    label: "m27".to_owned(),
+                    class: Class::Dedicated,
+                    dir: Some(m27_dir.to_string_lossy().into_owned()),
+                    was: Vec::new(),
+                    email: Some("sol-m27@example.test".to_owned()),
+                    browser: None,
+                },
+                Row {
+                    label: "m27-2".to_owned(),
+                    class: Class::Dedicated,
+                    dir: Some(
+                        store
+                            .logins_dir()
+                            .join("m27-2")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    was: Vec::new(),
+                    email: Some("sun.m27.2@example.test".to_owned()),
+                    browser: None,
+                },
+                Row {
+                    label: "m27-3".to_owned(),
+                    class: Class::Dedicated,
+                    dir: Some(
+                        store
+                            .logins_dir()
+                            .join("m27-3")
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
+                    was: Vec::new(),
+                    email: Some("star.m27.3@example.test".to_owned()),
+                    browser: Some("Claude m27-3".to_owned()),
+                },
+            ],
+        };
+        let mut roster_toml = String::new();
+        for r in &roster.rows {
+            roster_toml.push_str(&accounts::row_text(r).unwrap());
+            roster_toml.push('\n');
+        }
+        fs::create_dir_all(&w.config).unwrap();
+        fs::write(w.roster(), &roster_toml).unwrap();
+
+        let mut note = None;
+        store
+            .transact_logins(UPKEEP_NOW, &mut note, |state, _logins| {
+                let mut ev = accounts::note_auth(state, "m27", accounts::Auth::Ok, UPKEEP_NOW);
+                let acc = state.accounts.entry("m27".to_owned()).or_default();
+                acc.sample = Some(accounts::Sample {
+                    session_pct: Some(95),
+                    session_reset: Some(UPKEEP_NOW + 3600),
+                    week_pct: Some(50),
+                    week_reset: Some(UPKEEP_NOW + 86_400),
+                    at: UPKEEP_NOW,
+                    by: "m27".to_owned(),
+                });
+                state.active = Some("m27".to_owned());
+                ev.push(accounts::Event::new(UPKEEP_NOW, accounts::Kind::Use, "m27"));
+                Ok(ev)
+            })
+            .unwrap();
+
+        let staging_m27_2 = store.claim_staging_dir("m27-2").unwrap();
+        let staging_m27_2_text = staging_m27_2.to_str().unwrap().to_owned();
+        fs::write(
+            staging_m27_2.join(".claude.json"),
+            "{\"oauthAccount\":{\"emailAddress\":\"sol-m27@example.test\"}}\n",
+        )
+        .unwrap();
+        let wrong_status = super::super::align::Captured {
+            stdout: b"{\"loggedIn\":true,\"authMethod\":\"claude.ai\",\"email\":\"sol-m27@example.test\",\"subscriptionType\":\"max\"}\n".to_vec(),
+            code: Some(0),
+        };
+        assert!(
+            !complete_staging_renewal(
+                &store,
+                &roster,
+                &roster,
+                &roster.rows[1],
+                &staging_m27_2,
+                &staging_m27_2_text,
+                &wrong_status,
+                UPKEEP_NOW + 5,
+            ),
+            "signing into already-enrolled low account m27 during m27-2's renewal must be refused as wrong-account"
+        );
+        assert!(
+            !staging_m27_2.exists(),
+            "refused wrong-account staging directory must be removed"
+        );
+        let (logins_after_wrong, _) = store.load_logins(UPKEEP_NOW + 5).unwrap();
+        assert!(
+            logins_after_wrong.get("m27").is_none(),
+            "m27's binding must not be overwritten by m27-2's failed staging login"
+        );
+        assert_eq!(
+            logins_after_wrong.get("m27-2").and_then(|b| b.wrong_at),
+            Some(UPKEEP_NOW + 5),
+            "wrong_at must be recorded on m27-2 when renewal signs into a different account"
+        );
+
+        let (state_now, _) = store.load(UPKEEP_NOW + 10).unwrap();
+        let cands: Vec<String> =
+            auto_renew_candidates(&roster, &state_now, &logins_after_wrong, UPKEEP_NOW + 10)
+                .into_iter()
+                .map(|r| r.label)
+                .collect();
+        assert_eq!(
+            cands,
+            vec!["m27-2".to_owned(), "m27-3".to_owned()],
+            "both unenrolled successors must be returned in priority order"
+        );
+
+        let wit = Witness::answering("");
+        assert!(
+            auto_renew_next_account(&w.home, &w.state, &w.roster(), UPKEEP_NOW + 10, &wit.fx()),
+            "auto_renew_next_account must skip m27-2 (no browser/mailbox) and spawn renewal for m27-3 (which has a browser profile)"
+        );
+        assert_eq!(wit.spawned.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            wit.guard.lock().unwrap().last_attempt.contains_key("m27-3"),
+            "m27-3 must be the account claimed by AutoRenewPermit"
+        );
+
+        // Configure a mailbox password for m27-3 only (and remove its browser profile so only
+        // its mailbox credential makes it headless-capable).
+        let mut roster_no_browser = roster.clone();
+        roster_no_browser.rows[2].browser = None;
+        let mut roster_no_browser_toml = String::new();
+        for r in &roster_no_browser.rows {
+            roster_no_browser_toml.push_str(&accounts::row_text(r).unwrap());
+            roster_no_browser_toml.push('\n');
+        }
+        fs::write(w.roster(), &roster_no_browser_toml).unwrap();
+        let secrets = w.home.join(".secrets");
+        fs::create_dir_all(&secrets).unwrap();
+        fs::write(
+            secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
+            "[passwords]\n\"star.m27.3@example.test\" = \"secret-pw\"\n",
+        )
+        .unwrap();
+
+        struct RecordingHost {
+            tty: bool,
+            flows: std::sync::Mutex<Vec<(String, super::super::cli::RenewBrowser)>>,
+        }
+        impl super::super::cli::AccountsHost for RecordingHost {
+            fn stdin_is_terminal(&self) -> bool {
+                self.tty
+            }
+            fn auth_status(&self, _: &str) -> Result<super::super::align::Captured, String> {
+                Err("unused".to_owned())
+            }
+            fn unaskable(&self) -> Option<String> {
+                None
+            }
+            fn login(&self, _: Option<&str>) -> Result<i32, String> {
+                Err("unused".to_owned())
+            }
+            fn now(&self) -> i64 {
+                UPKEEP_NOW + 20
+            }
+            fn renew_flow(
+                &self,
+                home: &str,
+                email: &str,
+                browser: &super::super::cli::RenewBrowser,
+            ) -> Result<i32, String> {
+                let _ = fs::write(Path::new(home).join(".credentials.json"), b"{}");
+                self.flows
+                    .lock()
+                    .unwrap()
+                    .push((email.to_owned(), browser.clone()));
+                Ok(0)
+            }
+            fn status_in_home(&self, _: &str) -> Result<super::super::align::Captured, String> {
+                Ok(super::super::align::Captured {
+                    stdout: br#"{"loggedIn":true,"authMethod":"claude.ai","email":"star.m27.3@example.test","subscriptionType":"max"}"#.to_vec(),
+                    code: Some(0),
+                })
+            }
+            fn current_exe(&self) -> Option<PathBuf> {
+                None
+            }
+        }
+
+        let env = w.env(UPKEEP_NOW + 20);
+        let non_tty_host = RecordingHost {
+            tty: false,
+            flows: std::sync::Mutex::new(Vec::new()),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code_unconfigured = super::super::cli::run_accounts(
+            &super::super::cli::AccountsCmd::Renew {
+                labels: vec!["m27-2".to_owned()],
+                due: false,
+                on: None,
+            },
+            &env,
+            &non_tty_host,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code_unconfigured, ExitCode::SUCCESS);
+        assert!(
+            non_tty_host.flows.lock().unwrap().is_empty(),
+            "non-terminal renew of m27-2 (which has no mailbox password) must not run renew_flow"
+        );
+        assert!(
+            String::from_utf8_lossy(&out).contains("due here: m27-2"),
+            "stdout: {}",
+            String::from_utf8_lossy(&out)
+        );
+
+        out.clear();
+        err.clear();
+        let code_due = super::super::cli::run_accounts(
+            &super::super::cli::AccountsCmd::Renew {
+                labels: Vec::new(),
+                due: true,
+                on: None,
+            },
+            &env,
+            &non_tty_host,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(
+            code_due,
+            ExitCode::SUCCESS,
+            "stderr: {}",
+            String::from_utf8_lossy(&err)
+        );
+        let recorded = non_tty_host.flows.lock().unwrap().clone();
+        assert_eq!(
+            recorded,
+            vec![(
+                "star.m27.3@example.test".to_owned(),
+                super::super::cli::RenewBrowser::Remote { opener: None }
+            )],
+            "renew --due must skip unconfigured m27-2 and run headless-capable m27-3 with Remote browser"
         );
     }
 }

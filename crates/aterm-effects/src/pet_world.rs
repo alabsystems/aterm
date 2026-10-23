@@ -1804,10 +1804,7 @@ impl PetWorld {
             .max(0.0) as usize;
         let end_col =
             ((target.1 + max_distance - cov_left - margin).floor() + 1.0).max(0.0) as usize;
-        let cols = std::iter::once(target.1).chain(
-            (first_col..end_col.min(self.coverage.cols))
-                .map(|c| (self.coverage.col + c) as f32 + margin),
-        );
+        let end_col = end_col.min(self.coverage.cols);
         for (i, row) in rows.into_iter().enumerate() {
             let r0_f = row - margin;
             let r1_f = row + body.rows + margin;
@@ -1827,7 +1824,10 @@ impl PetWorld {
             } else {
                 None
             };
-            for col in cols.clone() {
+            let mut stop_after = |col: f32| {
+                if col > target.1 && col - target.1 > max_distance.min(best_distance) {
+                    return true;
+                }
                 let col_dist = (col - target.1).abs();
                 let distance = row_dist.max(col_dist);
                 let tie = row_dist + col_dist;
@@ -1847,9 +1847,19 @@ impl PetWorld {
                                 best = Some(rect);
                                 best_distance = distance;
                                 best_tie = tie;
+                                return col_dist == 0.0;
                             }
                         }
                     }
+                }
+                false
+            };
+            if stop_after(target.1) {
+                continue;
+            }
+            for c in first_col..end_col {
+                if stop_after((self.coverage.col + c) as f32 + margin) {
+                    break;
                 }
             }
         }

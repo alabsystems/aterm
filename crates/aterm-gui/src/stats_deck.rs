@@ -267,6 +267,8 @@ pub(crate) struct DeckInput<'a> {
     pub(crate) snap: Option<&'a Snapshot>,
     /// This window's active tab's key (its session id).
     pub(crate) tab_key: Option<u64>,
+    /// That tab's sessions, its focused pane first (`App::deck_tab_panes`): the tab the lens's Why now says "this tab" of.
+    pub(crate) tab_panes: Vec<u64>,
     /// Its label, `Tab 2`.
     pub(crate) tab_label: String,
     /// How many tabs this window holds (the sill draws the Tab lane at 2+; the Deck says "the only tab" at 1).
@@ -2054,6 +2056,8 @@ pub(crate) struct DeckFrame {
     pub(crate) geom: DeckGeom,
     pub(crate) dy: u32,
     pub(crate) tab_key: Option<u64>,
+    /// [`DeckInput::tab_panes`].
+    pub(crate) tab_panes: Vec<u64>,
     pub(crate) tab_label: String,
     pub(crate) tab_count: usize,
     pub(crate) inks: VitalsInks,
@@ -2097,6 +2101,7 @@ impl crate::App {
         let pad = self.win_pad(wid);
         let w = ws.cols as usize * cw + 2 * pad;
         let (tab_key, tab_label) = self.deck_tab(wid);
+        let tab_panes = self.deck_tab_panes(wid);
         let tab_count = ws.tab_set.tabs().len();
         let prefs = crate::native_appearance::current_preferences();
         let (dwc, contrast) = (prefs.differentiate_without_color, prefs.high_contrast);
@@ -2120,6 +2125,7 @@ impl crate::App {
                     },
                     dy: u32::try_from(dy).unwrap_or(0),
                     tab_key,
+                    tab_panes,
                     tab_label,
                     tab_count,
                     inks: band_inks,
@@ -2155,6 +2161,7 @@ impl crate::App {
                     },
                     dy: u32::try_from(frame_h.saturating_sub(pad)).unwrap_or(0),
                     tab_key,
+                    tab_panes,
                     tab_label,
                     tab_count,
                     inks: cached_inks(floor, value, accent),
@@ -2248,6 +2255,7 @@ impl crate::App {
         let input = DeckInput {
             snap: self.vitals.snapshot.as_deref(),
             tab_key: f.tab_key,
+            tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
             tab_count: f.tab_count,
             inks: f.inks,
@@ -2933,6 +2941,7 @@ pub(crate) mod tests {
         DeckInput {
             snap: Some(snap),
             tab_key: Some(7),
+            tab_panes: vec![7],
             tab_label: "Tab 1".into(),
             tab_count: 1,
             inks: dark_inks(),

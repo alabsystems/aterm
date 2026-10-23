@@ -48,15 +48,7 @@ fn ready(path: &str, w: u32, h: u32) -> crate::app_config::WallpaperAsset {
     }
 }
 
-/// MODIFIED NAMES THE WALLPAPER BY ITS FILE: the row's control is a way to
-/// the Wallpaper page that paints the file's name and size (not the head of
-/// a long path, cut mid-word), says the whole path, and fits, from a
-/// 22-column window to a wide one, at 1×, 1.25×, 1.5× and 2× text — every
-/// letter of the file's name painted, the size given up first, then the
-/// name set on lines, never cut (the audit: elided from its end on
-/// one line it read "sun…" at 178pt and 2×, "sunset-over-the…" at 320pt).
-/// Negative control: an image that did not load is named by its file
-/// alone.
+/// Modified names the wallpaper by its file name and dimensions across window widths and text scales.
 #[test]
 fn modified_names_the_wallpaper_by_its_file() {
     at_each_text_scale(&[1.0, 1.25, 1.5, 2.0], "wallpaper words", |scale| {
@@ -89,8 +81,6 @@ fn wallpaper_words_at_scale(scale: f32) {
             "{at}"
         );
         assert_eq!(node.value, SemanticValue::Text(path.to_string()), "{at}");
-        // The name starts with the words the button paints, then says the
-        // row once and the image: never "Wallpaper image: Wallpaper: …".
         assert_eq!(
             node.label,
             format!(
@@ -100,8 +90,6 @@ fn wallpaper_words_at_scale(scale: f32) {
             "{at}"
         );
         let painted = button_words(&compiled, key);
-        // Every letter of the name, on however many lines (a line may break
-        // after a hyphen, or with one inside a word wider than the button).
         let letters = |text: &str| text.replace(['\n', '-'], "");
         assert!(
             letters(&painted).contains(&letters("sunset-over-the-bay.png")),
@@ -149,12 +137,7 @@ fn wallpaper_preview_of(
     })
 }
 
-/// THE WALLPAPER PAGE SHOWS THE PICTURE: with an image loaded, the page
-/// draws a preview of the session over it (the renderer's own wallpaper
-/// path) at the dim and text tint the page shows, an unsaved dim draft
-/// included, at the shipped sizes, no taller than the page's list; and the
-/// Appearance color sample draws over it too. Negative controls: no image,
-/// or one that did not load, draws no preview.
+/// The Wallpaper page and Appearance color sample draw over a loaded wallpaper image.
 #[test]
 fn the_wallpaper_page_shows_the_picture() {
     let path = "/tmp/wall.png";
@@ -204,7 +187,6 @@ fn the_wallpaper_page_shows_the_picture() {
             "{at}: {preview:?} in {list:?}"
         );
     }
-    // The dim and the tint the page shows, a draft among them.
     let mut state = wallpaper_state(path, ready(path, 1074, 686));
     state.navigate(SettingsRoute::Wallpaper);
     state.field_inputs.insert(
@@ -219,7 +201,6 @@ fn the_wallpaper_page_shows_the_picture() {
         .expect("the preview");
     let wallpaper = spec.wallpaper.expect("the picture");
     assert_eq!((wallpaper.dim, wallpaper.tint), (0.6, false));
-    // The Appearance color sample draws over the picture.
     let mut state = wallpaper_state(path, ready(path, 1074, 686));
     state.navigate(SettingsRoute::Appearance);
     let appearance = renderer_preview_spec_for_key_with_font(
@@ -236,7 +217,6 @@ fn the_wallpaper_page_shows_the_picture() {
         appearance.wallpaper.map(|wallpaper| wallpaper.identity().0),
         Some(7)
     );
-    // Negative controls.
     for asset in [
         crate::app_config::WallpaperAsset::None,
         crate::app_config::WallpaperAsset::Invalid {

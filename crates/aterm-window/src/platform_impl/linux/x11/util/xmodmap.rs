@@ -9,19 +9,11 @@ use std::slice;
 
 use super::ffi::{KeyCode as XKeyCode, XModifierKeymap};
 
-// Offsets within XModifierKeymap to each set of keycodes.
-// We are only interested in Shift, Control, Alt, and Logo.
-//
-// There are 8 sets total. The order of keycode sets is:
-//     Shift, Lock, Control, Mod1 (Alt), Mod2, Mod3, Mod4 (Logo), Mod5
-//
-// https://tronche.com/gui/x/xlib/input/XSetModifierMapping.html
 const NUM_MODS: usize = 8;
 
 /// Track which keys are modifiers, so we can properly replay them when they were filtered.
 #[derive(Debug, Default)]
 pub struct ModifierKeymap {
-    // Maps keycodes to modifiers
     modifiers: HashSet<XKeyCode>,
 }
 

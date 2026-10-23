@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The supervisor policy's protocol, declared and model-checked by the compiler.
-//
-// `config_watcher_island.rs` proves by hand, for any policy values and any run, that the
-// watcher's post agrees with what the window runs. This island only declares the protocol as
-// data: the Trust compiler detects the `ScalarModel` by its kernel type, searches its 85
-// reachable states, and the Clean kernel checks the result while this crate builds
-// (`docs/DESIGN-trust-temporal-models-2026-09-29.md`, P2 and P5):
-//   * `OneWriter` is safe: `Agrees` holds in every reachable state
-//     (`trust_checked_safe.HarnessPolicy.OneWriter`);
-//   * `CatchesUp` is live: under weak fairness of the poll, the delivery and the forget, the
-//     window runs the file on disk again and again (`trust_checked_live.HarnessPolicy.CatchesUp`).
-// Setting `Buggy` to 1 adds two failure shapes (a second writer; a Commit that raises no forget)
-// and stops this crate compiling, printing the run that breaks `Agrees`.
-//
-// The model's `in_force` is the policy the window runs, in `HarnessPolicyCell`
-// (harness_policy_cell.rs), whose seals (`harness_policy_cell_island.rs`) say only `offer`
-// changes it, and only with the watcher's stamp. The compiler does not match the model's actions
-// to the arms; the Tier-1 tests do.
-//
-// Mounted only on the seal lane (`--cfg clean_islands --cfg trust_seals`, config_watcher.rs):
-// `import Trust.Protocol` needs a Trust newer than the installed seal.
-//
-// The text is `aterm_spec::derive::harness_policy_one_writer_model` and its liveness obligation
-// as `emit_clean_models` writes them, so the model here is the one `ty`, the interpreter and the
-// Tier-1 tests check.
+// Supervisor policy protocol (`aterm_spec::derive::harness_policy_one_writer_model`), model-checked by Clean.
 clean {
     import Trust.Protocol
     namespace HarnessPolicy

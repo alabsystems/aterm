@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A degenerate sense never puts the pet nowhere.
-//!
-//! The pet's body is fractional cells in `f32`, and the brain does many
-//! divisions, roots and trig operations on host-supplied numbers. A zero cell
-//! metric or zero-sized grid is what a host holds between a resize and the next
-//! surface attach; a NaN there would draw the cat nowhere or at a garbage
-//! position. This walks the legal-but-degenerate corners and asserts the body
-//! stays finite and on the grid whenever it is drawn.
+//! Degenerate grid and cell metrics keep the pet's body finite and within bounds.
+
 use aterm_effects::kitty_pet::{PetBrain, PetSense};
 use std::time::{Duration, Instant};
 
@@ -28,8 +22,6 @@ fn s(now: Instant, rows: u16, cols: u16, cw: u16, ch: u16, caret: Option<(u16, u
     }
 }
 
-/// One degenerate corner: its name, the grid rows and columns, the cell width and
-/// height in pixels, and the caret (row, column) if there is one.
 type Shape<'a> = (&'a str, u16, u16, u16, u16, Option<(u16, u16)>);
 
 #[test]
@@ -60,7 +52,6 @@ fn no_legal_sense_makes_the_pet_non_finite_or_off_grid() {
                 ));
                 break;
             }
-            // A body that is drawn must be somewhere a person could see.
             if f.alpha > 0
                 && (f.col < -64.0
                     || f.row < -64.0

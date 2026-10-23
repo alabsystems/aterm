@@ -44,6 +44,10 @@ aterm-spec = { workspace = true }
 # is first-party (crates/aterm-libc).
 [target.'cfg(unix)'.dev-dependencies]
 libc = { workspace = true }
+# The live-pty tests' pty (`LiveShell::spawn_on_pty`): aterm-pty's pair, where `script(1)`
+# gave one before (BSD and util-linux `script` differ; docs/DESIGN-init-system-2026-10-20.md
+# §6.1 row 7).
+aterm-pty = { workspace = true }
 
 # The Windows key-press test (src/tests_pwsh_keys.rs) types at a live PowerShell
 # prompt through the ConPTY a tab gets: aterm-pty's spawn, with the caps the test

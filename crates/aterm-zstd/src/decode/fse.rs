@@ -4,20 +4,11 @@
 // Derived from ruzstd 0.8.3 src/fse/fse_decoder.rs, modified by the aterm
 // project in 2026. See ../../LICENSE-MIT for the upstream MIT license.
 
-//! Finite State Entropy decoding (RFC 8878 §4.1): the code lengths, match
-//! lengths and offsets of the sequences section, and compressed Huffman
-//! weights.
-//!
-//! A table is built from a probability distribution, read from the stream
-//! ([`FseTable::build_decoder`]) or predefined
-//! ([`FseTable::build_from_probabilities`]). A built table always has
-//! `1 << accuracy_log` entries, and every entry's `base_line + (1 << num_bits)`
-//! stays within it, so a decoder state never leaves the table.
+//! Finite State Entropy decoding (RFC 8878 §4.1).
 
 use super::bits::{BitReader, BitReaderReversed};
 use super::error::DecodeError;
 
-/// Added to the 4-bit field at the start of a table description.
 const ACC_LOG_OFFSET: u8 = 5;
 
 /// One state of a decoding table.
@@ -87,8 +78,7 @@ impl FseTable {
             .map(|e| (e.symbol, e.num_bits, e.base_line))
     }
 
-    /// Reads a table description from the front of `source` (at most
-    /// `max_log` accuracy) and builds the table. Returns the bytes read.
+    /// Reads a table description from the front of `source` and builds the table.
     pub(crate) fn build_decoder(
         &mut self,
         source: &[u8],
@@ -112,8 +102,6 @@ impl FseTable {
         self.build_decoding_table()
     }
 
-    /// Spreads the symbols over the table and gives each state its base line
-    /// and bit count (RFC 8878 §4.1.1).
     fn build_decoding_table(&mut self) -> Result<(), DecodeError> {
         let Self {
             max_symbol,
@@ -134,8 +122,6 @@ impl FseTable {
             ));
         }
         let table_size = 1usize << acc_log;
-        // The shares, "less than one" counting one, must fill the table
-        // exactly; the spread below relies on it to terminate.
         let total: i64 = probs
             .iter()
             .map(|&p| i64::from(p.max(0)) + i64::from(p == -1))
@@ -150,8 +136,6 @@ impl FseTable {
         decode.clear();
         decode.resize(table_size, Entry::ZERO);
 
-        // "Less than one" symbols take the top states, one each, and read
-        // a whole accuracy_log bits from base line 0.
         let mut negative_idx = table_size;
         for (symbol, &p) in probs.iter().enumerate() {
             if p == -1 {
@@ -160,15 +144,12 @@ impl FseTable {
                     *entry = Entry {
                         base_line: 0,
                         num_bits: acc_log,
-                        // At most max_symbol + 1 <= 256 symbols.
                         symbol: symbol as u8,
                     };
                 }
             }
         }
 
-        // The rest are spread in symbol order with a step coprime to the
-        // table size, skipping the states taken above.
         let mut position = 0;
         for (symbol, &p) in probs.iter().enumerate() {
             for _ in 0..p.max(0) {
@@ -182,8 +163,6 @@ impl FseTable {
             }
         }
 
-        // Base lines and bit counts, once every symbol is placed: the k-th
-        // state of a symbol in table order is its k-th slice.
         counter.clear();
         counter.resize(probs.len(), 0);
         for entry in decode.iter_mut().take(negative_idx) {
@@ -206,12 +185,9 @@ impl FseTable {
         Ok(())
     }
 
-    /// Reads `Accuracy_Log` and the distribution (RFC 8878 §4.1.1) from the
-    /// front of `source`. Returns the bytes read, a partly read byte counted.
     fn read_probabilities(&mut self, source: &[u8], max_log: u8) -> Result<usize, DecodeError> {
         self.probs.clear();
         let mut br = BitReader::new(source);
-        // `get_bits(4)` is at most 15.
         self.accuracy_log = ACC_LOG_OFFSET + br.get_bits(4)? as u8;
         if self.accuracy_log > max_log {
             self.accuracy_log = 0;
@@ -225,7 +201,6 @@ impl FseTable {
             let bits_to_read = highest_bit_set(max_remaining_value);
             let unchecked_value = br.get_bits(bits_to_read as usize)?;
 
-            // Values below the threshold take one bit fewer.
             let low_threshold = ((1u32 << bits_to_read) - 1) - max_remaining_value;
             let mask = (1u32 << (bits_to_read - 1)) - 1;
             let small_value = unchecked_value & mask;
@@ -238,7 +213,6 @@ impl FseTable {
                 unchecked_value
             };
 
-            // `value <= max_remaining_value <= 513`, so the cast is exact.
             let prob = value as i32 - 1;
             self.probs.push(prob);
             if prob > 0 {
@@ -246,8 +220,6 @@ impl FseTable {
             } else if prob == -1 {
                 probability_counter += 1;
             } else {
-                // A zero is followed by 2-bit repeat counts of further zeros;
-                // 3 means "and another count follows".
                 loop {
                     let skip = br.get_bits(2)? as usize;
                     self.probs.resize(self.probs.len() + skip, 0);
@@ -339,13 +311,10 @@ pub(crate) const fn highest_bit_set(x: u32) -> u32 {
     u32::BITS - x.leading_zeros()
 }
 
-/// The next state to fill when spreading symbols (RFC 8878 §4.1.1).
 const fn next_position(p: usize, table_size: usize) -> usize {
     (p + (table_size >> 1) + (table_size >> 3) + 3) & (table_size - 1)
 }
 
-/// The base line and bit count of a symbol's `state_number`-th state, where
-/// the symbol holds `num_states_symbol` of `num_states_total` states.
 const fn calc_baseline_and_numbits(
     num_states_total: u32,
     num_states_symbol: u32,
@@ -354,12 +323,10 @@ const fn calc_baseline_and_numbits(
     if num_states_symbol == 0 {
         return (0, 0);
     }
-    // The next power of two at or above the symbol's state count.
     let num_state_slices = num_states_symbol.next_power_of_two();
     let num_double_width = num_state_slices - num_states_symbol;
     let num_single_width = num_states_symbol - num_double_width;
     let slice_width = num_states_total / num_state_slices;
-    // `slice_width` is a power of two >= 1, so this is its log2 (<= 9).
     let num_bits = highest_bit_set(slice_width).saturating_sub(1) as u8;
     if state_number < num_double_width {
         let base_line = num_single_width * slice_width + state_number * slice_width * 2;
@@ -374,8 +341,6 @@ mod tests {
     use super::FseTable;
     use crate::decode::sequences::{LL_DEFAULT_ACC_LOG, LL_DEFAULT_DISTRIBUTION};
 
-    /// Spot values of the predefined literal-length table, from RFC 8878
-    /// Appendix A.
     #[test]
     fn predefined_literal_length_table() {
         let mut table = FseTable::new(35);

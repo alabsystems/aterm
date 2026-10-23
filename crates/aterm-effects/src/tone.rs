@@ -1,34 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tone of typing: a small fastText-style classifier that guesses the coarse
-//! mood of the line being typed, so the trail synth's melody can lean with the
-//! writer (`trail_sound`'s tone tables). [`Tone::Technical`] doubles as the
-//! neutral verdict: its melody mapping is the identity, so "no idea" and "shell
-//! command" leave the sound unchanged.
-//!
-//! Hashed character n-grams (1–3) → embedding bag → mean pool → one 64-unit
-//! `tanh` hidden layer → 5-way softmax. Features are Unicode chars, so the model
-//! is script-agnostic (CJK needs no segmenter), and there is no vocabulary file:
-//! every n-gram hashes (FNV-1a, per-order salt) into [`BUCKETS`] embedding rows.
-//! ~68k parameters, i8-quantized into a ~67 KiB [`include_bytes!`] asset and
-//! dequantized once at load. Inference is two fixed-size matmuls, inside the
-//! <100 µs/line input-path budget and allocation-free given a [`ToneScratch`].
-//!
-//! Trained offline (`examples/tone_train.rs`) on a small curated corpus
-//! (`data/tone_corpus.tsv`: short lines in ten languages plus code-flavoured
-//! Technical lines), it learns loud surface markers (laughter tokens,
-//! exclamation shapes, complaint vocabulary, shell/code syntax), not real
-//! sentiment. The tests pin asset integrity and a modest held-out floor, not
-//! accuracy; the verdict is only an aesthetic hint, never shown to the user.
+//! Tone of typing: a small fastText-style classifier that guesses the coarse mood of the line being typed, so the trail synth's melody can lean with the writer (`trail_sound`'s tone tables).
 
 use std::sync::OnceLock;
 
 /// Number of tone classes. Fixed by the model asset format.
 pub const TONE_COUNT: usize = 5;
 
-/// The coarse mood vocabulary. Order is the model's output index order, fixed
-/// by the trained weight asset.
+/// The coarse mood vocabulary.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Tone {
     /// Even, unhurried prose ("ok sounds good", "no rush").
@@ -39,8 +19,7 @@ pub enum Tone {
     Frustrated,
     /// Laughter, teasing, whimsy ("lol", "ㅋㅋㅋ", ":3").
     Playful,
-    /// Code, commands, logs, technical prose, and the neutral fallback (its
-    /// melody mapping is the identity), hence the default.
+    /// Code, commands, logs, technical prose, and the neutral fallback (its melody mapping is the identity), hence the default.
     #[default]
     Technical,
 }
@@ -67,8 +46,7 @@ impl Tone {
         }
     }
 
-    /// Inverse of [`Tone::index`]; out-of-range folds to the neutral
-    /// [`Tone::Technical`] rather than panicking on an audio-adjacent path.
+    /// Inverse of [`Tone::index`]; out-of-range folds to the neutral [`Tone::Technical`] rather than panicking on an audio-adjacent path.
     #[inline]
     pub const fn from_index(i: usize) -> Tone {
         if i < Tone::ALL.len() {
@@ -90,39 +68,27 @@ impl Tone {
         }
     }
 
-    /// Parse a corpus label. Unknown labels are `None` (the trainer treats
-    /// that as a data error, not a silent class).
+    /// Parse a corpus label.
     #[inline]
     pub fn parse_label(s: &str) -> Option<Tone> {
         Tone::ALL.iter().copied().find(|t| t.label() == s)
     }
 }
 
-/// Hashed embedding rows; a power of two so the bucket fold is a mask. 2048 × 32
-/// is deliberately small: collisions regularize a corpus this size.
+/// Hashed embedding rows; a power of two so the bucket fold is a mask.
 pub const BUCKETS: usize = 2048;
 /// Embedding (and mean-pool) width.
 pub const EMBED: usize = 32;
 /// Hidden layer width.
 pub const HIDDEN: usize = 64;
 
-/// Minimum n-gram count before the model gives an opinion (three typed chars
-/// emit six). Below it [`ToneModel::scores`] returns `None` and classification
-/// stays [`Tone::Technical`], so the melody does not lurch on a two-key line.
+/// Minimum n-gram count before the model gives an opinion (three typed chars emit six).
 pub const MIN_NGRAMS: usize = 6;
 
-/// Feed every hashed n-gram bucket of `text` to `f`; returns how many were
-/// emitted. The one featurization for inference and the trainer, so the weights
-/// match the runtime's view.
-///
-/// Chars are ASCII-lowercased (full Unicode folding adds little for mood markers
-/// and brings locale questions), whitespace runs collapse to one space (so
-/// indentation does not dominate code), and each position emits its 1-gram plus
-/// the 2- and 3-grams ending at it.
+/// Feed every hashed n-gram bucket of `text` to `f`; returns how many were emitted.
 pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     use aterm_hash::{FNV64_OFFSET, fnv1a_64_extend};
-    /// Per-order salt (odd constant × order) so n-gram orders occupy
-    /// distinct hash streams.
+    /// Per-order salt (odd constant × order) so n-gram orders occupy distinct hash streams.
     const ORDER_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
     #[inline]
@@ -135,7 +101,6 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     }
 
     let mut count = 0usize;
-    // Rolling partial hashes of the previous one and two (folded) chars.
     let mut prev1_h2: Option<u64> = None;
     let mut prev1_h3: Option<u64> = None;
     let mut prev2_h3: Option<u64> = None;
@@ -156,14 +121,11 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
             }
         };
         let cb = (c as u32).to_le_bytes();
-        // 1-gram.
         f(bucket(fold(FNV64_OFFSET ^ ORDER_SALT, cb)));
         count += 1;
-        // 2-gram ending here.
         if let Some(h2_p1) = prev1_h2 {
             f(bucket(fold(h2_p1, cb)));
             count += 1;
-            // 3-gram ending here.
             if let Some(h3_p2_p1) = prev2_h3 {
                 f(bucket(fold(h3_p2_p1, cb)));
                 count += 1;
@@ -176,8 +138,7 @@ pub fn for_each_ngram_bucket(text: &str, mut f: impl FnMut(usize)) -> usize {
     count
 }
 
-/// Fixed-size inference scratch: construct once and reuse; `classify` allocates
-/// nothing.
+/// Fixed-size inference scratch: construct once and reuse; `classify` allocates nothing.
 #[derive(Clone, Debug)]
 pub struct ToneScratch {
     sum: [f32; EMBED],
@@ -213,8 +174,7 @@ pub enum ToneModelError {
     BadScale,
 }
 
-/// 8-byte asset magic. The trailing version byte is part of the magic: a
-/// format change mints `ATONEv2\0` rather than reinterpreting old bytes.
+/// 8-byte asset magic.
 const MAGIC: [u8; 8] = *b"ATONEv1\0";
 
 const EMB_LEN: usize = BUCKETS * EMBED;
@@ -237,8 +197,7 @@ const fn fnv1a32(bytes: &[u8]) -> u32 {
     h
 }
 
-/// The loaded (dequantized) classifier. Layouts: `emb[bucket*EMBED + i]`,
-/// `w1[i*HIDDEN + j]`, `w2[j*TONE_COUNT + c]`.
+/// The loaded (dequantized) classifier.
 #[derive(Clone, Debug)]
 pub struct ToneModel {
     emb: Vec<f32>,
@@ -249,8 +208,7 @@ pub struct ToneModel {
 }
 
 impl ToneModel {
-    /// Decode and verify a weight asset. Any length, dim or checksum mismatch is
-    /// refused: a half-read model would classify garbage with full confidence.
+    /// Decode and verify a weight asset.
     pub fn from_bytes(bytes: &[u8]) -> Result<ToneModel, ToneModelError> {
         if bytes.len() < HEADER_LEN {
             return Err(ToneModelError::Truncated);
@@ -334,8 +292,7 @@ impl ToneModel {
         })
     }
 
-    /// Compute the raw output logits into `s.logits`, returning `false` when
-    /// the text has fewer than [`MIN_NGRAMS`] character n-grams.
+    /// Compute the raw output logits into `s.logits`, returning `false` when the text has fewer than [`MIN_NGRAMS`] character n-grams.
     fn compute_logits(&self, text: &str, s: &mut ToneScratch) -> bool {
         s.sum = [0.0; EMBED];
         let emb_rows = self.emb.as_chunks::<EMBED>().0;
@@ -354,8 +311,6 @@ impl ToneModel {
         for e in &mut s.sum {
             *e *= inv;
         }
-        // Hidden layer: tanh(b1 + e·W1), accumulated row-wise for cache locality
-        // and auto-vectorization in the exact `i = 0..EMBED` addition order.
         s.hid.copy_from_slice(&self.b1);
         for (row, &e) in self.w1.as_chunks::<HIDDEN>().0.iter().zip(&s.sum) {
             for (h, &w) in s.hid.iter_mut().zip(row) {
@@ -365,7 +320,6 @@ impl ToneModel {
         for h in &mut s.hid {
             *h = h.tanh();
         }
-        // Output logits, accumulated row-wise in the exact `j = 0..HIDDEN` order.
         s.logits.copy_from_slice(&self.b2);
         for (row, &h) in self.w2.as_chunks::<TONE_COUNT>().0.iter().zip(&s.hid) {
             for (l, &w) in s.logits.iter_mut().zip(row) {
@@ -375,14 +329,11 @@ impl ToneModel {
         true
     }
 
-    /// Softmax scores in [`Tone::ALL`] order, or `None` when the text is too
-    /// short ([`MIN_NGRAMS`]). Pure, deterministic, allocation-free (state lives
-    /// in `s`).
+    /// Softmax scores in [`Tone::ALL`] order, or `None` when the text is too short ([`MIN_NGRAMS`]).
     pub fn scores(&self, text: &str, s: &mut ToneScratch) -> Option<[f32; TONE_COUNT]> {
         if !self.compute_logits(text, s) {
             return None;
         }
-        // Softmax (max-shifted for stability).
         let mut mx = f32::NEG_INFINITY;
         for &l in &s.logits {
             mx = mx.max(l);
@@ -401,10 +352,7 @@ impl ToneModel {
         Some(out)
     }
 
-    /// The verdict with abstention explicit: the argmax tone, or `None` when the
-    /// evidence is too thin ([`MIN_NGRAMS`]). Ties resolve to the lowest index.
-    /// A host that caches a mood uses this, so an evidence-thin window (a
-    /// one-char line after Enter) leaves the prior verdict standing.
+    /// The verdict with abstention explicit: the argmax tone, or `None` when the evidence is too thin ([`MIN_NGRAMS`]).
     #[inline]
     pub fn classify_opt(&self, text: &str, s: &mut ToneScratch) -> Option<Tone> {
         if !self.compute_logits(text, s) {
@@ -419,20 +367,14 @@ impl ToneModel {
         Some(Tone::from_index(best))
     }
 
-    /// The verdict: argmax tone, or the neutral [`Tone::Technical`] when the
-    /// evidence is too thin. Ties resolve to the lowest index.
+    /// The verdict: argmax tone, or the neutral [`Tone::Technical`] when the evidence is too thin.
     #[inline]
     pub fn classify(&self, text: &str, s: &mut ToneScratch) -> Tone {
         self.classify_opt(text, s).unwrap_or(Tone::Technical)
     }
 }
 
-/// Quantize and serialize full-precision weights into the asset format, beside
-/// the decoder so the byte layout has one author. The offline trainer
-/// round-trips the bytes through [`ToneModel::from_bytes`] before reporting
-/// holdout accuracy, so what ships is what was measured.
-///
-/// Panics unless the slices have the compiled lengths (trainer-only code).
+/// Quantize and serialize full-precision weights into the asset format, beside the decoder so the byte layout has one author.
 pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32]) -> Vec<u8> {
     assert_eq!(emb.len(), EMB_LEN);
     assert_eq!(w1.len(), W1_LEN);
@@ -473,9 +415,7 @@ pub fn encode_model(emb: &[f32], w1: &[f32], b1: &[f32], w2: &[f32], b2: &[f32])
     out
 }
 
-/// The shipped weights (`data/tone_model.atn`, from `targo --unverified run -p
-/// aterm-effects --example tone_train`), loaded once. `None` if the embedded
-/// asset fails verification; callers fall back to the neutral tone.
+/// The shipped weights (`data/tone_model.atn`, from `targo --unverified run -p aterm-effects --example tone_train`), loaded once.
 #[inline]
 pub fn builtin() -> Option<&'static ToneModel> {
     static MODEL: OnceLock<Option<ToneModel>> = OnceLock::new();
@@ -485,12 +425,10 @@ pub fn builtin() -> Option<&'static ToneModel> {
 }
 
 /// The committed held-out sanity set (never trained on), read by the tests.
-/// Format: `label \t lang \t text`.
 #[cfg(test)]
 pub const HOLDOUT_TSV: &str = include_str!("../data/tone_holdout.tsv");
 
-/// Parse one corpus/holdout TSV line (shared by the trainer and the
-/// conformance tests). Blank lines and `#` comments yield `None`.
+/// Parse one corpus/holdout TSV line (shared by the trainer and the conformance tests).
 #[inline]
 pub fn parse_corpus_line(line: &str) -> Option<(Tone, &str, &str)> {
     let line = line.trim_end_matches('\r');
@@ -545,8 +483,7 @@ mod tests {
         );
     }
 
-    /// `classify_opt` reports thin evidence as `None`, and agrees with
-    /// `classify` on a real line.
+    /// `classify_opt` reports thin evidence as `None`, and agrees with `classify` on a real line.
     #[test]
     fn classify_opt_reports_abstention_as_none() {
         let m = builtin().expect("shipped model");
@@ -557,8 +494,7 @@ mod tests {
         assert_eq!(m.classify_opt(line, &mut s), Some(m.classify(line, &mut s)));
     }
 
-    /// The shipped weights clear a modest held-out floor, overall and per focus
-    /// language: an asset-integrity pin, not an accuracy claim.
+    /// The shipped weights clear a modest held-out floor, overall and per focus language: an asset-integrity pin, not an accuracy claim.
     #[test]
     fn holdout_sanity_set_clears_documented_floors() {
         let m = builtin().expect("shipped model");
@@ -602,30 +538,23 @@ mod tests {
         }
     }
 
-    /// Featurization is script-agnostic (CJK needs no tokenizer), collapses
-    /// whitespace runs and folds ASCII case.
+    /// Featurization is script-agnostic (CJK needs no tokenizer), collapses whitespace runs and folds ASCII case.
     #[test]
     fn featurization_is_script_agnostic_and_folded() {
         let count = |t: &str| for_each_ngram_bucket(t, |_| {});
-        // 4 chars ⇒ 4 + 3 + 2 n-grams, same for any script.
         assert_eq!(count("abcd"), 9);
         assert_eq!(count("猫が好き"), 9);
         assert_eq!(count("사랑해요"), 9);
-        // Case folding: identical bucket streams.
         let mut a = Vec::new();
         let mut b = Vec::new();
         for_each_ngram_bucket("Hello World", |x| a.push(x));
         for_each_ngram_bucket("hello world", |x| b.push(x));
         assert_eq!(a, b);
-        // Whitespace collapsing: indentation does not change the stream.
         a.clear();
         b.clear();
         for_each_ngram_bucket("    ls -la", |x| a.push(x));
         for_each_ngram_bucket(" ls -la", |x| b.push(x));
         assert_eq!(a, b);
-        // Unicode White_Space also includes ASCII vertical tab, which
-        // is_ascii_whitespace deliberately excludes. Keep every ASCII
-        // whitespace character equivalent to the normalized space.
         for ch in (0..=0x7f)
             .filter_map(char::from_u32)
             .filter(|ch| ch.is_whitespace())
@@ -654,12 +583,10 @@ mod tests {
         let bytes = encode_model(&emb, &w1, &b1, &w2, &b2);
         assert_eq!(bytes.len(), ASSET_LEN);
         let m = ToneModel::from_bytes(&bytes).expect("round trip");
-        // Quantization error bounded by half a step per weight.
         let step = emb.iter().fold(0.0f32, |a, &v| a.max(v.abs())) / 127.0;
         for (orig, got) in emb.iter().zip(&m.emb) {
             assert!((orig - got).abs() <= step * 0.5 + 1e-6);
         }
-        // Biases are stored full-precision.
         for (orig, got) in b1.iter().zip(&m.b1) {
             assert_eq!(orig.to_bits(), got.to_bits());
         }

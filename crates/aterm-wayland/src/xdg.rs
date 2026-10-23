@@ -133,7 +133,6 @@ pub struct Toplevel<'s> {
     _listeners: Vec<Listener>,
 }
 
-/// Owns a constructor's objects and installed listeners until a Toplevel takes them.
 struct PendingToplevel {
     xdg_surface: Option<Proxy>,
     toplevel: Option<Proxy>,
@@ -176,7 +175,6 @@ enum Part {
     Decoration,
 }
 
-/// One event of a toplevel's objects, decoded.
 enum Heard {
     /// `xdg_surface.configure`: the configure is whole.
     Serial(u32),

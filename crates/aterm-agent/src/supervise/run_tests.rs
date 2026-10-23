@@ -41,7 +41,6 @@ struct KeyProbe {
     digit: Digit,
 }
 
-/// `rows` with their last `deny this request in M:SS,` row `ticks` seconds lower (never below 0:00).
 fn ticked_countdown(rows: &[String], ticks: u64) -> (Vec<String>, Option<u64>) {
     let mut out = rows.to_vec();
     let Some(at) = out
@@ -1178,14 +1177,11 @@ impl Mock {
         self.scrollback.get_or_insert_with(Vec::new);
         self.alt_screen.get_or_insert(false);
     }
-    /// How much longer the screen stays as the first `send` found it ([`Self::unmoved_after_send`]).
     fn unmoved_for(&self) -> Option<Duration> {
         let (hold, sent) = self.unmoved_after_send.zip(self.first_send_at)?;
         hold.checked_sub(run_since(self.waits.as_deref(), sent))
             .filter(|left| !left.is_zero())
     }
-    /// The content seq the next read will carry ([`Self::screen_json`]): the
-    /// screen it serves again while one is held, else the next.
     fn next_read_seq(&self) -> u64 {
         let redrawn = self
             .redrawn_after_reads
@@ -1198,8 +1194,6 @@ impl Mock {
         };
         self.screen_gens.get(&i).map_or(seq, |&(_, s)| s)
     }
-    /// A settle's latch (`OK idle <seq>`): the seq of the read after it, so that read shows
-    /// the screen the settle latched on, or one before it ([`Self::idle_latch_behind`]).
     fn idle_latched(&self) -> String {
         let seq = self.next_read_seq();
         let seq = if self.idle_latch_behind {
@@ -1241,7 +1235,6 @@ impl Mock {
         } else if self.held() && !redrawn
             || tail.is_none() && after_tail && self.whole_sees_the_tail && self.served > 0
         {
-            // The last screen is served again past the script's end.
             (self.served - 1).min(self.screens.len() - 1)
         } else {
             let i = self.served.min(self.screens.len() - 1);
@@ -2281,7 +2274,6 @@ impl Mock {
                 if self.served < self.screens.len() && !stale {
                     return Ok(ok("OK seq\n"));
                 }
-                // The countdown on the last screen ticks: the next second.
                 if self.countdown_ticks && !stale && self.countdown_left.is_some_and(|l| l > 0) {
                     return Ok(ok("OK seq\n"));
                 }
@@ -2591,7 +2583,6 @@ impl Mock {
                 let line = self.status_line();
                 Ok(ok(&line))
             }
-            // The program's own OSC title, whatever is pinned over it.
             "title" if tail.is_empty() && self.title_refused => {
                 Ok(err("unknown verb 'title' (help lists them)"))
             }
@@ -3594,15 +3585,6 @@ fn a_read_still_open_after_the_rereads_is_output_arriving() {
     );
 }
 
-/// An idle read with no evidence is no point until it has stood (I1 of
-/// `docs/measured/idle-no-evidence-2026-10-22.md`). MEASURED: Muse Code 1.4.10's status row
-/// still bare after its glyph cycled (`◈ Thinking`), read idle with no evidence under its
-/// composer. Read once and the turn runs on: the turn's end decides. One that stands is the
-/// point NO_EVIDENCE_HOLD after its first read, whether it holds still, animates, or changes
-/// just before the hold ends and then animates (a settle latched at 0.99 s, the next running to
-/// its cap: 2.49 s before each settle was capped). NEGATIVE CONTROL: an end with evidence is the
-/// point at its one read. MUTANTS: the hold never taken; a hold that never ends; a hold not ended
-/// by a busy read; the settles not capped.
 #[test]
 fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
     use aterm_phase::muse::fixtures as u;
@@ -3621,9 +3603,6 @@ fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
         reader.phase_authoritative(&end, &Phase::Idle),
         "the end is evidence"
     );
-    // The turn as read, the requests, and the time from the first read to the point.
-    // `await gone` judged on the screen to come, as the server does: a busy screen after a busy
-    // one holds the wait its whole step.
     let run_idle = |screens: Vec<Vec<String>>, idle_after: &[Duration]| {
         let mut m = Mock::new(screens);
         m.gone_on_next = true;
@@ -3639,7 +3618,6 @@ fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
         (t, m.requests, took)
     };
     let run = |screens: Vec<Vec<String>>| run_idle(screens, &[]);
-    // The request after the first read: the short settle where that read was held.
     let after_first_read = |requests: &[String]| {
         let first = requests
             .iter()
@@ -3657,8 +3635,6 @@ fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
         after_first_read(&requests).starts_with("await idle 500"),
         "{requests:#?}"
     );
-    // A busy read between two such readings ends the first: the second's hold starts afresh,
-    // though the busy reads between stood longer than the hold.
     let (t, requests, took) = run(vec![
         cycled.clone(),
         busy.clone(),
@@ -3673,7 +3649,6 @@ fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
         "the turn's end decides: {requests:#?}"
     );
     assert!(took > NO_EVIDENCE_HOLD * 2, "{took:?} {requests:#?}");
-    // The same reading standing is the point once it stood the hold.
     let (t, requests, took) = run(vec![cycled.clone()]);
     assert_eq!(t.phase, Phase::Idle, "{requests:#?}");
     assert!(
@@ -3684,9 +3659,6 @@ fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
     assert!(told.contains(&took), "{took:?} {requests:#?}");
     let reads = requests.iter().filter(|r| r.starts_with("text")).count();
     assert!(reads >= 2, "read again before it is taken: {requests:#?}");
-    // Told as the hold ends, however the settles between go: a screen that holds still (each
-    // settle latching at 0.5 s), one that animates (none latching), and one that changed 0.49 s
-    // into the first settle (latching at 0.99 s) and then animates.
     let never = Duration::from_secs(10);
     for (idle_after, reads_then) in [
         (
@@ -3705,7 +3677,6 @@ fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
         let reads = requests.iter().filter(|r| r.starts_with("text")).count();
         assert_eq!(reads, reads_then, "{idle_after:?}: {requests:#?}");
     }
-    // NEGATIVE CONTROL: an end with evidence, at its first read.
     let (t, requests, _) = run(vec![end.clone()]);
     assert_eq!(
         (t.phase, &t.screen.rows),
@@ -3716,15 +3687,6 @@ fn an_idle_read_with_no_evidence_is_no_point_until_it_holds_still() {
     assert_eq!(reads, 1, "{requests:#?}");
 }
 
-/// Muse Code's end under its running title is held until the title rests (I2 of
-/// `docs/measured/idle-no-evidence-2026-10-22.md`). MEASURED: after the reply Muse Code 1.4.10
-/// runs its end-of-turn review (0.5 to 4.4 s measured) with the reply's end whole and nothing
-/// else moving; only its title's spinner (`⠙ proj`, `⠹ proj`, …) says the run goes on, and the
-/// title rests (`proj`) at the run's end. The read is held, one `title` read each, until the
-/// title rests, and so under a pinned title (a hold that read `status`'s `subject=` never held a
-/// pinned tab, `ie-fb`). NEGATIVE CONTROLS: a resting title and no title are the point at the
-/// first read; Claude Code's reader asks none. A title that never rests is held TITLE_HOLD.
-/// MUTANTS: no hold; a hold with no cap; the pinned subject read.
 #[test]
 fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
     use aterm_phase::muse::fixtures as u;
@@ -3749,7 +3711,6 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
         let (t, requests, took, _) = run_pinned(rows, titles, None);
         (t, requests, took)
     };
-    // Reads of a title, by either verb that can tell one.
     let reads = |r: &[String]| r.iter().filter(|r| *r == "title" || *r == "status").count();
     let turning = [Some("⠙ proj"), Some("⠹ proj"), Some("⠸ proj"), Some("proj")];
     for pinned in [None, Some("land-d")] {
@@ -3759,7 +3720,6 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
             (Phase::Idle, &end, false),
             "{pinned:?}"
         );
-        // Told once the title rested, not before: every title of the run read.
         assert_eq!(unread, 0, "{pinned:?}: {requests:#?}");
         assert_eq!(reads(&requests), 4, "{pinned:?}: {requests:#?}");
         let first = requests
@@ -3775,7 +3735,6 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
             "each held read waits the short settle: {pinned:?}: {requests:#?}"
         );
     }
-    // NEGATIVE CONTROLS.
     for titles in [[Some("proj")], [None]] {
         let (t, requests, _) = run(&end, &titles);
         assert_eq!((t.phase, &t.screen.rows), (Phase::Idle, &end), "{titles:?}");
@@ -3785,7 +3744,6 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
     let (t, requests, _) = run(&claude, &[Some("⠙ proj")]);
     assert_eq!(t.phase, Phase::Idle);
     assert_eq!(reads(&requests), 0, "{requests:#?}");
-    // The hang detector: a title that never rests.
     let (t, requests, took) = run(&end, &[Some("⠙ proj")]);
     assert_eq!(
         (t.phase, &t.screen.rows, t.timed_out),
@@ -3798,7 +3756,6 @@ fn a_muse_end_under_its_running_title_is_held_until_the_title_rests() {
     );
 }
 
-/// The title hold's run under one held end, counted for the screens and titles it serves.
 struct TitleRun {
     turn: Turn,
     requests: Vec<String>,
@@ -3865,12 +3822,6 @@ fn title_reads(requests: &[String]) -> usize {
     requests.iter().filter(|r| *r == "title").count()
 }
 
-/// The title hold's hang detector counts from the hold now running: a busy read ends a hold. A
-/// turn whose first end-of-turn review was held, then worked on past TITLE_HOLD (Muse Code's
-/// `◆ Double checking` going on into more work), is held again at its next review until the
-/// title rests: every title read and nothing noted. NEGATIVE CONTROL: the same turn with no busy
-/// spell between holds the one end until the title rests. MUTANT: a hold a busy read does not
-/// end takes the second review's pause as the end at its first read, its titles unread.
 #[test]
 fn a_title_hold_is_counted_from_the_review_it_holds() {
     use aterm_phase::muse::fixtures as u;
@@ -3896,7 +3847,6 @@ fn a_title_hold_is_counted_from_the_review_it_holds() {
         r.requests
     );
     assert!(r.noted.is_empty(), "{:#?}", r.noted);
-    // NEGATIVE CONTROL.
     let r = title_run(vec![end.clone()], &turning, false);
     assert_eq!(
         (r.turn.phase, r.unread, title_reads(&r.requests)),
@@ -3904,14 +3854,6 @@ fn a_title_hold_is_counted_from_the_review_it_holds() {
     );
 }
 
-/// What the title hold holds, what it reads as no run, and what it notes (I2 of
-/// `docs/measured/idle-no-evidence-2026-10-22.md`). MEASURED: Muse Code 1.4.10's reply that ends
-/// on a question (`Which do you prefer (1 or 2)?`), read as a question: under a running title it
-/// is held as an idle end is, so no answer is typed into the review. A `title` the host refuses
-/// says no run: the end is told at its first read. A title still turning TITLE_HOLD into the
-/// hold lets the end be taken with one NOTE; a title that rests notes nothing. MUTANTS: a hold of
-/// idle reads alone takes the question in the review; a refused read taken as a running title
-/// holds the end TITLE_HOLD; the NOTE never written.
 #[test]
 fn a_title_hold_holds_a_question_and_notes_its_hang() {
     use aterm_phase::muse::fixtures as u;
@@ -3933,12 +3875,10 @@ fn a_title_hold_holds_a_question_and_notes_its_hang() {
         "{:#?}",
         r.requests
     );
-    // A refused title: no run, the end at its first read.
     let r = title_run(vec![end.clone()], &["⠙ proj"], true);
     assert_eq!((r.turn.phase, &r.turn.screen.rows), (Phase::Idle, &end));
     assert_eq!(title_reads(&r.requests), 1, "{:#?}", r.requests);
     assert!(r.took < Duration::from_secs(1), "{:?}", r.took);
-    // The hang detector's NOTE, once; none where the title rests.
     let r = title_run(vec![end.clone()], &["⠙ proj"], false);
     assert_eq!((r.turn.phase, r.turn.timed_out), (Phase::Idle, false));
     assert!(r.took >= TITLE_HOLD, "{:?}", r.took);
@@ -4626,17 +4566,6 @@ fn render_prompt_prints_the_notes_after_the_description_and_before_classify() {
     assert!(!out.contains("\nnote "), "{out}");
 }
 
-/// A box's `classify` word (the EVENT line's `classify=`, the phase lines'
-/// `classify`) is the read-only rule's verdict over every reading of the
-/// box's rows ([`readings_read_only`]), not the classifier's word on the
-/// joined command: the MEASURED 2.1.307 too-many box (`echo` and 65
-/// `$(true)` wrapped into barred rows), whose joined command the classifier
-/// reads as a read, is `not-read-only` on its newline reading; a one-row
-/// `echo \  #; tee x` (a read to the classifier, a `tee x` write under the
-/// blank the screen cannot show) is `not-read-only` as not read as drawn.
-///
-/// NEGATIVE CONTROL: the one-row `git log --oneline -5` box says
-/// `read-only` on both lines.
 #[test]
 fn a_boxs_classify_word_is_the_read_only_rules_verdict_on_its_readings() {
     use crate::supervise::classify::classify_command;
@@ -4681,7 +4610,6 @@ fn a_boxs_classify_word_is_the_read_only_rules_verdict_on_its_readings() {
             "{out}"
         );
     }
-    // NEGATIVE CONTROL
     let turn = turn_for(bash_one_row());
     let event = event_line(&turn, &[]);
     assert!(
@@ -4692,12 +4620,6 @@ fn a_boxs_classify_word_is_the_read_only_rules_verdict_on_its_readings() {
     assert!(out.contains("\nclassify read-only\n"), "{out}");
 }
 
-/// A Bash box whose rows were not read whole (the box parsed, its v2 rows
-/// not: no verdict) is never called read-only on the phase lines: `classify
-/// not-read-only the box's command was not read whole`.
-///
-/// NEGATIVE CONTROL: the same prompt with the rule's `Ok` verdict says
-/// `classify read-only`, and a box of another kind says no `classify`.
 #[test]
 fn a_bash_box_not_read_whole_is_never_called_read_only() {
     let bash = Prompt {
@@ -4713,7 +4635,6 @@ fn a_bash_box_not_read_whole_is_never_called_read_only() {
         "{out}"
     );
     assert!(!out.contains("classify read-only"), "{out}");
-    // NEGATIVE CONTROL
     let out = render_prompt(&bash, None, Some(Ok(())));
     assert!(out.contains("\nclassify read-only\n"), "{out}");
     let other = Prompt {
@@ -8271,7 +8192,6 @@ fn reset_violations(m: &Mock, host: &ResetHost) -> Vec<String> {
             }
             (ResetAt::Dialog, "down" | "up" | "enter") => {
                 if p.key == "enter" && grant {
-                    // The grant row entered with no claim in flight.
                     "TakeRow"
                 } else {
                     "PressWait"
@@ -9097,9 +9017,6 @@ mod engine {
         use super::*;
         include!("run_box_key_tests.rs");
     }
-    /// A hold never runs a box into the vendor's auto-deny
-    /// (`run_box_hold_tests.rs`, `DENY_MARGIN`), over this module's box
-    /// helpers, with its Tier-1 bind to `SupervisorBoxHold`.
     mod box_hold {
         use super::*;
         include!("run_box_hold_tests.rs");
@@ -9111,10 +9028,6 @@ mod box_head_loop {
     include!("box_head_tests.rs");
 }
 
-// A module file, not an `include!` in an inline `mod turn_end`: rustc reads an
-// included file's `#[path]` modules from the included file's directory and
-// rustfmt from the inline module's (`turn_end/`), so only a module file names
-// the same files to both.
 #[path = "turn_end_loop_tests.rs"]
 mod turn_end;
 

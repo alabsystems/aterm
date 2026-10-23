@@ -4,9 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/windows/monitor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Update BOOL/handle bindings and retain shared monitor handles with windows-sys 0.61.
-
 use std::collections::{BTreeSet, VecDeque};
 use std::hash::Hash;
 use std::{io, mem, ptr};
@@ -33,7 +30,6 @@ pub struct VideoModeHandle {
     pub(crate) bit_depth: u16,
     pub(crate) refresh_rate_millihertz: u32,
     pub(crate) monitor: MonitorHandle,
-    // DEVMODEW is huge so we box it to avoid blowing up the size of aterm_window::window::Fullscreen
     pub(crate) native_video_mode: Box<DEVMODEW>,
 }
 
@@ -88,11 +84,6 @@ impl VideoModeHandle {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, PartialOrd, Ord)]
 pub struct MonitorHandle(HMONITOR);
-
-// Send is not implemented for HMONITOR, we have to wrap it and implement it manually.
-// For more info see:
-// https://github.com/retep998/winapi-rs/issues/360
-// https://github.com/retep998/winapi-rs/issues/396
 
 unsafe impl Send for MonitorHandle {}
 unsafe impl Sync for MonitorHandle {}
@@ -220,9 +211,6 @@ impl MonitorHandle {
 
     #[inline]
     pub fn video_modes(&self) -> impl Iterator<Item = VideoModeHandle> {
-        // EnumDisplaySettingsExW can return duplicate values (or some of the
-        // fields are probably changing, but we aren't looking at those fields
-        // anyway), so we're using a BTreeSet deduplicate
         let mut modes = BTreeSet::<RootVideoModeHandle>::new();
         let mod_map = |mode: RootVideoModeHandle| mode.video_mode;
 
@@ -248,7 +236,6 @@ impl MonitorHandle {
                 DM_BITSPERPEL | DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
             assert!(has_flag(mode.dmFields, REQUIRED_FIELDS));
 
-            // Use Ord impl of RootVideoModeHandle
             modes.insert(RootVideoModeHandle {
                 video_mode: VideoModeHandle {
                     size: (mode.dmPelsWidth, mode.dmPelsHeight),

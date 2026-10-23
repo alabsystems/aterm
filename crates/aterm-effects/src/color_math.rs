@@ -80,9 +80,23 @@ pub(crate) fn relative_luminance_table() -> &'static RelativeLuminanceTable {
 }
 
 #[inline]
+pub(crate) fn relative_luminance_rgb(
+    table: &RelativeLuminanceTable,
+    r: usize,
+    g: usize,
+    b: usize,
+) -> f32 {
+    (table.red[r & 0xff] + table.green[g & 0xff]) + table.blue[b & 0xff]
+}
+
+#[inline]
 pub(crate) fn relative_luminance_with(table: &RelativeLuminanceTable, rgb: u32) -> f32 {
-    (table.red[((rgb >> 16) & 0xff) as usize] + table.green[((rgb >> 8) & 0xff) as usize])
-        + table.blue[(rgb & 0xff) as usize]
+    relative_luminance_rgb(
+        table,
+        ((rgb >> 16) & 0xff) as usize,
+        ((rgb >> 8) & 0xff) as usize,
+        (rgb & 0xff) as usize,
+    )
 }
 
 /// WCAG relative luminance of a `0x00RRGGBB` colour.

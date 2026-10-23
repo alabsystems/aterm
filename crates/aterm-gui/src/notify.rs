@@ -172,16 +172,11 @@ fn deliver(
         return;
     }
     let title = title.unwrap_or("aterm");
-    let notifier = notifier_path();
 
-    match way_for(
-        center,
-        running_bundled(),
-        notifier.is_some(),
-        alerts,
-        &ASKED,
-        wanted,
-    ) {
+    // A bundle's voice is aterm's own: posted in-process as the bundle, or
+    // not at all. A center that would not take the notice, or none to post
+    // through, is one log line, never a subprocess.
+    match way_for(center, running_bundled(), alerts, &ASKED, wanted) {
         Route::Center => {
             let posted = center.post(&crate::notice_center::Notice {
                 title,
@@ -230,24 +225,18 @@ fn deliver(
             );
             return;
         }
-        Route::Notifier | Route::Osascript => {}
+        Route::Osascript => {}
     }
 
-    let tn = notifier.map(|notifier| {
-        let mut tn = aterm_uds::spawnfd::command(notifier);
-        notifier_args(&mut tn, title, body);
-        tn.status()
-    });
-    if tn.is_some_and(|status| status.is_ok()) {
-        return;
-    }
-
+    // A bare binary: the OS's osascript, by its absolute path (an aterm the Dock started has
+    // launchd's PATH). Body and title land in an AppleScript string literal, so both are
+    // escaped, and the script is one `-e` argv entry, never a shell string.
     let script = format!(
         "display notification \"{}\" with title \"{}\"",
         applescript_escape(body),
         applescript_escape(title),
     );
-    let _ = aterm_uds::spawnfd::command("osascript")
+    let _ = aterm_uds::spawnfd::command(aterm_uds::os_path!("osascript"))
         .arg("-e")
         .arg(script)
         .stdin(Stdio::null())
@@ -266,7 +255,6 @@ const ASK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 fn way_for(
     center: crate::notice_center::NoticeCenter,
     bundled: bool,
-    notifier: bool,
     alerts: bool,
     asked: &AtomicBool,
     wanted: impl Fn() -> bool,
@@ -274,7 +262,6 @@ fn way_for(
     match route(
         center.answer(),
         bundled,
-        notifier,
         alerts,
         asked.load(Ordering::Acquire),
     ) {
@@ -290,7 +277,7 @@ fn way_for(
         aterm_log::info!("notices: macOS has not answered aterm's ask within {ASK_WAIT:?}");
     }
     learn_voice(center, || wake(crate::Wake::NoticeVoice));
-    match route(center.answer(), bundled, notifier, alerts, true) {
+    match route(center.answer(), bundled, alerts, true) {
         Route::Center if !wanted() => Route::Lapsed,
         way => way,
     }
@@ -306,7 +293,6 @@ enum Route {
     #[cfg(target_os = "macos")]
     Lapsed,
     Centerless,
-    Notifier,
     Osascript,
 }
 
@@ -314,19 +300,17 @@ enum Route {
 const fn route(
     center: crate::notice_center::Center,
     bundled: bool,
-    notifier: bool,
     alerts: bool,
     asked: bool,
 ) -> Route {
     use crate::notice_center::Center;
-    match (center, notifier) {
-        (Center::Granted, _) => Route::Center,
-        (Center::Refused, _) => Route::Withheld,
-        (Center::Unasked, _) if alerts && !asked => Route::Ask,
-        (Center::Unasked, _) => Route::Unasked,
-        (Center::Absent, _) if bundled => Route::Centerless,
-        (Center::Absent, true) => Route::Notifier,
-        (Center::Absent, false) => Route::Osascript,
+    match center {
+        Center::Granted => Route::Center,
+        Center::Refused => Route::Withheld,
+        Center::Unasked if alerts && !asked => Route::Ask,
+        Center::Unasked => Route::Unasked,
+        Center::Absent if bundled => Route::Centerless,
+        Center::Absent => Route::Osascript,
     }
 }
 
@@ -337,53 +321,6 @@ fn running_bundled() -> bool {
     *BUNDLED.get_or_init(|| {
         consent::fence_exe().is_some_and(|exe| consent::path_is_in_app_bundle(&exe))
     })
-}
-
-#[cfg(target_os = "macos")]
-fn notifier_args(tn: &mut aterm_uds::spawnfd::Command, title: &str, body: &str) {
-    use aterm_uds::spawnfd::Stdio;
-    tn.arg("-title")
-        .arg(title)
-        .arg("-message")
-        .arg(body)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-}
-
-#[cfg(target_os = "macos")]
-const NOTIFIER_HOMES: [&str; 2] = ["/opt/homebrew/bin", "/usr/local/bin"];
-
-#[cfg(target_os = "macos")]
-fn notifier_path() -> Option<&'static std::path::Path> {
-    use std::path::PathBuf;
-    static FOUND: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
-    if cfg!(test) {
-        return None;
-    }
-    FOUND
-        .get_or_init(|| {
-            let process = std::env::var_os("PATH");
-            let near = process
-                .iter()
-                .flat_map(std::env::split_paths)
-                .chain(NOTIFIER_HOMES.iter().map(PathBuf::from));
-            find_notifier(near).or_else(|| {
-                find_notifier(std::env::split_paths(crate::spawn::atpkg_child_path_once()))
-            })
-        })
-        .as_deref()
-}
-
-#[cfg(all(unix, any(target_os = "macos", test)))]
-fn find_notifier(dirs: impl IntoIterator<Item = std::path::PathBuf>) -> Option<std::path::PathBuf> {
-    use std::os::unix::fs::PermissionsExt as _;
-    dirs.into_iter()
-        .map(|dir| dir.join("terminal-notifier"))
-        .find(|path| {
-            std::fs::metadata(path)
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
 }
 
 #[cfg(target_os = "macos")]
@@ -419,19 +356,18 @@ fn platform_voice() -> Option<crate::status_item::NoticeVoice> {
 const fn voice_of(
     center: crate::notice_center::Center,
     bundled: bool,
-    notifier: bool,
     bundle_id: bool,
 ) -> crate::status_item::NoticeVoice {
     use crate::status_item::{NoticeFallback, NoticeVoice};
-    let fallback = match (bundled, notifier) {
-        (true, _) => NoticeFallback::Withheld { named: bundle_id },
-        (false, true) => NoticeFallback::Notifier,
-        (false, false) => NoticeFallback::ScriptEditor,
+    let fallback = if bundled {
+        NoticeFallback::Withheld { named: bundle_id }
+    } else {
+        NoticeFallback::ScriptEditor
     };
     NoticeVoice { center, fallback }
 }
 
-/// LEARN [`own_voice`] off the event loop, then call `then` (the App marks its status item dirty, so the hover says it, and becomes the center's delegate): the notifier lookup can wait on the login shell, the bundle id reads its `Info.plist` and macOS's answer is a wait on the center, so a thread of its own does all three.
+/// LEARN [`own_voice`] off the event loop, then call `then` (the App marks its status item dirty, so the hover says it, and becomes the center's delegate): the bundle id reads its `Info.plist` and macOS's answer is a wait on the center, so a thread of its own does both.
 #[cfg(target_os = "macos")]
 pub(crate) fn learn_voice(
     center: crate::notice_center::NoticeCenter,
@@ -447,7 +383,6 @@ pub(crate) fn learn_voice(
             let voice = voice_of(
                 center.answer(),
                 running_bundled(),
-                notifier_path().is_some(),
                 crate::signing_identity::running_bundle_id().is_some(),
             );
             *VOICE
@@ -1311,23 +1246,17 @@ mod tests {
             Center::Granted,
         ] {
             let voice = |fallback| NoticeVoice { center, fallback };
-            for notifier in [true, false] {
-                for named in [true, false] {
-                    assert_eq!(
-                        super::voice_of(center, true, notifier, named),
-                        voice(NoticeFallback::Withheld { named }),
-                        "bundled, notifier={notifier}"
-                    );
-                }
+            for named in [true, false] {
+                assert_eq!(
+                    super::voice_of(center, true, named),
+                    voice(NoticeFallback::Withheld { named }),
+                    "bundled"
+                );
+                assert_eq!(
+                    super::voice_of(center, false, named),
+                    voice(NoticeFallback::ScriptEditor)
+                );
             }
-            assert_eq!(
-                super::voice_of(center, false, true, false),
-                voice(NoticeFallback::Notifier)
-            );
-            assert_eq!(
-                super::voice_of(center, false, false, false),
-                voice(NoticeFallback::ScriptEditor)
-            );
         }
         assert_eq!(
             super::own_voice(),
@@ -1350,57 +1279,47 @@ mod tests {
             status_answer(1),
             status_answer(-1),
         ];
-        for notifier in [true, false] {
-            for alerts in [true, false] {
-                for asked in [true, false] {
-                    let case = format!("notifier={notifier} alerts={alerts} asked={asked}");
+        for alerts in [true, false] {
+            for asked in [true, false] {
+                let case = format!("alerts={alerts} asked={asked}");
+                assert_eq!(
+                    route(Center::Granted, true, alerts, asked),
+                    Route::Center,
+                    "{case}"
+                );
+                for refused in [Center::Refused, status_answer(1), status_answer(-1)] {
                     assert_eq!(
-                        route(Center::Granted, true, notifier, alerts, asked),
-                        Route::Center,
+                        route(refused, true, alerts, asked),
+                        Route::Withheld,
                         "{case}"
-                    );
-                    for refused in [Center::Refused, status_answer(1), status_answer(-1)] {
-                        assert_eq!(
-                            route(refused, true, notifier, alerts, asked),
-                            Route::Withheld,
-                            "{case}"
-                        );
-                    }
-                    let unasked = if alerts && !asked {
-                        Route::Ask
-                    } else {
-                        Route::Unasked
-                    };
-                    assert_eq!(
-                        route(Center::Unasked, true, notifier, alerts, asked),
-                        unasked,
-                        "{case}"
-                    );
-                    assert_eq!(
-                        route(Center::Absent, true, notifier, alerts, asked),
-                        Route::Centerless,
-                        "Absent while bundled: {case}"
-                    );
-                    for answer in answers {
-                        assert!(
-                            !matches!(
-                                route(answer, true, notifier, alerts, asked),
-                                Route::Notifier | Route::Osascript
-                            ),
-                            "a bundle reached a subprocess: {answer:?} {case}"
-                        );
-                    }
-                    let fallback = if notifier {
-                        Route::Notifier
-                    } else {
-                        Route::Osascript
-                    };
-                    assert_eq!(
-                        route(Center::Absent, false, notifier, alerts, asked),
-                        fallback,
-                        "a bare binary: {case}"
                     );
                 }
+                let unasked = if alerts && !asked {
+                    Route::Ask
+                } else {
+                    Route::Unasked
+                };
+                assert_eq!(
+                    route(Center::Unasked, true, alerts, asked),
+                    unasked,
+                    "{case}"
+                );
+                assert_eq!(
+                    route(Center::Absent, true, alerts, asked),
+                    Route::Centerless,
+                    "Absent while bundled: {case}"
+                );
+                for answer in answers {
+                    assert!(
+                        !matches!(route(answer, true, alerts, asked), Route::Osascript),
+                        "a bundle reached a subprocess: {answer:?} {case}"
+                    );
+                }
+                assert_eq!(
+                    route(Center::Absent, false, alerts, asked),
+                    Route::Osascript,
+                    "a bare binary: {case}"
+                );
             }
         }
     }
@@ -1464,16 +1383,13 @@ mod tests {
             let _ = answered.send(());
         }));
         assert_eq!(
-            route(center.answer(), true, true, true, true),
+            route(center.answer(), true, true, true),
             Route::Unasked,
             "no wait: macOS has not answered yet"
         );
         click();
         assert_eq!(answer_came.recv_timeout(HANG), Ok(()));
-        assert_eq!(
-            route(center.answer(), true, true, true, true),
-            Route::Center
-        );
+        assert_eq!(route(center.answer(), true, true, true), Route::Center);
 
         let notices = |answers: Option<Center>, alerts: bool, closes: bool| {
             macos(answers);
@@ -1488,10 +1404,10 @@ mod tests {
             });
             let asked = AtomicBool::new(false);
             let ways = [
-                way_for(center, true, true, alerts, &asked, || {
+                way_for(center, true, alerts, &asked, || {
                     WANTED.load(Ordering::Acquire)
                 }),
-                way_for(center, true, false, alerts, &asked, || true),
+                way_for(center, true, alerts, &asked, || true),
             ];
             if let Some(person) = person {
                 person.join().expect("the person clicks");
@@ -1528,34 +1444,6 @@ mod tests {
             ([Route::Unasked, Route::Unasked], 0, false),
             "notices off: a program's notification asks nothing"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn terminal_notifier_is_found_where_it_is_installed() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let root = std::env::temp_dir().join(format!("aterm-notifier-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        let (empty, plain, brew) = (root.join("empty"), root.join("plain"), root.join("brew"));
-        for dir in [&empty, &plain, &brew] {
-            std::fs::create_dir_all(dir).unwrap();
-        }
-        let write = |dir: &std::path::Path, mode: u32| {
-            let path = dir.join("terminal-notifier");
-            std::fs::write(&path, b"#!/bin/sh\n").unwrap();
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            path
-        };
-        let _ = write(&plain, 0o644);
-        let found = write(&brew, 0o755);
-        let dirs = || vec![empty.clone(), plain.clone(), brew.clone()];
-        assert_eq!(super::find_notifier(dirs()), Some(found));
-        assert_eq!(
-            super::find_notifier(vec![empty.clone(), plain.clone()]),
-            None
-        );
-        assert_eq!(super::find_notifier(Vec::new()), None);
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

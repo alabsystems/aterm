@@ -18,13 +18,10 @@ use aterm_objc::{Id, RcBlock, Sel, msg, ns_string, sel};
 unsafe extern "C" {
     fn dispatch_queue_create(label: *const std::ffi::c_char, attr: *const c_void) -> *mut c_void;
     fn dispatch_release(obj: *mut c_void);
-    /// `dispatch_sync(queue, ^{ … })`.
     fn dispatch_sync(queue: *mut c_void, block: *mut c_void);
-    /// `dispatch_apply(count, queue, ^(size_t i){ … })`.
     fn dispatch_apply(iterations: usize, queue: *mut c_void, block: *mut c_void);
 }
 
-/// A payload whose drop is observable.
 struct DropSpy(Arc<AtomicUsize>);
 
 impl Drop for DropSpy {
@@ -44,8 +41,7 @@ fn queue() -> *mut c_void {
 fn libdispatch_invokes_an_arity_zero_block() {
     let hits = Arc::new(AtomicUsize::new(0));
     let seen = Arc::clone(&hits);
-    // SAFETY: `dispatch_sync` calls a `void (^)(void)` block, which is exactly the `Fn() -> ()`
-    // prototype declared here.
+    // SAFETY: `dispatch_sync` calls a `void (^)(void)` block.
     let block = unsafe {
         RcBlock::new0(move || {
             seen.fetch_add(1, Ordering::SeqCst);
@@ -53,8 +49,7 @@ fn libdispatch_invokes_an_arity_zero_block() {
     }
     .expect("_Block_copy produced a heap block");
     let q = queue();
-    // SAFETY: `q` is a live queue and `block` a live heap block of the right
-    // signature; `dispatch_sync` runs it to completion before returning.
+    // SAFETY: `q` is a live queue and `block` a live heap block of the right signature.
     unsafe {
         dispatch_sync(q, block.as_ptr());
         dispatch_sync(q, block.as_ptr());
@@ -67,8 +62,7 @@ fn libdispatch_invokes_an_arity_zero_block() {
 fn libdispatch_invokes_an_arity_one_block_with_its_argument() {
     let sum = Arc::new(AtomicUsize::new(0));
     let acc = Arc::clone(&sum);
-    // SAFETY: `dispatch_apply` calls a `void (^)(size_t)` block, the `Fn(usize)` prototype declared
-    // here.
+    // SAFETY: `dispatch_apply` calls a `void (^)(size_t)` block.
     let block = unsafe {
         RcBlock::new1(move |i: usize| {
             acc.fetch_add(i, Ordering::SeqCst);
@@ -88,12 +82,10 @@ fn libdispatch_invokes_an_arity_one_block_with_its_argument() {
 fn foundation_invokes_an_arity_two_block() {
     let lines = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let sink = Arc::clone(&lines);
-    // SAFETY: prototype matches Foundation's `enumerateLinesUsingBlock:`, which passes a live
-    // NSString `line` for the call.
+    // SAFETY: prototype matches Foundation's `enumerateLinesUsingBlock:`.
     let block = unsafe {
         RcBlock::new2(move |line: Id, _stop: *mut aterm_objc::Bool| {
-            // SAFETY (inherited from the enclosing block): Foundation passes a live, autoreleased
-            // NSString for the duration of the call; the bytes are copied out before returning.
+            // SAFETY: Foundation passes a live, autoreleased NSString for the duration of the call.
             sink.lock()
                 .expect("uncontended")
                 .push(aterm_objc::ns_string_to_rust(line));
@@ -102,8 +94,7 @@ fn foundation_invokes_an_arity_two_block() {
     .expect("_Block_copy produced a heap block");
 
     let text = ns_string("alpha\nbeta\ngamma").expect("NSString");
-    // SAFETY: `enumerateLinesUsingBlock:` is `-(void)` taking one block argument; `text` is a
-    // live NSString.
+    // SAFETY: `enumerateLinesUsingBlock:` is `-(void)` taking one block argument.
     unsafe {
         let enumerate: unsafe extern "C-unwind" fn(Id, Sel, *mut c_void) = msg();
         enumerate(text.id(), sel!(enumerateLinesUsingBlock:), block.as_ptr());
@@ -128,8 +119,7 @@ fn a_returning_block_hands_its_value_back() {
         reserved: i32,
         invoke: unsafe extern "C" fn(*mut c_void, Id) -> Id,
     }
-    // SAFETY: the first four fields of every block are fixed ABI, and `block` is a live heap
-    // block built with an `id (^)(id)` invoke.
+    // SAFETY: the first four fields of every block are fixed ABI.
     let out = unsafe {
         let hdr = &*block.as_ptr().cast::<HeaderPrefix>();
         (hdr.invoke)(block.as_ptr(), expect)
@@ -163,7 +153,6 @@ fn a_retained_block_defers_the_dispose() {
 #[test]
 fn a_framework_block_is_called_through_its_header() {
     unsafe extern "C" {
-        /// `dispatch_block_create(flags, block)`.
         fn dispatch_block_create(flags: usize, block: *mut c_void) -> *mut c_void;
         fn _Block_release(block: *const c_void);
     }
@@ -206,9 +195,7 @@ fn a_framework_block_is_called_through_its_header() {
 
 #[test]
 fn a_named_prototype_builds_and_calls_its_block() {
-    /// `void (^)(NSUInteger, NSUInteger)`.
     type Pair = fn(usize, usize);
-    /// `void (^)(void)`.
     type Done = fn();
     let sum = Arc::new(AtomicUsize::new(0));
     let acc = Arc::clone(&sum);

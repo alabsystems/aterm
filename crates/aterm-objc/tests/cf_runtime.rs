@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm_objc::cf`'s two owners AT RUN TIME, on CoreFoundation alone.
-//!
-//! `cf_sdk.rs` proves the declarations are the headers'; this proves the
-//! owners balance their retains and the string reads out whole. `aterm-cg`
-//! has no run-time test: every CoreGraphics display call opens a WindowServer
-//! connection, so only a real aterm exercises it.
+//! Runtime tests for `aterm_objc::cf` CoreFoundation wrappers.
 
 #![cfg(target_os = "macos")]
 
@@ -105,15 +100,12 @@ fn cf_string(units: &[u16]) -> CFString {
 fn the_string_owner_reads_out_the_whole_string() {
     for s in [
         "",
-        // `IO32BitDirectPixels`, the string upstream winit's macOS `video_modes` compares.
         "--------RRRRRRRRGGGGGGGGBBBBBBBB",
         "é → 😀 (two bytes, three, four)",
     ] {
         let units: Vec<u16> = s.encode_utf16().collect();
         assert_eq!(cf_string(&units).to_string(), s);
     }
-    // A lone surrogate has no UTF-8 form: it reads as U+FFFD, and the rest of
-    // the string still comes back (a UTF-8 `CFStringGetBytes` stops there).
     let lone = [0xD800, u16::from(b'a')];
     assert_eq!(cf_string(&lone).to_string(), "\u{FFFD}a");
 }

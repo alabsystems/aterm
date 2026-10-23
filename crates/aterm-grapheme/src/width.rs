@@ -12,20 +12,6 @@ use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
 use crate::types::{Grapheme, GraphemeInfo};
 
 /// Calculate grapheme information for a string.
-///
-/// REQUIRES: `s` is valid UTF-8 (`&str` invariant).
-/// ENSURES: `result.byte_count == s.len()` and width/count fields are derived from grapheme iteration of `s`.
-///
-/// # Example
-///
-/// ```
-/// use aterm_grapheme::grapheme_width;
-///
-/// let info = grapheme_width("Hello 世界!");
-/// assert_eq!(info.grapheme_count, 9);
-/// assert_eq!(info.display_width, 11); // 7 ASCII + 2 wide chars
-/// ```
-/// use aterm_grapheme::grapheme_width;
 #[inline]
 pub fn grapheme_width(s: &str) -> GraphemeInfo {
     grapheme_width_inner(s, false)
@@ -71,14 +57,6 @@ fn grapheme_width_inner(s: &str, cjk: bool) -> GraphemeInfo {
 ///
 /// REQUIRES: `grapheme` is valid UTF-8 (`&str` invariant).
 /// ENSURES: returns a terminal cell width in the inclusive range `0..=2`.
-///
-/// A lone C0/C1 control is 1 (terminals advance past a rendered control); a
-/// cluster takes its first spacing character's width, except that an emoji base with
-/// VS16, a skin tone or a ZWJ is 2.
-///
-/// This is cluster presentation width. Use [`crate::GridColumns`] for terminal
-/// cursor columns: minimally-qualified `❤‍🔥` presents as 2 here while the grid
-/// keeps its narrow base's 1, and grid fold state can cross cluster boundaries.
 #[inline]
 pub fn grapheme_display_width(grapheme: &str) -> usize {
     grapheme_display_width_inner(grapheme, false)
@@ -107,23 +85,17 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
         return char_width_fn(first);
     }
 
-    // GB9b Prepend signs can precede the spacing base. Apply presentation
-    // rules to that base too, rather than only repairing the final width.
     let mut chars = spacing_chars(grapheme);
     let Some(first) = chars.next() else {
         return 0;
     };
     let second = chars.next();
 
-    // Multi-codepoint grapheme cluster. VS16 (U+FE0F) widens a text-default
-    // emoji, and only that: the grid's rule (`is_vs16_emoji_capable`), so `a️`
-    // and `✓️` stay one cell, as the grid draws them.
     if is_vs16_emoji_capable(first) && grapheme.contains('\u{FE0F}') {
         return 2;
     }
     let first_is_emoji = is_emoji_char(first) || is_vs16_emoji_capable(first);
 
-    // An emoji base with a skin tone, or an emoji ZWJ sequence, is wide.
     if first_is_emoji
         && (second.is_some_and(is_skin_tone_modifier)
             || second == Some('\u{200D}')
@@ -132,26 +104,11 @@ fn grapheme_display_width_inner(grapheme: &str, cjk: bool) -> usize {
         return 2;
     }
 
-    // Base + combining marks: the spacing base's width.
     char_width_fn(first).min(2)
 }
 
 /// [`grapheme_width`] with ambiguous-width characters sized by
 /// `config.ambiguous_width`.
-///
-/// # Example
-///
-/// ```
-/// use aterm_grapheme::grapheme_width_with_config;
-/// use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
-///
-/// let cjk = TextShapingConfig { ambiguous_width: AmbiguousWidth::Double, ..Default::default() };
-/// // Degree sign is ambiguous-width: 1 in single mode, 2 in double (CJK) mode
-/// let info = grapheme_width_with_config("\u{00B0}test", &cjk);
-/// assert_eq!(info.display_width, 6); // degree(2) + t(1) + e(1) + s(1) + t(1)
-/// ```
-/// use aterm_grapheme::grapheme_width_with_config;
-/// use aterm_types::text_shaping::{AmbiguousWidth, TextShapingConfig};
 #[inline]
 pub fn grapheme_width_with_config(s: &str, config: &TextShapingConfig) -> GraphemeInfo {
     grapheme_width_inner(s, is_cjk(config))
@@ -205,8 +162,7 @@ fn split_graphemes_inner(s: &str, cjk: bool) -> impl Iterator<Item = Grapheme<'_
     })
 }
 
-/// The cluster from its first spacing base. Ambiguous-width policy changes
-/// positive widths only, so the zero-width prefix is shared by both modes.
+/// The cluster from its first spacing base.
 #[inline]
 fn spacing_chars(grapheme: &str) -> impl Iterator<Item = char> + '_ {
     grapheme
@@ -214,8 +170,7 @@ fn spacing_chars(grapheme: &str) -> impl Iterator<Item = char> + '_ {
         .skip_while(|&ch| unicode_tables::char_width(ch) == 0)
 }
 
-/// Whether the spacing base [`is_emoji_char`]. A cluster with no spacing
-/// base retains the coarse first-character classification (such as VS16).
+/// Whether the spacing base [`is_emoji_char`].
 #[inline]
 fn is_emoji_grapheme(grapheme: &str) -> bool {
     spacing_chars(grapheme)
@@ -241,19 +196,12 @@ pub const fn is_emoji_char(c: char) -> bool {
 }
 
 /// Check if a character is a skin tone modifier.
-///
-/// Skin tone modifiers (Fitzpatrick scale) are U+1F3FB through U+1F3FF.
 #[inline]
 pub const fn is_skin_tone_modifier(c: char) -> bool {
     matches!(c, '\u{1F3FB}'..='\u{1F3FF}')
 }
 
 /// Whether `c` takes a Fitzpatrick skin-tone modifier (U+1F3FB..=U+1F3FF).
-///
-/// Exactly `Emoji_Modifier_Base` from Unicode 16.0.0 emoji-data.txt (UTS #51;
-/// 134 code points), the UCD version of [`crate::tables`]. The live write path
-/// (`try_combine_skin_tone_modifier`) and the scrollback materializer both
-/// fold skin tones on this, so a skin-toned emoji is one cell either way.
 #[must_use]
 #[inline]
 pub const fn is_emoji_modifier_base(c: char) -> bool {
@@ -303,8 +251,6 @@ pub const fn is_emoji_modifier_base(c: char) -> bool {
 }
 
 /// Check if a character is a regional indicator.
-///
-/// Regional indicators (A-Z) are used in pairs to create flag emoji.
 #[inline]
 pub const fn is_regional_indicator(c: char) -> bool {
     matches!(c, '\u{1F1E6}'..='\u{1F1FF}')

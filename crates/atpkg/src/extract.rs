@@ -83,9 +83,7 @@ pub(crate) enum FrameChecksum {
     Required,
 }
 
-/// Steps 2–4 of [`vet_entry`]: the pure component walk. Accepts only `Normal` segments
-/// (`.` dropped; `..` is traversal; a root/prefix component is an absolute escape) and
-/// refuses a path that names nothing.
+/// Steps 2–4 of [`vet_entry`].
 fn vet_components(raw: &Path) -> Result<PathBuf, ExtractReject> {
     // An absolute entry path can never be made relative to the root.
     if raw.is_absolute() {
@@ -106,8 +104,7 @@ fn vet_components(raw: &Path) -> Result<PathBuf, ExtractReject> {
     Ok(rel)
 }
 
-/// Drop the first `strip` components of an already-vetted relative path. `None` when
-/// nothing remains — the entry is skipped, as GNU tar skips it.
+/// Drop the first `strip` components of an already-vetted relative path.
 fn strip_leading(rel: &Path, strip: u32) -> Option<PathBuf> {
     let mut out = PathBuf::new();
     let mut dropped: u32 = 0;
@@ -134,8 +131,7 @@ fn leading_curdirs(raw: &Path) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
 }
 
-/// Step 5 of [`vet_entry`]: the join must still be under the root (defence in depth
-/// against any normalization surprise).
+/// Step 5 of [`vet_entry`].
 fn join_under(root: &Path, rel: &Path) -> Result<PathBuf, ExtractReject> {
     let dest = root.join(rel);
     if !dest.starts_with(root) {
@@ -279,8 +275,7 @@ impl From<io::Error> for ExtractError {
     }
 }
 
-/// Attach the failing operation and the path it was on to an I/O error — the context a
-/// bare `?` into [`ExtractError::Io`] throws away.
+/// Attach the failing operation and the path it was on to an I/O error ([`ExtractError::Io`]).
 fn io_at(err: io::Error, op: &'static str, path: &Path) -> ExtractError {
     ExtractError::Io {
         err,
@@ -356,8 +351,7 @@ impl std::fmt::Display for TooLargeReason {
 
 impl std::error::Error for TooLargeReason {}
 
-/// Map a tar entry type to our [`EntryKind`]; anything that is not a plain file,
-/// directory or link is treated as a disallowed kind (refused by [`vet_entry`]).
+/// Map a tar entry type to our [`EntryKind`] ([`vet_entry`]).
 const fn classify(ty: TarEntryType) -> EntryKind {
     match ty {
         TarEntryType::Regular | TarEntryType::Continuous => EntryKind::Regular,
@@ -377,13 +371,10 @@ pub const fn safe_mode(entry_mode: u32, is_dir: bool) -> u32 {
     }
 }
 
-/// The per-entry structural byte budget: the most decompressed bytes the tar reader may
-/// pull for one entry's non-content parts (header, padding, GNU longname/longlink or PAX
-/// extension body).
+/// The per-entry structural byte budget.
 const TAR_ENTRY_STRUCTURAL_BUDGET: u64 = 1 << 20;
 
-/// Marker error the [`CappedReader`] raises when the structural budget is exhausted, so
-/// extraction maps it to `TooLargeReason::StructuralBudget` wherever the over-read happens.
+/// Marker error the [`CappedReader`] raises when the structural budget is exhausted.
 #[derive(Debug)]
 struct SizeCapExceeded;
 
@@ -395,9 +386,8 @@ impl std::fmt::Display for SizeCapExceeded {
 
 impl std::error::Error for SizeCapExceeded {}
 
-/// Wraps the decompressor and bounds every byte the tar reader pulls against a shared,
-/// per-entry-reset budget, catching extension-header bodies the reader pulls inside its
-/// entry iterator before [`write_capped`] sees anything.
+/// Wraps the decompressor and bounds every byte the tar reader pulls against a shared
+/// ([`write_capped`]).
 struct CappedReader<R> {
     inner: R,
     budget: Rc<Cell<u64>>,
@@ -416,8 +406,7 @@ impl<R: Read> Read for CappedReader<R> {
     }
 }
 
-/// Translate a tar/io error into [`ExtractError`], mapping the [`CappedReader`]'s
-/// [`SizeCapExceeded`] marker (wherever in the stream it fired) to `TooLarge`.
+/// Translate a tar/io error into [`ExtractError`] ([`CappedReader`], [`SizeCapExceeded`]).
 fn map_tar_io(e: io::Error) -> ExtractError {
     if e.get_ref()
         .is_some_and(|inner| inner.is::<SizeCapExceeded>())
@@ -432,8 +421,7 @@ fn map_tar_io(e: io::Error) -> ExtractError {
     }
 }
 
-/// [`map_tar_io`] with the I/O half attributed to `op` on `path`; the cap half already
-/// carries its own reason, so it passes through untouched.
+/// [`map_tar_io`] with the I/O half attributed to `op` on `path`.
 fn map_tar_io_at(e: io::Error, op: &'static str, path: &Path) -> ExtractError {
     match map_tar_io(e) {
         ExtractError::Io { err, .. } => io_at(err, op, path),
@@ -441,12 +429,10 @@ fn map_tar_io_at(e: io::Error, op: &'static str, path: &Path) -> ExtractError {
     }
 }
 
-/// One node of the staged tree as the digest sees it: a regular file (one per inode) or
-/// a symlink (one per path — links share nothing).
+/// One node of the staged tree as the digest sees it.
 #[derive(Debug, Clone)]
 enum Node {
-    /// The folded permission bits (`platform::folded_mode`, masked to `0o7777`) and the
-    /// lowercase-hex content sha256.
+    /// The folded permission bits.
     File(u32, String),
     /// Lowercase-hex sha256 of the raw target bytes ([`crate::tree::symlink_target_sha`]).
     Link(String),
@@ -455,13 +441,11 @@ enum Node {
 /// Extraction-time accumulator for [`crate::tree::tree_root`].
 #[derive(Debug)]
 pub(crate) struct TreeAccumulator {
-    /// relpath bytes → index into `nodes`: which node that path currently names. Sorted,
-    /// as the fold wants the lines.
+    /// relpath bytes → index into `nodes`.
     paths: std::collections::BTreeMap<Vec<u8>, usize>,
     /// One entry per distinct node laid down.
     nodes: Vec<Node>,
-    /// The directories this extraction made, as a tree of exact names: `dirs[i]` maps each
-    /// child directory's name bytes to its index, and `dirs[0]` is the root.
+    /// The directories this extraction made, as a tree of exact names.
     dirs: Vec<std::collections::BTreeMap<Vec<u8>, usize>>,
 }
 
@@ -475,14 +459,12 @@ impl TreeAccumulator {
         }
     }
 
-    /// The index of the directory this extraction made as `name` inside directory
-    /// `parent`, under exactly those bytes.
+    /// The index of the directory this extraction made as `name` inside directory `parent`.
     fn child_dir(&self, parent: usize, name: &[u8]) -> Option<usize> {
         self.dirs.get(parent)?.get(name).copied()
     }
 
-    /// Record that this extraction made directory `name` inside directory `parent`, and
-    /// return its index.
+    /// Record that this extraction made directory `name` inside directory `parent`.
     fn record_dir(&mut self, parent: usize, name: Vec<u8>) -> usize {
         let child = self.dirs.len();
         self.dirs.push(std::collections::BTreeMap::new());
@@ -507,18 +489,15 @@ impl TreeAccumulator {
         self.paths.insert(rel, node);
     }
 
-    /// Whether this extraction already wrote a regular file (or a hardlink to one) at
-    /// exactly `rel` — the one name a later member may re-open and truncate, because the
-    /// fold models it ([`Self::record_file`]).
+    /// Whether this extraction already wrote a regular file ([`Self::record_file`]).
     fn wrote_file(&self, rel: &[u8]) -> bool {
         self.paths
             .get(rel)
             .is_some_and(|&node| matches!(self.nodes.get(node), Some(Node::File(..))))
     }
 
-    /// Record a hardlink at `rel` aliasing the already-extracted `target_rel`. False (fail
-    /// closed) when the target is not a regular file this extraction wrote under exactly
-    /// these bytes; [`Layer::hardlink`] checks [`Self::wrote_file`] first.
+    /// Record a hardlink at `rel` aliasing the already-extracted `target_rel` ([`Layer::hardlink`],
+    /// [`Self::wrote_file`]).
     fn record_alias(&mut self, rel: Vec<u8>, target_rel: &[u8]) -> bool {
         let Some(&node) = self.paths.get(target_rel) else {
             return false;
@@ -551,7 +530,8 @@ impl TreeAccumulator {
 
     /// Verify that on-disk filenames under `dest` match the recorded paths byte-for-byte.
     /// # Errors
-    /// Returns [`ExtractError`] on any [`ExtractReject::Respelled`] mismatch or directory read failure.
+    /// Returns [`ExtractError`] on any [`ExtractReject::Respelled`] mismatch or directory read
+    /// failure.
     pub(crate) fn require_spelled_back(&self, dest: &Path) -> Result<(), ExtractError> {
         let listed = crate::tree::line_names(dest).map_err(|e| io_at(e, "read_dir", dest))?;
         if listed.iter().eq(self.paths.keys()) {
@@ -647,33 +627,25 @@ pub(crate) fn require_empty_destination(dest_root: &Path) -> Result<(), ExtractE
     Ok(())
 }
 
-/// One extraction in progress: the vetted, capped, digest-folding writer every archive
-/// lane lays its entries through.
+/// One extraction in progress.
 struct Layer<'a> {
     root: &'a Path,
     opts: ExtractOptions,
     /// The signed content cap, decremented as bytes are written (or drained).
     remaining: u64,
-    /// A tar's structure allowance: the signed cap again, decremented as headers, padding
-    /// and extension bodies are decompressed ([`Self::charge_structure`]).
+    /// A tar's structure allowance ([`Self::charge_structure`]).
     structure_remaining: u64,
     max_entries: u64,
     count: u64,
-    /// The per-entry structural budget of the tar [`CappedReader`], shared so
-    /// [`write_capped`] can refund content bytes into it.
+    /// The per-entry structural budget of the tar [`CappedReader`] ([`write_capped`]).
     budget: Rc<Cell<u64>>,
-    /// One copy buffer for the whole archive: a 64 KiB local in `write_capped` would be
-    /// zeroed per entry (LLVM cannot elide it behind `Read::read`).
+    /// One copy buffer for the whole archive.
     copy_buf: Vec<u8>,
-    /// The tree_root of what we are writing, folded as we write it (see
-    /// [`TreeAccumulator`]) — so `verify_and_stage` need not walk the payload a second
-    /// time.
+    /// The tree_root of what we are writing, folded as we write it (see [`TreeAccumulator`]).
     tree: Option<TreeAccumulator>,
-    /// Whether any symlink has been laid yet. Until one has, no entry can pass through or
-    /// land on a link, so the per-entry `lstat` walks are skipped.
+    /// Whether any symlink has been laid yet.
     laid_symlink: bool,
-    /// The parent directory the last laid entry needed, known to be a directory
-    /// ([`Layer::ensure_parent`]).
+    /// The parent directory the last laid entry needed ([`Layer::ensure_parent`]).
     last_parent: Option<PathBuf>,
 }
 
@@ -714,8 +686,7 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Charge `n` decompressed structural bytes (a tar header, padding, a GNU/PAX extension
-    /// header and body) against the structure allowance.
+    /// Charge `n` decompressed structural bytes.
     const fn charge_structure(&mut self, n: u64) -> Result<(), ExtractError> {
         if n > self.structure_remaining {
             return Err(ExtractError::TooLarge(TooLargeReason::StructureCap));
@@ -728,9 +699,7 @@ impl<'a> Layer<'a> {
         self.opts.strip_components
     }
 
-    /// Every proper ancestor of `dest` below the root must be a real directory (or not
-    /// exist yet), never a symlink: a write through one lands somewhere the digest does
-    /// not describe.
+    /// Every proper ancestor of `dest` below the root must be a real directory.
     fn guard_ancestors(&self, dest: &Path, raw: &Path) -> Result<(), ExtractError> {
         if !self.laid_symlink {
             return Ok(());
@@ -755,8 +724,7 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// A file/directory/hardlink entry landing ON a symlink laid earlier would write
-    /// through it (`open(O_TRUNC)` follows the link).
+    /// A file/directory/hardlink entry landing ON a symlink laid earlier would write through it.
     fn refuse_if_link(&self, dest: &Path, raw: &Path) -> Result<(), ExtractError> {
         if self.laid_symlink && std::fs::symlink_metadata(dest).is_ok_and(|m| m.is_symlink()) {
             return Err(ExtractError::Rejected(
@@ -767,9 +735,7 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Make sure `dest`'s parent directory exists, remembering the last one so a run of
-    /// entries in one directory asks once (a `create_dir_all` on an existing parent is a
-    /// failing `mkdir` plus a `stat`, per file).
+    /// Make sure `dest`'s parent directory exists.
     fn ensure_parent(&mut self, dest: &Path, raw: &Path) -> Result<(), ExtractError> {
         let Some(parent) = dest.parent() else {
             return Ok(());
@@ -782,9 +748,7 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Make directory `dir` and its missing ancestors. A folding lane makes each
-    /// component under its exact name or refuses it ([`make_dir_exact`]): its root began
-    /// empty, so a name already there that it did not make is a filesystem fold.
+    /// Make directory `dir` and its missing ancestors ([`make_dir_exact`]).
     fn ensure_dir(&mut self, dir: &Path, raw: &Path) -> Result<(), ExtractError> {
         match self.tree.as_mut() {
             Some(tree) => make_dir_exact(self.root, dir, raw, tree),
@@ -792,9 +756,7 @@ impl<'a> Layer<'a> {
         }
     }
 
-    /// Lay down a directory entry. A non-zero `declared_size` (the effective body size) is
-    /// a bomb the content cap never sees, since the reader skips the body, so it is
-    /// refused on the header.
+    /// Lay down a directory entry.
     fn directory(&mut self, raw: &Path, declared_size: u64, mode: u32) -> Result<(), ExtractError> {
         if declared_size != 0 {
             return Err(ExtractError::TooLarge(TooLargeReason::DirectoryWithBody(
@@ -818,14 +780,11 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Lay down a regular file from `body`, capped and (when folding) hashed as it is
-    /// written.
+    /// Lay down a regular file from `body`, capped and (when folding) hashed as it is written.
     fn regular(&mut self, raw: &Path, mode: u32, body: impl Read) -> Result<u64, ExtractError> {
         let Some(dest) = vet_entry_stripped(self.root, raw, EntryKind::Regular, self.strip())
             .map_err(|r| ExtractError::Rejected(r, raw.to_path_buf()))?
         else {
-            // Stripped away: the body still has to be consumed for the stream to
-            // advance, through the same caps as a body that is written.
             return drain_capped(body, &mut self.remaining, &self.budget, &mut self.copy_buf);
         };
         self.guard_ancestors(&dest, raw)?;
@@ -870,8 +829,7 @@ impl<'a> Layer<'a> {
         Ok(written.len)
     }
 
-    /// Lay down a hardlink: both ends vetted (and stripped), the target already an
-    /// extracted regular file, the alias recorded against the target's node.
+    /// Lay down a hardlink.
     fn hardlink(
         &mut self,
         raw: &Path,
@@ -924,8 +882,6 @@ impl<'a> Layer<'a> {
         if let (Some(tree), Some((dest_rel, target_rel))) = (self.tree.as_mut(), rels)
             && !tree.record_alias(dest_rel, &target_rel)
         {
-            // Unreachable: the fold answered for this target above. Fail closed rather
-            // than invent a digest.
             return Err(ExtractError::Rejected(
                 ExtractReject::HardlinkTargetMissing,
                 raw.to_path_buf(),
@@ -934,9 +890,7 @@ impl<'a> Layer<'a> {
         Ok(())
     }
 
-    /// Lay down a symlink under the selected target policy, only onto a path
-    /// nothing occupies, created with the VERBATIM
-    /// target so the digest and the disk agree.
+    /// Lay down a symlink under the selected target policy.
     fn symlink(
         &mut self,
         raw: &Path,
@@ -1044,9 +998,7 @@ pub(crate) fn extract_tar_zst_tree(
     )?)
 }
 
-/// The zstd decoder over `archive` (first-party `aterm_zstd::Decoder`: a frame's content
-/// checksum is verified when the frame carries one, and required under
-/// [`FrameChecksum::Required`]).
+/// The zstd decoder over `archive` ([`FrameChecksum::Required`]).
 fn zstd_decoder(
     archive: &Path,
     checksum: FrameChecksum,
@@ -1140,28 +1092,22 @@ pub fn extract_tree(
     .map(|_| ())
 }
 
-/// The fold a `fold = true` extraction always produces; its absence fails closed.
+/// The fold a `fold = true` extraction always produces.
 fn folded(tree: Option<TreeAccumulator>) -> Result<TreeAccumulator, ExtractError> {
     tree.ok_or_else(|| io::Error::other("extraction produced no tree_root").into())
 }
 
-/// What [`extract_stream`] does with the decoded bytes after the tar's end-of-archive
-/// marker: the marker's second block, the record padding `tar` writes after it, and
-/// anything else the stream holds.
+/// What [`extract_stream`] does with the decoded bytes after the tar's end-of-archive marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Trailer {
-    /// Left unread. The `tar-gz` lane: its reader refuses trailing bytes that are not a
-    /// gzip member, which a vendor archive padded past its last member would hit.
+    /// Left unread.
     Unread,
-    /// Read to the end of the stream, under one entry's structural budget and charged to
-    /// the structure allowance like any other tar structure.
+    /// Read to the end of the stream.
     Drained,
 }
 
-/// The one tar extraction body, over an already-decompressed `decoded` stream. `fold`
-/// decides whether it also accumulates the [`crate::tree::tree_root`] of what it writes
-/// (see [`extract_tar_zst_tree`]) or performs the historical write-only pass
-/// ([`extract_tar_zst`]); `trailer` what happens past the tar's end.
+/// The one tar extraction body ([`crate::tree::tree_root`], [`extract_tar_zst_tree`],
+/// [`extract_tar_zst`]).
 fn extract_stream(
     decoded: impl Read,
     dest_root: &Path,
@@ -1220,9 +1166,7 @@ fn extract_stream(
             }
             EntryKind::Directory => layer.directory(&raw, declared, mode)?,
             EntryKind::Regular => {
-                // The reader hands out content bytes through the CappedReader; the
-                // content cap and the structural refund happen in write_capped (or
-                // drain_capped, for an entry the strip skips).
+                // Distinct branch.
                 layer.regular(&raw, mode, &mut entry)?;
             }
             EntryKind::Other if opts.allow_global_pax && entry.header().is_global_pax() => {
@@ -1257,18 +1201,14 @@ pub(crate) struct WrittenFile {
     pub(crate) len: u64,
 }
 
-/// The file [`write_capped`] streams into: the handle its caller opened (how it was
-/// created is the caller's decision — see [`Layer::regular`]), the path it was opened
-/// at, for messages, and the permission bits to leave on it.
+/// The file [`write_capped`] streams into: the handle its caller opened ([`Layer::regular`]).
 struct Sink<'p> {
     file: std::fs::File,
     dest: &'p Path,
     mode: u32,
 }
 
-/// Stream `reader` into `sink`'s freshly opened file with `sink.mode`, decrementing
-/// `remaining`; abort with [`ExtractError::TooLarge`] the moment the total would exceed it,
-/// so a decompression bomb stops mid-stream.
+/// Stream `reader` into `sink`'s freshly opened file with `sink.mode` ([`ExtractError::TooLarge`]).
 fn write_capped(
     mut reader: impl Read,
     sink: Sink<'_>,
@@ -1333,9 +1273,7 @@ fn write_capped(
     }
 }
 
-/// Consume `reader` to EOF without writing, through the same caps as [`write_capped`]:
-/// the bytes of an entry `strip_components` skipped still count against the signed
-/// content cap (a skipped bomb is still a bomb) and still refund the structural budget.
+/// Consume `reader` to EOF without writing, through the same caps as [`write_capped`].
 fn drain_capped(
     mut reader: impl Read,
     remaining: &mut u64,
@@ -1669,10 +1607,6 @@ mod tests {
         PathBuf::from("/store/ay/staging")
     }
 
-    /// The entry vet, every classic tar-slip shape (the §15 "every escape fixture aborts"
-    /// matrix): safe relative paths resolve under the root (a `.` component dropped, dots
-    /// within a name a plain name); `..` anywhere, an absolute path, an empty or dot-only
-    /// path, and any link or exotic kind — however in-root its path — are refused.
     #[test]
     fn vet_entry_admits_in_root_paths_and_refuses_every_escape() {
         use EntryKind::{Directory as D, Hardlink, Other, Regular as F, Symlink};
@@ -1706,7 +1640,6 @@ mod tests {
         }
     }
 
-    /// `strip_components` drops leading components after the full path is vetted: `..`
     #[test]
     fn strip_components_vets_the_full_path_first() {
         let r = root();
@@ -1759,9 +1692,6 @@ mod tests {
         );
     }
 
-    /// The symlink vet: in-root targets (relative to the link's directory) pass; a pop
-    /// above the root, a `..` after a normal component, an absolute or an empty target is
-    /// refused.
     #[test]
     fn symlink_vet_resolves_targets_lexically_inside_the_root() {
         let r = root();
@@ -1819,12 +1749,10 @@ mod tests {
         crate::testdir::dir(&format!("atpkg-ex-{label}-"))
     }
 
-    /// [`raw_header_mode`] at mode `0o644`.
     fn raw_header(name: &str, typeflag: u8, linkname: &str, size: usize) -> [u8; 512] {
         raw_header_mode(name, typeflag, linkname, size, 0o644)
     }
 
-    /// [`tar_bytes`] at mode `0o644`, zstd-compressed to `dir/<label>.tar.zst`.
     fn make_archive(dir: &Path, label: &str, entries: &[(&str, u8, &str, &[u8])]) -> PathBuf {
         let moded: Vec<_> = entries
             .iter()
@@ -1833,9 +1761,6 @@ mod tests {
         make_archive_moded(dir, label, &moded)
     }
 
-    /// The fold `tree` produced and the on-disk walk that must agree with it: the
-    /// declared-mode walk, which on Unix reads modes from the inode and on Windows (which
-    /// stores none) uses the fold's declared modes.
     fn fused_and_walked(tree: TreeAccumulator, root: &Path) -> (String, String) {
         tree.require_spelled_back(root)
             .expect("the disk spells back every name the fold records");
@@ -1873,8 +1798,7 @@ mod tests {
         let Some(dir) = std::env::var_os(OPEN_UMASK_ENV) else {
             return;
         };
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
-        // process runs this one test (`--exact`), so no other create sees the mask.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail.
         unsafe { libc::umask(0) };
         let d = PathBuf::from(dir);
         let root = d.join("staging");
@@ -1930,9 +1854,6 @@ mod tests {
         );
     }
 
-    /// The release-bundle lane's link refusals: a symlink entry, refused outright however
-    /// in-root its target, and a hardlink whose target leaves the root, is absolute, or is
-    /// a forward reference (not yet extracted) — the §9 fixtures for links.
     #[test]
     fn the_release_lane_refuses_symlinks_and_escaping_or_dangling_hardlinks() {
         let d = dest("release-links");
@@ -1980,13 +1901,9 @@ mod tests {
         }
     }
 
-    /// Every bomb defence of the tar lanes refuses with its OWN reason — a caller matches
-    /// on it, and an operator once chased `disk_installed` for what was a directory
-    /// header's size — naming the member where there is one, and lays nothing for it:
     #[test]
     fn every_tar_bomb_defence_refuses_with_its_own_reason() {
         use TooLargeReason as Why;
-        /// `(label, tar, content cap, entry cap, member never laid, the refusal)`.
         type Case<'a> = (
             &'a str,
             &'a [u8],
@@ -2073,9 +1990,6 @@ mod tests {
         }
     }
 
-    /// The tar STRUCTURE counts against the signed cap, not file content alone: every byte
-    /// the reader decompresses — headers, padding, extension bodies — is charged to an
-    /// allowance the size of `max_total_bytes`, kept apart from content's.
     #[test]
     fn the_tar_structure_counts_against_the_signed_cap() {
         let d = dest("structure-cap");
@@ -2137,10 +2051,6 @@ mod tests {
         }
     }
 
-    /// Structure and content are two allowances of the signed size, never one counter: a
-    /// tree of small files carries more structure than content (a 512-byte header and the
-    /// padding to the next block per file), and the packers signed `disk_installed` as the
-    /// content's apparent size.
     #[test]
     fn a_small_file_tree_spends_structure_and_content_apart() {
         let d = dest("small-files");
@@ -2212,7 +2122,6 @@ mod tests {
         );
     }
 
-    /// The refusal a zstd lane's decoder raised, inside the extraction error.
     fn zstd_refusal(err: &ExtractError) -> Option<&aterm_zstd::DecodeError> {
         match err {
             ExtractError::Io { err, .. } => err.get_ref()?.downcast_ref(),
@@ -2220,8 +2129,6 @@ mod tests {
         }
     }
 
-    /// A zstd lane reads the stream to its end, so a frame's content checksum is checked
-    /// even where the tar ends a block before the frame does.
     #[test]
     fn a_zstd_lane_checks_a_checksum_past_the_tar_end() {
         let d = dest("checksum-past-end");
@@ -2282,8 +2189,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// [`FrameChecksum::Required`] refuses a frame that carries no content checksum at its
-    /// header: nothing is laid.
     #[test]
     fn a_required_checksum_refuses_a_frame_without_one_before_any_entry() {
         let d = dest("checksum-required");
@@ -2335,9 +2240,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The parity gate for the fused digest (§8): the extraction-time root must be the same
-    /// 64 hex characters `tree::tree_root` computes over the finished directory, since that
-    /// is what signed the row.
     #[test]
     fn fused_tree_root_is_byte_identical_to_the_on_disk_walk() {
         let d = dest("fused-parity");
@@ -2411,10 +2313,6 @@ mod tests {
         }
     }
 
-    /// Two members whose names differ in bytes but name one file on the filesystem (a case
-    /// pair on case-insensitive APFS or NTFS, NFC and NFD `café` on APFS): the second is
-    /// refused (`O_EXCL`); where the filesystem keeps both names, both are laid and the
-    /// fold equals the walk.
     #[test]
     fn a_member_the_filesystem_names_like_another_never_replaces_it_unseen() {
         let d = dest("fs-folded-names");
@@ -2444,10 +2342,6 @@ mod tests {
         }
     }
 
-    /// The directory half of the test above: a directory component spelled differently
-    /// (`Dir`/`dir`, NFC/NFD `café`, at the top or below a shared parent) that the
-    /// filesystem folds onto another is refused as `Occupied` for every member kind; where
-    /// the filesystem keeps both spellings, both are laid and the fold equals the walk.
     #[test]
     fn a_directory_the_filesystem_names_like_another_never_merges_unseen() {
         let d = dest("fs-folded-dirs");
@@ -2503,8 +2397,6 @@ mod tests {
         }
     }
 
-    /// The case the two tests above cannot see: ONE name the filesystem stores under
-    /// other bytes, or lays nothing for, collides with nothing.
     #[test]
     fn a_name_the_filesystem_stores_under_other_bytes_is_refused() {
         let d = dest("fs-respelled");
@@ -2543,11 +2435,8 @@ mod tests {
         }
     }
 
-    /// The other side of the parity gate: the fused root moves for exactly the mutations
-    /// (content, mode) the on-disk walk moves for.
     #[test]
     fn the_fused_root_moves_with_content_and_mode_exactly_as_the_walk_does() {
-        /// Extract a one-file bundle and return the (walk-agreeing) fused root.
         fn one_file(d: &Path, label: &str, payload: &[u8], mode: u32) -> String {
             let root = d.join(label);
             std::fs::create_dir_all(&root).unwrap();
@@ -2574,9 +2463,6 @@ mod tests {
         assert_ne!(base, other_mode, "mode must move the fused root");
     }
 
-    /// The fold's precondition: a destination that already holds something is refused
-    /// rather than folded, since a fold over what the extractor wrote would never see a
-    /// stranger's file that the on-disk walk hashes.
     #[test]
     fn a_non_empty_destination_is_refused_rather_than_folded() {
         let d = dest("fused-nonempty");
@@ -2606,8 +2492,6 @@ mod tests {
         assert!(fold(&planted).is_err());
     }
 
-    /// The vendor lane options every test below uses: strip one leading component and
-    /// admit in-root symlinks — the `gh` archive shape.
     fn vendor(strip: u32) -> ExtractOptions {
         ExtractOptions {
             strip_components: strip,
@@ -2773,9 +2657,6 @@ mod tests {
         assert!(extract("truncated", 1 << 20, 2, opts).is_err());
     }
 
-    /// A `tar -C dir -c .` archive opens with a root-naming `./` directory member and names
-    /// every path `./…`; the lanes lay the same tree the system tar does, and the strip
-    /// spends itself on the leading `.`.
     #[test]
     fn dot_rooted_archives_extract_like_the_tar_that_authored_them() {
         let d = dest("dot-root");
@@ -2861,8 +2742,6 @@ mod tests {
         lanes
     }
 
-    /// Slip refusals per lane: `..`, an absolute path, and an escaping, absolute or empty
-    /// symlink target each abort the gzip and zip lanes with `strip_components` set.
     #[test]
     fn gzip_and_zip_lanes_refuse_every_slip_shape() {
         let d = dest("lanes-slip");
@@ -2922,7 +2801,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn writes_through_or_onto_a_symlink_are_refused() {
-        /// `(label, tar entries, expected rejection)`.
         type Case = (
             &'static str,
             &'static [(&'static str, u8, &'static str, &'static [u8], u32)],
@@ -3078,10 +2956,6 @@ mod tests {
         }
     }
 
-    /// The caps hold in the gzip and zip lanes alike: the byte cap trips mid-body (a
-    /// deflate bomb stops mid-stream); a body stripped away entirely is still charged and,
-    /// under a cap it fits, lays nothing and folds the empty root the walk of the
-    /// pre-created scratch agrees with; and the entry cap trips.
     #[test]
     fn gzip_and_zip_lanes_enforce_the_same_caps() {
         type Lane =
@@ -3168,10 +3042,6 @@ mod tests {
         );
     }
 
-    /// What the zip reader refuses on its own format rules — each fail-closed, none a
-    /// panic: encryption, an unsupported method, a backslash in a name, a truncated file,
-    /// a body that disagrees with its declared size, trailing garbage, and a non-Unix
-    /// member whose attributes carry no mode (laid down `0644`, never executable).
     #[test]
     fn the_zip_reader_refuses_what_it_does_not_understand_and_reads_zip64() {
         let d = dest("zip-format");
@@ -3272,8 +3142,6 @@ mod tests {
         );
     }
 
-    /// `stage_file` — the raw-binary lane's whole extraction — lays one file down with the
-    /// requested mode, caps it, and hands back the digest the walk would compute.
     #[test]
     fn stage_file_lays_one_capped_file_and_folds_it() {
         let d = dest("stage-file");
@@ -3318,7 +3186,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_capped_sets_the_mode_through_the_open_handle() {
-        /// Hands the body over in one read, then unlinks `dest` behind the writer.
         struct UnlinkMidBody<'a> {
             body: &'a [u8],
             dest: &'a Path,

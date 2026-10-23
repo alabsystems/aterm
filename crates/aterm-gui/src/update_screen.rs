@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The software update model: the one structured snapshot ([`UpdateState`], captured from the process-owned reducer, or in tests from [`aterm_update::status`]) that every update surface reads.
+//! Software update model ([`UpdateState`], [`aterm_update::status`]).
 
 use crate::native_updater_service::UpdateInstallability;
 use crate::update_apply_trouble::{ApplyRetry, ApplyTrouble};
@@ -20,74 +20,51 @@ pub(crate) struct UpdateState {
     current_build: u64,
     /// A strictly-newer staged build `(build, version)`, if one is ready to apply.
     staged: Option<(u64, String)>,
-    /// The stage is an installed-bundle activation
-    /// (`StagedUpdate::is_installed_activation`): already at this app's path, never
-    /// downloaded, so the detail does not say "downloaded".
+    /// The stage is an installed-bundle activation (`StagedUpdate::is_installed_activation`).
     staged_activation: bool,
     /// The staged build's "what changed" notes, rendered from Markdown to clean lines.
     changelog: Vec<String>,
-    /// Whether the native updater runs here (`aterm_update::enabled`: macOS and Linux —
-    /// on Linux also only for an enrolled copy, `aterm_update::linux::status`).
+    /// Whether the native updater runs here.
     enabled: bool,
-    /// "Check for updates automatically" (`[update] enabled`, default on) as this process
-    /// reads it: whether its background checker looks for builds by itself.
+    /// "Check for updates automatically".
     automatic_checks: bool,
-    /// The same key as saved, which the next launch reads; where it differs from
-    /// [`Self::automatic_checks`] the detail says what changes then.
+    /// The same key as saved, which the next launch reads ([`Self::automatic_checks`]).
     automatic_checks_saved: bool,
-    /// The last updater outcome string (from the health ledger) — shown small.
+    /// The last updater outcome string (from the health ledger).
     outcome: String,
-    /// The health ledger says this machine's updates are failing persistently (a streak
-    /// of one failure class, not a blip): the headline says so instead of "You're up to
-    /// date", and `outcome` carries the ledger's own sentence with the cause.
+    /// The health ledger says this machine's updates are failing persistently.
     failing_persistent: bool,
-    /// The failing class (`apply`, `pipeline`, …) when `failing_persistent`: the most
-    /// recent one, which is why it cannot decide [`Self::apply_is_failing`].
+    /// The failing class ([`Self::apply_is_failing`]).
     failing_kind: String,
-    /// Consecutive apply failures. `>= PERSISTENT_AFTER` is the exact statement "the
-    /// staged build will not start", whichever class failed last; any non-zero value is
-    /// already news (the threshold decides how loudly the person is told, not whether).
+    /// Consecutive apply failures.
     failing_applies: u32,
-    /// Why those applies failed: the ledger's `last_apply_error`, the prose the control
-    /// socket prints as `apply_failure=`.
+    /// Why those applies failed.
     apply_failure: String,
-    /// Which artifact [`Self::apply_failure`] is about (0 when unknown), and how many
-    /// consecutive attempts on that artifact are behind it (the ledger's
-    /// `last_apply_failure_target_build` / `apply_failures_for_target`).
+    /// Which artifact [`Self::apply_failure`] is about.
     apply_failure_build: u64,
     /// See [`Self::apply_failure_build`].
     apply_attempts_for_stage: u32,
-    /// Whether the automatic lane retries this artifact by itself or needs a person
-    /// (`App::apply_retry_for`): event-loop state, not ledger state, and the half that
-    /// decides whether the reader has to act.
+    /// Whether the automatic lane retries this artifact by itself or needs a person.
     apply_retry: ApplyRetry,
-    /// The staged build is on hold (`App::latched_activation_trial_spent`, the fact the
-    /// Version menu's press refuses on): its next start is the one its boot trial rolls
-    /// back.
+    /// The staged build is on hold.
     staged_on_hold: bool,
-    /// Whether this launch has a bundle the updater could replace at all, as far
-    /// as a read has observed.
+    /// Whether this launch has a bundle the updater could replace at all.
     installable: UpdateInstallability,
-    /// The stranded verdict: checks complete but the release channel cannot be
-    /// read (401/403/404 with nothing to try, or a renamed repo).
+    /// The stranded verdict.
     channel_unreadable: bool,
     /// A manual "Check for Updates" is running off-thread (shows "Checking…").
     checking: bool,
-    /// When the last check completed (Unix seconds), `None` before any has: the page
-    /// says "Checked 12 min ago" from it ([`UpdateProjection::checked_line`]).
+    /// When the last check completed ([`UpdateProjection::checked_line`]).
     checked_at: Option<i64>,
-    /// The automatic lane's download in flight, which the band does not show: the
-    /// headline and detail say it.
+    /// The automatic lane's download in flight, which the band does not show.
     downloading: Option<QuietDownload>,
-    /// A dev-marked copy (`ship dev-app`), which the updater leaves alone on
-    /// purpose; `None` for every other copy ([`Self::with_dev_build`]).
+    /// A dev-marked copy ([`Self::with_dev_build`]).
     dev_build: Option<DevBuildPage>,
-    /// Where this copy runs from (`aterm_update::which_copy::running_posture`),
-    /// read once at launch: why a copy that can't update itself can't.
+    /// Where this copy runs from.
     install_posture: Option<aterm_update::which_copy::InstallPosture>,
 }
 
-/// The detail under "This copy of aterm can't update itself." for a copy that is not an app bundle at all: what it is, and how to get a copy that updates.
+/// Detail under "This copy of aterm can't update itself." for a non-bundle copy.
 pub(crate) const NOT_A_BUNDLE_DETAIL: &str =
     "It isn\u{2019}t an installed aterm.app. Install aterm from alab.systems to get updates.";
 
@@ -98,8 +75,7 @@ pub(crate) struct DevBuildPage {
 }
 
 impl DevBuildPage {
-    /// The headline: how far behind, when that is known and true; else that it is a
-    /// dev build.
+    /// The headline: how far behind, when that is known and true.
     fn headline(&self) -> String {
         use aterm_update::dev_channel::DevLag;
         match &self.standing {
@@ -116,8 +92,7 @@ impl DevBuildPage {
         }
     }
 
-    /// The detail: where it stands, in the dev channel's words, then why nothing moves
-    /// it and what does.
+    /// The detail: where it stands.
     fn detail(&self) -> String {
         let standing = self
             .standing
@@ -132,7 +107,7 @@ impl DevBuildPage {
     }
 }
 
-/// A download (or its check) nobody is waiting on — the automatic lane's — as the page says it: it takes no row on the band, so this page is where its progress is seen.
+/// A download (or its check) nobody is waiting on — the automatic lane's — as the page says it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct QuietDownload {
     /// The version, for the record a failure writes.
@@ -141,7 +116,7 @@ pub(crate) struct QuietDownload {
     pub(crate) progress: String,
 }
 
-/// Owned, structured read projection shared with the native Settings `/updates` route: it keeps the updater service state private without parsing the `controls update` serialization.
+/// Owned, structured read projection shared with the native Settings `/updates` route.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct UpdateProjection {
     pub(crate) linux_host: bool,
@@ -152,41 +127,41 @@ pub(crate) struct UpdateProjection {
     pub(crate) staged: Option<(u64, String)>,
     pub(crate) changelog: Vec<String>,
     pub(crate) enabled: bool,
-    /// "Check for updates automatically" as this process runs it (a saved flip applies next launch): the full headline and the compact rungs key "off" on it, so no squeeze of the page calls it "Current" while nothing checks by itself.
+    /// "Check for updates automatically" as this process runs it.
     pub(crate) automatic_checks: bool,
     pub(crate) outcome: String,
     pub(crate) checking: bool,
-    /// The ledger's persistent-failure verdict — the surfaces style the headline as a warning and never say "current" while it holds.
+    /// The ledger's persistent-failure verdict.
     pub(crate) failing_persistent: bool,
-    /// …and specifically in the apply class: the staged build will not start.
+    /// Persistent failure in the apply class.
     pub(crate) apply_is_failing: bool,
-    /// The apply lane's standing trouble for the staged build: how many attempts failed, why, and whether the lane will try again unaided.
+    /// The apply lane's standing trouble for the staged build.
     pub(crate) apply_trouble: Option<ApplyTrouble>,
-    /// The staged build is on hold (`App::latched_activation_trial_spent`): its next start is the one its boot trial rolls back, so the page says it is on hold at every width, and its button sends nothing and says so.
+    /// The staged build is on hold (`App::latched_activation_trial_spent`).
     pub(crate) staged_on_hold: bool,
-    /// Whether a replacement could be installed here at all — false for a copy run from the mounted disk image, a Gatekeeper-translocated download, or a dev-marked build.
+    /// Whether a replacement could be installed here at all.
     pub(crate) installable: UpdateInstallability,
-    /// This copy is dev-marked (`ship dev-app`): `installable` is false on purpose, so every card that would say "can't update" or "reinstall" says it is a dev build instead.
+    /// This copy is dev-marked (`ship dev-app`).
     pub(crate) dev_build: bool,
-    /// The stranded verdict (see [`UpdateState`]): the compact card must say "Can't check", never "Current", while the channel is unreadable.
+    /// The stranded verdict (see [`UpdateState`]).
     pub(crate) channel_unreadable: bool,
     /// When the last check completed (Unix seconds), `None` before any has.
     pub(crate) checked_at: Option<i64>,
     pub(crate) headline: String,
     pub(crate) detail: Option<String>,
-    /// macOS: what the automatic-checks switch means for this process where it is not simply on ([`UpdateState::automatic_checks_detail`]), said after when the last check ran.
+    /// Meaning of the automatic-checks switch ([`UpdateState::automatic_checks_detail`]).
     pub(crate) automatic_checks_note: Option<String>,
 }
 
 impl UpdateProjection {
-    /// `Checked 12 min ago` — when the last check completed, said relative to `now` (Unix seconds); `None` before any check has.
+    /// `Checked 12 min ago` — when the last check completed.
     pub(crate) fn checked_line(&self, now: i64) -> Option<String> {
         self.checked_at
             .map(|at| format!("Checked {}", ago_words(at, now)))
     }
 }
 
-/// How long before `now` the instant `at` was, as a person says it: `just now`, `12 min ago`, `3 h ago`, `2 days ago` (Unix seconds both).
+/// How long before `now` the instant `at` was, as a person says it.
 pub(crate) fn ago_words(at: i64, now: i64) -> String {
     let age = now.saturating_sub(at);
     if age < 60 {
@@ -203,7 +178,7 @@ pub(crate) fn ago_words(at: i64, now: i64) -> String {
 }
 
 impl UpdateState {
-    /// Project the process-owned updater reducer into UI state: memory-only, so opening Settings, introspection and repainting never parse a ledger or probe a bundle on the event-loop thread.
+    /// Project the process-owned updater reducer into UI state.
     pub(crate) fn from_service(
         snapshot: &crate::native_updater_service::UpdaterSnapshot,
         checking: bool,
@@ -328,26 +303,26 @@ impl UpdateState {
         .without_inapplicable_stage()
     }
 
-    /// "Check for updates automatically" as this process runs it (`running`: the value `aterm_update::automatic` read at launch) and as saved (`saved`: `app_config::update_checks_automatic`, which the next launch reads).
+    /// "Check for updates automatically" as this process runs it.
     pub(crate) const fn with_automatic_checks(mut self, running: bool, saved: bool) -> Self {
         self.automatic_checks = running;
         self.automatic_checks_saved = saved;
         self
     }
 
-    /// The automatic lane's download in flight (`App::update_quiet`): no row says it, so the page does.
+    /// The automatic lane's download in flight (`App::update_quiet`).
     pub(crate) fn with_download(mut self, downloading: Option<QuietDownload>) -> Self {
         self.downloading = downloading;
         self
     }
 
-    /// This copy is dev-marked (`App::dev_build`): the page says so, and where it stands, instead of the move-it remedy.
+    /// This copy is dev-marked (`App::dev_build`).
     pub(crate) fn with_dev_build(mut self, dev_build: Option<DevBuildPage>) -> Self {
         self.dev_build = dev_build;
         self
     }
 
-    /// Where this copy runs from (`App::install_posture`): a copy that can't update itself is told its one cause and remedy, not a guess between three.
+    /// Where this copy runs from (`App::install_posture`).
     pub(crate) const fn with_install_posture(
         mut self,
         posture: Option<aterm_update::which_copy::InstallPosture>,
@@ -356,7 +331,7 @@ impl UpdateState {
         self
     }
 
-    /// The staged build is on hold (`App::latched_activation_trial_spent`): the page says so, and its button starts nothing.
+    /// The staged build is on hold (`App::latched_activation_trial_spent`).
     pub(crate) const fn with_staged_on_hold(mut self, on_hold: bool) -> Self {
         self.staged_on_hold = on_hold;
         self
@@ -367,9 +342,7 @@ impl UpdateState {
         self.enabled && self.staged.is_some() && self.staged_on_hold
     }
 
-    /// The quiet download, where the page may say it: macOS, an installable copy
-    /// with the updater on, nothing staged, and no check a person started (whose
-    /// own words and row own the surface).
+    /// The quiet download, where the page may say it.
     fn quiet_download(&self) -> Option<&QuietDownload> {
         self.downloading.as_ref().filter(|_| {
             !self.linux_host
@@ -380,11 +353,7 @@ impl UpdateState {
         })
     }
 
-    /// A stage this copy cannot apply is not a stage for this copy. `aterm_update::status()`
-    /// reads a HOME-keyed Updates directory, so every copy for one user shares one
-    /// ready.toml, while `installable` is per-copy (`bundle::resolve()`): an older aterm.app
-    /// opened from a DMG would otherwise headline the installed copy's stage and offer an
-    /// Install whose apply returns `NotApplicable`.
+    /// A stage this copy cannot apply is not a stage for this copy.
     fn without_inapplicable_stage(mut self) -> Self {
         if self.linux_host {
             self.staged = None;
@@ -400,7 +369,7 @@ impl UpdateState {
         self
     }
 
-    /// Attach the apply lane's facts to a `from_status` fixture: the ledger reason behind the streak and whether the loop still intends to retry.
+    /// Attach the apply lane's facts to a `from_status` fixture.
     #[cfg(test)]
     pub(crate) fn with_apply_lane(mut self, reason: &str, retry: ApplyRetry) -> Self {
         self.apply_failure = reason.to_string();
@@ -461,18 +430,12 @@ impl UpdateState {
         }
     }
 
-    /// The persistent failure is in the apply class (the staged build will not start), as
-    /// opposed to an acquisition class (`manifest`, `pipeline`, `network`, `stage`).
+    /// The persistent failure is in the apply class.
     const fn apply_is_failing(&self) -> bool {
-        // Not `failing_kind == "apply"`: that is the last class to fail, so a machine
-        // whose apply lane escalated but whose latest failure was a network blip
-        // would hide it, and a single apply failure under an escalated `pipeline`
-        // streak would wrongly claim it. The apply streak itself is the statement.
         self.failing_applies >= aterm_update::PERSISTENT_AFTER
     }
 
-    /// The Linux ladder's disk, enrollment and trouble arms, first match first: every
-    /// headline that outranks this process's checker.
+    /// The Linux ladder's disk, enrollment and trouble arms, first match first.
     fn linux_fact_headline(&self) -> Option<&'static str> {
         let linux = self.linux.as_ref();
         if self.installable.cannot_install() {
@@ -493,45 +456,29 @@ impl UpdateState {
         }
     }
 
-    /// The primary status headline: a short statement ("Update ready"); the version
-    /// specifics live in [`Self::detail`].
+    /// The primary status headline: a short statement ("Update ready") ([`Self::detail`]).
     fn headline(&self) -> String {
         if self.checking {
             "Checking for updates\u{2026}".to_string()
         } else if self.installable == UpdateInstallability::Unobserved {
-            // Nothing has read this copy yet (the startup or first-open reconcile is
-            // in flight): it may be an installed copy or one that can't replace
-            // itself, so the page claims neither — no "up to date", no "can't update
-            // itself".
             UPDATE_UNOBSERVED_HEADLINE.to_string()
         } else if self.linux_host {
             if let Some(fact) = self.linux_fact_headline() {
                 fact.to_string()
             } else if !self.automatic_checks {
-                // The Linux updater reads `[update] enabled` as macOS's does (once per
-                // process, gating only its background checker), so the idle arm speaks for
-                // the checker this process runs. Every Linux arm above outranks it.
                 "Automatic checks are off.".to_string()
             } else {
                 "No update staged.".to_string()
             }
         } else if self.on_hold() {
-            // Not "ready": no surface starts a build on hold (the band's record
-            // says "is on hold" too). The count and the cause, when the ledger
-            // still has them, ride the detail line below.
             "Update on hold".to_string()
         } else if self.staged.is_some() && self.enabled && self.apply_is_failing() {
-            // Only the apply class earns this: the health notice points here and this line
-            // must not contradict it. A `manifest`/`pipeline` streak is about acquiring the
-            // next build; the stage in hand is verified and will install.
             "Update keeps failing to install.".to_string()
         } else if self.apply_trouble().is_some() {
-            // The count and the cause ride the detail line.
             "Update didn\u{2019}t install.".to_string()
         } else if self.staged.is_some() {
             "Update ready".to_string()
         } else if let Some(quiet) = self.quiet_download() {
-            // The automatic lane's download takes no band row, so this is where it is seen.
             format!("{}\u{2026}", quiet.title)
         } else if self.installable.cannot_install() {
             match &self.dev_build {
@@ -539,32 +486,19 @@ impl UpdateState {
                 None => "This copy of aterm can\u{2019}t update itself.".to_string(),
             }
         } else if !self.enabled {
-            // No native updater on this platform (Linux answers in its own ladder above),
-            // so the line does not call the updater macOS-only. The Settings switch is not
-            // this: off, it stops only the background checker (the arm below).
             "aterm doesn\u{2019}t update itself on this platform.".to_string()
         } else if self.channel_unreadable {
-            // Stranded: the channel cannot be read and the state records zero ledger
-            // failures, so the `failing_persistent` arm below never catches it.
             "aterm can\u{2019}t check for updates on this machine.".to_string()
         } else if self.failing_persistent {
-            // Never "up to date" while the ledger says otherwise. The cause, in words, is the
-            // detail; the ledger's own sentence is `aterm ctl update status`'s and the log's.
             "Updates are failing on this machine.".to_string()
         } else if !self.automatic_checks {
-            // Nothing in this process looks by itself, so "up to date" would describe a
-            // check that is not running. Short: the medium workbench gives the hero line
-            // ~320pt, and "Automatic update checks are off." ellipsized there.
             "Automatic checks are off.".to_string()
         } else {
             "You\u{2019}re up to date.".to_string()
         }
     }
 
-    /// What `[update] enabled` means for this page while nothing is staged: this process
-    /// read the key at launch, so a saved value that differs applies next launch; the
-    /// sentence says which way and what still works (the switch stops only the background
-    /// checker).
+    /// What `[update] enabled` means for this page while nothing is staged.
     fn automatic_checks_detail(&self) -> Option<String> {
         if !self.enabled || self.staged.is_some() {
             return None;
@@ -594,8 +528,7 @@ impl UpdateState {
         }
     }
 
-    /// The secondary detail line under the headline, in plain words: the version on
-    /// offer, what is wrong and what happens next.
+    /// The secondary detail line under the headline, in plain words.
     fn detail(&self) -> Option<String> {
         if self.linux_host {
             let outcome = self.outcome.trim().trim_end_matches('.');
@@ -652,8 +585,6 @@ impl UpdateState {
             return (!detail.is_empty()).then_some(detail);
         }
         if self.installable == UpdateInstallability::Unobserved {
-            // The headline says the copy is being read; no detail claims anything
-            // about it before that read lands.
             return None;
         }
         if self.installable.cannot_install() {
@@ -737,11 +668,10 @@ impl UpdateState {
     }
 }
 
-/// Where a trouble line sends the reader for the rest: the page's own log link.
+/// Where a trouble line sends the reader for the rest.
 const LOG_POINTER: &str = " Details in Settings \u{25b8} Messages.";
 
-/// A failing check class (`network` / `manifest` / `pipeline` / `stage`, the updater's
-/// health-ledger names) in a person's words.
+/// A failing check class.
 fn check_trouble_words(kind: &str) -> &'static str {
     match kind {
         "network" => "the update server can\u{2019}t be reached",
@@ -784,10 +714,8 @@ mod tests {
         }
     }
 
-    /// The held download's ledger sentence (`aterm_update::linux`).
     const LINUX_HELD: &str = "aterm 0.5.15 is downloaded \u{2014} `aterm update apply` installs it \
          (\u{201c}Install updates automatically\u{201d} is off)";
-    /// A replaced executable's ledger sentence while it waits for its first start.
     const LINUX_PENDING: &str = "aterm 0.5.15 is installed \u{2014} the next aterm you start \
                                  finishes it; existing sessions continue unchanged";
 
@@ -880,10 +808,6 @@ mod tests {
         assert_eq!(projection.outcome, state.outcome);
     }
 
-    /// The Linux checker reads `[update] enabled` once per process
-    /// (`aterm_update::automatic()`), as macOS's does, and a typed `aterm update check`
-    /// ignores it: the idle headline follows the running value, the detail names a saved
-    /// flip and the terminal lane, and every disk, enrollment or trouble fact outranks it.
     #[test]
     fn linux_automatic_checks_follow_the_running_checker_and_name_the_terminal_lane() {
         let mut idle = linux_facts();
@@ -999,9 +923,6 @@ mod tests {
         }
     }
 
-    /// "Check for updates automatically" off stops only the background checker: the page
-    /// never claims "You're up to date" over it and says a check still runs when asked; a
-    /// staged build is still "Update ready", and real trouble still outranks the switch.
     #[test]
     fn automatic_checks_off_is_named_and_leaves_the_manual_lane_standing() {
         let mut st = staged_status();
@@ -1037,10 +958,6 @@ mod tests {
         assert_eq!(stranded.automatic_checks_note, None);
     }
 
-    /// The headline speaks for the checker this process runs, which read `[update]
-    /// enabled` at launch: flipped off, it keeps running until quit, so the headline stays
-    /// and the detail says checks stop next launch; flipped on over an off launch, nothing
-    /// checks until the next one, so the headline stays "off" and the detail says so.
     #[test]
     fn a_saved_flip_of_automatic_checks_is_named_as_next_launch_in_both_directions() {
         let mut st = staged_status();
@@ -1067,9 +984,6 @@ mod tests {
         assert_eq!(page(true, true).automatic_checks_note, None);
     }
 
-    /// The stage ledger is HOME-keyed and shared by every copy of the app: a copy that
-    /// cannot replace itself shows neither the installed copy's stage, its notes, nor its
-    /// check verdict.
     #[test]
     fn a_stage_this_copy_cannot_apply_is_not_shown_as_ready() {
         let mut st = staged_status();
@@ -1113,9 +1027,6 @@ mod tests {
         );
     }
 
-    /// A copy that cannot be replaced (the mounted DMG, a translocated download, a plain
-    /// binary) never starts a check, so its ledger fields are pristine defaults: the page
-    /// says it can't update itself, with the one cause's remedy, never "up to date".
     #[test]
     fn a_copy_that_cannot_replace_itself_says_so_instead_of_up_to_date() {
         let mut st = staged_status();
@@ -1141,9 +1052,6 @@ mod tests {
         assert_eq!(page(None).detail, None);
     }
 
-    /// A dev-marked copy cannot be replaced either, but on purpose: the page says it is a
-    /// dev build, how far behind the newest release it is once the dev channel has read
-    /// that, and what moves it, never "move it to Applications".
     #[test]
     fn a_dev_build_is_told_where_it_stands_not_to_move() {
         use aterm_update::dev_channel::DevLag;
@@ -1263,9 +1171,6 @@ mod tests {
         );
     }
 
-    /// Deferrals and blocks record refusals and advance no streak, and `last_apply_error`
-    /// is not expiry-bound like the streak: a reason with no attempts behind it is
-    /// reachable and reads as a plain ready stage.
     #[test]
     fn a_clean_staged_update_does_not_read_as_a_failure() {
         let st = staged_status();
@@ -1292,9 +1197,6 @@ mod tests {
         }
     }
 
-    /// An installed-bundle activation (a newer bundle already at this app's path, staged
-    /// under its activation digest) is not called downloaded; a real download stage still
-    /// is (the negative control).
     #[test]
     fn an_installed_activation_is_not_called_downloaded() {
         use crate::native_updater_service::{
@@ -1324,8 +1226,6 @@ mod tests {
         assert!(downloaded.contains("downloaded"), "{downloaded}");
     }
 
-    /// Same failure, count and cause: only whether a retry is scheduled differs, and the
-    /// words differ with it.
     #[test]
     fn the_surface_says_whether_the_update_will_retry_without_the_user() {
         let mut st = staged_status();
@@ -1350,9 +1250,6 @@ mod tests {
         );
     }
 
-    /// A current installed-source block (an ad-hoc-signed `/Applications/aterm.app`
-    /// refused as the rollback source) names the refused copy and its remedy, and never
-    /// promises an automatic retry.
     #[test]
     fn observability_audit_the_page_tells_the_owner_to_reinstall_over_an_unsigned_install() {
         let mut st = staged_status();
@@ -1389,8 +1286,6 @@ mod tests {
         );
     }
 
-    /// A healthy page carries no detail of its own: the surface paints when the last
-    /// check completed, relative to now, never the updater's decision sentence.
     #[test]
     fn a_healthy_page_says_when_it_last_checked() {
         let mut st = staged_status();
@@ -1411,9 +1306,6 @@ mod tests {
         assert_eq!(p.checked_line(checked), None);
     }
 
-    /// A persistent check failure is said in words, with where the rest is: the class
-    /// the ledger names, that aterm keeps trying, and Settings ▸ Messages — never the
-    /// ledger's "FAILING (3 consecutive checks since …)" sentence.
     #[test]
     fn a_persistent_check_failure_is_plain_and_points_at_the_log() {
         let mut st = staged_status();

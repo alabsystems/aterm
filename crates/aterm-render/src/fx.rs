@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE ART REGISTRY (`docs/DESIGN-card-engine-2026-10-19.md` §4.7): the one place an effect turns its pictures into [`FxArt`]s, and the CPU painting a tool or a test draws fx layers and glow quads with.
+//! The art registry where effects turn pictures into [`FxArt`]s and CPU painting draws fx layers and glow quads.
 
 use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
@@ -171,7 +171,7 @@ impl PieceArt {
     }
 }
 
-/// The folded and the peeled arts of the rectangles `laid`, in order, each with its piece id (`0..=254`: a peeled texel is `id + 1`), interned (design §4.7).
+/// The folded and the peeled arts of the rectangles `laid`, in order, each with its piece id (`0..=254`: a peeled texel is `id + 1`), interned.
 #[must_use]
 pub fn pieces(laid: &[(PxRect, u8)]) -> Option<PieceArt> {
     count_build();
@@ -310,7 +310,7 @@ fn run_union(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
     out
 }
 
-/// A COVER of `art` (design §4.7 as built): at most `max` texel rectangles (at least one), pairwise disjoint, whose union holds every texel that can write a byte ([`draws`]).
+/// A cover of `art`: at most `max` texel rectangles (at least one), pairwise disjoint, whose union holds every texel that can write a byte ([`draws`]).
 #[must_use]
 pub fn cover(art: &FxArt, max: usize) -> Box<[PxRect]> {
     let (w, h) = (usize::from(art.w()), usize::from(art.h()));
@@ -669,9 +669,6 @@ mod tests {
                                 crate::add_sat(s, inks[usize::from(id)].color) & 0x00FF_FFFF
                             }))
                         } else {
-                            // A fold of over inks has no exact class ink:
-                            // the last member's stands in, as a careless
-                            // fold would.
                             inks[usize::from(*m.last().expect("a member"))]
                         }
                     })
@@ -809,12 +806,7 @@ mod tests {
         (whole, covered)
     }
 
-    /// A COVER DRAWS ITS SPRITE'S BYTES (design §4.7 as built): random arts
-    /// of every texel kind, laid scaled up and down and mirrored, drawn whole
-    /// and drawn as one item per cover rectangle (its pixels the item's
-    /// clip), are the same bytes on a random ground; the rectangles are at
-    /// most `max`, inside the art, pairwise disjoint, and hold every texel
-    /// that draws.
+    /// A cover draws its sprite's bytes identically to the whole sprite.
     #[test]
     fn a_cover_draws_its_sprites_bytes() {
         let mut next = rng(0xC0_7E2);

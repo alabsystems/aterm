@@ -23,7 +23,7 @@ use crate::{
     verify,
 };
 
-/// Every `cut` flag (spec §5), parsed by cli.rs.
+/// Every `cut` flag, parsed by `cli.rs`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CutOptions {
     pub release_credentials: Option<PathBuf>,
@@ -1615,7 +1615,7 @@ pub fn release_publisher_fence(
     }
 }
 
-/// AN UNPUBLISHED CUT'S LAST TWO WRITES, in their one order.
+/// Withdraw the release tag and unlock the session.
 pub fn withdraw_tag_then_unlock(
     git: &dyn GitRunner,
     tag: &str,
@@ -2189,7 +2189,6 @@ impl Drop for DurablePostPermit {
     fn drop(&mut self) {}
 }
 
-/// A fully prepared one-shot POST ([`crate::github::prepare`]): every fallible preflight is done before the caller persists its durable intent, and the token rides curl's stdin (`-H @-`), never its argv, environment or a file.
 struct OneShotPost(aterm_update_core::github_rest::Prepared);
 
 const CURL_EXIT_FAILED_INIT: i32 = 2;
@@ -2395,8 +2394,6 @@ fn release_create_payload(tag: &str, title: &str, body: &ReleaseBody) -> Result<
 }
 
 impl OneShotPost {
-    /// JSON-body POST to `path` on the API origin (the channel draft's create). A draft
-    /// body is a few hundred bytes, written to a private scratch file curl reads.
     fn prepare_json(path: &str, payload: &[u8]) -> Result<Self> {
         crate::github::prepare(
             crate::github::OneShotUrl::Api(path),
@@ -2405,7 +2402,6 @@ impl OneShotPost {
         .map(Self)
     }
 
-    /// Raw file-body POST to `path` on the uploads origin (an asset upload), streamed by `--upload-file`, never buffered: the DMG is over a gigabyte.
     fn prepare_binary(path: &str, file: &Path) -> Result<Self> {
         crate::github::prepare(
             crate::github::OneShotUrl::Uploads(path),
@@ -2574,7 +2570,6 @@ pub fn canonical_channel_tag_version(tag: &str) -> Result<String> {
     Ok(format!("{major}.{minor}.{patch}"))
 }
 
-/// One appcast-listing row of `release`, as [`parse_appcast_asset_listing`] reads it: its id, tag, draft flag, target and its exact appcast pair's ids and names.
 fn appcast_listing_row(release: &aterm_json::Value) -> String {
     let assets: Vec<aterm_json::Value> = release["assets"]
         .as_array()
@@ -2626,7 +2621,6 @@ fn list_appcast_releases(slug: &str) -> Result<Vec<AppcastRelease>> {
     ))
 }
 
-/// Releases per listing page: GitHub's most.
 const RELEASES_PER_PAGE: usize = 100;
 
 /// Every release object of `slug`, the listing read whole (drafts included when the token
@@ -2847,8 +2841,6 @@ pub fn verify_live_channel_head_signature(
     journal_pubkey: Option<&str>,
 ) -> Result<bool> {
     let Some(journal_pubkey) = journal_pubkey else {
-        // Unsigned channel: gh auth + SHA-256 + monotonic build number are the
-        // trust. No ratchet — older `.sig` assets never demand a signed head.
         return Ok(false);
     };
     let pubkey = canonical_update_pubkey(journal_pubkey)?;
@@ -2946,8 +2938,6 @@ pub fn resume_apple_tier(
     credentials: Option<&sign::ReleaseCredentials>,
 ) -> Result<sign::AppleTier> {
     if journal.is_done("sign") {
-        // Not a claim that the tier is off: nothing remaining will sign or notarize,
-        // and `Inactive` makes every hook a no-op if one were somehow reached.
         return Ok(sign::AppleTier::Inactive);
     }
     resolve_apple_tier(team_id, credentials)
@@ -3070,7 +3060,6 @@ pub fn unique_release_object_by_tag(
 }
 
 pub fn release_object_by_id(slug: &str, id: u64) -> Result<Option<ReleaseObjectIdentity>> {
-    // A 404 is an answer (the object is absent), never retried.
     let Some(object) = crate::github::get_optional(&format!("repos/{slug}/releases/{id}"))
         .map_err(|e| Error::new(format!("read exact GitHub release ID {id} failed: {e}")))?
     else {
@@ -3105,7 +3094,6 @@ pub fn release_object_and_asset_identity(
     release_id: u64,
     name: &str,
 ) -> Result<ReleaseObjectAndAsset> {
-    // A 404 is an answer, never retried (`release_object_by_id`'s rule); any other failure retries.
     let Some(object) = crate::github::get_optional(&format!("repos/{slug}/releases/{release_id}"))?
     else {
         return Ok(ReleaseObjectAndAsset {
@@ -3166,8 +3154,6 @@ fn release_target_matches(observed: &str, expected: &str) -> bool {
     if is_oid(observed) && is_oid(expected) {
         observed.eq_ignore_ascii_case(expected)
     } else {
-        // Git ref and branch names are case-sensitive. Never normalize a
-        // symbolic release target into a different mutation capability.
         observed == expected
     }
 }
@@ -3280,9 +3266,6 @@ pub fn drain_bounded_diagnostic(
     Ok((retained, truncated))
 }
 
-/// The bytes of asset `id` on `slug`, streaming ([`crate::github::open_asset`]): the asset
-/// API's redirect, held to the asset CDN's origins (any other `Location` is refused and never
-/// asked), then an anonymous curl of the CDN with its stdout and stderr piped.
 fn exact_release_asset_download(slug: &str, id: u64) -> Result<aterm_uds::spawnfd::Child> {
     exact_release_asset_child(slug, id).map_err(|error| {
         Error::new(format!(
@@ -3291,17 +3274,12 @@ fn exact_release_asset_download(slug: &str, id: u64) -> Result<aterm_uds::spawnf
     })
 }
 
-/// [`exact_release_asset_download`], its failure as the REST client classed it.
 fn exact_release_asset_child(
     slug: &str,
     id: u64,
 ) -> std::result::Result<aterm_uds::spawnfd::Child, aterm_update_core::github_rest::RestError> {
     crate::github::open_asset(slug, id)
 }
-
-// A lost body (curl: "transfer closed with N bytes remaining to read") and a server that
-// answered "no" both end the CDN curl non-zero. A 404, a 401 and a permission refusal are
-// answers; only a transport failure can come out differently the second time.
 
 /// Whether repeating a bounded asset transfer can possibly change its outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3340,13 +3318,11 @@ pub(crate) const ASSET_TRANSFER_BACKOFFS: &[u64] = &[2, 5];
 pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransferFault {
     let d = diagnostic.to_ascii_lowercase();
     const ANSWERED: &[&str] = &[
-        // The REST client's words for GitHub's answer (`HTTP 404: Not Found`).
         "http 401",
         "http 403",
         "http 404",
         "http 410",
         "http 422",
-        // curl's `--fail` words for the CDN's (`The requested URL returned error: 404`).
         "returned error: 401",
         "returned error: 403",
         "returned error: 404",
@@ -3364,7 +3340,6 @@ pub(crate) fn classify_asset_transfer_failure(diagnostic: &str) -> AssetTransfer
         "maximum file size exceeded",
     ];
     const TRANSPORT: &[&str] = &[
-        // curl read a body that stopped short.
         "transfer closed with",
         "partial file",
         "unexpected eof",
@@ -3452,8 +3427,6 @@ fn attempt_exact_release_asset_transfer(
     expected_size: u64,
     limit: usize,
 ) -> std::result::Result<Vec<u8>, TransferAttemptFailure> {
-    // The asset API's own failure is classed as the client read it: a definitive answer is
-    // not asked again, a transport failure or a 5xx is.
     let mut child = exact_release_asset_child(slug, id).map_err(|error| {
         let message = format!("exact GitHub asset-ID {id} download on {slug}: {error}");
         if crate::github::definitive(&error) {
@@ -3516,7 +3489,6 @@ fn attempt_exact_release_asset_transfer(
         TransferAttemptFailure::answered("downloaded release-asset length does not fit u64")
     })?;
     if downloaded_size != expected_size {
-        // A body that ended early but exited 0. Same fault, quieter symptom.
         return Err(TransferAttemptFailure::transport(format!(
             "API size {expected_size} differs from bounded download size {downloaded_size}"
         )));
@@ -3530,7 +3502,6 @@ mod asset_transport_retry_tests {
     use super::*;
     use std::cell::RefCell;
 
-    /// The CDN curl's stderr for a truncated body.
     const TRUNCATED: &str = "curl: (18) transfer closed with 1048576 bytes remaining to read";
 
     fn run(
@@ -4546,7 +4517,7 @@ fn download_live_manifest_pair(
     Ok((manifest, signature))
 }
 
-/// The monotonic gate (spec §7 steps 4+5).
+/// The monotonic build-number gate.
 pub fn monotonic_ok(n: u64, our_tag: &str, best: Option<(&str, u64)>) -> Result<()> {
     match best {
         None => Ok(()),
@@ -4601,6 +4572,12 @@ impl CutCtx {
                 .artifacts
                 .iter()
                 .map(|artifact| artifact.asset.clone())
+                .chain(
+                    handoff
+                        .verifiers
+                        .iter()
+                        .map(|verifier| verifier.asset.clone()),
+                )
                 .collect()
         })
     }
@@ -4962,9 +4939,6 @@ pub const fn exact_delete_absence_is_converged(
     preexisting_absence_is_converged || delete_attempted
 }
 
-/// One DELETE of `endpoint`, asked once: what GitHub or curl said when it failed, else
-/// nothing. The caller re-reads the object to learn whether it is gone, so a failure is
-/// only words here.
 fn github_delete(endpoint: &str) -> String {
     match crate::github::send_once(
         aterm_update_core::github_rest::Method::Delete,
@@ -5585,7 +5559,6 @@ fn refuse_roster_downgrade(dist: &Path, incoming_seq: u64) -> Result<()> {
         fs::read(&local),
         fs::read(dist.join(roster::ROSTER_SIG_ASSET)),
     ) else {
-        // No local pair (or half of one): there is nothing here to protect.
         return Ok(());
     };
     let Ok(verified) =
@@ -5985,7 +5958,7 @@ pub struct VerifiedBundle {
     pub line: String,
 }
 
-/// THE VERIFIED BUNDLE OF THE RELEASE OF `source`, read from this clone's release journal (`ship release`'s, in the git common dir).
+/// Read the verified release bundle of `source` from this clone's release journal.
 pub fn verified_release_bundle(
     operator: &dyn GitRunner,
     repo: &Path,
@@ -6085,7 +6058,7 @@ pub fn verified_release_bundle(
     })
 }
 
-/// The whole `targo --unverified ship cut` (spec §7 order).
+/// Run `targo --unverified ship cut`.
 pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     gates::arm_toolchain_lease();
     let credentials = sign::ReleaseCredentials::resolve(opts.release_credentials.as_deref(), repo)
@@ -6150,8 +6123,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         );
     }
     if fresh_cut_journal_triage(existing.as_ref(), kind)? {
-        // A finished cut's journal — whichever cutter wrote it — is just history: clear
-        // it and move on.
         let _ = fs::remove_file(&journal_path);
     }
     let published = if kind == CutKind::Real {
@@ -6188,8 +6159,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         )
     })?;
     if kind == CutKind::Real {
-        // The tree's own statement of its repository, bound again: the one read
-        // before the placement was this checkout's.
         assert_origin_repo_binding(&git, &origin_slug)?;
     }
     let publish_slug = channel_slug(&cargo_text)?;
@@ -6235,8 +6204,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
             },
         )?
     } else {
-        // A dry run never rolls, so there is no recut concept: the version
-        // is the workspace's; notes come from [Unreleased].
         (release_version.clone(), false)
     };
     ledger::check_version_shape(&version)?;
@@ -6322,8 +6289,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
     );
     step("gate", &verified.line);
     if kind != CutKind::Real && !opts.linux_workers.is_empty() {
-        // A Linux worker fetches the commit it builds from origin, and only a real
-        // claim puts the release commit there.
         return Err(Error::new(format!(
             "a dry run signs its release's reserved commit {}, which is pushed \
              nowhere until a real claim lands it, so a Linux worker (it fetches the commit it \
@@ -6581,7 +6546,6 @@ fn resume_cut(
         journal_path,
     } = paths;
     let Some(next) = journal.first_incomplete() else {
-        // The release is complete; the site follows in `ship release`'s after-cut step.
         return Err(Error::new(format!(
             "the journaled cut already completed every step — nothing to resume \
              (delete dist/cut-state.toml, or just cut: a fresh cut clears it). The website \
@@ -7014,6 +6978,27 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
             journal.linux = Some(handoff.clone());
             journal.save(&ctx.journal_path)?;
         }
+        match handoff.record(&ctx.slug, &ctx.version, ctx.build, &ctx.commit) {
+            None => println!(
+                "==> no static bootstrap verifier in this cut: install.sh keeps its embedded \
+                 verifier"
+            ),
+            Some(record) => {
+                let at = ctx.dist.join(crate::buildplan::linux::PIN_RECORD);
+                fs::write(&at, record.to_toml())
+                    .map_err(|e| Error::new(format!("write {}: {e}", at.display())))?;
+                println!(
+                    "==> install.sh's bootstrap verifier pin for v{} is in {}. Once the release \
+                     is public, `targo --unverified ship pin-verifier {}` in a checkout of main \
+                     writes these lines into tools/install.sh, with {}; commit both:\n{}",
+                    ctx.version,
+                    at.display(),
+                    at.display(),
+                    aterm_bootstrap_verify::pin::RECORD,
+                    record.pin().lines()
+                );
+            }
+        }
     }
     let (Some(key), Some(macho_sha256)) = (ctx.artifact.clone(), ctx.macho_sha256.clone()) else {
         return Err(Error::new(
@@ -7289,8 +7274,6 @@ pub fn selfcheck_signing(
         ))
     })?;
     if team.is_empty() {
-        // A cut that claims no team (a fork's tier) has no notarization promise to
-        // keep: no Apple tool is spawned.
         return Ok("");
     }
     sign::apple_selfcheck_verdict(&sign::AppleSelfcheck {
@@ -7784,8 +7767,6 @@ pub fn preflight_channel_target(slug: &str, claimed: bool) -> Result<()> {
              and grant the release account write access."
         ))
     })?;
-    // `.permissions` is GitHub's answer for the identity that asked; an anonymous read
-    // carries none, so it never reads as push.
     let (Some(private), push) = (
         repository["private"].as_bool(),
         repository["permissions"]["push"].as_bool().unwrap_or(false),
@@ -7804,7 +7785,6 @@ pub fn preflight_channel_target(slug: &str, claimed: bool) -> Result<()> {
             || "~/.secrets/gh_access_token_alabsystems".to_string(),
             |path| path.display().to_string(),
         );
-        // With no token loaded the read went anonymously: the token was never asked.
         return Err(Error::new(if crate::github::has_token() {
             format!(
                 "the release token ({token_path}) cannot write {slug}: grant it write access{then}"
@@ -8335,7 +8315,7 @@ pub enum PointerProbe {
     Other(String),
 }
 
-/// One anonymous.
+/// Run one anonymous probe of the evergreen pointer.
 pub fn probe_evergreen_pointer(
     slug: &str,
     asset: &str,
@@ -8419,7 +8399,6 @@ pub fn prove_pointer_serves(
     }
     let Some(location) = location else {
         if let PointerProbe::Refused { code, reason } = &last {
-            // Distinct branch.
             return Err(Error::new(format!(
                 "the evergreen pointer https://github.com/{slug}/releases/latest/download/\
                  {asset} was REFUSED with HTTP {code} ({reason}). That host carries no API \
@@ -8887,8 +8866,7 @@ fn prove_client_elects_this_cut(ctx: &CutCtx, slug: &str, release_id: u64) -> Re
     Ok(())
 }
 
-/// The upload path of asset `name` on release `release_id` of `slug`, on the uploads
-/// origin: every part canonical, so nothing in it can reach another endpoint.
+/// The canonical upload path of asset `name` on release `release_id` of `slug`.
 pub fn exact_release_upload_url(slug: &str, release_id: u64, name: &str) -> Result<String> {
     let valid_slug = slug.split_once('/').is_some_and(|(owner, repo)| {
         !owner.is_empty()
@@ -8972,7 +8950,6 @@ mod transport_body_tests {
 
     use super::*;
 
-    /// A one-shot POST prepared against a loopback GitHub with a token (nothing is sent).
     fn prepared(body: impl FnOnce() -> Result<OneShotPost>) -> Vec<String> {
         let _github = crate::github::Fixture {
             origins: aterm_update_core::github_rest::Origins::loopback(1, 2, 3, 4),
@@ -9006,7 +8983,6 @@ mod transport_body_tests {
         );
         let request = args.iter().position(|a| a == "-X").unwrap();
         assert_eq!(args[request + 1], "POST");
-        // No `@` prefix: that spelling is --data-binary's, and curl would look for a file named "@/…".
         let flag = args.iter().position(|a| a == "--upload-file").unwrap();
         assert_eq!(args[flag + 1], dmg.to_str().unwrap());
         assert_eq!(
@@ -9014,8 +8990,6 @@ mod transport_body_tests {
             Some("http://127.0.0.1:2/repos/o/r/releases/1/assets?name=aterm-0.33.0.dmg"),
             "the uploads origin"
         );
-        // A JSON body still buffers from its private temp file, and either way the token
-        // is read from stdin, never the argv.
         let args = prepared(|| OneShotPost::prepare_json("repos/o/r/releases", b"{}"));
         let flag = args.iter().position(|a| a == "--data-binary").unwrap();
         assert!(args[flag + 1].starts_with('@'), "{args:?}");
@@ -9707,7 +9681,6 @@ mod anonymous_readability_tests {
                 "the channel's anonymous proof spent the metered API: {url}"
             );
         }
-        // Negative control: the predicate flags an API-host URL (`<api origin>/repos/<slug>/releases/tags/<tag>`).
         let retired = format!(
             "{}/repos/{SLUG}/releases/tags/{TAG}",
             aterm_update_core::github_rest::Origins::github().api

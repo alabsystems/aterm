@@ -1,23 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! Conformance: the real `transact()` obeys the derived no-lost-update discipline.
-//!
-//! `aterm_models_session::transact_model()`: a transaction commits only if no
-//! write intervened since it read the head (`CommitClean`, `seq = tbase`);
-//! otherwise it aborts (`Abort`, `seq > tbase`) without clobbering the concurrent
-//! write. Each real `Surface::transact` outcome is checked against the model's
-//! own guard (`Model::action_enabled`), and a conflicted transaction must apply
-//! nothing. Pure Rust, so it always runs.
+
+//! Conformance tests verifying that `Surface::transact` obeys `transact_model`.
 
 use crate::support::write_cap;
 use aterm_buffer::{Edit, Surface, TxnOutcome};
 use aterm_models_session::transact_model;
 use std::collections::BTreeMap;
 
-/// Project the state of a transaction attempting to commit (`active = 1`)
-/// against `tbase`, with no loss yet. Heads stay small so the model's
-/// `seq <= MaxSeq - K` bound does not interfere.
 fn attempting(seq: u64, tbase: u64) -> BTreeMap<&'static str, i64> {
     [
         ("seq", seq as i64),
@@ -57,7 +47,6 @@ fn real_transact_conflict_aborts_no_lost_update() {
     let m = transact_model();
     let mut s = Surface::new();
     let base = s.seq(); // txn reads the head at base
-    // A concurrent write advances the head past `base`.
     s.apply(&write_cap(), Edit::AppendLine("concurrent".into()));
     let st = attempting(s.seq().0, base.0); // seq > tbase
 
@@ -76,7 +65,6 @@ fn real_transact_conflict_aborts_no_lost_update() {
         matches!(outcome, TxnOutcome::Conflict),
         "real transact must CONFLICT under a concurrent write, not commit against a stale base"
     );
-    // A conflicted transaction applied nothing, so the concurrent write survives.
     assert_eq!(
         s.seq().0,
         head_before,

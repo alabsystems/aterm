@@ -1,6 +1,5 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Truncate and remove_newest operations including cross-tier slow paths.
 
@@ -17,9 +16,7 @@ fn three_tier() -> Scrollback {
     sb
 }
 
-/// `truncate` keeps exactly the newest `keep` lines on every path — hot only,
-/// into warm, into cold (#1693: it once cleared cold/warm whenever `keep`
-/// exceeded the hot tier) and zero — and never leaves hot over its limit.
+/// `truncate` keeps the newest `keep` lines across hot, warm, and cold tiers.
 #[test]
 fn truncate_keeps_the_newest_lines_on_every_path() {
     let (hot, warm) = {
@@ -54,10 +51,7 @@ fn truncate_keeps_the_newest_lines_on_every_path() {
     );
 }
 
-/// `remove_newest` keeps exactly the oldest lines on every path — the hot
-/// fast path, a partial warm block, past warm into cold, and everything. The
-/// slow path once dumped every survivor into hot past `hot_limit`; it
-/// re-promotes instead.
+/// `remove_newest` keeps the oldest lines across hot, warm, and cold tiers.
 #[test]
 fn remove_newest_keeps_the_oldest_lines_on_every_path() {
     let (hot, warm) = {

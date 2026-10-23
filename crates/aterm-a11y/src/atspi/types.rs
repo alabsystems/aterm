@@ -1,12 +1,6 @@
 // Copyright 2022 Tait Hoyem and the atspi contributors.
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//
-// Derived from atspi-common 0.13.0 (Apache-2.0 OR MIT, used under
-// Apache-2.0) src/interface.rs, src/state.rs, src/role.rs,
-// src/relation_type.rs and src/lib.rs, and cut by the aterm project in 2026
-// to the values aterm's publisher sends, as plain enums and bit sets in
-// place of serde and enumflags2.
 
 //! AT-SPI interfaces, states, roles, and relation types.
 

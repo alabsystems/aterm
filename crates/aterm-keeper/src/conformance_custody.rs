@@ -31,7 +31,6 @@ fn header(rdev: Rdev) -> MasterHeader {
     }
 }
 
-/// The world, answered from a model state.
 struct World<'a> {
     st: &'a State,
     pids: &'a Pids,
@@ -70,9 +69,6 @@ impl KeeperEnv for World<'_> {
             .iter()
             .any(|(who, p)| *p == pid && self.st[format!("{who}_live").as_str()] == 1)
     }
-    /// A window's crash marker (the window's and the relaunched window's), named in each of its
-    /// HELLOs: held by the live window, gone once it ended through its exit path — the Commit's
-    /// `clean_exit_now` and the quit alike (a crash's status says otherwise).
     fn marker(&mut self, pid: u32, _marker: &MarkerRef) -> MarkerEvidence {
         let role = [("w", self.pids.w), ("r", self.pids.r)]
             .into_iter()
@@ -85,7 +81,6 @@ impl KeeperEnv for World<'_> {
     }
 }
 
-/// The marker the window names at HELLO.
 fn window_marker() -> MarkerRef {
     MarkerRef {
         nanos: 1,
@@ -113,18 +108,11 @@ struct Rig {
     s_quiet: bool,
 }
 
-/// The runner's own move for a Commit to a successor that takes no part in
-/// the keeper: the model's `Commit`.
 const QUIET_COMMIT: &str = "CommitQuiet";
 
-/// The runner's moves for a tab closed while the window's link is down: the model's `LinkDrops`,
-/// then `CloseTabA` (`B`).
 const LINK_DROPS_CLOSE_TAB_A: &str = "LinkDropsCloseTabA";
 const LINK_DROPS_CLOSE_TAB_B: &str = "LinkDropsCloseTabB";
 
-/// The runner's move for the model's `RelaunchedWindowQuits` with the BYE lost: the window wrote
-/// it, but no keeper read it (the link was down, or the keeper dropped the connection with the
-/// BYE unread).
 const RELAUNCHED_WINDOW_QUITS_BYE_LOST: &str = "RelaunchedWindowQuitsByeLost";
 
 impl Rig {
@@ -179,7 +167,6 @@ impl Rig {
         }
     }
 
-    /// Deliver a peer's death: its EOF and the kernel's status.
     fn die(&mut self, role: &'static str, status: i32, env_st: &State) -> Vec<Out> {
         let pid = self.pid_of(role);
         let conn = self.conn.remove(role);
@@ -210,7 +197,6 @@ impl Rig {
         core.register(conn, header(rdev), b"tag".to_vec(), rdev)
     }
 
-    /// The keeper's variables of the model, from the real core.
     fn project(&self, env: &State) -> State {
         let mut st = env.clone();
         match &self.core {
@@ -232,7 +218,6 @@ impl Rig {
         st
     }
 
-    /// A shape of the real core for de-duplicating the exploration.
     fn shape(&self) -> String {
         let Some(core) = &self.core else {
             return "down".to_string();
@@ -271,11 +256,6 @@ impl Rig {
         )
     }
 
-    /// Whether `action` is one a committed successor that takes no part in the
-    /// keeper never makes while it lives: a REGISTER (the only one the model
-    /// enables then is the successor's), a RELEASE on its tab close — and the
-    /// outgoing window's late RELEASE beside it, which is then the last claim,
-    /// a case the model states only beside a successor that registered.
     fn quiet_never(&self, action: &str) -> bool {
         self.s_quiet
             && self.st["s_live"] == 1
@@ -288,8 +268,6 @@ impl Rig {
 
 type Step = (State, &'static str, State);
 
-/// Environment moves the explorer may take (the keeper's own moves come only
-/// from a clock tick or a HELLO).
 const ENV_MOVES: &[&str] = &[
     "RegisterA",
     "RegisterB",
@@ -318,8 +296,6 @@ const ENV_MOVES: &[&str] = &[
     "KeeperRestarts",
 ];
 
-/// [`LINK_DROPS_CLOSE_TAB_A`] (`B`): two model steps, `LinkDrops` then the
-/// tab's close, each checked on the real core.
 fn link_drops_close_tab(model: &Model, rig: &mut Rig, close: &'static str) -> Vec<Step> {
     let rdev = if close == "CloseTabA" { A } else { B };
     let before = rig.st.clone();
@@ -381,7 +357,6 @@ fn link_drops_close_tab(model: &Model, rig: &mut Rig, close: &'static str) -> Ve
     vec![(before, "LinkDrops", mid.clone()), (mid, close, after)]
 }
 
-/// Apply one environment move to the rig; returns the model steps it made.
 fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
     match mv {
         LINK_DROPS_CLOSE_TAB_A => return link_drops_close_tab(model, rig, "CloseTabA"),
@@ -531,7 +506,6 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
             }
         }
         "OutgoingDrained" => {
-            // The outgoing window's EOF and `_exit(0)` (no BYE) are read.
             rig.die("o", 0, &next);
         }
         "Rollback" => {
@@ -687,8 +661,6 @@ fn env_move(model: &Model, rig: &mut Rig, mv: &'static str) -> Vec<Step> {
     vec![(before, action, after)]
 }
 
-/// The clock: relaunch if due, and the relaunched window's HELLO with its
-/// offers.
 fn tick(model: &Model, rig: &mut Rig) -> Vec<Step> {
     rig.now += TICK_MS;
     let now = rig.now;
@@ -762,10 +734,6 @@ struct Explored {
     sequences: usize,
 }
 
-/// Every move sequence of up to `depth` steps from `rig`. `seen` holds the most steps each
-/// (model state, real shape) has been explored with: a node explored with `n` steps left has
-/// already walked every sequence a later visit with `n` or fewer could, so that visit is
-/// skipped and only a visit with more steps left walks it again.
 fn explore(
     model: &Model,
     rig: Rig,
@@ -836,8 +804,6 @@ fn explore(
     }
 }
 
-/// Between them, the bounded event sequences fire every action of the model. Negative control:
-/// the buggy model rejects real steps at each mutant's site.
 #[test]
 fn the_real_keeper_conforms_to_the_custody_model() {
     let model = pty_keeper_custody_model();
@@ -938,8 +904,6 @@ fn the_real_keeper_conforms_to_the_custody_model() {
     }
 }
 
-/// The anchors the conformance exercises are compiled in and were entered: the refinements name
-/// real functions that ran.
 #[test]
 fn the_custody_anchors_are_live() {
     assert!(
@@ -1004,7 +968,6 @@ fn the_custody_anchors_are_live() {
     }
 }
 
-/// Every schedule of `KeeperRelaunchBrake` replayed on the real brake.
 #[test]
 fn the_real_brake_conforms_to_the_brake_model() {
     let model = keeper_relaunch_brake_model();
@@ -1098,13 +1061,9 @@ fn the_real_brake_conforms_to_the_brake_model() {
     assert!(rejected > 0, "the buggy brake accepts every real decision");
 }
 
-/// The classifier over real wait statuses, read by the keeper's own exit
-/// watch, and the real core's judgement of a window that ended so.
 #[test]
 fn the_classifier_judges_real_ends() {
     use std::process::{Command, Stdio};
-    /// No holder, a live shell, a dead window, and — once `marker` is set —
-    /// that window's marker: held while it names it, then what `marker` says.
     struct NoWorld {
         marker: Option<MarkerEvidence>,
         named: bool,
@@ -1233,13 +1192,9 @@ fn the_classifier_judges_real_ends() {
     }
 }
 
-/// The window whose end `KeeperDeathJudgement` judges, and when.
 const JUDGED_WINDOW: u32 = 4_343;
 const JUDGE_AT: u64 = 1 + crate::core::DEATH_GRACE_MS;
 
-/// The world a judgement asks about, from a `KeeperDeathJudgement` state: master `A`'s shell
-/// lives while `shell_live`; the window's marker is held while it lives (`alive`), then what
-/// `marker` says.
 struct JudgeWorld<'a> {
     st: &'a State,
     alive: bool,
@@ -1272,7 +1227,6 @@ impl KeeperEnv for JudgeWorld<'_> {
     }
 }
 
-/// The model's wait status as the kernel encodes it.
 fn wait_status(model_status: i64) -> Option<i32> {
     match model_status {
         1 => Some(0),
@@ -1290,7 +1244,6 @@ struct JudgeRig {
     watching: bool,
 }
 
-/// Drive the real keeper through `action` from `st`, and project.
 fn judge_step(model: &Model, rig: &JudgeRig, st: &State, action: &str) -> (JudgeRig, State) {
     let mut real = rig.clone();
     let env_next = || {
@@ -1378,8 +1331,6 @@ fn judge_step(model: &Model, rig: &JudgeRig, st: &State, action: &str) -> (Judge
     (real, next)
 }
 
-/// Tier-1 of `KeeperDeathJudgement`: every schedule driven on the real `KeeperCore`, each step a
-/// transition the model admits and every model state reached.
 #[test]
 fn the_real_keeper_conforms_to_the_death_judgement_model() {
     let model = keeper_death_judgement_model();

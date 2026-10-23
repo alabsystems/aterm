@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The live seamless-update handoff (proof-carrying DSU rung 1b).
+//! Live seamless-update handoff.
 
 use crate::handoff_env::{HandoffEnv, HandoffName};
 use crate::session_store::{ConnectionCarry, HandoffFds, ScreenCarry, SessionHandoff, WindowCarry};
@@ -797,7 +797,7 @@ fn write_private_new(path: &std::path::Path, bytes: &[u8]) -> Option<()> {
     Some(())
 }
 
-/// THE PERSON'S STAMPS AT THE COMMIT'S WRITE (LC-4 of ): the sidecar beside an attempt's manifest (`seamless-<pid>-<nonce>.person`, swept with the attempt's other files once its writer is gone) in which the outgoing process names, right before its Commit's one write, how long ago a person last gave each carried session input ([`crate::App::write_person_stamps_at_commit`]), and which the successor takes at its Commit ([`crate::App::take_carried_person_stamps`]).
+/// Path to the person-stamps sidecar beside `manifest`.
 #[cfg(unix)]
 pub(crate) fn person_stamps_path(manifest: &std::path::Path) -> std::path::PathBuf {
     manifest.with_extension("person")
@@ -816,7 +816,7 @@ pub(crate) enum PersonStamp {
     Unkeyed(u64),
 }
 
-/// Write the person-stamps sidecar at `path` ([`person_stamps_path`]): one line per handed session, `<local id> <milliseconds since the last gesture>` for a keyed one and `<local id> -<milliseconds served unkeyed>` for one nobody keyed ([`PersonStamp`]), created afresh with owner-only permissions.
+/// Write the person-stamps sidecar at `path`.
 #[cfg(unix)]
 pub(crate) fn write_person_stamps(path: &std::path::Path, stamps: &[(u64, PersonStamp)]) -> bool {
     let body: String = stamps
@@ -829,7 +829,7 @@ pub(crate) fn write_person_stamps(path: &std::path::Path, stamps: &[(u64, Person
     write_private_new(path, body.as_bytes()).is_some()
 }
 
-/// Take the person-stamps sidecar at `path` under the private dir `dir` ([`write_person_stamps`]): its `(local id, stamp)` rows, a malformed row dropped; none for a missing, oversized or unreadable file — every adopted session then reads as never keyed since the Commit.
+/// Consume the person-stamps sidecar at `path` under `dir`.
 #[cfg(unix)]
 pub(crate) fn take_person_stamps(
     path: &std::path::Path,
@@ -3689,8 +3689,6 @@ fn attest_handoff_parent_from(
         return None;
     }
     if creator > 1 && creator != pid {
-        // A live creator that is not who the environment named: no published detail overrides
-        // the kernel. This arm refuses a stale handoff block re-entering through a shell.
         return None;
     }
     let live = read_process_birth(pid);
@@ -4220,7 +4218,6 @@ pub(crate) fn take_target_identity_from(env: &mut HandoffEnv) -> Option<HandoffT
     let raw = env.take(ENV_TARGET).and_then(|v| v.into_string().ok());
     let own = HandoffTarget::own();
     let Some(raw) = raw else {
-        // Older parent: it hashes its ticket's target and we hash our own build_info.
         return own;
     };
     let Some(own) = own else {
@@ -4597,13 +4594,9 @@ impl CommitReceiver {
                 if let Err(end) = received
                     && fail_stop
                 {
-                    // No exact Commit can arrive now, so this candidate can
-                    // never become authoritative.
                     fail_stop_without_commit(parent, end)
                 }
                 if send.send(received).is_err() && fail_stop {
-                    // The event-loop authority disappeared while the parent was
-                    // deciding. Remaining alive readerless is never terminal.
                     fail_stop_without_commit(parent, NoCommit::ReceiverGone)
                 }
             })
@@ -4711,10 +4704,6 @@ pub(crate) fn commit_and_exit(
         // SAFETY: one atomic write from a live fixed buffer to the private pipe.
         let wrote = unsafe { libc::write(fd.as_raw_fd(), wire.as_ptr().cast(), wire.len()) };
         if wrote == isize::try_from(wire.len()).unwrap_or(-1) {
-            // This is the protocol's point of no return. `_exit` skips every
-            // App/Session destructor that could SIGHUP the handed-off PTYs; the
-            // crash marker goes with it, because handing off IS a clean end
-            // (`crash_signal::clean_exit_now`).
             crate::crash_signal::clean_exit_now(0)
         }
         if wrote < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
@@ -4773,7 +4762,6 @@ pub(crate) fn take_ready_fd_from(
     let raw = env.take(ENV_READY_FD).and_then(|v| v.into_string().ok());
     let fd: i32 = raw?.trim().parse().ok()?;
     if fd < 3 {
-        // Distinct branch.
         return None;
     }
     // Live-fd probe. SAFETY: `F_GETFD` on an arbitrary fd is side-effect-free.
@@ -4968,7 +4956,7 @@ fn with_fabric(mut json: Vec<u8>, fabric: Option<&[u8]>) -> Option<Vec<u8>> {
     Some(json)
 }
 
-/// The keeper's META: the Repaint rung's scalar state of a live terminal (modes, keyboard protocols, charsets, the pen, the cursor, the directory and title) as the JSON the handoff's screen carry uses, without either grid, without the shell-integration nonce (the keeper holds no secret; the re-key channel heals it), and with no partial escape sequence or in-flight output state (`CheckpointMeta::output_state`: the REP character, an open OSC 8 link, a VT52 address in progress).
+/// Build the keeper's Repaint-rung metadata JSON for a live terminal.
 #[cfg(unix)]
 pub(crate) fn keeper_meta_of(
     mut meta: CheckpointMeta,
@@ -5734,7 +5722,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
     }
 }
 
-/// THE CARRIED ENDS' INTAKE (`docs/DESIGN-harness-autopilot-2026-10-15.md` §11.2.3, item 8): each record's Autopilot end and its task's work ([`crate::session_store::SessionRecord::autopilot_end`], read by `harness_end_carry::EndCarry::parse`) by the sid it is adopted under — the successor's `App::end_carry` (through [`IncomingHandoff::end_carry`]), spent at each adopted session's first publication (`App::adopt_end_carry`), never a reason to refuse.
+/// Parse each session record's carried Autopilot end and task state, keyed by `sid`.
 pub(crate) fn end_carry_of(
     sessions: &[crate::session_store::SessionRecord],
 ) -> std::collections::HashMap<String, crate::harness_end_carry::EndCarry> {
@@ -5767,7 +5755,7 @@ mod fixture_tests;
 #[path = "seamless_fixture_cover.rs"]
 pub(crate) mod fixture_cover;
 
-/// Tier-1 for `NativeUpdateSuccessorWarmBeforeClaim` (the handoff environment snapshot, docs/DESIGN-warm-successor-2026-09-29.md P1).
+/// Tier-1 conformance for `NativeUpdateSuccessorWarmBeforeClaim` (the handoff environment snapshot).
 #[cfg(all(test, unix))]
 #[path = "seamless_handoff_env_tests.rs"]
 pub(crate) mod handoff_env_conformance;

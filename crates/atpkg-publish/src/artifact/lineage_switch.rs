@@ -179,7 +179,7 @@ enum Bounded {
 }
 
 fn bounded_git(repo: &Path, env: &[(&str, &std::ffi::OsStr)], args: &[&str]) -> Bounded {
-    let mut cmd = aterm_uds::spawnfd::command("git");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     cmd.arg("-C").arg(repo).args(args);
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     for (k, v) in env {

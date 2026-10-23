@@ -1,5 +1,4 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 //! Boundary condition tests: a 1x1 write, history line API ordering and
@@ -8,13 +7,10 @@
 use super::super::*;
 use crate::grid::test_support::write_marker_line;
 
-// Minimum dimension / clamping
-
 #[test]
 fn grid_write_char_1x1_stays_at_origin() {
     let mut grid = Grid::new(1, 1);
 
-    // Write to the only cell — cursor should stay at (0, 0)
     grid.write_char('X');
     assert_eq!(grid.cursor_row(), 0);
     assert_eq!(
@@ -24,8 +20,6 @@ fn grid_write_char_1x1_stays_at_origin() {
     );
     grid.assert_invariants();
 }
-
-// History line API ordering
 
 #[test]
 fn grid_history_line_api_covers_ring_buffer_ordering() {
@@ -62,19 +56,15 @@ fn grid_history_line_api_covers_ring_buffer_ordering() {
     assert!(grid.history_line_rev(3).is_none());
 }
 
-// row_u16 / clamp_u16 saturation
-
 /// `row_u16` saturates to `u16::MAX` for values above the u16 range.
 #[test]
 fn row_u16_saturates_on_overflow() {
     use super::super::row_u16;
 
-    // In-range values convert exactly.
     for val in [0_usize, 1, 24, 500, 65_535] {
         assert_eq!(usize::from(row_u16(val)), val);
     }
 
-    // Values above u16::MAX saturate.
     assert_eq!(row_u16(u16::MAX as usize + 1), u16::MAX);
     assert_eq!(row_u16(usize::MAX), u16::MAX);
 }

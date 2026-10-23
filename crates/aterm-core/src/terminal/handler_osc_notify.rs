@@ -2,47 +2,29 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! OSC desktop-notification handlers: OSC 9 (simple), OSC 99 (kitty: title,
-//! body, urgency, multi-part) and OSC 777 (rxvt-unicode `notify`).
-//!
-//! All three are gated by `modes.allow_notifications`, off by default and set
-//! from `TerminalConfig::allow_notifications` by
-//! [`Terminal::apply_config`](super::Terminal::apply_config): a wired callback
-//! alone is never reached.
+//! OSC desktop-notification handlers (OSC 9, OSC 99, and OSC 777).
 
 use super::handler::TerminalHandler;
 use aterm_types::osc::{Notification, NotificationUrgency, TaskbarProgress};
 
-/// Maximum in-flight multi-part OSC 99 notifications; while full, a non-final
-/// chunk of a new id is dropped.
 const MAX_PENDING_NOTIFICATIONS: usize = 64;
 
-/// Pending-map key shared by every OSC 99 chunk without an `i=` id.
 const ANON_NOTIFICATION_KEY: &str = "\u{0}anon";
 
-/// Maximum bytes of a notification title or body; longer text is cut at a UTF-8
-/// boundary.
 const MAX_NOTIFICATION_FIELD_BYTES: usize = 4096;
 
 impl TerminalHandler<'_> {
-    /// Handle OSC 9 (Terminal / ConEmu): `ESC ] 9 ; message ST` goes to the
-    /// simple notification callback. ConEmu's `9;4;st;pr` taskbar progress
-    /// carries no text: it sets
-    /// [`Terminal::taskbar_progress`](super::Terminal::taskbar_progress) ungated
-    /// and never reaches the callback.
+    /// Handles OSC 9 simple notifications and ConEmu `9;4;st;pr` taskbar progress.
     pub(super) fn handle_osc_9(&mut self, params: &[&[u8]]) {
-        // The message is params[1..] rejoined, so literal semicolons round-trip.
         let Some(message) = join_params(params, 1) else {
             return;
         };
-        // ConEmu taskbar progress: ungated, never a notification.
         if message == "4" || message.starts_with("4;") {
             if let Some(progress) = parse_conemu_taskbar_progress(&message) {
                 *self.taskbar_progress = Some(progress);
             }
             return;
         }
-        // Asked for, whatever the gate says.
         *self.notify_total = self.notify_total.saturating_add(1);
         if !self.modes.allow_notifications {
             return;
@@ -56,24 +38,12 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Handle OSC 99, the kitty notification protocol:
-    /// `ESC ] 99 ; <metadata> ; <payload> ST`, metadata a `:`-separated list of
-    /// - `i=<id>`: groups multi-part chunks (id-less chunks share one default id)
-    /// - `p=title|body`: payload kind (default `title`)
-    /// - `u=0|1|2`: urgency low, normal (default), critical
-    /// - `d=0`: more chunks follow (`d=1` or absent: final)
-    ///
-    /// Same-kind text accumulates, capped at [`MAX_NOTIFICATION_FIELD_BYTES`],
-    /// until the final chunk, then goes to the advanced notification callback.
+    /// Handles OSC 99 kitty notifications, accumulating multi-part chunks by id.
     pub(super) fn handle_osc_99(&mut self, params: &[&[u8]]) {
-        // params[1] = metadata (key=value pairs), params[2..] = payload.
         let metadata = params
             .get(1)
             .and_then(|p| std::str::from_utf8(p).ok())
             .unwrap_or("");
-        // A final chunk is one notification asked for, counted before the
-        // gate: `d=` absent or not `0`, the last `d=` winning as
-        // in the parse below. Only the metadata is read.
         if metadata
             .split(':')
             .rev()
@@ -90,16 +60,15 @@ impl TerminalHandler<'_> {
         let mut id: Option<String> = None;
         let mut payload_kind = Osc99Payload::Title;
         let mut urgency = NotificationUrgency::Normal;
-        let mut done = true; // absent `d` means final.
+        let mut done = true;
 
         for pair in metadata.split(':') {
             let Some((key, value)) = pair.split_once('=') else {
                 continue;
             };
             match key {
-                "i" => {
-                    // Arm-local `if`, not a match guard (a guard would fall
-                    // through to the unknown-key default arm when false).
+                "i" =>
+                {
                     #[allow(clippy::collapsible_match)]
                     if !value.is_empty() && value.len() <= 256 {
                         id = Some(value.to_string());
@@ -113,15 +82,12 @@ impl TerminalHandler<'_> {
                 }
                 "u" => urgency = NotificationUrgency::from_param(value),
                 "d" => done = value != "0",
-                _ => {} // Unknown / unsupported key — ignore.
+                _ => {}
             }
         }
 
         let text = sanitize_notification(&payload);
 
-        // Every id-less chunk shares one key (kitty treats a missing `i` as one
-        // default id), so an id-less `d=0` chunk can be completed and cannot fill
-        // the map.
         let key = id
             .clone()
             .unwrap_or_else(|| ANON_NOTIFICATION_KEY.to_string());
@@ -147,23 +113,16 @@ impl TerminalHandler<'_> {
                 }
             }
         } else if self.notifications.pending.len() < MAX_PENDING_NOTIFICATIONS {
-            // More chunks follow. The cap is checked after this key's own entry
-            // was removed, so a continuing id always has room.
             self.notifications.pending.insert(key, entry);
         }
-        // Otherwise the map is full of other in-flight ids: drop this chunk.
     }
 
-    /// Handle OSC 777 (rxvt-unicode): `ESC ] 777 ; notify ; <title> ; <body> ST`
-    /// goes to the advanced notification callback; other sub-commands are
-    /// ignored.
+    /// Handles OSC 777 rxvt-unicode `notify` sequences.
     pub(super) fn handle_osc_777(&mut self, params: &[&[u8]]) {
-        // params[1] = sub-command. Only "notify" is a notification.
         let subcmd = params.get(1).and_then(|p| std::str::from_utf8(p).ok());
         if subcmd != Some("notify") {
             return;
         }
-        // Asked for, whatever the gate says.
         *self.notify_total = self.notify_total.saturating_add(1);
         if !self.modes.allow_notifications {
             return;
@@ -173,7 +132,6 @@ impl TerminalHandler<'_> {
             .and_then(|p| std::str::from_utf8(p).ok())
             .map(sanitize_notification)
             .filter(|s| !s.is_empty());
-        // The body may contain literal semicolons; rejoin params[3..].
         let body = join_params(params, 3)
             .map(|s| sanitize_notification(&s))
             .filter(|s| !s.is_empty());
@@ -193,19 +151,14 @@ impl TerminalHandler<'_> {
     }
 }
 
-/// OSC 99 payload kind (the `p=` metadata key).
 enum Osc99Payload {
     Title,
     Body,
 }
 
-/// Parse a ConEmu OSC 9;4 body (`"4"`, `"4;st"` or `"4;st;pr"`, `pr` a 0-100
-/// progress, clamped). State `0` is Hidden, `1` Normal, `2` Error, `3`
-/// Indeterminate, `4` Paused; `None` for an unknown state, so the caller keeps
-/// the current progress.
 fn parse_conemu_taskbar_progress(message: &str) -> Option<TaskbarProgress> {
     let mut fields = message.split(';');
-    let marker = fields.next(); // "4" sub-command marker
+    let marker = fields.next();
     debug_assert_eq!(marker, Some("4"));
     let state = fields.next().unwrap_or("0");
     let value = fields
@@ -222,9 +175,6 @@ fn parse_conemu_taskbar_progress(message: &str) -> Option<TaskbarProgress> {
     })
 }
 
-/// Append one OSC 99 chunk's sanitized text to a title/body field, keeping the
-/// field within [`MAX_NOTIFICATION_FIELD_BYTES`] (cut at a UTF-8 boundary). Empty
-/// text leaves the field untouched.
 #[inline]
 fn append_notification_field(field: &mut Option<String>, text: &str) {
     if text.is_empty() {
@@ -235,8 +185,6 @@ fn append_notification_field(field: &mut Option<String>, text: &str) {
     value.push_str(&text[..text.floor_char_boundary(room)]);
 }
 
-/// Rejoin OSC params from `start..` with `;` (the parser splits a payload's
-/// literal semicolons); `None` if there is no param at `start`.
 #[inline]
 fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
     if params.len() <= start {
@@ -245,10 +193,6 @@ fn join_params(params: &[&[u8]], start: usize) -> Option<String> {
     Some(String::from_utf8_lossy(&params[start..].join(&b';')).into_owned())
 }
 
-/// Strip control characters and BiDi overrides, as
-/// [`super::handler_osc::sanitize_title`] does (notification surfaces, like title
-/// bars, render outside the grid's BiDi filter), then truncate to
-/// [`MAX_NOTIFICATION_FIELD_BYTES`] at a UTF-8 boundary.
 #[inline]
 fn sanitize_notification(text: &str) -> String {
     let filtered = super::handler_osc::sanitize_title(text);
@@ -293,7 +237,6 @@ mod tests {
         term.set_notification_callback(move |_| {
             *fired_clone.lock().expect("poisoned") = true;
         });
-        // No authorize_notifications() call: default posture is denied.
 
         term.process(b"\x1b]9;Should not fire\x07");
 
@@ -332,7 +275,6 @@ mod tests {
         });
         term.authorize_notifications();
 
-        // ConEmu taskbar progress, not a notification.
         term.process(b"\x1b]9;4;1;50\x07");
 
         assert!(
@@ -353,10 +295,8 @@ mod tests {
         );
         term.process(b"\x1b]9;4;4;10\x07");
         assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Paused(10)));
-        // Value over 100 is clamped.
         term.process(b"\x1b]9;4;1;250\x07");
         assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(100)));
-        // State 0 hides progress.
         term.process(b"\x1b]9;4;0\x07");
         assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Hidden));
     }
@@ -366,7 +306,6 @@ mod tests {
         let mut term = Terminal::new(24, 80);
         term.process(b"\x1b]9;4;1;42\x07");
         assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(42)));
-        // Unknown state 9 must not clobber the existing progress.
         term.process(b"\x1b]9;4;9;1\x07");
         assert_eq!(term.taskbar_progress(), Some(TaskbarProgress::Normal(42)));
     }
@@ -399,7 +338,6 @@ mod tests {
         });
         term.authorize_notifications();
 
-        // First chunk (title, more to come), then final chunk (body).
         term.process(b"\x1b]99;i=42:p=title:d=0;My Title\x07");
         assert!(
             captured.lock().expect("poisoned").is_none(),
@@ -427,9 +365,6 @@ mod tests {
         captured
     }
 
-    /// Id-less `d=0` chunks share one default id: a flood stays one pending
-    /// entry, the next id-less final chunk completes it, and a fresh id is never
-    /// refused for capacity.
     #[test]
     fn osc_99_anonymous_nonfinal_chunks_do_not_starve_final_notifications() {
         let mut term = Terminal::new(24, 80);
@@ -458,7 +393,6 @@ mod tests {
         );
         assert!(term.notifications.pending.is_empty());
 
-        // A full map of distinct in-flight ids must not reject a final chunk.
         for i in 0..MAX_PENDING_NOTIFICATIONS {
             term.process(format!("\x1b]99;i={i}:d=0;t\x07").as_bytes());
         }
@@ -470,7 +404,6 @@ mod tests {
         );
     }
 
-    /// Same-kind chunks are concatenated, not replaced.
     #[test]
     fn osc_99_same_kind_chunks_concatenate() {
         let mut term = Terminal::new(24, 80);
@@ -487,13 +420,12 @@ mod tests {
         assert_eq!(got[1].body.as_deref(), Some("ab"));
     }
 
-    /// Concatenation stays bounded by the per-field cap, cut at a char boundary.
     #[test]
     fn osc_99_concatenated_field_is_capped() {
         let mut term = Terminal::new(24, 80);
         let captured = capture_all(&mut term);
 
-        let chunk = "\u{00e9}".repeat(1500); // 3000 bytes
+        let chunk = "\u{00e9}".repeat(1500);
         for _ in 0..3 {
             term.process(format!("\x1b]99;i=big:d=0;{chunk}\x07").as_bytes());
         }
@@ -544,12 +476,6 @@ mod tests {
         );
     }
 
-    /// THE NOTIFY COUNT: every desktop
-    /// notification a program asks for is counted, with notifications off
-    /// and on alike — OSC 9 past its `9;4` branch, OSC 99 at its final
-    /// chunk, OSC 777 `notify`. NEGATIVE CONTROLS: a `9;4` progress, a
-    /// non-final 99 chunk and a 777 sub-command other than `notify` count
-    /// nothing; the gate still decides what reaches a callback.
     #[test]
     fn every_notification_asked_for_is_counted_whatever_the_gate() {
         for allowed in [false, true] {

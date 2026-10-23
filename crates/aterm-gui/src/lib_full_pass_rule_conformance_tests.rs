@@ -7,9 +7,7 @@ use aterm_spec::derive::Model;
 use aterm_update_core::pkg_check::{FULL_PASS_INTERVAL_SECS, PassOutcome, Stamps};
 
 type State = std::collections::BTreeMap<&'static str, i64>;
-/// A model tick as a wall-clock age: each side of the spacing and of the interval.
 const AGE_SECS: [i64; 5] = [60, 15 * 60, 3 * 3600, 6 * 3600 + 60, 9 * 3600];
-/// What a reader sees of a state: the record and the pass in flight.
 const RECORD: [&str; 6] = [
     "rec",
     "pass_age",
@@ -19,7 +17,6 @@ const RECORD: [&str; 6] = [
     "running",
 ];
 
-/// One reachable state per distinct record — the readers see nothing else.
 fn records(model: &Model) -> Vec<State> {
     let mut order = vec![model.init_state()];
     let mut seen: std::collections::BTreeSet<State> = order.iter().cloned().collect();
@@ -48,7 +45,6 @@ fn walk(model: &Model, actions: &[&str]) -> State {
     state
 }
 
-/// `state` after the look `action`, taken with no child queued (no reader sees one).
 fn looks(model: &Model, action: &str, state: &State) -> State {
     let mut next = state.clone();
     next.insert("queued", 0);
@@ -61,9 +57,6 @@ fn stamp(unix: i64) -> String {
     aterm_types::rfc3339::format_rfc3339(unix.unsigned_abs())
 }
 
-/// Lays down `state`'s record at `now` with atpkg's own writers: the success; each pass's end
-/// when `records_pass_end` (else a failed pass is a bare `updated_at` write, with no
-/// `last_pass`); and a vendor row written after the last pass.
 fn realize(
     dir: &std::path::Path,
     state: &State,
@@ -116,8 +109,6 @@ fn realize(
     layout
 }
 
-/// Negative control, the stamp readers without `last_pass`: attempt is `updated_at` else the
-/// success; a failure is an attempt after the success; no hold.
 fn legacy_stamps(layout: &atpkg::store::Layout, now: i64) -> Stamps {
     let status = atpkg::status::read(layout).unwrap_or_default();
     let unix = |stamp: &str| aterm_update_core::pkg_check::rfc3339_to_unix(stamp.trim());
@@ -152,10 +143,6 @@ fn legacy_launch_park(stamps: &Stamps, now: i64) -> Option<Duration> {
     (age < FULL_PASS_INTERVAL_SECS).then(|| Duration::from_secs(FULL_PASS_INTERVAL_SECS - age))
 }
 
-/// `AtpkgFullPassRule`, the window's half: over every `Buggy=0` record, written by atpkg's own
-/// writers, [`scheduled_pass_gate`] over [`pass_stamps`] runs a pass exactly when `WindowWalk`
-/// does and a launch exactly when `WindowLaunch` does. Negative control: [`legacy_stamps`] over
-/// `Buggy=1`'s records is `Buggy=1`'s window.
 #[test]
 fn the_windows_gate_and_launch_conform_to_the_full_pass_rule() {
     let model = atpkg_full_pass_rule_model();
@@ -170,7 +157,6 @@ fn the_windows_gate_and_launch_conform_to_the_full_pass_rule() {
     let fixed = records(&model);
     assert!(fixed.len() > 20, "{}", fixed.len());
     for state in &fixed {
-        // Each state at its own now: a progress heartbeat is fresh for seconds only.
         let now = unix_secs(std::time::SystemTime::now());
         let dir = aterm_tempfile::tempdir().unwrap();
         let layout = realize(dir.path(), state, true, now);
@@ -213,7 +199,6 @@ fn the_windows_gate_and_launch_conform_to_the_full_pass_rule() {
             "{state:?} {stamps:?}"
         );
     }
-    // A success three hours old with the head watch's row written since: the launch parks.
     let defect = walk(
         &model,
         &[

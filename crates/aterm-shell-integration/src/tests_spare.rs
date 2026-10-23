@@ -167,7 +167,7 @@ impl SpareRig {
         }
         argv.push("-i".to_owned());
         let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-        let mut cmd = pty_script(&argv);
+        let mut cmd = pty_command(&argv);
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
@@ -216,7 +216,7 @@ impl SpareRig {
             ShellType::Fish => "fish",
             _ => "bash",
         };
-        LiveShell::spawn(label, &mut cmd).holding(hermetic.into_home())
+        LiveShell::spawn_on_pty(label, &mut cmd).holding(hermetic.into_home())
     }
 
     /// Write `name` under fish's config dir (`$XDG_CONFIG_HOME/fish`).
@@ -229,38 +229,17 @@ impl SpareRig {
 
 #[cfg(unix)]
 impl LiveShell {
-    /// The shell's pid: `script`'s one child.
+    /// The shell's pid: the child on its own pty.
     fn shell_pid(&mut self) -> u32 {
-        let started = std::time::Instant::now();
-        loop {
-            let out = Command::new("pgrep")
-                .arg("-P")
-                .arg(self.child.id().to_string())
-                .output()
-                .expect("pgrep");
-            if let Some(pid) = String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .find_map(|l| l.trim().parse().ok())
-            {
-                return pid;
-            }
-            assert!(
-                started.elapsed() < Self::TIMEOUT,
-                "{}: no shell under script\n{}",
-                self.label,
-                self.transcript()
-            );
-            std::thread::sleep(std::time::Duration::from_millis(15));
-        }
+        self.child.id()
     }
 
-    /// Wait for the shell (and so `script`) to exit; a hang detector.
+    /// Wait for the shell to exit; a hang detector.
     fn wait_exit(&mut self) {
         self.wait_exit_status("did not exit");
     }
 
-    /// End a shell the test no longer needs: `script` killed, its pty closed,
-    /// the shell hung up.
+    /// End a shell the test no longer needs: killed and reaped.
     fn kill_now(mut self) {
         if self.job.is_some() {
             self.stop_owned_job().expect("owned background job retired");
@@ -307,7 +286,6 @@ fn spare_zsh() -> &'static str {
 /// A bash and a pty: COULD NOT RUN where the host cannot allocate a pty.
 #[cfg(unix)]
 fn spare_bash() -> &'static str {
-    need_pty_script();
     bash_shell()
 }
 
@@ -1149,12 +1127,10 @@ fn a_warm_spare_carries_seconds_on_from_its_rc_run() {
     }
 }
 
-/// A fish and a pty: COULD NOT RUN where the host has either missing.
+/// A fish (the pty is aterm-pty's, in process): COULD NOT RUN where the host has none.
 #[cfg(unix)]
 fn spare_fish() -> &'static str {
-    let fish = need_fish();
-    need_pty_script();
-    fish
+    need_fish()
 }
 
 /// No live fish of this crate's makes its man-page completions. A first prompt

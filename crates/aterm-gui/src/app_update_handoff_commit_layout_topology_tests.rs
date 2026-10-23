@@ -7,9 +7,6 @@ use crate::restore::{
     TerminalLeafRestore, WindowLayout,
 };
 
-/// One window, one terminal tab, shaped as `capture_restore_manifest` produces
-/// it: the legacy `tabs` mirror and the canonical `restored_tabs` tree carry the
-/// same session's cwd/title, so a projection missing either would still reject.
 fn captured(position: Option<(i32, i32)>, cwd: Option<&str>, title: &str) -> RestoreManifest {
     RestoreManifest::new(vec![WindowLayout {
         rows: 40,
@@ -78,9 +75,6 @@ fn dragging_the_window_while_the_successor_boots_is_not_a_topology_change() {
     );
 }
 
-/// The macOS show state is live, like the position: entering full screen,
-/// minimizing or focusing another window while the successor boots must not
-/// reject the Commit, nor hide a real topology change riding with it.
 #[test]
 fn a_show_state_change_while_the_successor_boots_is_not_a_topology_change() {
     use crate::restore::WindowShow;
@@ -109,7 +103,6 @@ fn a_show_state_change_while_the_successor_boots_is_not_a_topology_change() {
             key: Some(false),
             ..committed.windows[0].show
         },
-        // A parent that captured nothing (headless, or before the field).
         WindowShow::UNKNOWN,
     ];
     for changed in changes {
@@ -139,8 +132,6 @@ fn a_show_state_change_while_the_successor_boots_is_not_a_topology_change() {
 #[test]
 fn a_contended_session_lock_that_empties_cwd_and_title_is_not_a_topology_change() {
     let committed = captured(Some((120, 80)), Some("/work"), "zsh");
-    // Exactly what `restore_session_meta` yields on a `WouldBlock` try_lock: no
-    // cwd, empty title, every structural field untouched.
     let degraded = captured(Some((120, 80)), None, "");
     assert_ne!(
         committed, degraded,
@@ -224,7 +215,6 @@ fn a_real_topology_change_still_rejects_the_commit() {
     );
 }
 
-/// `captured`'s single terminal leaf, edited in place.
 fn with_leaf(
     mut layout: RestoreManifest,
     edit: impl FnOnce(&mut TerminalLeafRestore),
@@ -247,10 +237,6 @@ fn stamp_all_five(terminal: &mut TerminalLeafRestore) {
     terminal.attention = Some("waiting on a human review".to_string());
 }
 
-/// All five user metadata fields stay in the Commit comparison (so a `meta set`
-/// answered before the Commit-time re-capture is seen), the cwd/title/position
-/// normalization never touches them, and the sidecar the child parses carries
-/// exactly what was compared.
 #[test]
 fn every_user_metadata_field_is_compared_and_rides_the_sidecar() {
     type Clear = fn(&mut TerminalLeafRestore);
@@ -292,9 +278,6 @@ fn every_user_metadata_field_is_compared_and_rides_the_sidecar() {
     );
 }
 
-/// A layout the capture's fold cannot bring within the caps is refused at the park as a fact
-/// about the desk (`CaptureRefusal`, retried once the desk changes), not as worker trouble. A
-/// layout within the caps commits to its usual digest.
 #[test]
 fn the_park_refuses_a_layout_past_the_caps_as_a_fact_about_the_desk() {
     use super::{CaptureRefusal, commit_handoff_layout};
@@ -305,7 +288,6 @@ fn the_park_refuses_a_layout_past_the_caps_as_a_fact_about_the_desk() {
         "within the caps: the digest the park always committed to"
     );
 
-    // Past the window cap, unfolded: the worker's round trip reads 64 of the 65 windows back.
     let one_window = captured(None, Some("/work"), "zsh").windows.remove(0);
     let past = RestoreManifest::new(vec![one_window; crate::restore::MAX_WINDOWS + 1]);
     let wire = past.to_toml().expect("serializes");
@@ -319,7 +301,6 @@ fn the_park_refuses_a_layout_past_the_caps_as_a_fact_about_the_desk() {
         refusal.local_id, None,
         "a fact about the desk, not about one session"
     );
-    // …and the fold the capture runs brings that desk within the caps.
     let mut folded = past;
     folded.fold_into_caps();
     assert!(commit_handoff_layout(&folded).is_ok());

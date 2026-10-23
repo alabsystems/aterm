@@ -24,9 +24,7 @@ pub(crate) fn reader(_windowed: Option<Windowed>) -> MenuBarReader {
     no_app_menu_bar
 }
 
-/// The menu bar of a windowed instance, read off AppKit (`NSApplication.mainMenu`): one
-/// `menu "<title>": <items>` line per top-level menu, a submenu as its own line after its
-/// parent's.
+/// Read the application menu bar from `NSApplication.mainMenu`.
 #[cfg(not(test))]
 fn read_app_menu_bar(mtm: MainThread) -> Vec<String> {
     fn menu_item_title(item: aterm_objc::Id) -> String {

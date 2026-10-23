@@ -1,23 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! POSIX console passthrough driver: raw mode, `poll(2)` I/O loop, `SIGWINCH` resize, and `SIGCHLD` reap.
+//! POSIX console passthrough driver: raw mode, `poll(2)` I/O loop, `SIGWINCH` resize, and `SIGCHLD`
+//! reap.
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
-/// Set by the SIGWINCH handler; drained in the main loop.
 static GOT_WINCH: AtomicBool = AtomicBool::new(false);
-/// Set by the SIGCHLD handler: a child of this process exited, so the loop
-/// asks whether it was the shell.
 static GOT_CHLD: AtomicBool = AtomicBool::new(false);
-/// The write end of the loop's wake pipe ([`wake_pipe`]); -1 until it exists.
 static WAKE_WR: AtomicI32 = AtomicI32::new(-1);
 
-/// The handler of both signals the loop waits on. A flag alone is a lost
-/// wakeup: one raised between the loop's check and its `poll(2)` (or on
-/// another thread, where `poll` sees no `EINTR`) waits for the next I/O, a
-/// resize applied late and a shell's exit not seen while a job holds the
-/// slave.
 extern "C" fn on_signal(sig: libc::c_int) {
     let errno = errno_slot();
     // SAFETY: `errno` points to the calling thread's errno slot.
@@ -37,7 +29,6 @@ extern "C" fn on_signal(sig: libc::c_int) {
     unsafe { *errno = saved };
 }
 
-/// The calling thread's `errno`.
 fn errno_slot() -> *mut libc::c_int {
     // SAFETY: `libc::__error` returns the calling thread's errno pointer.
     #[cfg(target_os = "macos")]
@@ -48,10 +39,6 @@ fn errno_slot() -> *mut libc::c_int {
     slot
 }
 
-/// The read end of the loop's wake pipe, made once per process (non-blocking
-/// and close-on-exec, [`aterm_pty::make_wake_pipe`]) and never closed, so a
-/// handler running on any thread at any moment writes into this pipe and never
-/// into a descriptor that later took its number.
 fn wake_pipe() -> Option<libc::c_int> {
     static PIPE: std::sync::OnceLock<Option<(libc::c_int, libc::c_int)>> =
         std::sync::OnceLock::new();
@@ -60,9 +47,6 @@ fn wake_pipe() -> Option<libc::c_int> {
     Some(rd)
 }
 
-/// Route `sig` to [`on_signal`]. `SA_RESTART` keeps this process's other
-/// threads' blocking calls running through it; the loop's `poll(2)` is never
-/// restarted, and the wake pipe holds the byte by then anyway.
 fn catch(sig: libc::c_int, flags: libc::c_int) {
     // SAFETY: zeroed `sigaction` is valid and initialized before `sigaction`.
     let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -74,7 +58,6 @@ fn catch(sig: libc::c_int, flags: libc::c_int) {
     unsafe { libc::sigaction(sig, &raw const sa, std::ptr::null_mut()) };
 }
 
-/// Ask the controlling terminal for its size; fall back to 24x80.
 fn host_winsize_raw() -> libc::winsize {
     let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
     let ok = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0;
@@ -150,9 +133,6 @@ fn eintr() -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
 }
 
-/// Whether the failed `read(2)` just made is one to try again: a signal
-/// (`EINTR`), or a non-blocking descriptor with nothing ready (`EAGAIN`) — the
-/// master is non-blocking, and a stdin that came in non-blocking is the same.
 fn retry_later() -> bool {
     matches!(
         std::io::Error::last_os_error().raw_os_error(),
@@ -160,14 +140,8 @@ fn retry_later() -> bool {
     )
 }
 
-/// The most input the session holds for a program that is not reading it
-/// before it stops reading its own stdin (see [`run`]): far past any tty input
-/// queue, so typing and pasting into a program that reads never touch it.
 const INPUT_BACKLOG_MAX: usize = 64 * 1024;
 
-/// Hand the program as much of `pending` as its tty input queue has room for,
-/// without ever parking: a full queue leaves the rest for the next turn of the
-/// loop.
 fn feed_input(master: libc::c_int, pending: &mut std::collections::VecDeque<u8>) {
     while !pending.is_empty() {
         let (front, _) = pending.as_slices();
@@ -184,15 +158,10 @@ fn feed_input(master: libc::c_int, pending: &mut std::collections::VecDeque<u8>)
     }
 }
 
-/// Whether `poll(2)` says a stream fd must be read now.
 const fn poll_must_read(revents: libc::c_short) -> bool {
     revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
 }
 
-/// Reap the shell if it has exited, never waiting: `None` while it runs,
-/// `Some(status)` once it is gone — `Some(None)` when its status is not this
-/// process's to read any more (`ECHILD`: a child can only stop being one by
-/// being reaped, so it has exited).
 fn reap_if_exited(pid: libc::pid_t) -> Option<Option<libc::c_int>> {
     let mut status = 0;
     loop {
@@ -210,8 +179,6 @@ fn reap_if_exited(pid: libc::pid_t) -> Option<Option<libc::c_int>> {
     }
 }
 
-/// Wait for the shell's exit and return its status (`None` when the wait
-/// fails).
 fn wait_for(pid: libc::pid_t) -> Option<libc::c_int> {
     let mut status = 0;
     loop {
@@ -224,8 +191,6 @@ fn wait_for(pid: libc::pid_t) -> Option<libc::c_int> {
     }
 }
 
-/// The session's exit code for the shell's wait status: its own code when it
-/// exited, 1 when a signal ended it or no status was to be had.
 const fn exit_code(status: Option<libc::c_int>) -> i32 {
     match status {
         Some(status) if libc::WIFEXITED(status) => libc::WEXITSTATUS(status),
@@ -233,14 +198,8 @@ const fn exit_code(status: Option<libc::c_int>) -> i32 {
     }
 }
 
-/// The most output the session still passes through once the shell has
-/// exited: far past what a PTY buffers, which is all the shell itself can have
-/// left there, so only a job that keeps writing after it ever meets the cap.
 const EXIT_DRAIN_MAX: usize = 1024 * 1024;
 
-/// Hand `pass` what the master holds right now, never waiting for more: a
-/// zero-timeout `poll(2)` before every read, so this cannot park whether or
-/// not the master is non-blocking and whatever still holds the slave.
 fn drain_master(master: libc::c_int, buf: &mut [u8], pass: &mut impl FnMut(&[u8])) {
     let mut left = EXIT_DRAIN_MAX;
     while left > 0 {
@@ -369,8 +328,7 @@ pub(crate) fn run(shell: aterm_pty::SpawnedShell, verbose: bool) -> i32 {
         }
         if poll_must_read(fds[2].revents) {
             let mut sink = [0u8; 64];
-            // SAFETY: reads at most `sink.len()` bytes into `sink` from the
-            // non-blocking wake pipe.
+            // SAFETY: reads at most `sink.len()` bytes into `sink` from the non-blocking wake pipe.
             unsafe { libc::read(fds[2].fd, sink.as_mut_ptr().cast(), sink.len()) };
         }
 
@@ -422,8 +380,6 @@ mod tests {
     use std::io::{Read, Write};
     use std::os::fd::FromRawFd;
 
-    /// The session's exit status is the shell's, even when another child of
-    /// this process has already exited.
     #[test]
     fn run_returns_the_shells_status_not_an_older_zombie_childs() {
         const CHILD: &str = "ATERM_TEST_DRIVER_REAPS_THE_SHELL";
@@ -510,8 +466,6 @@ mod tests {
         assert_eq!(code, 3, "the session took another child's exit status");
     }
 
-    /// The first-shell-output hook ([`crate::on_first_shell_output`]) runs
-    /// once, after the first bytes reach the terminal.
     #[test]
     fn the_shells_first_output_runs_the_hook_once() {
         use std::sync::atomic::AtomicUsize;
@@ -580,9 +534,6 @@ mod tests {
         assert_eq!(RAN.load(Ordering::SeqCst), 1, "once, however much it said");
     }
 
-    /// Input the program never reads does not stop its output: far more typed-ahead input
-    /// than a tty queue holds, while the program writes thousands of lines, must not park
-    /// the driver.
     #[test]
     fn input_the_program_never_reads_does_not_stop_its_output() {
         const CHILD: &str = "ATERM_TEST_DRIVER_UNREAD_INPUT";
@@ -689,8 +640,6 @@ mod tests {
         );
     }
 
-    /// A host resize between the spawn's size read and the `SIGWINCH` handler's install
-    /// reaches the program.
     #[test]
     fn a_resize_before_the_driver_listens_reaches_the_program() {
         const CHILD: &str = "ATERM_TEST_DRIVER_EARLY_RESIZE";
@@ -719,8 +668,8 @@ mod tests {
         }
         let (host, host_slave) = aterm_pty::open_pty_pair().expect("host pty");
         aterm_pty::resize(host, 30, 100);
-        // SAFETY: duplicating descriptors this test owns: the harness's stdout
-        // is kept aside for its result line, and the host slave takes its place.
+        // SAFETY: duplicating descriptors this test owns: the harness's stdout is kept aside for
+        // its result line, and the host slave takes its place.
         let harness_stdout = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
         assert!(harness_stdout >= 0, "keep the harness's stdout");
         // SAFETY: as above.
@@ -793,9 +742,6 @@ mod tests {
         assert_eq!(code, 0, "the program saw the resize: {text:?}");
     }
 
-    /// Run this module's test `name` again in a fresh process of this test
-    /// binary, with `child` set and `stdin` as its stdin, and check that it
-    /// ran and passed.
     fn reexec(name: &str, child: &str, stdin: aterm_uds::spawnfd::Stdio) {
         let name = format!(
             "{}::{name}",
@@ -819,7 +765,6 @@ mod tests {
         );
     }
 
-    /// Poll every 20 ms until `done` holds; a minute is the hang detector.
     fn wait_until(what: &str, done: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while !done() {
@@ -831,7 +776,6 @@ mod tests {
         }
     }
 
-    /// Whether this process's child `pid` has exited, left unreaped.
     fn has_exited(pid: libc::pid_t) -> bool {
         // SAFETY: `siginfo_t` is plain old data and valid when zeroed.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -848,10 +792,6 @@ mod tests {
         r == 0 && unsafe { info.si_pid() } == pid
     }
 
-    /// A resize that lands between the loop's signal check and its `poll(2)` reaches the
-    /// program with nothing else to wake the loop: [`BEFORE_POLL`] resizes the host and
-    /// raises `SIGWINCH` there once, while the program waits silently and stdin stays open
-    /// and empty.
     #[test]
     fn a_resize_between_the_signal_check_and_the_poll_reaches_the_program() {
         const CHILD: &str = "ATERM_TEST_DRIVER_RESIZE_BEFORE_POLL";
@@ -937,7 +877,8 @@ mod tests {
                 .set(|| {
                     if !FIRED.swap(true, Ordering::SeqCst) {
                         aterm_pty::resize(HOST.load(Ordering::SeqCst), 40, 120);
-                        // SAFETY: raises `SIGWINCH` on the current thread with async-signal-safe handler.
+                        // SAFETY: raises `SIGWINCH` on the current thread with async-signal-safe
+                        // handler.
                         #[expect(
                             clippy::disallowed_methods,
                             reason = "test code: SIGWINCH, which dumps no core"
@@ -963,8 +904,6 @@ mod tests {
         assert_eq!(code, 0, "the program saw the resize: {text:?}");
     }
 
-    /// The session ends when the shell exits, though a job it left behind (ignoring `SIGHUP`,
-    /// as under `nohup`) opens the terminal again by path once the shell is gone.
     #[test]
     fn the_session_ends_with_the_shell_while_a_job_holds_its_terminal() {
         const CHILD: &str = "ATERM_TEST_DRIVER_JOB_HOLDS_THE_SLAVE";
@@ -1071,9 +1010,6 @@ mod tests {
         assert!(!poll_must_read(libc::POLLOUT));
     }
 
-    /// A pipe closed with buffered bytes becomes terminal readiness (bare
-    /// `POLLHUP` or `POLLIN|POLLHUP`); driving every observation through
-    /// `poll_must_read` recovers the full tail and then EOF.
     #[test]
     fn closed_pipe_drains_buffered_bytes_then_consumes_hangup() {
         let mut raw = [-1; 2];

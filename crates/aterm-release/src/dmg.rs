@@ -168,7 +168,7 @@ fn build_in_stage(app: &Path, stage: &Path, volname: &str, dmg: &Path) -> Result
 
     println!("==> hdiutil create {} (UDZO)", dmg.display());
     run_quiet(
-        Command::new("hdiutil")
+        Command::new(aterm_uds::os_path!("hdiutil"))
             .arg("create")
             .args(["-volname", volname])
             .arg("-srcfolder")

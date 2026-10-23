@@ -1,13 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Allocation-free literal matching helpers.
 
 /// Iterator over overlapping ASCII case-insensitive match byte offsets.
-///
-/// Candidate starts come from `memchr`/`memchr2` ([`crate::bytesearch`]); each is
-/// verified with `eq_ignore_ascii_case`.
 pub(crate) struct AsciiCaseInsensitiveMatches<'a> {
     haystack: &'a [u8],
     needle: &'a [u8],
@@ -40,7 +36,6 @@ impl Iterator for AsciiCaseInsensitiveMatches<'_> {
         let max_start = self.haystack.len().checked_sub(needle_len)?;
         let &first = self.needle.first()?;
 
-        // A word-at-a-time scan cannot repay its setup on a haystack of a word or less.
         if self.haystack.len() <= 8 {
             while self.next_start <= max_start {
                 let candidate = self.next_start;
@@ -66,8 +61,6 @@ impl Iterator for AsciiCaseInsensitiveMatches<'_> {
                 crate::bytesearch::memchr2(lower, upper, tail)
             }?;
             let candidate = self.next_start.checked_add(relative)?;
-            // Advancing one byte preserves overlaps. All inputs on this path
-            // are ASCII, so every byte offset is a character boundary.
             self.next_start = candidate.checked_add(1)?;
             let match_end = candidate.checked_add(needle_len)?;
             let candidate_bytes = self.haystack.get(candidate..match_end)?;

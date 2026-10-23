@@ -55,8 +55,6 @@ fn refused(path: &str) -> Option<Refusal> {
     refuse(None, Path::new(path), &table(), &deny())
 }
 
-// The path test
-
 #[test]
 fn every_privacy_protected_place_is_refused_before_any_syscall() {
     for path in [
@@ -270,10 +268,7 @@ fn unsafe_mount_points_are_named_for_their_parent() {
     assert!(unsafe_mounts_in(Path::new("/Users//a/aterm"), &t, true).is_empty());
 }
 
-/// A removable volume is refused by the table before any syscall wherever it
-/// is mounted, not only under `/Volumes`: its mount point (broad), a path
-/// inside it, and as a mount point inside a walked folder, whose name the
-/// lister skips unread.
+/// Removable volumes are refused at any mount point and skipped when listing their parent.
 #[test]
 fn a_removable_volume_mounted_anywhere_is_never_asked() {
     let mut t = table();
@@ -305,9 +300,7 @@ fn a_removable_volume_mounted_anywhere_is_never_asked() {
     );
 }
 
-/// Each spelling of `path` the canonicaliser reads as that one folder: the
-/// case variants APFS folds together, doubled separators, `.` components, a
-/// trailing separator, and the data volume's firmlinked prefix in any case.
+/// Case, separator, `.` component, and firmlink prefix spellings of `path`.
 fn spellings_of(path: &str) -> Vec<String> {
     let alternating: String = path
         .chars()
@@ -343,11 +336,7 @@ fn spellings_of(path: &str) -> Vec<String> {
     out
 }
 
-/// The design's law for `refuse()` (§17, "a denied prefix is refused for
-/// every spelling the canonicaliser produces"), swept: every denied place
-/// and a folder under it, in every spelling of [`spellings_of`], is refused
-/// as the canonical form and as the logical form beside an innocent
-/// canonical one.
+/// Every denied path and child path is refused across all canonical and logical spellings.
 #[test]
 fn a_denied_place_is_refused_in_every_spelling_the_canonicaliser_reads() {
     let d = deny();
@@ -391,9 +380,7 @@ fn a_denied_place_is_refused_in_every_spelling_the_canonicaliser_reads() {
     assert_eq!(checked, places.len() * 2 * 64);
 }
 
-/// A share is never asked anything in any spelling, nor a local volume
-/// mounted inside it (a component-wise open reaches that through the share),
-/// and the lister skips its name under every spelling of its parent.
+/// Remote shares and volumes mounted inside them are refused across all spellings.
 #[test]
 fn a_share_is_refused_in_every_spelling_and_through_a_volume_inside_it() {
     let d = deny();

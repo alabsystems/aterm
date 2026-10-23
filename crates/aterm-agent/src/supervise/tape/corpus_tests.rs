@@ -9,10 +9,6 @@ use super::*;
 use crate::supervise::CtlReply;
 use crate::supervise::tape::codec::Item;
 
-/// The lab's names on a recording machine, as a promote's scrub takes them.
-/// The home is `/Users/_a`, which the public export keeps as written: it
-/// doubles the separator of every `/Users/<letter>` (aterm-census's
-/// `export::rewrite`), which a scrub refuses as a path with an empty name.
 fn lab_scrub() -> Scrub {
     let mut s = Scrub::new();
     s.path(
@@ -33,10 +29,6 @@ fn lab_scrub() -> Scrub {
     s
 }
 
-/// THE LONGEST NAME FIRST, A PATH TO ITS END: the lab's state inside the
-/// checkout inside the home is each its own token; a path that goes on
-/// past a name with more of its last name (`/Users/_ab`) is not that name's;
-/// a path stands wherever it stands — after `%20` in a title, inside JSON.
 #[test]
 fn a_path_is_taken_whole_and_the_longest_first() {
     let s = lab_scrub();
@@ -66,10 +58,6 @@ fn a_path_is_taken_whole_and_the_longest_first() {
     }
 }
 
-/// macOS NAMES ITS TEMPORARY DIRECTORIES TWO WAYS: a path under `/var`,
-/// `/tmp` or `/etc` is taken under `/private` too, and one under
-/// `/private/var` without it; the trailing `/` a `TMPDIR` carries is no part
-/// of the name.
 #[test]
 fn a_private_directory_is_taken_in_both_spellings() {
     let s = lab_scrub();
@@ -85,9 +73,6 @@ fn a_private_directory_is_taken_in_both_spellings() {
     );
 }
 
-/// A WORD (the user, the host) is taken where no letter stands beside it —
-/// after a `%20`, before a `-` or a digit — and nowhere inside another word;
-/// the host's longer name goes before the user's inside it.
 #[test]
 fn a_word_is_taken_only_where_no_letter_stands_beside_it() {
     let s = lab_scrub();
@@ -103,9 +88,6 @@ fn a_word_is_taken_only_where_no_letter_stands_beside_it() {
     }
 }
 
-/// A NAME IN A PRESS GUARD: the guard a press is bound to its row by writes
-/// the row's `.` as `\.` and its spaces as `\x20` (`policy::guard`), so a
-/// name holding either is taken in that spelling too, as the token's.
 #[test]
 fn a_name_is_taken_in_a_press_guards_spelling_too() {
     let mut s = Scrub::new();
@@ -121,8 +103,6 @@ fn a_name_is_taken_in_a_press_guards_spelling_too() {
     assert_eq!(s.text(r"^on\x20host\.local\s*$"), r"^on\x20lab-host\s*$");
 }
 
-/// A NAME TOO NEAR THE ROOT, OR TOO SHORT, IS REFUSED: taken everywhere it
-/// would rewrite paths and words that are no one's.
 #[test]
 fn a_name_that_would_take_too_much_is_refused() {
     let mut s = Scrub::new();
@@ -135,11 +115,6 @@ fn a_name_that_would_take_too_much_is_refused() {
     assert_eq!(s.names().count(), 0, "nothing refused was taken");
 }
 
-/// A CONTROL ROUND TRIP IS READ AND WRITTEN AGAIN: its words and its reply's
-/// streams are rewritten, and the bytes read back as a request and a reply
-/// (its encoding counts lengths, which a rewrite in place would break); any
-/// other door's body is rewritten where it stands; door names, stamps and
-/// clocks are kept.
 #[test]
 fn a_control_round_trip_is_rewritten_through_its_codec() {
     let s = lab_scrub();
@@ -229,8 +204,6 @@ fn a_control_round_trip_is_rewritten_through_its_codec() {
     );
 }
 
-/// A control request that does not read cannot be rewritten without its
-/// lengths: the scrub refuses the tape, naming the item.
 #[test]
 fn a_control_request_that_does_not_read_is_refused() {
     let items = vec![Item::effect(EffectRecord::Exchange {
@@ -244,9 +217,6 @@ fn a_control_request_that_does_not_read_is_refused() {
     assert!(e.contains("item 0 (ctl)"), "{e}");
 }
 
-/// THE LINT: `/Users/`, the recording machine's home and every name the
-/// scrub takes — a word only where no letter stands beside it, any case —
-/// each with its first line; and a text over the corpus's size.
 #[test]
 fn the_lint_names_what_a_corpus_may_not_hold() {
     let s = lab_scrub();
@@ -276,8 +246,6 @@ fn the_lint_names_what_a_corpus_may_not_hold() {
     assert!(size.len() == 1 && size[0].contains("512 KiB"), "{size:?}");
 }
 
-/// THE TAPES A CHECK IS NAMED: a file as it is named; a directory's tapes at
-/// any depth, in path order, its other files and its links passed over.
 #[test]
 fn a_check_reads_every_tape_under_a_directory() {
     let dir = aterm_tempfile::tempdir().expect("scratch");
@@ -301,8 +269,6 @@ fn a_check_reads_every_tape_under_a_directory() {
     assert!(tapes_in(&[root.join("missing")]).is_err());
 }
 
-/// A CHECK'S EXIT: a divergence first, then a tape not replayed, a stale one,
-/// a reproduced panic; 0 only when every tape took its acts.
 #[test]
 fn a_checks_exit_is_its_worst_tapes() {
     assert_eq!(worst(&[]), 0);

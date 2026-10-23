@@ -2,13 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! [`super::System::relay`]'s live arm: `screen`'s local end (design §6).
-//!
-//! A listener on `127.0.0.1:0` and one thread that accepts on it. Each connection becomes one
-//! run of the relay's [`Cmd`] (the fleet's `ssh … screen` request), started by
-//! `aterm_uds::spawnfd::command` with the connection as its standard input and output; this
-//! process keeps no copy of the connection, so the viewer sees it close when the run ends.
-//! The runs are kept, a finished one reaped as the next connection arrives; [`Live::close`]
-//! stops the accepting thread, then kills and reaps every run still going.
 
 use super::{Cmd, Relaying, RunFailed};
 use aterm_uds::spawnfd::{Child, Stdio};
@@ -20,8 +13,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-/// How long the connection that wakes the accepting thread may take: `accept` blocks until
-/// one arrives, and a listener on loopback answers at once.
+/// How long the connection that wakes the accepting thread may take: `accept` blocks until one arrives, and a listener on loopback answers at once.
 const WAKE_BUDGET: Duration = Duration::from_secs(5);
 
 /// A listening relay.
@@ -31,15 +23,12 @@ pub(super) struct Live {
     /// The accepting thread; it answers the first failure it met, if any.
     accepter: Option<JoinHandle<Option<String>>>,
     runs: Arc<Mutex<Vec<Child>>>,
-    /// The listener, which only the accepting thread owns: gone once that thread has ended,
-    /// so a test sees the close end it without asking the machine-wide port space, where
-    /// another process may take the freed port at once.
+    /// The listener, which only the accepting thread owns: gone once that thread has ended, so a test sees the close end it without asking the machine-wide port space, where another process may take the freed port at once.
     #[cfg(test)]
     listener: std::sync::Weak<TcpListener>,
 }
 
-/// Listen on a free loopback port and carry each connection over a run of `cmd`, in the
-/// cleared environment `env` ([`super::Live`]'s `child_env`, as [`super::Live::run`] gives).
+/// Listen on a free loopback port and carry each connection over a run of `cmd`, in the cleared environment `env` ([`super::Live`]'s `child_env`, as [`super::Live::run`] gives).
 pub(super) fn listen(cmd: &Cmd, env: Vec<(String, String)>) -> Result<Live, RunFailed> {
     if cmd.user.is_some() || cmd.session || cmd.stdin.is_some() || cmd.keep_on_timeout {
         return Err(RunFailed::Refused(format!(
@@ -102,8 +91,6 @@ fn accept(
         held.retain_mut(|run| matches!(run.try_wait(), Ok(None)));
         match start(cmd, env, stream) {
             Ok(run) => held.push(run),
-            // The connection was dropped with the run that never started, so the viewer
-            // sees it close; the next one is tried again.
             Err(e) => {
                 first_failure
                     .get_or_insert_with(|| format!("relay: {}: {e}", cmd.program.display()));
@@ -114,7 +101,6 @@ fn accept(
 
 /// One run of `cmd` carrying `stream`, in `env`.
 fn start(cmd: &Cmd, env: &[(String, String)], stream: TcpStream) -> io::Result<Child> {
-    // Nagle off, as on the host's end (`agent::relay`): the stream is interactive.
     let _ = stream.set_nodelay(true);
     let output = stream.try_clone()?;
     let mut child = super::fixed_command(&cmd.program, &cmd.args, env, cmd.cwd.as_deref());
@@ -122,8 +108,6 @@ fn start(cmd: &Cmd, env: &[(String, String)], stream: TcpStream) -> io::Result<C
         .stdin(OwnedFd::from(stream))
         .stdout(OwnedFd::from(output))
         .stderr(Stdio::null());
-    // `child` (the command) holds this process's copies of the connection until it drops at
-    // the end of this function.
     child.spawn()
 }
 
@@ -137,13 +121,11 @@ impl Relaying for Live {
             return Ok(());
         };
         self.stop.store(true, Ordering::SeqCst);
-        // The connection that wakes `accept`; refused when the thread has already stopped.
         let _ = TcpStream::connect_timeout(
             &SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)),
             WAKE_BUDGET,
         );
         let stopped = accepter.join();
-        // No run starts after the join: the accepting thread is gone.
         let runs = std::mem::take(&mut *self.runs.lock().unwrap_or_else(PoisonError::into_inner));
         for mut run in runs {
             let _ = run.kill();
@@ -186,7 +168,6 @@ mod tests {
     fn each_connection_is_its_own_run_and_close_ends_every_run() {
         let port = Port::new();
         let cat = Cmd::new("/bin/cat");
-        // `listen`, as `relay` calls it, for the relay itself and so its listener.
         let mut relay = listen(&cat, port.child_env(&cat)).unwrap();
         let mut one = connect(relay.port());
         let mut two = connect(relay.port());
@@ -195,8 +176,6 @@ mod tests {
         assert_eq!(read_exactly(&mut one, 5), b"one\x00\xff");
         assert_eq!(read_exactly(&mut two, 3), b"two");
         relay.close().unwrap();
-        // Both `cat`s still had their input open: only the kill ends them, and with them
-        // the connections.
         for s in [&mut one, &mut two] {
             let mut rest = Vec::new();
             assert_eq!(s.read_to_end(&mut rest).unwrap(), 0);
@@ -227,7 +206,6 @@ mod tests {
         let mut relay = port.relay(&Cmd::new("/nonexistent/ssh")).unwrap();
         let mut s = connect(relay.port());
         let mut got = Vec::new();
-        // The connection closes with the run that never started.
         s.read_to_end(&mut got).unwrap();
         assert!(got.is_empty());
         let why = relay.close().unwrap_err();

@@ -1,0 +1,47 @@
+# Copyright 2026 Andrew Yates
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "aterm-bootstrap-verify"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Linux installer's bootstrap verifier: tools/install.sh's signed-release chain (paper master, live machine, appcast, durable floors, store ancestry, ELF) as a static executable install.sh pins by sha256"
+
+# The one executable besides `aterm` that ships: install.sh fetches a release's static
+# build of it (`pin::asset_name`) and runs it before anything it downloaded runs.
+[[bin]]
+name = "aterm-bootstrap-verify"
+path = "src/main.rs"
+
+[dependencies]
+# Ed25519, as the updater's roster chain verifies it (aterm-update-core's roster.rs).
+# No features: verification needs neither an RNG nor alloc.
+ring = { workspace = true }
+# SHA-256 of the store's executable and the candidate: astream-digest's, which the
+# updater's Linux arm hashes with (aterm-update-core's hash.rs).
+aterm-digest = { workspace = true }
+# The roster, the appcasts and the durable state, read as values: duplicate keys refused.
+aterm-toml = { workspace = true }
+# The keys' base64 and the digests' hex.
+aterm-codec = { workspace = true }
+
+# getuid(2) and the errno values std does not name.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+# The chain the verifier is held to, and the ancestry walk on Linux (`install_path`).
+aterm-update = { workspace = true }
+aterm-update-core = { workspace = true }
+# Signs the synthetic releases.
+ring = { workspace = true, features = ["default"] }
+# install.sh's test support (tests/install_sh): spawns, deadlines, stand-ins, scratch.
+aterm-uds = { workspace = true }
+aterm-tempfile = { workspace = true }
+aterm-types = { workspace = true }
+aterm-json = { workspace = true }
+
+[lints]
+workspace = true

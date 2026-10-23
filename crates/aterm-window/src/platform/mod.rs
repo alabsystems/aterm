@@ -4,13 +4,7 @@
 // Derived from winit 0.30.13 src/platform/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE. (Cut the Android, iOS,
-//! Orbital and Web modules and the unused `run_on_demand`, `scancode` and `startup_notify`
-//! extensions.)
-//!
-//! Contains traits with platform-specific methods in them.
-//!
-//! Only the modules corresponding to the platform you're compiling to will be available.
+//! Platform-specific windowing traits and extension modules.
 
 #[cfg(any(macos_platform, docsrs))]
 pub mod macos;

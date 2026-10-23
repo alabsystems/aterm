@@ -38,8 +38,7 @@ where
     }
 }
 
-/// Asserts that `value` serializes to the given `tokens`, and then yields
-/// `error`.
+/// Asserts that `value` serializes to the given `tokens`, and then yields `error`.
 #[track_caller]
 pub fn assert_ser_tokens_error<T>(value: &T, tokens: &[Token], error: &str)
 where
@@ -74,9 +73,6 @@ where
         panic!("{} remaining tokens", de.remaining());
     }
 
-    // Do the same thing for deserialize_in_place. This isn't *great* because a
-    // no-op impl of deserialize_in_place can technically succeed here. Still,
-    // this should catch a lot of junk.
     let mut de = Deserializer::new(tokens);
     match T::deserialize_in_place(&mut de, &mut deserialized_val) {
         Ok(()) => {
@@ -101,7 +97,6 @@ where
         Err(e) => assert_eq!(e, *error),
     }
 
-    // There may be one token left if a peek caused the error
     de.next_token_opt();
 
     if de.remaining() > 0 {

@@ -229,51 +229,34 @@ fn entering_the_alternate_screen_curtains_the_band_and_leaving_it_returns_nothin
 fn every_coordinate_space_seam_curtains_the_band() {
     type Seam = fn(&mut App, WindowId);
     let rows: [(&str, Seam); 3] = [
-        (
-            // A terminal/tab switch: the `terminal_id` changes with the front
-            // tab or pane while the screen flag is unchanged.
-            "a terminal switch",
-            |app, wid| {
-                let ws = app.windows.get_mut(&wid).expect("window");
-                super::sync_cursor_effect_coordinate_space(ws, 7, false);
-                assert!(
-                    super::sync_cursor_effect_coordinate_space(ws, 8, false),
-                    "a different terminal is a different coordinate space"
-                );
-            },
-        ),
-        (
-            // A content invalidation: `sync_cursor_effect_scroll`'s
-            // `Invalidate` arm (RIS, `ESC[3J`, a splice), where retained
-            // coordinates stop sharing one transform.
-            "a content invalidation",
-            |app, wid| {
-                let ws = app.windows.get_mut(&wid).expect("window");
-                super::sync_cursor_effect_scroll(ws, ContentScrollState::default());
-                let change = super::sync_cursor_effect_scroll(
-                    ws,
-                    ContentScrollState {
-                        invalidation_epoch: 9,
-                        ..ContentScrollState::default()
-                    },
-                );
-                assert!(change.invalidated, "precondition: the arm under test");
-            },
-        ),
-        (
-            // The resize seam: `apply_term_resize` changes the grid's meaning
-            // under every retained cell, and `resize` exposes no reflow map to
-            // translate cells through, so the curtain is the whole law here.
-            "a grid resize",
-            |app, wid| {
-                let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
-                app.apply_term_resize(
-                    wid,
-                    rows.saturating_sub(2).max(2),
-                    cols.saturating_sub(7).max(8),
-                );
-            },
-        ),
+        ("a terminal switch", |app, wid| {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            super::sync_cursor_effect_coordinate_space(ws, 7, false);
+            assert!(
+                super::sync_cursor_effect_coordinate_space(ws, 8, false),
+                "a different terminal is a different coordinate space"
+            );
+        }),
+        ("a content invalidation", |app, wid| {
+            let ws = app.windows.get_mut(&wid).expect("window");
+            super::sync_cursor_effect_scroll(ws, ContentScrollState::default());
+            let change = super::sync_cursor_effect_scroll(
+                ws,
+                ContentScrollState {
+                    invalidation_epoch: 9,
+                    ..ContentScrollState::default()
+                },
+            );
+            assert!(change.invalidated, "precondition: the arm under test");
+        }),
+        ("a grid resize", |app, wid| {
+            let (rows, cols) = (app.windows[&wid].rows, app.windows[&wid].cols);
+            app.apply_term_resize(
+                wid,
+                rows.saturating_sub(2).max(2),
+                cols.saturating_sub(7).max(8),
+            );
+        }),
     ];
     for (label, seam) in rows {
         let t0 = Instant::now() - Duration::from_millis(300);

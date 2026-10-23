@@ -88,7 +88,7 @@ pub(crate) mod tests {
         drop(file);
     }
 
-    const SHELL: &str = "/bin/sh";
+    const SHELL: &str = crate::os_path!("sh");
 
     /// A child parked between `fork` and `exec`, holding a copy of every descriptor this
     /// process had open: the state a sibling test's `pre_exec` spawn puts this process in for

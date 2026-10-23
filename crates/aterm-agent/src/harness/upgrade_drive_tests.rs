@@ -35,7 +35,13 @@ const STATUS: &str = "OK schema=1 sid=0 subject=%E2%97%90%20Git%20commit%20and%2
     hash=7adef2d5e8547a9e";
 
 /// [`file_holders`] (the holder scan) names the holders `lsof -t` names, of a lock held through
-/// descriptors.
+/// descriptors: this process and two children, one given the file through a symlink. On a Mac
+/// where some agent of this uid holds a file in a protected folder, the scan reads those
+/// descriptors as no file sought once their refusal is shown to be the file's, so its answer
+/// is complete there too. NEGATIVE CONTROLS: nobody holds the lock once each lets go, and a
+/// path that is not there is unknown. Run ALONE in a re-run of this binary: a sibling test's
+/// child forked short of its exec holds this process's descriptors for one read and not the
+/// other.
 #[cfg(target_os = "macos")]
 #[test]
 fn file_holders_are_lsof_s() {
@@ -138,156 +144,95 @@ fn file_holders_are_lsof_s() {
     println!("{DONE}");
 }
 
+/// [`open_files`] (read in process) names the files `/usr/sbin/lsof -p <pid> -d 0-1023 -Fn`
+/// names for a process's descriptors, the reader it replaced, in descriptor order: a child
+/// holding one file as its stdin, `/dev/null` as its stdout and another file as its stderr.
+/// NEGATIVE CONTROLS: a file it does not hold is in neither list, and once it has exited
+/// [`open_files`] reads nothing.
+#[cfg(target_os = "macos")]
+#[test]
+fn open_files_are_lsof_s() {
+    let lsof_names = |pid: u32| -> Vec<std::path::PathBuf> {
+        let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"))
+            .args([
+                "-n",
+                "-P",
+                "-w",
+                "-a",
+                "-p",
+                &pid.to_string(),
+                "-d",
+                "0-1023",
+                "-Fn",
+            ])
+            .output()
+            .expect("run lsof");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| l.strip_prefix('n').map(std::path::PathBuf::from))
+            .collect()
+    };
+    let dir = scratch("open-files");
+    let (input, errors, other) = (dir.join("in"), dir.join("err"), dir.join("other"));
+    for file in [&input, &errors, &other] {
+        std::fs::write(file, b"").expect("write a file");
+    }
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("600")
+        .stdin(std::fs::File::open(&input).expect("open"))
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(std::fs::File::create(&errors).expect("create"))
+        .spawn()
+        .expect("spawn a holder");
+    let pid = child.id();
+    let ours = open_files(pid).expect("its descriptors");
+    let theirs = lsof_names(pid);
+    let _ = child.kill();
+    let _ = child.wait();
+    assert_eq!(ours, theirs, "lsof, the oracle");
+    assert_eq!(ours.len(), 3, "{ours:?}");
+    let named = |path: &std::path::Path| {
+        let canonical = path.canonicalize().expect("canonical");
+        ours.contains(&canonical)
+    };
+    assert!(named(&input) && named(&errors), "{ours:?}");
+    assert!(!named(&other), "a file it does not hold: {ours:?}");
+    assert_eq!(open_files(pid), None, "exited");
+}
+
+/// ONLY A COMPLETE SCAN NAMES THE HOLDERS: an unreadable table leaves them unknown, with or
+/// without a holder found. A sealed table (Linux's non-dumpable process, such as
+/// `ssh-agent`) is no holder, as `lsof -t` run as this uid, which this read replaced, named
+/// none of it. NEGATIVE CONTROL: a sealed table beside an unreadable one is still unknown.
 #[test]
 fn only_a_complete_holder_scan_can_establish_the_holder_set() {
-    let scan = |holders, unreadable| aterm_uds::holders::HolderScan {
+    let scan = |holders, unreadable, sealed| aterm_uds::holders::HolderScan {
         holders,
         unreadable,
+        sealed,
         scanned: 4,
     };
-    assert_eq!(complete_file_holders(scan(vec![], vec![])), Some(vec![]));
     assert_eq!(
-        complete_file_holders(scan(vec![42, 73], vec![])),
+        complete_file_holders(scan(vec![], vec![], vec![])),
+        Some(vec![])
+    );
+    assert_eq!(
+        complete_file_holders(scan(vec![42, 73], vec![], vec![])),
         Some(vec![42, 73])
     );
-    assert_eq!(complete_file_holders(scan(vec![], vec![99])), None);
-    assert_eq!(complete_file_holders(scan(vec![42], vec![99])), None);
-}
-
-/// The census asks `lsof` only where the scan could not answer: a complete scan is the answer, lsof
-/// never run.
-#[test]
-fn the_census_asks_lsof_only_where_the_scan_could_not_answer() {
-    use aterm_uds::holders::HolderScan;
-    use std::io::{Error, ErrorKind};
-    let scan = |holders: &[u32], unreadable: &[u32]| {
-        Ok(HolderScan {
-            holders: holders.to_vec(),
-            unreadable: unreadable.to_vec(),
-            scanned: 9,
-        })
-    };
-    let asked: std::cell::RefCell<Vec<String>> = std::cell::RefCell::default();
-    let among = |answer: Option<Vec<u32>>| {
-        let asked = &asked;
-        move |pids: &[u32]| {
-            asked.borrow_mut().push(format!("among {pids:?}"));
-            answer
-        }
-    };
-    let whole = |answer: Option<Vec<u32>>| {
-        let asked = &asked;
-        move || {
-            asked.borrow_mut().push("whole".to_string());
-            answer
-        }
-    };
+    assert_eq!(complete_file_holders(scan(vec![], vec![99], vec![])), None);
     assert_eq!(
-        holder_census(scan(&[7], &[]), among(Some(vec![8])), whole(Some(vec![8]))),
-        Some(vec![7])
-    );
-    assert_eq!(
-        holder_census(scan(&[], &[]), among(Some(vec![8])), whole(Some(vec![8]))),
-        Some(Vec::new())
-    );
-    assert!(asked.borrow().is_empty(), "a complete scan asks nothing");
-    assert_eq!(
-        holder_census(scan(&[7], &[9, 3]), among(Some(vec![9])), whole(None)),
-        Some(vec![7, 9])
-    );
-    assert_eq!(
-        holder_census(scan(&[7], &[9]), among(Some(Vec::new())), whole(None)),
-        Some(vec![7])
-    );
-    assert_eq!(
-        holder_census(scan(&[7], &[9]), among(None), whole(Some(vec![7]))),
+        complete_file_holders(scan(vec![42], vec![99], vec![])),
         None
     );
-    let unsupported = Err(Error::new(ErrorKind::Unsupported, "off macOS"));
     assert_eq!(
-        holder_census(unsupported, among(None), whole(Some(vec![8]))),
-        Some(vec![8])
-    );
-    assert_eq!(
-        *asked.borrow(),
-        ["among [9, 3]", "among [9]", "among [9]", "whole"],
-        "an incomplete scan asks about its unreadable processes alone"
-    );
-    let failed = Err(Error::new(ErrorKind::NotFound, "no such file"));
-    assert_eq!(
-        holder_census(failed, among(Some(vec![8])), whole(Some(vec![8]))),
-        None
-    );
-    assert_eq!(asked.borrow().len(), 4, "a failed scan asks nothing");
-}
-
-/// `lsof`'s listing of the processes the scan could not read (`-F 0pftDin`, each field ended by a
-/// NUL) names a holder by a numbered descriptor on the file's device and inode.
-#[cfg(unix)]
-#[test]
-fn the_unreadable_processes_are_read_by_lsofs_own_listing() {
-    use std::os::unix::process::ExitStatusExt as _;
-    const KEY: (u64, u64) = (0x100_000f, 294_134_038);
-    let read = |status: i32, fields: &str, stderr: &str, alive: &[u32]| {
-        let stdout = fields.replace('\n', "\0\n");
-        lsof_fd_holders(
-            &std::process::Output {
-                status: std::process::ExitStatus::from_raw(status),
-                stdout: stdout.into_bytes(),
-                stderr: stderr.as_bytes().to_vec(),
-            },
-            &[41, 42, 43],
-            KEY,
-            |pid| alive.contains(&pid),
-        )
-    };
-    let held = "f9\ntREG\nD0x100000f\ni294134038\nn/w/writer.lock\n";
-    let other = "f3\ntREG\nD0x100000f\ni7\nn/w/other\n";
-    let socket = "f4\ntunix\nn->0xe1286e4cf8d006a7\n";
-    let closed = "f27\nnvnode: FD unavailable\n";
-    let cwd = "fcwd\ntDIR\nD0x100000f\ni294134038\nftxt\ntREG\nD0x100000f\ni294134038\n";
-    let all = format!("p41\n{other}{held}{held}p42\n{cwd}{socket}{closed}p43\n{other}");
-    assert_eq!(read(0, &all, "", &[]), Some(vec![41]), "the holder, once");
-    let gone = format!("p42\n{held}");
-    assert_eq!(
-        read(1 << 8, &gone, "", &[]),
+        complete_file_holders(scan(vec![42], vec![], vec![77])),
         Some(vec![42]),
-        "exit 1: pids 41 and 43 exited"
+        "a sealed table is no holder"
     );
     assert_eq!(
-        read(1 << 8, "", "", &[]),
-        Some(Vec::new()),
-        "all three exited"
-    );
-    let escaped = "p41\nf9\ntREG\nD0x100000f\ni294134038\nn/w/a\\nb\np42\np43\n";
-    assert_eq!(
-        read(0, escaped, "", &[]),
-        Some(vec![41]),
-        "a name's newline is escaped"
-    );
-    let unknown = [
-        read(1 << 8, &gone, "", &[43]),
-        read(0, &format!("p41\n{held}p42\nf5\ntREG\np43\n"), "", &[]),
-        read(
-            0,
-            "p41\nf5\nnvnode: Operation not permitted\np42\np43\n",
-            "",
-            &[],
-        ),
-        read(0, "p41\nf5\nD0x100000f\np42\np43\n", "", &[]),
-        read(0, &format!("p41\np42\np43\np44\n{held}"), "", &[]),
-        read(0, "p41\np41\np42\np43\n", "", &[]),
-        read(0, &format!("{held}p41\np42\np43\n"), "", &[]),
-        read(0, "p41\nf9\ntREG\nD100000f\ni1\np42\np43\n", "", &[]),
-        read(0, "p41\nf9\ntREG\nD0x100000f\nix\np42\np43\n", "", &[]),
-        read(0, "p4x\np42\np43\n", "", &[]),
-        read(0, &all, "lsof: WARNING: can't stat()\n", &[]),
-        read(2 << 8, &all, "", &[]),
-        read(libc::SIGKILL, &all, "", &[]),
-    ];
-    assert!(
-        unknown.iter().all(Option::is_none),
-        "LSOF_UNKNOWN_MUST_NOT_FREE_THE_LOCK: {unknown:?}"
+        complete_file_holders(scan(vec![], vec![99], vec![77])),
+        None
     );
 }
 
@@ -3163,11 +3108,13 @@ fn a_terminal_is_the_tabs_only_when_aterm_opened_it() {
     assert_eq!(owner_word(Some((5, "a b/c"))), "abc");
 }
 
-/// End to end: an agent on a pty the tab does not own (`script`'s here, the shape of every tmux or
-/// screen pane, whose environment still names the tab) is never driven through that tab.
+/// End to end: an agent on a pty the tab does not own ([`pty_host`]'s here, the shape of
+/// every `script`, tmux or screen pane, whose environment still names the tab) is never
+/// driven through that tab: held back once, naming the pty's owner, then waited on.
 #[cfg(target_os = "macos")]
 #[test]
 fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
+    use std::ffi::OsStr;
     let exe = std::env::current_exe().expect("exe");
     let child_of = |parent: u32| {
         (0..3_000).find_map(|_| {
@@ -3184,43 +3131,50 @@ fn an_agent_on_a_pty_the_tab_does_not_own_is_never_driven_through_the_tab() {
     for in_shell in [true, false] {
         let dir = scratch(if in_shell { "pty" } else { "pty-own" });
         let opts = drive(&dir);
-        let mut script = Command::new("/usr/bin/script");
-        script.args(["-q", "/dev/null"]);
+        let mut argv: Vec<&OsStr> = Vec::new();
         if in_shell {
-            script
-                .args(["/bin/zsh", "-f", "-i", "-c"])
-                .args([r#""$@"; :"#, "zsh"]);
+            argv.extend(["/bin/zsh", "-f", "-i", "-c", r#""$@"; :"#, "zsh"].map(OsStr::new));
         }
-        let mut script = script
-            .arg(&exe)
-            .args(PARK)
+        argv.push(exe.as_os_str());
+        argv.extend(PARK.map(OsStr::new));
+        let mut host = pty_host(&argv)
             .env(PARK_ENV, "1")
             .env("ATERM_PARENT_SESSION_ID", TAB)
-            .stdin(aterm_uds::spawnfd::Stdio::null())
-            .stdout(aterm_uds::spawnfd::Stdio::null())
-            .stderr(aterm_uds::spawnfd::Stdio::null())
             .spawn()
-            .expect("script");
+            .expect("pty host");
         let agent = if in_shell {
-            let shell = child_of(script.id()).expect("the shell under script");
+            let shell = child_of(host.id()).expect("the shell on the host's pty");
             child_of(shell).expect("the agent, the shell's job")
         } else {
-            child_of(script.id()).expect("the agent, script's own program")
+            child_of(host.id()).expect("the agent, the host's own program")
         };
         wait_exec(agent);
+        let owner = ps_name(host.id()).expect("the host, as ps names it");
         let sf = register(&opts.home, agent, SESSION);
         let got = visit(&opts, &sf, &table(), &newer(), &Live);
         let again = visit(&opts, &sf, &table(), &newer(), &Live);
-        let _ = aterm_uds::deadline::output_until(
-            Command::new("kill").args(["-9", &agent.to_string()]),
-            std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+        // SAFETY: kill takes two integers; the agent is this test's grandchild, alive until
+        // the host it parks under goes.
+        let _ = unsafe { libc::kill(libc::pid_t::try_from(agent).expect("pid"), libc::SIGKILL) };
+        let _ = host.kill();
+        let _ = host.wait();
+        assert!(
+            !owned_by_aterm((host.id(), &owner)),
+            "the host is no aterm: {owner}"
         );
-        let _ = script.kill();
-        let _ = script.wait();
-        assert_eq!(got.step, "held-back:terminal:script", "{in_shell}: {got:?}");
+        let word = owner_word(Some((host.id(), &owner)));
+        assert_eq!(
+            got.step,
+            format!("held-back:terminal:{word}"),
+            "{in_shell}: {got:?}"
+        );
         assert_eq!(got.tab, TAB);
         assert!(got.is_act(), "said, where the window's host logs it");
-        assert_eq!(again.step, "wait:terminal:script", "{in_shell}: {again:?}");
+        assert_eq!(
+            again.step,
+            format!("wait:terminal:{word}"),
+            "{in_shell}: {again:?}"
+        );
         assert!(!again.is_act(), "said ONCE");
         assert_eq!(ledger_lines(&opts), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -15199,6 +15153,109 @@ fn tty_zsh() -> std::process::Child {
     let _ = child.kill();
     let _ = child.wait();
     panic!("zsh never held its terminal");
+}
+
+/// The pty host's argv: this test binary, running only [`host_a_pty_when_asked`].
+#[cfg(target_os = "macos")]
+const PTY_HOST: [&str; 2] = [
+    "harness::upgrade_drive::tests::host_a_pty_when_asked",
+    "--exact",
+];
+
+/// What tells [`host_a_pty_when_asked`] to host, and the argv it runs, its words split by a
+/// unit separator (`0x1f`): an argv after `--exact` would be more test filters.
+const PTY_HOST_ENV: &str = "UPGRADE_DRIVE_TEST_PTY_HOST";
+
+/// The pty host's body ([`pty_host`]): `script(1)`'s part, without `script(1)`, whose BSD
+/// and util-linux forms differ (S12 of the init design). A pty pair of its own, the argv on
+/// its slave in a session it leads, the master drained, until the argv's process exits or
+/// this one's parent goes.
+#[cfg(unix)]
+#[test]
+fn host_a_pty_when_asked() {
+    use aterm_uds::spawnfd::InheritNothing as _;
+    use std::os::fd::{FromRawFd as _, OwnedFd};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::process::CommandExt as _;
+    let Some(argv) = std::env::var_os(PTY_HOST_ENV) else {
+        return;
+    };
+    let words: Vec<&std::ffi::OsStr> = argv
+        .as_bytes()
+        .split(|b| *b == 0x1f)
+        .map(std::ffi::OsStr::from_bytes)
+        .collect();
+    let (program, args) = words.split_first().expect("a program to host");
+    let (master, slave) = aterm_pty::open_pty_pair().expect("open_pty_pair");
+    // SAFETY: both descriptors were just opened above and are owned exclusively here.
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    let tty = |fd: &OwnedFd| std::process::Stdio::from(fd.try_clone().expect("dup"));
+    let mut hosted = std::process::Command::new(program);
+    hosted
+        .inherit_nothing()
+        .args(args)
+        .env_remove(PTY_HOST_ENV)
+        .stdin(tty(&slave))
+        .stdout(tty(&slave))
+        .stderr(tty(&slave));
+    // SAFETY: calls only async-signal-safe `setsid`/`ioctl` between fork and exec.
+    unsafe {
+        hosted.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    // SAFETY: getppid takes nothing and cannot fail.
+    let parent = unsafe { libc::getppid() };
+    let mut child = hosted.spawn().expect("the hosted program");
+    drop(slave);
+    let mut master = std::fs::File::from(master);
+    std::thread::spawn(move || {
+        let mut sink = [0_u8; 4096];
+        while std::io::Read::read(&mut master, &mut sink).is_ok_and(|n| n > 0) {}
+    });
+    // SAFETY: as above.
+    while unsafe { libc::getppid() } == parent {
+        if child.try_wait().ok().flatten().is_some() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// `argv` on a pty a process of its own opened ([`host_a_pty_when_asked`]): the shape of
+/// `script -q /dev/null argv…`, of every tmux or screen pane. Its pid is the terminal's owner.
+#[cfg(target_os = "macos")]
+fn pty_host(argv: &[&std::ffi::OsStr]) -> Command {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut words = Vec::new();
+    for (i, word) in argv.iter().enumerate() {
+        assert!(!word.as_bytes().contains(&0x1f), "{word:?}");
+        if i > 0 {
+            words.push(0x1f);
+        }
+        words.extend_from_slice(word.as_bytes());
+    }
+    let mut c = Command::new(std::env::current_exe().expect("exe"));
+    c.args(PTY_HOST)
+        .env(PTY_HOST_ENV, std::ffi::OsStr::from_bytes(&words))
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null());
+    c
+}
+
+/// The name `ps` gives `pid` (`tty_table`, the oracle), `None` once it is gone.
+#[cfg(target_os = "macos")]
+fn ps_name(pid: u32) -> Option<String> {
+    tty_table()
+        .into_iter()
+        .find(|(p, _, _, _)| *p == pid)
+        .map(|(_, _, _, name)| name)
 }
 
 /// A STAND-IN AGENT ([`parked`]) THAT LEADS A TERMINAL OF ITS OWN, as a

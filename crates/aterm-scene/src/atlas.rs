@@ -4,10 +4,6 @@
 //! Straight-alpha RGBA8 tile rasterization shared by aterm's live effects.
 
 /// A scratch RGBA8 tile (straight alpha) drawn into during baking.
-///
-/// Public so host-side bakers (e.g. `CatBaker` in `aterm-gui`) share this
-/// 4×4-supersampled coverage and straight-alpha src-over instead of a drifting
-/// look-alike.
 pub struct Tile {
     w: u32,
     h: u32,
@@ -65,10 +61,7 @@ impl Tile {
         self.px.as_mut_slice()
     }
 
-    /// Source-over one pixel (straight alpha). `rgb` channels and `a` are in `[0,1]`.
-    // Skipped: the native memory verifier reports every `self.px[..]` BoundsCheck as
-    // Unsupported however the bound is re-established. Safe by the Tile invariant
-    // (px.len() == w*h*4, set in `new`) plus the leading x/y range guard.
+    /// Source-over one pixel (straight alpha).
     #[cfg_attr(trust_verify, trust::skip)]
     #[inline]
     pub fn over(&mut self, x: i32, y: i32, rgb: (f32, f32, f32), a: f32) {
@@ -98,17 +91,12 @@ impl Tile {
         self.px[i + 3] = to(oa);
     }
 
-    /// Source-over a horizontal run of `len` pixels starting at `(x, y)` — the span-fill
-    /// fast path the scanline rasterizer ([`crate::vector::fill_path`]) uses for
-    /// fully-covered pixel runs. Byte-identical to calling [`over`](Self::over) `len`
-    /// times; when `a` is opaque it pattern-fills the RGBA quad directly (one 4-byte
-    /// `copy_from_slice` per pixel, no per-pixel blend). The run is clipped to the tile.
+    /// Source-over a horizontal run of `len` pixels starting at `(x, y)`.
     #[inline]
     pub(crate) fn over_run(&mut self, x: i32, y: i32, len: u32, rgb: (f32, f32, f32), a: f32) {
         if y < 0 || y as u32 >= self.h || a <= 0.0 || len == 0 {
             return;
         }
-        // Clip [x, x+len) to [0, w) in i64 so a hostile x+len never overflows.
         let start = x.max(0);
         let end = (i64::from(x) + i64::from(len)).min(i64::from(self.w));
         if i64::from(start) >= end {
@@ -118,7 +106,6 @@ impl Tile {
         let sa = crate::clampf(a, 0.0, 1.0);
         let to = |v: f32| (crate::clampf(v, 0.0, 1.0) * 255.0 + 0.5) as u8;
         if sa >= 1.0 {
-            // Opaque source-over collapses to a straight copy (oa = 1, mix = source).
             let quad = [to(rgb.0), to(rgb.1), to(rgb.2), 255];
             for xi in start..end as i32 {
                 let i = ((row + xi as u32) * 4) as usize;
@@ -151,10 +138,6 @@ impl Tile {
 
     /// Fill `bbox` with `rgb` at `alpha`, modulated by the 4×4-supersampled coverage of
     /// `inside(px, py)` (sample coords are pixel centers in tile space).
-    // A raw bbox + colour + alpha parameter list reads better at the dozens of tiny
-    // call sites than a packed struct would.
-    // Skipped: the generic `inside` closure is absent from the lowered bundle and
-    // `over` is itself skipped; the verifier times out on the body.
     #[cfg_attr(trust_verify, trust::skip)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn fill<F: Fn(f32, f32) -> bool>(
@@ -176,9 +159,6 @@ impl Tile {
                 let mut hit = 0u32;
                 for sy in 0..4 {
                     for sx in 0..4 {
-                        // ×0.25 is bit-identical to /4 (power of two); saturating
-                        // add is a no-op for a counter bounded by 16. Both purely
-                        // discharge proof obligations.
                         let fx = px as f32 + (sx as f32 + 0.5) * 0.25;
                         let fy = py as f32 + (sy as f32 + 0.5) * 0.25;
                         if inside(fx, fy) {
@@ -187,8 +167,6 @@ impl Tile {
                     }
                 }
                 if hit > 0 {
-                    // ×(1/16) is bit-identical to /16 (power of two) and avoids a
-                    // float-division obligation on the hot supersampling path.
                     const INV16: f32 = 1.0 / 16.0;
                     self.over(px, py, rgb, alpha * hit as f32 * INV16);
                 }
@@ -199,8 +177,6 @@ impl Tile {
     /// A filled disc of radius `r` centered at `(cx, cy)`.
     pub fn disc(&mut self, cx: f32, cy: f32, r: f32, rgb: (f32, f32, f32), a: f32) {
         let rr = r * r;
-        // Saturating bbox math: the float→int casts already saturate at the i32
-        // limits, so ±1/±2 must not wrap there. Real sprite coords are ≤ tile size.
         self.fill(
             ((cx - r) as i32).saturating_sub(1),
             ((cy - r) as i32).saturating_sub(1),
@@ -217,7 +193,6 @@ impl Tile {
 
     /// An axis-aligned filled ellipse with radii `(rx, ry)` centered at `(cx, cy)`.
     pub fn ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32, rgb: (f32, f32, f32), a: f32) {
-        // Saturating bbox math, same reasoning as `disc`.
         self.fill(
             ((cx - rx) as i32).saturating_sub(1),
             ((cy - ry) as i32).saturating_sub(1),

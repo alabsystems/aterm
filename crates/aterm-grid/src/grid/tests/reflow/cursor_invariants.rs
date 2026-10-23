@@ -2,13 +2,10 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Exhaustive cursor invariant tests for reflow: after any shrink or grow,
-//! `cursor.row < visible_rows && cursor.col < cols`.
+//! Exhaustive cursor invariant tests for reflow.
 
 use super::super::super::*;
 
-/// Every (rows, old_cols, new_cols) triple in [1..8] with the cursor at every
-/// position passes `assert_invariants()` after resize (O(max^5), kept small).
 #[test]
 fn cursor_invariant_exhaustive_small_grids() {
     let max: u16 = 8;
@@ -22,7 +19,6 @@ fn cursor_invariant_exhaustive_small_grids() {
                 for cursor_row in 0..rows {
                     for cursor_col in 0..old_cols {
                         let mut grid = Grid::new(rows, old_cols);
-                        // Content on the cursor row exercises `chunk_cells_to_rows`.
                         grid.set_cursor(cursor_row, 0);
                         let content_len = old_cols.min(26);
                         for i in 0..content_len {
@@ -59,8 +55,6 @@ fn cursor_invariant_exhaustive_small_grids() {
     );
 }
 
-/// A cursor on an empty row (the `content_len == 0` branch) stays valid for
-/// every shrink and grow.
 #[test]
 fn cursor_on_empty_row_shrink_and_grow() {
     for rows in 1..=12u16 {
@@ -89,7 +83,6 @@ fn cursor_on_empty_row_shrink_and_grow() {
     }
 }
 
-/// Shrink → grow → shrink → grow keeps the cursor in bounds at every step.
 #[test]
 fn cursor_invariant_multi_resize_cycle() {
     let dimensions: &[(u16, u16)] = &[
@@ -126,7 +119,6 @@ fn cursor_invariant_multi_resize_cycle() {
     }
 }
 
-/// Extreme ratio: 1-row terminal. Cursor row must clamp to 0.
 #[test]
 fn cursor_invariant_single_row_terminal() {
     for old_rows in 2..=10u16 {
@@ -144,7 +136,6 @@ fn cursor_invariant_single_row_terminal() {
     }
 }
 
-/// The cursor stays valid across shrink/grow with scrollback active.
 #[test]
 fn cursor_invariant_with_scrollback() {
     let rows: u16 = 5;

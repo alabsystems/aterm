@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! AI CLI status projection and login actions ([`App::start_ai_looks`], [`LOOK_EVERY`],
-//! [`App::ai_config_changed`], [`ai_entries`], [`AiProjection`], [`AiState`],
-//! [`App::ai_sign_in`]).
+//! AI CLI status projection and login actions.
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
@@ -21,13 +19,11 @@ use aterm_messages::need::{Mover, Reason, Resurface, Then, Why};
 use crate::App;
 use crate::native_settings::SettingsRoute;
 
-/// How often the window looks with nothing else asking (§7.3).
+/// How often the window looks with nothing else asking.
 pub(crate) const LOOK_EVERY: Duration = Duration::from_hours(6);
 
-/// How often the worker stats the AI store's wake marker between asks.
 const WAKE_POLL: Duration = Duration::from_secs(5);
 
-/// The longest fact a row or a line carries.
 const FACT_MAX: usize = 400;
 
 /// One AI CLI as the window's look judged it: plain data, its words already sanitized.
@@ -39,7 +35,7 @@ pub(crate) struct AiCli {
     pub(crate) product: &'static str,
     /// Whether this is Claude Code, whose login accounts v2 owns.
     pub(crate) claude: bool,
-    /// Whether it is wanted here (`[ai.<id>] use`).
+    /// Whether it is wanted here.
     pub(crate) wanted: bool,
     /// Its state.
     pub(crate) state: State,
@@ -53,7 +49,6 @@ pub(crate) struct AiCli {
     pub(crate) version: Option<String>,
 }
 
-/// Suffix of `foreign` preserved in `fact` ([`AiCli::path`], [`FACT_MAX`]).
 fn named_path(fact: &str, foreign: Option<&Path>) -> Option<String> {
     foreign
         .map(|path| one_line(&path.display().to_string()))
@@ -142,7 +137,6 @@ impl AiReading {
     }
 }
 
-/// `text` from outside aterm as one line the page and Messages may show.
 fn one_line(text: &str) -> String {
     aterm_agent::ai::review::sanitize_block(text, FACT_MAX)
         .replace(['\n', '\t'], " ")
@@ -180,7 +174,6 @@ pub(crate) struct AiChoices {
 }
 
 impl AiChoices {
-    /// Whether the policy currently admits this CLI on this machine.
     fn wants(&self, id: &str) -> bool {
         self.uses.iter().any(|(cli, on, _)| *cli == id && *on)
     }
@@ -267,7 +260,7 @@ impl AiAct {
 /// One row of the CLIS card: what it is, its state, and the act it offers.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AiCliRow {
-    /// The CLI's id: what a press names, and its `ai.<id>.use` switch.
+    /// The CLI's id.
     pub(crate) id: &'static str,
     /// The product's name.
     pub(crate) product: &'static str,
@@ -306,12 +299,10 @@ pub(crate) struct AiProjection {
     pub(crate) fleet_from_url: bool,
 }
 
-/// Whether a value came from the fleet document.
 const fn from_fleet(from: From) -> bool {
     matches!(from, From::Fleet | From::FleetMachine)
 }
 
-/// Where a value came from, in the page's words.
 const fn from_words(from: From) -> &'static str {
     match from {
         From::Local => "aterm.toml",
@@ -321,7 +312,6 @@ const fn from_words(from: From) -> &'static str {
     }
 }
 
-/// A row's state and fact, `signed-out · no login is stored`.
 fn detail_words(word: &str, fact: &str) -> String {
     if fact.starts_with(&word.replace('-', " ")) {
         fact.to_string()
@@ -330,7 +320,6 @@ fn detail_words(word: &str, fact: &str) -> String {
     }
 }
 
-/// `names` as a list a sentence can hold: `a`, `a and b`, `a, b and c`.
 fn listed(names: &[&str]) -> String {
     match names.split_last() {
         None => String::new(),
@@ -369,7 +358,6 @@ impl AiState {
         }
     }
 
-    /// The CLIS card's first line.
     fn health(&self, observed: bool) -> String {
         if !observed {
             return "Reading\u{2026}".to_string();
@@ -412,7 +400,6 @@ impl AiState {
         format!("{words} \u{b7} looked {when}")
     }
 
-    /// One row per CLI this build has a connection for.
     fn cli_rows(&self) -> Vec<AiCliRow> {
         let preferred = self.choices.preferred.0;
         connector::connections()
@@ -465,7 +452,6 @@ impl AiState {
             .collect()
     }
 
-    /// The REVIEWS card's facts, under its two rows: who reviews and how long each may take.
     fn review_rows(&self) -> Vec<(String, String)> {
         let c = &self.choices;
         let row = |label: &str, value: String| (label.to_string(), value);
@@ -518,7 +504,6 @@ impl AiState {
         ]
     }
 
-    /// The FLEET card.
     fn fleet_rows(&self) -> Vec<(String, String)> {
         let c = &self.choices;
         let row = |label: &str, value: String| (label.to_string(), value);
@@ -599,7 +584,6 @@ pub(crate) fn ai_entries(reading: &AiReading, accounts_listed: bool) -> Vec<Entr
         .collect()
 }
 
-/// The line for one CLI that needs a person.
 fn ai_entry(cli: &AiCli, preferred: bool) -> Entry {
     let product = cli.product;
     let (what, reason, step) = match cli.state {
@@ -650,7 +634,6 @@ pub(crate) enum AiAsk {
     Off,
 }
 
-/// The wake marker's identity: its write time and file, or none.
 fn wake_stamp(path: Option<&Path>) -> Option<(Option<std::time::SystemTime>, u64)> {
     let meta = std::fs::metadata(path?).ok()?;
     #[cfg(unix)]
@@ -660,7 +643,6 @@ fn wake_stamp(path: Option<&Path>) -> Option<(Option<std::time::SystemTime>, u64
     Some((meta.modified().ok(), file))
 }
 
-/// THE LOOK WORKER'S LOOP.
 fn look_loop(
     asks: &Receiver<AiAsk>,
     mut on: bool,
@@ -709,7 +691,6 @@ fn look_loop(
     }
 }
 
-/// One look, as the window takes it.
 fn look_now(fetch: bool) -> Result<AiReading, String> {
     let mut env = aterm_agent::ai::cli::Env::from_process();
     env.vars
@@ -944,7 +925,6 @@ impl App {
         self.except_replace(Family::Ai, &entries);
     }
 
-    /// Every old AI line ends now; the next admitted look states its answer.
     fn clear_ai_entries(&mut self) {
         for key in self.messages.digest_keys_under(&Family::Ai.prefix()) {
             self.except_clear(&key);
@@ -997,7 +977,6 @@ impl App {
         );
     }
 
-    /// Type `line` and Enter into newborn session `sid` (`app_tabs::inject_launch_line`).
     fn type_into_new_session(&mut self, sid: &str, line: &str) {
         let found = {
             let store = self.store.read().unwrap_or_else(|p| p.into_inner());

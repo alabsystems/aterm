@@ -266,8 +266,6 @@ impl Grid {
         }
         self.storage.history_renumber_epoch = self.storage.history_renumber_epoch.saturating_add(1);
         if let Some(budget) = budget {
-            // An enforcement failure leaves the store over its budget, as the
-            // store's own pushes would; the next drain enforces again.
             let _ = self.set_scrollback_memory_budget(budget);
         }
         self.set_scrollback_line_limit(limit);

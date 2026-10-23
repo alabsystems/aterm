@@ -6,6 +6,10 @@
 use std::time::{Duration, Instant};
 
 use aterm_vitals::Rates;
+use aterm_vitals::explain::episodes::CLAUSE_STALE_MS;
+use aterm_vitals::explain::{
+    CauseId, Context, Evidence, Lead, Part, Role, Voucher, WhySubject, account_of,
+};
 use aterm_vitals::ink::{self, Rgb, VitalsInks};
 use aterm_vitals::model::{
     CpuView, DiskFacts, LinkKind, Pressure, ProcScope, Resource, ResourceView, Snapshot,
@@ -30,7 +34,7 @@ pub(crate) const LENS_PERIOD: Duration = Duration::from_millis(500);
 pub(crate) enum Opened {
     /// The pointer rested on an instrument.
     Hover,
-    /// A click pinned it: it stays until a click outside, Esc or a key it does not take.
+    /// A click pinned it.
     Pinned,
     /// ⌘I: it takes ←/→/↑/↓, Return, ⌘C and Esc.
     Keyboard,
@@ -183,7 +187,7 @@ fn step_bar(bar: Bar, forward: bool) -> Bar {
     }]
 }
 
-/// The shell's side margin: the explainer wraps to the shell width − 24.
+/// The shell's side margin.
 const SIDE: f64 = 12.0;
 /// Two columns from this shell width.
 const TWO_COLUMNS_PT: f64 = 640.0;
@@ -196,10 +200,9 @@ const PITCH: f64 = 13.0;
 const GAP: f64 = 4.0;
 /// No ink comes nearer the shell's bottom edge than this.
 const FOOT: f64 = 10.0;
-/// A one-line section: one 10 pt line and its descent.
+/// A one-line section.
 const LINE_H: f64 = 13.0;
-/// The name's size on line 1, a section heading's, the words', a note's and
-/// an axis label's.
+/// The name's size on line 1, a section heading's, the words', a note's and an axis label's.
 const NAME_PT: f64 = 12.0;
 const HEAD_PT: f64 = 10.5;
 const BODY_PT: f64 = 10.0;
@@ -226,6 +229,8 @@ type Draw<'d> = Box<dyn Fn(&mut Pen<'_>, Place) + 'd>;
 pub(crate) struct Form<'d> {
     h: f64,
     grow: bool,
+    /// Whether it fits only as its column's last section (Cores' grow form over Why now).
+    last: bool,
     /// A one-line form's label.
     label: Option<String>,
     draw: Draw<'d>,
@@ -235,6 +240,7 @@ fn form<'d>(h: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
     Form {
         h,
         grow: false,
+        last: false,
         label: None,
         draw: Box::new(draw),
     }
@@ -244,17 +250,19 @@ fn grow<'d>(h: f64, draw: impl Fn(&mut Pen<'_>, Place) + 'd) -> Form<'d> {
     Form {
         h,
         grow: true,
+        last: false,
         label: None,
         draw: Box::new(draw),
     }
 }
 
-/// A one-line form: `label`, then the first of `forms` that fits.
+/// A one-line form.
 fn line_form<'d>(label: &str, forms: Vec<String>) -> Form<'d> {
     let owned = label.to_owned();
     Form {
         h: LINE_H,
         grow: false,
+        last: false,
         label: Some(label.to_owned()),
         draw: Box::new(move |pen, p| one_line(pen, p, &owned, &forms)),
     }
@@ -278,7 +286,7 @@ pub(crate) struct LensDoc<'d> {
     explainer: String,
     /// "Wrong?" (Disk) or the row's state now.
     answer: Option<(&'static str, String, InkKind)>,
-    /// In priority order: one column stacks them in this order.
+    /// In priority order.
     sections: Vec<Section<'d>>,
     /// The order two columns stack them in, top down (each column keeps its own).
     two_order: Vec<usize>,
@@ -295,7 +303,7 @@ fn columns(lw: f64) -> (bool, f64) {
     }
 }
 
-/// One placed section: its index in the doc, the form it took and its box.
+/// One placed section.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Placed {
     pub(crate) section: usize,
@@ -342,10 +350,7 @@ pub(crate) fn lens_body(
         .unwrap_or_default()
 }
 
-/// One column at `x`, `cw` wide, from `top` to `bottom`, holding every one
-/// of `ids` in order, each in its largest form that leaves room for the
-/// one-line forms after it (section 0 where `keeps_first`: its largest form
-/// that fits); `None` when they do not all fit.
+/// One column at `x` ([`Form::last`]).
 fn stack(
     (x, cw): (f64, f64),
     (top, bottom): (f64, f64),
@@ -373,7 +378,7 @@ fn stack(
         let fi = sections[i]
             .forms
             .iter()
-            .position(|f| f.h + after <= room + EPS)?;
+            .position(|f| (!f.last || k + 1 == ids.len()) && f.h + after <= room + EPS)?;
         let f = &sections[i].forms[fi];
         let h = if f.grow {
             (room - after).max(f.h).min(room)
@@ -417,7 +422,7 @@ pub(crate) struct Pen<'a> {
 }
 
 impl<'a> Pen<'a> {
-    /// `v` pt in whole device px: `floor(v·s + 0.5)`.
+    /// `v` pt in whole device px.
     fn px(&self, v: f64) -> f32 {
         (v * self.s + 0.5).floor() as f32
     }
@@ -426,12 +431,12 @@ impl<'a> Pen<'a> {
         self.m.width(s, pt, bold)
     }
 
-    /// `s` cut to `room` with "…" (rule F); empty when not even that fits.
+    /// `s` cut to `room` with "…" (rule F).
     fn cut(&self, s: &str, room: f64, pt: f64, bold: bool) -> String {
         self.m.fit(&[s], room, pt, bold)
     }
 
-    /// `s` at `(x, base)`; answers its advance.
+    /// `s` at `(x, base)`.
     fn text(&mut self, x: f64, base: f64, s: &str, pt: f64, bold: bool, ink: Rgb) -> f64 {
         if s.is_empty() {
             return 0.0;
@@ -458,7 +463,7 @@ impl<'a> Pen<'a> {
         w
     }
 
-    /// `s` ending at `right`; answers its advance.
+    /// `s` ending at `right`.
     fn text_end(&mut self, right: f64, base: f64, s: &str, pt: f64, bold: bool, ink: Rgb) -> f64 {
         let w = self.width(s, pt, bold);
         self.text(right - w, base, s, pt, bold, ink)
@@ -526,7 +531,7 @@ impl<'a> Pen<'a> {
         });
     }
 
-    /// An outlined rect, one device px wide: a span with no reading.
+    /// An outlined rect, one device px wide.
     fn hollow(&mut self, x: f64, y: f64, w: f64, h: f64, ink: Rgba) {
         if !self.draw {
             return;
@@ -563,8 +568,7 @@ impl<'a> Pen<'a> {
         );
     }
 
-    /// ←→ (`across`) or ↑↓ drawn as Lines, the faces lacking the glyphs;
-    /// answers the advance.
+    /// ←→ (`across`) or ↑↓ drawn as Lines, the faces lacking the glyphs.
     fn arrows(&mut self, x: f64, base: f64, across: bool) -> f64 {
         const L: f64 = 3.4;
         const HW: f64 = 1.8;
@@ -590,7 +594,7 @@ impl<'a> Pen<'a> {
         }
     }
 
-    /// Heat step `step`'s ink: `heat_ic` under Increase Contrast.
+    /// Heat step `step`'s ink.
     fn heat(&self, v: f32) -> Rgb {
         let step = usize::from(ink::heat_step(v.max(0.0)).min(6));
         if self.ic {
@@ -609,8 +613,7 @@ impl<'a> Pen<'a> {
         }
     }
 
-    /// The shell: a soft shadow laid as rings, the opaque ground a step off
-    /// the band's, and the rim.
+    /// The shell: a soft shadow laid as rings.
     fn shell(&mut self, lg: &LensGeom) {
         let inks = self.inks;
         let m = lg.margin;
@@ -645,10 +648,7 @@ impl<'a> Pen<'a> {
     }
 }
 
-/// `text` wrapped to `width` where the shared rule lets a line break
-/// ([`aterm_grapheme::pieces`]): at word boundaries, and between CJK
-/// characters with nothing put between them; a word wider than a line is
-/// cut, never drawn past it.
+/// `text` wrapped to `width` where the shared rule lets a line break ([`aterm_grapheme::pieces`]).
 fn wrap(m: &FaceMetrics, text: &str, width: f64, pt: f64) -> Vec<String> {
     let mut out = Vec::new();
     let mut line = String::new();
@@ -682,7 +682,7 @@ fn wrap(m: &FaceMetrics, text: &str, width: f64, pt: f64) -> Vec<String> {
         .collect()
 }
 
-/// The first of `forms` that fits `room`; `None` when none does.
+/// The first of `forms` that fits `room`.
 fn first_fit(m: &FaceMetrics, forms: &[String], room: f64, pt: f64, bold: bool) -> Option<String> {
     forms
         .iter()
@@ -696,8 +696,7 @@ fn fit_cut(m: &FaceMetrics, forms: &[String], room: f64, pt: f64, bold: bool) ->
     m.fit(&refs, room, pt, bold)
 }
 
-/// A section heading at `p`'s top, with the first of `subs` that fits
-/// beside it.
+/// A section heading at `p`'s top, with the first of `subs` that fits beside it.
 fn heading(pen: &mut Pen<'_>, p: Place, name: &str, subs: &[String]) {
     let base = p.y + HEAD_BASE;
     let name = pen.cut(name, p.w, HEAD_PT, true);
@@ -718,8 +717,7 @@ fn tab_after(label_w: f64) -> f64 {
         .unwrap_or(label_w + 8.0)
 }
 
-/// A one-line form: the label, then the first of `forms` that fits, else the
-/// last cut.
+/// A one-line form.
 fn one_line(pen: &mut Pen<'_>, p: Place, label: &str, forms: &[String]) {
     let base = p.y + HEAD_BASE;
     let label = pen.cut(label, p.w, HEAD_PT, true);
@@ -764,8 +762,7 @@ impl Row {
     }
 }
 
-/// Processes of one name in one scope as one row (`rustc ×9`), their
-/// figures summed, largest first.
+/// Processes of one name in one scope as one row.
 fn grouped<'a>(
     items: impl IntoIterator<Item = (&'a str, ProcScope, f64)>,
 ) -> Vec<(String, ProcScope, f64)> {
@@ -794,13 +791,12 @@ fn grouped<'a>(
         .collect()
 }
 
-/// A list's height: a heading, `n` rows and an optional note line.
+/// A list's height.
 fn rows_h(n: usize, note: bool) -> f64 {
     PITCH * (n + usize::from(note)) as f64 + 14.0
 }
 
-/// A chip's ink (§11.3): Tab ink only for this window's front tab, aterm ink
-/// for other tabs and aterm itself, the machine's for everything else.
+/// A chip's ink (§11.3).
 fn chip_ink(pen: &Pen<'_>, scope: ProcScope, tab_key: Option<u64>) -> Rgb {
     match scope {
         ProcScope::Tab(k) if Some(k) == tab_key => {
@@ -821,9 +817,7 @@ fn chip_ink(pen: &Pen<'_>, scope: ProcScope, tab_key: Option<u64>) -> Rgb {
     }
 }
 
-/// `rows` under a heading at `p`'s top: a list with no bars and no scopes
-/// gives its names the room the figures leave; any other sizes its name
-/// column to its longest name.
+/// `rows` under a heading at `p`'s top.
 fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], tab_key: Option<u64>) {
     let fig_w = rows
         .iter()
@@ -882,9 +876,7 @@ fn draw_rows(pen: &mut Pen<'_>, p: Place, rows: &[Row], tab_key: Option<u64>) {
     }
 }
 
-/// A list section: its heading and subtitle, `rows`, an optional note; in
-/// two columns all of `rows` (at most `most`); in one, `most` then 2 rows;
-/// and the one-line form `label` `line` last.
+/// A list section: its heading and subtitle, `rows`, an optional note.
 #[expect(clippy::too_many_arguments, reason = "a list's words, rows and forms")]
 fn list_section<'d>(
     c: Ctx<'d>,
@@ -975,9 +967,7 @@ fn nice_up(v: f64) -> f64 {
     10.0 * e
 }
 
-/// The smallest axis step at or above `v`: 1, 2, 2.5, 3, 4 or 5 times a
-/// power of ten, so a 24-hour trace of 868 to 911 GB reads 870, 900, 930
-/// rather than 850, 900, 950.
+/// The smallest axis step at or above `v`.
 fn step_up(v: f64) -> f64 {
     let e = 10f64.powf(v.max(1e-9).log10().floor());
     [1.0, 2.0, 2.5, 3.0, 4.0, 5.0, 10.0]
@@ -987,8 +977,7 @@ fn step_up(v: f64) -> f64 {
         .unwrap_or(10.0 * e)
 }
 
-/// An axis of `n` intervals over `lo..hi` (at least `min_span` wide): its
-/// floor and its step.
+/// An axis of `n` intervals over `lo..hi` (at least `min_span` wide).
 fn axis(lo: f64, hi: f64, n: usize, min_span: f64) -> (f64, f64) {
     let mid = (lo + hi) / 2.0;
     let (lo, hi) = if hi - lo < min_span {
@@ -1017,15 +1006,12 @@ fn decimals(step: f64) -> usize {
         .unwrap_or(2)
 }
 
-/// A trace's height for a plot `ch` pt tall: the heading, the plot and the
-/// labels under it.
+/// A trace's height for a plot `ch` pt tall.
 fn trace_h(ch: f64) -> f64 {
     ch + 32.0
 }
 
-/// The trace `t` in `p` under its heading: gridlines with their figures in a
-/// gutter, a step line per read bucket, an outlined band for an unread span
-/// with its words, the mark's rule and the labels under the plot.
+/// The trace `t` in `p` under its heading.
 fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     let inks = pen.inks;
     let read: Vec<f64> = t.vals.iter().flatten().copied().collect();
@@ -1160,7 +1146,7 @@ fn draw_trace(pen: &mut Pen<'_>, p: Place, t: &Trace) {
     }
 }
 
-/// A trace section: the trace growing in two columns, at `heights` in one, then its one-line form.
+/// A trace section.
 #[expect(
     clippy::too_many_arguments,
     reason = "a trace section's words and forms"
@@ -1207,15 +1193,12 @@ fn trace_section<'d>(
     }
 }
 
-/// Bytes printed alone, as the deck and its Details print them
-/// ([`words::bytes_lone`], §6.0, §7.7: "69 GB", "8.6 GB", "1.2 TB"), so a
-/// line, a size or a growth reads the same in the lens as on the deck.
+/// Bytes printed alone ([`words::bytes_lone`]).
 fn gb(bytes: f64) -> String {
     words::bytes_lone(bytes.max(0.0).round() as u64)
 }
 
-/// A write rate printed alone, as the deck's writes cells print it
-/// ([`words::rate_mb_lone`], §7.7: "31 MB/s", "5.1 MB/s").
+/// A write rate printed alone ([`words::rate_mb_lone`]).
 fn mb_s(bytes_per_s: f64) -> String {
     words::rate_mb_lone(bytes_per_s)
 }
@@ -1234,8 +1217,7 @@ fn clock_s(at_unix_ms: i64, utc_offset_s: i64) -> String {
     )
 }
 
-/// The disk's growth (§7.7): "used grew 2.6 GB in the last 10 min, 16 GB in
-/// the last hour", then "+2.6 GB in 10 min, +16 GB in 1 h".
+/// The disk's growth (§7.7).
 fn growth_forms(r: &Rates) -> Vec<String> {
     let change = |g: f64| -> (&'static str, String) {
         if g.abs() < 1e8 {
@@ -1297,8 +1279,7 @@ fn growth_forms(r: &Rates) -> Vec<String> {
     }
 }
 
-/// A trace's sentence: its first and last readings, its unread spans and
-/// its mark.
+/// A trace's sentence.
 fn trace_said(what: &str, unit: &str, t: &Trace, span: (i64, i64), loc: &Locale) -> String {
     let (start_ms, bucket_ms) = span;
     let fmt = |v: f64| {
@@ -1368,6 +1349,8 @@ struct Ctx<'d> {
     snap: &'d Snapshot,
     m: &'d FaceMetrics,
     tab_key: Option<u64>,
+    /// The front tab's sessions ([`DeckInput::tab_panes`]).
+    panes: &'d [u64],
     tab_label: &'d str,
     loc: Locale,
     bar: Bar,
@@ -1395,7 +1378,7 @@ impl Ctx<'_> {
         }
     }
 
-    /// A process's scope in a word: its tab's label, aterm, or other.
+    /// A process's scope in a word.
     fn scope_word(&self, scope: ProcScope) -> String {
         match scope {
             ProcScope::Tab(k) => self
@@ -1415,8 +1398,7 @@ impl Ctx<'_> {
         self.snap.resource(res, self.tab_key)
     }
 
-    /// The row's state now (the answer of every lens but Disk's): its % of
-    /// max and its amount, and its state's words, in its mark's ink.
+    /// The row's state now (the answer of every lens but Disk's).
     fn now_answer(&self, res: Resource, of: &str) -> Option<(&'static str, String, InkKind)> {
         let view = self.view(res);
         let mut text = match view.now {
@@ -1637,7 +1619,7 @@ fn space_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// GB free, last 24 hours; else its Filling line (§7.7).
+/// GB free, last 24 hours.
 fn filling_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let now = snap.at_unix_ms;
@@ -1770,7 +1752,7 @@ fn where_section(c: Ctx<'_>) -> Section<'_> {
     )
 }
 
-/// Writing now (§7.7): this user's busiest writers in the chosen scope.
+/// Writing now (§7.7).
 fn writing_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let writers = grouped(
@@ -1889,12 +1871,14 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
         }
         _ => vec!["not read yet".to_owned()],
     };
-    let sections = vec![
-        cores_section(c),
+    let why = why_now_section(c);
+    let mut sections = vec![
+        cores_section(c, why.is_some()),
         busiest_section(c),
         line_section("Load", "Load", load, true),
         line_section("Over max", "Over max", vec![over_words], true),
     ];
+    sections.extend(why);
     LensDoc {
         name: "CPU",
         sources,
@@ -1907,7 +1891,7 @@ fn cpu_doc(c: Ctx<'_>) -> LensDoc<'_> {
 }
 
 /// Cores, last 60 s: a core × second strip per cluster with its caption.
-fn cores_section(c: Ctx<'_>) -> Section<'_> {
+fn cores_section(c: Ctx<'_>, under: bool) -> Section<'_> {
     let Some(cpu) = c.snap.cpu.as_ref().filter(|cpu| cpu.total() > 0) else {
         return line_section(
             "Cores, last 60 s",
@@ -1941,15 +1925,28 @@ fn cores_section(c: Ctx<'_>) -> Section<'_> {
         "a row a core".to_owned(),
     ];
     let mut forms = Vec::new();
-    let heights: &[f64] = if c.two { &[1.0] } else { &[4.0, 3.0, 2.0, 1.0] };
-    for &rh in heights {
+    let heights: &[(f64, bool)] = match (c.two, under) {
+        (true, false) => &[(1.0, true)],
+        (true, true) => &[
+            (1.0, true),
+            (4.0, false),
+            (3.0, false),
+            (2.0, false),
+            (1.0, false),
+        ],
+        (false, _) => &[(4.0, false), (3.0, false), (2.0, false), (1.0, false)],
+    };
+    for &(rh, grows) in heights {
         let subs = subs.clone();
         let draw = move |pen: &mut Pen<'_>, p: Place| {
             heading(pen, p, "Cores, last 60 s", &subs);
             draw_cores(pen, p, cpu, gaps);
         };
-        forms.push(if c.two {
-            grow(strip_h(rh), draw)
+        forms.push(if grows {
+            Form {
+                last: under,
+                ..grow(strip_h(rh), draw)
+            }
         } else {
             form(strip_h(rh), draw)
         });
@@ -1965,8 +1962,7 @@ fn cores_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// The strip: each cluster's caption in a gutter, then its cores, a row a
-/// core and a column a second, in heat inks; an unread second is left bare.
+/// The strip: each cluster's caption in a gutter.
 fn draw_cores(pen: &mut Pen<'_>, p: Place, cpu: &CpuView, gaps: f64) {
     let inks = pen.inks;
     let n = cpu.total().max(1);
@@ -2030,8 +2026,7 @@ fn draw_cores(pen: &mut Pen<'_>, p: Place, cpu: &CpuView, gaps: f64) {
     }
 }
 
-/// Busiest now: the busiest processes in the chosen scope, with whose they
-/// are and their cores-worth.
+/// Busiest now: the busiest processes in the chosen scope.
 fn busiest_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let n = snap.total_cores().unwrap_or(1).max(1) as f64;
@@ -2092,6 +2087,321 @@ fn busiest_section(c: Ctx<'_>) -> Section<'_> {
         line,
         true,
     )
+}
+
+/// Where a row's words start after the ∵ mark.
+const MARK_ADV: f64 = 11.0;
+
+/// Why now (RD §4.2) ([`account_of`], [`CLAUSE_STALE_MS`]).
+fn why_now_section(c: Ctx<'_>) -> Option<Section<'_>> {
+    let snap = c.snap;
+    let a = account_of(WhySubject::Cpu, c.panes, snap);
+    let f = a.facts.as_deref()?;
+    let age_ms = snap.at_ns.saturating_sub(f.at_ns) / 1_000_000;
+    let top = f.open.iter().find(|o| o.id.covering());
+    let top = top.filter(|_| age_ms <= CLAUSE_STALE_MS)?;
+    let held = a
+        .causes
+        .iter()
+        .find(|s| s.cause.id.covering() && s.opened_unix_ms.is_some())
+        .map(|s| {
+            let context = Context::ORDER
+                .into_iter()
+                .find(|c| s.cause.contexts.contains(c));
+            (
+                s.cause.id,
+                context,
+                s.cause.covers_mc,
+                Some(&s.cause.evidence),
+            )
+        });
+    let (id, context, covers_mc, evidence) = held.unwrap_or_else(|| {
+        let context = Context::ORDER
+            .into_iter()
+            .find(|c| top.contexts.contains(c));
+        (top.id, context, top.covers_mc, None)
+    });
+    let services = words::services_word(c.loc.platform.name());
+    let two = |mc: i64| cents((mc + 5).div_euclid(10));
+
+    let (marked, base, short) = match id {
+        CauseId::Activity(act) => {
+            let word = act.activity().word.to_owned();
+            (true, word.clone(), word)
+        }
+        CauseId::AppWork(coalition) => {
+            let lead = f
+                .split
+                .rows
+                .iter()
+                .find(|r| r.id == coalition)
+                .and_then(|r| r.lead.as_ref());
+            let name = lead.and_then(|l| l.exe.as_deref()).map_or_else(
+                || "an app".to_owned(),
+                aterm_vitals::jobs::wire::person_name,
+            );
+            let voucher = lead.map_or(Voucher::Unknown, |l| l.voucher);
+            let chip = match voucher {
+                Voucher::Apple => "Apple".to_owned(),
+                Voucher::DeveloperId => lead.and_then(Lead::team_id).map_or_else(
+                    || "Developer ID".to_owned(),
+                    |t| format!("Developer ID {t}"),
+                ),
+                Voucher::AdHoc => "ad-hoc".to_owned(),
+                v => v.word().to_owned(),
+            };
+            let whose = if voucher == Voucher::Apple {
+                "macOS (as you)"
+            } else {
+                "yours"
+            };
+            (true, format!("{name} \u{b7} {chip} \u{b7} {whose}"), name)
+        }
+        CauseId::TabWork(k) => {
+            let work = snap.tab(k).map_or_else(
+                || "a tab's work".to_owned(),
+                |t| format!("{}'s work", t.label),
+            );
+            (true, work.clone(), work)
+        }
+        CauseId::AtermWork => (true, "aterm itself".to_owned(), "aterm itself".to_owned()),
+        CauseId::Unexplained => {
+            let base = match evidence {
+                Some(Evidence::Uncovered { part }) => {
+                    let word = match part {
+                        Part::Services => services,
+                        Part::Others => "others",
+                        Part::Aterm => "aterm",
+                    };
+                    format!("no cause aterm can name: {word}")
+                }
+                _ => "no cause aterm can name".to_owned(),
+            };
+            (false, base.clone(), base)
+        }
+        CauseId::Context(_) => return None,
+    };
+    let long = words::cause_words(&base, context);
+    let covers = if held.is_some() {
+        format!("{} cores", two(covers_mc))
+    } else {
+        format!("was {} cores", two(covers_mc))
+    };
+
+    let at_least = a.tab_at_least(snap);
+    let p = a.parts.unwrap_or_else(|| f.split.parts_of(&[]));
+    let [services_h, others_h, tab_h, rest_h, residual_h] = hundredths(
+        [p.services, p.others, p.tab, p.aterm_rest, p.unaccounted],
+        f.split.global_mc,
+    );
+    let tab_part = (!c.panes.is_empty()).then(|| match a.parts {
+        Some(_) => format!(
+            ", {} {}{}",
+            c.tab_label,
+            if at_least { "at least " } else { "" },
+            cents(tab_h)
+        ),
+        None => format!(", {} not read", c.tab_label),
+    });
+    let mut parts = [
+        (services, p.services, services_h, None),
+        ("others", p.others, others_h, None),
+        ("aterm", p.tab + p.aterm_rest, tab_h + rest_h, tab_part),
+    ];
+    parts.sort_by_key(|x| std::cmp::Reverse(x.1));
+    let residual = (residual_h != 0).then(|| {
+        let sign = if residual_h > 0 { "+" } else { "" };
+        format!("unaccounted {sign}{}", cents(residual_h))
+    });
+    let split_of = |tab: bool, residual: Option<&String>| {
+        let words = parts.iter().map(|(w, _, h, part)| {
+            let part = part.as_deref().filter(|_| tab).unwrap_or_default();
+            format!("{w} {}{part}", cents(*h))
+        });
+        words
+            .chain(residual.cloned())
+            .collect::<Vec<_>>()
+            .join(" \u{b7} ")
+    };
+    let split = split_of(true, residual.as_ref());
+    let splits = dedup(vec![
+        split.clone(),
+        split_of(false, residual.as_ref()),
+        split_of(false, None),
+    ]);
+    let busy = format!("{} cores", two(f.split.global_mc));
+
+    let y = &a.you;
+    let of = |mc: i64| {
+        format!(
+            "{}{} of {} cores",
+            if at_least { "at least " } else { "" },
+            words::cores(mc as f32 / 1000.0),
+            words::cores(f.split.global_mc as f32 / 1000.0)
+        )
+    };
+    let you = match (y.role, y.figure) {
+        (Role::Main, Some(t)) => format!("this tab is the main cause: {}", of(t)),
+        (Role::Minor, Some(t)) => {
+            let pct = y
+                .share_pm
+                .filter(|_| !at_least)
+                .map(|pm| format!(" ({:.1}%)", f64::from(pm) / 10.0))
+                .unwrap_or_default();
+            format!("this tab uses {}{pct}; it is not the cause", of(t))
+        }
+        (Role::Unavailable(_), Some(t)) => {
+            format!(
+                "this tab uses {}; whether it is the cause is not read now",
+                of(t)
+            )
+        }
+        _ => y.clause().to_owned(),
+    };
+    let trend = snap.cpu.as_ref().map_or("trend not read yet", |cpu| {
+        cpu.busy
+            .motion(words::CORES_GATE)
+            .word()
+            .unwrap_or("steady")
+    });
+
+    let step = if a.nothing_needed {
+        "nothing needed"
+    } else {
+        "no step offered yet"
+    };
+    let how = "measured per coalition";
+    let signed = match id {
+        CauseId::Activity(act) => format!(", {} by its code signature", act.activity().word),
+        _ => String::new(),
+    };
+
+    let rows: [(Vec<String>, Option<String>); 4] = [
+        (
+            dedup(vec![long.clone(), short.clone()]),
+            Some(covers.clone()),
+        ),
+        (splits, Some(busy.clone())),
+        (
+            dedup(vec![
+                format!("{you} \u{b7} {trend}"),
+                format!("{} \u{b7} {trend}", y.clause()),
+            ]),
+            None,
+        ),
+        (
+            dedup(vec![
+                format!("{step} \u{b7} {how}{signed}"),
+                format!("{step} \u{b7} {how}"),
+                step.to_owned(),
+            ]),
+            None,
+        ),
+    ];
+    let said = vec![
+        format!("{}{long}, {covers}.", if marked { "Why: " } else { "" }),
+        format!("{busy} busy: {split}."),
+        format!("{you}, {trend}."),
+        format!("{step}; {how}{signed}."),
+    ];
+    let secs = f.window_ns as f64 / 1e9;
+    let window = if secs >= 1.0 {
+        format!("{secs:.0} s window")
+    } else {
+        format!("{secs:.1} s window")
+    };
+    let exact = if f.split.exact { "exact, " } else { "" };
+    let subs = vec![
+        format!("{window} \u{b7} {exact}{} coalitions", f.split.listed),
+        window,
+    ];
+    let line = dedup(vec![
+        format!("{long}; {}", y.clause()),
+        format!("{short}; {}", y.clause()),
+        short,
+    ]);
+    let full = form(rows_h(rows.len(), false), move |pen, p| {
+        heading(pen, p, "Why now", &subs);
+        let ink = pen.inks.words2;
+        for (i, (forms, figure)) in rows.iter().enumerate() {
+            let base = p.y + ROW0_BASE + PITCH * i as f64;
+            let fig_w = figure.as_deref().map_or(0.0, |s| {
+                pen.text_end(p.x + p.w, base, s, BODY_PT, false, ink) + 8.0
+            });
+            let x = if i == 0 && marked {
+                cause_mark(pen, p.x, base);
+                MARK_ADV
+            } else {
+                0.0
+            };
+            let s = fit_cut(pen.m, forms, p.w - x - fig_w, BODY_PT, false);
+            pen.text(p.x + x, base, &s, BODY_PT, false, ink);
+        }
+    });
+    let one = Form {
+        h: LINE_H,
+        grow: false,
+        last: false,
+        label: Some("Why now".to_owned()),
+        draw: Box::new(move |pen, p| {
+            let base = p.y + HEAD_BASE;
+            let label = pen.cut("Why now", p.w, HEAD_PT, true);
+            let ink = pen.inks.words;
+            let lw = pen.text(p.x, base, &label, HEAD_PT, true, ink);
+            let mut x = tab_after(lw).max(pen.line_tab);
+            if marked {
+                cause_mark(pen, p.x + x, base);
+                x += MARK_ADV;
+            }
+            let s = fit_cut(pen.m, &line, p.w - x, BODY_PT, false);
+            let ink = pen.inks.words2;
+            pen.text(p.x + x, base, &s, BODY_PT, false, ink);
+        }),
+    };
+    Some(Section {
+        name: "Why now".into(),
+        words: said,
+        right: false,
+        parts: Vec::new(),
+        forms: vec![full, one],
+    })
+}
+
+/// The ∵ mark in the words2 ink ([`MARK_ADV`]).
+fn cause_mark(pen: &mut Pen<'_>, x: f64, base: f64) {
+    let ink = pen.inks.words2;
+    pen.mark(
+        WellMark::Cause,
+        x + 4.0,
+        base - 3.4,
+        BODY_PT,
+        crate::stats_paint::QUIET_ARC,
+        ink,
+    );
+}
+
+/// Millicores `mcs` in hundredths of a core.
+fn hundredths<const N: usize>(mcs: [i64; N], total_mc: i64) -> [i64; N] {
+    let mut out = mcs.map(|mc| mc.div_euclid(10));
+    let short = (total_mc + 5).div_euclid(10) - out.iter().sum::<i64>();
+    let mut order: [usize; N] = std::array::from_fn(|i| i);
+    order.sort_by_key(|&i| std::cmp::Reverse(mcs[i].rem_euclid(10)));
+    for &i in order.iter().take(usize::try_from(short).unwrap_or(0)) {
+        out[i] += 1;
+    }
+    out
+}
+
+/// Hundredths of a core `h` as `2.17` (`-0.05`).
+fn cents(h: i64) -> String {
+    let sign = if h < 0 { "-" } else { "" };
+    format!("{sign}{}.{:02}", h.abs() / 100, h.abs() % 100)
+}
+
+/// `forms` with each repeat of the one before it dropped.
+fn dedup(mut forms: Vec<String>) -> Vec<String> {
+    forms.dedup();
+    forms
 }
 
 /// The Memory lens (§11.4).
@@ -2265,8 +2575,7 @@ fn classes_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// Biggest now: footprints in the chosen scope, largest first, with aterm's
-/// and the tab's totals beside the heading.
+/// Biggest now: footprints in the chosen scope.
 fn biggest_section(c: Ctx<'_>) -> Section<'_> {
     let snap = c.snap;
     let total = snap.mem.as_ref().map_or(1, |m| m.sample.total.max(1)) as f64;
@@ -2433,7 +2742,7 @@ fn processes_doc(c: Ctx<'_>) -> LensDoc<'_> {
     }
 }
 
-/// Counts against limits: the machine's, yours, aterm's and the tab's.
+/// Counts against limits.
 fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
     let snap = c.snap;
     let f = &snap.facts;
@@ -2506,9 +2815,7 @@ fn counts_section<'d>(c: Ctx<'d>, unit: &'static str) -> Section<'d> {
     )
 }
 
-/// The jobs list: every job in the chosen scope that is not fine, worst
-/// first (its mark, its tab, its program, the engine's sentence), then the
-/// zombies a tab holds; past its room it counts the rest.
+/// The jobs list: every job in the chosen scope that is not fine.
 fn jobs_section(c: Ctx<'_>) -> Section<'_> {
     use aterm_vitals::jobs::{Verdict, wire::person_name};
     let snap = c.snap;
@@ -2660,7 +2967,7 @@ fn jobs_section(c: Ctx<'_>) -> Section<'_> {
     }
 }
 
-/// How to read (§11.4): the grammar every row shares.
+/// How to read (§11.4).
 fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     let m = c.m;
     let cw = c.cw;
@@ -2961,8 +3268,7 @@ fn how_to_read(c: Ctx<'_>) -> LensDoc<'_> {
     }
 }
 
-/// A text-only well (§11.4): Network, Tokens and GPU say their row's
-/// sentence and their Details long, one per line.
+/// A text-only well (§11.4).
 fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     let snap = c.snap;
     let res = focus.resource().unwrap_or(Resource::Network);
@@ -3079,8 +3385,7 @@ fn text_well(c: Ctx<'_>, focus: Instrument) -> LensDoc<'_> {
     }
 }
 
-/// A heading over `lines`, one a row; fewer lines as room runs out, then its
-/// first line beside its name.
+/// A heading over `lines`, one a row.
 fn lines_section<'d>(
     name: &'static str,
     lines: Vec<String>,
@@ -3117,7 +3422,7 @@ fn lines_section<'d>(
     }
 }
 
-/// A key hint's pieces: words, or a pair of drawn arrows.
+/// A key hint's pieces.
 #[derive(Clone, Copy, Debug)]
 enum Seg {
     T(&'static str),
@@ -3164,10 +3469,7 @@ fn hint_w(m: &FaceMetrics, hint: &[Seg]) -> f64 {
         .sum()
 }
 
-/// Line 1, the explainer and the answer, each line drawn only while it
-/// clears the foot, and while it leaves `reserve` pt of body under the rule
-/// (the first section's one-line form, when the doc always keeps it); the
-/// last line drawn of a cut paragraph ends in "…".
+/// Draw the header while it clears the foot and leaves `reserve` pt of body.
 fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, reserve: f64) -> f64 {
     let m = pen.m;
     let inks = pen.inks;
@@ -3247,9 +3549,7 @@ fn head(pen: &mut Pen<'_>, doc: &LensDoc<'_>, how: Opened, lw: f64, lh: f64, res
     rule + 5.0
 }
 
-/// A wrapped paragraph's `lines` from `x`, one a pitch from `*base`, while
-/// `fits` the baseline; the last line drawn ends in "…" when lines are left
-/// over.
+/// A wrapped paragraph's `lines` from `x`, one a pitch from `*base`, while `fits` the baseline.
 fn draw_lines(
     pen: &mut Pen<'_>,
     (x, right): (f64, f64),
@@ -3285,7 +3585,7 @@ pub(crate) struct LensLaid {
     pub(crate) explainer: String,
     /// The answer's and each placed section's heading and lines.
     pub(crate) wells: Vec<(String, String)>,
-    /// Each column's sections in the order it stacks them (one column, or the left and the right).
+    /// Each column's sections in the order it stacks them.
     pub(crate) stacks: Vec<Vec<usize>>,
     /// Each column's placed sections, top down.
     pub(crate) placed: Vec<Vec<(usize, usize)>>,
@@ -3355,6 +3655,7 @@ pub(crate) fn lay_lens(
                 snap,
                 m: metrics,
                 tab_key: input.tab_key,
+                panes: &input.tab_panes,
                 tab_label: &input.tab_label,
                 loc: input.locale,
                 bar: lens.bar,
@@ -3450,9 +3751,7 @@ impl crate::App {
         Some((lg, lens, f))
     }
 
-    /// Where a lens would hang in `wid` from the form `f` draws; `None` when
-    /// the window is too small to hold one (then no lens opens, and an open
-    /// one closes: a lens with nothing on screen would swallow the arrows).
+    /// Where a lens would hang in `wid` from the form `f` draws.
     fn lens_geom_for(
         &self,
         wid: crate::WindowId,
@@ -3483,12 +3782,12 @@ impl crate::App {
             .is_some_and(|f| self.lens_geom_for(wid, &f).is_some())
     }
 
-    /// The lens's input for `wid`: the snapshot, the window's front tab and
-    /// the Deck's inks.
+    /// The lens's input for `wid`.
     fn lens_input(&self, f: &crate::stats_deck::DeckFrame) -> DeckInput<'_> {
         DeckInput {
             snap: self.vitals.snapshot.as_deref(),
             tab_key: f.tab_key,
+            tab_panes: f.tab_panes.clone(),
             tab_label: f.tab_label.clone(),
             tab_count: f.tab_count,
             inks: f.lens_inks,
@@ -3516,6 +3815,7 @@ impl crate::App {
         (lg.dx, lg.dy, lg.w.to_bits(), lg.h.to_bits()).hash(&mut h);
         format!("{:?}", f.lens_inks).hash(&mut h);
         f.tab_key.hash(&mut h);
+        f.tab_panes.hash(&mut h);
         f.tab_label.hash(&mut h);
         (f.dwc, f.contrast).hash(&mut h);
         std::sync::Arc::as_ptr(&deck_metrics()).hash(&mut h);
@@ -3575,8 +3875,7 @@ impl crate::App {
         Some((lg, lens, laid))
     }
 
-    /// Show `lens` in `wid`: remember it for ⌘I, and ask for the "where"
-    /// survey whenever Disk becomes the lens's instrument.
+    /// Show `lens` in `wid`.
     fn set_stats_lens(&mut self, wid: crate::WindowId, lens: Lens) {
         let was = self
             .windows
@@ -3770,7 +4069,7 @@ impl crate::App {
         }
     }
 
-    /// The lens's keys: ⌘I closes any lens.
+    /// The lens's keys.
     pub(crate) fn stats_lens_key(
         &mut self,
         wid: crate::WindowId,

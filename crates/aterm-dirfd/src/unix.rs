@@ -163,16 +163,13 @@ flags! {
         CREATE = libc::O_CREAT;
         /// `O_APPEND` — every write lands at the file's end.
         APPEND = libc::O_APPEND;
-        /// `O_EXCL` — with `O_CREAT`, fail if the name already exists. The
-        /// atomic "create or lose" the private-file path depends on.
+        /// `O_EXCL` — with `O_CREAT`, fail if the name already exists.
         EXCL = libc::O_EXCL;
         /// `O_DIRECTORY` — fail unless the name is a directory.
         DIRECTORY = libc::O_DIRECTORY;
-        /// `O_NOFOLLOW` — fail if the final component is a symlink. Applies to
-        /// the last component only, which is why the callers pin every ancestor.
+        /// `O_NOFOLLOW` — fail if the final component is a symlink.
         NOFOLLOW = libc::O_NOFOLLOW;
-        /// `O_NONBLOCK` — so opening a FIFO left in place by another process
-        /// cannot wedge the server thread.
+        /// `O_NONBLOCK` — open without blocking on a FIFO or device.
         NONBLOCK = libc::O_NONBLOCK;
         /// `O_CLOEXEC`.
         CLOEXEC = libc::O_CLOEXEC;
@@ -516,8 +513,7 @@ impl DirEntry {
 /// A directory being read, over an independent open file description.
 pub struct Dir {
     dirp: *mut libc::DIR,
-    /// Latched by the first failed `readdir`; iteration ends there, since a
-    /// faulted stream need not return anything meaningful.
+    /// Latched by the first failed `readdir` so iteration ends there.
     errored: bool,
 }
 
@@ -573,9 +569,7 @@ impl Dir {
     }
 }
 
-/// `readdir` under the name that returns 64-bit inode and offset fields: on a
-/// 32-bit glibc without `_FILE_OFFSET_BITS=64`, plain `readdir` can fail with
-/// `EOVERFLOW`.
+/// `readdir` returning 64-bit inode and offset fields to avoid `EOVERFLOW` on 32-bit glibc.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 unsafe fn readdir_ffi(dirp: *mut libc::DIR) -> *mut libc::dirent64 {
     // SAFETY: forwarded from the caller, which owns a live stream.

@@ -6,9 +6,7 @@
 // project in 2026.
 // See ../../LICENSE-RUSTYBUZZ for the upstream license.
 
-//! Applying a plan's `GSUB` lookups, stage by stage, and the per-glyph
-//! layout properties they read and write: the glyph class (`GDEF`, else
-//! guessed from the general category) and the ligature id and component.
+//! `GSUB` lookup application and per-glyph layout properties.
 
 use super::ShapeFace;
 use super::apply::ApplyContext;
@@ -18,8 +16,7 @@ use super::plan::ShapePlan;
 pub(crate) const MAX_NESTING_LEVEL: usize = 64;
 pub(crate) const MAX_CONTEXT_LENGTH: usize = 64;
 
-/// Sets every glyph's class from `GDEF` and clears its ligature props:
-/// done once before substitution.
+/// Sets every glyph's class from `GDEF` and clears its ligature props.
 #[inline]
 pub(crate) fn substitute_start(face: &ShapeFace, buffer: &mut Buffer) {
     for info in &mut buffer.info[..buffer.len] {
@@ -30,9 +27,6 @@ pub(crate) fn substitute_start(face: &ShapeFace, buffer: &mut Buffer) {
 
 /// Applies the plan's `GSUB` lookups, running each stage's pause after it.
 pub(crate) fn substitute(plan: &ShapePlan, face: &ShapeFace, buffer: &mut Buffer) {
-    // The first `gsub_lookup` parses every lookup of the face, so a face
-    // whose `GSUB` runs past its parse budget is shaped with none of it
-    // rather than with the lookups before the cut (`ShapeFace::gsub_lookups`).
     let digest = buffer_digest(buffer);
     let mut ctx = ApplyContext::new(face, buffer, digest);
     for (stage_index, stage) in plan.map.stages().iter().enumerate() {
@@ -73,7 +67,6 @@ fn apply_string(ctx: &mut ApplyContext, lookup: &super::face::SubstLookup) {
     }
     ctx.lookup_props = lookup.props;
     if !lookup.reverse {
-        // In/out forward substitution.
         ctx.buffer.clear_output();
         ctx.buffer.idx = 0;
         while ctx.buffer.idx < ctx.buffer.len && ctx.buffer.successful {
@@ -109,13 +102,6 @@ fn apply_string(ctx: &mut ApplyContext, lookup: &super::face::SubstLookup) {
 }
 
 const IS_LIG_BASE: u8 = 0x10;
-
-// lig_props: when a ligature forms, the ligature glyph and the marks between
-// its components get a fresh ligature id; the ligature records its component
-// count, and each mark the component it attached to. A multiple
-// substitution's glyphs get id 0 and components 0, 1, 2, ... GPOS reads
-// them to attach marks; here they keep later ligatures from forming across
-// another ligature's components.
 
 #[inline]
 pub(crate) const fn set_lig_props_for_ligature(

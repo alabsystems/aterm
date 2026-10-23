@@ -8,7 +8,6 @@ use aterm_lz4::{compress_prepend_size, decompress_size_prepended};
 
 #[test]
 fn round_trip_repeated_pattern() {
-    // Highly compressible — should shrink significantly.
     let input: Vec<u8> = b"ABCDEFGH".iter().copied().cycle().take(10_000).collect();
     let compressed = compress_prepend_size(&input);
     assert!(
@@ -43,24 +42,18 @@ fn size_prefix_is_little_endian_original_length() {
 
 #[test]
 fn decompress_rejects_too_short_input() {
-    // Need at least 4 bytes for the size prefix.
     assert!(decompress_size_prepended(b"").is_err());
     assert!(decompress_size_prepended(b"abc").is_err());
 }
 
 #[test]
 fn decompress_rejects_corrupt_payload() {
-    // Valid 4-byte size prefix but garbage payload.
     let data = [0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
     assert!(decompress_size_prepended(&data).is_err());
 }
 
-// Malformed input: an overrunning literal or match length is an `Err`, never
-// a panic or an out-of-bounds access.
-
 #[test]
 fn malformed_literal_length_overruns_output_errors() {
-    // token 0xE0 => 14 literal bytes requested, but output is only 4 bytes.
     let mut input = vec![0xE0u8];
     input.extend_from_slice(&[b'x'; 14]);
     input.extend_from_slice(&[0u8, 0u8]);
@@ -71,7 +64,6 @@ fn malformed_literal_length_overruns_output_errors() {
 
 #[test]
 fn malformed_match_length_overruns_output_errors() {
-    // token 0x1E => 1 literal then a 14+MINMATCH match into a 2-byte output.
     let input = vec![0x1Eu8, b'a', 1, 0];
     let mut output = [0u8; 2];
     decompress_into(&input, &mut output)

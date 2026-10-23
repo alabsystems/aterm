@@ -15,23 +15,17 @@ use super::{encoder, loss};
 
 #[link(name = "QuartzCore", kind = "framework")]
 unsafe extern "C" {
-    /// Mach absolute time in seconds — the clock CoreAnimation itself uses.
     fn CACurrentMediaTime() -> f64;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    /// +1: the caller owns the result and must `CGColorSpaceRelease` it.
     fn CGColorSpaceCreateWithName(name: *const c_void) -> *mut c_void;
     /// +0: a borrowed `CFStringRef` owned by the colorspace.
     #[cfg(test)]
     fn CGColorSpaceGetName(space: *mut c_void) -> *const c_void;
     fn CGColorSpaceRelease(space: *mut c_void);
-    /// `kCGColorSpaceExtendedLinearSRGB` (scRGB): linear transfer, sRGB
-    /// primaries, unclamped components.
     static kCGColorSpaceExtendedLinearSRGB: *const c_void;
-    /// `kCGColorSpaceSRGB`, the SDR present's space. Set explicitly because an
-    /// EDR-to-SDR flip on a live layer does not restore it.
     static kCGColorSpaceSRGB: *const c_void;
 }
 
@@ -39,8 +33,7 @@ unsafe extern "C" {
 /// `name` must be NULL or a live `CFString`.
 #[cfg(test)]
 unsafe fn cf_string_text(name: *const c_void) -> Option<String> {
-    // SAFETY: a live CFString is toll-free bridged to NSString; the caller vouches for it, and it
-    // is copied out at once.
+    // SAFETY: a live CFString is toll-free bridged to NSString; the caller vouches for it, and it is copied out at once.
     (!name.is_null()).then(|| unsafe { super::ffi::ns_string_text(Id::from_ptr(name.cast_mut())) })
 }
 
@@ -78,33 +71,26 @@ unsafe impl aterm_objc::Encode for CgRect {
     const ENCODING: &'static str = "{CGRect={CGPoint=dd}{CGSize=dd}}";
 }
 
-/// Everything one swapchain configure sets. `Self::aterm_present` builds the
-/// production values; tests build others to prove every setter is live.
+/// Everything one swapchain configure sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SwapchainConfig {
-    /// The layer `pixelFormat`: [`PixelFormat::Bgra8Unorm`] (SDR) or
-    /// [`PixelFormat::Rgba16Float`] (EDR); anything else is rejected.
+    /// The layer `pixelFormat`: [`PixelFormat::Bgra8Unorm`] (SDR) or [`PixelFormat::Rgba16Float`] (EDR).
     pub(crate) format: PixelFormat,
-    /// `drawableSize`, in pixels. Explicit, never derived from layer bounds.
+    /// `drawableSize`, in pixels.
     pub(crate) width: usize,
     pub(crate) height: usize,
-    /// `framebufferOnly`: `true` gives lossless drawable compression but no
-    /// sampling or blit access.
+    /// `framebufferOnly`: `true` gives lossless drawable compression but no sampling or blit access.
     pub(crate) framebuffer_only: bool,
-    /// `displaySyncEnabled`. `false` is wgpu's `Immediate`, the shipped macOS
-    /// choice; `true` is `Fifo` (`wgpu-hal surface.rs:74-78`).
+    /// `displaySyncEnabled`.
     pub(crate) display_sync: bool,
-    /// `maximumDrawableCount`. Legal range `[2, 3]` (`CAMetalLayer.h:104-108`;
-    /// out-of-range values throw); the shipped value is 3.
+    /// `maximumDrawableCount`.
     pub(crate) maximum_drawables: usize,
-    /// `CALayer.opaque`. `false` for the `PostMultiplied` translucent
-    /// present.
+    /// `CALayer.opaque`.
     pub(crate) opaque: bool,
 }
 
 impl SwapchainConfig {
-    /// The production macOS values: `framebufferOnly` on, display sync off
-    /// (Immediate), 3 drawables, opaque.
+    /// The production macOS values.
     #[cfg(test)]
     pub(crate) const fn aterm_present(format: PixelFormat, width: usize, height: usize) -> Self {
         Self {
@@ -118,7 +104,6 @@ impl SwapchainConfig {
         }
     }
 
-    /// Reject in Rust what the layer would throw (or silently misdraw) on.
     fn validate(&self) -> Result<(), String> {
         match self.format {
             PixelFormat::Bgra8Unorm | PixelFormat::Rgba16Float => {}
@@ -148,8 +133,7 @@ impl SwapchainConfig {
     }
 }
 
-/// One configured `CAMetalLayer` and what every acquire needs. Thread-pinned
-/// raw-pointer holder; not `Send`/`Sync`.
+/// One configured `CAMetalLayer` and what every acquire needs.
 #[derive(Debug)]
 pub(crate) struct Swapchain {
     /// The +1 layer. Owned; released on drop.
@@ -192,8 +176,7 @@ impl Swapchain {
         })
     }
 
-    /// A swapchain parented under `parent` (any `CALayer`). Adds one sublayer
-    /// and never touches existing ones.
+    /// A swapchain parented under `parent` (any `CALayer`).
     pub(crate) fn attached(
         device: &Device,
         parent: &Obj,
@@ -202,8 +185,7 @@ impl Swapchain {
     ) -> Result<Self, String> {
         let layer = Self::new_layer()?;
         Self::configure(&layer, device, config)?;
-        // SAFETY: `addSublayer:` is a void message on the live parent that retains the sublayer;
-        // our +1 stays ours for drop to balance.
+        // SAFETY: `addSublayer:` is a void message on the live parent that retains the sublayer; our +1 stays ours for drop to balance.
         unsafe {
             let add: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             add(parent.id(), sel(c"addSublayer:"), layer.id());
@@ -222,17 +204,13 @@ impl Swapchain {
         Ok(sc)
     }
 
-    /// Adopt the parent layer's `contentsScale`, so a drawable pixel is a
-    /// display pixel; a fresh `CAMetalLayer` defaults to 1.0, which on a 2x
-    /// display draws the grid at twice its size and soft.
+    /// Adopt the parent layer's `contentsScale`, so a drawable pixel is a display pixel.
     pub(crate) fn sync_layer_geometry(&mut self) {
         if !self.is_attached {
             return;
         }
         let _pool = AutoreleasePool::new();
-        // SAFETY: `superlayer` answers a borrowed `CALayer` or nil, never released here;
-        // `contentsScale` and `setContentsScale:` pass a `CGFloat` by value, scalar on every
-        // target, so no `objc_msgSend_stret`.
+        // SAFETY: `superlayer` answers a borrowed `CALayer` or nil, never released here; `contentsScale` and `setContentsScale:` pass a `CGFloat` by value, scalar on every target, so no `objc_msgSend_stret`.
         unsafe {
             let superlayer: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let parent = superlayer(self.layer.id(), sel(c"superlayer"));
@@ -272,8 +250,7 @@ impl Swapchain {
         }
     }
 
-    /// The `contentsScale` read back off the live layer, not echoed from
-    /// [`Self::applied_geometry`].
+    /// The `contentsScale` read back off the live layer, not echoed from [`Self::applied_geometry`].
     #[cfg(test)]
     pub(crate) fn contents_scale(&self) -> f64 {
         let _pool = AutoreleasePool::new();
@@ -284,7 +261,6 @@ impl Swapchain {
         }
     }
 
-    /// `[[CAMetalLayer alloc] init]` — +1, owned.
     fn new_layer() -> Result<Obj, String> {
         let _pool = AutoreleasePool::new();
         let cls = class(c"CAMetalLayer");
@@ -305,13 +281,10 @@ impl Swapchain {
         }
     }
 
-    /// Write `config`'s axes onto the layer, with the device, the EDR flag and
-    /// colorspace its format implies, and `allowsNextDrawableTimeout = YES`.
     fn configure(layer: &Obj, device: &Device, config: &SwapchainConfig) -> Result<(), String> {
         config.validate()?;
         let _pool = AutoreleasePool::new();
-        // SAFETY: documented property setters on the live layer, each prototype written out; the
-        // colorspace is created at +1 and released after `setColorspace:`, which retains it.
+        // SAFETY: documented property setters on the live layer, each prototype written out; the colorspace is created at +1 and released after `setColorspace:`, which retains it.
         unsafe {
             let set_obj: unsafe extern "C-unwind" fn(Id, Sel, Id) = checked_msg();
             let set_usize: unsafe extern "C-unwind" fn(Id, Sel, usize) = checked_msg();
@@ -378,8 +351,7 @@ impl Swapchain {
         Ok(())
     }
 
-    /// Apply a new config to the live layer instead of rebuilding the
-    /// `Swapchain` (resize, HDR flip, `COPY_SRC` arming).
+    /// Apply a new config to the live layer instead of rebuilding the `Swapchain` (resize, HDR flip, `COPY_SRC` arming).
     pub(crate) fn reconfigure(
         &mut self,
         device: &Device,
@@ -428,8 +400,6 @@ impl Swapchain {
         }
     }
 
-    /// The raw acquire: `nextDrawable` under a pool, both objects retained to
-    /// +1.
     fn raw_next_drawable(&self) -> Option<(Obj, Obj)> {
         acquire_drawable(&self.layer).map(OwnedDrawable::into_parts)
     }
@@ -523,9 +493,7 @@ impl Swapchain {
     /// The layer colorspace's CoreGraphics name, or `None` when nil or unnamed.
     #[cfg(test)]
     pub(crate) fn colorspace_name(&self) -> Option<String> {
-        // SAFETY: `colorspace` answers a +0 `CGColorSpaceRef` or NULL, and `CGColorSpaceGetName` a
-        // CFString (or NULL) the colorspace owns, copied out at once; nothing is retained or
-        // released.
+        // SAFETY: `colorspace` answers a +0 `CGColorSpaceRef` or NULL, and `CGColorSpaceGetName` a CFString (or NULL) the colorspace owns, copied out at once; nothing is retained or released.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> *mut c_void = checked_msg();
             let space = f(self.layer.id(), sel(c"colorspace"));
@@ -552,8 +520,7 @@ impl Swapchain {
 impl Drop for Swapchain {
     fn drop(&mut self) {
         if self.is_attached {
-            // SAFETY: `removeFromSuperlayer` detaches the live layer, a no-op if it is already
-            // detached; the parent's retain drops and our +1 drops with `Obj`.
+            // SAFETY: `removeFromSuperlayer` detaches the live layer, a no-op if it is already detached; the parent's retain drops and our +1 drops with `Obj`.
             unsafe {
                 let f: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
                 f(self.layer.id(), sel(c"removeFromSuperlayer"));
@@ -564,14 +531,12 @@ impl Drop for Swapchain {
     }
 }
 
-/// A retained `CAMetalLayer` used only for `nextDrawable`. The owner defers
-/// every layer setter, geometry sync and unparent until the request completes.
+/// A retained `CAMetalLayer` used only for `nextDrawable`.
 pub(crate) struct LayerAcquire {
     layer: Option<Obj>,
 }
 
-// SAFETY: `LayerAcquire` holds a retained `CAMetalLayer`, whose `nextDrawable` may run on another
-// thread; its owner defers every layer mutation until the request completes.
+// SAFETY: `LayerAcquire` holds a retained `CAMetalLayer`, whose `nextDrawable` may run on another thread; its owner defers every layer mutation until the request completes.
 unsafe impl Send for LayerAcquire {}
 
 impl LayerAcquire {
@@ -601,8 +566,7 @@ pub(crate) struct OwnedDrawable {
     objects: Option<(Obj, Obj)>,
 }
 
-// SAFETY: Metal drawable and texture references support cross-thread handoff; ownership moves once
-// and neither reference is accessed concurrently.
+// SAFETY: Metal drawable and texture references support cross-thread handoff; ownership moves once and neither reference is accessed concurrently.
 unsafe impl Send for OwnedDrawable {}
 
 impl OwnedDrawable {
@@ -623,8 +587,7 @@ fn acquire_drawable(layer: &Obj) -> Option<OwnedDrawable> {
     let _pool = AutoreleasePool::new();
     #[cfg(test)]
     encoder::queue_ffi_census::note();
-    // SAFETY: `layer` is a retained `CAMetalLayer`; both +0 returns are retained under the pool and
-    // nil refuses. The caller serializes this with layer mutation and other acquisitions.
+    // SAFETY: `layer` is a retained `CAMetalLayer`; both +0 returns are retained under the pool and nil refuses. The caller serializes this with layer mutation and other acquisitions.
     unsafe {
         let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let drawable = Obj::retain(get(layer.id(), sel(c"nextDrawable")))?;
@@ -649,19 +612,15 @@ pub(crate) struct Frame<'sc> {
 }
 
 impl Frame<'_> {
-    /// The drawable's texture: the render-pass colour attachment (and, when
-    /// the layer is not `framebufferOnly`, a legal blit source for readback).
+    /// The drawable's texture: the render-pass colour attachment (and, when the layer is not `framebufferOnly`, a legal blit source for readback).
     #[inline]
     pub(crate) const fn texture(&self) -> &Obj {
         &self.texture
     }
 
-    /// The drawable's texture as a sealed render target stamped with this
-    /// swapchain's loss domain, the only form the encoder's write verbs
-    /// accept; a session on a different latch is refused there.
+    /// The drawable's texture as a sealed render target stamped with this swapchain's loss domain, the only form the encoder's write verbs accept.
     pub(crate) fn render_target(&self) -> super::resources::SealedTexture {
-        // SAFETY: retaining a live +1 texture; the sealed handle releases its
-        // own +1 on drop, independently of this frame's.
+        // SAFETY: retaining a live +1 texture; the sealed handle releases its own +1 on drop, independently of this frame's.
         let obj =
             unsafe { Obj::retain(self.texture.id()) }.expect("retain of a live drawable texture");
         super::resources::SealedTexture::from_parts(obj, Arc::clone(&self.swapchain.latch))
@@ -673,8 +632,7 @@ impl Frame<'_> {
         self.swapchain
     }
 
-    /// `-[CAMetalDrawable layer]`, the layer this drawable came from; the
-    /// stacking test compares it with [`Swapchain::layer_ptr`].
+    /// `-[CAMetalDrawable layer]`, the layer this drawable came from; the stacking test compares it with [`Swapchain::layer_ptr`].
     #[cfg(test)]
     pub(crate) fn drawable_layer_ptr(&self) -> Id {
         // SAFETY: object getter (+0 borrow, compared by pointer only).
@@ -684,9 +642,7 @@ impl Frame<'_> {
         }
     }
 
-    /// Present the frame: a fresh command buffer from the session's queue with
-    /// `presentDrawable:` registered before `commit` (wgpu-hal's shape), so
-    /// presentation cannot fire before the drawable's rendering is scheduled.
+    /// Present the frame: a fresh command buffer from the session's queue with `presentDrawable:` registered before `commit` (wgpu-hal's shape).
     pub(crate) fn present(self, session: &encoder::EncodeSession) -> Result<PresentTicket, String> {
         // The loss may land between acquire and present. Refuse before touching
         // the queue; dropping `self` discards the drawable.
@@ -706,9 +662,7 @@ impl Frame<'_> {
         #[cfg(test)]
         encoder::queue_ffi_census::note();
         let _pool = AutoreleasePool::new();
-        // SAFETY: `commandBuffer` returns a +0 buffer, retained into the ticket
-        // so callers can wait after the pool pops. `presentDrawable:` then
-        // `commit`, in that order.
+        // SAFETY: `commandBuffer` returns a +0 buffer, retained into the ticket so callers can wait after the pool pops. `presentDrawable:` then `commit`, in that order.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let raw = get(session.one_shot_queue().id(), sel(c"commandBuffer"));
@@ -737,9 +691,7 @@ unsafe fn register_presented_handler(drawable: Id) {
     let registered_s = unsafe { CACurrentMediaTime() };
     let (serial, tag) = crate::present_glass::registration_begin(registered_s);
     let handler = move |presented: Id| {
-        // SAFETY: Metal passes the live drawable being reported;
-        // `presentedTime` is a `CFTimeInterval` (double) getter, 0 when the
-        // drawable was never shown.
+        // SAFETY: Metal passes the live drawable being reported; `presentedTime` is a `CFTimeInterval` (double) getter, 0 when the drawable was never shown.
         let presented_s = unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> f64 = checked_msg();
             get(presented, sel(c"presentedTime"))
@@ -750,21 +702,17 @@ unsafe fn register_presented_handler(drawable: Id) {
             crate::present_glass::classify(registered_s, presented_s),
         );
     };
-    // SAFETY: `MTLDrawablePresentedHandler` is `void (^)(id<MTLDrawable>)`, exactly `(Id) -> ()`,
-    // and the closure captures only `Copy` values.
+    // SAFETY: `MTLDrawablePresentedHandler` is `void (^)(id<MTLDrawable>)`, exactly `(Id) -> ()`, and the closure captures only `Copy` values.
     let block = unsafe { aterm_objc::RcBlock::new1(handler) };
     let Some(block) = block else { return };
-    // SAFETY: `addPresentedHandler:` copies the block, so ours is released independently when
-    // `block` drops.
+    // SAFETY: `addPresentedHandler:` copies the block, so ours is released independently when `block` drops.
     unsafe {
         let add: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::BlockPtr) = checked_msg();
         add(drawable, sel(c"addPresentedHandler:"), block.as_block_ptr());
     }
 }
 
-/// The committed present's command buffer, retained so its status can be
-/// awaited and classified, plus the latch handle so the classification always
-/// reaches the latch.
+/// The committed present's command buffer, retained so its status can be awaited and classified, plus the latch handle so the classification always reaches the latch.
 #[derive(Debug)]
 pub(crate) struct PresentTicket {
     cb: Obj,
@@ -776,8 +724,7 @@ pub(crate) struct PresentTicket {
 }
 
 impl PresentTicket {
-    /// Block until the present's command buffer completes, classify it via
-    /// [`loss::outcome_of`] and feed the latch.
+    /// Block until the present's command buffer completes, classify it via [`loss::outcome_of`] and feed the latch.
     pub(crate) fn wait_outcome(&self) -> loss::CbOutcome {
         if let Some(done) = self.settled.get() {
             return done;
@@ -790,10 +737,7 @@ impl PresentTicket {
         self.settle_terminal(loss::outcome_of(self.cb.id()))
     }
 
-    /// Poll: `None` while in flight, `Some(outcome)` once terminal. The first
-    /// terminal answer feeds the latch like [`Self::wait_outcome`] (same
-    /// contract as [`super::encoder::Submitted::try_outcome`]); later calls
-    /// answer from the cache and feed nothing.
+    /// Poll: `None` while in flight, `Some(outcome)` once terminal.
     pub(crate) fn try_outcome(&self) -> Option<loss::CbOutcome> {
         if let Some(done) = self.settled.get() {
             return Some(done);
@@ -804,16 +748,12 @@ impl PresentTicket {
         }
     }
 
-    /// Record the terminal outcome once: feed the latch, fill the cache.
     fn settle_terminal(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.settled.set(Some(outcome));
         self.settle(outcome)
     }
 
-    /// Record one classified outcome on the process latch and return it. Also
-    /// the injection seam, deliberately uncached: a real `Lost` cannot be
-    /// produced on a healthy GPU, so the end-to-end test drives a `PageFault`
-    /// through this on a real present's ticket.
+    /// Record one classified outcome on the process latch and return it.
     pub(crate) fn settle(&self, outcome: loss::CbOutcome) -> loss::CbOutcome {
         self.latch.record(&outcome);
         outcome
@@ -829,8 +769,6 @@ mod tests {
         sublayer_count,
     };
 
-    /// [`Swapchain::colorspace_name`]'s CFString is read by its counted UTF-16
-    /// units.
     #[test]
     fn a_colorspace_name_is_read_whole() {
         let _pool = ffi::AutoreleasePool::new();
@@ -842,8 +780,6 @@ mod tests {
         assert_eq!(unsafe { cf_string_text(std::ptr::null()) }, None);
     }
 
-    /// The config refuses exactly what `CAMetalLayer` would throw on (or never
-    /// vend a drawable for), with the reason in the message.
     #[test]
     fn the_config_rejects_what_the_layer_would_throw_on() {
         let ok = SwapchainConfig::aterm_present(PixelFormat::Bgra8Unorm, 16, 16);
@@ -868,8 +804,6 @@ mod tests {
         assert!(bad.validate().is_err());
     }
 
-    /// The standalone shape has no parent, so the sync is a no-op and must not
-    /// crash on a nil `superlayer`.
     #[test]
     fn a_standalone_swapchain_has_no_parent_to_adopt_a_scale_from() {
         let dev = device();
@@ -920,8 +854,6 @@ mod tests {
         chrome_pad: [f32; 3],
     }
 
-    /// Injected loss end to end through production plumbing: a real present's
-    /// ticket, an injected `PageFault` via [`PresentTicket::settle`], then:
     #[test]
     fn an_injected_loss_latches_and_every_later_acquire_and_present_refuses_fast() {
         use crate::metal::loss::{
@@ -1025,10 +957,6 @@ mod tests {
         }
     }
 
-    /// Reconfigure storm: every axis the renderer reconfigures (sizes, both
-    /// formats, `opaque`, `framebufferOnly`, `displaySyncEnabled`,
-    /// `maximumDrawableCount`), 12 reconfigures of one live layer with an
-    /// acquire and present after each.
     #[test]
     fn a_reconfigure_storm_lands_every_axis_live_and_the_pool_follows() {
         use crate::metal::encoder::EncodeSession;
@@ -1180,7 +1108,6 @@ mod tests {
         );
     }
 
-    /// The two-submit frame, six times through a 3-drawable pool on one queue.
     #[test]
     fn six_two_submit_frames_encode_compose_present_and_verify() {
         use crate::metal::encoder::{
@@ -1432,8 +1359,6 @@ mod tests {
         );
     }
 
-    /// A second latch and session cross-wired with the first are refused at
-    /// every crossing:
     #[test]
     fn the_two_latch_cross_wired_present_has_no_remaining_shape() {
         use crate::metal::encoder::{EncodeSession, RenderPassDesc, StoreAction};
@@ -1555,8 +1480,6 @@ mod tests {
         );
     }
 
-    /// A raw foreign `CAMetalLayer` (the wgpu leftover) with device and
-    /// `drawableSize` set and `framebufferOnly` off.
     fn foreign_metal_layer(dev: &Device, w: usize, h: usize) -> Obj {
         let _pool = AutoreleasePool::new();
         // SAFETY: `alloc`/`init` is +1 and property setters use documented types.
@@ -1586,8 +1509,6 @@ mod tests {
         }
     }
 
-    /// Stacking: our swapchain and a live foreign `CAMetalLayer` under one
-    /// parent, both with drawables in flight:
     #[test]
     fn a_present_beside_a_live_foreign_metal_layer_touches_only_its_own_layer() {
         use crate::pipeline_table::Pipeline;
@@ -1782,11 +1703,9 @@ mod tests {
         drop(foreign_drawable);
     }
 
-    /// `-[CALayer sublayers][0]`, or null.
     fn first_sublayer(layer: &Obj) -> Id {
         let _pool = AutoreleasePool::new();
-        // SAFETY: `sublayers` answers a +0 NSArray or nil and `objectAtIndex:` a +0 element, which
-        // callers only compare by pointer.
+        // SAFETY: `sublayers` answers a +0 NSArray or nil and `objectAtIndex:` a +0 element, which callers only compare by pointer.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let arr = get(layer.id(), sel(c"sublayers"));
@@ -1798,8 +1717,6 @@ mod tests {
         }
     }
 
-    /// One present ticket feeds the latch exactly once across wait and poll,
-    /// however mixed; the injection seam stays uncached.
     #[test]
     fn a_present_ticket_feeds_the_latch_exactly_once_however_asked() {
         use crate::metal::loss::{CbOutcome, LossLatch};
@@ -1853,8 +1770,6 @@ mod tests {
         assert!(!latch.is_lost());
     }
 
-    /// With a sink installed, each present delivers one presented-handler
-    /// sample (on glass or skipped; an unparented layer may read `Skipped`).
     #[test]
     fn a_present_delivers_a_glass_sample_once_a_sink_listens() {
         use crate::metal::loss::{CbOutcome, LossLatch};
@@ -1918,8 +1833,7 @@ mod tests {
             (sc, parent.id())
         };
         let child = sc.layer.clone_retained();
-        // SAFETY: a scalar object-property read on the retained layer; the result is compared,
-        // never dereferenced or released.
+        // SAFETY: a scalar object-property read on the retained layer; the result is compared, never dereferenced or released.
         let parent_of = || unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             get(child.id(), sel(c"superlayer"))

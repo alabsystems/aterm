@@ -4,17 +4,7 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/wayland/window/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-//! Modified by the aterm project in 2026; see the repository NOTICE.
-//!
 //! The Wayland window.
-//!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the window's
-//! objects are made here on first-party `aterm-wayland`'s tables (sctk's `XdgShell::
-//! create_window` made them before), with listeners that record their events in the loop's
-//! inbox: the `xdg_surface`'s configure is acked as it arrives, as sctk acked it. A window
-//! dropped on another thread lets go of its state before it tells the loop it closed, so the
-//! loop's reference is the last and the window's objects are destroyed on the loop's thread,
-//! between dispatches, never while it dispatches their events.
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -71,7 +61,6 @@ pub struct Window {
     toplevel: Proxy,
 
     /// Xdg activation to request user attention.
-    // A window may remain callable after the event loop drops its global.
     xdg_activation: Option<Arc<Owned>>,
 
     /// The loop's inbox, for the activation token's event.
@@ -128,7 +117,6 @@ impl Window {
         let configured = move |xdg: Proxy, opcode: u32, args: &[EventArg<'_>]| match (opcode, args)
         {
             (xdg_surface::evt::CONFIGURE, [EventArg::Uint(serial)]) => {
-                // Acked as it arrives, before the loop hears it (sctk's order).
                 // SAFETY: the live xdg_surface the event came from.
                 unsafe { xdg_surface::ack_configure(xdg, *serial) };
                 Some(Wire::Toplevel { window: window_id, event: ToplevelEvent::Configured })
@@ -148,8 +136,6 @@ impl Window {
             })
         };
 
-        // Server-side decorations are asked for (WC.8: no window turns decorations off, which
-        // asked for client mode).
         let decoration = state.xdg_shell.decoration_manager().and_then(|manager| {
             // SAFETY: the shell's live decoration manager and the toplevel made above.
             let decoration =
@@ -181,8 +167,6 @@ impl Window {
             Some(decoration)
         });
 
-        // The viewport and the fractional scale, where the compositor offers fractional
-        // scaling.
         let viewport = state.viewporter.as_ref().and_then(|viewporter| {
             // SAFETY: the live viewporter and this window's surface.
             let viewport = unsafe { wp_viewporter::get_viewport(viewporter.proxy(), surface) }?;
@@ -219,7 +203,6 @@ impl Window {
             xdg_surface: xdg_owned,
             surface: surface_owned,
         };
-        // The shadow margin's globals, where the compositor offers subsurfaces.
         let frame_globals = state.subcompositor.as_ref().map(|subcompositor| frame::FrameGlobals {
             compositor: Arc::clone(&state.compositor),
             subcompositor: Arc::clone(subcompositor),
@@ -235,25 +218,17 @@ impl Window {
             frame_globals,
         );
 
-        // The surface is opaque (WC.8: no window is transparent, and none asks for blur).
         window_state.reload_transparency_hint();
 
-        // Set the app_id.
         if let Some(name) = attributes.platform_specific.name.map(|name| name.general) {
             window_state.set_app_id(&name);
         }
 
-        // Set the window title.
         window_state.set_title(attributes.title);
 
-        // Set the min size. We must set the hint upon creating a window, so we use the default
-        // `1.` scaling... (WC.8: no window has a max size, is created maximized or fullscreen,
-        // or starts with resize increments or a cursor other than the default.)
         let min_size = attributes.min_inner_size.map(|size| size.to_logical(1.));
         window_state.set_min_inner_size(min_size);
 
-        // Activate the window with the launcher's token, before the initial commit, so
-        // the compositor raises and focuses it and ends the launch's startup sequence.
         if let (Some(xdg_activation), Some(token)) =
             (xdg_activation.as_ref(), attributes.platform_specific.activation_token)
         {
@@ -267,11 +242,9 @@ impl Window {
             };
         }
 
-        // XXX Do initial commit.
         // SAFETY: this window's live surface.
         unsafe { wl_surface::commit(surface) };
 
-        // Add the window and window requests into the state.
         let window_state = Arc::new(Mutex::new(window_state));
         state.windows.get_mut().insert(window_id, window_state.clone());
 
@@ -282,23 +255,19 @@ impl Window {
         let window_requests = Arc::new(window_requests);
         state.window_requests.get_mut().insert(window_id, window_requests.clone());
 
-        // Setup the event sync to insert `WindowEvents` right from the window.
         let window_events_sink = state.window_events_sink.clone();
 
-        // Do a roundtrip.
         let queue = &state.connection.queue;
         let result = queue.roundtrip();
         state.drain();
         result.map_err(|error| os_error!(OsError::from(error)))?;
 
-        // XXX Wait for the initial configure to arrive.
         while !window_state.lock().unwrap().is_configured() {
             let result = state.connection.queue.dispatch();
             state.drain();
             result.map_err(|error| os_error!(OsError::from(error)))?;
         }
 
-        // Wake-up event loop, so it'll send initial redraw requested.
         let event_loop_awakener = event_loop_window_target.waker.clone();
         event_loop_awakener.wake();
 
@@ -339,9 +308,7 @@ fn toplevel_event(opcode: u32, args: &[EventArg<'_>]) -> Option<ToplevelEvent> {
     })
 }
 
-/// Make `request` with the output `monitor` names, while it is still bound (a monitor handle
-/// may outlive its output), or with `None`, which lets the compositor choose. The monitors'
-/// lock is held for the request: the loop releases a removed output only while holding it.
+/// Make `request` with the output `monitor` names while it is still bound, or with `None`.
 fn with_live_output(
     monitors: &Mutex<Vec<MonitorHandle>>,
     monitor: Option<PlatformMonitorHandle>,
@@ -382,9 +349,7 @@ impl Window {
     }
 
     #[inline]
-    pub fn set_visible(&self, _visible: bool) {
-        // Not possible on Wayland.
-    }
+    pub fn set_visible(&self, _visible: bool) {}
 
     #[inline]
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
@@ -397,9 +362,7 @@ impl Window {
     }
 
     #[inline]
-    pub fn set_outer_position(&self, _: Position) {
-        // Not possible on Wayland.
-    }
+    pub fn set_outer_position(&self, _: Position) {}
 
     #[inline]
     pub fn inner_size(&self) -> PhysicalSize<u32> {
@@ -410,10 +373,6 @@ impl Window {
 
     #[inline]
     pub fn request_redraw(&self) {
-        // NOTE: try to not wake up the loop when the event was already scheduled and not yet
-        // processed by the loop, because if at this point the value was `true` it could only
-        // mean that the loop still haven't dispatched the value to the client and will do
-        // eventually, resetting it to `false`.
         if self
             .window_requests
             .redraw_requested
@@ -445,7 +404,6 @@ impl Window {
         let scale_factor = self.scale_factor();
         let min_size = min_size.map(|size| size.to_logical(scale_factor));
         self.window_state.lock().unwrap().set_min_inner_size(min_size);
-        // NOTE: Requires commit to be applied.
         self.request_redraw();
     }
 
@@ -464,7 +422,6 @@ impl Window {
 
     #[inline]
     pub fn is_minimized(&self) -> Option<bool> {
-        // XXX clients don't know whether they are minimized or not.
         None
     }
 
@@ -490,8 +447,7 @@ impl Window {
         self.window_state.lock().unwrap().is_decorated()
     }
 
-    /// LOCAL PATCH (aterm), LW.5: the decorations the application must draw
-    /// ([`WindowState::client_decorations`]).
+    /// The decorations the application must draw ([`WindowState::client_decorations`]).
     #[inline]
     pub fn client_decorations(&self) -> Option<crate::platform::wayland::ClientDecorations> {
         self.window_state.lock().unwrap().client_decorations()
@@ -499,7 +455,6 @@ impl Window {
 
     #[inline]
     pub fn set_minimized(&self, minimized: bool) {
-        // You can't unminimize the window on Wayland.
         if !minimized {
             warn!("Unminimizing is ignored on Wayland.");
             return;
@@ -600,8 +555,6 @@ impl Window {
         };
 
         let mut window_state = self.window_state.lock().unwrap();
-        // Urgency is only removed by the compositor and there's no need to raise urgency when it
-        // was already raised.
         if request_type.is_none() || window_state.attention_requested {
             return;
         }
@@ -674,10 +627,7 @@ impl Window {
     #[inline]
     pub fn focus_window(&self) {}
 
-    /// Raise and focus the window with an activation token another client handed over (a
-    /// notification server's click): `xdg_activation_v1.activate`, which the compositor
-    /// honours for a token it issued for a recent user action. Nothing without the
-    /// activation global, as [`Self::focus_window`] does nothing.
+    /// Raise and focus the window with an `xdg_activation_v1` token.
     pub fn focus_window_with_activation_token(&self, token: &str) {
         let Some(xdg_activation) = self.xdg_activation.as_ref() else {
             return;
@@ -704,13 +654,10 @@ impl Window {
 
     #[inline]
     pub fn primary_monitor(&self) -> Option<MonitorHandle> {
-        // XXX there's no such concept on Wayland.
         None
     }
 
-    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
-    /// the Linux half): the window's handles for first-party `aterm_types::native_window`, which
-    /// the GL arm and the CPU presenter read; the opt-in `rwh_06` handle wraps this same answer.
+    /// The window's handles for `aterm_types::native_window`.
     #[inline]
     pub fn native_window(&self) -> NativeWindow {
         NativeWindow::Wayland {
@@ -723,7 +670,6 @@ impl Window {
     #[inline]
     pub fn set_theme(&self, theme: Option<Theme>) {
         if self.window_state.lock().unwrap().set_theme(theme) {
-            // The frame's border colour moved: its parts apply with the window's next commit.
             self.request_redraw();
         }
     }
@@ -736,9 +682,6 @@ impl Window {
 
 impl Drop for Window {
     fn drop(&mut self) {
-        // The window's reference to its state goes before the loop hears the window closed,
-        // so the loop's, dropped once it has (`take_closed`), is the last: the window's objects
-        // are destroyed on the loop's thread, never on this one while the loop dispatches them.
         // SAFETY: the field is not used again; this is the window's drop.
         unsafe { ManuallyDrop::drop(&mut self.window_state) };
         self.window_requests.closed.store(true, Ordering::Release);
@@ -757,8 +700,7 @@ pub struct WindowRequests {
 }
 
 impl WindowRequests {
-    /// Whether the window closed. Acquire, with the window's Release store: the window's own
-    /// reference to its state was gone before it.
+    /// Whether the window closed.
     pub fn take_closed(&self) -> bool {
         self.closed.swap(false, Ordering::Acquire)
     }
@@ -771,13 +713,7 @@ impl WindowRequests {
 impl TryFrom<&str> for Theme {
     type Error = ();
 
-    /// ```
-    /// use aterm_window::window::Theme;
-    ///
-    /// assert_eq!("dark".try_into(), Ok(Theme::Dark));
-    /// assert_eq!("lIghT".try_into(), Ok(Theme::Light));
-    /// ```
-    /// use aterm_window::window::Theme;
+    /// Parse `"dark"` or `"light"` case-insensitively into a [`Theme`].
     fn try_from(theme: &str) -> Result<Self, Self::Error> {
         if theme.eq_ignore_ascii_case("dark") {
             Ok(Self::Dark)

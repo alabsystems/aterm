@@ -41,9 +41,6 @@ const STALL_PACE: Duration = Duration::from_millis(100);
 #[cfg(unix)]
 const DRAIN_MAX: usize = 256;
 
-/// The listener's published health — process-wide, like every other `metrics`
-/// field, and written only by the listener thread (plus the two admission
-/// counters the accept path bumps).
 struct ListenerHealth {
     /// Connections `accept` returned, since start.
     accepts: AtomicU64,
@@ -105,8 +102,6 @@ struct HealthSnapshot {
     busy_replies: u64,
 }
 
-/// The published health, with the last accept's age measured at `now_us` (the
-/// `metrics::now_us` clock).
 fn snapshot(now_us: u64) -> HealthSnapshot {
     let last = HEALTH.last_accept_us.load(Ordering::Relaxed);
     HealthSnapshot {
@@ -260,12 +255,10 @@ impl Watch {
         })
     }
 
-    /// A rebind was attempted at `now` (whether or not it completed): back off.
     const fn attempted(&mut self, now: Instant) {
         self.last_rebind = Some(now);
     }
 
-    /// A fresh generation took over at `now`: judge it from scratch.
     fn rebound(&mut self, now: Instant) {
         *self = Self {
             last_rebind: Some(now),
@@ -394,9 +387,6 @@ impl Endpoint {
             .mint_listener = Some(mint_listener);
     }
 
-    /// Make `listener` the serving generation `generation` — which retires
-    /// every earlier one — unless the endpoint is retired: then it is closed
-    /// here and `None` comes back.
     fn install(
         &self,
         listener: CtlListener,
@@ -421,8 +411,6 @@ impl Endpoint {
         Some(listener)
     }
 
-    /// An installed listener whose accept thread never started is about to
-    /// close: stop naming it.
     fn forget(&self, listener: &CtlListener) {
         let mut endpoint = self
             .shared
@@ -434,8 +422,6 @@ impl Endpoint {
         }
     }
 
-    /// Wait out one watchdog tick, cut short by a listener [`Self::reopen`]
-    /// hands over, which comes back.
     fn tick(&self, tick: Duration) -> Option<CtlListener> {
         let endpoint = self
             .shared
@@ -450,7 +436,6 @@ impl Endpoint {
         endpoint.handed.take()
     }
 
-    /// The watchdog's replacement for a wedged socket; none while retired.
     fn replacement(&self) -> Option<CtlListener> {
         let mut endpoint = self
             .shared
@@ -466,8 +451,6 @@ impl Endpoint {
             .and_then(|mint_listener| mint_listener())
     }
 
-    /// The supervisor stopped (tests): retire every accept thread, and name
-    /// no listener any more.
     fn stop(&self, current: &AtomicU64) {
         let mut endpoint = self
             .shared
@@ -499,15 +482,13 @@ fn close_listening(fd: RawFd) -> bool {
         );
         return false;
     };
-    // SAFETY: `fd` is an open listening socket owned by the serving generation,
-    // for the reason the `dup2` below states, and `shutdown` reads and writes no
-    // memory.
+    // SAFETY: `fd` is an open listening socket owned by the serving generation, for the reason the
+    // `dup2` below states, and `shutdown` reads and writes no memory.
     let _ = unsafe { libc::shutdown(fd, libc::SHUT_RDWR) };
     loop {
-        // SAFETY: both descriptors are open for the whole call: `null` is
-        // borrowed across it, and `fd` is the serving generation's listener,
-        // which its accept thread closes only once retired — never while
-        // `EndpointState::serving` names it, under the lock the caller holds.
+        // SAFETY: both descriptors are open for the whole call: `null` is borrowed across it, and
+        // `fd` is the serving generation's listener, which its accept thread closes only once
+        // retired — never while `EndpointState::serving` names it, under the lock the caller holds.
         let duplicated = unsafe { libc::dup2(null.as_raw_fd(), fd) };
         if duplicated == fd {
             break;
@@ -556,11 +537,10 @@ fn shutdown_if_accepted_at(fd: RawFd, names: &[PathBuf]) -> bool {
         return false;
     }
     if !is_socket(copy) {
-        // Descriptor reused for a non-socket; leak the duplicate above `STDERR_FILENO`.
         return false;
     }
-    // SAFETY: `copy` was just created by this call, nothing else owns it, and
-    // it names a socket, so closing it releases no lock.
+    // SAFETY: `copy` was just created by this call, nothing else owns it, and it names a socket, so
+    // closing it releases no lock.
     let copy = CtlStream::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(copy) });
     copy.local_addr()
         .ok()
@@ -573,9 +553,9 @@ fn shutdown_if_accepted_at(fd: RawFd, names: &[PathBuf]) -> bool {
 #[cfg(unix)]
 fn is_socket(fd: RawFd) -> bool {
     let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
-    // SAFETY: `info` is a valid `MaybeUninit<libc::stat>` pointer; `fstat`
-    // writes exactly one `struct stat` through the pointer and reads nothing
-    // else; the descriptor is inspected, never consumed.
+    // SAFETY: `info` is a valid `MaybeUninit<libc::stat>` pointer; `fstat` writes exactly one
+    // `struct stat` through the pointer and reads nothing else; the descriptor is inspected, never
+    // consumed.
     if unsafe { libc::fstat(fd, info.as_mut_ptr()) } != 0 {
         return false;
     }
@@ -668,7 +648,7 @@ impl<R: FnMut() -> Option<CtlListener> + Send + 'static> Supervisor<R> {
         }
     }
 
-    /// Run the watchdog loop until stopped, serving each accepted connection in blocking mode via `serve`.
+    /// Run the watchdog loop until stopped, serving each accepted connection via `serve`.
     pub(crate) fn run(
         self,
         serve: impl Fn(CtlStream) + Send + Sync + 'static,
@@ -799,8 +779,6 @@ struct AcceptThread {
 
 #[cfg(unix)]
 impl AcceptThread {
-    /// Start this generation's accept thread; its beat on success, or the
-    /// unstarted loop (to run inline) when no thread could start.
     fn spawn(
         listener: CtlListener,
         generation: u64,
@@ -865,8 +843,6 @@ impl AcceptThread {
         false
     }
 
-    /// Serve until retired. Each turn: park until readable (or [`TICK`]),
-    /// drain, read the queue, beat.
     fn run(self) {
         let serve = |stream: CtlStream| {
             (self.serve)(stream);
@@ -895,7 +871,6 @@ impl AcceptThread {
                 0
             } else {
                 let Some(accepted) = drain(&self.listener, &serve, &mut backoff) else {
-                    // Descriptor retired onto /dev/null (`ENOTSOCK`/`EINVAL`).
                     return;
                 };
                 accepted
@@ -936,8 +911,8 @@ pub(crate) fn poll_readable(fd: RawFd, timeout: Duration) -> std::io::Result<boo
         revents: 0,
     };
     let ms = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
-    // SAFETY: `pfd` is a valid single-element `pollfd` array for a descriptor
-    // the caller keeps open for the whole call.
+    // SAFETY: `pfd` is a valid single-element `pollfd` array for a descriptor the caller keeps open
+    // for the whole call.
     match unsafe { libc::poll(&mut pfd, 1, ms) } {
         n if n > 0 => Ok(pfd.revents != 0),
         0 => Ok(false),
@@ -989,7 +964,7 @@ fn drain(
     Some(accepted)
 }
 
-/// Read the listening socket's completed-connection queue length (`soi_qlen` on macOS, `poll` elsewhere).
+/// Read the listening socket's completed-connection queue length.
 #[cfg(target_os = "macos")]
 pub(crate) fn queue_pending(listener: &CtlListener) -> Option<u32> {
     use std::os::fd::AsRawFd;
@@ -1010,8 +985,8 @@ pub(crate) fn queue_pending(listener: &CtlListener) -> Option<u32> {
     #[repr(C, align(8))]
     struct SocketFdInfo([u8; SOCKET_FDINFO_SIZE]);
     let mut info = SocketFdInfo([0; SOCKET_FDINFO_SIZE]);
-    // SAFETY: `info` is a writable, 8-aligned buffer of exactly the size passed,
-    // which is the size the kernel requires for this flavor.
+    // SAFETY: `info` is a writable, 8-aligned buffer of exactly the size passed, which is the size
+    // the kernel requires for this flavor.
     let got = unsafe {
         proc_pidfdinfo(
             libc::getpid(),
@@ -1068,7 +1043,7 @@ pub(crate) fn socket_file_id(path: &str) -> Option<(u64, u64)> {
         .then(|| (meta.dev(), meta.ino()))
 }
 
-/// Bind a replacement socket at a temp path (`0600`) and atomically rename it over `path` if owned.
+/// Bind a replacement socket at a temp path and atomically rename it over `path` if owned.
 #[cfg(unix)]
 pub(crate) fn rebind_socket(path: &str, expected: &mut Option<(u64, u64)>) -> Option<CtlListener> {
     let target = std::path::Path::new(path);
@@ -1115,8 +1090,6 @@ mod tests {
         crate::test_scratch::short_dir("a listener's socket")
     }
 
-    /// The macOS reading is the kernel's own queue: N connects nobody accepted
-    /// read as N, and an emptied queue reads 0.
     #[test]
     fn queue_pending_reads_the_kernel_queue() {
         let dir = scratch();
@@ -1139,8 +1112,6 @@ mod tests {
         drop(clients);
     }
 
-    /// Run a supervisor on `path` in a thread at `pace`: every accepted peer is
-    /// answered `OK served` and closed.
     fn supervised(
         path: &std::path::Path,
         pace: Pace,
@@ -1175,7 +1146,6 @@ mod tests {
         (stop, seams, thread)
     }
 
-    /// Set read timeout on `stream`, ignoring `EINVAL` when Darwin's peer already closed.
     fn arm(stream: &CtlStream, patience: Duration) -> std::io::Result<()> {
         match stream.set_read_timeout(Some(patience)) {
             Err(error)
@@ -1189,8 +1159,6 @@ mod tests {
         }
     }
 
-    /// The one line a fresh client on `path` is answered (`OK served`), or "" when the
-    /// connection ends with none.
     fn ask(path: &std::path::Path, patience: Duration) -> std::io::Result<String> {
         let stream = CtlStream::connect(path)?;
         arm(&stream, patience)?;
@@ -1204,10 +1172,6 @@ mod tests {
         Ok(reply)
     }
 
-    /// The one line a new client on `path` is answered once the watchdog has rebound it,
-    /// each step waited for with a hang detector ([`aterm_spec::wait::MUST_HAPPEN`]): the
-    /// path names a socket other than `before` (the rename is the rebind's last step, and
-    /// the fresh socket listens before it), then that client is answered.
     fn served_after_rebind(path: &std::path::Path, before: Option<(u64, u64)>) -> String {
         let published = path.to_str().expect("utf8");
         aterm_spec::wait::until_within(
@@ -1231,7 +1195,6 @@ mod tests {
         assert_eq!(mode, 0o600, "the rebound socket is owner-only");
     }
 
-    /// Verify the watchdog rebinds and serves new clients when the accept queue stalls.
     #[test]
     fn a_stalled_listener_is_detected_and_rebound() {
         let dir = scratch();
@@ -1274,8 +1237,6 @@ mod tests {
         thread.join().expect("supervisor thread");
     }
 
-    /// Verify the watchdog rebinds when the accept thread blocks inside its accept step,
-    /// and that the retired thread drains its old queue once unblocked.
     #[test]
     fn a_listener_stuck_inside_accept_is_detected_and_rebound() {
         let dir = scratch();
@@ -1325,10 +1286,6 @@ mod tests {
         }
     }
 
-    /// The judgement, tick by tick. A beat that moves is healthy however full the queue; a
-    /// beat that stands still is stuck only after [`STUCK_TICKS`] ticks and [`WEDGE_AFTER`]
-    /// (a process waking from suspension turns within a tick); a turning thread whose
-    /// queue stands still is stalled after [`WEDGE_AFTER`]; and a rebind backs off.
     #[test]
     fn the_watch_judges_stuck_stalled_and_healthy() {
         let t0 = Instant::now();
@@ -1376,7 +1333,6 @@ mod tests {
         ));
     }
 
-    /// Verify `shutdown_accepted` delivers EOF to both full-duplex and half-closed clients.
     #[test]
     fn shutting_accepted_connections_down_reaches_a_client_that_half_closed() {
         let dir = scratch();
@@ -1413,9 +1369,6 @@ mod tests {
         drop((open_held, half_closed_held));
     }
 
-    /// A rebind never takes over an endpoint this process no longer owns: when
-    /// the path names some other socket, nothing is renamed and the other
-    /// socket keeps its path.
     #[test]
     fn rebind_refuses_a_path_it_does_not_own() {
         let dir = scratch();

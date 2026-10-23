@@ -2,12 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance for bounded control-socket connection admission.
-//!
-//! Drives the shipping `BoundedDispatch` with real `CtlStream` pairs and checks every
-//! transition against the derived model. Completion runs through
-//! `BoundedDispatch::serve_next` (the body every control and subscription worker loops on)
-//! under a panicking handler, so a lost completion guard fails the `Complete` step. Negative
-//! controls reject an over-admission and a completion that keeps its lane.
 
 #![cfg(test)]
 
@@ -89,7 +83,6 @@ fn shipping_connection_dispatch_conforms_and_rejects_overflow() {
     assert!(admit(&model, &dispatch, &mut facts, true).is_none());
     let full = project(&model, &dispatch, facts);
 
-    // Negative control: an unbounded admission retaining a third stream breaks LaneBounded.
     let mut overflow = full.clone();
     overflow.insert("outstanding", 3);
     overflow.insert("arrivals", 3);
@@ -103,7 +96,6 @@ fn shipping_connection_dispatch_conforms_and_rejects_overflow() {
     );
 
     let before_complete = project(&model, &dispatch, facts);
-    // The handler panics, so only the completion guard's `Drop` can release the lane.
     let mut while_serving = None;
     let returned = dispatch.serve_next(|stream| {
         while_serving = Some(project(&model, &dispatch, facts));
@@ -120,12 +112,10 @@ fn shipping_connection_dispatch_conforms_and_rejects_overflow() {
     let after_complete = project(&model, &dispatch, facts);
     assert_transition(&model, &before_complete, &after_complete, "Complete");
 
-    // Negative control: a worker that returns without releasing its lane.
     let mut leaked = after_complete.clone();
     leaked.insert("outstanding", before_complete["outstanding"]);
     assert_eq!(admits(&model, &before_complete, &leaked), None);
     assert!(!model.check_invariant("AcceptedWorkAccounted", &leaked));
 
-    // Capacity released by genuine worker completion is immediately reusable.
     assert!(admit(&model, &dispatch, &mut facts, true).is_none());
 }

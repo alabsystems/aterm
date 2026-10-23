@@ -47,10 +47,7 @@ const ERR_SEC_INVALID_EXTENDED_KEY_USAGE: CFIndex = -67609;
 /// `errSecCertificateRevoked`.
 const ERR_SEC_CERTIFICATE_REVOKED: CFIndex = -67820;
 
-/// `CFArrayCallBacks`. Declared with real function-pointer fields rather than
-/// opaque words so the type is `Sync` (an `extern` static of a
-/// raw-pointer-bearing type is not) and so the layout claim is checkable against
-/// `CFArray.h:78`.
+/// `CFArrayCallBacks`, declared with function-pointer fields so the type is `Sync`.
 #[repr(C)]
 struct CFArrayCallBacks {
     version: CFIndex,
@@ -117,8 +114,7 @@ unsafe extern "C" {
     fn SecTrustSetOCSPResponse(trust: SecTrustRef, response_data: CFTypeRef) -> OSStatus;
     fn SecTrustSetAnchorCertificates(trust: SecTrustRef, anchors: CFArrayRef) -> OSStatus;
     fn SecTrustSetAnchorCertificatesOnly(trust: SecTrustRef, only: Boolean) -> OSStatus;
-    /// Returns C `_Bool`: `true` iff the chain is trusted. Not an `OSStatus`: compared to
-    /// `errSecSuccess` (0), a rejection (`false`) would read as success.
+    /// Returns C `_Bool`: `true` iff the chain is trusted.
     fn SecTrustEvaluateWithError(trust: SecTrustRef, error: *mut CFErrorRef) -> bool;
 }
 
@@ -151,7 +147,7 @@ fn cf_string(s: &str) -> Option<CfOwned> {
     (!r.is_null()).then(|| CfOwned(r))
 }
 
-/// Copy a `CFString` out as a Rust `String`. Diagnostics only.
+/// Copy a `CFString` out as a Rust `String`.
 fn cf_string_to_string(s: CFStringRef) -> Option<String> {
     // SAFETY: `s` is a live CFString for the duration of these calls.
     let len = unsafe { CFStringGetLength(s) };
@@ -283,7 +279,7 @@ impl Verifier {
     }
 }
 
-/// The evaluation itself: steps 1-8 of this module's header, in order.
+/// Evaluate `job`'s certificate chain against Security.framework.
 fn evaluate(job: &Job) -> Result<(), rustls::Error> {
     let Job {
         chain,
@@ -420,7 +416,6 @@ fn evaluate(job: &Job) -> Result<(), rustls::Error> {
     }
 
     let Some(error) = error else {
-        // A rejection with no CFError. Still a rejection.
         return Err(invalid_certificate(
             "SecTrustEvaluateWithError refused the chain without a reason",
         ));

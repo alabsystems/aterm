@@ -381,11 +381,7 @@ fn numbered(row: &str) -> Option<(Pointer, u8, &str)> {
     Some((pointer, n, text))
 }
 
-/// A multi-select label's checkbox: `[ ] x` → `(false, "x")`, `[✔] x` →
-/// `(true, "x")` — and `[✔]x`, the box with no space after it, as Claude
-/// Code 2.1.300 draws a ticked free-text row in a narrow pane (MEASURED at 50
-/// columns: `4. [✔]Decide yourself: …`, its rows at column 8, the fixture
-/// `claude-2.1.300-question-multi-typed-50col.txt` F2).
+/// Parse a multi-select label's `[ ]` or `[✔]` checkbox and remaining label text.
 fn checkbox(text: &str) -> Option<(bool, &str)> {
     let (ticked, rest) = match text.strip_prefix("[ ]") {
         Some(rest) => (false, rest),
@@ -487,10 +483,7 @@ fn measured(row: &str) -> Option<usize> {
         .then(|| t.chars().count())
 }
 
-/// Whether row `below` may be the wrap of row `above` in a dialog `width`
-/// cells wide: `above` plus a space plus `below`'s first word would have
-/// run past the edge (two cells of slack for Ink's box: the measured 80-cell
-/// label wrapped at cell 78).
+/// Whether row `below` may be the wrap of row `above` in a dialog `width` cells wide.
 fn possibly_wrap(above: &str, below: &str, width: usize) -> bool {
     let (Some(len), Some(_)) = (measured(above), measured(below)) else {
         return true;
@@ -502,10 +495,7 @@ fn possibly_wrap(above: &str, below: &str, width: usize) -> bool {
     len + 1 + first > width.saturating_sub(2)
 }
 
-/// A character's width in cells: 2 for the East Asian wide and fullwidth
-/// blocks and the emoji blocks, else 1 (the grid's own rule; a close
-/// reading without a width table, used only to find the preview pane's
-/// column on a row).
+/// A character's width in cells (2 for East Asian wide/fullwidth and emoji blocks, else 1).
 fn cell_width(c: char) -> usize {
     let wide = matches!(u32::from(c),
         0x1100..=0x115F
@@ -929,13 +919,6 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
     if rows[ready..=last].iter().any(|r| is_transcript_row(r)) {
         return None;
     }
-    // The auto-deny countdown, when the question carries one: the permission
-    // reason block Claude Code draws between the answers and `Ready to submit
-    // …` (read in 2.1.301's code; not measured) — its `⚠ Claude Code will
-    // automatically deny this request in …` row and the rows a narrow pane
-    // wraps it onto, at column 0, over its own blank row. Not the dialog's
-    // rows: passed over below, and read as the dialog's countdown
-    // ([`QShape::countdown`]), the review read whole or not.
     let countdown = ready
         .checked_sub(1)
         .filter(|&gap| blank(&rows[gap]))
@@ -978,7 +961,6 @@ pub(crate) fn review(rows: &[String]) -> Option<QShape> {
     let Some(mut at) = skip_blanks(gap) else {
         return partial(0);
     };
-    // The countdown (above): passed over, to the blank row over it.
     if let Some((head, _)) = countdown {
         top = head;
         let Some(up) = head.checked_sub(1).filter(|&u| blank(&rows[u])) else {
@@ -1270,8 +1252,7 @@ fn select_form(rows: &[String], shape: &QShape) -> Result<QuestionForm, &'static
     one_focus(form)
 }
 
-/// `form` when exactly one of its rows carries the `❯`: 2.1.282 always draws one, so
-/// none is a rendering this reader does not understand.
+/// Return `form` when exactly one of its rows carries the `❯` focus marker.
 fn one_focus(form: QuestionForm) -> Result<QuestionForm, &'static str> {
     let probe = QuestionDialog {
         tabs: Vec::new(),

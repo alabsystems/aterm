@@ -472,8 +472,7 @@ impl DeviceHandle<'_> {
             .unwrap_or_else(|e| panic!("device layer: {label}: {e}"))
     }
 
-    /// The one buffer constructor behind the three roles. Metal storage is
-    /// shared for every role, so only wgpu reads `role`.
+    /// The one buffer constructor behind the three roles.
     fn try_create_buffer(
         &self,
         label: &'static str,
@@ -1342,7 +1341,6 @@ impl FramePass<'_, '_> {
             }
             #[cfg(gl_arm)]
             (Self::Gl(pass), FrameAtlas::Gl { tex, sampler, unit }) => {
-                // Frame atlases are never sRGB-stored; `raw` is moot.
                 pass.bind_texture(tex, sampler, unit, false);
             }
             #[cfg(target_os = "macos")]
@@ -1544,10 +1542,7 @@ const fn host_read_barrier(
 
 #[cfg(all(test, wgpu_arm, unix, not(target_vendor = "apple")))]
 mod host_read_tests {
-    /// A Vulkan readback's submit carries the host-read barrier: wgpu hands
-    /// the raw encoder over and the barrier is recorded, so the fix cannot
-    /// lapse into a silent no-op, and two readbacks in one submit (a
-    /// recording and a still of one present) get theirs too.
+    /// A Vulkan readback's submit carries the host-read barrier.
     #[test]
     fn a_vulkan_readback_submit_carries_the_host_read_barrier() {
         let ctx = crate::GpuContext::new()
@@ -1777,13 +1772,7 @@ mod tests {
         assert!(msg.contains("MTLBuffer"), "got: {msg}");
     }
 
-    /// Padding bytes at widths 17 and 97:
-    ///
-    ///  * not written: the Metal copy lands each row at its padded base and
-    ///    leaves the poisoned tail untouched;
-    ///  * not consulted: `frame_from_padded_rgba` gives identical `Frame`s from
-    ///    a poisoned and a zeroed tail;
-    ///  * both arms' readbacks equal the expected packing.
+    /// Padding bytes at widths 17 and 97 are neither written nor consulted.
     #[test]
     #[cfg(wgpu_arm)]
     fn the_padding_tail_is_neither_written_nor_consulted() {

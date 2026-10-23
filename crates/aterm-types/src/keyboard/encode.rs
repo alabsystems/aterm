@@ -114,10 +114,6 @@ pub fn encode_key_with_text(
     encode_legacy(legacy_key, modifiers, mode, legacy_text)
 }
 
-/// The chord modifiers that make a press something other than TEXT: with any
-/// of them held the key writes its chord form (a control byte, an ESC prefix,
-/// a CSI form) where one exists, and otherwise the character the layout types
-/// at that level ([`encode_key_with_text`]).
 const NON_TEXT_MODIFIERS: Modifiers = Modifiers::CTRL
     .union(Modifiers::ALT)
     .union(Modifiers::META)
@@ -170,7 +166,8 @@ pub fn layout_letter_twin(layout_char: char, base_layout_key: Option<char>) -> O
     base_layout_key.filter(char::is_ascii_alphabetic)
 }
 
-/// Modifier and lock keys, mirroring kitty's `is_modifier_key` (kitty also gates ISO_LEVEL3/5_SHIFT, which `NamedKey` lacks).
+/// Modifier and lock keys, mirroring kitty's `is_modifier_key` (kitty also gates
+/// ISO_LEVEL3/5_SHIFT, which `NamedKey` lacks).
 #[inline]
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
@@ -238,8 +235,6 @@ fn should_encode_kitty_event(
     key_event_needs_csi_u(key, modifiers)
 }
 
-/// Chord modifiers — the bits that make a key combination "ambiguous" in
-/// legacy encodings.
 const CHORD_MODIFIERS: Modifiers = Modifiers::SHIFT
     .union(Modifiers::ALT)
     .union(Modifiers::CTRL)
@@ -555,7 +550,7 @@ pub fn typed_character(c: char, modifiers: Modifiers) -> char {
     }
 }
 
-/// The glyph SHIFT composes from base key `c` on the US layout (`'h'`→`'H'`, `'2'`→`'@'`, `'/'`→`'?'`; `c` itself when Shift does not change it), or `None` when SHIFT is not held.
+/// Glyph that Shift composes from base key `c` on the US layout, or `None` without Shift.
 #[inline]
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -591,33 +586,21 @@ pub const fn shifted_character(c: char, modifiers: Modifiers) -> Option<char> {
     }
 }
 
-/// ConPTY win32-input-mode: `VK_RETURN` (13) and scan code 0x1C (28), shared by both Enter
-/// keys; the keypad's is flagged `ENHANCED_KEY` in `dwControlKeyState`.
 const WIN32_VK_RETURN: u32 = 13;
 const WIN32_SC_RETURN: u32 = 28;
-/// `VK_ESCAPE` / scan 0x01 and `VK_BACK` / scan 0x0E, with the `UnicodeChar` a Windows
-/// keyboard gives each: ESC (0x1B) and BS (0x08).
 const WIN32_VK_ESCAPE: u32 = 0x1b;
 const WIN32_SC_ESCAPE: u32 = 0x01;
 const WIN32_ESCAPE_CHAR: u32 = 0x1b;
 const WIN32_VK_BACK: u32 = 0x08;
 const WIN32_SC_BACK: u32 = 0x0e;
 const WIN32_BACK_CHAR: u32 = 0x08;
-/// `dwControlKeyState` bits (wincon.h). The LEFT modifier bits stand for either side: once
-/// winit has canonicalized the chord the host cannot tell them apart, and conhost reports the
-/// same for a modifier it cannot side-attribute.
 const WIN32_SHIFT_PRESSED: u32 = 0x10;
 const WIN32_LEFT_CTRL_PRESSED: u32 = 0x08;
 const WIN32_LEFT_ALT_PRESSED: u32 = 0x02;
 const WIN32_ENHANCED_KEY: u32 = 0x100;
-/// The `UnicodeChar` of an Enter-chord record: what the physical chord carries under Windows
-/// Terminal (the OS's `ToUnicode` of it), so every ReadConsoleInput reader (.NET `ReadKey`,
-/// libuv, MSYS, cmd.exe) sees the record it sees under WT.
 const WIN32_SHIFT_ENTER_CHAR: u32 = 13;
 const WIN32_CTRL_ENTER_CHAR: u32 = 10;
 
-/// The four `INPUT_RECORD` fields a routed key decides — `wVirtualKeyCode`,
-/// `wVirtualScanCode`, `UnicodeChar` and `dwControlKeyState`.
 struct Win32KeyRecord {
     vk: u32,
     sc: u32,
@@ -741,10 +724,8 @@ fn win32_escape_record(
     Some(Win32KeyRecord { vk, sc, uc, cs })
 }
 
-/// BS, the legacy byte of Ctrl+H: conhost decodes a bare BS as Ctrl+Backspace.
 const LEGACY_CTRL_H: u8 = 0x08;
 
-/// LF, the legacy byte of Ctrl+J: conhost decodes a bare LF as Ctrl+Enter.
 const LEGACY_CTRL_J: u8 = 0x0a;
 
 /// The record for a Ctrl letter chord whose legacy byte conhost reads as a different key:
@@ -937,8 +918,6 @@ fn encode_xterm_other_keys(
     }
 }
 
-/// xterm modifyOtherKeys level 1 (`mokUser`) preserves ordinary Shift-only and
-/// established Ctrl mappings, but reports otherwise ambiguous combinations.
 fn xterm_modify_other_keys_level1_applies(key: &Key, modifiers: Modifiers) -> bool {
     if modifiers.is_empty() {
         return false;
@@ -960,8 +939,6 @@ fn xterm_level1_character_applies(c: char, modifiers: Modifiers) -> bool {
         return true;
     }
     if modifiers == Modifiers::CTRL {
-        // A traditional Ctrl mapping already has a unique legacy byte. If the
-        // character has no such mapping, CSI is needed to retain the modifier.
         return ctrl_character(c).is_none();
     }
     false

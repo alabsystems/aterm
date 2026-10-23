@@ -95,7 +95,7 @@ pub struct Caps {
     /// Every logical core's busy and idle ticks.
     pub per_core: Cap,
     /// The cores grouped by performance level (macOS `hw.perflevelN`, Linux
-    /// `cpu_core`/`cpu_atom` PMUs or `cpu_capacity`, Windows CPU Sets'
+    /// `cpu_core`/`cpu_atom` PMUs or `cpu_capacity` per core design, Windows CPU Sets'
     /// `EfficiencyClass`).
     pub core_kinds: Cap,
     /// Which cores the OS took away (Linux offline CPUs, Windows parked CPU Sets).

@@ -5,10 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Touch handling.
-//!
-//! Modified by the aterm project in 2026; see the repository NOTICE. (The touch events come
-//! decoded from first-party `aterm_wayland::seat`, where upstream had smithay-client-toolkit's
-//! `TouchHandler`: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 use aterm_wayland::seat::TouchEvent;
 use tracing::warn;
@@ -29,7 +25,6 @@ impl WinitState {
             TouchEvent::Up { id, .. } => self.touch_up(seat, id),
             TouchEvent::Motion { id, x, y, .. } => self.touch_motion(seat, id, (x, y)),
             TouchEvent::Cancel => self.touch_cancel(seat),
-            // Blank.
             TouchEvent::Frame | TouchEvent::Shape { .. } | TouchEvent::Orientation { .. } => {},
         }
     }
@@ -55,7 +50,6 @@ impl WinitState {
             },
         };
 
-        // Update the state of the point.
         let location = LogicalPosition::<f64>::from(position);
         seat_state.touch_map.insert(id, TouchPoint { window_id, location });
 
@@ -82,7 +76,6 @@ impl WinitState {
             },
         };
 
-        // Remove the touch point.
         let touch_point = match seat_state.touch_map.remove(&id) {
             Some(touch_point) => touch_point,
             None => return,
@@ -117,7 +110,6 @@ impl WinitState {
             },
         };
 
-        // Remove the touch point.
         let touch_point = match seat_state.touch_map.get_mut(&id) {
             Some(touch_point) => touch_point,
             None => return,

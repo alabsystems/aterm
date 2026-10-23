@@ -716,11 +716,11 @@ fn dmg_mount_point(dest: &Path) -> Result<PathBuf, StageError> {
     Ok(dest.with_file_name(mnt))
 }
 
+/// Run the OS tool at `path` (an `aterm_uds::os_path!`) on `args`, its failure named by
+/// the tool's file name.
 #[cfg(target_os = "macos")]
-fn run_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
-    let mut path = String::from("/usr/bin/");
-    path.push_str(tool);
-    let out = aterm_uds::spawnfd::command(&path)
+fn run_tool(path: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
+    let out = aterm_uds::spawnfd::command(path)
         .args(args)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
@@ -728,7 +728,13 @@ fn run_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<(), StageError> {
     if out.status.success() {
         return Ok(());
     }
-    Err(tool_failed(tool, out.status.code(), &out.stderr))
+    Err(tool_failed(tool_name(path), out.status.code(), &out.stderr))
+}
+
+/// The tool at `path` by its file name, as a failure names it.
+#[cfg(target_os = "macos")]
+fn tool_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
 #[cfg(target_os = "macos")]
@@ -749,17 +755,16 @@ fn tool_failed(tool: &str, code: Option<i32>, stderr: &[u8]) -> StageError {
     StageError::Payload(m)
 }
 
+/// [`run_tool`], keeping what the tool printed.
 #[cfg(target_os = "macos")]
-fn capture_tool(tool: &str, args: &[&std::ffi::OsStr]) -> Result<String, StageError> {
-    let mut path = String::from("/usr/bin/");
-    path.push_str(tool);
-    let out = aterm_uds::spawnfd::command(&path)
+fn capture_tool(path: &str, args: &[&std::ffi::OsStr]) -> Result<String, StageError> {
+    let out = aterm_uds::spawnfd::command(path)
         .args(args)
         .stdin(aterm_uds::spawnfd::Stdio::null())
         .output()
         .map_err(StageError::Io)?;
     if !out.status.success() {
-        return Err(tool_failed(tool, out.status.code(), &out.stderr));
+        return Err(tool_failed(tool_name(path), out.status.code(), &out.stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -906,7 +911,7 @@ impl Mount {
                 attached: true,
             };
             match run_tool(
-                "hdiutil",
+                aterm_uds::os_path!("hdiutil"),
                 &[
                     "attach".as_ref(),
                     "-nobrowse".as_ref(),
@@ -937,7 +942,7 @@ impl Mount {
         }
         self.attached = false;
         let by_point = run_tool(
-            "hdiutil",
+            aterm_uds::os_path!("hdiutil"),
             &["detach".as_ref(), "-quiet".as_ref(), self.point.as_os_str()],
         );
         let r = match by_point {
@@ -956,7 +961,7 @@ impl Mount {
         let mut last: Option<StageError> = None;
         for node in &nodes {
             if run_tool(
-                "hdiutil",
+                aterm_uds::os_path!("hdiutil"),
                 &["detach".as_ref(), "-quiet".as_ref(), node.as_os_str()],
             )
             .is_ok()
@@ -964,7 +969,7 @@ impl Mount {
                 continue;
             }
             if let Err(e) = run_tool(
-                "hdiutil",
+                aterm_uds::os_path!("hdiutil"),
                 &[
                     "detach".as_ref(),
                     "-force".as_ref(),
@@ -987,7 +992,7 @@ impl Mount {
     }
 
     fn own_devices(&self) -> Result<Vec<PathBuf>, StageError> {
-        let report = capture_tool("hdiutil", &["info".as_ref()])?;
+        let report = capture_tool(aterm_uds::os_path!("hdiutil"), &["info".as_ref()])?;
         Ok(self.reclaimable(&report))
     }
 
@@ -1050,7 +1055,7 @@ fn stage_dmg(image: &Path, dest: &Path) -> Result<(), StageError> {
     let out = dest.join(name);
     let (no_acl, no_clone) = ("--noacl".as_ref(), "--noclone".as_ref());
     run_tool(
-        "ditto",
+        aterm_uds::os_path!("ditto"),
         &[no_acl, no_clone, app.as_os_str(), out.as_os_str()],
     )?;
     if let Err(e) = vet_copied_tree(dest, &out) {

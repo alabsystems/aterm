@@ -2737,8 +2737,6 @@ impl Config {
             .and_then(|sparkle| sparkle.enabled)
             == Some(false)
         {
-            // A disabled feed has no consumer; re-enabling it forces a fresh
-            // worker generation, so dormant paths need no I/O.
             return (None, fingerprint.finish());
         }
         let admitted_lexicon = self.admitted_sparkle_lexicon(&mut fingerprint);
@@ -4940,7 +4938,6 @@ impl Config {
     pub(crate) fn engine_behaviour_config(&self) -> aterm_core::config::TerminalConfig {
         let mut tc = aterm_core::config::TerminalConfig::default();
         if let Some(n) = self.scrollback_lines {
-            // 0 → unlimited (None); N → cap at N lines.
             tc.scrollback_limit = (n != 0).then_some(n);
         }
         if self.cursor_style.is_some() || self.cursor_blink.is_some() {
@@ -6313,8 +6310,6 @@ impl App {
             .collect();
         for (wid, size) in sized {
             if Some(wid) == settling {
-                // Its band's head follows the rows now, so the frame its caller's
-                // settle asks for has it.
                 self.sync_synthetic_strip_head(wid, size.height);
             } else {
                 self.on_resize(wid, size);
@@ -6533,8 +6528,6 @@ impl App {
             }
             self.on_resize(wid, size);
             if let Some(ws) = self.windows.get_mut(&wid) {
-                // A font/theme rebuild is an external visual stimulus: couple the
-                // recovery reset to its repaint edge until a real present or drop.
                 ws.rearm_present(true);
             }
         }
@@ -6982,9 +6975,6 @@ impl App {
             return true;
         }
         let Some(observation) = self.native_config_service.admitted_observation() else {
-            // An unwritten edit or an unreconciled write: the generation that
-            // admits it resolves the typography of this state, so the colours
-            // install now and the face follows with it.
             return false;
         };
         if !self.font_generation_available() {
@@ -7271,7 +7261,6 @@ impl App {
         let secure_input_refusal =
             crate::secure_input::set_desired(self.config.secure_keyboard_entry_or_default()).err();
         if let Some(voice) = audition_voice {
-            // After the swap, so the preview plays at the new volume and master.
             self.audition_typing_sound(voice);
         }
         {

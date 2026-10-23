@@ -16,7 +16,7 @@ use crate::refuse::{Deny, Refusal, refuse};
 use crate::tree::DirId;
 use crate::tree::{Sums, Tree};
 
-/// A slice's budget (design §10.5 rule 10).
+/// Default time budget for a single walk slice.
 pub const SLICE: Duration = Duration::from_millis(4);
 /// The deepest a cursor goes; deeper folders are `too deep` rows.
 pub const MAX_DEPTH: u16 = 128;
@@ -50,8 +50,8 @@ pub struct Policy {
     pub mounts: Table,
     /// Read each file's private (unshared-clone) size: about 2.5× the cost.
     pub private: bool,
-    /// Keep a `(dev, inode)` map of multiply linked files for the walk's
-    /// first-seen and shared-out figures ([`LinkTotals`]).
+    /// Keep a `(dev, inode)` map of multiply linked files for the walk's first-seen and shared-out
+    /// figures ([`LinkTotals`]).
     pub links_out: bool,
     /// A slice's budget.
     pub slice: Duration,
@@ -154,6 +154,7 @@ impl std::fmt::Debug for Walk {
 
 impl Walk {
     /// Test `root` with [`refuse`].
+    ///
     /// # Errors
     /// The [`Refusal`] the path test, the open or the volume check gave.
     pub fn begin(root: &RootSpec, policy: &Policy) -> Result<Walk, Refusal> {
@@ -360,6 +361,7 @@ impl Walker {
     }
 
     /// Begin walking `root`, superseding the walk in flight (its ticket goes stale), and arm.
+    ///
     /// # Errors
     /// The [`Refusal`] [`Walk::begin`] gave.
     #[cfg_attr(
@@ -525,11 +527,12 @@ pub struct SizeFull {
     pub links: Option<LinkTotals>,
 }
 
-/// A whole walk in one call for a one-shot survey (design §10.7).
+/// Runs a whole walk in one call up to `budget`.
+///
 /// # Errors
 /// The [`Refusal`] the root earned.
-// COST: UNBOUNDED(entries) — a whole walk; the harness's survey and the CLI
-// call it on their own threads, never the event loop.
+// COST: UNBOUNDED(entries) — a whole walk; the harness's survey and the CLI call it on their own
+// threads, never the event loop.
 pub fn diskwalk_size_full(
     root: &RootSpec,
     policy: &Policy,
@@ -560,7 +563,6 @@ pub fn diskwalk_size_full(
     })
 }
 
-/// A regular-file root: its own allocation, read through its parent.
 fn file_root(root: &RootSpec, policy: &Policy) -> Result<SizeFull, Refusal> {
     let canon = crate::refuse::canonical(&root.path).ok_or(Refusal::Relative)?;
     let parent = canon.parent().ok_or(Refusal::TooBroad)?;
@@ -632,6 +634,7 @@ pub struct LevelRow {
 }
 
 /// A too-broad root's one-level listing: names, kinds and direct entry counts, nothing walked.
+///
 /// # Errors
 /// The [`Refusal`] the root earned, other than [`Refusal::TooBroad`].
 pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>, Refusal> {
@@ -656,6 +659,7 @@ pub fn list_one_level(root: &RootSpec, policy: &Policy) -> Result<Vec<LevelRow>,
 }
 
 /// One directory's direct entry count without listing it where the platform can.
+///
 /// # Errors
 /// The [`Refusal`] the path earned.
 pub fn entry_count_of(path: &Path, policy: &Policy) -> Result<u32, Refusal> {
@@ -714,7 +718,6 @@ pub(crate) mod imp {
         DIR_FLAGS | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
     }
 
-    /// `/`, opened.
     fn open_slash() -> Result<OwnedFd, Refusal> {
         // SAFETY: a NUL-terminated literal path; the flags open a directory.
         let fd = unsafe {
@@ -754,7 +757,6 @@ pub(crate) mod imp {
         Ok(fd)
     }
 
-    /// Open the directory `name` in `parent`, following no link.
     fn open_child(parent: &OwnedFd, name: &OsStr) -> Result<OwnedFd, Refusal> {
         aterm_dirfd::openat(parent, name, dir_flags(), Mode::empty()).map_err(|e| {
             match e.raw_os_error() {
@@ -855,9 +857,6 @@ pub(crate) mod imp {
         None
     }
 
-    /// `fstat` of an open descriptor: (dev, ino, allocated bytes, flags). Every cast reads a
-    /// field through its `libc` alias (`dev_t`, `ino_t`, `blkcnt_t`), which clippy leaves alone
-    /// on every platform, so no cast lint is expected here.
     fn fstat_of(fd: &OwnedFd) -> Result<(u64, u64, u64, u32), Refusal> {
         // SAFETY: `stat` is integers: all-zero is a value.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -931,7 +930,6 @@ pub(crate) mod imp {
         })
     }
 
-    /// Where one entry lands.
     struct Sink<'a> {
         tree: &'a mut Tree,
         links: Option<&'a mut HashMap<(u64, u64), Link>>,
@@ -1054,7 +1052,6 @@ pub(crate) mod imp {
         }
     }
 
-    /// What a step decided to do with the cursor's top.
     enum Next {
         Nothing,
         Push(Frame),
@@ -1146,8 +1143,6 @@ pub(crate) mod imp {
                         })
                     }
                     other => {
-                        // A different device (the open crossed a mount), or a
-                        // refusal; an opened descriptor closes here.
                         let why = other.err();
                         let r = tree.rec_mut(child);
                         match why {
@@ -1172,8 +1167,6 @@ pub(crate) mod imp {
             match next {
                 Next::Nothing => {}
                 Next::Push(frame) => {
-                    // Its parent's listing gave the count `ATTR_DIR_ENTRYCOUNT`
-                    // read; its own listing counts again from zero.
                     let r = tree.rec_mut(frame.dir);
                     r.direct_entries = 0;
                     r.direct_exec = 0;

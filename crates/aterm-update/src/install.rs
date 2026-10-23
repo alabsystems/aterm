@@ -19,7 +19,7 @@ pub(crate) const MAX_BOOT_ATTEMPTS: u32 = 3;
 /// How long a launch waits for the apply lock before starting on the installed build.
 pub(crate) const APPLY_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// How long the background lane (the checker's stage and publish, and the floor ratchet under them) waits for the stage, apply or floor lock before giving the cycle up, so a stopped holder in another aterm cannot park the checker thread.
+/// Lock wait budget for background stage, apply, and floor operations.
 pub(crate) const BACKGROUND_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 const CROSS_VOLUME_COPY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
@@ -348,9 +348,7 @@ fn startup_authority_decision(
 }
 
 fn take_reexec_nonce() -> Option<std::ffi::OsString> {
-    // Apply runs before any thread spawns. Read and clear are one critical section
-    // (`aterm_log::env::take`), before any codesign/spctl helper can launch, so the
-    // one-shot authority, even a malformed one, is observed once.
+    // Read and clear `ATERM_UPDATE_REEXEC` atomically before any helper process can launch.
     aterm_log::env::take("ATERM_UPDATE_REEXEC")
 }
 
@@ -508,8 +506,7 @@ fn boot_sentinel(staging: &Staging) -> Sentinel {
 }
 
 fn foreign_trial_counter(staging: &Staging) -> Sentinel {
-    // Ordered: an older count after a power loss restarts the escape budget, which is
-    // the conservative direction.
+    // Ordered flush: an older count after power loss conservatively restarts the escape budget.
     Sentinel::ordered(foreign_trial_path(staging))
 }
 
@@ -699,7 +696,7 @@ fn trial_window_launch_path(staging: &Staging) -> PathBuf {
     staging.root.join("boot.sentinel.windowed")
 }
 
-/// How long a trial a window has launched waits for a window to settle it (confirm at a first frame, or count launches that crash before one) before headless launches count and confirm it again (law L5: no wait without a deadline).
+/// How long a window-launched trial waits for a window to settle it before headless launches may count and confirm it again.
 pub(crate) const WINDOW_TRIAL_HEADLESS_WAIT: std::time::Duration =
     std::time::Duration::from_secs(48 * 60 * 60);
 
@@ -771,7 +768,7 @@ fn window_trial_wait_notice(build: u64, until: u64) -> String {
     )
 }
 
-/// The trial of `build` waiting for a window, as `update status` says it ([`window_trial_wait_notice`]), or `None` when it is not waiting.
+/// Status message when `build`'s trial is waiting on a window ([`window_trial_wait_notice`]), or `None`.
 pub(crate) fn window_trial_wait_at(staging: &Staging, build: u64, now: u64) -> Option<String> {
     // Armed as the confirmation reads it ([`trial_armed_for`]): a trial whose
     // sentinel does not read but whose identity names the build is retried, so its
@@ -1068,7 +1065,7 @@ fn trial_owned_by(staging: &Staging, app_root: &Path) -> bool {
     }
 }
 
-/// Path equality for install roots, tolerant of a canonicalizable spelling: the one "is this the same copy of aterm.app?" test, shared by the trial-ownership rule and `which_copy`, so a symlinked spelling reads the same on both.
+/// Path equality for install roots, falling back to `canonicalize` when spellings differ.
 #[must_use]
 pub(crate) fn same_install_root(a: &Path, b: &Path) -> bool {
     if a == b {
@@ -1213,10 +1210,7 @@ fn recover_abandoned_preswap_trial_if_exact(
     if ready.as_ref().is_some_and(|ready| {
         ready_matches_verified_identity(ready, candidate_build, &candidate_commit)
     }) {
-        // Cross-volume staging copies staged_app -> fixed and keeps the staged copy,
-        // so when the staged bundle already carries the exact candidate identity the
-        // fixed twin is redundant: reclaim it and keep the publication (renaming
-        // back would fail EXDEV on every external-volume install).
+        // Reclaim `fixed` directly when `staged_app` already holds the candidate (e.g. cross-volume copy).
         if verified_bundle_identity(&staging.staged_app)
             .is_ok_and(|(build, commit)| build == candidate_build && commit == candidate_commit)
         {
@@ -1257,8 +1251,6 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
         return false;
     }
     if !matches!(counter_state, Some((build, _)) if build == armed_build) {
-        // A different armed build than the one we were counting (or none yet):
-        // start this build's budget from zero rather than inheriting it.
         let _ = counter.arm(armed_build);
     }
     let observed = counter.observe_launch(armed_build).unwrap_or(0);
@@ -2164,7 +2156,7 @@ fn sealed_commit_matches(expected: Option<&str>, sealed: &str) -> bool {
         .is_some_and(|expected| crate::commit_matches(&expected, sealed))
 }
 
-/// Pre-park handoff verification: the full staged-bundle authenticity gate (the tiered codesign policy plus the sealed CFBundleVersion/commit rebinding the swap re-runs), run while every parent PTY reader is still live, so a failing candidate is refused before a reader stops.
+/// Pre-park handoff verification of the staged bundle's signature, build number, and commit before stopping parent PTY readers.
 pub fn preverify_staged_handoff_candidate(
     current_build: u64,
     current_commit: Option<&str>,
@@ -2186,7 +2178,7 @@ pub fn preverify_staged_handoff_candidate(
     .and_then(std::convert::identity)
 }
 
-/// The key marking the refusal of an installed bundle that cannot become the rollback source a swap installs at the fixed path (a corrupt or replaced install must never become crash-recovery authority), e.g. a local ad-hoc build swapped into `/Applications` without the `ATermDevBuild` mark.
+/// Refusal substring when the installed bundle cannot serve as the swap's rollback source.
 pub const ROLLBACK_SOURCE_REFUSAL_KEY: &str = "cannot be the rollback source";
 
 /// The one sentence that names the way out of an unverifiable install.
@@ -2223,7 +2215,7 @@ pub(crate) fn install_location_refusal(app_root: &Path) -> String {
     )
 }
 
-/// The swap's write, checked on every lane that needs it (the pre-park check, the boot apply's step 5, the activation supersede): `Ok` when the parent folder took a probe entry.
+/// Probe whether `app_root`'s parent directory is writable for an update swap.
 pub(crate) fn install_location_check(app_root: &Path) -> Result<(), String> {
     install_location_verdict(app_root, bundle::probe_parent_write(app_root))
 }
@@ -2401,7 +2393,7 @@ fn preverify_installed_rollback_source_with(
     }
 }
 
-/// What a fresh cached pass cannot vouch for when the candidate is the installed activation `build`: the operator floor ([`handoff_apply_floor_refusal_at`]), and that the install path still holds it (another window's retire, `supersede_installed_activation`, may have put the running build back since).
+/// Check whether a cached pre-verification pass for an installed activation `build` is still valid against the operator floor and current install path.
 pub(crate) fn handoff_activation_cached_pass_refusal_at(
     staging: &Staging,
     build: u64,
@@ -2423,7 +2415,7 @@ pub(crate) fn handoff_activation_cached_pass_refusal_at(
     }
 }
 
-/// The operator apply floor, as a handoff to `build` must respect it: `Some(refusal)` when `build` is below the floor (a yank the swap's gate 4b would answer by retiring the stage and leaving the successor the old build), or when the staged marker for `build` was signed by a machine a roster has since revoked.
+/// Check whether `build` or its signing machine violates the operator apply floor.
 pub(crate) fn handoff_apply_floor_refusal_at(staging: &Staging, build: u64) -> Option<String> {
     let marker = Ready::read(&staging.ready).filter(|ready| ready.build_number == build);
     handoff_floor_refusal(
@@ -2456,7 +2448,7 @@ fn handoff_floor_refusal(staging: &Staging, build: u64, machine: Option<&str>) -
     })
 }
 
-/// What a cached pass cannot vouch for, asked by a worker that skips the staged candidate's full pre-verification on it: `Some(refusal)` unless the stage the pass was cached for — `build` at `commit` — is still the published one, not quarantined, and admitted by the floor ([`handoff_floor_refusal`], for the signer of the marker it read).
+/// Check whether a cached pre-verification pass for staged `build` at `commit` still matches the published, unquarantined, floor-admitted stage.
 pub(crate) fn handoff_cached_pass_refusal_at(
     staging: &Staging,
     build: u64,
@@ -2701,13 +2693,12 @@ impl StageIncoming {
 
 impl Drop for StageIncoming {
     fn drop(&mut self) {
-        // Only an EMPTY reservation can go. A retained candidate keeps its exact
-        // path even after this stage returns; there is no assessment-end receipt.
+        // Remove only an empty reservation; a retained candidate keeps its path across assessment.
         let _ = std::fs::remove_dir(&self.path);
     }
 }
 
-/// Stages a verified copy of the bundle from a downloaded (SHA-256-checked) DMG: mount, `ditto` the `.app` out, verify it (codesign/Team ID/spctl), publish `staged/aterm.app`, and write `ready.toml` last, atomically, so a reader never sees a half-staged bundle.
+/// Mount `dmg`, copy out `aterm.app`, verify its signature and identity, and atomically publish `staged/aterm.app` and `ready.toml`.
 pub fn stage_from_dmg(
     staging: &Staging,
     dmg: &Path,
@@ -3268,11 +3259,11 @@ fn boot_apply_refusal_reason(outcome: &ApplyOutcome) -> Option<&str> {
 /// What a launch's boot does with a ready stage, by its image class ([`crate::ImageReplacement`]); [`boot_image_lane`] decides it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BootImageLane {
-    /// Swap the stage in and exec the build it installed (steps 3–10).
+    /// Swap the stage in and exec the build it installed.
     SwapAndExec,
-    /// Leave the admitted stage for the window's automatic in-session lane, with this launch on the left-stage record ([`left_stage_path`]) that the escape counts: nothing verified, swapped or exec'd ([`ApplyOutcome::LeftForSession`]).
+    /// Leave the admitted stage for the window's automatic in-session lane and record this launch ([`ApplyOutcome::LeftForSession`]).
     LeaveForSession,
-    /// Leave it for a person's press (`[update] auto_apply = false`): nothing verified, swapped or exec'd, and nothing recorded, since a launch that ends waiting for a press is the design and no evidence that a lane cannot land the stage.
+    /// Leave the stage for a manual install (`[update] auto_apply = false`) without recording an escape count.
     LeaveForPress,
     /// Swap nothing: a LaunchServices-launched successor, whose parent swapped first.
     NeverSwap,
@@ -3682,10 +3673,7 @@ fn swap_admitted_stage(
     let previous_receipt = previous_receipt_for_sealed_old(staging, old_build, &old_commit);
 
     if let Err(error) = (seams.probe)(&prepared.fixed, ready.build_number) {
-        // A probe that started the candidate and was killed before it exited leaves
-        // macOS assessing its first exec, which the kill does not end: the candidate
-        // stays exactly where it ran ([`keep_unproven_candidate`]). Any other failure
-        // either ran it to an exit or never started it, and is backed out as before.
+        // Keep a candidate whose start probe was killed mid-exec at its path while macOS finishes assessing it ([`keep_unproven_candidate`]).
         if probe_left_unproven(&error) {
             keep_unproven_candidate(&prepared, staging, unix_now_secs());
         } else {
@@ -3875,7 +3863,7 @@ fn record_left_launch(
     Ok(())
 }
 
-/// The parent's half of a LaunchServices-launched handoff: swap the stage the attempt authorizes (`expected`) into the install before asking LaunchServices for the successor, so the process it starts is already NEW and never replaces its own image (an `execve` some hundred milliseconds after a LaunchServices launch leaves LaunchServices answering pid -1 for the app for the rest of its life).
+/// Swap the stage authorized by `expected` into the install path before launching a successor via LaunchServices.
 pub(crate) fn swap_staged_for_launch(
     current_build: u64,
     current_commit: &str,
@@ -4863,7 +4851,7 @@ fn write_trial_launch_stamp(stamp: &Path, launch: TrialLauncher) -> std::io::Res
     file.write_all(format!("{} {} {}\n", name.pid, name.started.0, name.started.1).as_bytes())
 }
 
-/// The launch `stamp` names ([`write_trial_launch_stamp`]), or `None` when there is none, it is not a regular file, or it is not exactly one name: nothing is given back by it, and a launch it counted stays counted.
+/// Read the [`LaunchName`] recorded at `stamp` ([`write_trial_launch_stamp`]), or `None` if absent or malformed.
 pub(crate) fn read_trial_launch_stamp(stamp: &Path) -> Option<LaunchName> {
     use std::os::unix::fs::OpenOptionsExt as _;
 
@@ -5481,7 +5469,7 @@ fn records_unreadable_deferral(
     ApplyOutcome::Deferred(refusal)
 }
 
-/// The swap's gates on the stage it read under the apply lock, in order: the artifact a seamless handoff's parent authorized (`expected`, [`expected_artifact_refusal`], which refuses and retires nothing), the floor's withdrawals (4b, 4c: [`floor_withdrawal_gate`], which retire), the crash-loop quarantine (retired), a marker that no longer names the published stage (retired), and the age of its roster confirmation (4d: [`roster_freshness_gate`], which waits).
+/// Check the admission gates for a stage read under the apply lock: expected handoff artifact, floor withdrawals, quarantine, published bundle match, and roster freshness.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -5568,7 +5556,7 @@ fn roster_freshness_gate(ready: &Ready, now: u64) -> Option<ApplyOutcome> {
         .map(ApplyOutcome::Deferred)
 }
 
-/// Record that a check confirmed `staged` against a roster it admitted, which it began reading at `confirmed_at` (RFC3339): the marker's [`Ready::roster_confirmed_at`] moves to that instant, so gate 4d and the pre-park checks admit it for another [`crate::manifest::ROSTER_FRESHNESS_SECS`], and a standing apply refusal that waited for this is withdrawn from the ledger.
+/// Record that `staged` was re-confirmed against an admitted roster at `confirmed_at` (RFC3339) and withdraw any stale-roster apply refusal.
 pub(crate) fn confirm_roster_authorization(
     staging: &Staging,
     staged: &Ready,

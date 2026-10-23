@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// Where one clipboard read or write goes ([`route`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ClipboardRoute {
-    /// The platform clipboard: `NSPasteboard`, the X11 / Wayland selections, the Win32 clipboard.
+    /// The platform clipboard.
     System,
     /// `ATERM_DEBUG_CLIPBOARD_FILE=<path>`.
     File(PathBuf),
@@ -119,7 +119,7 @@ fn board_paste(board: &'static TestBoard) -> Option<String> {
         .filter(|text| !text.is_empty())
 }
 
-/// Place `text` on the clipboard; returns whether it was placed.
+/// Place `text` on the clipboard.
 pub(crate) fn pbcopy(text: &str) -> bool {
     match route() {
         ClipboardRoute::System => system_pbcopy(text),
@@ -135,11 +135,7 @@ fn system_pbcopy(text: &str) -> bool {
         use aterm_objc::{Id, Sel, autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
-        // thread; `-clearContents` is `-(NSInteger)` (result discarded) and takes
-        // ownership before writing, per the documented protocol;
-        // `-setString:forType:` is `-(BOOL)(NSString *, NSPasteboardType)`, the
-        // type is an `NSString *`, and both arguments outlive the call.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
         autoreleasepool(|_| unsafe {
             let Some(ns) = appkit::nsstring(text) else {
                 return false;
@@ -182,8 +178,7 @@ fn system_pbcopy(text: &str) -> bool {
 /// `NSPasteboardTypeString`, the UTF-8 plain-text pasteboard type.
 #[cfg(target_os = "macos")]
 fn pasteboard_type_string() -> aterm_objc::Id {
-    // SAFETY: AppKit exports this as an immortal `NSString *` constant; reading
-    // the symbol is a load, and the object it names outlives the process.
+    // SAFETY: AppKit exports this as an immortal `NSString *` constant.
     #[link(name = "AppKit", kind = "framework")]
     unsafe extern "C" {
         static NSPasteboardTypeString: *mut std::ffi::c_void;
@@ -208,9 +203,7 @@ fn system_pbpaste() -> Option<String> {
         use aterm_objc::{autoreleasepool, class, sel};
 
         use crate::appkit;
-        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any
-        // thread; `-stringForType:` is `-(NSString *)(NSPasteboardType)` and
-        // returns a borrowed string, copied out to Rust inside this pool.
+        // SAFETY: `+generalPasteboard` is `-(id)`, a valid singleton on any thread.
         let s = autoreleasepool(|_| unsafe {
             let pb = appkit::send_id(class(c"NSPasteboard").as_id(), sel!(generalPasteboard));
             if pb.is_null() || pasteboard_type_string().is_null() {

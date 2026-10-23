@@ -11,20 +11,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use aterm_json::Value;
 use aterm_primer::CLAUDE_TOP_EFFORT_KEY;
 
-/// How much of a transcript's end one read window takes; one turn with a large tool result can be hundreds of KiB.
+/// How much of a transcript's end one read window takes.
 pub const TAIL_BYTES: u64 = 512 * 1024;
 
-/// Longest transcript line [`tail_facts`] will parse. A row past this is a
-/// tool result, never a model or effort carrier worth a large parse.
 const MAX_LINE_BYTES: usize = 256 * 1024;
 
-/// Longest `sessions/<pid>.json` read: the file is a few hundred bytes.
 const MAX_SESSION_FILE_BYTES: u64 = 64 * 1024;
 
-/// How many directories [`git_head`] climbs looking for `.git`.
 const MAX_GIT_CLIMB: usize = 64;
 
-/// Longest `HEAD` or `.git` file read: both are one short line.
 const MAX_GIT_FILE_BYTES: u64 = 4096;
 
 /// The mark before model + effort.
@@ -50,7 +45,7 @@ pub const RESET_MARK: char = '\u{267B}';
 /// The mark before a live upgrade that waits on the person at this composer ([`UpgradeNote`]).
 pub const UPGRADE_MARK: char = '\u{21E3}';
 
-/// Most transcript bytes one [`FooterCache::usage`] folds, so a long session catches up over several reads without holding the resolver thread.
+/// Most transcript bytes one [`FooterCache::usage`] folds.
 pub const FOLD_BUDGET: u64 = 64 * 1024 * 1024;
 
 /// The pitch the facts are set at, in cells ([`set_facts`]).
@@ -62,7 +57,7 @@ pub const GAP: f32 = 3.0;
 /// The steps a cell is divided into for a fact glyph's sideways move ([`SetGlyph::nudge`]).
 pub const NUDGES_PER_CELL: i8 = 16;
 
-/// Rule glyphs left at the left end of the run aterm writes into ([`rule_run`]), so the rule still reads as a rule however much it carries.
+/// Rule glyphs left at the left end of the run aterm writes into ([`rule_run`]).
 pub const RULE_LEAD: usize = 3;
 
 /// Rule glyphs between the lights and the facts, when both are drawn.
@@ -75,7 +70,7 @@ pub struct SessionEntry {
     pub session_id: String,
     /// The directory the session runs in.
     pub cwd: PathBuf,
-    /// The running build's version, as Claude Code records it (`2.1.283`), when the file carries one.
+    /// The running build's version, as Claude Code records it (`2.1.283`).
     pub version: Option<String>,
     /// The process's start (unix seconds), from the file's `procStart`.
     pub proc_start: Option<u64>,
@@ -99,11 +94,11 @@ pub struct FooterFacts {
     pub model: Option<String>,
     /// The effort level (`xhigh`).
     pub effort: Option<String>,
-    /// Where the session's Bash tool stands, else its launch directory, home shown as `~` (`~/aterm`).
+    /// Where the session's Bash tool stands, else its launch directory, home shown as `~`.
     pub path: Option<String>,
     /// The checked-out branch, or a short commit id when HEAD is detached.
     pub branch: Option<String>,
-    /// The working directory when the repository read failed with `EPERM` (macOS folder privacy consent).
+    /// The working directory when the repository read failed with `EPERM`.
     pub repo_read_denied: Option<PathBuf>,
     /// The Claude Code build this process runs (`2.1.283`).
     pub version: Option<String>,
@@ -111,21 +106,21 @@ pub struct FooterFacts {
     pub resume: Option<String>,
     /// The session's usage ([`super::session_usage`]); only [`FooterCache::usage`] fills it.
     pub usage: Option<super::session_usage::UsageFacts>,
-    /// Nothing since the process started decided the model — no answer, no model result, no `--model`: its launch card may name it.
+    /// Nothing since the process started decided the model.
     pub model_open: bool,
     /// Nothing since the process started decided the effort.
     pub effort_open: bool,
-    /// While [`Self::effort_open`]: the model a launch card must name for its effort to count, set when a model switch named no effort.
+    /// While [`Self::effort_open`].
     pub effort_for: Option<String>,
     /// Whose facts these are, when the registry named a session.
     pub owner: Option<FactsOwner>,
-    /// The live upgrade waiting on the person here, in the words the composer now calls for ([`UpgradeNote::words`]).
+    /// The live upgrade waiting on the person here, in the words the composer now calls for.
     pub upgrade: Option<UpgradeWords>,
-    /// The roster's label for the login this process runs under ([`super::accounts::footer_label`]: only where two or more accounts are listed).
+    /// The roster's label for the login this process runs under.
     pub account: Option<String>,
-    /// What the newest statement since the process started says of the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]).
+    /// What the newest statement since the process started says of the top-effort key.
     pub top_effort: Option<bool>,
-    /// The facts the person hid in this session by a click (hidden facts read as a greyed `off`, [`fact_segments`]).
+    /// The facts the person hid in this session by a click.
     pub off: FactMask,
     /// Volatile email, subscription and weekly quota from the selected process's own profile.
     pub subscription: Option<super::profile::SubscriptionDisplay>,
@@ -153,8 +148,6 @@ pub enum FactKind {
 }
 
 impl FactKind {
-    /// Its bit in a [`FactMask`]: none for [`FactKind::Usage`], which the
-    /// `[claude_footer] usage` switch alone hides.
     const fn bit(self) -> u8 {
         match self {
             Self::Model => 1,
@@ -166,7 +159,7 @@ impl FactKind {
         }
     }
 
-    /// The mark its segment leads with; none for the effort, which shares the model's (`◆ Opus 5.5 xhigh`).
+    /// The mark its segment leads with; none for the effort, which shares the model's.
     #[must_use]
     pub const fn mark(self) -> Option<char> {
         match self {
@@ -180,7 +173,7 @@ impl FactKind {
     }
 }
 
-/// A set of hidden facts ([`FooterFacts::off`]): the model, the effort, the path, the branch and the context, each on its own.
+/// A set of hidden facts ([`FooterFacts::off`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct FactMask(u8);
 
@@ -234,7 +227,7 @@ pub struct UpgradeWords {
     pub short: String,
 }
 
-/// What the footer says of a live upgrade that waits only on the person at this composer (`upgrade_status::Row::pause_note`).
+/// What the footer says of a live upgrade that waits only on the person at this composer.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct UpgradeNote {
     /// While the composer holds no draft: `… waits while you use this tab`.
@@ -258,25 +251,22 @@ impl UpgradeNote {
 /// What the process's own command line says ([`launch_facts`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct LaunchFacts {
-    /// The model `--model` names, only when it is a real id (`claude-opus-5-5`); an alias resolves per account and build.
+    /// The model `--model` names, only when it is a real id (`claude-opus-5-5`).
     pub model: Option<String>,
-    /// The model is pinned from launch: any `--model`, or an environment pin (`ANTHROPIC_MODEL`, `ANTHROPIC_DEFAULT_<FAMILY>_MODEL`).
+    /// The model is pinned from launch: any `--model`, or an environment pin.
     pub pinned: bool,
-    /// The conversation the launch resumed (`--resume`, `--continue`), when it resumed one ([`LaunchResume`]).
+    /// The conversation the launch resumed (`--resume`, `--continue`), when it resumed one.
     pub resume: Option<LaunchResume>,
-    /// The `CLAUDE_CONFIG_DIR` the process's environment at exec named, raw (set and empty is `Some("")`).
+    /// The `CLAUDE_CONFIG_DIR` the process's environment at exec named, raw.
     pub config: Option<String>,
 }
 
 /// The conversation a process's launch resumed ([`crate::harness::upgrade::launch_resume`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LaunchResume {
-    /// `--resume <id>` / `-r <id>`: the process's first session is the
-    /// conversation it names.
+    /// `--resume <id>` / `-r <id>`: the process's first session is the conversation it names.
     Session(String),
-    /// A resume that names no conversation the process keeps: `--continue`,
-    /// `-c`, a bare `--resume` (Claude's picker), or any resume with
-    /// `--fork-session` (the conversation takes a new id).
+    /// A resume that names no conversation the process keeps.
     Unnamed,
 }
 
@@ -286,7 +276,7 @@ pub fn launch_facts(argv: &[String]) -> LaunchFacts {
     launch_facts_of(argv, &[])
 }
 
-/// [`launch_facts`], and whether the process's environment at exec (`env`, `KEY=value` entries) pins its model ([`LaunchFacts::pinned`]).
+/// [`launch_facts`], and whether the process's environment at exec (`env`, `KEY=value` entries) pins its model.
 #[must_use]
 pub fn launch_facts_of(argv: &[String], env: &[String]) -> LaunchFacts {
     let flag = crate::harness::upgrade::launch_model(argv);
@@ -345,9 +335,6 @@ impl Segment {
         }
     }
 
-    /// Its mark and the part of its text a value shows, its stubs left
-    /// out: what a reason never takes the room of compares by this
-    /// ([`same_top`]).
     fn shown_part(&self) -> (char, &str) {
         let text = self.text.as_str();
         let shown = match (self.split, self.quiet) {
@@ -364,7 +351,7 @@ impl Segment {
 /// What a hidden fact says after its greyed value.
 pub const OFF_STUB: &str = "off";
 
-/// The Claude Code directory of one process, resolved from `config_dir` (`CLAUDE_CONFIG_DIR`), `home` (`HOME`), and `cwd` (`upgrade_drive::claude_home_dir`).
+/// The Claude Code directory of one process, resolved from `config_dir` (`CLAUDE_CONFIG_DIR`), `home` (`HOME`), and `cwd`.
 pub fn claude_dir_of(
     config_dir: Option<&str>,
     home: Option<&str>,
@@ -381,8 +368,6 @@ pub fn claude_dir_of(
     )
 }
 
-/// Open `path` for reading, non-blocking, so a FIFO planted where a `HEAD`
-/// or a transcript should be cannot park the reader thread forever.
 fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -394,8 +379,6 @@ fn open_nonblocking(path: &Path) -> std::io::Result<File> {
     options.open(path)
 }
 
-/// `file` if it is a regular file, judged on the open handle (no
-/// check-then-open race).
 fn regular(file: File) -> Option<File> {
     file.metadata().ok()?.is_file().then_some(file)
 }
@@ -405,7 +388,6 @@ pub(crate) fn open_regular(path: &Path) -> Option<File> {
     regular(open_nonblocking(path).ok()?)
 }
 
-/// At most `cap` bytes of `file`, as text.
 fn read_capped(file: File, cap: u64) -> Option<String> {
     let mut text = String::new();
     file.take(cap).read_to_string(&mut text).ok()?;
@@ -417,7 +399,7 @@ pub(crate) fn read_small(path: &Path, cap: u64) -> Option<String> {
     read_capped(open_regular(path)?, cap)
 }
 
-/// The registry entry for Claude Code process `pid`, or `None` when that pid is not a Claude Code session (or its file cannot be read).
+/// The registry entry for Claude Code process `pid`, or `None` when that pid is not a Claude Code session.
 pub fn session_of_pid(claude_dir: &Path, pid: u32, started: Option<u64>) -> Option<SessionEntry> {
     let path = claude_dir.join("sessions").join(format!("{pid}.json"));
     #[cfg(test)]
@@ -460,13 +442,12 @@ pub fn parse_session_entry(text: &str, pid: u32, started: Option<u64>) -> Option
     })
 }
 
-/// Whether `s` has the shape of a Claude Code session id — the transcript's file stem, so letters, digits and `-` only.
+/// Whether `s` has the shape of a Claude Code session id — the transcript's file stem.
 #[must_use]
 pub fn is_session_id(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
-/// Runs of whitespace collapsed to one space, ends trimmed.
 fn squash(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
@@ -539,7 +520,7 @@ pub fn sole_transcript_path(claude_dir: &Path, entry: &SessionEntry) -> Option<P
     found.next().is_none().then_some(one)
 }
 
-/// What the last [`TAIL_BYTES`] of the transcript at `path` say about the model and effort, counting only rows written no earlier than `since` ([`tail_facts`]).
+/// What the last [`TAIL_BYTES`] of the transcript at `path` say about the model and effort, counting only rows written no earlier than `since`.
 pub fn read_tail_facts(path: &Path, since: Option<u64>) -> Option<TailFacts> {
     Some(tail_facts(&read_tail(path)?, since))
 }
@@ -554,8 +535,6 @@ const MAX_APPEND_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(unix)]
 const GUARD_BYTES: u64 = 4096;
 
-/// How far back from its end a transcript is read afresh for a fact the
-/// newest rows do not decide ([`TailCache`]).
 const MAX_BACK_BYTES: u64 = 16 * 1024 * 1024;
 
 /// The resolver's per-session transcript memo, keyed by process and image start.
@@ -690,7 +669,6 @@ impl TailKey {
 }
 
 impl TailCache {
-    /// [`Self::read_since`]'s facts alone.
     fn read(
         &mut self,
         path: &Path,
@@ -724,7 +702,6 @@ impl TailCache {
         read
     }
 
-    /// [`Self::read_since`], before its excerpts are kept.
     fn read_tail_since(
         &mut self,
         path: &Path,
@@ -777,11 +754,6 @@ impl TailCache {
         Some(facts)
     }
 
-    /// The transcript read afresh, newest first, a [`TAIL_BYTES`] window at a
-    /// time, until both facts are decided, a row before the floor is met, the
-    /// file's start, or [`MAX_BACK_BYTES`] — so an answer above one huge row
-    /// (a pasted image, a large tool result) is still found, however the
-    /// reads fell between them.
     fn read_fresh(
         &mut self,
         file: &mut File,
@@ -980,16 +952,12 @@ impl TailCache {
         self.len
     }
 
-    /// What this cache keeps of the process (`pid`, `started`, `floor`).
     fn process_of(&self, pid: u32, started: Option<u64>, floor: u64) -> Option<&ProcessFacts> {
         self.process
             .as_ref()
             .filter(|p| p.pid == pid && p.started == started && p.floor == floor)
     }
 
-    /// The floor under `session`'s rows that speak for the process: its own
-    /// floor at first sight, or, in a session it switched into, the moment it
-    /// was last seen in the session it left (never below the floor).
     fn session_floor(&self, pid: u32, started: Option<u64>, floor: u64, session: &str) -> u64 {
         match self.process_of(pid, started, floor) {
             Some(p) if p.session == session => p.session_floor,
@@ -1074,8 +1042,6 @@ impl TailCache {
     }
 }
 
-/// The facts a restore leaves: the restored model, with the effort open for
-/// that model only ([`TailFacts::over`]), or unknown if the model is unreadable.
 fn restored_facts(model: Said) -> TailFacts {
     let effort_for = model.shown().map(str::to_owned);
     TailFacts {
@@ -1090,8 +1056,6 @@ fn restored_facts(model: Said) -> TailFacts {
     }
 }
 
-/// How [`TailCache::for_process`] reads a session switch of one process, or
-/// its first sight of it.
 struct Switch<L, R> {
     /// When this read happened (unix seconds, the wall clock): from now on,
     /// when the process was last seen in the current session.
@@ -1121,9 +1085,6 @@ enum Row<'a> {
     Oversized(&'a [u8]),
 }
 
-/// Every row of the transcript at `path`, newest first, a [`TAIL_BYTES`]
-/// window at a time, until `visit` breaks, the file's start, or
-/// [`MAX_BACK_BYTES`].
 fn rows_back(
     path: &Path,
     mut visit: impl FnMut(Row<'_>) -> std::ops::ControlFlow<()>,
@@ -1177,9 +1138,6 @@ fn rows_back(
     }
 }
 
-/// Whether the transcript at `path` holds, since `floor`, a model choice by
-/// the process: a `/model` command row or a `/fast` result that moved the
-/// model.
 fn chose_model_since(path: &Path, floor: u64) -> bool {
     use crate::harness::upgrade_models::{ModelResultKind, model_result_of};
     use std::ops::ControlFlow::{Break, Continue};
@@ -1226,12 +1184,8 @@ fn chose_model_since(path: &Path, floor: u64) -> bool {
     chose
 }
 
-/// How much of a transcript's head [`head_stamp`] reads: its first rows
-/// are a few short ones (`mode`, `permission-mode`, the first system row).
 const HEAD_BYTES: u64 = 64 * 1024;
 
-/// The stamp of the first stamped row among the whole rows of the file's first
-/// [`HEAD_BYTES`].
 fn head_stamp(file: &mut File, own_rows: bool) -> Option<u64> {
     let head = read_range(file, 0, HEAD_BYTES)?;
     let whole = if head.len() as u64 == HEAD_BYTES {
@@ -1261,18 +1215,12 @@ fn head_stamp(file: &mut File, own_rows: bool) -> Option<u64> {
         })
 }
 
-/// Whether the transcript at `path` began before `floor` ([`head_stamp`]): a
-/// conversation older than the process, which it resumed.
 fn began_before(path: &Path, floor: u64) -> bool {
     open_regular(path)
         .and_then(|mut file| head_stamp(&mut file, false))
         .is_some_and(|at| at < floor)
 }
 
-/// Whether the transcript at `path` existed before `moment` (the last sighting
-/// in the session switched out of): created before it, where the filesystem
-/// keeps a birth time, or its first own main-chain row ([`head_stamp`]) is
-/// older.
 fn existed_before(path: &Path, moment: u64) -> bool {
     let Some(mut file) = open_regular(path) else {
         return false;
@@ -1286,8 +1234,6 @@ fn existed_before(path: &Path, moment: u64) -> bool {
     born.is_some_and(|at| at < moment) || head_stamp(&mut file, true).is_some_and(|at| at < moment)
 }
 
-/// The top-level stamp at an oversized row's end: the last `"timestamp":"…"`
-/// in `part`.
 fn last_stamp(part: &[u8]) -> Option<u64> {
     const KEY: &[u8] = b"\"timestamp\":\"";
     let at = part.windows(KEY.len()).rposition(|w| w == KEY)? + KEY.len();
@@ -1298,27 +1244,18 @@ fn last_stamp(part: &[u8]) -> Option<u64> {
         .and_then(crate::harness::upgrade_models::parse_utc)
 }
 
-/// At first sight: when the transcript is a conversation resumed from before
-/// `floor` (`met_before`, or [`began_before`]), the model Claude restores
-/// ([`conversation_model`]); `None` otherwise or with no answer to restore.
 fn resumed_model(path: &Path, floor: u64, met_before: bool) -> Option<Said> {
     (met_before || began_before(path, floor))
         .then(|| conversation_model(path, floor))
         .flatten()
 }
 
-/// At a switch after `moment`: when the transcript existed before it
-/// ([`existed_before`]), the model Claude restored ([`conversation_model`]);
-/// `None` for a created session or no answer to restore.
 fn resumed_since(path: &Path, moment: u64) -> Option<Said> {
     existed_before(path, moment)
         .then(|| conversation_model(path, moment))
         .flatten()
 }
 
-/// The model a resumed conversation last answered with before `before`, read as
-/// Claude reads it: the newest main-chain `assistant` row, not meta, whose
-/// model is not `<synthetic>`.
 fn conversation_model(path: &Path, before: u64) -> Option<Said> {
     use std::ops::ControlFlow::{Break, Continue};
     let mut found = None;
@@ -1381,13 +1318,13 @@ fn conversation_model(path: &Path, before: u64) -> Option<Said> {
 /// The directories beside one read's facts ([`FooterCache::dirs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FactDirs {
-    /// Where the session's Bash tool stands, else its launch directory: the directory the path fact shows, absolute.
+    /// Where the session's Bash tool stands, else its launch directory.
     pub cwd: PathBuf,
-    /// Its repository's root ([`GitHeadRead::Found`]), when it is in one the branch read could read.
+    /// Its repository's root ([`GitHeadRead::Found`]).
     pub repo_root: Option<PathBuf>,
 }
 
-/// The resolver's per-session usage fold ([`super::session_usage::SessionUsage`]), so each read folds only what was appended.
+/// The resolver's per-session usage fold ([`super::session_usage::SessionUsage`]).
 #[derive(Debug)]
 pub struct FooterCache {
     usage: Option<super::session_usage::SessionUsage>,
@@ -1428,16 +1365,13 @@ impl Default for FooterCache {
     }
 }
 
-/// The main transcript's newest limit-notice row per window, and the newest
-/// response served in any of the session's files
-/// ([`super::session_usage::wall_of`]'s two readings).
 type WallBasis = (
     std::collections::BTreeMap<String, super::usage::LimitNoticeRow>,
     Option<i64>,
 );
 
 impl FooterCache {
-    /// The usage of the conversation in `transcript` (the one the same registry read named, [`read_pid`]), folded on from the last read unless no file moved ([`super::session_usage::SessionUsage::moved`]).
+    /// The usage of the conversation in `transcript` (the one the same registry read named, [`read_pid`]), folded on from the last read unless no file moved.
     pub fn usage(
         &mut self,
         transcript: Option<PathBuf>,
@@ -1466,7 +1400,6 @@ impl FooterCache {
         self.shown(now, offset_at)
     }
 
-    /// What the fold as last read shows at `now`.
     fn shown(
         &self,
         now: i64,
@@ -1504,7 +1437,7 @@ impl FooterCache {
         }
     }
 
-    /// Everything the step tap queued since the last take, and the main chain's end; an empty batch while it is not armed.
+    /// Everything the step tap queued since the last take, and the main chain's end.
     pub fn take_steps(&mut self) -> super::steps::StepBatch {
         let mut batch = self
             .steps
@@ -1585,21 +1518,19 @@ impl FooterCache {
             .map(|usage| (self.dropped, usage.flight_generation()))
     }
 
-    /// What moves whenever [`Self::traffic`] would, under the same rule (`None` until the fold has caught up).
+    /// What moves whenever [`Self::traffic`] would, under the same rule.
     #[must_use]
     pub fn traffic_generation(&self) -> Option<(u64, u64)> {
         self.caught_up_usage()
             .map(|usage| (self.dropped, usage.traffic_generation()))
     }
 
-    /// The fold, once its last refresh caught up.
     fn caught_up_usage(&self) -> Option<&super::session_usage::SessionUsage> {
         self.refreshed
             .filter(|refresh| refresh.caught_up)
             .and(self.usage.as_ref())
     }
 
-    /// Drop the fold and what was read from it.
     fn forget(&mut self) {
         if self.usage.take().is_some() {
             self.dropped = self.dropped.wrapping_add(1);
@@ -1609,7 +1540,6 @@ impl FooterCache {
     }
 }
 
-/// The whole rows in the last [`TAIL_BYTES`] of the transcript at `path`.
 fn read_tail(path: &Path) -> Option<Vec<u8>> {
     let mut file = open_regular(path)?;
     let len = file.metadata().ok()?.len();
@@ -1625,13 +1555,10 @@ fn read_tail(path: &Path) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
-/// Bytes `from..to` of `file` (fewer, if it shrank meanwhile).
 fn read_range(file: &mut File, from: u64, to: u64) -> Option<Vec<u8>> {
     read_range_then(file, from, to, &[])
 }
 
-/// Bytes `from..to` of `file` (fewer if it shrank), then `then`, in one buffer
-/// sized for both.
 fn read_range_then(file: &mut File, from: u64, to: u64, then: &[u8]) -> Option<Vec<u8>> {
     file.seek(SeekFrom::Start(from)).ok()?;
     let want = to.saturating_sub(from);
@@ -1644,10 +1571,9 @@ fn read_range_then(file: &mut File, from: u64, to: u64, then: &[u8]) -> Option<V
     Some(bytes)
 }
 
-/// How many `sessions/<pid>.json` files [`shell_cwds`] reads at most.
 const MAX_SESSION_FILES: usize = 256;
 
-/// Where the Bash tool of each live Claude Code session launched in `launch` stands, per its transcript ([`last_cwd`]).
+/// Where the Bash tool of each live Claude Code session launched in `launch` stands, per its transcript.
 pub fn shell_cwds(claude_dir: &Path, launch: &Path) -> Vec<PathBuf> {
     let Ok(dir) = std::fs::read_dir(claude_dir.join("sessions")) else {
         return Vec::new();
@@ -1687,9 +1613,6 @@ pub fn last_cwd(body: &[u8]) -> Option<PathBuf> {
     last_cwd_since(rows_of(body), None)
 }
 
-/// [`last_cwd`] of `rows` ([`rows_of`]) since `since` (unix seconds, the
-/// process's floor as [`scan`] takes it): a row stamped before it ends the
-/// search, and an unstamped row is skipped.
 fn last_cwd_since<'a>(
     rows: impl IntoIterator<Item = &'a str>,
     since: Option<u64>,
@@ -1731,12 +1654,10 @@ fn last_cwd_since<'a>(
 /// What the transcript since the process started says about one of the footer's facts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub enum Said {
-    /// Nothing since the start names it: the launch flag or the launch card
-    /// may ([`facts_for_entry_at`]).
+    /// Nothing since the start names it: the launch flag or the launch card may.
     #[default]
     Unsaid,
-    /// The newest statement is one this build cannot read (an unparsed `/model`
-    /// result, effort `auto`): unknown, and nothing older stands in.
+    /// The newest statement is one this build cannot read.
     Unread,
     /// The newest statement names it, as the footer shows it.
     Is(String),
@@ -1772,9 +1693,6 @@ pub struct TailFacts {
 }
 
 impl TailFacts {
-    /// `self` (newer rows) over `older`: what the newer rows decided stands,
-    /// and a switch in them that named no effort takes the older effort only
-    /// when the older rows' model is the one it switched to.
     fn over(self, older: Self) -> Self {
         let (effort, effort_for) = match self.effort_for {
             None if self.effort.decided() => (self.effort, None),
@@ -1811,13 +1729,10 @@ impl TailFacts {
         }
     }
 
-    /// Nothing older can change what these rows say.
     const fn settled(&self) -> bool {
         self.model.decided() && self.effort.decided() && self.effort_for.is_none()
     }
 
-    /// A row naming the model in force (`said`), met newest first: sets the
-    /// model if nothing newer did, and settles a newer effort-less switch.
     fn meet_model(&mut self, said: Said) {
         if let Some(to) = self.effort_for.take()
             && said != Said::Is(to)
@@ -1829,7 +1744,6 @@ impl TailFacts {
         }
     }
 
-    /// The effort, decided by a row with no model of its own.
     fn decide_effort(&mut self, said: Said) {
         if said == Said::Unread {
             self.effort_for = None;
@@ -1838,19 +1752,12 @@ impl TailFacts {
     }
 }
 
-/// The row Claude Code writes when a `/model` choice is made: a `type:user` row
-/// whose `message.content` starts with this tag; its result is the next such
-/// row ([`COMMAND_STDOUT`]).
 const MODEL_COMMAND: &str = "<command-name>/model</command-name>";
 
-/// The row Claude Code writes for an `/effort` command, its result after it.
 const EFFORT_COMMAND: &str = "<command-name>/effort</command-name>";
 
-/// The tag every local command's row opens with (`/model`, `/effort`,
-/// `/fast`, …): a command's result is the row directly under it.
 const COMMAND_NAME: &str = "<command-name>";
 
-/// The tag a local command's result row opens with.
 const COMMAND_STDOUT: &str = "<local-command-stdout>";
 
 /// The effort levels the footer names, as `/effort` takes them.
@@ -1909,7 +1816,6 @@ enum EffortSaid {
 }
 
 impl EffortSaid {
-    /// The effort it decides, if any.
     fn effort(&self) -> Option<Said> {
         match self {
             Self::Level { said, .. } => Some(said.clone()),
@@ -1918,7 +1824,6 @@ impl EffortSaid {
         }
     }
 
-    /// The key's state it says, if any.
     const fn top(&self) -> Option<bool> {
         match self {
             Self::Level { top, .. } => *top,
@@ -1928,9 +1833,6 @@ impl EffortSaid {
     }
 }
 
-/// `text` past a head naming the top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]),
-/// compared without case: the vendor writes it capitalised at the start of
-/// its sentences, and the key's one spelling stays the const's.
 fn past_key(text: &str) -> Option<&str> {
     let key = CLAUDE_TOP_EFFORT_KEY.as_bytes();
     text.as_bytes()
@@ -1939,9 +1841,6 @@ fn past_key(text: &str) -> Option<&str> {
         .then(|| &text[key.len()..])
 }
 
-/// The key's state an effort result ends with (`… · <Key> off`): the text
-/// after its last ` · ` (the clauses' join, typography aterm's own rows
-/// share, so no anchor) names the key, then ` on` or ` off` as a word.
 fn key_suffix(body: &str) -> Option<bool> {
     let (_, last) = body.rsplit_once(" \u{b7} ")?;
     let rest = past_key(last)?;
@@ -1958,8 +1857,6 @@ fn key_suffix(body: &str) -> Option<bool> {
     }
 }
 
-/// The level a result's `word…` names ([`effort_level`]): `Is` it, else
-/// [`Said::Unread`] (`auto`, a level this build does not know).
 fn level_word(text: &str) -> Said {
     let word: String = text
         .chars()
@@ -1968,10 +1865,6 @@ fn level_word(text: &str) -> Said {
     effort_level(&word).map_or(Said::Unread, |level| Said::Is(level.to_owned()))
 }
 
-/// What an `/effort` result says ([`EffortSaid`]): a level ([`effort_level`];
-/// [`Said::Unread`] for `auto` or an unknown level) with the key's state where
-/// it ends with one; the key's own on or off and the level that stays; or the
-/// key refused.
 fn effort_result(content: &str) -> Option<EffortSaid> {
     use aterm_phase::anchor;
     let body = content
@@ -2083,8 +1976,6 @@ pub fn tail_facts(body: &[u8], since: Option<u64>) -> TailFacts {
     scan(&rows_of(body).collect::<Vec<_>>(), since).0
 }
 
-/// The rows of `body` a tail read scans, newest first: each whole row of at
-/// most [`MAX_LINE_BYTES`] that is UTF-8.
 fn rows_of(body: &[u8]) -> impl Iterator<Item = &str> {
     body.rsplit(|&b| b == b'\n')
         .filter(|raw| !raw.is_empty() && raw.len() <= MAX_LINE_BYTES)
@@ -2164,9 +2055,6 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
                     && !answered.effort
                     && !facts.effort.decided()
                 {
-                    // No effort result under it: an answer this build cannot
-                    // read. A refused key under it answered it and moved
-                    // nothing, so the older effort stands.
                     facts.decide_effort(Said::Unread);
                 }
                 continue;
@@ -2179,7 +2067,6 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
                 .and_then(Value::as_str)
                 .filter(|m| !m.starts_with('<') && is_word(m))
         {
-            // The model this answer ran with: its effort below is for it.
             facts.meet_model(Said::Is(model_display(model)));
         }
         if !facts.effort.decided()
@@ -2192,8 +2079,6 @@ fn scan(rows: &[&str], since: Option<u64>) -> (TailFacts, bool) {
     (facts, false)
 }
 
-/// A value safe to paint as-is: short, and only letters, digits, `-`, `.`,
-/// `_`, `[`, `]`.
 fn is_word(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 64
@@ -2241,18 +2126,14 @@ pub fn git_head(cwd: &Path) -> Option<String> {
 /// What [`read_git_head`] found for a directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GitHeadRead {
-    /// The branch, and the repository's root: the directory the climb
-    /// found `.git` in (a worktree's own, where `.git` is its file).
+    /// The branch, and the repository's root: the directory the climb found `.git` in.
     Found(String, PathBuf),
     /// Not inside a repository (or not one this bounded read can parse).
     Absent,
-    /// A read failed with `EPERM` (macOS folder privacy consent); the host
-    /// raises consent attention rather than showing nothing.
+    /// A read failed with `EPERM` (macOS folder privacy consent).
     Denied,
 }
 
-/// `EPERM`, the kernel's answer to a read a privacy consent refuses (distinct
-/// from an ordinary `EACCES` permission bit).
 fn is_eperm(error: &std::io::Error) -> bool {
     #[cfg(unix)]
     {
@@ -2265,7 +2146,7 @@ fn is_eperm(error: &std::io::Error) -> bool {
     }
 }
 
-/// Whether `path` is inside a file-provider domain of `home` (iCloud Drive, a third-party sync provider) or another app's data (`~/Library/Containers`, `~/Library/Group Containers`).
+/// Whether `path` is inside a file-provider domain of `home` (iCloud Drive, a third-party sync provider) or another app's data.
 pub(crate) fn under_file_provider_domain(home: Option<&Path>, path: &Path) -> bool {
     let Some(home) = home else {
         return false;
@@ -2281,7 +2162,6 @@ pub fn read_git_head(cwd: &Path) -> GitHeadRead {
     read_git_head_in(aterm_types::dirs::home_dir().as_deref(), cwd)
 }
 
-/// [`read_git_head`] against an explicit `home`, so a test needs no `$HOME`.
 fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
     if under_file_provider_domain(home, cwd) {
         return GitHeadRead::Absent;
@@ -2316,8 +2196,6 @@ fn read_git_head_in(home: Option<&Path>, cwd: &Path) -> GitHeadRead {
     GitHeadRead::Absent
 }
 
-/// The `HEAD` file's text (bounded, regular files only, like [`read_small`]);
-/// `Err(())` when the open was refused with `EPERM`.
 fn read_head(path: &Path) -> Result<Option<String>, ()> {
     match open_nonblocking(path) {
         Ok(file) => Ok(regular(file).and_then(|file| read_capped(file, MAX_GIT_FILE_BYTES))),
@@ -2326,8 +2204,6 @@ fn read_head(path: &Path) -> Result<Option<String>, ()> {
     }
 }
 
-/// The git directory `.git` names: itself when it is a directory, the
-/// `gitdir:` target when it is a worktree's file.
 fn resolve_git_dir_of(dot_git: &Path, meta: &std::fs::Metadata) -> Option<PathBuf> {
     if meta.is_dir() {
         return Some(dot_git.to_path_buf());
@@ -2353,8 +2229,6 @@ pub fn branch_of_head(head: &str) -> Option<String> {
     (head.len() >= 7 && head.chars().all(|c| c.is_ascii_hexdigit())).then(|| head[..7].to_owned())
 }
 
-/// A filesystem name fit for a chrome row: non-empty, at most 128 chars, no
-/// control characters.
 fn printable(name: &str) -> Option<String> {
     (!name.is_empty() && name.chars().count() <= 128 && !name.chars().any(char::is_control))
         .then(|| name.to_owned())
@@ -2369,7 +2243,7 @@ pub fn floor_of(started: Option<u64>, entry: &SessionEntry) -> Option<u64> {
     }
 }
 
-/// Everything the footer shows for process `pid` given its registry `entry` ([`session_of_pid`]) and command-line facts (`launch`, [`launch_facts`]).
+/// Everything the footer shows for process `pid` given its registry `entry` ([`session_of_pid`]) and command-line facts.
 pub fn facts_for_entry_at(
     claude_dir: &Path,
     pid: u32,
@@ -2531,13 +2405,13 @@ fn facts_for_entry_from(
     )
 }
 
-/// Claude Code's launch card, read for the footer only under a live REPL ([`live_repl_row`]) and only when it is the newest card with no user message under it (`aterm_phase::launch_card`).
+/// Claude Code's launch card, read for the footer only under a live REPL ([`live_repl_row`]) and only when it is the newest card with no user message under it.
 #[must_use]
 pub fn launch_card(rows: &[String]) -> Option<aterm_phase::LaunchCard> {
     launch_card_read(rows).map(|(_, read)| read.card)
 }
 
-/// [`launch_card`] with the reader that read it (Claude Code's, agy's or Muse Code's) and the rows it was read from ([`aterm_phase::LaunchCardRead`]).
+/// [`launch_card`] with the reader that read it (Claude Code's, agy's or Muse Code's) and the rows it was read from.
 #[must_use]
 pub fn launch_card_read(
     rows: &[String],
@@ -2697,7 +2571,7 @@ pub fn mode_row(rows: &[String]) -> Option<usize> {
     mode_row_under(rows, aterm_phase::phase::composer_bottom(rows)?)
 }
 
-/// [`mode_row`] under the composer bottom rule the caller has found (row `bottom`), so a reader that has it does not look for it again.
+/// [`mode_row`] under the composer bottom rule the caller has found (row `bottom`).
 #[must_use]
 pub fn mode_row_under(rows: &[String], bottom: usize) -> Option<usize> {
     under_composer(rows, bottom).find(|&i| is_mode_row(&rows[i]))
@@ -2709,7 +2583,6 @@ pub fn pill_row_under(rows: &[String], bottom: usize) -> Option<usize> {
     under_composer(rows, bottom).find(|&i| opens_with_pill_glyph(&rows[i]))
 }
 
-/// The rows under the composer's bottom rule `bottom`, before the first blank.
 fn under_composer(rows: &[String], bottom: usize) -> impl Iterator<Item = usize> + '_ {
     (bottom + 1..rows.len()).take_while(|&i| !rows[i].trim().is_empty())
 }
@@ -2722,7 +2595,7 @@ pub fn live_repl_row(rows: &[String]) -> Option<usize> {
         .or_else(|| under_composer(rows, bottom).find(|&i| is_bare_footer_row(&rows[i])))
 }
 
-/// Whether Claude Code's screen says its context indicator has GONE (as after `/compact`), for the context fact, which follows the indicator ([`FooterFacts::context`]).
+/// Whether Claude Code's screen says its context indicator has GONE (as after `/compact`), for the context fact.
 #[must_use]
 pub fn context_gone(rows: &[String]) -> bool {
     let Some(bottom) = aterm_phase::phase::composer_bottom(rows) else {
@@ -2761,29 +2634,18 @@ pub fn is_mode_row(row: &str) -> bool {
     })
 }
 
-/// VIM'S INSERT INDICATOR, the vendor's (anchor `vim.insert`): with the
-/// composer's vim editor mode in INSERT (`editorMode: "vim"`), Claude Code
-/// draws `-- INSERT --` dim at the mode row's head and its pill one cell
-/// after it — `  -- INSERT -- ⏵⏵ auto mode on (shift+tab to cycle)`, the
-/// indicator at column 2 and the pill at column 15, MEASURED on 2.1.304
-/// (`claude-2.1.304-top-vim-insert-120col.txt`).
 const VIM_INSERT: &str = aterm_phase::anchor_text("vim.insert");
 
-/// `row` past the lead its pill stands after: the two-space indent, and
-/// where Claude draws it, vim's INSERT indicator and its one-cell gap
-/// ([`vim_insert`]).
 fn pill_lead(row: &str) -> Option<&str> {
     let rest = row.strip_prefix("  ")?;
     Some(after_vim_insert(rest).unwrap_or(rest))
 }
 
-/// `rest` (a row past its indent) past vim's INSERT indicator and the cell
-/// after it, if it opens with them.
 fn after_vim_insert(rest: &str) -> Option<&str> {
     rest.strip_prefix(VIM_INSERT)?.strip_prefix(' ')
 }
 
-/// Whether `row` opens with vim's INSERT indicator before its pill (anchor `vim.insert`'s row: `  -- INSERT -- ⏵⏵ auto mode on …`).
+/// Whether `row` opens with vim's INSERT indicator before its pill.
 #[must_use]
 pub fn vim_insert(row: &str) -> bool {
     row.strip_prefix("  ")
@@ -2791,17 +2653,12 @@ pub fn vim_insert(row: &str) -> bool {
         .is_some_and(|after| PILLS.iter().any(|pill| after.starts_with(pill.glyph)))
 }
 
-/// `rest` past the pill (`<glyph> <indicator> on`) it opens with, if it
-/// opens with that one.
 fn after_pill<'a>(rest: &'a str, pill: &Pill) -> Option<&'a str> {
     rest.strip_prefix(pill.glyph)?
         .strip_prefix(' ')?
         .strip_prefix(pill.text)
 }
 
-/// How many chars of `after` (the row past a pill) are the `(<key> to cycle)`
-/// hint: all of it, or the head a narrow pane leaves, cut only between words
-/// and ending at the row's end or the blanks before a separator.
 fn cycle_hint_len(after: &str) -> usize {
     let Some(hint) = after.strip_prefix(" (") else {
         return 0;
@@ -2827,7 +2684,7 @@ fn cycle_hint_len(after: &str) -> usize {
     }
 }
 
-/// One of the vendor's mode pills: its glyph and the anchor (`aterm_phase::anchor`) of the words after it.
+/// One of the vendor's mode pills.
 pub(super) struct Pill {
     pub(super) glyph: &'static str,
     /// The anchor id (`mode.auto`): what [`pill_indicator`] answers.
@@ -2870,7 +2727,7 @@ pub fn opens_with_pill_glyph(row: &str) -> bool {
     pill_lead(row).is_some_and(|rest| PILLS.iter().any(|pill| rest.starts_with(pill.glyph)))
 }
 
-/// Whether `row` is a known pill cut short by a narrow pane (`⏵⏵ bypass permissi`): geometry, not drift.
+/// Whether `row` is a known pill cut short by a narrow pane (`⏵⏵ bypass permissi`).
 #[must_use]
 pub fn is_cut_pill(row: &str) -> bool {
     let Some(rest) = pill_lead(row) else {
@@ -2883,7 +2740,6 @@ pub fn is_cut_pill(row: &str) -> bool {
             .any(|pill| prefix_of_parts(rest, &[pill.glyph, " ", pill.text]))
 }
 
-/// Whether `cut` is a prefix of `parts` joined, without joining them.
 fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
     let mut rest = cut;
     for part in parts {
@@ -2898,9 +2754,9 @@ fn prefix_of_parts(cut: &str, parts: &[&str]) -> bool {
     rest.is_empty()
 }
 
-/// What aterm draws over Claude's bypass pill (`⏵⏵ bypass permissions on`) on the glass (owner, 2026-10-19: "Replace '⏵⏵ bypass permissions on' with 'YOLO on' (or off)").
+/// What aterm draws over Claude's bypass pill (`⏵⏵ bypass permissions on`) on the glass.
 pub const YOLO_ON: &str = "YOLO on";
-/// What it draws over the manual-mode pill (`⏸ manual mode on`), the mode that asks before each tool: YOLO's off.
+/// What it draws over the manual-mode pill (`⏸ manual mode on`), the mode that asks before each tool.
 pub const YOLO_OFF: &str = "YOLO off";
 
 /// Claude's mode pill as [`relabel_under`] found it, in PANE COLUMNS of the GUI's pane text (one char per cell), for the glass to relabel.
@@ -2911,9 +2767,9 @@ pub struct Relabel {
     /// Claude's pill, its glyph to its `on`: `start..end`.
     pub start: usize,
     pub end: usize,
-    /// Where the pill's words start (after the glyph and its space): the cell whose style the label takes.
+    /// Where the pill's words start (after the glyph and its space).
     pub words: usize,
-    /// The end of the row's left items, from the pill's end to the first two blanks (or the row's text end).
+    /// The end of the row's left items, from the pill's end to the first two blanks.
     pub run_end: usize,
     /// [`YOLO_ON`] or [`YOLO_OFF`].
     pub label: &'static str,
@@ -2985,12 +2841,9 @@ pub fn relabel_under(rows: &[String], bottom: usize) -> Option<Relabel> {
     })
 }
 
-/// How many rows of Claude's footer the panel's locator passes before the
-/// panel: the footer row and up to three more (a left slot a narrow pane
-/// wraps, a right-hand notice on its own row).
 const FOOTER_ROWS_MAX: usize = 4;
 
-/// Claude Code's agents panel under the composer bottom rule `bottom`, read in PANE CELLS (one char per cell, as the GUI's pane text holds them: [`aterm_phase::agents_panel::one_cell`]).
+/// Claude Code's agents panel under the composer bottom rule `bottom`, read in PANE CELLS.
 #[must_use]
 pub fn agents_panel_under(
     rows: &[String],
@@ -2999,7 +2852,7 @@ pub fn agents_panel_under(
     agents_panel_under_with(rows, bottom, aterm_phase::agents_panel::one_cell)
 }
 
-/// [`agents_panel_under`], its spans counted in `width`'s columns (`aterm_grapheme::char_width` for a screen's text whose wide glyphs are one char each, such as `aterm ctl text`).
+/// [`agents_panel_under`], its spans counted in `width`'s columns.
 #[must_use]
 pub fn agents_panel_under_with(
     rows: &[String],
@@ -3055,7 +2908,7 @@ pub fn agents_panel_under_with(
     Some(panel)
 }
 
-/// The footer's marked values, in order: a live upgrade waiting on the person here ([`FooterFacts::upgrade`]), whole.
+/// The footer's marked values, in order.
 pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
     let mut out: Vec<Segment> = facts
         .upgrade
@@ -3067,17 +2920,10 @@ pub fn segments(facts: &FooterFacts) -> Vec<Segment> {
     out
 }
 
-/// The upgrade note's segment, `text` its whole or its short words.
 fn upgrade_segment(text: &str) -> Segment {
     Segment::plain(UPGRADE_MARK, text)
 }
 
-/// The model-and-effort segment under the mask ([`FooterFacts::off`]): `◆
-/// Opus 5.5 xhigh` split at the effort; a hidden model or effort is its
-/// stub — its value greyed, [`OFF_STUB`] after it (`◆ Opus 5.5 off xhigh`,
-/// `◆ Opus 5.5 xhigh off`, both `◆ Opus 5.5 off xhigh off`, each side of the
-/// split its own) — or with no `stubs` is left out (`◆ xhigh`, `◆ Opus 5.5`,
-/// nothing).
 fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
     let off = facts.off;
     let model = facts.model.as_deref();
@@ -3134,8 +2980,6 @@ fn model_effort_segment(facts: &FooterFacts, stubs: bool) -> Option<Segment> {
     }
 }
 
-/// [`segments`] but the upgrade note: what Claude Code's own files say, a
-/// hidden fact as its stub (`stubs`) or left out.
 fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
     let usage = facts.usage.as_ref();
     let hidable = |kind: FactKind, value: &Option<String>| -> Option<Segment> {
@@ -3207,8 +3051,6 @@ fn fact_segments(facts: &FooterFacts, stubs: bool) -> Vec<Segment> {
     .collect()
 }
 
-/// The model alone as a segment — the rung a narrow rule gives up last
-/// ([`facts_ladder`]).
 fn model_alone(facts: &FooterFacts) -> Option<Segment> {
     facts
         .model
@@ -3217,7 +3059,7 @@ fn model_alone(facts: &FooterFacts) -> Option<Segment> {
         .map(|model| Segment::plain(MODEL_MARK, model.clone()))
 }
 
-/// The cells `text` takes on the glass: a wide char two, a combining mark or a control none (the painter leaves those out).
+/// The cells `text` takes on the glass: a wide char two, a combining mark or a control none.
 #[must_use]
 pub fn text_width(text: &str) -> usize {
     aterm_grapheme::str_grid_columns(text)
@@ -3238,11 +3080,11 @@ pub struct SetGlyph {
     pub cell: usize,
     /// The cells it takes: 1, or 2 for a wide char.
     pub cols: usize,
-    /// How far its glyph is drawn from the middle of its cells, in [`NUDGES_PER_CELL`]ths of a cell (negative: left).
+    /// How far its glyph is drawn from the middle of its cells, in [`NUDGES_PER_CELL`]ths of a cell.
     pub nudge: i8,
     /// A fact's mark (`◆`, `⌂`, ...) rather than a character of its value.
     pub mark: bool,
-    /// A character of the model-and-effort segment's effort, past its [`Segment::split`] ([`fact_spans`]).
+    /// A character of the model-and-effort segment's effort, past its [`Segment::split`].
     pub tail: bool,
     /// A character of a hidden fact's greyed stub, its value and [`OFF_STUB`] ([`Segment::quiet`]).
     pub quiet: bool,
@@ -3251,7 +3093,7 @@ pub struct SetGlyph {
 /// The facts set as a line of small type ([`set_facts`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SetFacts {
-    /// The cells the line takes, a whole number: the rule meets it on a cell boundary at either end.
+    /// The cells the line takes, a whole number.
     pub cells: usize,
     /// Every glyph, in reading order, each in a cell of its own.
     pub glyphs: Vec<SetGlyph>,
@@ -3441,18 +3283,15 @@ pub fn set_facts(segments: &[Segment]) -> SetFacts {
 pub struct FactSpan {
     /// Which fact.
     pub kind: FactKind,
-    /// Its cells in the set run ([`SetFacts::cells`]), `start..end`: its mark (where the fact leads its segment) through its last glyph.
+    /// Its cells in the set run ([`SetFacts::cells`]), `start..end`.
     pub cells: (u16, u16),
-    /// The hidden facts a click on it shows again: empty for a shown fact, the stub's own fact for a stub.
+    /// The hidden facts a click on it shows again.
     pub restores: FactMask,
 }
 
 /// Every fact of one rule's facts, in reading order ([`fact_spans`]).
 pub type FactSpans = [Option<FactSpan>; 6];
 
-/// The fact a glyph of segment `segment` stands for (`tail`: past its split,
-/// the effort), and what a click on it shows again; `None` for the segments
-/// that are no fact (a limit wall, the account, the upgrade note).
 fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, FactMask)> {
     let kind = if tail {
         FactKind::Effort
@@ -3474,7 +3313,7 @@ fn glyph_fact(segment: &Segment, tail: bool, quiet: bool) -> Option<(FactKind, F
     Some((kind, restores))
 }
 
-/// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies: a mark glyph starts the next segment.
+/// Where each fact of `segments`, as [`set_facts`] set them (`set`), lies.
 #[must_use]
 pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
     let mut spans: FactSpans = [None; 6];
@@ -3516,9 +3355,7 @@ pub fn fact_spans(set: &SetFacts, segments: &[Segment]) -> FactSpans {
     spans
 }
 
-/// Where the subscription/account group (`⎆`, `◇`, `◷`) of `segments`, as
-/// [`set_facts`] set them (`set`), lies (`start..end` in [`SetFacts::cells`]).
-/// `None` when none of those segments is in `segments`. Pure.
+/// Where the subscription/account group (`⎆`, `◇`, `◷`) of `segments`, as [`set_facts`] set them (`set`), lies.
 #[must_use]
 pub fn account_span(set: &SetFacts, segments: &[Segment]) -> Option<(u16, u16)> {
     let mut segment: Option<&Segment> = None;
@@ -3549,7 +3386,7 @@ pub fn account_span(set: &SetFacts, segments: &[Segment]) -> Option<(u16, u16)> 
     span
 }
 
-/// The cells of the set run ([`SetFacts::cells`]) an underline under `span`'s fact takes, so that it lies under the fact's glyphs where they are drawn rather than under the cells they stand in.
+/// The cells of the set run ([`SetFacts::cells`]) an underline under `span`'s fact takes.
 #[must_use]
 pub fn drawn_cells(set: &SetFacts, span: &FactSpan) -> std::ops::Range<usize> {
     let n = isize::from(NUDGES_PER_CELL);
@@ -3592,13 +3429,13 @@ pub fn rule_run(coverable: &[bool]) -> Option<std::ops::Range<usize>> {
     best
 }
 
-/// The cells of `run` ([`rule_run`]) aterm's text may take: all but [`RULE_LEAD`] glyphs at the left and one glyph at the right.
+/// The cells of `run` ([`rule_run`]) aterm's text may take.
 #[must_use]
 pub fn rule_room(run: &std::ops::Range<usize>) -> usize {
     run.len().saturating_sub(RULE_LEAD + 1)
 }
 
-/// How many leaner forms a light's title may have between its whole and its short form ([`LightsWidth::lean`], [`TitleFit::Lean`]).
+/// How many leaner forms a light's title may have between its whole and its short form.
 pub const LEAN_FORMS: usize = 4;
 
 /// The widths of the lights' block (`claude_lights`).
@@ -3608,7 +3445,7 @@ pub struct LightsWidth {
     pub chips: usize,
     /// `Light: what  `.
     pub title: usize,
-    /// The whole title with parts given up, widest first, each still more than the short form (0: no such form).
+    /// The whole title with parts given up, widest first, each still more than the short form.
     pub lean: [usize; LEAN_FORMS],
     /// `what  `.
     pub short: usize,
@@ -3648,8 +3485,6 @@ impl RuleFit {
     }
 }
 
-/// The fewest cells a rule of `segments`, `title` and (with `chips`) the lights
-/// takes: ` <chips>  <title> `, [`RULE_SEP`] glyphs, ` <facts> `.
 fn rule_width(
     segments: &[Segment],
     title: TitleFit,
@@ -3676,11 +3511,6 @@ fn rule_width(
     facts + lights + if facts > 0 && lights > 0 { RULE_SEP } else { 0 }
 }
 
-/// The facts as a narrow rule gives them up: a hidden fact's stub first
-/// ([`OFF_STUB`]: the whole facts with their stubs, then without them), then
-/// the usage (its total narrowed to its runtime alone, `Σ 7h52m`, then gone),
-/// then the path cut to `…/<dir>`, the branch, the path, the effort and the
-/// model, a limit wall standing alone last.
 fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let plain = plain_ladder(facts);
     let Some(note) = &facts.upgrade else {
@@ -3703,8 +3533,6 @@ fn facts_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
-/// What a reason never takes the room of ([`fit_rule`]): a standing limit
-/// and subscription identity/quota, or model and effort without a subscription.
 fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     let subscription = rung.iter().any(|s| s.mark == WEEKLY_MARK);
     rung.iter().filter(move |s| {
@@ -3714,8 +3542,6 @@ fn top_of(rung: &[Segment]) -> impl Iterator<Item = &Segment> {
     })
 }
 
-/// Whether rungs `a` and `b` show the same [`top_of`], a hidden fact's stub
-/// aside ([`Segment::shown_part`]): a stub gives way before a reason does.
 fn same_top(a: &[Segment], b: &[Segment]) -> bool {
     let shown = |rung| {
         top_of(rung)
@@ -3725,9 +3551,6 @@ fn same_top(a: &[Segment], b: &[Segment]) -> bool {
     shown(a).eq(shown(b))
 }
 
-/// [`facts_ladder`] of the facts alone, with no upgrade note: the whole facts
-/// with their stubs, then today's rungs of the facts without them
-/// ([`bare_ladder`]).
 fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut out = vec![fact_segments(facts, true)];
     for rung in bare_ladder(facts) {
@@ -3738,8 +3561,6 @@ fn plain_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
-/// [`plain_ladder`] without a hidden fact's stub: a hidden fact is left out
-/// of every rung.
 fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     if facts.subscription.is_some() {
         return subscription_ladder(facts);
@@ -3838,8 +3659,6 @@ fn bare_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
-/// The explicit subscription display keeps identity and weekly quota after secondary
-/// workspace and usage details have given way.
 fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     let mut rung = fact_segments(facts, false);
     let mut out = vec![rung.clone()];
@@ -3873,8 +3692,6 @@ fn subscription_ladder(facts: &FooterFacts) -> Vec<Vec<Segment>> {
     out
 }
 
-/// Shorten by display columns, so an international account does not reserve
-/// twice the intended room when the control block is built.
 fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool {
     let Some(account) = segments.iter_mut().find(|s| s.mark == ACCOUNT_MARK) else {
         return false;
@@ -3890,8 +3707,6 @@ fn shorten_subscription_account(segments: &mut [Segment], limit: usize) -> bool 
     true
 }
 
-/// The account/quota pair that controls must leave room for. A limit wall
-/// retains priority when a pane cannot hold it and the pair together.
 fn subscription_reservation(facts: &FooterFacts, room: usize) -> usize {
     let segments = fact_segments(facts, false);
     let wall = segments.iter().find(|s| s.mark == WALL_MARK).cloned();
@@ -3946,7 +3761,6 @@ pub fn fit_rule(facts: &FooterFacts, room: usize, lights: Option<LightsWidth>) -
         .iter()
         .map(|rung| (rung.as_slice(), TitleFit::None, chips));
     let last = if facts.subscription.is_some() {
-        // If the pane is narrower still, keep its active controls before a model.
         [(&[][..], true), (model.as_slice(), false)]
     } else {
         [(model.as_slice(), false), (&[][..], true)]
@@ -3983,7 +3797,7 @@ pub fn chips_room(facts: &FooterFacts, room: usize) -> usize {
     room.saturating_sub(beside + 2)
 }
 
-/// Where Claude Code's top-effort tag ([`CLAUDE_TOP_EFFORT_KEY`]) stands in the composer's TOP rule `row` (`──── <key> ─`, right-aligned the way it writes its labels).
+/// Where Claude Code's top-effort tag ([`CLAUDE_TOP_EFFORT_KEY`]) stands in the composer's TOP rule `row`.
 #[must_use]
 pub fn top_rule_tag(row: &str) -> Option<(usize, usize)> {
     if !aterm_phase::phase::is_rule(row) {
@@ -4030,9 +3844,6 @@ pub enum TopAnswer {
     Unavailable,
 }
 
-/// How many rows an answer [`top_effort_answer`] reads may take: its `⎿`
-/// row and the rows it wraps onto (MEASURED on 2.1.304: the refusal wraps to
-/// six rows at 26 columns).
 const TOP_ANSWER_ROWS: usize = 8;
 
 /// What Claude Code answered an `/effort <key> on|off` with ([`top_effort_reply`]).
@@ -4042,20 +3853,17 @@ pub struct TopReply {
     pub model: Option<String>,
 }
 
-/// Claude Code's transient level hint, right-aligned above the composer's
-/// top rule a moment after an `/effort` (`◐ medium · /effort`, `◐ medium ·
-/// <key> · /effort`; MEASURED on 2.1.304): no answer's row.
 fn is_effort_hint(text: &str) -> bool {
     text.ends_with(aterm_phase::anchor("effort.hint_tail"))
 }
 
-/// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule (row `top_rule`).
+/// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule.
 #[must_use]
 pub fn top_effort_answer(rows: &[String], top_rule: usize) -> Option<TopAnswer> {
     top_effort_reply(rows, top_rule).map(|reply| reply.answer)
 }
 
-/// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule (row `top_rule`).
+/// The answer to an `/effort <key> on|off` that the screen `rows` show above the composer's top rule.
 #[must_use]
 pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
     use aterm_phase::anchor;
@@ -4104,7 +3912,7 @@ pub fn top_effort_reply(rows: &[String], top_rule: usize) -> Option<TopReply> {
     })
 }
 
-/// The environment actions of `ClaudeFooterModel` (`aterm_models_harness::claude_footer_model_model`).
+/// The environment actions of `ClaudeFooterModel`.
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
     any(test, debug_assertions),

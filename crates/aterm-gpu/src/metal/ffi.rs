@@ -9,9 +9,6 @@ use std::ptr;
 /// The runtime's pointer-shaped types and the checked send, `aterm_objc`'s.
 pub(crate) use aterm_objc::{ClassPtr, Encode, Id, Sel, checked_msg};
 
-/// The Objective-C `BOOL` for this target, used for every `BOOL` in a send
-/// prototype: `aterm_objc::Bool`, `bool` on arm64 and `i8` (`signed char`) on
-/// x86_64, read as `!= 0`.
 use aterm_objc::Bool as ObjcBool;
 
 #[link(name = "objc")]
@@ -24,18 +21,16 @@ unsafe extern "C" {
 
 #[link(name = "Metal", kind = "framework")]
 unsafe extern "C" {
-    /// Every Metal device, as a +1 `NSArray<id<MTLDevice>>`; elements are +0
-    /// until retained.
     fn MTLCopyAllDevices() -> Id;
 }
 
-/// Resolve a selector from a checked C-string literal, e.g. `sel(c"length")`.
+/// Resolve a selector from a checked C-string literal.
 #[inline]
 pub(crate) fn sel(name: &'static CStr) -> Sel {
     aterm_objc::sel_uncached(name)
 }
 
-/// Look up a class from a checked C-string literal, e.g. `class(c"NSString")`.
+/// Look up a class from a checked C-string literal.
 #[inline]
 pub(crate) fn class(name: &'static CStr) -> ClassPtr {
     aterm_objc::class(name)
@@ -82,8 +77,6 @@ impl Obj {
 }
 
 impl Drop for Obj {
-    /// Releasing a Metal object runs the driver's dealloc path, which
-    /// autoreleases one object into the owner's current frame.
     fn drop(&mut self) {
         // SAFETY: `self.0` is non-null by construction (both constructors reject null) and holds exactly one +1 reference, released once here.
         unsafe { objc_release(self.0) }
@@ -96,8 +89,7 @@ pub(crate) struct AutoreleasePool(*mut c_void);
 impl AutoreleasePool {
     #[inline]
     pub(crate) fn new() -> Self {
-        // SAFETY: push/pop are the documented runtime entry points and are
-        // balanced by `Drop`; the token is opaque and only handed back to pop.
+        // SAFETY: push/pop are the documented runtime entry points and are balanced by `Drop`; the token is opaque and only handed back to pop.
         Self(unsafe { objc_autoreleasePoolPush() })
     }
 }
@@ -109,13 +101,11 @@ impl Drop for AutoreleasePool {
     }
 }
 
-/// Build a +1 `NSString` from a Rust `&str` via `alloc` + `initWithBytes:length:encoding:`, so it is owned rather than autoreleased.
+/// Build a +1 `NSString` from a Rust `&str` via `alloc` + `initWithBytes:length:encoding:`.
 pub(crate) fn ns_string(s: &str) -> Option<Obj> {
     const NS_UTF8: usize = 4;
     let cls = class(c"NSString");
-    // SAFETY: `alloc` returns a +1 uninitialized instance that
-    // `initWithBytes:length:encoding:` consumes, returning +1 or nil. The byte
-    // pointer is read for `len` bytes during the call only.
+    // SAFETY: `alloc` returns a +1 uninitialized instance that `initWithBytes:length:encoding:` consumes, returning +1 or nil. The byte pointer is read for `len` bytes during the call only.
     unsafe {
         let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
         let raw = alloc(cls, sel(c"alloc"));
@@ -175,7 +165,7 @@ impl PixelFormat {
         }
     }
 
-    /// Recover a format from an `MTLPixelFormat` raw value (e.g. `-pixelFormat` off a live texture).
+    /// Recover a format from an `MTLPixelFormat` raw value.
     #[inline]
     pub(crate) const fn from_raw(raw: usize) -> Option<Self> {
         match raw {
@@ -296,7 +286,7 @@ pub(crate) enum SamplerAddressMode {
     ClampToEdge = 0,
 }
 
-/// Everything [`Device::new_sampler`] sets, so the two combinations the renderer uses (`NEAREST_CLAMP`, `LINEAR_CLAMP`) are named once.
+/// Everything [`Device::new_sampler`] sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SamplerDesc {
     pub(crate) min: SamplerFilter,
@@ -307,7 +297,7 @@ pub(crate) struct SamplerDesc {
 }
 
 impl SamplerDesc {
-    /// The glyph atlas and blit sampler: nearest, clamped (the bare `MTLSamplerDescriptor` defaults).
+    /// The glyph atlas and blit sampler.
     pub(crate) const NEAREST_CLAMP: Self = Self {
         min: SamplerFilter::Nearest,
         mag: SamplerFilter::Nearest,
@@ -425,7 +415,6 @@ pub(crate) fn choose_listed(
     gpus: &[Option<ListedGpu>],
     want_high: bool,
 ) -> Option<(usize, &'static str)> {
-    /// The index of the one item `it` yields, or `None` for zero or several.
     fn sole(mut it: impl Iterator<Item = usize>) -> Option<usize> {
         match (it.next(), it.next()) {
             (Some(i), None) => Some(i),
@@ -443,8 +432,6 @@ pub(crate) fn choose_listed(
     sole(display().map(|(i, _)| i)).map(|i| (i, "the only display GPU"))
 }
 
-/// The Metal door: `MTLCreateSystemDefaultDevice`, the one Metal call that makes
-/// this process a WindowServer client.
 mod window_server_door {
     use super::{AutoreleasePool, Device, Id, Obj};
 
@@ -459,13 +446,9 @@ mod window_server_door {
             Self::system_default_asks_window_server()
         }
 
-        /// The system default GPU (raw `MTLCreateSystemDefaultDevice`, the
-        /// discrete GPU on a dual-GPU Mac), or `None` without a Metal device.
         fn system_default_asks_window_server() -> Option<Self> {
             #[link(name = "Metal", kind = "framework")]
             unsafe extern "C" {
-                /// `CF_RETURNS_RETAINED`: the caller owns the +1 and must
-                /// release it, which [`Device`] does on drop.
                 fn MTLCreateSystemDefaultDevice() -> Id;
             }
             #[cfg(test)]
@@ -478,7 +461,6 @@ mod window_server_door {
 }
 
 impl Device {
-    /// The GPU [`choose_listed`] picks from `MTLCopyAllDevices`, or `None`.
     fn listed(want_high: bool) -> Option<Self> {
         static SAID: std::sync::Once = std::sync::Once::new();
         let _pool = AutoreleasePool::new();
@@ -502,14 +484,8 @@ impl Device {
         Some(dev)
     }
 
-    /// `MTLCopyAllDevices` (+1, owned) and, per element, the two facts
-    /// [`choose_listed`] reads (`None` for a nil slot).
     fn listing() -> Option<(Obj, Vec<Option<ListedGpu>>)> {
-        // SAFETY: `MTLCopyAllDevices` is `CF_RETURNS_RETAINED`, so `Obj`
-        // releases the array once. `-count` and `-objectAtIndexedSubscript:` are
-        // NSArray getters; elements are +0 and only read. `-isLowPower` /
-        // `-isHeadless` are `BOOL` getters read through [`ObjcBool`]. The caller
-        // holds the pool.
+        // SAFETY: `MTLCopyAllDevices` is `CF_RETURNS_RETAINED`, so `Obj` releases the array once. `-count` and `-objectAtIndexedSubscript:` are NSArray getters; elements are +0 and only read. `-isLowPower` / `-isHeadless` are `BOOL` getters read through [`ObjcBool`]. The caller holds the pool.
         unsafe {
             let all = Obj::from_owned(MTLCopyAllDevices())?;
             let count: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
@@ -557,7 +533,7 @@ impl Device {
         self.new_library_with_options(source, &opts)
     }
 
-    /// `Self::new_library` with explicit compile options, so a test can compile against a different language version.
+    /// `Self::new_library` with explicit compile options.
     pub(crate) fn new_library_with_options(
         &self,
         source: &str,
@@ -566,9 +542,7 @@ impl Device {
         let _pool = AutoreleasePool::new();
         let src = ns_string(source).ok_or_else(|| "NSString allocation failed".to_owned())?;
         let mut err: Id = Id::NIL;
-        // SAFETY: `newLibraryWithSource:options:error:` is a `new*` family
-        // method returning +1 (or nil with `err` set to an autoreleased
-        // NSError). `options` is read during the call and not retained.
+        // SAFETY: `newLibraryWithSource:options:error:` is a `new*` family method returning +1 (or nil with `err` set to an autoreleased NSError). `options` is read during the call and not retained.
         let lib = unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id, Id, *mut Id) -> Id = checked_msg();
             f(
@@ -593,8 +567,7 @@ impl Device {
     ) -> Result<Obj, String> {
         let _pool = AutoreleasePool::new();
         let mut err: Id = Id::NIL;
-        // SAFETY: `new*` family, +1 or nil-with-error. The descriptor is only
-        // read during the call; Metal copies what it needs.
+        // SAFETY: `new*` family, +1 or nil-with-error. The descriptor is only read during the call; Metal copies what it needs.
         let pso = unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id, *mut Id) -> Id = checked_msg();
             f(
@@ -610,8 +583,7 @@ impl Device {
 
     /// A shared-storage `MTLBuffer` of `len` bytes.
     pub(crate) fn new_buffer(&self, len: usize) -> Option<Obj> {
-        // SAFETY: `new*` family, +1. Shared storage means the CPU may map it via `-contents` for
-        // the lifetime of the buffer.
+        // SAFETY: `new*` family, +1. Shared storage means the CPU may map it via `-contents` for the lifetime of the buffer.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, usize, usize) -> Id = checked_msg();
             Obj::from_owned(f(
@@ -632,9 +604,7 @@ impl Device {
         usage: usize,
     ) -> Option<Obj> {
         let _pool = AutoreleasePool::new();
-        // SAFETY: the `+texture2DDescriptorWith...` factory returns an
-        // autoreleased object, borrowed and left to the pool.
-        // `newTextureWithDescriptor:` is +1 and is the only value that escapes.
+        // SAFETY: the `+texture2DDescriptorWith...` factory returns an autoreleased object, borrowed and left to the pool. `newTextureWithDescriptor:` is +1 and is the only value that escapes.
         unsafe {
             let dcls = class(c"MTLTextureDescriptor");
             let mk: unsafe extern "C-unwind" fn(
@@ -667,9 +637,7 @@ impl Device {
     /// An `MTLSamplerState` with `desc`'s filters and address modes.
     pub(crate) fn new_sampler(&self, desc: SamplerDesc) -> Option<Obj> {
         let _pool = AutoreleasePool::new();
-        // SAFETY: `MTLSamplerDescriptor` is alloc/init (+1, released by `Obj`);
-        // every setter is an `NSUInteger` property write;
-        // `newSamplerStateWithDescriptor:` is +1 and escapes.
+        // SAFETY: `MTLSamplerDescriptor` is alloc/init (+1, released by `Obj`); every setter is an `NSUInteger` property write; `newSamplerStateWithDescriptor:` is +1 and escapes.
         unsafe {
             let dcls = class(c"MTLSamplerDescriptor");
             let alloc: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
@@ -717,8 +685,7 @@ impl Library {
     pub(crate) fn function(&self, name: &str) -> Option<Obj> {
         let _pool = AutoreleasePool::new();
         let n = ns_string(name)?;
-        // SAFETY: `newFunctionWithName:` is +1 (or nil when the entry point is
-        // absent). The NSString is only read during the call.
+        // SAFETY: `newFunctionWithName:` is +1 (or nil when the entry point is absent). The NSString is only read during the call.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, Id) -> Id = checked_msg();
             Obj::from_owned(f(self.0.id(), sel(c"newFunctionWithName:"), n.id()))
@@ -765,9 +732,7 @@ impl RenderPipelineDescriptor {
         blend: Option<BlendState>,
     ) {
         let _pool = AutoreleasePool::new();
-        // SAFETY: `colorAttachments` and its subscript return borrowed
-        // (autoreleased) objects owned by the pool; only mutated here, never
-        // released.
+        // SAFETY: `colorAttachments` and its subscript return borrowed (autoreleased) objects owned by the pool; only mutated here, never released.
         unsafe {
             let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             let atts = get(self.0.id(), sel(c"colorAttachments"));
@@ -920,9 +885,7 @@ impl Device {
 /// `buf` must be a shared-storage `MTLBuffer` of at least `count * 4` bytes whose GPU writes have completed.
 #[cfg(test)]
 pub(crate) unsafe fn buffer_u32s(buf: &Obj, count: usize) -> Vec<u32> {
-    // SAFETY: `-contents` on a shared buffer returns a CPU-visible pointer
-    // valid for the buffer's lifetime; the caller pins the length and the
-    // completion ordering.
+    // SAFETY: `-contents` on a shared buffer returns a CPU-visible pointer valid for the buffer's lifetime; the caller pins the length and the completion ordering.
     unsafe {
         let c: unsafe extern "C-unwind" fn(Id, Sel) -> *const u32 = checked_msg();
         let p = c(buf.id(), sel(c"contents"));
@@ -958,10 +921,7 @@ pub(crate) fn dispatch_compute(
     grid: MtlSize,
 ) -> Result<(), String> {
     let _pool = AutoreleasePool::new();
-    // SAFETY: `commandBuffer` and `computeCommandEncoder` return autoreleased
-    // objects owned by the pool, not released here and alive until
-    // `waitUntilCompleted` returns. Every setter is a void message on live
-    // objects.
+    // SAFETY: `commandBuffer` and `computeCommandEncoder` return autoreleased objects owned by the pool, not released here and alive until `waitUntilCompleted` returns. Every setter is a void message on live objects.
     unsafe {
         let get: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
         let cb = get(queue.id(), sel(c"commandBuffer"));
@@ -1003,8 +963,7 @@ pub(crate) fn dispatch_compute(
 #[cfg(test)]
 fn wait_for_command_buffer(command_buffer: Id) -> Result<(), String> {
     const STATUS_COMPLETED: usize = 4;
-    // SAFETY: callers pass a live command buffer retained by their surrounding
-    // autorelease pool. All messages are property reads or the blocking wait.
+    // SAFETY: callers pass a live command buffer retained by their surrounding autorelease pool. All messages are property reads or the blocking wait.
     unsafe {
         let wait: unsafe extern "C-unwind" fn(Id, Sel) = checked_msg();
         wait(command_buffer, sel(c"waitUntilCompleted"));
@@ -1057,7 +1016,7 @@ unsafe impl Encode for ClearColor {
     const ENCODING: &'static str = "{?=dddd}";
 }
 
-/// `MTLScissorRect`, passed by value to `-setScissorRect:`: four `NSUInteger`s (32 bytes), passed indirectly like [`MtlRegion`].
+/// `MTLScissorRect`, passed by value to `-setScissorRect:`.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MtlScissorRect {
@@ -1164,8 +1123,7 @@ impl MtlRegion {
 /// Upload CPU bytes into a 2-D texture's level 0.
 ///
 /// # Safety
-/// `tex` must be a 2-D `MTLTexture` whose storage mode is not `Private`, whose dimensions are at least `region`, and whose pixel format has exactly `bytes_per_row / region.size.width` bytes per texel; `bytes` holds at least
-/// `bytes_per_row * region.size.height` bytes.
+/// `tex` must be a 2-D `MTLTexture` whose storage mode is not `Private`, whose dimensions are at least `region`, and whose pixel format has exactly `bytes_per_row / region.size.width` bytes per texel; `bytes` holds at least `bytes_per_row * region.size.height` bytes.
 pub(crate) unsafe fn texture_upload(
     tex: &Obj,
     region: MtlRegion,
@@ -1187,7 +1145,7 @@ pub(crate) unsafe fn texture_upload(
     }
 }
 
-/// `newTextureViewWithPixelFormat:`: the Unorm/sRGB aliasing the base passes rely on (see [`super::shaders`]).
+/// `newTextureViewWithPixelFormat:`.
 pub(crate) fn texture_view(tex: &Obj, format: PixelFormat) -> Option<Obj> {
     let _pool = AutoreleasePool::new();
     // SAFETY: `new*` family, +1 or nil; the view holds its own reference to the base texture, so the two lifetimes are independent.
@@ -1201,7 +1159,7 @@ pub(crate) fn texture_view(tex: &Obj, format: PixelFormat) -> Option<Obj> {
     }
 }
 
-/// Read `-[MTLTexture pixelFormat]` as its raw value, so `draw_and_read` can validate a row stride against the destination it was handed.
+/// Read `-[MTLTexture pixelFormat]` as its raw value.
 #[inline]
 pub(crate) fn texture_pixel_format_raw(tex: &Obj) -> usize {
     // SAFETY: `-pixelFormat` is an `NSUInteger` getter on a live `MTLTexture`.
@@ -1291,7 +1249,7 @@ pub(crate) struct DrawCall<'a> {
     pub(crate) stream: Option<&'a Obj>,
 }
 
-/// Run the pass (the fullscreen triangle, or [`Pass::draw`]'s geometry) and copy the result into `readback`, which must be Shared storage.
+/// Run the pass (the fullscreen triangle, or [`Pass::draw`]'s geometry) and copy the result into `readback`.
 #[cfg(test)]
 pub(crate) fn draw_and_read(
     queue: &Obj,
@@ -1349,11 +1307,7 @@ pub(crate) fn draw_and_read(
     }
 
     let _pool = AutoreleasePool::new();
-    // SAFETY: the pass descriptor, `colorAttachments`, its subscript,
-    // `commandBuffer`, and both encoders return autoreleased objects owned by
-    // the pool, not released here and alive past `waitUntilCompleted`. Other
-    // sends are void messages on live objects with full prototypes. The copy's
-    // extent, stride and length were validated above.
+    // SAFETY: the pass descriptor, `colorAttachments`, its subscript, `commandBuffer`, and both encoders return autoreleased objects owned by the pool, not released here and alive past `waitUntilCompleted`. Other sends are void messages on live objects with full prototypes. The copy's extent, stride and length were validated above.
     unsafe {
         let rp_cls = class(c"MTLRenderPassDescriptor");
         let mk: unsafe extern "C-unwind" fn(ClassPtr, Sel) -> Id = checked_msg();
@@ -1498,8 +1452,7 @@ pub(crate) fn draw_and_read(
 /// # Safety
 /// As `buffer_u32s`, for `len` bytes.
 pub(crate) unsafe fn buffer_bytes(buf: &Obj, len: usize) -> Vec<u8> {
-    // SAFETY: `-contents` on a shared buffer is CPU-visible for the buffer's
-    // lifetime; the caller pins the length and the completion ordering.
+    // SAFETY: `-contents` on a shared buffer is CPU-visible for the buffer's lifetime; the caller pins the length and the completion ordering.
     unsafe {
         let c: unsafe extern "C-unwind" fn(Id, Sel) -> *const u8 = checked_msg();
         let p = c(buf.id(), sel(c"contents"));
@@ -1519,13 +1472,8 @@ mod tests {
     /// How many times this process has called [`Device::system_default_asks_window_server`].
     pub(super) static WINDOW_SERVER_ASKS: AtomicUsize = AtomicUsize::new(0);
 
-    /// Every device `MTLCopyAllDevices` lists as `(name, isLowPower,
-    /// isHeadless)`, read independently of [`Device::listing`]. `None` without
-    /// Metal.
     fn listing_read_independently() -> Option<Vec<(String, bool, bool)>> {
-        // SAFETY: as in `Device::listing`: a +1 array released by `Obj`, +0
-        // elements retained for the name while the array lives, `BOOL` getters
-        // through `ObjcBool`.
+        // SAFETY: as in `Device::listing`: a +1 array released by `Obj`, +0 elements retained for the name while the array lives, `BOOL` getters through `ObjcBool`.
         unsafe {
             let all = Obj::from_owned(MTLCopyAllDevices())?;
             let count: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
@@ -1547,10 +1495,6 @@ mod tests {
         }
     }
 
-    /// [`Device::preferred`] calls `MTLCreateSystemDefaultDevice` only when
-    /// the listing cannot name the GPU, and otherwise returns exactly the GPU
-    /// the listing names (expected value derived from the raw listing, not
-    /// [`choose_listed`]).
     #[test]
     fn preferred_asks_the_window_server_only_when_the_listing_cannot_decide() {
         let _pool = AutoreleasePool::new();
@@ -1587,11 +1531,8 @@ mod tests {
         }
     }
 
-    /// Every listing shape [`choose_listed`] can meet, including dual- and
-    /// multi-GPU shapes.
     #[test]
     fn listing_decides_every_shape_it_can() {
-        /// What [`choose_listed`] answers: the index it picked and its word.
         type Pick = Option<(usize, &'static str)>;
         let gpu = |low_power, headless| {
             Some(ListedGpu {
@@ -1634,9 +1575,6 @@ mod tests {
         );
     }
 
-    /// An NSError's description is read by its counted UTF-16 units, so
-    /// neither of the strings a C-string read gets wrong truncates or blanks a
-    /// Metal compile or pipeline diagnostic.
     #[test]
     fn an_error_description_is_read_whole() {
         let _pool = AutoreleasePool::new();
@@ -1644,10 +1582,7 @@ mod tests {
         let domain = ns_string("aterm.test").expect("domain");
         let read = C_STRING_HOLES.map(|(units, _)| {
             let description = ns_string_of_units(units);
-            // SAFETY: `+dictionaryWithObject:forKey:` (`@32@0:8@16@24`) and
-            // `+errorWithDomain:code:userInfo:` (`@40@0:8@16q24@32`) return
-            // autoreleased objects the pool above owns; every argument is a
-            // live object for the call, and the dictionary retains its value.
+            // SAFETY: `+dictionaryWithObject:forKey:` (`@32@0:8@16@24`) and `+errorWithDomain:code:userInfo:` (`@40@0:8@16q24@32`) return autoreleased objects the pool above owns; every argument is a live object for the call, and the dictionary retains its value.
             let error = unsafe {
                 let dict: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id, Id) -> Id = checked_msg();
                 let info = dict(
@@ -1672,15 +1607,12 @@ mod tests {
         assert_eq!(read, C_STRING_HOLES.map(|(_, want)| want));
     }
 
-    /// [`Device::name`] reads `-name` by its counted UTF-16 units.
     #[test]
     fn a_device_name_is_read_whole() {
         let _pool = AutoreleasePool::new();
         let read = C_STRING_HOLES.map(|(units, _)| {
             let name = ns_string_of_units(units);
-            // SAFETY: `+notificationWithName:object:` (`@32@0:8@16@24`) returns
-            // an autoreleased NSNotification the pool above owns; `Obj::retain`
-            // takes it to +1, which the stand-in `Device` releases on drop.
+            // SAFETY: `+notificationWithName:object:` (`@32@0:8@16@24`) returns an autoreleased NSNotification the pool above owns; `Obj::retain` takes it to +1, which the stand-in `Device` releases on drop.
             let stand_in = unsafe {
                 let f: unsafe extern "C-unwind" fn(ClassPtr, Sel, Id, Id) -> Id = checked_msg();
                 Obj::retain(f(

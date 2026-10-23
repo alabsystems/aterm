@@ -221,9 +221,7 @@ fn handoff_committed() -> bool {
 
 /// Prime detected coding agents if `cue` starts a pass ([`PrimeSchedule::admit`]).
 pub(crate) fn prime_agents_if_due(cue: PrimeCue) {
-    // Unit tests construct `App`s that reach spawn seams, and headless
-    // instances are tests and agents' private instances: neither may write
-    // the `$HOME` it happened to inherit. A windowed aterm is where this runs.
+    // Unit tests construct `App`s that reach spawn seams, and headless instances are tests and agents' private instances: neither may write the `$HOME` it happened to inherit.
     if !agent_prime_permitted(cfg!(test), HEADLESS_INSTANCE.load(Ordering::Acquire)) {
         return;
     }
@@ -1100,9 +1098,7 @@ impl HandedMaster {
         #[cfg(unix)]
         let _ = aterm_pty::set_cloexec(self.0, true);
         let master = std::mem::ManuallyDrop::new(self).0;
-        // SAFETY: `master` is the handed-off descriptor this handle owned solely
-        // (`HandedMaster::new` takes ownership, and nothing else closes it); the
-        // `ManuallyDrop` above gave that ownership up to the sink.
+        // SAFETY: `master` is the handed-off descriptor this handle owned solely (`HandedMaster::new` takes ownership, and nothing else closes it); the `ManuallyDrop` above gave that ownership up to the sink.
         unsafe { master_sink(master) }
     }
 }
@@ -1116,12 +1112,6 @@ impl Drop for HandedMaster {
     }
 }
 
-/// # Safety
-///
-/// The caller owns `master` outright — no other owner will close it — and gives
-/// that ownership up by this call. On Unix it is an open descriptor; on Windows
-/// it is the opaque ConPTY registry key, which `OwnedMaster::adopt` takes over
-/// under the same contract.
 unsafe fn master_sink(master: i32) -> Arc<SinkWriter> {
     // SAFETY: the caller's contract above — `master` is open and solely ours.
     #[cfg(unix)]
@@ -1308,8 +1298,6 @@ pub(crate) fn hydrate_adopted_engine(
             history.anchor_in(&engine);
             authorize_adopted_shell_nonce(&mut engine, cp, id);
         } else {
-            // Adopted with no screen to restore: the shell's mark authority
-            // still crosses (see `hold_adopted_shell_nonce_requirement`).
             hold_adopted_shell_nonce_requirement(&mut engine, id);
         }
         if let Some(mut control) = control {
@@ -1536,8 +1524,6 @@ pub(crate) fn spawn_session(
     );
     let mut integrated_shell = None;
     let (mut env_add, argv_override, shell_nonce) = if adopt.is_some() {
-        // Adopted: the shell is already running with its original env (including
-        // the nonce minted at its first spawn), so nothing is injected.
         (Vec::new(), None, None)
     } else if factory.integrate {
         match prepare_shell_integration(shell_override, shell_args) {
@@ -1636,8 +1622,6 @@ pub(crate) fn spawn_session(
         env_add.push(factory.shell_colorfgbg());
     }
     let child_proxy = if adopt.is_some() {
-        // Adopted: the child keeps its first-spawn recursion tokens; env cannot be
-        // re-injected, so nothing is re-provisioned.
         None
     } else if factory.exec_command.is_none() {
         let (recursion_env, child) = provision_child_proxy(control_auth::socket_dir().as_deref());
@@ -1706,8 +1690,7 @@ pub(crate) fn spawn_session(
                     shell_version = crate::spare::shell_version(pid);
                 }
                 start.say();
-                // SAFETY: `master` is this session's forkpty master, freshly returned
-                // and owned solely here; the sink takes it over.
+                // SAFETY: `master` is this session's forkpty master, freshly returned and owned solely here; the sink takes it over.
                 let sink = unsafe { master_sink(master) };
                 (
                     master,
@@ -1774,6 +1757,7 @@ pub(crate) fn spawn_session(
         crash_journal: Default::default(),
         typed: Default::default(),
         bells: Default::default(),
+        screen_moves: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -2082,8 +2066,6 @@ fn pulse_adopted_pty(
             },
         );
         if let Err(error) = spawned {
-            // No thread: end the pulse now rather than leave the program at
-            // `rows-1`. It may not repaint, but it is never left mis-sized.
             aterm_log::warn!("adoption pulse: no hold thread ({error}); ending the pulse at once");
         }
     });
@@ -2455,8 +2437,7 @@ mod pty_keyboard_posture_tests {
                 name: *const u16,
             ) -> isize;
         }
-        // SAFETY: NULL attrs and name; manual-reset, initially unsignaled.
-        // `adopt_handoff` owns the handle from its `Ok` on.
+        // SAFETY: NULL attrs and name; manual-reset, initially unsignaled. `adopt_handoff` owns the handle from its `Ok` on.
         let client = unsafe { CreateEventW(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
         assert_ne!(client, 0, "CreateEventW");
         let master = aterm_pty::adopt_handoff(0, 0, 0, client)
@@ -3294,7 +3275,6 @@ pub(crate) fn post_to(proxy: &EventLoopProxy<Wake>) -> WakePost {
 
 /// Where [`spawn_session`] wires a session's reader and host callbacks to post.
 pub(crate) trait WakeTarget {
-    /// A [`WakePost`] onto this target.
     fn wake_post(&self) -> WakePost;
 }
 
@@ -3311,10 +3291,7 @@ fn attach_reader_inner(
     factory: &SessionFactory,
     start_gate: Option<DeferredReaderGate>,
 ) -> Result<(), String> {
-    // A previous reader still winding down (a park that missed its deadline):
-    // wait it out — two readers on one master interleave bytes and corrupt both
-    // engines. Bounded in practice: the park already poked the wake pipe, so the
-    // old thread is past its last blocking read.
+    // A previous reader still winding down (a park that missed its deadline): wait it out — two readers on one master interleave bytes and corrupt both engines.
     if let Some(join) = session.reader_join.take() {
         let _ = join.join();
     }
@@ -3413,6 +3390,7 @@ fn attach_reader_inner(
             proc_watch: (factory.proc_watch)(session.pid),
         },
         timeline: session.ctx.timeline.clone(),
+        screen_moves: session.ctx.screen_moves.clone(),
         card_probe: factory.card_probe,
         person: session.ctx.human_input.clone(),
         launch: session.ctx.launch.clone(),
@@ -3517,7 +3495,6 @@ impl UpdatePark {
 #[cfg(any(unix, test))]
 pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
     let Some(join) = session.reader_join.take() else {
-        // Distinct branch.
         return true;
     };
     session.ctx.update_parked.park();
@@ -3537,8 +3514,6 @@ pub(crate) fn park_reader(session: &mut Session, deadline: Instant) -> bool {
         std::thread::yield_now();
     }
     if join.join().is_err() {
-        // Fail closed so automatic handoff rolls back and reattaches a reader;
-        // never treat thread termination alone as a successful quiescence ACK.
         return false;
     }
     if let Some(writer) = session.temporal_writer_join.take() {
@@ -3667,7 +3642,6 @@ mod shell_exit_tests {
         assert_eq!(exits_after, 0, "the job's letting go is not a second exit");
     }
 
-    /// A real session on a real pseudo-terminal whose slave the test holds, over a real shell (`read _; exit 3`, its input piped), the reader attached: each `Wake::Exit` it posts is sent on with whether the shell was collectable then.
     fn exit_rig(
         app: &App,
         id: u64,
@@ -3700,14 +3674,12 @@ mod shell_exit_tests {
         });
         attach_reader_inner(&mut session, WindowId(0), post, &app.session_factory, None)
             .expect("attach the real reader");
-        // A hang detector: the gather's start is the event.
         ready
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the reader's gather started");
         (session, slave, shell, exits)
     }
 
-    /// Park the rig's reader and free its master.
     fn end_rig(mut session: crate::Session) {
         let _ = super::park_reader(
             &mut session,
@@ -3717,7 +3689,6 @@ mod shell_exit_tests {
         aterm_pty::close_fd(master);
     }
 
-    /// The gather posts a shell's exit at its terminal's EOF only once the shell is retired ([`super::ShellExit::await_retired_at_exit`]): the terminal closes while the shell runs, the shell exits 300 ms later, and the `Wake::Exit` finds it collectable (at 20 ms, a starved shell that failed at start read as a clean exit). NEGATIVE CONTROL: the same look at the running shell finds it not collectable.
     #[test]
     fn the_gather_posts_the_exit_at_its_terminals_eof_only_once_the_shell_is_retired() {
         let app = App::headless_for_test();
@@ -3726,17 +3697,14 @@ mod shell_exit_tests {
             !collectable(shell.id()),
             "a running shell is not collectable"
         );
-        // The shell closes its terminal on its way out; its exit trails.
         aterm_pty::close_fd(slave);
         let stdin = shell.stdin.take().expect("its input");
         let closer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
             drop(stdin);
         });
-        // A hang detector: the exit's post is the event.
         let retired = exits.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
         closer.join().expect("the closer");
-        // Reaped here, before the session goes (its drop takes its shell).
         let code = shell.wait().expect("its owner reaps it").code();
         end_rig(session);
         assert_eq!(
@@ -3747,8 +3715,6 @@ mod shell_exit_tests {
         assert_eq!(code, Some(3), "and the status was left for its owner");
     }
 
-    /// A cancellation wake may precede the stop flag. Both exit paths must
-    /// send Wake even then, including when the exit watch is ready too.
     #[test]
     fn a_cancelled_retirement_wait_wakes_the_reader_without_posting_a_shell_exit() {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -3769,7 +3735,6 @@ mod shell_exit_tests {
             }
             let exit = ShellExit {
                 watch: watched.then_some(watch_rd),
-                // This process is not its own child; no shell is needed.
                 pid: std::process::id(),
             };
             let result = exit.await_retired_at_exit(wake_rd.as_raw_fd(), &NO_STOP);
@@ -3855,8 +3820,6 @@ mod shell_exit_tests {
         );
     }
 
-    /// Whether `pid`, a child of this process, is collectable now: a look that
-    /// reaps nothing (`WNOWAIT`).
     fn collectable(pid: u32) -> bool {
         // SAFETY: a zeroed `siginfo_t` out-param for a non-reaping peek.
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -3873,15 +3836,6 @@ mod shell_exit_tests {
         rc == 0 && u32::try_from(unsafe { info.si_pid() }).ok() == Some(pid)
     }
 
-    /// THE WAIT FOR THE SHELL'S RETIREMENT IS A HANG DETECTOR
-    /// ([`super::SHELL_RETIRE_HANG`]): a shell whose exit trails the moment
-    /// the reader looks — a starved machine's moment between a session
-    /// leader's terminal closing on its way out and its exit, measured past
-    /// the 20 ms this wait was — is waited for and left collectable, so the
-    /// exit path reads its real status, never none (a failed shell read as a
-    /// clean exit, its only pane closed). NEGATIVE CONTROL: a stop's wake ends
-    /// the wait at once, the shell still running; a wait the stop could not
-    /// end would hold a closing tab's reader for the whole bound.
     #[test]
     fn the_wait_for_a_shells_retirement_outlasts_a_slow_exit_and_a_stop_ends_it() {
         let mut shell = aterm_uds::spawnfd::command("/bin/sh")
@@ -3896,8 +3850,6 @@ mod shell_exit_tests {
             watch: Some(aterm_uds::exitwatch::exit_fd(pid).expect("the shell is watched")),
             pid,
         };
-        // Negative control: the stop's wake, already written, ends a wait far
-        // longer than this test's hang detector.
         let mut wake = [0; 2];
         // SAFETY: a two-int out-param for `pipe(2)`.
         assert_eq!(unsafe { libc::pipe(wake.as_mut_ptr()) }, 0, "the wake pipe");
@@ -3910,7 +3862,6 @@ mod shell_exit_tests {
             let _ = ended_tx.send(());
             exit
         });
-        // A hang detector: the wake is the event.
         ended
             .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
             .expect("the stop's wake ended the wait");
@@ -3921,15 +3872,12 @@ mod shell_exit_tests {
             shell.try_wait().expect("a look at the shell").is_none(),
             "a stop leaves the shell running"
         );
-        // The shell's exit trails the wait's start: its input closes a
-        // moment after the reader began to wait.
         let stdin = shell.stdin.take().expect("its input");
         let closer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
             drop(stdin);
         });
         exit.await_retired_at_exit(-1, &NO_STOP);
-        // Looked at the moment the wait ends, before anything else waits.
         let retired = collectable(pid);
         closer.join().expect("the closer");
         assert!(retired, "the wait outlasted the shell's slow exit");
@@ -3940,7 +3888,6 @@ mod shell_exit_tests {
         );
     }
 
-    /// `/bin/sh -c <script>` with its input piped and its output dropped.
     fn sh(script: &str) -> aterm_uds::spawnfd::Child {
         aterm_uds::spawnfd::command("/bin/sh")
             .args(["-c", script])
@@ -3951,12 +3898,9 @@ mod shell_exit_tests {
             .expect("spawn the shell")
     }
 
-    /// A gather's stop never raised, and one raised.
     static NO_STOP: AtomicBool = AtomicBool::new(false);
     static STOPPED: AtomicBool = AtomicBool::new(true);
 
-    /// `exit.await_retired(within, wake_rd, stop)` on a thread, and whether it
-    /// ended within the hang detector.
     fn ended_at_once(
         exit: super::ShellExit,
         within: std::time::Duration,
@@ -3968,31 +3912,17 @@ mod shell_exit_tests {
             exit.await_retired(within, wake_rd, stop);
             let _ = ended_tx.send(());
         });
-        // A hang detector: the wait's end is the event.
         ended.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok()
     }
 
-    /// A SHELL ALREADY ON ITS WAY OUT WHEN ITS READER ATTACHES KEEPS ITS WAIT:
-    /// Darwin's kqueue refuses an exit watch on a process that has begun to
-    /// exit (`ESRCH`) before that process can be collected, so a shell of this
-    /// process's own that failed at once, already exiting when a loaded machine
-    /// attached its reader, keeps a [`super::ShellExit`] with no watch
-    /// ([`super::shell_exit_of`]), and the wait for it ends at once once it is
-    /// collectable. Before, it had none, and the exit was posted at the master's
-    /// EOF before its status could be read: a shell killed at start read as a
-    /// clean exit, its only pane closed. NEGATIVE CONTROL: an adopted shell no
-    /// watch can be made for has no wait. Darwin's alone: Linux's pidfd watches
-    /// a zombie, so there such a shell is watched.
+    /// A SHELL ALREADY ON ITS WAY OUT WHEN ITS READER ATTACHES KEEPS ITS WAIT: Darwin's kqueue refuses an exit watch on a process that has begun to exit (`ESRCH`) before that process can be collected, so a shell of this process's own that failed at once, already exiting when a loaded machine attached its reader, keeps a [`super::ShellExit`] with no watch ([`super::shell_exit_of`]), and the wait for it ends at once once it is collectable. Before, it had none, and the exit was posted at the master's EOF before its status could be read: a shell killed at start read as a clean exit, its only pane closed. NEGATIVE CONTROL: an adopted shell no watch can be made for has no wait. Darwin's alone: Linux's pidfd watches a zombie, so there such a shell is watched.
     #[cfg(target_vendor = "apple")]
     #[test]
     fn a_shell_already_exiting_when_its_reader_attaches_keeps_its_wait() {
-        // A shell already exited: the kernel takes no watch of it, and this
-        // process can still wait for it.
         let mut gone = sh("exit 3");
         let pid = gone.id();
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while !collectable(pid) {
-            // A hang detector: the shell's exit is the event.
             assert!(std::time::Instant::now() < deadline, "the shell exited");
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
@@ -4015,13 +3945,6 @@ mod shell_exit_tests {
         assert_eq!(gone.wait().expect("its owner reaps it").code(), Some(3));
     }
 
-    /// A SHELL WITH NO EXIT WATCH IS STILL WAITED FOR ([`super::shell_exit_of`]
-    /// keeps one for a shell of this process's own the kernel would not watch):
-    /// its exit trails the wait's start, and the gather's wait
-    /// ([`super::ShellExit::await_retired_at_exit`]) ends only once it is
-    /// collectable. NEGATIVE CONTROLS: the stop's wake ends a wait with no
-    /// watch at once, the shell still running; and a pid that is not this
-    /// process's child ends it at once.
     #[test]
     fn a_shell_that_could_not_be_watched_is_still_waited_for() {
         let mut shell = sh("read _; exit 3");
@@ -4061,7 +3984,6 @@ mod shell_exit_tests {
             drop(stdin);
         });
         unwatched().await_retired_at_exit(-1, &NO_STOP);
-        // Looked at the moment the wait ends, before anything else waits.
         let retired = collectable(pid);
         closer.join().expect("the closer");
         assert!(
@@ -4075,14 +3997,6 @@ mod shell_exit_tests {
         );
     }
 
-    /// A GATHER WITH NO WAKE PIPE (fd exhaustion: `wake_rd == -1`) IS STOPPED
-    /// BY ITS FLAG ALONE, and its wait for the shell's retirement reads it: a
-    /// raised stop ends the minute-long wait at once, the shell still running,
-    /// whether the shell is watched (the watch's poll, read in steps) or not
-    /// (the naps). Before, that wait read no flag, and a park or a tab's close
-    /// held its reader for the whole bound. NEGATIVE CONTROL: with the stop
-    /// down, a wait bounded at 300 ms on the same running shell lasts its
-    /// bound.
     #[test]
     fn a_stop_with_no_wake_pipe_ends_the_wait_for_a_shells_retirement() {
         let mut shell = sh("read _; exit 3");
@@ -4092,7 +4006,6 @@ mod shell_exit_tests {
             pid,
         };
         let unwatched = || super::ShellExit { watch: None, pid };
-        // A bound far past the hang detector's minute: only the stop can end these waits in it.
         let far = std::time::Duration::from_secs(600);
         assert!(
             ended_at_once(watched(), far, -1, &STOPPED),
@@ -4949,7 +4862,6 @@ fn read_kitty_file(path: &Path) -> Option<Vec<u8>> {
         .read_to_end(&mut bytes)
         .ok()?;
     if bytes.len() as u64 > MAX_KITTY_MEDIUM_BYTES {
-        // Distinct branch.
         return None;
     }
     Some(bytes)
@@ -4964,7 +4876,6 @@ fn consume_kitty_temp_file(path: &Path) {
 fn consume_kitty_temp_file_with(path: &Path, before_unlink: impl FnOnce()) {
     // Distinct branch.
     if let (Some(dir), Some(name)) = (path.parent(), path.file_name()) {
-        // Distinct branch.
         consume_kitty_temp_entry(dir, name, before_unlink); // the client's temp file
     }
 }
@@ -5038,8 +4949,7 @@ fn kitty_temp_dirs() -> Vec<std::path::PathBuf> {
 #[cfg(unix)]
 fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
     let cname = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `cname` is a valid NUL-terminated C string; `shm_open` with O_RDONLY
-    // either returns a valid fd or -1, which we check.
+    // SAFETY: `cname` is a valid NUL-terminated C string; `shm_open` with O_RDONLY either returns a valid fd or -1, which we check.
     let fd = unsafe { libc::shm_open(cname.as_ptr(), libc::O_RDONLY, 0) };
     if fd < 0 {
         return None;
@@ -5069,8 +4979,7 @@ fn read_posix_shm(name: &str) -> Option<Vec<u8>> {
         if addr == libc::MAP_FAILED {
             return None;
         }
-        // SAFETY: `addr`/`len` describe a valid read-only mapping just established;
-        // copy the bytes out before unmapping.
+        // SAFETY: `addr`/`len` describe a valid read-only mapping just established; copy the bytes out before unmapping.
         let bytes = unsafe { std::slice::from_raw_parts(addr.cast::<u8>(), len) }.to_vec();
         // SAFETY: unmapping the exact `addr`/`len` we mapped above.
         unsafe { libc::munmap(addr, len) };
@@ -5650,17 +5559,7 @@ fn shell_exit_watch(session: &Session) -> Option<ShellExit> {
     shell_exit_of(session.shell_identity)
 }
 
-/// [`shell_exit_watch`] of a shell not yet reaped. A shell of this process's
-/// own that no watch can be made for keeps a [`ShellExit`] with none: the
-/// kernel refuses an exit watch on a process that has begun to exit (`ESRCH`)
-/// a moment before that process can be collected, and a shell that fails at
-/// once is there by the time a loaded machine attaches its reader (measured:
-/// 290 of 300 such refusals came before the child was collectable). Its
-/// parent can still wait for it ([`ShellExit::await_retired`]); without the
-/// wait the exit was posted before its status could be read, and a shell
-/// killed at start was read as a clean exit, its only pane closed
-/// (`shell_exit_at_start_live_headless`, four suites beside eight CPU hogs,
-/// load 357).
+/// [`shell_exit_watch`] of a shell not yet reaped. A shell of this process's own that no watch can be made for keeps a [`ShellExit`] with none: the kernel refuses an exit watch on a process that has begun to exit (`ESRCH`) a moment before that process can be collected, and a shell that fails at once is there by the time a loaded machine attaches its reader (measured: 290 of 300 such refusals came before the child was collectable). Its parent can still wait for it ([`ShellExit::await_retired`]); without the wait the exit was posted before its status could be read, and a shell killed at start was read as a clean exit, its only pane closed (`shell_exit_at_start_live_headless`, four suites beside eight CPU hogs, load 357).
 #[cfg(unix)]
 fn shell_exit_of(identity: aterm_pty::ShellIdentity) -> Option<ShellExit> {
     let pid = u32::try_from(identity.pid).ok().filter(|pid| *pid > 1)?;
@@ -5676,29 +5575,23 @@ fn shell_exit_of(identity: aterm_pty::ShellIdentity) -> Option<ShellExit> {
 #[cfg(unix)]
 pub(crate) const SHELL_RETIRE_HANG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// How often [`ShellExit::await_retired`] looks again for a shell that has
-/// exited, or could not be watched, and is not collectable yet: a nap, never a
-/// spin that would take the CPU the exiting process needs.
+/// How often [`ShellExit::await_retired`] looks again for a shell that has exited, or could not be watched, and is not collectable yet: a nap, never a spin that would take the CPU the exiting process needs.
 #[cfg(unix)]
 const RETIRE_LOOK: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// How often [`ShellExit::await_retired`] of a gather with no wake pipe (fd
-/// exhaustion) reads the gather's stop flag while the shell's exit watch is
-/// silent: a stop is all such a gather has, and the wait is a minute long.
+/// How often [`ShellExit::await_retired`] of a gather with no wake pipe (fd exhaustion) reads the gather's stop flag while the shell's exit watch is silent: a stop is all such a gather has, and the wait is a minute long.
 #[cfg(unix)]
 const RETIRE_STOP_LOOK: std::time::Duration = std::time::Duration::from_millis(10);
 
 /// A session's shell's exit watch ([`shell_exit_watch`]) and the pid it watches.
 #[cfg(unix)]
 pub(crate) struct ShellExit {
-    /// The kernel's exit watch; `None` for a shell of this process's own that
-    /// was already on its way out when its reader attached ([`shell_exit_of`]).
+    /// The kernel's exit watch; `None` for a shell of this process's own that was already on its way out when its reader attached ([`shell_exit_of`]).
     watch: Option<std::os::fd::OwnedFd>,
     pid: u32,
 }
 
-/// Whether retirement was observed, remained unknown at the existing bound
-/// or error, or was cancelled by the reader's stop/wake.
+/// Whether retirement was observed, remained unknown at the existing bound or error, or was cancelled by the reader's stop/wake.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ShellRetirement {
@@ -5709,8 +5602,6 @@ enum ShellRetirement {
 
 #[cfg(unix)]
 impl ShellRetirement {
-    /// Timeout/error still use the existing exit policy; cancellation never
-    /// authorizes the parser to post a shell exit.
     fn gather_message(self, ending: GatherMsg) -> GatherMsg {
         match self {
             Self::Cancelled => GatherMsg::Wake,
@@ -5721,23 +5612,16 @@ impl ShellRetirement {
 
 #[cfg(unix)]
 impl ShellExit {
-    /// The watch's descriptor, `-1` (which `poll` ignores) without one.
     fn as_raw_fd(&self) -> i32 {
         self.watch
             .as_ref()
             .map_or(-1, std::os::fd::AsRawFd::as_raw_fd)
     }
 
-    /// The gather's one wait before reporting the exit, bounded by
-    /// [`SHELL_RETIRE_HANG`]. Cancellation must instead wake the parser.
     fn await_retired_at_exit(&self, wake_rd: i32, stop: &AtomicBool) -> ShellRetirement {
         self.await_retired(SHELL_RETIRE_HANG, wake_rd, stop)
     }
 
-    /// Wait at most `within` for retirement without reaping. Stop/wake returns
-    /// Cancelled, distinct from a collectable child or an unconfirmed timeout
-    /// or error. With no wake pipe, the silent watch reads the stop flag every
-    /// [`RETIRE_STOP_LOOK`].
     fn await_retired(
         &self,
         within: std::time::Duration,
@@ -5766,7 +5650,6 @@ impl ShellExit {
                         events: libc::POLLIN,
                         revents: 0,
                     },
-                    // A negative descriptor is ignored by `poll`.
                     libc::pollfd {
                         fd: wake_rd,
                         events: libc::POLLIN,
@@ -5779,8 +5662,6 @@ impl ShellExit {
                 if rc < 0 {
                     return ShellRetirement::Unconfirmed;
                 }
-                // park_reader writes the wake before raising the stop flag.
-                // Cancellation wins even if the shell watch became ready too.
                 if fds[1].revents != 0 || stopped() {
                     return ShellRetirement::Cancelled;
                 }
@@ -5807,11 +5688,9 @@ impl ShellExit {
                     libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
                 )
             };
-            // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing waitable under `WNOHANG`,
-            // left it zeroed; `si_pid` is defined in both.
+            // SAFETY: `waitid` filled a `CLD_*` siginfo or, with nothing waitable under `WNOHANG`, left it zeroed; `si_pid` is defined in both.
             let collectable = rc == 0 && unsafe { info.si_pid() } == pid;
             let finished = rc != 0 || collectable || Instant::now() >= deadline;
-            // A negative descriptor is ignored by `poll`, which then only naps.
             let mut wake = libc::pollfd {
                 fd: wake_rd,
                 events: libc::POLLIN,
@@ -6027,7 +5906,6 @@ fn spawn_pty_gather(
                             .send(GatherMsg::Edge(edge, holder, exec.take_image()))
                             .is_err()
                         {
-                            // Distinct branch.
                             return false;
                         }
                     }
@@ -6050,10 +5928,7 @@ fn spawn_pty_gather(
             let mut after_exit: Option<usize> = None;
             let mut exit_reported = false;
             loop {
-                // Stop before the next read, never between a read and its hand-off:
-                // bytes drained from the kernel must reach the engine (the
-                // checkpoint-tear contract), and the parse stage processes every
-                // batch it was sent.
+                // Stop before the next read, never between a read and its hand-off: bytes drained from the kernel must reach the engine (the checkpoint-tear contract), and the parse stage processes every batch it was sent.
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = filled_tx.send(GatherMsg::Wake);
                     break;
@@ -6107,8 +5982,6 @@ fn spawn_pty_gather(
                         }
                     }
                     aterm_pty::ReadOutcome::Eof => {
-                        // The shell closing its terminal on its way out: the
-                        // exit it is about to make goes with this one.
                         let message = if exit_reported {
                             GatherMsg::Wake
                         } else {
@@ -6176,7 +6049,6 @@ fn spawn_pty_gather(
                             .send(GatherMsg::Data(buf, filled, edge, holder, image))
                             .is_err()
                         {
-                            // Distinct branch.
                             break;
                         }
                         if owed > 0 {
@@ -6256,6 +6128,7 @@ struct PtyReaderWiring {
     #[cfg(unix)]
     fg: ForegroundWiring,
     timeline: Arc<std::sync::Mutex<crate::session_timeline::SessionTimeline>>,
+    screen_moves: Arc<crate::vitals_host::ScreenMoves>,
     card_probe: bool,
     person: Arc<crate::human_input::HumanInputStamp>,
     launch: Arc<crate::launch_witness::LaunchWitness>,
@@ -6301,6 +6174,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
         #[cfg(unix)]
         fg,
         timeline,
+        screen_moves,
         card_probe: card_probe_on,
         person,
         launch,
@@ -6765,6 +6639,7 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                                 }
                             }
                             backlog = t.lazy_backlog_len();
+                            screen_moves.fed(crate::control::screen_gen(&t));
                             if let (Some(tx), Some(pre), Some(copy)) =
                                 (&temporal_tx, spine_pre, &spine_copy)
                                 && end > off
@@ -6851,10 +6726,6 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
                 if let Some(resp) = response {
                     let resp: std::sync::Arc<[u8]> = resp.into();
                     if let Some(tx) = &temporal_tx {
-                        // The spine records the reply's instant, BEFORE handing it
-                        // to the peer; its bytes stay out (a replay never re-emits
-                        // a reply). Bounded `try_send` (see the RawIn tap above):
-                        // dropped on a full queue or inside a break, and counted.
                         spine_mark.reply(tx);
                     }
                     let _ = reply_tx.submit(resp);
@@ -6906,19 +6777,14 @@ fn spawn_pty_reader(w: PtyReaderWiring) -> Result<std::thread::JoinHandle<()>, S
             };
             #[cfg(windows)]
             loop {
-                // Stop is honored at the top of every iteration, never between a
-                // read and its processing (bytes out of the kernel queue must reach
-                // the engine). A flooding master keeps `poll` readable, so without
-                // this the wake-pipe-less fallback could never park such a reader.
+                // Stop is honored at the top of every iteration, never between a read and its processing (bytes out of the kernel queue must reach the engine).
                 if stop.load(std::sync::atomic::Ordering::Acquire) {
                     break;
                 }
                 let r = match aterm_pty::read_or_wake(master, &mut buf, wake_rd, -1, -1) {
                     aterm_pty::ReadOutcome::Wake => break,
                     aterm_pty::ReadOutcome::Idle => {
-                        // Wake-pipe-less fallback (fd exhaustion): honor the fd-free
-                        // stop flag `Session::drop` raises, so an orphan-pinned reader
-                        // still exits. Else keep waiting.
+                        // Wake-pipe-less fallback (fd exhaustion): honor the fd-free stop flag `Session::drop` raises, so an orphan-pinned reader still exits.
                         if stop.load(std::sync::atomic::Ordering::Acquire) {
                             break;
                         }
@@ -7055,8 +6921,7 @@ fn ingest_chunk_width(pending: impl FnOnce() -> bool, remaining: usize) -> usize
 }
 
 fn stamp_output_arrival(last_output_ns: &AtomicU64, now_ns: u64) {
-    // Load first: a flood between two presents finds the edge already stamped,
-    // and a plain load leaves the line shared instead of a failing RMW.
+    // Load first: a flood between two presents finds the edge already stamped, and a plain load leaves the line shared instead of a failing RMW.
     if last_output_ns.load(Ordering::Relaxed) == 0 {
         let _ = last_output_ns.compare_exchange(0, now_ns, Ordering::Relaxed, Ordering::Relaxed);
     }
@@ -7212,7 +7077,6 @@ fn gated_output_wake(
         } else if wake_stranded(word, idle_since_ns, now_ns) {
             (word, WakeGate::Reposted)
         } else {
-            // Distinct branch.
             return WakeGate::Coalesced;
         };
         match flag.compare_exchange(from, arm, Ordering::Relaxed, Ordering::Relaxed) {
@@ -8338,8 +8202,7 @@ mod reroute_path_env_tests {
             );
         }
         let (master, slave) = aterm_pty::open_pty_pair().expect("a pty pair");
-        // SAFETY: two live descriptors this test owns, each taken by exactly
-        // one `OwnedFd`; the stand-in's stdin is the copy std makes of `slave`.
+        // SAFETY: two live descriptors this test owns, each taken by exactly one `OwnedFd`; the stand-in's stdin is the copy std makes of `slave`.
         let (master, slave) = unsafe {
             use std::os::fd::{FromRawFd as _, OwnedFd};
             (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave))

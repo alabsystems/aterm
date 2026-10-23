@@ -65,6 +65,17 @@ pub fn scan_path_users_of(pids: &[u32], dirs: &[PathBuf], skip: &[u32]) -> io::R
     Ok(scan)
 }
 
+/// The path of every file `pid` holds open through a descriptor, in descriptor order, as the
+/// kernel names it: what `lsof -p <pid>` names for its descriptors, read in this process. A
+/// descriptor closed or revoked mid-read names nothing, and so does one whose metadata the
+/// kernel keeps from this process once that refusal is shown to be the file's and not the
+/// process's (`refusal_is_the_vnodes`).
+///
+/// # Errors
+///
+/// `NotFound` when `pid` has exited; `PermissionDenied` when the kernel will not list the
+/// table or describe a descriptor for a reason not shown to be the file's; `Other` for any
+/// other failure; `Unsupported` off macOS and Linux.
 #[cfg(target_vendor = "apple")]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
@@ -80,12 +91,26 @@ pub fn open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
     })
 }
 
+/// See the macOS twin. Linux: each `/proc/<pid>/fd/<n>` link that names a path (a pipe,
+/// socket or anonymous inode names none), as `lsof` reads them, in descriptor order, read
+/// from the links alone (`holders_procfs.rs`).
+///
+/// # Errors
+///
+/// `NotFound` when `pid` has exited or is a zombie; `PermissionDenied` when its table is not
+/// this process's to read (another uid's, or a non-dumpable process's); the read's error
+/// otherwise.
+#[cfg(target_os = "linux")]
+pub fn open_files(pid: u32) -> io::Result<Vec<PathBuf>> {
+    super::procfs::open_files_in(Path::new(super::procfs::PROC), pid)
+}
+
 /// See the macOS twin.
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
 pub fn open_files(_pid: u32) -> io::Result<Vec<PathBuf>> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "a process's descriptors are read in process through libproc (macOS)",
+        "a process's descriptors are read in process through libproc (macOS) or /proc (Linux)",
     ))
 }
 
@@ -314,6 +339,10 @@ mod mac {
     }
 
     fn fd_path(pid: i32, fd: i32) -> Result<Option<PathBuf>, Failed> {
+        #[cfg(test)]
+        if super::super::hook::refuses(pid, fd) {
+            return Err(Failed::Refused);
+        }
         let mut buf = [0u8; ffi::VNODE_PATH_SIZE];
         let size = i32::try_from(buf.len()).map_err(|_| Failed::Other)?;
         clear_errno();
@@ -398,21 +427,36 @@ mod mac {
         Ok(out)
     }
 
-    /// [`super::open_files`].
+    /// [`super::open_files`]: a descriptor refused for its vnode (`refusal_is_the_vnodes`) names nothing.
     pub(super) fn open_files(pid: u32) -> Result<Vec<PathBuf>, Failed> {
         let n = i32::try_from(pid).map_err(|_| Failed::Other)?;
         let mut files = Vec::new();
+        let mut refused = Vec::new();
+        let mut described = false;
         for (fd, kind) in list_fds(n)? {
             if kind != ffi::PROX_FDTYPE_VNODE {
                 continue;
             }
             match fd_path(n, fd) {
-                Ok(path) => files.extend(path),
+                Ok(path) => {
+                    described = true;
+                    files.extend(path);
+                }
                 Err(Failed::Closed | Failed::Dead) => {}
+                Err(Failed::Refused) => refused.push(fd),
                 Err(failed) => return Err(failed),
             }
         }
-        Ok(files)
+        // Each is read again without its path: refused so too, what the kernel keeps from
+        // this process is its vnode's metadata, not only its path.
+        let lookup = super::super::Lookup::BY_FILE;
+        if refused.is_empty()
+            || (described && super::super::refusal_is_the_vnodes(n, &refused, lookup))
+        {
+            Ok(files)
+        } else {
+            Err(Failed::Refused)
+        }
     }
 
     /// The first use `pid` makes of a path under `dirs`.
@@ -1558,7 +1602,7 @@ fn running(child: &crate::spawnfd::Child, exe: &str) -> u32 {
 mod dmg_acceptance {
     use super::*;
     #[cfg(target_vendor = "apple")]
-    const HDIUTIL: &str = "/usr/bin/hdiutil";
+    const HDIUTIL: &str = crate::os_path!("hdiutil");
 
     #[cfg(target_vendor = "apple")]
     fn detach(dev: &str) -> io::Result<std::process::Output> {

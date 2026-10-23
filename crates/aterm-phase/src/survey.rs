@@ -81,11 +81,8 @@ fn is_options_row(row: &str) -> bool {
 /// columns, with room for a narrower pane's third and fourth.
 const OPTION_ROWS: usize = 4;
 
-/// The cells the options' keys start at on the options' first row — `1:` at column 2
-/// first, then each `<digit>:` after it, whatever ran into it (`  1: Bad2:    3:` at 26
-/// columns, `  1:   2:    3:   0: Di` at 23, where the first box is too narrow for `1:
-/// Bad`): the columns of the boxes Ink lays the options out in. `None` when the row
-/// does not open `  1:` two columns in.
+/// The cells the options' keys start at on the options' first row (`1:` at column 2
+/// first, then each `<digit>:` after it).
 fn option_keys(row: &str) -> Option<Vec<usize>> {
     row.strip_prefix("  1:")?;
     let chars: Vec<char> = row.chars().collect();
@@ -164,8 +161,6 @@ pub fn survey_block(rows: &[String]) -> Option<SurveyBlock> {
             } else if crate::text::trim(row).is_empty()
                 || (row.starts_with("  ") && !row.starts_with("   "))
             {
-                // A body row: the message continues at column 2 (a blank is the
-                // memory card's paragraph break).
                 None
             } else {
                 Some(None)
@@ -207,9 +202,7 @@ fn kind_of(question: &str) -> SurveyKind {
     }
 }
 
-/// `^●.` and the first four words of `question`, as a `key if=` token. Each word must
-/// be plain text (letters, digits and the punctuation a question uses); the guard ends
-/// before the first word that is not, and is empty under three words.
+/// `^●.` and the first four words of `question`, as a `key if=` token.
 fn guard_of(question: &str) -> String {
     let words: Vec<&str> = question
         .split_whitespace()
@@ -250,7 +243,6 @@ pub fn drafts_card(rows: &[String]) -> Option<(usize, usize)> {
             } else if crate::text::trim(row).is_empty() {
                 None
             } else if is_glyph_row(row) || is_transcript_row(row) || is_rule(row) {
-                // Another block starts here: the card has no head above its hint.
                 Some(None)
             } else {
                 None
@@ -306,8 +298,6 @@ pub fn ask_card(rows: &[String]) -> Option<(usize, usize)> {
                 && !row.starts_with("   ")
                 && !crate::text::trim(row).is_empty()
             {
-                // The docs URL, or the row a long question wraps to: column 2. The card
-                // holds no blank row, so a blank above the options ends the walk: no ask.
                 None
             } else {
                 Some(None)
@@ -774,7 +764,7 @@ mod tests {
         }
     }
 
-    /// A CARD INK WRAPPED IS STILL THE CARD (KI S2R-F2).
+    /// A card Ink wrapped is still the card.
     #[test]
     fn a_card_ink_wrapped_is_still_the_card() {
         let narrow = |above: &[&str], width: usize, footer: &str| {
@@ -1158,11 +1148,8 @@ mod tests {
         }
     }
 
-    /// , "Dialogs in narrow panes": where Ink shrinks the card's FIRST box
-    /// under its label (`1:` over `Bad`: the session card under 24 columns, the plugin
-    /// and memory cards' five boxes under 30), the options' first row opens `  1:` and
-    /// spaces, and the row under it opens at column two (`  Bad  Fine  Good smiss`) —
-    /// neither parked nor an options row.
+    /// Where Ink shrinks the card's first box under its label, the options' first row
+    /// opens `  1:` and spaces, and the row under it opens at column two.
     #[test]
     fn a_rating_card_whose_first_box_wraps_is_the_card() {
         for width in 16..=60 {

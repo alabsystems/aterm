@@ -3,6 +3,7 @@
 
 //! `aterm fabric`: fabric status, live traffic (`tail`), session-log brief (`brief`), lifecycle (`on`, `off`, `doctor` in [`crate::enable`]), and person commands (`mint-for`, `halt`, `inbox`, `post` in [`crate::person`]).
 
+#[cfg(any(test, not(target_os = "macos")))]
 use aterm_uds::spawnfd::Stdio;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
@@ -735,7 +736,7 @@ pub(crate) fn process_table() -> Vec<Proc> {
 
 #[cfg(not(target_os = "macos"))]
 fn ps_table() -> Vec<Proc> {
-    aterm_uds::spawnfd::command("ps")
+    aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"))
         .args(["-A", "-ww", "-o", "pid=", "-o", "ppid=", "-o", "command="])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -936,7 +937,7 @@ pub(crate) fn running_image_inode(pid: u32) -> Option<u64> {
     not(any(target_os = "linux", target_os = "macos"))
 ))]
 fn lsof_image_inode(pid: u32) -> Option<u64> {
-    let out = aterm_uds::spawnfd::command("/usr/sbin/lsof")
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("lsof"))
         .args([
             "-n",
             "-P",
@@ -2868,34 +2869,10 @@ fn warnings(
     w
 }
 
-/// The local clock's offset from UTC in seconds, from `date +%z`; `None` when it cannot be run, and then every time prints in UTC and says so.
+/// The local clock's offset from UTC in seconds, read once in this process (`localtime_r`'s `tm_gmtoff`); `None` where the C library cannot say, and then every time prints in UTC and says so.
 pub(crate) fn local_offset() -> Option<i64> {
     static OFFSET: std::sync::OnceLock<Option<i64>> = std::sync::OnceLock::new();
-    *OFFSET.get_or_init(|| {
-        let out = aterm_uds::spawnfd::command("date")
-            .arg("+%z")
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        parse_utc_offset(String::from_utf8_lossy(&out.stdout).trim())
-    })
-}
-
-/// `+0200` / `-0700` as seconds.
-#[must_use]
-pub fn parse_utc_offset(z: &str) -> Option<i64> {
-    let (sign, digits) = match z.as_bytes().first()? {
-        b'+' => (1, &z[1..]),
-        b'-' => (-1, &z[1..]),
-        _ => return None,
-    };
-    if digits.len() != 4 || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let hh: i64 = digits[..2].parse().ok()?;
-    let mm: i64 = digits[2..].parse().ok()?;
-    Some(sign * (hh * 3600 + mm * 60))
+    *OFFSET.get_or_init(aterm_uds::zone::local_offset_now)
 }
 
 /// A record's time at the clock's offset: `HH:MM:SS` within a day of `now`, `MM-DDTHH:MM` beyond it, `-` when the record carried none.
@@ -5083,13 +5060,6 @@ mod tests {
         let hostile = traffic_of("lab", 12, "/f/lab/in/n-a/s-w/n-\u{1b}[2J/note", b"v=1");
         let line = tail_line(&hostile, 0, 0, true);
         assert!(!line.contains('\u{1b}'), "{line:?}");
-    }
-
-    #[test]
-    fn a_utc_offset_is_parsed_from_dates_own_spelling() {
-        assert_eq!(parse_utc_offset("-0700"), Some(-7 * 3600));
-        assert_eq!(parse_utc_offset("+0530"), Some(5 * 3600 + 30 * 60));
-        assert_eq!(parse_utc_offset("UTC"), None);
     }
 
     const CMD: &str = "aterm link serve --fleet lab --broker /tmp/b.sock --state /s";

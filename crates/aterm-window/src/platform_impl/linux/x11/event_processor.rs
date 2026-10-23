@@ -42,12 +42,6 @@ use crate::platform_impl::x11::{
     ReportExt, ScrollOrientation, UnownedWindow, WindowId,
 };
 
-// LOCAL PATCH (aterm): events are read through aterm-x11's Xlib and XInput 2 declarations and the
-// requests are its encoders, where upstream used x11-dl and x11rb. No device events: the raw XInput
-// 2 events are not selected on the root, and `WindowEvent::AxisMotion` is not reported. A window
-// manager's `_NET_WM_SYNC_REQUEST` is noted on its window (`sync_request.rs`). A failed request is
-// reported (`XConnection::report`), where upstream's `expect`s panicked.
-
 /// The core protocol's modifier bits in a key event's state (`KeyButMask`).
 mod mod_mask {
     pub const SHIFT: u16 = 1 << 0;
@@ -79,7 +73,7 @@ fn xi_mask_is_set(mask: &[u8], bit: c_int) -> bool {
 /// The maximum amount of X modifiers to replay.
 pub const MAX_MOD_REPLAY_LEN: usize = 32;
 
-/// The X11 documentation states: "Keycodes lie in the inclusive range `[8, 255]`".
+/// The X11 documentation states.
 const KEYCODE_OFFSET: u8 = 8;
 
 pub struct EventProcessor {
@@ -113,7 +107,7 @@ impl EventProcessor {
         self.process_ime(&mut callback);
     }
 
-    /// Send the IME requests the windows queued (`ImeRequest`), then hand on what the input method's callbacks queued (`ImeEvent`).
+    /// Send the IME requests the windows queued.
     pub(super) fn process_ime<T: 'static, F>(&mut self, mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -169,7 +163,7 @@ impl EventProcessor {
         }
     }
 
-    /// End `window`'s composition, if it has one open ([`Self::composing`]); whether it had.
+    /// End `window`'s composition, if it has one open ([`Self::composing`]).
     fn end_composition(&mut self, window: xproto::Window) -> bool {
         let open = self.composing == Some(window);
         if open {
@@ -225,7 +219,7 @@ impl EventProcessor {
             return;
         }
 
-        // SAFETY (each arm's union read): Xlib wrote the member that `event_type` names.
+        // SAFETY: Xlib wrote the member that `event_type` names.
         match event_type {
             event_type::CLIENT_MESSAGE => {
                 self.client_message(unsafe { &xev.client_message }, &mut callback)
@@ -363,7 +357,6 @@ impl EventProcessor {
             _event: *mut XEvent,
             _arg: *mut c_char,
         ) -> c_int {
-            // This predicate always returns "true" (1) to accept all events
             1
         }
 
@@ -408,7 +401,6 @@ impl EventProcessor {
             .map(|window| callback(&window));
 
         if deleted {
-            // Garbage collection
             window_target.windows.borrow_mut().remove(&window_id);
         }
 
@@ -530,7 +522,6 @@ impl EventProcessor {
             let time = if version >= 1 {
                 client_long(xev, 3) as xproto::Timestamp
             } else {
-                // In version 0, time isn't specified
                 aterm_x11::proto::CURRENT_TIME
             };
             self.dnd.request(window, time);
@@ -640,8 +631,7 @@ impl EventProcessor {
         self.dnd_data_came(window, &data, &mut callback);
     }
 
-    /// The drag's data came to `window`, whole: hover its local files, or deliver and finish
-    /// the drop that came first; a drag whose data names none is refused.
+    /// The drag's data came to `window`.
     fn dnd_data_came<T: 'static, F>(&mut self, window: xproto::Window, data: &[u8], mut callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -825,7 +815,6 @@ impl EventProcessor {
 
             if let Some(adjusted_size) = shared_state_lock.dpi_adjusted {
                 if new_inner_size == adjusted_size || !util::wm_name_is_one_of(&["Xfwm4"]) {
-                    // When this finally happens, the event will not be synthetic.
                     shared_state_lock.dpi_adjusted = None;
                 } else {
                     drop(shared_state_lock);
@@ -844,9 +833,7 @@ impl EventProcessor {
         }
     }
 
-    /// This is generally a reliable way to detect when the window manager's been
-    /// replaced, though this event is only fired by reparenting window managers
-    /// (which is almost all of them).
+    /// This is generally a reliable way to detect when the window manager's been replaced.
     fn reparent_notify(&self, xev: &XReparentEvent) {
         let wt = Self::window_target(&self.target);
 
@@ -872,8 +859,7 @@ impl EventProcessor {
         self.change_occlusion(window, |occlusion| occlusion.unmapped = false, &mut callback);
     }
 
-    /// The window was unmapped: the window manager iconified it or moved it off the current
-    /// workspace (mutter unmaps both), or the application hid it.
+    /// The window was unmapped.
     fn unmap_notify<T: 'static, F>(&self, xev: &ffi::XUnmapEvent, callback: F)
     where
         F: FnMut(&RootAEL, Event<T>),
@@ -882,8 +868,7 @@ impl EventProcessor {
         self.change_occlusion(window, |occlusion| occlusion.unmapped = true, callback);
     }
 
-    /// Applies `change` to what hides `window` (`window::Occlusion`), and reports
-    /// `WindowEvent::Occluded` when that changes what the window last reported.
+    /// Applies `change` to what hides `window`.
     fn change_occlusion<T: 'static, F>(
         &self,
         window: xproto::Window,
@@ -1151,9 +1136,6 @@ impl EventProcessor {
 
             BUTTON3 => WindowEvent::MouseInput { device_id, state, button: MouseButton::Right },
 
-            // LOCAL PATCH (aterm): a wheel button with no scroll valuator (XTEST: xdotool, x11vnc,
-            // Barrier/Synergy) sends a press and a release per notch; one notch is one step, so the
-            // release is dropped.
             4..=7 if state == ElementState::Released => return,
             4..=7 => WindowEvent::MouseWheel {
                 device_id,
@@ -1455,8 +1437,7 @@ impl EventProcessor {
         }
     }
 
-    /// A device came or went: its scroll axes are read, or forgotten. (WC.8: the
-    /// `DeviceEvent::Added`/`Removed` upstream reported no aterm crate reads.)
+    /// A device came or went.
     fn xinput2_hierarchy_changed(&mut self, xev: &XIHierarchyEvent) {
         let infos = unsafe { slice::from_raw_parts(xev.info, xev.num_info as usize) };
         for info in infos {
@@ -1805,13 +1786,11 @@ fn is_first_touch(first: &mut Option<u64>, num: &mut u32, id: u64, phase: TouchP
 
 /// The `i`th of a format-32 client message's five values.
 fn client_long(xev: &XClientMessageEvent, i: usize) -> c_long {
-    // SAFETY: every member of the data union is plain bytes; a format-32 message's are
-    // five longs, and any other format's are read as Xlib would.
+    // SAFETY: every member of the data union is plain bytes.
     unsafe { xev.data.l[i] }
 }
 
-/// Whether an XI2 focus event's `mode` is a keyboard grab's start or end (`XINotifyGrab`,
-/// `XINotifyUngrab`, `XINotifyPassiveGrab`, `XINotifyPassiveUngrab`).
+/// Whether an XI2 focus event's `mode` is a keyboard grab's start or end.
 fn is_grab_focus_change(mode: c_int) -> bool {
     /// XI2 focus modes (XI2.h).
     const GRAB: c_int = 1;

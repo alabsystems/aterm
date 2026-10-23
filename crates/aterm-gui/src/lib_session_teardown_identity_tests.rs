@@ -4,8 +4,6 @@
 use super::*;
 use std::time::{Duration, Instant};
 
-/// A `sleep` in its own session: a session and group leader, like the job-control leader
-/// or daemon a reissued shell pid can land on, so `getpgid(pid) == pid` alone passes it.
 fn setsid_sleep() -> aterm_uds::spawnfd::Child {
     aterm_uds::spawnfd::command("/bin/sleep")
         .arg("30")
@@ -14,8 +12,6 @@ fn setsid_sleep() -> aterm_uds::spawnfd::Child {
         .expect("the bystander sleep must spawn")
 }
 
-/// Whether the child is still running. `Err` is "already reaped by someone
-/// else" (the teardown's reaper thread), which is not running either.
 fn running(child: &mut aterm_uds::spawnfd::Child) -> bool {
     matches!(child.try_wait(), Ok(None))
 }
@@ -33,24 +29,16 @@ fn dropping_a_session_whose_pid_names_another_process_signals_nothing() {
     let born = aterm_pty::process_birth(pid).expect("a live child reads a birth");
     let mut session = stub_session(1);
     session.pid = pid;
-    // The adopted shell this session took was born a microsecond earlier:
-    // it has exited, launchd reaped it, and the kernel reissued its pid.
     session.shell_identity = aterm_pty::ShellIdentity::from_parts(pid, Some(born - 1), false);
     assert!(
         !session.shell_identity.verify(),
         "the stale identity must not verify"
     );
     drop(session);
-    // Every reap the drop started has settled or sent its SIGKILL (a hang
-    // detector, not a budget), so any signal the teardown sends is sent.
     assert!(
         aterm_pty::wait_for_reaps(aterm_spec::wait::MUST_HAPPEN),
         "the teardown's reaps never settled"
     );
-    // Then this test ends the bystander with SIGTERM. A SIGHUP or SIGKILL the
-    // teardown sent ended it already or is delivered first (lowest signal
-    // first), so how it died names who signalled it, however late a
-    // descheduled reaper ran.
     // SAFETY: a signal to the test's own child, not yet reaped.
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let status = bystander
@@ -88,9 +76,7 @@ fn dropping_a_session_whose_shell_still_verifies_hangs_it_up() {
     );
 }
 
-/// An adopted shell belongs to the predecessor until Commit: dropping its session before
-/// Commit leaves it alive for the rollback to resume. Negative control: after Commit,
-/// closing it hangs the shell up.
+/// An adopted shell belongs to the predecessor until Commit: dropping its session before Commit leaves it alive, while dropping after Commit hangs it up.
 #[test]
 fn dropping_an_adopted_session_before_commit_leaves_its_shell_alive() {
     for committed in [false, true] {
@@ -122,22 +108,7 @@ fn dropping_an_adopted_session_before_commit_leaves_its_shell_alive() {
     }
 }
 
-/// …AND SO ARE THE FILES THE PREDECESSOR HANDED THAT SHELL.
-/// The parent re-keyed the shell, or pointed it at its
-/// body, at an earlier update's Commit; the shell (an agent tab) has not
-/// reached a prompt to take either, so both still wait at
-/// `<control dir>/rekey/<sid>` and `<control dir>/integration/<sid>` — paths
-/// keyed by the sid alone, which the successor inherits. A drop before
-/// this update's Commit deleted both, so after the rollback the resumed
-/// shell kept signing with a key the parent no longer accepts (`status
-/// integration=degraded`) and stayed on its older body. The drop now
-/// leaves them, and withdraws only this process's own held writes for the
-/// sid, so a later release cannot put its key over the parent's.
-/// NEGATIVE CONTROL: after Commit the files are this process's, and the
-/// drop removes them as before — with the `<sid>.trap` a bash writes beside
-/// its re-key path at load (2026-10-17), which was left behind before.
-///
-/// RED before the fix: both files were gone after the uncommitted drop.
+/// Dropping an adopted session before Commit preserves the predecessor's rekey, body, and trap files while withdrawing uncommitted writes.
 #[test]
 fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_body_files() {
     let Some(_env) = crate::seamless::tests::env_alone() else {
@@ -157,12 +128,9 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
         let mut trap = rekey.clone().into_os_string();
         trap.push(aterm_core::shell_integration::DEBUG_TRAP_SUFFIX);
         let trap = std::path::PathBuf::from(trap);
-        // The predecessor's files, written at ITS Commit, and the one its bash
-        // wrote at its load (its read of the rc's DEBUG trap).
         std::fs::write(&rekey, "parent-key\n").expect("the parent's re-key");
         std::fs::write(&body, "parent-body\n").expect("the parent's body pointer");
         std::fs::write(&trap, "trap -- ': rc' DEBUG\n").expect("the shell's trap read");
-        // This process's own write for the same shell, held for its Commit.
         commit.hold(crate::shell_rekey::Pending::body(
             &body,
             "successor-body",
@@ -197,8 +165,6 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
             ),
             "an uncommitted drop deleted the files the predecessor handed its shell"
         );
-        // Its own held write went with the session: a release leaves the predecessor's
-        // pointer as it is.
         commit.release();
         assert_eq!(
             std::fs::read_to_string(&body).ok().as_deref(),
@@ -211,16 +177,7 @@ fn dropping_an_adopted_session_before_commit_leaves_the_predecessors_rekey_and_b
     }
 }
 
-/// THE LATCH `spawn_session` HANDS A SESSION decides that drop:
-/// built through `spawn::adopted_handoff_commit` — the one
-/// expression `spawn_session` sets `handoff_commit` with — over a factory whose `rekey_deferred` is an overlap handoff's
-/// `Deferred::holding()`, an ADOPTED session's drop leaves its shell to the
-/// predecessor. NEGATIVE CONTROLS, each hung up as before: a fresh spawn, a
-/// shell the PTY keeper kept (`recovered`), and an adoption with no overlap
-/// handoff (no latch).
-///
-/// RED against `handoff_commit: None` (or a latch that ignores `adopted`):
-/// the adopted shell is dead at 500 ms (or the fresh one survives).
+/// `spawn::adopted_handoff_commit` preserves only an uncommitted, non-recovered adopted shell when dropped.
 #[test]
 fn a_session_built_through_the_spawn_s_latch_keeps_only_an_uncommitted_adopted_shell() {
     let overlap = Arc::new(crate::shell_rekey::Deferred::holding());
@@ -257,11 +214,7 @@ fn a_session_built_through_the_spawn_s_latch_keeps_only_an_uncommitted_adopted_s
     assert!(!overlap.released(), "PRECONDITION: no Commit in this test");
 }
 
-/// A quit ends every tab's shell as closing the tab does. The final exit forgets the App,
-/// so no session drops; `hang_up_at_exit` runs each one's hang-up and reap instead. This
-/// shell ignores SIGHUP, so only the reap's SIGKILL ends it (the master's close SIGHUPs
-/// the session leader alone). Control: a shell the predecessor still owns (an adoption
-/// before Commit) is left alive, as its close leaves it.
+/// `SessionPool::hang_up_at_exit` terminates a `SIGHUP`-ignoring shell while leaving an uncommitted adopted shell alive.
 #[cfg(unix)]
 #[test]
 fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
@@ -285,7 +238,6 @@ fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
 
     pool.hang_up_at_exit();
     let settled = aterm_pty::wait_for_reaps(Duration::from_secs(60));
-    // A hang detector: the reap's SIGKILL is the event.
     let deadline = Instant::now() + Duration::from_secs(60);
     while running(&mut holdout) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -308,21 +260,7 @@ fn the_final_exit_ends_a_hup_ignoring_shell_as_closing_its_tab_does() {
     );
 }
 
-/// THE COLD UPDATE LANE'S `exec` LEAVES NO HUP-IGNORING SHELL OF A CLOSED TAB
-/// . The cold lane runs only at zero live tabs, but a tab
-/// closed just before keeps its shell's reap in grace for ~250 ms, and `exec`
-/// ends the reap's thread with every other: a shell that ignores SIGHUP, not
-/// yet SIGKILLed, would outlive the switch. The steps before the `exec`
-/// (`App::prepare_cold_exec`) settle those reaps, so by the time the `exec`
-/// runs no reap is in grace: each holdout has its SIGKILL.
-///
-/// Deterministic: the holdout says when its trap is set, so the hang-up cannot
-/// land first, and the reap is held at its SIGKILL tick
-/// (`aterm_pty::hold_reap_kills_for_test`) until the precondition is read, so a
-/// descheduled test thread cannot outlast the grace. RED with the wait removed
-/// from `prepare_cold_exec`: the exec runs while the released reap is still in
-/// its grace. Runs alone in its own process: the reap count and the hold are
-/// the process's.
+/// `App::prepare_cold_exec` waits for pending tab reaps to settle before executing the cold-update image.
 #[cfg(unix)]
 #[test]
 fn the_cold_exec_runs_only_once_a_closed_tabs_holdout_has_its_sigkill() {
@@ -353,7 +291,6 @@ fn the_cold_exec_runs_only_once_a_closed_tabs_holdout_has_its_sigkill() {
     tab.pid = i32::try_from(holdout.id()).expect("pid fits i32");
     tab.shell_identity = aterm_pty::record_spawned_shell(tab.pid);
     let hold = aterm_pty::hold_reap_kills_for_test();
-    // Closing the tab: its hang-up, and the reap in grace.
     drop(tab);
     assert!(
         !aterm_pty::wait_for_reaps(Duration::ZERO),
@@ -372,7 +309,6 @@ fn the_cold_exec_runs_only_once_a_closed_tabs_holdout_has_its_sigkill() {
         std::io::Error::from(std::io::ErrorKind::NotFound)
     });
     app.resume_after_cold_exec();
-    // A hang detector: the reap's SIGKILL is the event.
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while running(&mut holdout) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));

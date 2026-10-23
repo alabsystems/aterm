@@ -241,6 +241,18 @@ impl Platform {
     }
 }
 
+/// What other users' processes are called on the OS family `family` (`macOS`,
+/// [`Platform::name`]): the split's services part, in `sys why` and the
+/// lens's Why now alike.
+#[must_use]
+pub fn services_word(family: &str) -> &'static str {
+    match family {
+        "macOS" => "macOS services",
+        "Windows" => "Windows services",
+        _ => "system services",
+    }
+}
+
 /// Platform wording and local UTC offset for formatting vitals text.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Locale {

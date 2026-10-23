@@ -1,17 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fixture FILES the sweeps read: every screen under
-//! `aterm-phase/src/fixtures/` and (when this crate sits in the aterm
-//! workspace) `aterm-agent/src/supervise/policy/fixtures/`, read at test time.
+//! Fixture screen loaders for phase and policy test sweeps.
 
 use std::path::{Path, PathBuf};
 
 use aterm_phase::prompt::fixtures as fx;
 
-/// A fixture file's rows: the provenance line (`# …`) dropped, and a saved
-/// waiter capture's `== …` head and `exit=` tail dropped, the way the
-/// crate's own loaders read them.
+/// Extracts screen rows from a fixture file, dropping provenance and capture headers.
 pub fn file_rows(text: &str) -> Vec<String> {
     let mut r = fx::screen(text);
     if r.first().is_some_and(|l| l.starts_with("== ")) {
@@ -42,11 +38,7 @@ fn dir_screens(crate_dir: &Path, dir: &Path, into: &mut Vec<(String, Vec<String>
     }
 }
 
-/// Every fixture file as `(its path under this crate, its rows)`. The
-/// supervisor's saved captures live in a sibling crate: they are read when
-/// this crate sits in the aterm workspace, and `sweep` says so when it does
-/// not (a packaged `aterm-phase` has no sibling, and its own sweep still
-/// runs).
+/// Loads all fixture screens from `src/fixtures` and sibling policy fixtures when present.
 pub fn fixture_screens(sweep: &str) -> Vec<(String, Vec<String>)> {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut out = Vec::new();

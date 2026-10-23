@@ -11,7 +11,6 @@ use super::*;
 use crate::harness::host_path::{self, abs};
 use crate::supervise::run::CtlReply;
 
-/// A fresh, empty directory under the system temp dir, removed on drop.
 fn tmp_dir(tag: &str) -> Tmp {
     aterm_tempfile::Builder::new()
         .prefix(&format!("aterm-harness-cli-{tag}-"))
@@ -19,9 +18,6 @@ fn tmp_dir(tag: &str) -> Tmp {
         .expect("temp dir")
 }
 
-/// An [`Env`] rooted in `tmp`, with every clock and path injected, including a
-/// control socket no instance listens on (so `--status` never asks a live
-/// window).
 fn env_at(tmp: &Tmp) -> Env {
     Env {
         state: tmp.path().join("state"),
@@ -46,7 +42,6 @@ fn env_at(tmp: &Tmp) -> Env {
     }
 }
 
-/// Run one command and answer `(exit-is-zero, stdout, stderr)`.
 fn go(cmd: &Cmd, env: &Env) -> (bool, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -62,7 +57,6 @@ fn words(s: &str) -> Vec<String> {
     s.split(' ').map(str::to_string).collect()
 }
 
-/// Every form the help text advertises parses to the command it names.
 #[test]
 fn the_grammar_parses_what_the_help_text_advertises() {
     let cases: Vec<(&str, Cmd)> = vec![
@@ -267,12 +261,6 @@ fn the_grammar_parses_what_the_help_text_advertises() {
     assert_eq!(over.sock.as_deref(), Some("/a.sock"));
 }
 
-/// The limit reset's lines of `accounts --help` are the code's own word, not
-/// a copy kept by hand (a hand-kept page named 2.1.287 alone after 2.1.304's
-/// texts were read, and none of 2.1.304's kinds): the page carries them,
-/// every build a `reset.` anchor was read in is named there, and each kind's
-/// verdict under the automatic-reset policy shows, flipping one kind's
-/// verdict changing the lines.
 #[test]
 fn the_accounts_page_says_what_the_limit_reset_reads_and_takes() {
     let anchors = aterm_phase::ANCHORS;
@@ -323,7 +311,6 @@ fn the_accounts_page_says_what_the_limit_reset_reads_and_takes() {
     );
 }
 
-/// What it does not know is refused, and the hook-era ring names are gone.
 #[test]
 fn the_grammar_refuses_what_it_does_not_know() {
     for line in [
@@ -414,8 +401,6 @@ fn the_grammar_refuses_what_it_does_not_know() {
     assert!(parse(&words("limits --sock /a.sock")).is_ok());
 }
 
-/// From a pipe, `hook` and `statusline` read the payload to the end, print
-/// nothing and exit 0.
 #[test]
 fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
     struct NeverRead;
@@ -446,9 +431,6 @@ fn the_retired_hook_verbs_drain_a_pipe_and_never_wait_on_a_terminal() {
     }
 }
 
-/// A `CLAUDE_CONFIG_DIR` this command cannot resolve (a relative one whose base, Claude Code's
-/// working directory, it cannot read): `usage` folds nothing and says why rather than folding
-/// another configuration's transcript.
 #[test]
 fn usage_with_a_relative_claude_config_dir_folds_nothing_and_says_so() {
     let tmp = tmp_dir("usage-relative-config");
@@ -482,9 +464,6 @@ fn usage_with_a_relative_claude_config_dir_folds_nothing_and_says_so() {
     );
 }
 
-/// Run from a Claude Code session, `usage` folds that session's transcript
-/// (named by `CLAUDE_CODE_SESSION_ID`, or `CLAUDE_PID`'s sessions file, under
-/// `CLAUDE_CONFIG_DIR`) and its subagents', never a newer neighbour's.
 #[test]
 fn usage_folds_the_session_claude_code_names_not_the_newest() {
     let tmp = tmp_dir("usage-named");
@@ -601,9 +580,6 @@ fn usage_folds_the_session_claude_code_names_not_the_newest() {
     );
 }
 
-/// A Claude Code process as the kernel would answer for it ([`ClaudeProcess`]):
-/// `started` and `env` for the one pid [`FakeClaude::PID`], and how often
-/// each was asked.
 struct FakeClaude {
     started: Option<u64>,
     env: Option<Vec<String>>,
@@ -612,10 +588,8 @@ struct FakeClaude {
 
 impl FakeClaude {
     const PID: u32 = 4242;
-    /// The second the kernel started it.
     const STARTED: u64 = 1_788_466_435;
 
-    /// The live process, started with `env`.
     fn with(env: &[(&str, &str)]) -> FakeClaude {
         FakeClaude {
             started: Some(FakeClaude::STARTED),
@@ -641,9 +615,6 @@ impl ClaudeProcess for FakeClaude {
     }
 }
 
-/// `usage` names its account by the roster's label for the login its Claude Code was started
-/// with (`CLAUDE_PID`'s exec environment, read once, only for a roster of two or more and a
-/// named session).
 #[test]
 fn usage_names_the_account_its_claude_code_runs_under() {
     let tmp = tmp_dir("usage-account");
@@ -780,10 +751,6 @@ fn usage_names_the_account_its_claude_code_runs_under() {
     assert_eq!(unread.asked.get(), (0, 0), "never read");
 }
 
-/// A Codex home under `tmp` holding one conversation — its TUI's thread
-/// (two turns on sol), a subagent forked from it (the copy, then a turn of
-/// its own on luna) and a subagent of a model no public page prices — and
-/// another conversation's thread beside it (a turn on gpt-5.5).
 fn codex_home_at(home: &Path) -> [&'static str; 3] {
     use crate::harness::codex_rollout::fixtures::{context, copied, count, message, meta};
     const ROOT: &str = "01900000-0000-7000-8000-000000000001";
@@ -841,11 +808,6 @@ fn codex_home_at(home: &Path) -> [&'static str; 3] {
     [ROOT, SUB, UNPRICED]
 }
 
-/// Run from a Codex session's own tools (`CODEX_THREAD_ID`), `usage` folds
-/// its conversation's rollouts under `CODEX_HOME`: the TUI's thread and its
-/// subagents, each served turn once and the fork's copied prefix not at all,
-/// at the shipped table's list prices; a model the table does not price is
-/// unpriced, its `usd` null; another conversation is none of it.
 #[test]
 fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
     let tmp = tmp_dir("usage-codex");
@@ -1010,9 +972,6 @@ fn usage_from_codex_tools_folds_its_conversation_at_list_prices() {
     assert!(!out.contains("source=rollout"), "{out}");
 }
 
-/// The Codex home is `CODEX_HOME`, else `$HOME/.codex`; a relative
-/// `CODEX_HOME` names none this command can find, and `~/.codex` is not it:
-/// nothing folds, and the run says why.
 #[test]
 fn usage_from_codex_tools_with_a_relative_codex_home_folds_nothing_and_says_so() {
     let tmp = tmp_dir("usage-codex-relative");
@@ -1041,7 +1000,6 @@ fn usage_from_codex_tools_with_a_relative_codex_home_folds_nothing_and_says_so()
     assert!(out.contains("has written no rollout under"), "{out}");
 }
 
-/// A screen with Claude Code's session-limit notice above its composer.
 fn limited_screen() -> Vec<String> {
     let mut screen = rows(&[
         "❯ carry on with the parser",
@@ -1054,14 +1012,12 @@ fn limited_screen() -> Vec<String> {
     screen
 }
 
-/// The same frame with the turn simply over — no notice.
 fn idle_screen() -> Vec<String> {
     let mut screen = rows(&["⏺ Merged and pushed.", ""]);
     screen.extend(composer("  ? for shortcuts"));
     screen
 }
 
-/// The `text --json` body a server sends for `rows`.
 fn text_json(rows: &[String]) -> String {
     let mut o = Map::new();
     o.insert(
@@ -1076,8 +1032,6 @@ fn text_json(rows: &[String]) -> String {
     aterm_json::to_string(&Value::Object(o)).expect("json")
 }
 
-/// A [`Ctl`] that answers every request with one scripted reply and records
-/// what it was asked.
 struct Scripted {
     reply: CtlReply,
     asked: Vec<String>,
@@ -1090,8 +1044,6 @@ impl Ctl for Scripted {
     }
 }
 
-/// A [`Ctl`] for one tab: `status` names `program` as its foreground (`None`:
-/// `program=-`), `text` sends `rows`; every request recorded.
 struct TabCtl {
     program: Option<&'static str>,
     rows: Vec<String>,
@@ -1128,9 +1080,6 @@ fn scripted(stdout: String, code: i32, stderr: &str) -> Scripted {
     }
 }
 
-/// Claude Code's critical-memory banner is the engine's own
-/// wall, `wall=memory`, and no limit: a restart ends it, not a wait, so it
-/// has no reset.
 #[test]
 fn the_memory_banner_is_its_own_wall_and_no_limit() {
     use aterm_phase::prompt::fixtures::{MEMORY_BANNER_IDLE, screen};
@@ -1154,10 +1103,6 @@ fn the_memory_banner_is_its_own_wall_and_no_limit() {
     );
 }
 
-/// `limits` asks the named session's `status` which program is in front, makes one screen read,
-/// and prints the engine's own wall reading by that program's grammar at `source=grid` (a reply
-/// that names none, as here, leaves it to the screen), its reset placed by the supervisor's
-/// clock.
 #[test]
 fn limits_reads_the_sessions_screen_once_and_names_its_wall() {
     let tmp = tmp_dir("limits");
@@ -1212,9 +1157,6 @@ fn limits_reads_the_sessions_screen_once_and_names_its_wall() {
     assert!(err.contains("@s-gone"), "{err}");
 }
 
-/// Outside an aterm session (`$ATERM_PARENT_SESSION_ID` empty) and with no
-/// `@<sid>`, `limits` refuses with exit 2 and reads nothing rather than
-/// classifying whichever session the socket defaults to.
 #[test]
 fn limits_with_no_session_to_read_refuses_and_reads_nothing() {
     let tmp = tmp_dir("limits-nosid");
@@ -1253,11 +1195,6 @@ fn limits_with_no_session_to_read_refuses_and_reads_nothing() {
     );
 }
 
-/// `limits` reads a tab by ITS OWN PROGRAM'S reader, the one `status` names
-/// in front: a Codex tab's usage wall (`■ You’ve hit your usage limit … try
-/// again at …`) reads as no wall, since aterm reads no Codex screen (its Codex
-/// screen lane was retired on 2026-10-16; codex-alab waits out its own
-/// limits).
 #[test]
 fn limits_reads_each_tab_by_its_own_programs_grammar() {
     let tmp = tmp_dir("limits-program");
@@ -1310,8 +1247,6 @@ fn limits_reads_each_tab_by_its_own_programs_grammar() {
     );
 }
 
-/// The report answers, removes nothing by default, and is journalled to the
-/// disk ledger `ledger disk` reads back.
 #[test]
 fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
     let tmp = tmp_dir("disk");
@@ -1350,11 +1285,6 @@ fn the_disk_report_names_nothing_removable_by_default_and_is_journalled() {
     assert_eq!(rows.lines().count(), 2, "{rows}");
 }
 
-/// THE VERB HOLDS THE SYSTEM'S ERROR BOXES OFF (
-/// its first finding): `aterm harness disk` canonicalizes its roots and the
-/// tabs' directories and walks build directories, and on Windows a query of
-/// an empty card reader or optical drive otherwise puts a box on the
-/// person's desktop and parks the command.
 #[test]
 fn the_disk_verb_holds_the_error_boxes_off() {
     let tmp = tmp_dir("disk-quiet");
@@ -1377,9 +1307,6 @@ fn the_disk_verb_holds_the_error_boxes_off() {
     );
 }
 
-/// The store the disk scan reads and the `bin/` clause 5 reads are atpkg's
-/// own, on every platform: `<atpkg's default prefix>/store` and its sibling
-/// `bin/`.
 #[test]
 fn the_disk_scan_reads_atpkgs_own_store_and_bin() {
     let tmp = tmp_dir("disk-store");
@@ -1415,8 +1342,6 @@ fn the_disk_scan_reads_atpkgs_own_store_and_bin() {
     );
 }
 
-/// The disk journal is bounded: a journal past the bound is cut back to its
-/// newest rows before the run appends.
 #[test]
 fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
     let tmp = tmp_dir("disk-bound");
@@ -1488,9 +1413,6 @@ fn the_disk_journal_is_cut_back_to_its_newest_rows_past_the_bound() {
     assert!(!bound_ledger(&tmp.path().join("none.jsonl"), 1, 1).unwrap());
 }
 
-/// THE CUT IS ONLY ORDERED (aterm-durable's counting seam): its temporary is
-/// flushed ahead of the rename that publishes it, never fully; a journal under
-/// the bound is not flushed at all.
 #[test]
 fn a_ledger_cut_is_ordered_ahead_of_its_rename() {
     let tmp = tmp_dir("ledger-cut-flush");
@@ -1504,8 +1426,6 @@ fn a_ledger_cut_is_ordered_ahead_of_its_rename() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "three\n");
 }
 
-/// `now` far enough past the files a test just wrote that every profile in
-/// them is idle.
 fn idle_now() -> i64 {
     i64::try_from(aterm_time::unix_secs().unwrap()).unwrap()
         + (disk::DEFAULT_TARGET_STALE_DAYS + 1) * 86_400
@@ -2007,8 +1927,6 @@ fn the_tick_removes_nothing_whose_intent_it_cannot_journal() {
     assert!(target.join("debug/incremental").exists(), "the cache stays");
 }
 
-/// The verb, too: with the disk journal unopenable (a directory sits at its
-/// path), `--apply cargo-targets` removes nothing and says why.
 #[test]
 fn the_verb_removes_nothing_whose_intent_it_cannot_journal() {
     let tmp = tmp_dir("disk-verb-unjournalled");
@@ -2111,8 +2029,6 @@ fn the_verb_json_carries_what_each_row_went_kept_and_why() {
     );
 }
 
-/// [`on_volume`] keeps the targets whose volume id is the measured one's, and
-/// nothing when an id cannot be read.
 #[test]
 fn only_the_measured_volumes_targets_are_candidates() {
     let id_of = |p: &Path| -> Option<u32> {
@@ -2203,8 +2119,6 @@ fn the_disk_knobs_are_read_from_aterm_toml() {
     );
 }
 
-/// The `[disk]` knobs are read by the window's TOML parser, not a line
-/// reader: an inline table, quoted keys and `_` separators read the same.
 #[test]
 fn every_spelling_the_window_parser_reads_reads_the_same_knobs() {
     for text in [
@@ -2244,10 +2158,6 @@ fn every_spelling_the_window_parser_reads_reads_the_same_knobs() {
     }
 }
 
-/// A removal knob that cannot be read turns every removal off (`apply`, the automatic floor, the
-/// whole-directory reclaim) whatever the rest of the file grants, and the reading names it: a
-/// file the parser refuses, a `disk` that is not a table, a removal knob of another type, and
-/// one TOML files under another table.
 #[test]
 fn a_disk_knob_that_cannot_be_read_turns_every_removal_off() {
     const GRANT: &str = "[disk]\napply = true\nauto_free_gib = 20\ndead_build_dirs = true\ntarget_stale_days = 30\n";
@@ -2385,8 +2295,6 @@ fn a_disk_knob_that_cannot_be_read_turns_every_removal_off() {
     );
 }
 
-/// The window's disk watch ends a `disk.low` line only at or above the floor the file sets
-/// ([`DiskReading::at_or_above_floor`]).
 #[test]
 fn a_floor_the_file_does_not_say_never_reads_as_space_back() {
     const GIB: u64 = 1 << 30;
@@ -2432,9 +2340,6 @@ fn a_floor_the_file_does_not_say_never_reads_as_space_back() {
     }
 }
 
-/// An aterm.toml that exists and cannot be read as text — not UTF-8, or not
-/// a file — grants no removal, and the reading names it; the hand-run verb
-/// prints each note on stderr, its `--json` stdout untouched.
 #[test]
 fn an_unreadable_aterm_toml_grants_no_removal_and_the_verb_says_so() {
     let tmp = tmp_dir("disk-unreadable");
@@ -2477,8 +2382,6 @@ fn an_unreadable_aterm_toml_grants_no_removal_and_the_verb_says_so() {
     assert!(!out.contains("disk.auto_free_gib"), "{out}");
 }
 
-/// `harness.enabled = false` appended below another table's header still
-/// switches the harness off, and the verb says where it found it.
 #[test]
 fn a_kill_switch_written_below_another_header_still_reads_off() {
     let tmp = tmp_dir("master-misplaced");
@@ -2502,8 +2405,6 @@ fn a_kill_switch_written_below_another_header_still_reads_off() {
     assert!(!err.contains("theme.harness"), "{err}");
 }
 
-/// Run one command and answer `(exit code, stdout, stderr)`, the code as its
-/// `Debug` form so a test can tell 1 from 75.
 fn go_code(cmd: &Cmd, env: &Env) -> (String, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -2515,8 +2416,6 @@ fn go_code(cmd: &Cmd, env: &Env) -> (String, String, String) {
     )
 }
 
-/// `upgrade` with no session under `env`'s scratch home: a sweep that runs
-/// visits nothing and reaches no live aterm.
 fn upgrade_cmd(dry_run: bool, json: bool) -> Cmd {
     Cmd::Upgrade {
         sid: String::new(),
@@ -2525,8 +2424,6 @@ fn upgrade_cmd(dry_run: bool, json: bool) -> Cmd {
     }
 }
 
-/// A hand-run `upgrade` stands down under `[harness] enabled = false` as the
-/// window's host does: one `refused:bypassed` line, no lock taken, exit 1.
 #[test]
 fn a_hand_run_upgrade_stands_down_while_the_master_switch_is_off() {
     let tmp = tmp_dir("upgrade-master");
@@ -2626,9 +2523,6 @@ fn a_hand_run_upgrade_leaves_out_an_agent_whose_switch_is_off() {
     assert!(err.contains("`[harness] enabled` reads off"), "{err}");
 }
 
-/// A one-shot `upgrade` whose sweep never ran does not exit 0: the lock held by
-/// another actor (the window's host) exits 75, atpkg's "try again later"; a
-/// state directory that cannot hold the lock exits 1.
 #[test]
 fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
     let tmp = tmp_dir("upgrade-busy");
@@ -2672,8 +2566,6 @@ fn a_hand_run_upgrade_that_could_not_sweep_does_not_exit_zero() {
     assert_eq!(code, format!("{:?}", ExitCode::from(1)), "{out}");
 }
 
-/// `ledger` reads the engine's approval ledger (written by the supervisor's
-/// approval loop) for one session, newest last.
 #[test]
 fn the_ledger_verb_reads_the_supervisors_approval_ledger() {
     let tmp = tmp_dir("ledger");
@@ -2726,8 +2618,6 @@ fn the_ledger_verb_reads_the_supervisors_approval_ledger() {
     assert!(out.contains("s-test.jsonl"), "{out}");
 }
 
-/// The tail is bounded however long the file is, and a missing file is no
-/// rows rather than an error.
 #[test]
 fn a_ledger_tail_keeps_only_the_newest_rows() {
     let tmp = tmp_dir("tail");
@@ -2761,7 +2651,6 @@ fn a_deferral_is_a_span_with_a_unit_within_a_month() {
     }
 }
 
-/// A recorded upgrade under `env`'s state, as the window's upgrade step leaves one.
 fn record_upgrade(env: &Env, session: &str, tab: &str, extra: &str) {
     let dir = env.state.join("upgrade");
     std::fs::create_dir_all(&dir).expect("state");
@@ -2824,7 +2713,7 @@ fn live_holder_in(
         read
     });
     let start = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("ps")
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"))
             .args(["-o", "lstart=", "-p", &pid.to_string()])
             .env("LC_ALL", "C")
             .env("TZ", "UTC"),
@@ -2854,9 +2743,6 @@ fn live_holder_in(
     child
 }
 
-/// The worst give-up row fits its cut whole ([`GAVE_UP_DETAIL_BYTES`]): more
-/// processes than are named, each with a longest name and command of four-byte
-/// characters, and the count of the rest still ends the row.
 #[test]
 fn the_worst_give_up_row_fits_its_cut_whole() {
     use super::super::upgrade::{HELD_COMMAND_CHARS, HELD_NAMED, Held};
@@ -3136,8 +3022,6 @@ fn a_conversation_resumed_outside_aterm_is_never_told_unwatched() {
     let _ = inside.wait();
 }
 
-/// The owner's word on a tab whose agent's own switch is off is recorded and waits, as under the
-/// master switch: stderr names that agent's switch, for a Claude Code tab and a Codex tab alike.
 #[test]
 fn an_owners_word_on_a_tab_whose_agent_is_off_names_its_switch() {
     let tmp = tmp_dir("upgrade-owner-agent-off");
@@ -3194,8 +3078,6 @@ fn an_owners_word_on_a_tab_whose_agent_is_off_names_its_switch() {
     }
 }
 
-/// A word the busy lock keeps out exits 75 — the sweep's own "try again"
-/// code — and writes nothing.
 #[test]
 fn an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing() {
     let tmp = tmp_dir("upgrade-owner-busy");
@@ -3234,9 +3116,6 @@ fn an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing() {
     );
 }
 
-/// A dry run's line carries how long the session has been behind and its
-/// current wait has lasted, from the recorded upgrade; a report with no
-/// recorded upgrade is the plain line.
 #[test]
 fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
     let report = super::super::upgrade_drive::Report {
@@ -3294,10 +3173,6 @@ fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
     assert!(lines[1].contains(r#""pending_for_s":null"#), "{}", lines[1]);
 }
 
-/// `harness limits` says the time the supervisor will continue at. A weekly wall hit at 8 pm
-/// that says `resets 9am` resets tomorrow, 13 hours off (the done row's clock is the print),
-/// where the session window's five-hour rule would put it 11 hours in the past; a session
-/// window's `9am` is still today's.
 #[test]
 fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
     use aterm_phase::prompt::fixtures::{composer, rows};
@@ -3345,13 +3220,10 @@ fn the_view_places_a_weekly_walls_bare_clock_after_its_print() {
     );
 }
 
-/// An exit code as a test compares it.
 fn exit(code: u8) -> String {
     format!("{:?}", ExitCode::from(code))
 }
 
-/// A scripted [`AccountsHost`]: `auth status` is answered by `status`, keyed by the login
-/// string it was handed, and every call is recorded; nothing is spawned.
 struct FakeHost<'a> {
     tty: bool,
     status: &'a dyn Fn(&str) -> Result<Captured, String>,
@@ -3408,13 +3280,10 @@ impl AccountsHost for FakeHost<'_> {
     }
 }
 
-/// The `auth status` of a verb that must run nothing.
 fn never_asked(login: &str) -> Result<Captured, String> {
     panic!("this verb runs no `claude` (asked under {login:?})");
 }
 
-/// What `claude auth status --json` prints and exits with on 2.1.286, for the one key read here
-/// (design §1): `loggedIn: true` and exit 0, or `loggedIn: false` and exit 1.
 fn said(logged_in: bool) -> Result<Captured, String> {
     Ok(Captured {
         stdout: format!(r#"{{"loggedIn":{logged_in},"authMethod":"claude.ai"}}"#).into_bytes(),
@@ -3422,7 +3291,6 @@ fn said(logged_in: bool) -> Result<Captured, String> {
     })
 }
 
-/// Run one `accounts` form against `host`: `(exit, stdout, stderr)`.
 fn acc(form: AccountsCmd, env: &Env, host: &dyn AccountsHost) -> (String, String, String) {
     let mut out = Vec::new();
     let mut err = Vec::new();
@@ -3434,13 +3302,10 @@ fn acc(form: AccountsCmd, env: &Env, host: &dyn AccountsHost) -> (String, String
     )
 }
 
-/// One `accounts` form that runs no `claude`.
 fn acc_quiet(form: AccountsCmd, env: &Env) -> (String, String, String) {
     acc(form, env, &FakeHost::new(&never_asked))
 }
 
-/// Record each login's auth as an observation is recorded, through the store's own transaction
-/// ([`accounts::note_auth`] at `env.now`), with no verb run.
 fn on_record(env: &Env, seen: &[(&str, Auth)]) {
     let mut note = None;
     env.accounts_store()
@@ -3462,17 +3327,12 @@ fn add(label: &str, class: Class) -> AccountsCmd {
     }
 }
 
-/// A login made in the login directory `dir`: the directory and one file in it, as the
-/// vendor's flow leaves it.
 fn login_made_in(dir: impl AsRef<Path>) {
     let dir = dir.as_ref();
     std::fs::create_dir_all(dir).expect("mkdir");
     std::fs::write(dir.join("a-login-file"), "{}").expect("write");
 }
 
-/// The design's own roster under `env`: `main` (this machine's login), `work-2` (dedicated, a
-/// login made in its directory) and `pool-a` (shared, its directory not made: not enrolled
-/// here).
 fn three_accounts(tmp: &Tmp, env: &Env) -> (String, String) {
     let work = tmp.path().join("logins").join("work-2");
     login_made_in(&work);
@@ -3491,7 +3351,6 @@ fn three_accounts(tmp: &Tmp, env: &Env) -> (String, String) {
     (work, pool)
 }
 
-/// Every file under `dir`, read whole.
 fn every_file(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     let mut found = Vec::new();
     for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
@@ -3506,8 +3365,6 @@ fn every_file(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
     found
 }
 
-/// With no roster (the packaged state) the report says no account is listed, names the file it
-/// read and the line that lists one, and writes nothing.
 #[test]
 fn with_no_roster_the_report_names_the_file_and_the_add_line_and_writes_nothing() {
     let tmp = tmp_dir("accounts-none");
@@ -3532,10 +3389,6 @@ fn with_no_roster_the_report_names_the_file_and_the_add_line_and_writes_nothing(
     assert!(!env.state.exists(), "the report made no state directory");
 }
 
-/// WHERE NO ACCOUNT CAN TAKE OVER, THE REPORT NAMES THE ONE STEP THAT CHANGES
-/// IT (the review of the login carry, r8c-3: it said `next: none` and closed
-/// on a paragraph about the build): the line that lists another account, the
-/// step a usage limit's notice gives there.
 #[test]
 fn where_no_account_can_take_over_the_report_names_another() {
     let tmp = tmp_dir("accounts-another");
@@ -3590,9 +3443,6 @@ fn where_no_account_can_take_over_the_report_names_another() {
     assert!(!names_add(&out), "{out}");
 }
 
-/// A roster that does not admit is refused whole, by name, exit 1: by the report (text, and
-/// JSON whose `refused` carries the reason) and by every verb that would act on it, none of
-/// which writes or runs anything.
 #[test]
 fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     let tmp = tmp_dir("accounts-refused");
@@ -3660,9 +3510,6 @@ fn a_refused_roster_is_said_by_name_and_nothing_acts_on_it() {
     assert!(out.contains("pool-a"), "{out}");
 }
 
-/// The first `accounts add` on a machine with no roster lists this machine's own login as
-/// `main` (dedicated, no dir) before the new row and says so; the row's dir is the login
-/// directory it made, 0700, and the line to run next is printed.
 #[test]
 fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     let tmp = tmp_dir("accounts-add");
@@ -3715,10 +3562,6 @@ fn the_first_add_lists_this_machines_own_login_then_the_new_row() {
     assert_eq!(read.row("pool-a").map(|r| r.class), Some(Class::Shared));
 }
 
-/// A row just added is listed, not signed in: with its directory empty it is `not-enrolled` in
-/// the report and its JSON, never `next:`, and its reason names the line that signs it in;
-/// `accounts use` refuses it with that line; and `accounts login` still runs on it, but a flow
-/// that exits 0 and leaves nothing there is `not enrolled`, exit 1, nothing asked.
 #[test]
 fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     let tmp = tmp_dir("accounts-empty-dir");
@@ -3789,8 +3632,6 @@ fn a_row_whose_login_directory_is_empty_is_listed_and_not_enrolled() {
     assert_eq!(*tty.asked.borrow(), vec![dir_text]);
 }
 
-/// Negative control for the first-add rule: a roster that already has a row (here one written
-/// by hand, with a dir) is not a new roster, and `add` lists no `main` into it.
 #[test]
 fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     let tmp = tmp_dir("accounts-add-existing");
@@ -3816,9 +3657,6 @@ fn an_add_to_a_roster_with_rows_lists_no_login_of_its_own() {
     );
 }
 
-/// `accounts add` refuses by name, exit 1, leaving the roster as it was: a label already
-/// listed, one outside the grammar, `main` as the first label of a new roster, and a state
-/// directory that is not absolute.
 #[test]
 fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
     let tmp = tmp_dir("accounts-add-refused");
@@ -3862,8 +3700,6 @@ fn add_refuses_a_listed_or_inadmissible_label_by_name_and_writes_nothing() {
     );
 }
 
-/// `accounts login` prints `CLAUDE_CONFIG_DIR='<dir>' claude auth login` with the dir verbatim
-/// from the roster (a trailing slash and a quote survive, the quote shell-escaped).
 #[test]
 fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     let tmp = tmp_dir("accounts-login");
@@ -3921,7 +3757,6 @@ fn login_prints_the_line_and_runs_it_only_at_a_terminal() {
     assert_eq!(tty.logins.borrow().len(), before, "neither ran anything");
 }
 
-/// A failed flow runs nothing more under any login (this host's `auth status` panics), exit 1.
 #[test]
 fn a_failed_flow_runs_nothing_and_records_only_a_first_login_signed_out() {
     let tmp = tmp_dir("accounts-login-failed");
@@ -4019,10 +3854,6 @@ fn wake_id(store: &accounts::Store) -> Option<u64> {
     std::fs::metadata(store.wake_path()).ok().map(|m| m.ino())
 }
 
-/// `accounts login` at a terminal waits for the flow, asks that one login under its own string,
-/// prints its answer after the flow's line, and records a login that works (the state's word, a
-/// ledger `auth` row `ok`, the wake marker replaced), exit 0, stamped by the host's clock read
-/// after the flow.
 #[test]
 fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     let tmp = tmp_dir("accounts-login-records");
@@ -4075,10 +3906,6 @@ fn login_at_a_terminal_asks_that_one_login_and_records_that_it_works() {
     assert_ne!(wake_id(&store), woken, "a login that works wakes");
 }
 
-/// A FLOW THAT EXITS 0 IS NOT A LOGIN THAT WORKS. One whose login then
-/// answers signed out is exit 1, and the state says so with a ledger row
-/// (one that could not be asked:
-/// `a_login_that_could_not_be_asked_is_said_and_never_recorded`).
 #[test]
 fn a_flow_that_ends_signed_out_is_recorded_so_and_exits_1() {
     let tmp = tmp_dir("accounts-login-signed-out");
@@ -4117,8 +3944,6 @@ fn a_flow_that_ends_signed_out_is_recorded_so_and_exits_1() {
     assert_eq!(wake_id(&store), woken, "nobody is woken");
 }
 
-/// Where no login can be asked (neither USER nor LOGNAME set) the flow is not started: it would
-/// cost a browser sign-in that records nothing.
 #[test]
 fn a_login_nobody_could_ask_afterwards_is_not_started() {
     let tmp = tmp_dir("accounts-login-unaskable");
@@ -4340,10 +4165,6 @@ fn terminal_flow_restores_signals_when_its_wait_unwinds() {
     .unwrap();
 }
 
-/// A login that COULD NOT BE ASKED after a flow that exited 0 is said with
-/// the reason, recorded as nothing, and the exit is 1: `claude` not on PATH
-/// (the runner's own sentence), an exit with no answer, an answer that
-/// disagrees with its exit, a signal.
 #[test]
 fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     let tmp = tmp_dir("accounts-login-unanswered");
@@ -4398,10 +4219,6 @@ fn a_login_that_could_not_be_asked_is_said_and_never_recorded() {
     assert_eq!(state.account("work-2").auth, Auth::Ok);
 }
 
-/// The secrecy control: `claude auth status --json` names an email and an organization. The
-/// fake host's output carries both (in a document that answers, in plain text, and inside the
-/// `loggedIn` key) and no byte of them reaches stdout, stderr, any file `accounts login` wrote,
-/// the report or the ledger view.
 #[test]
 fn login_keeps_no_byte_of_the_vendors_output() {
     let tmp = tmp_dir("accounts-secrecy");
@@ -4503,9 +4320,6 @@ fn login_keeps_no_byte_of_the_vendors_output() {
     }
 }
 
-/// `accounts use <label>` records the owner's pin — `active`, `proven`,
-/// `pinned`, a ledger `use` row, the wake marker replaced — and says that it
-/// is recorded ([`ACCOUNTS_USE_RECORDED`]).
 #[test]
 fn use_records_the_owners_pin_and_claims_no_move() {
     let tmp = tmp_dir("accounts-use");
@@ -4557,8 +4371,6 @@ fn use_records_the_owners_pin_and_claims_no_move() {
     assert_eq!(store.tail(20).expect("ledger").len(), 2, "no pin: no row");
 }
 
-/// `accounts use` refuses by name, exit 1, with nothing changed: a label the roster does not
-/// list, one not enrolled here, and one on record as signed out, each with what to run.
 #[test]
 fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     let tmp = tmp_dir("accounts-use-refused");
@@ -4599,10 +4411,6 @@ fn use_refuses_an_unlisted_unenrolled_or_signed_out_label_by_name() {
     assert_eq!(code, exit(0), "{err}");
 }
 
-/// A state with something of everything, written through the store: `main` sampled five
-/// minutes ago with its session window read and its week not, a reset offer, a session on it;
-/// `work-2` at a wall, with a session that could not move; `pool-a` never observed and not
-/// enrolled here.
 fn reported_state(env: &Env) {
     let now = env.now;
     let mut state = accounts::State {
@@ -4645,11 +4453,6 @@ fn reported_state(env: &Env) {
     env.accounts_store().save(&state).expect("save");
 }
 
-/// THE REPORT, as JSON: one line, schema 1, kind `accounts`; every key of a
-/// row present whatever is known; an unknown is `null`, never `0`; an
-/// instant in Unix seconds with its UTC form beside it; `dir` absent for
-/// this machine's own login; an offer's count with the kind it counts, in
-/// the text report too.
 #[test]
 fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     let tmp = tmp_dir("accounts-json");
@@ -4786,9 +4589,6 @@ fn the_json_report_has_every_key_and_null_for_what_nobody_read() {
     );
 }
 
-/// The check after a sign-in is not run with neither USER nor LOGNAME set: Claude Code then
-/// answers `loggedIn: false`, exit 1, for a login that works (2.1.286), which would record it
-/// signed out and end a pin on it.
 #[test]
 fn the_check_after_a_sign_in_needs_user_or_logname() {
     type Vars = &'static [(&'static str, &'static str)];
@@ -4821,10 +4621,6 @@ fn the_check_after_a_sign_in_needs_user_or_logname() {
     );
 }
 
-/// A STATE FILE THAT IS NOT OURS IS NEVER SAVED OVER. A `state.json` of
-/// another schema — a newer build's, with this older one still on the
-/// machine — used to load as the empty state and be written over by the next
-/// `login` or `use`: the pin, every wall and every signed-out word gone.
 #[test]
 fn a_state_file_of_another_schema_is_refused_by_every_write_and_left_as_it_is() {
     let tmp = tmp_dir("accounts-not-ours");
@@ -4994,9 +4790,6 @@ fn add_writes_a_symlinked_roster_through_the_link() {
     assert!(!env.accounts_store().logins_dir().exists());
 }
 
-/// A roster that defines `account` inline (`account = [ { … } ]`) admits and is reported, but
-/// cannot be appended to (an `[[account]]` table cannot extend it): `add` says so, prints the
-/// row to add by hand, and writes nothing.
 #[test]
 fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     let tmp = tmp_dir("accounts-add-inline");
@@ -5053,11 +4846,6 @@ fn add_to_an_inline_roster_says_so_and_prints_the_row_to_add_by_hand() {
     );
 }
 
-/// A SIGN-IN AFTER THE CLOCK WAS SET BACK IS STILL RECORDED. A word stamped
-/// ahead of the clock used to make every later answer "older than the one
-/// held": the verb printed `signed in` and recorded nothing, for as long as
-/// the clock was behind the stamp, and the account stayed signed-out to
-/// `use` and to every rotation.
 #[test]
 fn a_login_is_recorded_over_a_word_stamped_ahead_of_the_clock() {
     let tmp = tmp_dir("accounts-login-clock");
@@ -5153,9 +4941,6 @@ fn the_auth_runner_runs_the_program_it_is_given_under_the_login() {
     ));
 }
 
-/// `harness limits` says whether usage credits carry the session: `credits=in-use` beside
-/// `wall=none` on the 2.1.300 credits screens (credits are no wall) and `"credits":"in-use"` in
-/// the JSON; the watchdog's retry row is a turn in progress, no wall, with `credits=-`.
 #[test]
 fn harness_limits_says_whether_credits_carry_the_session() {
     use aterm_phase::prompt::fixtures::{
@@ -5220,10 +5005,6 @@ fn harness_limits_attributes_credits_only_to_claude_code() {
     assert!(!view(Program::Claude, &screen(END_SESSION_LIMIT)).credits);
 }
 
-/// `harness accounts` shows what the record says of an account's usage: with no roster, the
-/// machine's own row once its usage is on record (`[harness] usage_notes`), credits in use since
-/// a time and then, written over that, the vendor's word that they are off and its weekly
-/// warning; on a roster's row the same words come before `on:`.
 #[test]
 fn the_accounts_report_shows_the_record_of_usage() {
     use super::super::accounts::{Credits, CreditsOff, CreditsUse, WindowSaid};
@@ -5313,9 +5094,6 @@ fn the_accounts_report_shows_the_record_of_usage() {
     assert!(!row("work-2").contains("credits:"), "{out}");
 }
 
-/// `usage` shows the tap's last reading of its own process: the file this tab and
-/// `CLAUDE_PID` name, written since that process started (the HUD's figures and the reading's
-/// age, the JSON's `windows`).
 #[test]
 fn usage_shows_the_tap_reading_of_its_own_process() {
     let tmp = tmp_dir("usage-tap");
@@ -5386,9 +5164,6 @@ fn usage_shows_the_tap_reading_of_its_own_process() {
     assert!(hud.contains("?%/5h · ?%/7d"), "a reused pid's file: {hud}");
 }
 
-/// `accounts` WITH NO ROSTER SHOWS THIS LOGIN'S TAP READING where the window
-/// recorded one (`main`, the roster's own row): the text adds its line under
-/// "no accounts listed", the JSON lists that row with its figures.
 #[test]
 fn accounts_with_no_roster_shows_this_logins_tap_reading() {
     let tmp = tmp_dir("accounts-tap");
@@ -5428,11 +5203,6 @@ fn accounts_with_no_roster_shows_this_logins_tap_reading() {
     assert_eq!(rows[0]["session_pct"], Value::from(42u64));
 }
 
-/// A FIGURE HELD ONLY IN THE SAMPLE IS SHOWN BY BOTH VIEWS (the
-/// account-stats design §3.2): a state the usage tap of an older build wrote
-/// — this login's sample, session 42% and no week, no window record — reads
-/// `session 42% until …` in `accounts`, and in `accounts --json` the row's
-/// `session_pct` and its `windows[0]` agree (`source: sample`).
 #[test]
 fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     let tmp = tmp_dir("accounts-sample");
@@ -5505,15 +5275,10 @@ fn a_figure_held_only_in_the_sample_is_shown_by_both_views() {
     );
 }
 
-/// The account id the composed profiles carry (invented).
 const STATS_UUID: &str = "0f6c2b8e-1d3a-4c5e-9b7f-2a4d6e8c0b1a";
 
-/// The text planted wherever a value must never be printed.
 const STATS_SENTINEL: &str = "S3NT1NEL";
 
-/// A composed `.claude.json`: a Max 5x plan, credits on, the Fable flags at
-/// the vendor's defaults, and the sentinel in every credential and identity
-/// field the real file can hold.
 fn stats_profile() -> String {
     let s = STATS_SENTINEL;
     aterm_json::to_string(&aterm_json::json!({
@@ -5540,7 +5305,6 @@ fn stats_profile() -> String {
     .expect("compose")
 }
 
-/// An [`Env`] whose Claude home is `dir` and its profile `profile`.
 fn stats_env(tmp: &Tmp, dir: PathBuf, profile: PathBuf) -> Env {
     let mut env = env_at(tmp);
     env.claude_dir = Some(dir);
@@ -5548,9 +5312,6 @@ fn stats_env(tmp: &Tmp, dir: PathBuf, profile: PathBuf) -> Env {
     env
 }
 
-/// `accounts stats` reads the default home's profile through the allowlist reader: the plan,
-/// its tier, the credits word and the Fable plan answer, labelled `main` and keyed by the id's
-/// hash, and prints no sentinel, id, email or vendor flag name in either form.
 #[test]
 fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     let tmp = tmp_dir("stats");
@@ -5618,8 +5379,6 @@ fn accounts_stats_prints_the_profiles_plan_and_nothing_else() {
     );
 }
 
-/// A home with no profile says why, in both forms; a home other than
-/// Claude Code's default is labelled by its key (`home-<key6>`).
 #[test]
 fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
     let tmp = tmp_dir("stats-missing");
@@ -5659,9 +5418,6 @@ fn accounts_stats_names_a_missing_profile_and_labels_another_home_by_key() {
     );
 }
 
-/// `accounts stats` reads the profile Claude Code keeps for the home this command's environment
-/// names ([`claude_profile_of`]), the plain file `join(CLAUDE_CONFIG_DIR || homedir(),
-/// ".claude.json")` (the 2.1.301 bundle's `b()`), and labels the login it holds.
 #[test]
 fn accounts_stats_reads_the_profile_claude_code_keeps_for_the_home_it_names() {
     let tmp = tmp_dir("stats-homes");
@@ -5754,10 +5510,6 @@ fn accounts_stats_reads_the_file_claude_code_reads_for_the_home() {
     assert_eq!(stats(&env), (main, Value::from("pro")));
 }
 
-/// `accounts stats` labels an enrolled home by its roster row, the name `accounts` lists the
-/// login by: the row whose `dir` names the home a set `CLAUDE_CONFIG_DIR` resolved to (with or
-/// without a trailing `/`) once a login was made there, or the row with no `dir` for the default
-/// home.
 #[test]
 fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     let tmp = tmp_dir("stats-roster");
@@ -5824,9 +5576,6 @@ fn accounts_stats_labels_an_enrolled_home_by_its_roster_row() {
     assert_eq!(label(&env), Value::from("main"));
 }
 
-/// A home that could not be resolved (a relative `CLAUDE_CONFIG_DIR` with no `CLAUDE_PID`, or no
-/// absolute `HOME`: [`claude_profile_of`] is `None`) is `no-home` in both forms, since no file was
-/// looked for, never the `no-profile` of a home whose file is missing.
 #[test]
 fn accounts_stats_names_a_home_it_could_not_resolve() {
     let tmp = tmp_dir("stats-no-home");
@@ -5861,13 +5610,6 @@ fn accounts_stats_names_a_home_it_could_not_resolve() {
     );
 }
 
-/// `accounts stats` SHOWS THE ACCOUNT'S RECORD ON THIS MACHINE (the
-/// account-stats design §3, §7.2; slice A1): a usage-tap reading recorded
-/// through the store as the host records it — 42.5% of the five-hour window
-/// under its reset, the week at 71% — is the account's block: `used_pct_x10:
-/// 425`, the reset the vendor named, `source: tap`, `by` this machine's kept
-/// id, which `machine.id` names too and a second run names again; the Claude
-/// Code running on this home is counted and one on another home is not.
 #[test]
 fn accounts_stats_shows_the_accounts_record_on_this_machine() {
     use super::accounts::{TapRead, WindowRead};
@@ -6003,13 +5745,8 @@ fn accounts_stats_shows_the_accounts_record_on_this_machine() {
     }
 }
 
-/// Account B's id, beside [`STATS_UUID`]'s A (invented).
 const STATS_OTHER: &str = "7d1e4a90-5b2c-4f3e-8a6d-0c9b8e7f6a5d";
 
-/// `aterm harness accounts` SHOWS NO FIGURE OF ANOTHER ACCOUNT under the one
-/// the default home's profile names, as `accounts stats` shows none (the
-/// account-stats design §3.1): A was walled at 100% on the five hours with
-/// the week at 80%, then B signed in to the home and nothing of B was read.
 #[test]
 fn the_accounts_report_shows_no_figure_of_another_account() {
     use super::accounts::{TapRead, WindowRead};
@@ -6340,11 +6077,6 @@ fn the_accounts_report_shows_no_figure_of_another_account() {
     }
 }
 
-/// A WINDOW THE USAGE TAP NEVER RECORDS SAYS SO (`tap-not-this-home`, the
-/// host's own rule `accounts::tap_roster`): under a roster that does not
-/// admit, no tap reading is recorded for the default home, so its empty
-/// windows say the tap does not record it — never `no-reading`, which
-/// promises one — in `accounts stats` and in `accounts --json`'s rows.
 #[test]
 fn a_window_the_tap_never_records_says_so() {
     let tmp = tmp_dir("stats-tap-roster");
@@ -6415,9 +6147,6 @@ fn a_window_the_tap_never_records_says_so() {
     );
 }
 
-/// The account's record as the host records a usage tap's reading under
-/// `label` in `env`'s store: the five hours at 100% (walled) under `reset`
-/// and the week at 80%, keyed `key`.
 fn walled_record(env: &Env, label: &str, reset: i64, key: Option<super::profile::AccountKey>) {
     use super::accounts::{TapRead, WindowRead};
     let mut note = None;
@@ -6457,8 +6186,6 @@ fn walled_record(env: &Env, label: &str, reset: i64, key: Option<super::profile:
         .expect("a transaction");
 }
 
-/// A ROSTER OF SEVERAL ACCOUNTS KEEPS ITS LABEL-SCOPED RECORDS, while
-/// `accounts stats` follows the profile's observed identity.
 #[test]
 fn under_several_accounts_the_default_homes_profile_keys_no_row() {
     let tmp = tmp_dir("stats-several");
@@ -6570,10 +6297,6 @@ fn under_several_accounts_the_default_homes_profile_keys_no_row() {
     );
 }
 
-/// A CLAUDE CODE ON NO STORED LOGIN SUPPRESSES THE CAPACITY (the
-/// account-stats design §3.6, `api-key-seen`): a process the census finds
-/// running on the home with an API key of its own spends into the home's
-/// transcripts, so no window's capacity is claimed from them.
 #[test]
 fn a_claude_code_on_no_stored_login_suppresses_the_capacity() {
     let tmp = tmp_dir("stats-api-key");
@@ -6602,10 +6325,6 @@ fn a_claude_code_on_no_stored_login_suppresses_the_capacity() {
     assert_eq!(suppressed(&env, true), Value::from("low"));
 }
 
-/// AN UNKEYED RECORD'S ROW CARRIES THE KEY `accounts stats` NAMES (one
-/// view, one answer, design §7.2): a record an older build's tap wrote holds
-/// no key, and the default home's profile names A — `accounts --json`'s row
-/// and `accounts stats --json` both say A's key.
 #[test]
 fn an_unkeyed_records_row_carries_the_key_stats_names() {
     let tmp = tmp_dir("stats-unkeyed");
@@ -6761,12 +6480,6 @@ fn a_compressed_reserve_folder_is_refused_and_journalled_once() {
     assert_eq!(rows(), ["refused", "written", "released", "refused"]);
 }
 
-/// THE SWEEP'S LEDGER ROWS SAY WHY EACH BUILD CACHE WENT, with the figures
-/// it was taken on: a gone workspace's names its idle time and the sweep's
-/// window (a day while the volume is only low, not a fixed ten minutes); one
-/// taken for a month unwritten names that and never says its workspace was
-/// removed; an earlier sweep's half-removed stage says so; what went from a
-/// build directory that stays names its counts and window.
 #[test]
 fn the_sweep_rows_say_why_each_build_cache_went() {
     use atpkg::build_cache::{RECLAIM_GONE, RECLAIM_STALE, Unused};
@@ -6839,10 +6552,6 @@ fn the_sweep_rows_say_why_each_build_cache_went() {
     );
 }
 
-/// A REFUSED RESERVE IS JOURNALLED ONCE PER REASON: a folder at the reserve's
-/// path refuses every look while the disk is healthy (the watch looks every
-/// minute), and three looks put one `refused` row in the ledger, the later two
-/// [`ReserveMove::StillRefused`] (nothing for the log either).
 #[test]
 fn a_refused_reserve_is_journalled_once_per_reason() {
     let tmp = tmp_dir("reserve-refused");
@@ -6937,8 +6646,6 @@ fn a_failed_reserve_write_waits_before_it_is_tried_again() {
     std::fs::remove_file(&other).expect("taken away");
 }
 
-/// A state-preserving cut streams bounded main rows and reads predecessors
-/// within the input cap; anything it cannot read whole keeps the ledger as it is.
 #[test]
 fn a_stateful_ledger_cut_keeps_input_it_cannot_read_whole() {
     let tmp = tmp_dir("ledger-cut-input");

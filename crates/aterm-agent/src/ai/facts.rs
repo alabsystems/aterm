@@ -359,16 +359,18 @@ fn claude_accounts(m: &Machine<'_>) -> Option<ClaudeAccounts> {
         .is_some_and(|d| accounts::login_made(Path::new(d)));
     let renews = row.email.is_some();
     let binding = logins.get(&row.label);
-    let cond = accounts::condition(&row, &state, true, m.now);
+    let row_enrolled = row.dir.is_none() || enrolled.contains(&row.label);
+    let cond = accounts::condition(&row, &state, row_enrolled, m.now);
     let limited_until = match cond {
         accounts::Condition::Limited { until } => Some(until),
         _ => None,
     };
-    let signed_out = matches!(cond, accounts::Condition::SignedOut);
+    let signed_out = matches!(
+        cond,
+        accounts::Condition::SignedOut | accounts::Condition::NotEnrolled
+    );
     let next_sign_in = if limited_until.is_some() || signed_out {
-        accounts::sign_in_next(&bound, &state, &enrolled, Some(&row.label), m.now)
-            .filter(|(_, has_email)| *has_email)
-            .map(|(label, _)| label)
+        accounts::renew_next(&bound, &state, &enrolled, Some(&row.label), m.now)
             .or_else(|| (signed_out && row.email.is_some()).then(|| row.label.clone()))
     } else {
         None

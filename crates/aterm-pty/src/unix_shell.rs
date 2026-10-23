@@ -95,8 +95,6 @@ pub fn fallback_shell(failed: &OsStr) -> Option<(OsString, ShellOrigin)> {
     fallback_shell_from(failed, account_shell)
 }
 
-/// [`select_shell_with_origin`] over its inputs: the environment's `$SHELL` and
-/// `PATH`, and the password-database lookup.
 fn select_shell_in(
     override_shell: Option<&OsStr>,
     env_shell: Option<OsString>,
@@ -112,7 +110,6 @@ fn select_shell_in(
     login_shell_from(account)
 }
 
-/// [`login_shell`] over its password-database lookup.
 fn login_shell_from(account: impl FnOnce() -> Option<OsString>) -> (OsString, ShellOrigin) {
     match account() {
         Some(shell) => (shell, ShellOrigin::Passwd),
@@ -120,7 +117,6 @@ fn login_shell_from(account: impl FnOnce() -> Option<OsString>) -> (OsString, Sh
     }
 }
 
-/// [`fallback_shell`] over its password-database lookup.
 fn fallback_shell_from(
     failed: &OsStr,
     account: impl FnOnce() -> Option<OsString>,
@@ -133,14 +129,10 @@ fn fallback_shell_from(
         .find(|(shell, _)| shell != failed && runnable(Path::new(shell)))
 }
 
-/// `value` when it names a shell: set and not empty.
 fn names_a_shell(value: Option<OsString>) -> Option<OsString> {
     value.filter(|v| !v.is_empty())
 }
 
-/// `name` as the program `execve` is handed: a path (it holds a `/`) as it is, a
-/// bare name as the first `PATH` entry holding a program this user can run by that
-/// name, and a bare name found nowhere — or holding a NUL — as it is.
 fn on_path(name: &OsStr, path_var: Option<&OsStr>) -> OsString {
     if name.as_bytes().contains(&0) {
         return name.to_owned();
@@ -223,9 +215,6 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;
 
-    /// A scratch folder holding `bin/fish` (a program) and `bin/notes` (a file no
-    /// one may run), and a `PATH` that names an empty entry, a missing folder and
-    /// then `bin`.
     struct Bed {
         _root: aterm_tempfile::TempDir,
         bin: PathBuf,
@@ -262,8 +251,6 @@ mod tests {
         OsString::from(s)
     }
 
-    /// The override wins, then a non-empty `$SHELL`, then the password database,
-    /// then `/bin/sh`; a bare name is looked up on `PATH` wherever it came from.
     #[test]
     fn the_shell_is_the_override_then_shell_then_the_account_then_sh() {
         let bed = Bed::new("order");
@@ -303,8 +290,6 @@ mod tests {
         }
     }
 
-    /// A bare name found nowhere, or one only a file nobody may run carries, stays
-    /// as typed, for the spawn to say so; a NUL is never looked up.
     #[test]
     fn a_name_path_cannot_resolve_stays_as_typed() {
         let bed = Bed::new("typed");
@@ -321,8 +306,6 @@ mod tests {
         assert_eq!(find_on_path(OsStr::new("./fish"), path), None);
     }
 
-    /// A relative `PATH` entry is never searched: it names a folder under aterm's
-    /// own current folder, not the pane's.
     #[test]
     fn a_relative_path_entry_is_not_searched() {
         let bed = Bed::new("relative");
@@ -346,8 +329,6 @@ mod tests {
         );
     }
 
-    /// Each reason a shell cannot start, in the spawn's own words; a program this
-    /// user can run is none.
     #[test]
     fn a_shell_that_cannot_start_is_named_with_where_it_was_set() {
         let bed = Bed::new("cannot");
@@ -379,8 +360,6 @@ mod tests {
         );
     }
 
-    /// The fallback is the account's shell, else `/bin/sh`, never the shell that
-    /// failed and never one nobody may run.
     #[test]
     fn the_fallback_is_the_account_shell_then_sh_never_the_failed_one() {
         let bed = Bed::new("fallback");
@@ -408,8 +387,6 @@ mod tests {
         assert_eq!(fallback_shell_from(OsStr::new("/bin/sh"), || None), None);
     }
 
-    /// The password database names this account's shell as an absolute program
-    /// this user can run, or nothing — never a bare or relative name.
     #[test]
     fn the_account_shell_is_an_absolute_program_or_none() {
         if let Some(shell) = account_shell() {

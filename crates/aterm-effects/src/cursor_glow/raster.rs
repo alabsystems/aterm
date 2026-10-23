@@ -5,7 +5,7 @@
 
 use super::*;
 
-/// The comet debris glint's coverage as a fraction of the grain's own (a highlight on a grain of ice is dimmer than the grain): the dealt grain's plus at its twinkle peak, laid over its round body on either ground (the comet arm of `emit_particles`).
+/// The comet debris glint's coverage as a fraction of the grain's own.
 pub(super) const COMET_GLINT_COV: f32 = 0.5;
 
 /// The seven names every point-mark of this family snaps to, red → violet (`0x00RRGGBB`): canonical ROYGBIV in spectral order.
@@ -89,7 +89,6 @@ pub(super) const fn light_ink_bold(rgb: u32) -> u32 {
     let hi = r.max(g).max(b);
     let lo = r.min(g).min(b);
     if hi <= 0.5 {
-        // a black input carries no hue to weigh
         return 0;
     }
     let span = hi - lo;
@@ -101,7 +100,6 @@ pub(super) const fn light_ink_bold(rgb: u32) -> u32 {
     let yt = LIGHT_INK_BOLD_MAX_LUMA / 255.0;
     let vmax = LIGHT_INK_BOLD_MAX_CHANNEL / 255.0;
     let s = if y0 >= 1.0 - 1e-4 {
-        // achromatic: nothing to desaturate
         0.0
     } else {
         ((1.0 - yt / vmax) / (1.0 - y0)).clamp(0.0, 1.0)
@@ -365,7 +363,7 @@ pub(super) const FRESH_INK_GLYPH_MIN_THEME_RATIO: f32 = 1.5;
 /// The ink must be a hue (max channel − min channel) and must differ visibly from the foreground it replaces, or the substitution buys nothing.
 pub(super) const FRESH_INK_GLYPH_MIN_SPREAD: i32 = 24;
 pub(super) const FRESH_INK_GLYPH_MIN_DELTA: i32 = 24;
-/// Bisection depth on the one-parameter ink family. 24 halvings resolve `k` far below the 1/255 quantization step, so the result is exact in u8 terms.
+/// Bisection depth on the one-parameter ink family.
 pub(super) const FRESH_INK_GLYPH_BISECT: usize = 24;
 
 /// WCAG relative luminance of a `0x00RRGGBB` colour, with the piecewise sRGB transfer (linear toe below 0.03928, 2.4 power above); a plain power law differs enough near black to move a ratio across the AA line.
@@ -479,45 +477,54 @@ pub(super) fn fresh_ink_glyph_ink(band: u32, fg: u32, side: GlyphInkSide, cap: f
     let span = (hi - lo).max(1e-3);
     let sat = |c: f32| ((c - lo) / span * hi).clamp(0.0, 255.0);
     let s = [sat(r), sat(g), sat(b)];
-    let cand = |k: f32| -> u32 {
-        let ch = |i: usize| -> u32 {
+    let table = crate::color_math::relative_luminance_table();
+    let fg_rgb = [16u32, 8, 0].map(|sh| ((fg >> sh) & 0xff) as usize);
+    let cand_rgb = |k: f32| -> [usize; 3] {
+        s.map(|c| {
             let v = match side {
-                GlyphInkSide::Dark => s[i] * k,
-                GlyphInkSide::Light => s[i] + (255.0 - s[i]) * (1.0 - k),
+                GlyphInkSide::Dark => c * k,
+                GlyphInkSide::Light => c + (255.0 - c) * (1.0 - k),
             };
-            ((v + 0.5) as u32).min(255)
-        };
-        (ch(0) << 16) | (ch(1) << 8) | ch(2)
+            ((v + 0.5) as usize).min(255)
+        })
     };
-    let ok = |ink: u32| -> bool {
+    let pack = |[r, g, b]: [usize; 3]| ((r as u32) << 16) | ((g as u32) << 8) | (b as u32);
+    let ok = |ink: [usize; 3]| -> bool {
         let corner = match side {
-            GlyphInkSide::Dark => chan_max(ink, fg),
-            GlyphInkSide::Light => chan_min(ink, fg),
+            GlyphInkSide::Dark => [
+                ink[0].max(fg_rgb[0]),
+                ink[1].max(fg_rgb[1]),
+                ink[2].max(fg_rgb[2]),
+            ],
+            GlyphInkSide::Light => [
+                ink[0].min(fg_rgb[0]),
+                ink[1].min(fg_rgb[1]),
+                ink[2].min(fg_rgb[2]),
+            ],
         };
-        let l = rel_luminance(corner);
+        let l = crate::color_math::relative_luminance_rgb(table, corner[0], corner[1], corner[2]);
         match side {
             GlyphInkSide::Dark => l <= cap,
             GlyphInkSide::Light => l >= cap,
         }
     };
-    let c1 = cand(1.0);
+    let c1 = cand_rgb(1.0);
     if ok(c1) {
-        return Some(c1);
+        return Some(pack(c1));
     }
-    if !ok(cand(0.0)) {
-        // Even the extreme fails: the foreground alone breaches the bound.
+    if !ok(cand_rgb(0.0)) {
         return None;
     }
     let (mut lo_k, mut hi_k) = (0.0f32, 1.0f32);
     for _ in 0..FRESH_INK_GLYPH_BISECT {
         let mid = 0.5 * (lo_k + hi_k);
-        if ok(cand(mid)) {
+        if ok(cand_rgb(mid)) {
             lo_k = mid
         } else {
             hi_k = mid
         }
     }
-    Some(cand(lo_k))
+    Some(pack(cand_rgb(lo_k)))
 }
 
 /// One memoized fresh-ink glyph palette: the `(theme_fg, theme_bg)` key and the seven band inks, or `None` for a memoized refusal (see [`fresh_ink_glyph_palette`]).
@@ -634,7 +641,7 @@ pub(crate) fn push_halo_over(
     );
 }
 
-/// A round glow's centre and radii fitted inside the effects box, so its radial falloff fades to nothing before the box's edge instead of being cut there (a landing at the grid's left column once left a bloom sliced by a hard vertical edge): the centre moves inward by at most a cell on each axis, then both radii shrink together until the ellipse fits.
+/// Fit a round glow's centre and radii inside the effects box so its radial falloff fades to zero before the box edge.
 #[inline]
 pub(crate) fn fit_glow_in_box(
     geom: Geom,
@@ -671,12 +678,7 @@ pub(crate) fn fit_glow_in_box(
     ((cx, cy), (rx * k, ry * k))
 }
 
-/// A round glow's radii held inside the effects box around a centre that
-/// stays put: each radius shrinks on its own axis to the room between the
-/// centre and the box's nearer edge (never below 1 px), so the falloff
-/// reaches nothing at the edge instead of being cut there. For a light that
-/// belongs to its cell (the caret's head), where [`fit_glow_in_box`] would
-/// move it a cell inward over the text beside it.
+/// Clamp a round glow's radii inside the effects box around a fixed centre.
 #[inline]
 pub(crate) fn hold_glow_radii_in_box(
     geom: Geom,
@@ -722,7 +724,7 @@ pub(crate) fn push_soft_veil(
     }
 }
 
-/// The share of the theme's text contrast on its paper a light band keeps under a wide glyph: a wide glyph's counters lie wholly on the band, where a Latin letter's share its ground with the paper above and below it, so at 0.6 the newest CJK glyph measured 6.8:1 on GitHub Light against the Latin letter's 9; at this share the band still reads in its hue.
+/// Share of the theme's text contrast on its paper that a light band keeps under a wide glyph.
 pub(crate) const LIGHT_WIDE_BED_KEEP: f32 = 0.75;
 
 /// The one dash: a velocity-aligned two-vertex AA beam trailing `trail_s` seconds of a particle's live ballistic motion behind `(x, y)`, shared by the laser ablation spark, the rainbow kitty shooting-star body and the sparkle mini-comet.
@@ -870,7 +872,7 @@ pub(super) fn push_paper_bead(
     disc(r * 0.6, core);
 }
 
-/// Where the crescent's shadow disc sits, as a share of the moon's radius from its centre: east and a little north, so the lit limb bulges to the lower left and the horns point up and to the right, the way a crescent moon is drawn (an upright, east-opening crescent is the letter `c`).
+/// The crescent's shadow disc offset as a share of the moon's radius from its centre.
 pub(super) const CRESCENT_SHADOW_OFFSET: (f32, f32) = (0.42, -0.30);
 /// The crescent's shadow disc radius, as a share of the moon's.
 pub(super) const CRESCENT_SHADOW_R: f32 = 0.84;
@@ -1025,14 +1027,7 @@ pub(super) fn push_dust_halo(
     push_halo(out, geom, cx, cy, core, core, premul_rgb(rgb, hot));
 }
 
-/// The water ripple ring (the water landing and the droplet cursor's
-/// waterline): a flattened elliptical annulus at `(cx, cy)` with outer radii
-/// `(rx, ry)` and a `thick` px rim, laid as left/right additive slabs one
-/// pixel row tall, so its curve steps a pixel at a time (slabs half `ry`
-/// tall stood its sides in visible stairs). Near the effects box's edges
-/// each slab fades ([`crate::effect_util::fx_fade_y`]), so a ring round a
-/// caret on the grid's last row melts into the edge instead of ending in a
-/// straight cut along it.
+/// Push a flattened elliptical annulus at `(cx, cy)` with outer radii `(rx, ry)` and a `thick` px rim, faded near the effects box edges.
 pub(crate) fn push_ripple_ring(
     out: &mut Vec<GlowQuad>,
     geom: Geom,

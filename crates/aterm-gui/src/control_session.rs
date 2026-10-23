@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Session-graph, drive and capability-authority verbs: the roster (`sessions`, `who`, `family`, `raise`), the waits (`ready`, `await`), `lease` and `turn`, the ledgers and recordings (`history`, `meta`, `timeline`, `cast`, `temporal`, `exits`), and the authority graph (`edges`, `grant`, `revoke`, `connect`, `disconnect`, `flows`, `whoami`).
+//! Session-graph, drive, and capability-authority control verbs.
 
 use std::sync::{Arc, Mutex};
 
@@ -371,7 +371,6 @@ fn lease_acquire<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
     });
     drop(lease);
     if here && asking.is_some() {
-        // The connection's end sweeps it, as it sweeps a bound claim.
         super::note_connection_claim();
     }
     crate::presence::post_lease_changed(&ctx.self_id);
@@ -407,9 +406,6 @@ fn lease_release<'a>(ctx: &SessionCtx, args: impl Iterator<Item = &'a str>) -> S
         None => Act::None,
         Some(crate::Lease::Turn { id, driver, .. }) => {
             if force {
-                // Force-preempt a wedged turn whose driver crashed: a deliberate operator
-                // override, like `signal`. Safe because the turn's `LeaseGuard` clears only its
-                // own id, so a fresh turn in the freed slot is not stomped when it returns.
                 Act::Release(driver.clone())
             } else {
                 Act::Refuse(format!(
@@ -1492,8 +1488,6 @@ impl TypingHold {
         {
             Look::Stop("changed")
         } else if (sent_from.is_some() && keys_unread(ctx)) || sent_from == Some(cursor) {
-            // The key before it is still unread by the program, or it has
-            // not yet moved the caret off where it went out from.
             Look::Wait
         } else {
             Look::Held(cursor)
@@ -2126,7 +2120,6 @@ pub(crate) fn turn_preflight(rest: &str) -> Result<Option<crate::session_log::Ca
 }
 
 /// `turn [idle=<ms>] [timeout=<ms>] [submit=<key|none|guarded:<re>>] [settle=match:<re>|gone:<re>|submitted] [submit_window=<ms>] [presses=<n>] [trim=<0|1>] [typed=<0|1>] [cadence=<ms>] [cap=<n>] [yield=<floor>] <text>` — one complete human turn against the target session: type `<text>`, submit it with a real keypress, block until the app's response settles, and return the settled screen — `OK <rows> turn submitted=<0|1> status=<settled|timeout|hangup|submitted> seq=<n> id=<n> dur_ms=<n> hash=<hex16>[ trimmed=<k>]` then `<rows>` text rows (the same rows `text` prints).
-/// `if-rows=` never vouches for half a frame: a typed turn on an input frame judges it on the whole frame its [`TypingHold`] waits for, any other waits up to a control read's bound ([`crate::term_lock_whole_when`]). The composer look and the settled screen are read whole, which a hang-up does not cut short ([`crate::park::Lane::ignoring_hangup`]), ` frame=open` closing the verdict when the settled screen is not.
 pub(crate) fn cmd_turn(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -2277,7 +2270,6 @@ pub(crate) fn cmd_turn(
     };
     let wait = |id, until| park(id, until, OnHangup::Abort);
     let wait_committed = |id, until| park(id, until, OnHangup::Finish);
-    // The reads a turn books after its commit: a hang-up must not cut them to half a frame.
     let finishing = crate::park::Lane::SERVED.ignoring_hangup();
     let arm = |spec: WatcherSpec| -> Option<aterm_core::terminal::WatchId> {
         term_lock(term).watch(spec, Instant::now())
@@ -2302,9 +2294,6 @@ pub(crate) fn cmd_turn(
     if if_gen.is_some() || if_rows.is_some() {
         let mut look = ctx.frame.look_frame();
         let typing = typed && !text.is_empty();
-        // Asked only of a frame unfinished within the read's bound: a typed turn that finds its
-        // input frame there lets its hold wait the frame out and judge the fence on the whole one,
-        // within the turn's deadline ([`TypingHold`]); no other fence vouches for an open frame.
         let held_open = std::cell::Cell::new(false);
         let waits = |t: &Terminal| {
             held_open.set(typing && if_rows.and_then(|fence| Frame::of(t, fence)).is_some());
@@ -2390,9 +2379,6 @@ pub(crate) fn cmd_turn(
                 if typed_keys == 0 {
                     note_ctl_input();
                 }
-                // The next key is due a cadence after this one goes out, however late
-                // that is (a wait for a frame, or a stall under load): the keys behind a
-                // late one never go out in a burst to catch up.
                 due = Instant::now() + cadence;
                 if !(io.key)(ev) {
                     return "ERR key delivery failed\n".to_string();
@@ -2604,7 +2590,6 @@ pub(crate) fn cmd_turn(
                 submitted = true;
             }
             if submitted || Instant::now() >= deadline {
-                // Distinct branch.
                 break;
             }
         }
@@ -2628,7 +2613,6 @@ pub(crate) fn cmd_turn(
 
     let mut status = "timeout";
     if settle_submitted && submitted {
-        // `settle=submitted`: the verified submit is the answer.
         status = "submitted";
     } else if submitted || submit == "none" {
         'settle: {
@@ -3409,10 +3393,6 @@ pub(super) fn cmd_meta_harness_act_with_clock(
                 == Some(aterm_agent::harness::acts::TaskFace::Theirs)
                 && !snapshot.is_some_and(|point| point.left_at_rest)
             {
-                // A pending submission already reports Working before Core
-                // accepts its turn. Working/Blocked/unknown cannot establish
-                // an earlier at-rest point; otherwise its count could become
-                // the new turn's own landing mark and never reopen the face.
                 return Some(("ERR busy harness_act\n".to_string(), false));
             }
         }
@@ -3843,7 +3823,6 @@ impl Drop for DriftSlot {
 }
 
 /// `cast drift [max_runs=<k>] [rows=<n>] [seed=auto|alt|primary]` -> the counterfactual replay audit of this session's asciicast against its live screen (`aterm_control::cast_drift`, which owns the method and the wire): `OK <n> verdict=<clean|desync|unfaithful|unknown|empty> fidelity=… culprit=… … cut=<quiescent|racy> folds=<f> fold_events=<e> ms=<ms>` then `n` `run`/`row`/`cursor` lines, parse by key.
-/// The live screen is read whole ([`crate::term_lock_whole`]); a frame still unfinished at the read's bound leaves the cut racy.
 pub(crate) fn cmd_cast_drift(
     term: &Arc<Mutex<Terminal>>,
     frame: &crate::frame_memo::FrameSlot,
@@ -4188,8 +4167,6 @@ pub(crate) fn cmd_connect_in(
         kind,
         "wire",
     ) {
-        // `connect_in` refuses only a self-loop, checked above; keep the
-        // fail-closed reply rather than an unreachable! on a future refusal.
         return "ERR self-loop\n".to_string();
     }
     let tokens = conn
@@ -4224,8 +4201,6 @@ pub(crate) fn cmd_disconnect_in(
         return "ERR usage: disconnect dst=<sid> src=<sid> [kind=pull|push|both]\n".to_string();
     };
     if src == dst {
-        // A self-loop is never a connection; refusing here also keeps the
-        // fallback sweep from eating raw self-granted rows by accident.
         return "ERR self-loop\n".to_string();
     }
     let dst_edges = {
@@ -4413,7 +4388,6 @@ pub(crate) fn typed_by(caller: &TurnBy, under: Option<&crate::Lease>) -> TurnBy 
 }
 
 /// Record a text the window harness types with `send` and submits with `key enter` into the ledger ([`crate::turn_ledger::STATUS_PRESSED`]): wherever the host fences `send`, the turn-end loop's continuation, done check and answers go out so (`aterm-agent`'s `Session::type_fenced`), never as a `turn`, and they are the harness's turns all the same.
-/// The Enter's `hash=` is read, only when it books a typed turn, on a whole frame no hang-up cuts short, as `turn`'s settled screen is.
 #[allow(
     clippy::too_many_arguments,
     reason = "the dispatch's resolved request and its reply, as every arm takes them"
@@ -4944,6 +4918,7 @@ mod tests {
             crash_journal: Default::default(),
             typed: Default::default(),
             bells: Default::default(),
+            screen_moves: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
@@ -5868,6 +5843,7 @@ mod tests {
             crash_journal: Default::default(),
             typed: Default::default(),
             bells: Default::default(),
+            screen_moves: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),

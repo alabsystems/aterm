@@ -24,10 +24,8 @@ use crate::common::cnst;
 
 type State = BTreeMap<&'static str, i64>;
 
-/// The loop's clock at the walk's start, ms.
 const T0: i64 = 1_000_000_000;
 
-/// A new break's read comes this long after the last read.
 const READ_MS: i64 = 1_000;
 
 /// The real side of a model state, along the first path the walk took to it with as many lines
@@ -62,9 +60,6 @@ struct Run {
     fault: Option<Fault>,
 }
 
-/// THE PROJECTION the anchors name (`decide`, `HoldClock::step`, `FactsState::seed`): the model
-/// variables the real side keeps, `held`, the clock's open hold having held `rule`'s age, and
-/// `owed`, the clock awaiting the answer to the harness's line.
 fn project(r: &Real, rule: RuleId) -> State {
     let held = r.clock.held_ms(r.now).is_some_and(|ms| ms >= age_ms(rule));
     State::from([
@@ -73,7 +68,6 @@ fn project(r: &Real, rule: RuleId) -> State {
     ])
 }
 
-/// The real guards the model's terms at `st` stand for, under `mode`.
 fn guards(st: &State, mode: Autopilot, variant: usize) -> Guards {
     let mut g = Guards::clear(mode);
     if st["person"] == 1 {
@@ -104,15 +98,12 @@ fn guards(st: &State, mode: Autopilot, variant: usize) -> Guards {
     g
 }
 
-/// The model term a real guard stands for.
 fn term(g: Guard) -> &'static str {
     match g {
-        // A manager's fabric note holds the door as a person's hand does.
         Guard::Person | Guard::Halted | Guard::Draft | Guard::Managed => "person",
         Guard::Taskless | Guard::Exchange => "task",
         Guard::Stall | Guard::Credits | Guard::Memory | Guard::Reach => "brake",
         Guard::ActUntaken => "untaken",
-        // A host's withhold is a brake of the break's own.
         Guard::HostWithheld => "brake",
         Guard::UpgradeDue => "upg",
         Guard::HostLine => "lines",
@@ -121,7 +112,6 @@ fn term(g: Guard) -> &'static str {
     }
 }
 
-/// The autopilot the model's `Mode` names.
 fn autopilot(m: &Model) -> Autopilot {
     match cnst(m, "Mode") {
         0 => Autopilot::Off,
@@ -130,7 +120,6 @@ fn autopilot(m: &Model) -> Autopilot {
     }
 }
 
-/// The board as hold-room reads it: every machine term met but the room, which is `room`.
 fn board(room: bool) -> OccupancyReading {
     OccupancyReading {
         taken_ms: T0,
@@ -156,8 +145,6 @@ enum Said {
     Other(String),
 }
 
-/// The real decider's verdict for `run.rule` at `st`'s break, a due line then judged by the
-/// write's own holds at the host's state; the other rule must be quiet.
 fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
     let reading = match run.rule {
         RuleId::WaitNudge => OccupancyReading::default(),
@@ -195,14 +182,12 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
     said
 }
 
-/// Whether the decision `said` at `st`'s break is the model's.
 fn agrees(m: &Model, st: &State, said: &Said) -> bool {
     let mut s = st.clone();
     if m.action_enabled("OpenNudge", &s) {
         m.fire("OpenNudge", &mut s);
     }
     if s["due"] == 0 || s["cond"] == 0 {
-        // Nothing due, or a due line whose condition failed: `Lapse`.
         return *said == Said::Quiet;
     }
     if s["intent"] == 0 {
@@ -231,7 +216,6 @@ fn agrees(m: &Model, st: &State, said: &Said) -> bool {
     }
 }
 
-/// Whether the walk follows `action` from `st`: what the real loop can do.
 fn realizable(st: &State, action: &str, r: &Real, rule: RuleId) -> bool {
     let eager = (st["due"] > 0 && st["intent"] == 0 && st["cond"] == 0)
         || (st["intent"] == 1 && st["cond"] == 0);
@@ -241,7 +225,6 @@ fn realizable(st: &State, action: &str, r: &Real, rule: RuleId) -> bool {
     match action {
         "OpenWake" => false,
         "Intend" | "Type" => st["door"] == 1,
-        // The model's `owed = held` keeps no young hold's answer, which the real clock owes.
         "UpgradeTypes" => st["held"] == 1,
         "HoldAges" => st["told"] == 0 && st["paced"] == 0,
         "Holds" => rule == RuleId::HoldRoom,
@@ -256,7 +239,6 @@ fn realizable(st: &State, action: &str, r: &Real, rule: RuleId) -> bool {
     }
 }
 
-/// The rule's age, ms.
 fn age_ms(rule: RuleId) -> i64 {
     match rule {
         RuleId::WaitNudge => WAIT_NUDGE_AFTER_MS,
@@ -264,9 +246,6 @@ fn age_ms(rule: RuleId) -> i64 {
     }
 }
 
-/// A settled read of a new break; the clock opens on it where none is open (and, for hold-room,
-/// the agent declares the hold at once, so the nudge stays quiet beside it), and the agent's last
-/// words are read where it wants them, declaring nothing.
 fn break_read(r: &mut Real, rule: RuleId) {
     r.now += READ_MS;
     let opened = r.clock.step(HoldEvent::Background {
@@ -285,7 +264,6 @@ fn break_read(r: &mut Real, rule: RuleId) {
     }
 }
 
-/// The episode a line of `rule` would be of now.
 fn episode_now(r: &Real, rule: RuleId) -> EpisodeKey {
     let since = r.clock.since_ms().expect("an open hold");
     EpisodeKey {
@@ -294,8 +272,6 @@ fn episode_now(r: &Real, rule: RuleId) -> EpisodeKey {
     }
 }
 
-/// A decided point, by `run.variant`: one that would close the hold (it acts, or finds no
-/// background work) where `closing`, else one that decides nothing while the work shows.
 fn point(closing: bool, variant: usize) -> HoldEvent {
     let (acts, background) = match (closing, variant % 3) {
         (false, _) => (false, true),
@@ -306,12 +282,9 @@ fn point(closing: bool, variant: usize) -> HoldEvent {
     HoldEvent::DecidedPoint { acts, background }
 }
 
-/// Mirrors `action` (from `st` to `next`) on the real side. `false` where the real side
-/// disagrees with the step itself (a crash's seed, or a fresh seed's word on the episode).
 fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> bool {
     let rule = run.rule;
     if matches!(action, "Break" | "IdleRead" | "Point" | "Turn") {
-        // A new break, a point or a live turn: the host's line was this break's.
         r.host_line = false;
     }
     match action {
@@ -325,9 +298,6 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
         }
         "Turn" => {
             if st["door"] == 2 && !std::mem::take(&mut r.pointed) {
-                // The point decided nothing that closed the hold: the one that ends a harness
-                // line's answer (decided as one that would close it), or one that decided
-                // nothing while the work showed.
                 r.clock.step(point(st["owed"] == 1, run.variant));
             }
             if st["door"] == 1 && st["owed"] == 1 {
@@ -401,8 +371,6 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
     true
 }
 
-/// The walk's result: every state reached, those where the real side disagreed, how often each
-/// action was mirrored, and each decision seen.
 struct Walked {
     states: HashSet<Vec<i64>>,
     off: Vec<State>,
@@ -411,8 +379,6 @@ struct Walked {
 }
 
 impl Walked {
-    /// Checks the real side `r` against the model state `st` it reached (by a step that agreed,
-    /// `stepped`): the hold's clock, and at a break the decision.
     fn check(&mut self, m: &Model, st: &State, r: &Real, stepped: bool, strict: bool, run: Run) {
         let real = project(r, run.rule);
         let mut ok = stepped && ["held", "owed"].iter().all(|v| real[v] == st[v]);
@@ -433,8 +399,6 @@ impl Walked {
     }
 }
 
-/// How many lines the real side has typed, as far as the walk tells histories apart (a later
-/// hold's nudge after an earlier one's is another visit than a first nudge).
 fn typed(r: &Real) -> usize {
     r.rows
         .iter()
@@ -443,9 +407,6 @@ fn typed(r: &Real) -> usize {
         .min(2)
 }
 
-/// Every reachable state of `m` the real loop can reach, with up to two lines typed before it,
-/// the real side mirrored along the first path to each; every step the walk follows is checked
-/// where it lands, a state seen before included.
 fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     let go = || {
         let init = Real {
@@ -469,13 +430,11 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
         w.check(m, &m.init_state(), &init, true, strict, run);
         let mut queue = VecDeque::from([(m.init_state(), init)]);
         while let Some((st, real)) = queue.pop_front() {
-            // Every state binds every variable, so its values in name order are its identity.
             let key: Vec<i64> = st.values().copied().collect();
             if !seen.insert((key.clone(), typed(&real))) {
                 continue;
             }
             w.states.insert(key);
-            // `Model::fire`'s step, its environment built once for the state's every action.
             let env = m.eval_env(&st);
             for action in &m.actions {
                 let Some(next) = m.successors_in(action, &env, &st).into_iter().next() else {
@@ -499,20 +458,14 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
     }
 }
 
-/// [`walk`] of [`under`]`(mode)` for each `(mode, run)`, on every core (the fault seam is per
-/// thread, so each walk plants its own), in `runs`' order.
 fn walks(runs: &[(i64, Run)], strict: bool) -> Vec<Walked> {
     aterm_spec::check::each(runs, |&(mode, run)| walk(&under(mode), strict, run))
 }
 
-/// The model under autopilot `mode` (0 Off, 1 Cruise, 2 Land).
 fn under(mode: i64) -> Model {
     aterm_spec::interp::with_consts(&occupancy_door_model(), &[("Mode", mode)])
 }
 
-/// THE DOOR, WALKED: every state the real loop can reach agrees with the real decider, clock,
-/// books and seed — for each rule, under each autopilot, with each real guard standing for its
-/// term — and every action the walk follows is mirrored.
 #[test]
 fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
     let mut runs = Vec::new();
@@ -601,17 +554,8 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
     }
 }
 
-/// Where a planted defect may disagree with the model: a state the walk reached by a step the
-/// defect changed.
 type Shows = fn(&State) -> bool;
 
-/// NEGATIVE CONTROLS, planted in the real code, each walked for both rules and every point kind:
-/// books that dedupe by the rule's name leave a later hold's nudge untold where the model has it
-/// due; a clock restarted at an idle read, or one that ends the hold at the harness line's own
-/// turn, at the point that ends its answer, or at a point that decides nothing (F5), loses the
-/// hold the model keeps; a seed that reads an intent or a skip as told says told where the
-/// model's episode is untold; a write that lets a nudge go over the upgrade's notice due, or a
-/// second line at the door the host's line went at, says due where the model holds it.
 #[test]
 fn tier1_each_planted_defect_disagrees_where_the_model_says() {
     let controls: [(Fault, Option<RuleId>, Shows, Option<Shows>); 9] = [
@@ -708,8 +652,6 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
     }
 }
 
-/// The anchors this bind stands for are linked into this binary, on the actions the code
-/// implements; `Sample` and `SampleLast` (the K Entry, not implemented yet) are not anchored.
 #[test]
 fn tier1_the_anchors_name_what_the_code_implements() {
     let anchored: BTreeSet<&str> = aterm_spec::xref::refinements()

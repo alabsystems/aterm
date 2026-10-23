@@ -4,12 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/util/cursor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (A window shows one of the
-// named icons aterm sets: custom cursor images and the hidden cursor are cut. A cursor that cannot
-// be set is reported, not a panic: `XConnection::report`; none is loaded once the connection is
-// broken: `set_cursor_icon`. The cursors follow the resource database's theme and size as it
-// changes: `follow_cursor_settings`.)
-
 use std::ffi::{CStr, CString};
 use std::iter;
 

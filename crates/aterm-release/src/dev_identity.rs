@@ -30,9 +30,9 @@ pub const WAIT: Duration = Duration::from_secs(60);
 /// answering: it will likely not answer this either.
 const CLEANUP_WAIT: Duration = Duration::from_secs(10);
 
-const OPENSSL: &str = "/usr/bin/openssl";
-const SECURITY: &str = "/usr/bin/security";
-pub const CODESIGN: &str = "/usr/bin/codesign";
+const OPENSSL: &str = aterm_uds::os_path!("openssl");
+const SECURITY: &str = aterm_uds::os_path!("security");
+pub const CODESIGN: &str = aterm_uds::os_path!("codesign");
 
 /// The basenames macOS gives the keychains this module never touches, compared
 /// case-folded (a Mac volume folds case unless made otherwise).

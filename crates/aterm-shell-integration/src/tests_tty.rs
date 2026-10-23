@@ -239,7 +239,6 @@ fn assert_tty_broken(sh: &mut LiveShell, what: &str) {
 #[cfg(unix)]
 #[test]
 fn the_tty_probes_leave_the_shell_at_its_last_prompt() {
-    need_pty_script();
     let zsh = need_zsh();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".zshrc"), "").expect(".zshrc");
@@ -355,7 +354,7 @@ fn spawn_pty_shell_unwaited(
     }
     argv.push("-i".to_owned());
     let argv: Vec<&str> = argv.iter().map(String::as_str).collect();
-    let mut cmd = pty_script(&argv);
+    let mut cmd = pty_command(&argv);
     let hermetic = shell_command(program);
     for (key, value) in hermetic.get_envs() {
         match value {
@@ -384,14 +383,12 @@ fn spawn_pty_shell_unwaited(
         ShellType::Zsh => "zsh",
         _ => "bash",
     };
-    LiveShell::spawn(label, &mut cmd).holding(hermetic.into_home())
+    LiveShell::spawn_on_pty(label, &mut cmd).holding(hermetic.into_home())
 }
 
 #[cfg(unix)]
 fn live_pty_zsh() -> &'static str {
-    let zsh = need_zsh();
-    need_pty_script();
-    zsh
+    need_zsh()
 }
 
 #[cfg(unix)]
@@ -597,7 +594,6 @@ fn a_running_zsh_with_a_broken_tty_is_repaired_by_the_body_the_loader_delivers()
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_repairs_its_tty_after_a_raw_program_fails() {
-    need_pty_script();
     let bash = bash_shell();
     let fx = LiveFixture::new();
     std::fs::write(fx.home.join(".bashrc"), "").expect(".bashrc");
@@ -1061,7 +1057,6 @@ fn cut_osc(raw: &str) -> String {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
-    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     std::fs::write(
@@ -1117,7 +1112,6 @@ fn an_integrated_bash_under_xtrace_traces_the_users_commands_and_not_aterms() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bash_does() {
-    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     fx.lay_dirs();
@@ -1197,7 +1191,6 @@ fn an_integrated_bash_keeps_the_users_err_trap_errexit_and_functrace_as_bare_bas
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_chains_the_debug_trap_its_rc_set() {
-    need_pty_script();
     let bash = bash_shell();
     let fx = LiveFixture::new();
     std::fs::write(
@@ -1272,7 +1265,6 @@ const BASH_HANDOVER_GUARD: &str = "if [ -z \"${ATERM_SHELL_INTEGRATION_INSTALLED
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
-    need_pty_script();
     let bash = bash_shell();
     let fx = LiveFixture::new();
     std::fs::write(
@@ -1327,7 +1319,6 @@ fn an_integrated_bash_whose_rc_sources_the_integration_keeps_its_marks() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
-    need_pty_script();
     let bash = bash_shell();
     let fx = LiveFixture::new();
     std::fs::write(
@@ -1367,7 +1358,6 @@ fn an_integrated_bash_whose_rc_set_errexit_and_an_err_trap_loads_quietly() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_reports_the_line_as_typed() {
-    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     std::fs::write(
@@ -1423,7 +1413,6 @@ const NO_TEMP_FOLDER: &str = "(version 1)(allow default)(deny file-write* \
 #[cfg(target_os = "macos")]
 #[test]
 fn an_integrated_bash_with_no_writable_temp_folder_runs_every_line_with_its_block() {
-    need_pty_script();
     let sandbox = "/usr/bin/sandbox-exec";
     let taken = aterm_uds::spawnfd::command(sandbox)
         .args(["-p", NO_TEMP_FOLDER, "/bin/sh", "-c"])
@@ -1486,7 +1475,6 @@ fn an_integrated_bash_with_no_writable_temp_folder_runs_every_line_with_its_bloc
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
-    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     let history = fx.home.join(".bash_history");
@@ -1554,7 +1542,6 @@ fn an_integrated_bash_with_an_array_prompt_command_reports_only_typed_lines() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_the_users_last_argument() {
-    need_pty_script();
     let fx = LiveFixture::new();
     let dir = install_script_set(&fx.base).expect("install");
     std::fs::write(
@@ -1585,7 +1572,6 @@ fn an_integrated_bash_keeps_the_users_last_argument() {
 #[cfg(unix)]
 #[test]
 fn an_integrated_bash_keeps_its_marks_out_of_a_redirected_compound_command() {
-    need_pty_script();
     let compounds = [
         ("{ echo a; } > out-group", "out-group", "a\n"),
         (

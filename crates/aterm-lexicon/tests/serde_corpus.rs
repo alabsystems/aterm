@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The lexicon, exceptions and tricks documents under mutations, against recorded answers the
-//! first-party serde must reproduce. Every table is
-//! `deny_unknown_fields`, the reviewer `notes` ride a `rename` into a field never read, `mode`
-//! defaults through a function, and `user` is `skip`.
-//!
-//! The models are private and not `Serialize`, so an `Ok` records what the build made of it: the
-//! sorted surfaces with their class, the species and the conflicts for a lexicon, and the rows'
-//! `Debug` for tricks.
+//! Serde corpus tests for lexicon, exceptions, and tricks documents.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;
@@ -63,8 +56,6 @@ lang  = "en"
 words = ["please"]
 "#;
 
-/// `base` with each `(from, to)` applied; `from` must occur exactly once, so
-/// a mutation can never silently leave the document as it was.
 fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     let mut doc = base.to_string();
     for (from, to) in edits {
@@ -74,8 +65,6 @@ fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     doc
 }
 
-/// A bundled document as the repository holds it. A Windows checkout under
-/// `core.autocrlf` hands `include_str!` a CRLF copy.
 fn lf(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
@@ -179,7 +168,6 @@ fn lexicon_documents_answer_as_recorded() {
             "wrong-type/suffixes-int",
             &[("suffixes = [\"\", \"ing\", \"ed\"]", "suffixes = [\"\", 1]")],
         ),
-        // `ambiguous` reaches the build: gated off for a language not configured.
         (
             "gated/ambiguous-unconfigured-lang",
             &[

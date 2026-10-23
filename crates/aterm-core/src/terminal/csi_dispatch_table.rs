@@ -1,18 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//
-// Maintained by hand. `every_entry_sits_in_its_own_hash_slot` re-derives every
-// occupied slot from its key, so a misplaced entry (one `lookup_csi_handler`
-// could never find) fails. A sequence that does not hash into a free slot falls
-// back to `csi_dispatch_untabled` (handler_csi.rs), which both dispatch paths
-// take on a miss.
-//
 //! Minimal perfect hash table for CSI dispatch routing.
-//!
-//! Maps `(intermediate_encoding, final_byte)` pairs to dispatch handler
-//! identifiers with a multiply-add-shift hash:
-//! `h(key) = ((key * A + B) >> C) % TABLE_SIZE`
-//! where `key = (intermediate_enc << 8) | final_byte`.
 
 /// CSI handler identifier for table-driven dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,11 +88,6 @@ const HASH_C: u32 = 0;
 const TABLE_SIZE: usize = 126;
 
 /// Encode CSI intermediate bytes as a single u8 for hashing.
-///
-/// Single-byte intermediates use their ASCII value directly.
-/// Special encodings:
-/// - `0x00` = no intermediates (standard CSI)
-/// - `0x01` = `?$` (two-byte DEC private mode request)
 #[inline]
 pub(crate) const fn encode_intermediates(intermediates: &[u8]) -> u8 {
     match intermediates {
@@ -253,8 +236,6 @@ pub(crate) static CSI_DISPATCH_TABLE: [Option<(u8, u8, CsiHandler)>; TABLE_SIZE]
 ];
 
 /// Look up the CSI handler for the given intermediates and final byte.
-///
-/// Returns `Some(handler)` if the sequence is recognized, `None` otherwise.
 #[inline]
 pub(crate) fn lookup_csi_handler(intermediates: &[u8], final_byte: u8) -> Option<CsiHandler> {
     let inter_enc = encode_intermediates(intermediates);
@@ -271,8 +252,6 @@ pub(crate) fn lookup_csi_handler(intermediates: &[u8], final_byte: u8) -> Option
 mod tests {
     use super::*;
 
-    /// Every occupied slot holds the entry its own key hashes to, so each
-    /// entry is reachable through `lookup_csi_handler`.
     #[test]
     fn every_entry_sits_in_its_own_hash_slot() {
         let mut occupied = 0;
@@ -291,8 +270,6 @@ mod tests {
 
     #[test]
     fn test_unknown_returns_none() {
-        // Unknown final byte, unknown intermediate, known intermediate with an
-        // unknown final, and unsupported intermediate combinations.
         assert_eq!(lookup_csi_handler(&[], b'Q'), None);
         assert_eq!(lookup_csi_handler(&[b'%'], b'A'), None);
         assert_eq!(lookup_csi_handler(&[b'?'], b'z'), None);

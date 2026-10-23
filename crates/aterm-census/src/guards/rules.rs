@@ -1438,8 +1438,7 @@ const SUPERVISE_LOOK_HOMES: &[(&str, &str, &str)] = &[
     ("limit.rs", "tz_offset_s", ZONE),
     ("limit.rs", "zone_offset_at", ZONE),
     ("limit.rs", "local_offset_at", ZONE),
-    ("limit.rs", "date_offset", ZONE),
-    ("limit.rs", "zone_known", ZONE),
+    ("limit.rs", "read_offset", ZONE),
     ("limit.rs", "offset_in", INJECTED),
     ("limit.rs", "reset_in_zone", INJECTED),
     ("run.rs", "zone_lookup", FIELD_DOOR),
@@ -3611,10 +3610,10 @@ mod tests {
                  zone_offset_at(\"z\").unwrap_or(0)\n}\n\
                  pub fn reset_at_with(zone_offset_at: &dyn Fn(&str) -> Option<i64>) -> i64 {\n    \
                  offset_in(zone_offset_at)\n}\n\
-                 fn date_offset(zone: &str, unix: i64) -> Option<i64> {\n    \
+                 fn read_offset(zone: &str, unix: i64) -> Option<i64> {\n    \
                  let t = std::fs::read(zone);\n}\n\
                  pub fn rogue_reset(unix: i64) -> i64 {\n    \
-                 date_offset(\"z\", unix).unwrap_or(0)\n}\n",
+                 read_offset(\"z\", unix).unwrap_or(0)\n}\n",
             ),
         ]
     }

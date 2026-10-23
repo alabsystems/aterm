@@ -2,9 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Weak reference registration and deallocation tests for `WeakSlot` and `WeakObj`.
-//!
-//! Verifies that `WeakObj` preserves its registered slot address across Rust moves and
-//! unregisters before freeing its box.
 
 #![cfg(target_os = "macos")]
 #![expect(

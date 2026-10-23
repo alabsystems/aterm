@@ -1,23 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE `events` DIGEST'S GOLDEN (plan 5B-5): the timeline frames
-//! [`drain_timeline_events`] pushes, byte for byte, over the fixed script of
-//! one row of every timeline kind (`control`'s `wire_goldens`, beside the
-//! `timeline` and `exits` goldens), from no watermark, past an id, and from
-//! a watermark below the retained low (the `GAP` line), every row through
-//! its production writer but the three the script names. Nothing is masked:
-//! a frame carries no clock. The digest reads the session log's view: the retained low is the log's, past its record bound (the third
-//! section, re-blessed for that alone: its flood and its `GAP` count).
-//!
-//! NEGATIVE CONTROL: the script with one payload byte planted fails it.
+//! The `events` digest's timeline frames [`drain_timeline_events`] pushes, byte for byte.
 
 use super::drain_timeline_events;
 use crate::control::wire_goldens::{scripted, title};
 use crate::session_store::{new_store, test_handle};
 
-/// The `events` digest's timeline frames the golden holds: from no
-/// watermark, past id 6, and from a watermark below the retained low.
 fn events_text(plant: bool) -> String {
     let h = scripted(plant);
     let mut out = String::new();
@@ -26,11 +15,6 @@ fn events_text(plant: bool) -> String {
         let high = drain_timeline_events(&h.ctx.timeline.lock().unwrap(), "5", wm, &mut frames);
         out.push_str(&format!("> watermark={name} -> {high:?}\n{frames}"));
     }
-    // A watcher fallen behind the session log (the view every reader
-    // reads): rows past the log's record bound, which the digest skips
-    // and the log's batch evicts the oldest of, then three it carries, each
-    // through its production writer (the drift flush's title, the `meta`
-    // verb, the agent sweep's publication, a delivery).
     let store = new_store();
     let b = test_handle(6);
     store
@@ -122,7 +106,6 @@ const EVENTS_GOLDEN: &str = concat!(
     "EVENT 6 inbox 1 from=s-a kind=ask off=44\n",
 );
 
-/// The `events` digest's timeline frames, byte for byte.
 #[test]
 fn events_digest_golden() {
     assert_eq!(events_text(false), EVENTS_GOLDEN);

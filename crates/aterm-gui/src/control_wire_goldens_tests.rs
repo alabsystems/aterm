@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GOLDENS FOR THE WIRES PHASE 5 MUST NOT MOVE (plan 5B-5): the `timeline`
-//! reply and the `exits` reply here, the `events` digest's timeline frames
-//! in `subscribe`'s `wire_goldens` (on this script), byte for byte, over a fixed script that writes one row of every timeline kind
-//! (plan §0.1). Later Phase 5 steps add typed records beside these rows;
-//! these goldens are what says the rows and their wire stayed put.
-//!
-//! Masked, and only because the process supplies them: the `t=` digits (the
-//! process clock) and, in `exits`, the minted sids (named `<sidN>` in
-//! registration order). Nothing else is masked: `kind=human`'s trailing
-//! space is in the golden.
-//!
-//! The script writes each row through its production writer ([`scripted`]
-//! names them), so a writer whose bytes move moves these goldens; only the
-//! two rows whose writers no unit test reaches (`fetch`, `hold-advisory`)
-//! and the update's `handoff` (whose writer starts the log over) are
-//! hand-written, and named. The replies are read from the session log's
-//! view, so a hand-written row is a `row` mark and its ring row
-//! (`SessionTimeline::record_hand_row`).
-//!
-//! NEGATIVE CONTROLS: the script with one payload byte planted fails each
-//! golden.
+//! Wire goldens for the `timeline` and `exits` control replies over a fixed multi-kind script.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -60,26 +40,6 @@ pub(crate) fn title(plant: bool) -> &'static str {
 
 /// One row of every timeline kind, on a session the store registered and,
 /// last, retired, each through its production writer but two (below).
-/// Returns the session.
-///
-/// The writers: the store's `register`, `set_state` and
-/// `deregister_local_as`; the `meta` verb; the timeline's `record_title`
-/// (the drift flush's), `record_cwd_change`, `publish_agent` (the agent sweep's publication),
-/// `mark_task`, `record_render` (the resize ledger's), `note_harness_act`,
-/// `note_program_state`; the status sweep's payload
-/// ([`crate::session_status::status_event_payload`], a failed command at
-/// rest, recorded as the sweep records it); a person's key
-/// ([`crate::app_input::note_person`]); the manual reset's
-/// [`crate::manual_reset::record`]; [`crate::pty_idem::record_in_doubt`];
-/// the policy cell's
-/// [`crate::harness_policy_verb::record_policy_move`]; and the fabric's
-/// verbs (a delivery, its `inbox seen`, a post answering it, its landing, a
-/// hold, a topic). HAND-WRITTEN, the two rows whose writers no unit test
-/// reaches (the overlap table names them, `every_named_difference_still_holds`):
-/// `fetch` (the bridge's fetch) and `hold-advisory` (the bridge's lost-link
-/// advisory); and the update's `handoff`, whose writer
-/// ([`crate::spawn::mark_handoff_gap`]) starts the session log over, so the
-/// view, which every reader reads, would begin at it.
 pub(crate) fn scripted(plant: bool) -> SessionHandle {
     let store = new_store();
     let h = test_handle(5);
@@ -91,7 +51,6 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
         g.register(h.clone()); // spawned
         g.set_title(5, title(plant));
     }
-    // title-change: the drift flush's writer, the title mark's row.
     assert!(
         ctx.timeline
             .lock()
@@ -134,8 +93,6 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
             crate::session_status::STATUS_CHANGE,
             crate::session_status::status_event_payload(&failed),
         );
-        // THE SESSION LOG's typed `status` mark, in the same hold, as the
-        // sweep writes it (the view prints the row from it).
         let at = tl.slog().now();
         tl.slog_mut()
             .observe_status(crate::session_status::status_facts(&failed), at);
@@ -163,10 +120,6 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     let key = crate::pty_idem::parse_key(&format!("{}:3:9", ctx.nonce.to_hex()), ctx.nonce)
         .expect("a key");
     let _ = crate::pty_idem::record_in_doubt(&ctx, "send", key, "ERR busy\n");
-    // HAND-WRITTEN: the update's row, whose writer
-    // (`spawn::mark_handoff_gap`) starts the session log over, so a
-    // successor's view begins at it; this one session keeps its rows on
-    // either side of it.
     ctx.timeline
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -196,8 +149,6 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
         "to=@s-b kind=answer re=1 --wait=0 SENTINEL-ANSWER",
         None,
     );
-    // Queued (post id 1) whether or not a bridge is up: `OK 1`, or an `ERR`
-    // naming it (`fabric absent id=1`, `timeout id=1`).
     assert!(
         reply.starts_with("OK 1") || reply.split_whitespace().any(|t| t == "id=1"),
         "the post: {reply}"
@@ -213,7 +164,6 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     assert!(reply.starts_with("OK hold="), "the hold: {reply}");
     {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        // HAND-WRITTEN: the bridge's fetch, which no unit test reaches.
         tl.record_hand_row("fetch", "off=40".to_string());
     }
     assert_eq!(
@@ -222,8 +172,6 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     );
     {
         let mut tl = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
-        // HAND-WRITTEN: the bridge's lost-link advisory, which no unit test
-        // reaches.
         tl.record_hand_row(
             "hold-advisory",
             "1 reason=bridge-lost origin=fabric".to_string(),
@@ -236,8 +184,6 @@ pub(crate) fn scripted(plant: bool) -> SessionHandle {
     h
 }
 
-/// The `timeline` replies the golden holds: all, the newest 3, past id 20,
-/// and an argument the grammar refuses.
 fn timeline_text(plant: bool) -> String {
     let h = scripted(plant);
     let mut out = String::new();
@@ -294,7 +240,6 @@ const TIMELINE_GOLDEN: &str = concat!(
     "ERR usage: timeline [<n>] [since=<id>]\n",
 );
 
-/// `timeline`, byte for byte, over one row of every kind.
 #[test]
 fn timeline_reply_golden() {
     assert_eq!(timeline_text(false), TIMELINE_GOLDEN);
@@ -305,7 +250,6 @@ fn timeline_reply_golden() {
     );
 }
 
-/// Every minted sid in `text` named `<sidN>`, in the order given.
 fn mask_sids(text: &str, sids: &[String]) -> String {
     let mut out = text.to_string();
     for (i, sid) in sids.iter().enumerate() {
@@ -314,10 +258,6 @@ fn mask_sids(text: &str, sids: &[String]) -> String {
     out
 }
 
-/// The `exits` replies the golden holds: every reason, each actor kind and
-/// both exit-code cases; the window, the cursor and the usage refusal; and
-/// over a seamless update, the successor's page past the producer's last
-/// row.
 fn exits_text(plant: bool) -> String {
     let store = new_store();
     let mut sids = Vec::new();
@@ -347,7 +287,6 @@ fn exits_text(plant: bool) -> String {
         out.push_str(&format!("> exits {rest}\n"));
         out.push_str(&cmd_exits(&store, rest));
     }
-    // Over an update: the successor's ids go on above the producer's.
     let mut producer = SessionStore::default();
     for local in 1..=3 {
         let h = test_handle(local);
@@ -411,7 +350,6 @@ const EXITS_GOLDEN: &str = concat!(
     "exit 8 t=* sid=<sid10> local=2 reason=window-close exit_code=- by=ctl\n",
 );
 
-/// `exits`, byte for byte, over every reason and actor and an update.
 #[test]
 fn exits_reply_golden() {
     assert_eq!(exits_text(false), EXITS_GOLDEN);

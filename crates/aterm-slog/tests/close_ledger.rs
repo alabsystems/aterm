@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A turn's close restates its `ledger=`: the log
-//! copies it from the turn's open record, pinned while the turn is open, so
-//! a close that outlives its evicted open still names the exchange that
-//! opened the turn, and `drive ledger --source=log` joins it with no clock.
+//! Tests that a turn's close record restates its open record's `ledger=` and `op_by=`.
 
 use aterm_slog::{
     Actor, Close, Conf, Fields, Key, Kind, Limits, Log, Node, Op, Open, Out, Rec, RunOut, Src,
@@ -38,14 +35,8 @@ fn done() -> Close {
     Close::new(Out::Turn(TurnOut::Done), Src::Screen, Conf::Strong)
 }
 
-/// Every way a turn closes restates its open's `ledger=`: the tracker's
-/// settle after a `ctl turn` exchange, a direct close, and a cascade that
-/// closes it `out=gone`. A caller's own `ledger=` is kept. NEGATIVE
-/// CONTROLS: a turn opened without one, a step and a run close name none —
-/// the close copies, it never invents.
 #[test]
 fn every_turn_close_restates_its_opens_ledger() {
-    // The tracker: a `ctl turn` exchange's turn, settled.
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let mut tr = TurnTracker::new(run);
@@ -61,7 +52,6 @@ fn every_turn_close_restates_its_opens_ledger() {
     let line = encode(&close_of(&log, t1).expect("closed"), Tier::Host).expect("fits");
     assert!(line.contains(" ledger=7 "), "{line}");
 
-    // Direct closes, a caller's own, and a cascade.
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let a = turn(&mut log, run, Some(11), 10);
@@ -107,9 +97,6 @@ fn every_turn_close_restates_its_opens_ledger() {
     assert_eq!(ledger(run), None, "NEGATIVE: a run's close");
 }
 
-/// THE CLOSE OUTLIVES ITS OPEN: in a ring that evicts closed turns' opens
-/// first (§5.1's `ClosedOpen` before `CloseRecord`), turns whose open is gone
-/// still name their exchange on the close; every live close names its own.
 #[test]
 fn a_close_whose_open_was_evicted_still_names_its_exchange() {
     let mut log = Log::with_limits(1, Limits::new(24, 1 << 20).expect("a ring"));
@@ -135,7 +122,6 @@ fn a_close_whose_open_was_evicted_still_names_its_exchange() {
     assert!(orphaned > 0, "some closes outlived their opens");
 }
 
-/// A turn opened by `by` (screen, no ledger) under `run`, at `ms`.
 fn turn_by(log: &mut Log, run: Node, by: Actor, ms: u64) -> Node {
     log.open(
         Open::new(Kind::Turn, Src::Screen, Conf::Strong)
@@ -146,13 +132,6 @@ fn turn_by(log: &mut Log, run: Node, by: Actor, ms: u64) -> Node {
     .expect("a turn")
 }
 
-/// A TURN'S CLOSE RESTATES WHO OPENED IT:
-/// `op_by=<opener>` on the close of a turn the person, `ctl`, the harness
-/// or an edge opened, whoever closes it (the screen `by=-`, the transcript
-/// `by=vendor`, a cascade), as a host-tier id. NEGATIVE CONTROLS, each
-/// naming none: a turn nobody opened that the transcript closes `by=vendor`
-/// (the closer is never taken for the opener), a step's and a run's close.
-/// A caller never writes it, on a close or on any other record.
 #[test]
 fn a_turn_close_restates_who_opened_it() {
     let edge = Actor::sid(aterm_slog::ShortId::new("s-edge42").expect("a sid"));
@@ -195,7 +174,6 @@ fn a_turn_close_restates_who_opened_it() {
             "{line}"
         );
     }
-    // A cascade's `out=gone` close, and the levels that name none.
     let t = turn_by(&mut log, run, Actor::Harness, 100);
     let step = log
         .open(
@@ -218,7 +196,6 @@ fn a_turn_close_restates_who_opened_it() {
     );
     assert_eq!(opener(&log, step), None, "NEGATIVE: a step's close");
     assert_eq!(opener(&log, run), None, "NEGATIVE: a run's close");
-    // A caller's `op_by=` is refused on every record it could ride.
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let planted = || {
@@ -276,12 +253,6 @@ fn a_turn_close_restates_who_opened_it() {
     assert_eq!(opener(&log, t).as_deref(), Some("ctl"), "the log's own");
 }
 
-/// A CLOSE AT THE SIZE CAP STILL FITS (6C-2): the opener is the last thing
-/// the close adds, so the size guard drops it first. Over every length of
-/// a caller's text on a harness turn's close (`ledger=7` on its open), each
-/// close the log takes fits the record cap; some keep `ledger=` but not
-/// `op_by=`, and none keeps `op_by=` without `ledger=`. A close whose field
-/// slots are full goes without both.
 #[test]
 fn a_close_at_the_size_cap_still_fits_without_its_opener() {
     let mut dropped_first = 0;
@@ -324,7 +295,6 @@ fn a_close_at_the_size_cap_still_fits_without_its_opener() {
     );
     assert!(both > 0, "PRECONDITION: a short close keeps both");
 
-    // Every field slot taken: the close goes without its restatements.
     let mut log = Log::new(1);
     let run = agent_session(&mut log, 0);
     let t = log

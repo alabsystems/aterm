@@ -1,23 +1,17 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 use super::super::*;
-
-// Memory pooling.
 
 #[test]
 fn alloc_new_page_when_full() {
     let mut store = PageStore::new();
     store.preheat(1);
 
-    // Fill the first page (64KB / 4 bytes = 16384 u32s max)
-    // Allocate slightly less to account for alignment
     let _slice1 = store.alloc_slice::<u32>(16000);
     assert_eq!(store.active_pages(), 1);
     assert_eq!(store.free_pages(), 0);
 
-    // This should require a new page (no preheated pages left)
     let _slice2 = store.alloc_slice::<u32>(16000);
     assert_eq!(store.active_pages(), 2);
     assert_eq!(store.stats().pages_allocated, 2); // 1 preheated + 1 new
@@ -42,10 +36,8 @@ fn total_memory_tracks_all_pages() {
     assert_eq!(store.total_memory(), 2 * PAGE_SIZE);
 
     let _slice = store.alloc_slice::<u32>(100);
-    // 1 active + 1 free = 2 total
     assert_eq!(store.total_memory(), 2 * PAGE_SIZE);
 
-    // Large allocation still fits in the active preheated page.
     let _big_slice = store.alloc_slice::<u32>(16000);
     assert_eq!(store.total_memory(), 2 * PAGE_SIZE);
 }

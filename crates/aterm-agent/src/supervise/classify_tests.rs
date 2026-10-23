@@ -153,7 +153,6 @@ fn segment_heads_must_be_known_reads() {
     assert!(ro("git tag -l 'v*'"));
     assert!(ro("git tag --contains abc"));
     assert!(!ro("git remote add x url"));
-    // `git remote show <remote>` (without -n) contacts the remote.
     assert!(!ro("git remote -v; git remote show origin"));
     assert!(ro("git remote -v; git remote show -n origin"));
     assert!(!ro("git config user.name Bob"));
@@ -499,22 +498,7 @@ fn awk_programs_and_sed_scripts_are_read_not_dropped() {
     );
 }
 
-/// `sed`'s script options hide a write in every spelling sed reads: a script
-/// file (`-f`) attached, clustered or abbreviated; an attached or clustered
-/// `-e`; a `--expression=`/abbreviation; and macOS's valueless `-l` (the next
-/// word is the real script, not the flag's value). The file operand is
-/// `input.txt` because classify-v6 read a skipped option's next word as the
-/// script, and `input.txt` parses as an `i` command, so v6 called each of
-/// these read-only (MEASURED 2026-10-23 with the pre-audit `aterm drive
-/// classify`); macOS `/usr/bin/sed` wrote `out` for `-fs.sed`, `-nfs.sed`,
-/// `-ew out`, `-e 'w out'` and `-l 'w out'` in a scratch directory. The
-/// `--fi`/`--file=`/`--e=`/`--expr=`/`--in` spellings are GNU's (`getopt_long`
-/// takes any unambiguous prefix); macOS sed rejects every long option, so they
-/// are REASONED, not measured.
-///
-/// NEGATIVE CONTROLS: the same options carrying a read script, and `-l` whose
-/// following positional script is a read (a mutant that made short `-l` eat the
-/// next word would refuse the real script's filename as unparsed here).
+/// `sed`'s script options hide a write in every spelling sed reads.
 #[test]
 fn sed_script_options_cannot_hide_a_write() {
     for cmd in [
@@ -548,9 +532,6 @@ fn sed_script_options_cannot_hide_a_write() {
     ] {
         assert!(ro(cmd), "{cmd:?} is a read but was refused");
     }
-    // GNU ends a label at `;`, so a `w` after a `;` on a `:label` line writes;
-    // BSD reads the label to the line end, so refusing only rejects a line BSD
-    // itself rejects.
     assert_eq!(
         sed_script_writes(":x;s/a/b/w out").as_deref(),
         Some("sed s///w (writes a file)")
@@ -558,20 +539,8 @@ fn sed_script_options_cannot_hide_a_write() {
     assert_eq!(sed_script_writes(":a;N;$!ba"), None);
 }
 
-/// A `sed` regex delimiter inside a `[…]` bracket expression is literal (BSD
-/// and GNU), so the regex does not end at it: `s/[/]/g;/w d/p` is one `s`
-/// command and a `/w d/p` that writes `d/p` (MEASURED 2026-10-23, macOS
-/// `/usr/bin/sed` wrote `d/p` in a scratch directory), which classify-v6
-/// misread as `s/[/` and a `]/g` replacement and called read-only; `s/[/]/x/w
-/// f` writes through the `w` after the real close (v6 refused that one only as
-/// unparsed). `skip_regex` makes the address and the `s` pattern bracket-aware
-/// (`[^…]`, a leading `]`, `[:class:]`), while the replacement stays a plain
-/// delimited field.
-///
-/// NEGATIVE CONTROLS: ordinary bracket expressions in a read script, including
-/// a negated class and a class that holds the delimiter, stay read-only (a
-/// mutant that dropped the bracket awareness would misread the `w`/`p` flag and
-/// flip these).
+/// A `sed` regex delimiter inside a `[…]` bracket expression is literal, so the regex does not
+/// end at it.
 #[test]
 fn a_sed_bracket_delimiter_does_not_end_the_regex_early() {
     for cmd in [
@@ -599,13 +568,7 @@ fn a_sed_bracket_delimiter_does_not_end_the_regex_early() {
     assert_eq!(sed_script_writes("/[/]/d"), None);
 }
 
-/// `sysctl` sets the kernel from a FILE of `name=value` pairs whose values
-/// never reach argv: macOS `-f FILE`/`--file`, Linux procps `-p`/`--system`.
-/// The `sysctl` arm refuses the flag directly, spelled whole, glued or
-/// clustered, alongside the `=`/`-w` write forms.
-///
-/// NEGATIVE CONTROLS: a bare OID read, `-n OID`, `-a`, and several OIDs stay
-/// read-only (a mutant that only checked for `=`/`-w` would approve `-f`/`-p`).
+/// `sysctl` sets the kernel from a file of `name=value` pairs whose values never reach argv.
 #[test]
 fn sysctl_sets_the_kernel_from_a_file() {
     for cmd in [
@@ -633,23 +596,7 @@ fn sysctl_sets_the_kernel_from_a_file() {
     }
 }
 
-/// A bare INPUT redirection with no command is not a no-op under zsh: `< file`
-/// runs `$READNULLCMD` (default `more`, not a read), whose value the classifier
-/// does not read, so it cannot be approved. `bare_redirection` refuses a
-/// segment that resolves to no command and holds an input redirect with a
-/// target, in any segment of the line.
-///
-/// A bare OUTPUT redirection runs `$NULLCMD` (default `cat`, a read); a bare
-/// write to a real file is a write `danger_scan` already names, and `>
-/// /dev/null` discards through `cat` — so output-only bare redirects stay
-/// read-only, which also keeps `<(…)` process substitution (a lone `<`
-/// `split_segments` artifact with no target) and a redirect trailing a `)`
-/// group (`find … \( … \) 2>/dev/null`) read-only.
-///
-/// NEGATIVE CONTROLS: the same input redirect with a command keeps that command
-/// (a mutant dropping the no-command guard would refuse `cat < f`); output
-/// redirects and process substitution stay reads (a mutant widening to every
-/// redirect would refuse them).
+/// A bare input redirection with no command runs `$READNULLCMD` under zsh and cannot be approved.
 #[test]
 fn a_bare_redirection_with_no_command_is_not_read_only() {
     for cmd in ["< f", "<f", "< /dev/null", "cat x; < f"] {
@@ -672,7 +619,6 @@ fn a_bare_redirection_with_no_command_is_not_read_only() {
     ] {
         assert!(ro(cmd), "{cmd:?} is a read but was refused");
     }
-    // The rm breaker's classifier (`classify_except_rm`) refuses it too.
     for cmd in ["< f", "rm -f /tmp/x; < f"] {
         let v = classify_except_rm(cmd, DEFAULT_PYTHON_ALLOW);
         assert!(
@@ -682,21 +628,7 @@ fn a_bare_redirection_with_no_command_is_not_read_only() {
     }
 }
 
-/// A FILE READ BY SUBSTITUTION AND A SUBSHELL'S REDIRECT RUN NO NULL COMMAND.
-/// MEASURED 2026-10-23 under zsh 5.9 and bash 3.2.57 with `$READNULLCMD` and
-/// `$NULLCMD` set to marker scripts (`docs/measured/classifier-audit-2-2026-10-22.md`):
-/// `$(< f)`, `$(<f)`, `$( < f )`, `` `<f` ``, `$(0<f)` and `(cat) < f` printed
-/// `f` and ran neither marker, as did `(cat; ls f) < f`; `< f`, `(< f)`, `$(<
-/// f; true)`, `$(true; < f)`, `$(3<f)`, `(cat); < f` and `(cat) | < f` ran
-/// `$READNULLCMD` under zsh and `$(<f <f)` ran `$NULLCMD`. So the
-/// bare-redirection refusal leaves the substitution that is one input redirect
-/// from fd 0 and the redirect right after a subshell's `)`, in both
-/// classifiers.
-///
-/// NEGATIVE CONTROLS: the spellings that ran a marker stay refused (a mutant
-/// that skipped every substitution body or every segment after a `)` would
-/// approve `$(< f; true)` or `(cat); < f`), and so does `$(<f &)`, a zsh
-/// parse error kept on the refusing side.
+/// A file read by substitution and a subshell's redirect run no null command.
 #[test]
 fn a_file_read_by_substitution_or_a_subshell_redirect_is_read_only() {
     for cmd in [
@@ -734,14 +666,7 @@ fn a_file_read_by_substitution_or_a_subshell_redirect_is_read_only() {
     }
 }
 
-/// AN AWK PROGRAM RUNS OR WRITES IN EVERY SPELLING AWK READS. MEASURED
-/// 2026-10-22 on macOS awk 20200816 in a scratch directory, each of the first
-/// ten ran a command or made a file the classifier called a read: `system`
-/// with a blank before its `(`, a bare `system` (it runs `$0`), a `print` or
-/// `printf` redirect to a field or a number (`>` in a print statement is a
-/// redirect whatever follows), one continued over a `,` newline, one after a
-/// `#` comment that held a `"`, one after a regex that held a `"`, and a pipe
-/// after a pattern regex on a new line.
+/// An awk program runs or writes in every spelling awk reads.
 #[test]
 fn an_awk_program_that_runs_or_writes_in_any_spelling_is_no_read() {
     for cmd in [
@@ -969,11 +894,7 @@ fn comments_heredocs_and_quoting_that_only_read_stay_reads() {
     assert!(!ro("bash <<'EOF'\nls\nEOF"));
 }
 
-/// A `#` RIGHT AFTER AN ESCAPED BLANK OR NEWLINE OPENS NO COMMENT: the escaped
-/// character is its word's, so the `#` is too, and what follows on the line
-/// runs (MEASURED 2026-10-22: `echo ab\ #; echo RAN`, the same with a tab
-/// after the backslash, and `echo ab\⏎#; echo RAN` each print `RAN` under
-/// `/bin/bash` 3.2 and `/bin/zsh` 5.9).
+/// A `#` right after an escaped blank or newline opens no comment.
 #[test]
 fn a_hash_after_an_escaped_blank_or_newline_opens_no_comment() {
     for cmd in [
@@ -1149,9 +1070,8 @@ fn the_worker_verbs_are_judged_by_their_form() {
     }
 }
 
-/// `mark` (phase 3A) writes a claim into a session's log: a worker's `aterm
-/// ctl … mark …` box is judged a write, never auto-approved as a read; the
-/// session log's reads (`log`, `brief`, `await log …`) stay reads.
+/// `mark` writes a claim into a session's log: a worker's `aterm ctl … mark …` box is judged a
+/// write, while the session log's reads (`log`, `brief`, `await log …`) stay reads.
 #[test]
 fn mark_is_not_a_read_only_ctl_verb() {
     for write in [
@@ -1420,11 +1340,7 @@ fn a_redirect_or_a_dash_before_the_name_does_not_hide_it() {
     }
 }
 
-/// A RESERVED WORD IS A KEYWORD ONLY WHERE A COMMAND BEGINS: behind an assignment, a redirect,
-/// zsh's `-`, `timeout` or a wrapper (`env`, `xargs`, `/usr/bin/time` behind an assignment or a
-/// pipe), bash reads it as the command's name and runs a program by that name (MEASURED, bash
-/// 3.2: with an `if` first on `PATH`, `X=1 if true; echo b` ran it; with a `time` first on `PATH`,
-/// `echo x | time if true` ran that `time` with `if true`).
+/// A reserved word is a keyword only where a command begins.
 #[test]
 fn a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program() {
     for cmd in [
@@ -1484,10 +1400,8 @@ fn a_reserved_word_behind_an_assignment_or_a_redirect_is_a_program() {
     }
 }
 
-/// AN OPTION AFTER `time` IS `/usr/bin/time`'S OWN: behind a pipe or an assignment `time` is the
-/// program, whose `-o FILE` writes FILE (MEASURED, bash 3.2: `ls | time -o out.txt ls` and `X=1
-/// time -o out.txt ls` each made `out.txt`). The head check had passed the `-o` as a fragment, so
-/// each line was a read, and Claude Code 2.1.307's too-many box over one would have been approved.
+/// An option after `time` behind a pipe or an assignment is `/usr/bin/time`'s own, whose `-o
+/// FILE` writes `FILE`.
 #[test]
 fn an_option_after_time_is_the_time_programs_own() {
     for cmd in [
@@ -1963,16 +1877,8 @@ fn an_extended_glob_word_may_become_a_flag_or_a_name() {
     }
 }
 
-/// `GIT REMOTE SHOW NAME` CONTACTS THE REMOTE IN EVERY SPELLING; WITH NO NAME
-/// IT LISTS THE REMOTES. MEASURED 2026-10-22 against an `ssh://127.0.0.1:1`
-/// remote with `GIT_SSH_COMMAND` a marker script: `git remote show origin`,
-/// `git remote -v show origin` and `git remote --verbose show origin` called
-/// ssh (the `-v` spellings were approved under classify-v6's box, since its
-/// `git_reads_clear` read only a first-word `show`); `git remote show`, `git
-/// remote -v show` and `git remote show -n origin` did not.
-///
-/// NEGATIVE CONTROLS: the forms that contact nothing stay read-only (a mutant
-/// that dropped the remote-name requirement would refuse `git remote show`).
+/// `git remote show <name>` contacts the remote in every spelling; with no name it lists the
+/// remotes.
 #[test]
 fn git_remote_show_contacts_the_remote_only_when_it_names_one() {
     for cmd in [
@@ -2001,15 +1907,7 @@ fn git_remote_show_contacts_the_remote_only_when_it_names_one() {
     }
 }
 
-/// THE SPELLINGS A CLASSIFY-V6 READ-ONLY CALL LET THROUGH, EACH PINNED: the
-/// sed script options by attachment, cluster and GNU abbreviation, the git
-/// cat-file driver abbreviations, and the hazard variables classify-v7 adds.
-/// Each was read-only under the guard's surviving mutant in the review of
-/// c1a32598c2 (`--expr=`, `--fi=`, `--in`, an attached `-e` whose script
-/// holds an escaped blank, `--t`, `--fil`, `PYTHONHOME=`, `FPATH=`).
-///
-/// NEGATIVE CONTROLS: the same options carrying a read script, and an
-/// assignment to an unlisted variable, stay read-only.
+/// Sed script options, git cat-file driver abbreviations, and shell hazard variables are refused.
 #[test]
 fn the_v6_spellings_of_a_write_or_a_hazard_are_each_refused() {
     for cmd in [
@@ -2053,8 +1951,6 @@ fn a_tied_array_is_assigned_as_its_scalar() {
         "path=/bin:/tmp/x ls",
         "module_path=/tmp/x; echo $terminfo",
         "for module_path in /tmp/x; do echo $terminfo; done",
-        // `cdpath`/`CDPATH` ties to `CDPATH`, a hazard since classifier audit 2:
-        // it moves where a following `cd` lands.
         "cdpath=/tmp/x; cd x",
         "CDPATH=/tmp/x cd x",
     ] {
@@ -2495,9 +2391,7 @@ fn a_closing_word_redirect_and_an_unopened_close_stay_reads() {
 }
 
 /// zsh closes a `{` group at a `}` glued to a word's end, unless the word's
-/// own braces balance: `{ echo a} always { cmd }` and `{ echo ${HOME}}
-/// always { cmd }` run `cmd`. Negative controls: balanced braces (`{a,b}`,
-/// `${HOME}`, `{}`), an escaped `}`, and a glued close ending its segment.
+/// own braces balance.
 #[test]
 fn a_brace_glued_to_a_word_closes_the_group() {
     for cmd in [
@@ -2613,14 +2507,7 @@ fn a_plain_line_expands_nothing() {
     }
 }
 
-/// A PLAIN LINE ADMITS ONLY THE EXPANSIONS ZSH TAKES NO FURTHER THAN BASH (MEASURED 2026-10-22
-/// against `/bin/zsh` 5.9 run as Claude Code's Bash tool runs it, a scratch HOME and ZDOTDIR,
-/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md`): a parameter read `$NAME` or
-/// `${NAME}`, quoted or not (zsh neither splits nor globs it unquoted; bash does both), and a
-/// command substitution `$(…)` over a plain line (zsh splits and does not glob it; bash globs
-/// too), nested, quoted, and with quotes inside; the classifier still judges what each runs and
-/// which words it feeds (`printf %d "path[$(id)]"` is plain and no read: zsh evaluates printf's
-/// numeric argument as arithmetic).
+/// A plain line admits only the expansions zsh takes no further than bash.
 #[test]
 fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
     for line in [
@@ -2702,21 +2589,10 @@ fn a_plain_line_admits_only_the_expansions_zsh_takes_no_further_than_bash() {
 }
 
 /// A write-or-run flag the classifier keys on is still caught when a single
-/// quote, a double quote or a backslash hides it from the quote-stripped scans:
-/// the shell strips the quote before the tool, so the tool writes or runs all
-/// the same (MEASURED 2026-10-22 under `/bin/zsh` 5.9 and `/bin/bash` 3.2 with
-/// macOS `find`/`sort`/`sed` and GNU `gsed`;
-/// `docs/measured/classifier-quoted-flags-2026-10-22.md`). The argv-word scan
-/// ([`argv_flag_hazard`]) reads these where [`danger_scan`] over the
-/// quote-stripped words sees only a blanked `""`.
-///
-/// MUTANT: drop the `argv_flag_hazard` call in `classify_command_with` (or make
-/// `flag_hazard_at` read the quote-stripped words only) and every line here
-/// classifies read-only — this test fails.
+/// quote, a double quote or a backslash hides it from the quote-stripped scans.
 #[test]
 fn a_quoted_or_escaped_write_flag_is_still_a_write() {
     for cmd in [
-        // find actions, each spelling of the quote.
         "find . '-delete'",
         "find . \"-delete\"",
         "find . \\-delete",
@@ -2725,32 +2601,26 @@ fn a_quoted_or_escaped_write_flag_is_still_a_write() {
         "find . '-ok' rm {} ';'",
         "find . '-fprint' f",
         "find . '-fls' f",
-        // sed in place; macOS `-I` too.
         "sed '-i' s/a/b/ f",
         "sed \"-i\" s/a/b/ f",
         "sed '-I' s/a/b/ f",
         "sed -n '-i' s/a/b/ f",
-        // sort / tree output file, long and short.
         "sort '-o' out in",
         "sort '--output=out' in",
         "sort '--compress-program=./cp.sh' -S 1M big",
         "tree '-o' out.html",
-        // less / more initial command, log file, lesskey.
         "less '+!id' f",
         "less '-o' log f",
         "less '-k' key f",
         "more '+1' f",
-        // the per-head run-or-write flags.
         "file '-C' -m m",
         "rg '--pre' sh x",
         "rg '--pre=sh' x",
         "printf '-v' X %s y",
-        // git read subcommands' write/run flags.
         "git log '--output=x'",
         "git log '--ext-diff'",
         "git diff '--textconv'",
         "printf '-vx[1]' hi",
-        // In a later segment, after `&&`, and inside a substitution.
         "ls | sort '-o' out",
         "cd d && find . '-delete'",
         "echo \"$(find . '-delete')\"",
@@ -2760,9 +2630,7 @@ fn a_quoted_or_escaped_write_flag_is_still_a_write() {
     }
 }
 
-/// NEGATIVE CONTROL for [`a_quoted_or_escaped_write_flag_is_still_a_write`]: a quoted operand that
-/// is no flag token stays a read (a word that is exactly one, such as `'-delete'`, is refused as
-/// its unquoted spelling is, whatever program it follows).
+/// A quoted operand that is no flag token stays a read.
 #[test]
 fn quoting_a_data_word_that_is_not_a_flag_stays_a_read() {
     for cmd in [
@@ -2784,14 +2652,8 @@ fn quoting_a_data_word_that_is_not_a_flag_stays_a_read() {
     }
 }
 
-/// The breaker's read-only check of the rest of an rm line
-/// ([`classify_except_rm`]) runs the same argv-word flag scan on its non-rm
-/// segments, so a quoted or escaped write flag there is still a write. NEGATIVE
-/// CONTROL: the same line with a plain read in place of the hidden flag stays
-/// read-only.
-///
-/// MUTANT: drop the argv-word pass in `classify_except_rm` and the first group
-/// classifies read-only — this test fails.
+/// [`classify_except_rm`] runs the argv-word flag scan on its non-rm segments, so a quoted or
+/// escaped write flag there is still a write.
 #[test]
 fn a_quoted_flag_on_the_rest_of_an_rm_line_is_still_a_write() {
     for cmd in [
@@ -2814,7 +2676,6 @@ fn a_quoted_flag_on_the_rest_of_an_rm_line_is_still_a_write() {
         "sed -n p /tmp/w/f && rm -rf /tmp/w/x",
         "rg x /tmp/w; rm -rf /tmp/w/x",
         "git remote -v; rm -rf /tmp/w/x",
-        // The rm command itself is the resolver's, not this scan's.
         "rm -f -- '-delete'",
     ] {
         let v = classify_except_rm(cmd, &[] as &[&str]);
@@ -2822,8 +2683,7 @@ fn a_quoted_flag_on_the_rest_of_an_rm_line_is_still_a_write() {
     }
 }
 
-/// A program `find -exec` runs is judged by its own write flags too: `file -C` writes magic.mgc
-/// (MEASURED 2026-10-22). NEGATIVE CONTROL: the same programs reading stay reads.
+/// A program `find -exec` runs is judged by its own write flags too.
 #[test]
 fn a_find_exec_programs_write_flag_is_a_write() {
     for cmd in [
@@ -2848,8 +2708,7 @@ fn a_find_exec_programs_write_flag_is_a_write() {
 }
 
 /// A git read's write form is read on the argv words too, and a remote's verb is its first
-/// operand: each of these wrote (MEASURED 2026-10-22, git 2.54.0). NEGATIVE CONTROL: the
-/// listing forms, quoted or not, stay reads.
+/// operand.
 #[test]
 fn a_quoted_git_verb_or_flag_is_still_a_write() {
     for cmd in [
@@ -2882,11 +2741,7 @@ fn a_quoted_git_verb_or_flag_is_still_a_write() {
 }
 
 /// A word the shell may brace-expand or glob into a flag, a verb or another operand is refused
-/// where a flag selects a write: each wrote under zsh 5.9 and bash 3.2 (MEASURED 2026-10-22; the
-/// globs beside a planted file such as `-delete`, `-o.txt`, `-C` or `add`). So is an expansion
-/// past `--` where `--` ends no write (`find`'s primaries, `sysctl`'s `name=value`, a split into
-/// two of uniq's operands or a config set). NEGATIVE CONTROL: words that expand only into their
-/// own literal start (`HEAD~1`, `./*`, `src/*.rs`), globs past `--`, and `{}`.
+/// where a flag selects a write.
 #[test]
 fn a_brace_or_glob_word_that_may_become_a_write_flag_is_refused() {
     for cmd in [

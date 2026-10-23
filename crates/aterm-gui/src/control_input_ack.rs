@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A control input mark follows a nonempty, fully accepted seam receipt.
-//! The factory captures admitted identity; a sole completion rides one event.
-//! Dropping it (refusal, cancellation, unwind) is inert. Queue admission is not
-//! completion, and neither a wire reply nor the current front session is evidence.
+//! Control input receipt marks.
 
 use crate::SessionCtx;
 use crate::input::EgressReceipt;
@@ -22,13 +19,11 @@ pub(crate) struct InputMark {
     verb: InputVerb,
     cause: Option<aterm_slog::ShortId>,
     turn: bool,
-    /// What the input says it means for the box it dismisses (`act=`),
-    /// and what the agent's tracker held when it was admitted.
+    /// What the input says it means for the box it dismisses.
     act: Option<aterm_slog::ActWord>,
     admission: Option<aterm_slog::Admission>,
     accepted: Arc<AtomicBool>,
-    /// Informational credit captured at admission. Owns only the existing leaf,
-    /// SID and caller, not a session, input payload or permission to write.
+    /// Informational credit captured at admission.
     typist: Option<(
         crate::typed_by::TypedStamp,
         aterm_session::SessionId,
@@ -47,9 +42,7 @@ impl std::fmt::Debug for InputMark {
 }
 
 impl InputMark {
-    /// A mark at the session timeline's current epoch. Not named `new`: the
-    /// lock-order census resolves a call by its name, so a `fn new` that takes
-    /// `timeline` would read every `X::new()` under a held lock as taking it.
+    /// A mark at the session timeline's current epoch.
     pub(crate) fn at_epoch(
         ctx: &SessionCtx,
         session: u64,
@@ -58,8 +51,6 @@ impl InputMark {
         cause: Option<aterm_slog::ShortId>,
         turn: bool,
     ) -> Self {
-        // THE ADMISSION: the step the input may dismiss is the
-        // one open now, under the lock taken before a byte is written.
         let (epoch, admission) = {
             let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let slog = timeline.slog();
@@ -80,22 +71,19 @@ impl InputMark {
         }
     }
 
-    /// The input's `act=`: what it means for the box it
-    /// dismisses, read only from a proven author.
+    /// The input's `act=`.
     pub(crate) const fn acting(mut self, act: Option<aterm_slog::ActWord>) -> Self {
         self.act = act;
         self
     }
 
-    /// The request read this before validating its cause. A reset at any later
-    /// point makes its eventual diagnostic observation ineligible, not retargeted.
+    /// The request read this before validating its cause.
     pub(crate) const fn within_epoch(mut self, epoch: Option<u32>) -> Self {
         self.epoch = epoch;
         self
     }
 
     /// The already admitted connection's caller, carried with this exact event.
-    /// An unrun, empty, refused, old-epoch or duplicate completion never credits it.
     pub(crate) fn typed_by(
         mut self,
         ctx: &SessionCtx,
@@ -114,8 +102,7 @@ impl InputMark {
     }
 }
 
-/// Sole custody of one event's observation. It contains no input payload and
-/// confers no authority. Its fixed cost is part of the existing Job size budget.
+/// Sole custody of one event's observation.
 pub(crate) struct InputCompletion {
     mark: InputMark,
 }
@@ -131,7 +118,6 @@ impl InputCompletion {
     }
 
     /// Called only after the source-blind seam and echo publication have returned.
-    /// Full spill acceptance counts; later program consumption is not asserted.
     pub(crate) fn finish(self, receipt: EgressReceipt) {
         if !receipt.fully_accepted_nonempty() {
             return;
@@ -172,11 +158,8 @@ impl InputCompletion {
                     at,
                 );
             }
-            // An owed wake rings the session's watchers under this lock.
             timeline.slog_take_wake();
         }
-        // Credit only after the same nonempty/epoch/once gate as the log, and
-        // outside its leaf lock. Queue admission and a wire reply never come here.
         if let Some((stamp, session, caller)) = self.mark.typist {
             stamp.record(&session, caller);
         }
@@ -204,7 +187,6 @@ pub(crate) mod testing {
                 0
             );
         }
-        // Readback is fail-fast; no blocking read can outlive a failed write.
         let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
         assert!(flags >= 0);
         assert_eq!(

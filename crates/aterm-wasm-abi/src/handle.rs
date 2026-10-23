@@ -193,7 +193,6 @@ mod tests {
     use super::*;
     use std::rc::Rc;
 
-    /// Counts its drops, so a test can tell a freed value from a leaked one.
     struct Probe(Rc<StdCell<u32>>, u32);
 
     impl Class for Probe {
@@ -253,7 +252,6 @@ mod tests {
         }
     }
 
-    /// Distinct, valid struct names whose default FNV-1a/32 tags collide.
     #[test]
     fn matching_class_hashes_do_not_authorize_another_rust_type() {
         #[repr(transparent)]
@@ -298,9 +296,6 @@ mod tests {
         }
     }
 
-    /// A trap inside a call never drops its guard (`forget` stands in for
-    /// the abort): the object is poisoned for good, `free()` throws and
-    /// leaks it, the finalizer leaks it quietly, and a sibling is unharmed.
     #[test]
     fn a_trap_mid_call_poisons_only_that_object() {
         let (h, drops) = probe();

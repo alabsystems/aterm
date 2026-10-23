@@ -2,10 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! End-to-end verified package install orchestration ([`install`]) over [`Fetcher`].
-//!
-//! Pipeline: [`crate::select::select_index`] → [`crate::gate::decide`] →
-//! [`TrustedIndex::verify_pkg`] and [`parse_pkg`] → [`crate::install::verify_and_stage`] →
-//! [`crate::activate::activate_build`] and [`crate::activate::install_shims`].
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -177,7 +173,7 @@ pub struct InstallReport {
     /// The build it is now on.
     pub build: u64,
     /// The `index_build` of the index this install resolved from — the caller advances the
-    /// durable high-water [`crate::sig::Floor`] to this on success (§8 gate 3).
+    /// durable high-water [`crate::sig::Floor`] to this on success.
     pub index_build: u64,
     /// The `roster_seq` of the master-signed generation that authorized that index.
     pub roster_seq: u64,
@@ -185,9 +181,9 @@ pub struct InstallReport {
     pub already_current: bool,
     /// The `bin/` shims installed.
     pub shimmed: Vec<String>,
-    /// `exposes` names refused a shim (sensitive-name collisions, ).
+    /// `exposes` names refused a shim (sensitive-name collisions).
     pub refused_shims: Vec<String>,
-    /// The signed `tree_root` () of the installed build.
+    /// The signed `tree_root` of the installed build.
     pub tree_root: String,
     /// Required-dependency pull-in outcomes (flattened transitive closure), with yanked.
     pub dependencies: Vec<DepOutcome>,
@@ -247,13 +243,13 @@ pub enum FlowError {
     NoIndex,
     /// The index source could not be reached (offline, DNS, a proxy, a 403 rate limit).
     Unreachable(String),
-    /// The program is not named in the verified index (unreachable, ).
+    /// The program is not named in the verified index (unreachable).
     NotReachable(String, Vec<String>),
     /// The requested channel does not exist in the index.
     NoChannel(String),
     /// The program is not pinned in the channel.
     NotPinned(String),
-    /// The selected index's freshness window has lapsed (`now >= valid_until`, ).
+    /// The selected index's freshness window has lapsed (`now >= valid_until`).
     Stale,
     /// The pinned build is yanked/below-floor.
     Tombstoned(String),
@@ -269,11 +265,11 @@ pub enum FlowError {
     ShimEnv(String),
     /// The signed `program`/`build_number` did not match the request (anti-replay).
     Mismatch,
-    /// No artifact for the target triple (a clean skip, ).
+    /// No artifact for the target triple (a clean skip).
     NoArtifact(String),
-    /// The artifact's `kind` is not installable by this tool path (fail closed, ).
+    /// The artifact's `kind` is not installable by this tool path (fail closed).
     UnsupportedKind(String),
-    /// An `app-bundle` member over `github-release`, the aterm app itself ().
+    /// An `app-bundle` member over `github-release`, the aterm app itself.
     AppBundleRefused(String),
     /// An artifact row failed per-protocol admission ([`crate::vendor::check_row`]).
     VendorRefused(String),
@@ -293,7 +289,7 @@ pub enum FlowError {
     Rollback(String),
     /// Disk preflight failed.
     InsufficientDisk { required: u64, available: u64 },
-    /// The program is dev-linked (linkmode, ).
+    /// The program is dev-linked (linkmode).
     Linked(String),
     /// The vendor-direct lane did not install a vendor program.
     Vendor(String),
@@ -308,9 +304,7 @@ impl std::fmt::Display for FlowError {
         match self {
             FlowError::NoIndex => f.write_str("no signature-valid index at/above the floor"),
             FlowError::Unreachable(why) => {
-                // No "retries automatically" tail: this reaches foreground verbs, where
-                // nothing retries; the CLI edge appends the per-verb re-run
-                // (`print_unreachable_followup`).
+                // CLI edge appends the per-verb re-run (`print_unreachable_followup`).
                 write!(f, "could not reach the toolchain index: {why}")
             }
             FlowError::NotReachable(p, roster) => {
@@ -351,8 +345,7 @@ impl std::fmt::Display for FlowError {
             FlowError::StageRefused(m) => f.write_str(m),
             FlowError::Activate(e) => write!(f, "activate: {e}"),
             FlowError::Rollback(m) => {
-                // No "rollback: " head: the CLI edge already prints "atpkg: rollback <p>
-                // failed:".
+                // CLI edge already prints the rollback head.
                 f.write_str(m)
             }
             FlowError::InsufficientDisk {
@@ -453,7 +446,7 @@ pub fn install_collecting_assets(
     )
 }
 
-/// [`install`] with a cycle-guard `seen` map threaded through the `requires` recursion ().
+/// [`install`] with a cycle-guard `seen` map threaded through the `requires` recursion.
 #[allow(
     clippy::too_many_arguments,
     reason = "install_inner is install plus the recursion cycle-guard set and the resolved-\
@@ -653,7 +646,6 @@ fn install_inner(
         | crate::dispatch::ApplyStrategy::SysrootBundle
         | crate::dispatch::ApplyStrategy::VendorApp => {}
         crate::dispatch::ApplyStrategy::AppBundle => {
-            // The app updates itself; atpkg never swaps it ([`FlowError::AppBundleRefused`]).
             return Err(FlowError::AppBundleRefused(program.to_string()));
         }
         crate::dispatch::ApplyStrategy::Unknown => {
@@ -729,7 +721,7 @@ pub(crate) fn vendor_install_outcome(
     crate::vendor_direct::lane::install_one(&lane, spec, false)
 }
 
-/// The signed yanks a targeted vendor door decides under (–).
+/// The signed yanks a targeted vendor door decides under.
 pub(crate) fn door_vendor_policy(
     fetcher: &dyn Fetcher,
     layout: &Layout,
@@ -1023,7 +1015,7 @@ pub(crate) fn roll_back_to(
     install_tools_env(layout, &build_dir, &tools, Aliases::Off, &env)
 }
 
-/// Lay a failing tombstone shim () over every tool `program`'s active build exposes.
+/// Lay a failing tombstone shim over every tool `program`'s active build exposes.
 pub(crate) fn install_tombstone_shims(layout: &Layout, program: &str, installed: Option<u64>) {
     if let Some(cur) = installed {
         let tools = crate::ops::active_tools(layout, program, cur);
@@ -1083,7 +1075,7 @@ pub struct ChannelApplyReport {
     pub groups: Vec<(Group, TxnOutcome)>,
     /// Per member flipped live, keyed by program.
     pub applied: BTreeMap<String, AppliedMember>,
-    /// Members excluded from this apply because they are dev-linked ().
+    /// Members excluded from this apply because they are dev-linked.
     pub skipped_linked: Vec<String>,
     /// `program → pinned artifact asset file name` for every member resolved far enough to
     /// select an artifact, including members whose download or stage then failed: the
@@ -2295,7 +2287,7 @@ fn group_install_need(
     InstallNeed::Published { pins, bytes }
 }
 
-/// Resolve and verify-select the signed index (cached fallback, ) and enforce its freshness window.
+/// Resolve and verify-select the signed index (cached fallback) and enforce its freshness window.
 pub fn resolve_verified_index(
     fetcher: &dyn Fetcher,
     layout: &Layout,
@@ -2507,7 +2499,7 @@ pub fn last_resolve() -> Option<ResolveProvenance> {
 }
 
 /// Roll `program` back to the highest retained build strictly below its active build that
-/// still passes the floor/yank gate (§9/§11), re-pointing its shims and `current` via
+/// still passes the floor/yank gate, re-pointing its shims and `current` via
 /// [`rollback_member`] (links only; no retained tree is touched).
 #[allow(
     clippy::too_many_arguments,
@@ -2605,7 +2597,7 @@ pub fn rollback(
     })
 }
 
-/// The transactional `update <grouped-member>` path ().
+/// The transactional `update <grouped-member>` path.
 #[allow(
     clippy::too_many_arguments,
     reason = "the transactional single-program update needs the same irreducible inputs as \
@@ -2648,7 +2640,7 @@ pub fn apply_program(
     ))
 }
 
-/// Read-only routing decision for the `update` verb ().
+/// Read-only routing decision for the `update` verb.
 #[allow(
     clippy::too_many_arguments,
     reason = "the routing decision needs the fetcher, the layout its roster ratchet turns \
@@ -2946,10 +2938,6 @@ fn fetch_member(
     let carried = ahead.is_none() && carried_archive(&dl, artifact);
     if ahead.is_none() {
         if !carried {
-            // Same reason as the singleton path: a stale staging entry can be a hardlink
-            // into a `dir:` registry, and fetching over it corrupts the registry. The
-            // carried arm never needs this: it only READS `dl` — nothing is written over a
-            // hardlink — and what it reads already matched the signed digest.
             let _ = std::fs::remove_file(&dl);
         }
         sweep_foreign_partials(&dl);

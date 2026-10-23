@@ -140,6 +140,101 @@ fn an_arm_board_is_split_by_cpu_capacity() {
     );
 }
 
+/// A DGX Spark's GB10 as its sysfs reads (2026-10-23): ten Cortex-X925 at
+/// 3.9 GHz whose `cpu_capacity` firmware spreads over 997, 1017 and 1024, and
+/// ten A725 at 2.8 GHz over 718 and 731, are two kinds, not five levels.
+#[test]
+fn a_gb10_is_two_kinds_however_its_capacities_spread() {
+    let core = |id: u16| -> (u32, &str, &str) {
+        match id {
+            0..=4 => (718, "0x00000000410fd871", "2808000"),
+            10..=14 => (731, "0x00000000410fd871", "2808000"),
+            5..=9 => (997, "0x00000000410fd851", "3900000"),
+            19 => (1024, "0x00000000410fd851", "3900000"),
+            _ => (1017, "0x00000000410fd851", "3900000"),
+        }
+    };
+    let mut files = vec![
+        (
+            "sys/devices/system/cpu/present".to_owned(),
+            "0-19\n".to_owned(),
+        ),
+        (
+            "sys/devices/armv8_pmuv3_0/cpus".to_owned(),
+            "0-4,10-14\n".to_owned(),
+        ),
+        (
+            "sys/devices/armv8_pmuv3_1/cpus".to_owned(),
+            "5-9,15-19\n".to_owned(),
+        ),
+    ];
+    for id in 0..20 {
+        let (cap, midr, top) = core(id);
+        let cpu = format!("sys/devices/system/cpu/cpu{id}");
+        files.push((format!("{cpu}/cpu_capacity"), format!("{cap}\n")));
+        files.push((
+            format!("{cpu}/regs/identification/midr_el1"),
+            format!("{midr}\n"),
+        ));
+        files.push((
+            format!("{cpu}/cpufreq/cpuinfo_max_freq"),
+            format!("{top}\n"),
+        ));
+    }
+    let refs: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(a, b)| (a.as_str(), b.as_str()))
+        .collect();
+    let root = tree(&refs);
+    let x925: Vec<u16> = (5..10).chain(15..20).collect();
+    let a725: Vec<u16> = (0..5).chain(10..15).collect();
+    assert_eq!(
+        names(&Root::new(root.path()).cpu_layout()),
+        [("Performance", x925), ("Efficiency", a725)]
+    );
+}
+
+/// One design at two clocks is two kinds (a Dimensity 1200's Cortex-A78 at
+/// 3.0 and 2.6 GHz), a revision is not a design, and a core with no MIDR
+/// leaves every capacity as firmware gave it. NEGATIVE CONTROL: the GB10's
+/// capacities without their designs read five levels.
+#[test]
+fn a_design_is_its_part_at_its_clock() {
+    let a78 = 0x411f_d410_u64;
+    let a55 = 0x412f_d050_u64;
+    let caps = [(0, 1024), (1, 890), (2, 880), (3, 400)];
+    let designs = [
+        (0, (a78 & linux::MIDR_DESIGN, Some(3_000_000))),
+        (1, (a78 & linux::MIDR_DESIGN, Some(2_600_000))),
+        (2, ((a78 | 0x1) & linux::MIDR_DESIGN, Some(2_600_000))),
+        (3, (a55 & linux::MIDR_DESIGN, Some(2_000_000))),
+    ];
+    assert_eq!(
+        linux::capacities_by_design(&caps, &designs),
+        [(0, 1024), (1, 890), (2, 890), (3, 400)]
+    );
+    let spread = [(0, 1024), (1, 1017), (2, 997), (3, 731)];
+    let one = (0x410f_d851 & linux::MIDR_DESIGN, Some(3_900_000));
+    let gb10 = [
+        (0, one),
+        (1, one),
+        (2, one),
+        (3, (0x410f_d871 & linux::MIDR_DESIGN, Some(2_808_000))),
+    ];
+    assert_eq!(
+        linux::capacities_by_design(&spread, &gb10),
+        [(0, 1024), (1, 1024), (2, 1024), (3, 731)]
+    );
+    assert_eq!(linux::capacities_by_design(&spread, &gb10[..3]), spread);
+    let present: Vec<u16> = (0..4).collect();
+    assert_eq!(
+        linux::layout_from(&present, None, &[], &spread)
+            .clusters
+            .len(),
+        4
+    );
+}
+
 /// A machine whose cores are alike is one `"CPU"` cluster. NEGATIVE
 /// CONTROLS: equal capacities; a capacity missing for one core; PMUs that
 /// overlap or leave a present core out; a single PMU.

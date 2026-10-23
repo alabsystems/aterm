@@ -86,8 +86,7 @@ impl Lifeline {
 /// # Errors
 /// Returns an error if [`Lifeline::arm`] fails.
 pub fn arm_for_process(cmd: &mut crate::spawnfd::StdCommand, dir: &Path) -> io::Result<()> {
-    /// The held ends, kept for the life of the process: never dropped, so the
-    /// kernel closes each when the process ends and at no other moment.
+    /// Held lifeline ends retained for the lifetime of the process.
     static HELD: std::sync::Mutex<Vec<Lifeline>> = std::sync::Mutex::new(Vec::new());
     let lifeline = Lifeline::arm(cmd, dir)?;
     HELD.lock()
@@ -137,9 +136,7 @@ pub fn adopt(number: RawFd) -> io::Result<OwnedFd> {
     Ok(OwnedFd::from(copy))
 }
 
-/// [`adopt`]'s and [`check`]'s shared half: every check a lifeline must pass,
-/// made through a private close-on-exec copy of `number` (3 or above), which is
-/// returned.
+/// Validate `number` as a read-only pipe or FIFO and return a close-on-exec duplicate.
 fn validated_copy(number: RawFd) -> io::Result<File> {
     if number < 0 {
         return Err(io::Error::new(
@@ -266,10 +263,7 @@ fn look(mut lifeline: impl io::Read) -> Option<Cut> {
     }
 }
 
-/// A lifeline read at the wakes of a loop that already wakes on its own (the
-/// broker's poll), so watching it costs no thread: its descriptor is made
-/// non-blocking once, and each [`OnWake::cut`] reads what is there and returns.
-/// A cut is seen at the first wake after it, never sooner.
+/// Non-blocking lifeline reader polled on each wake of an event loop.
 #[derive(Debug)]
 pub struct OnWake(File);
 
@@ -294,8 +288,7 @@ impl OnWake {
         Ok(Self(file))
     }
 
-    /// How the lifeline ended, once it has: `None` while the launcher holds it.
-    /// Never blocks.
+    /// Non-blocking check returning `Some(Cut)` once the lifeline has ended.
     pub fn cut(&mut self) -> Option<Cut> {
         look(&mut self.0)
     }
@@ -308,8 +301,7 @@ unsafe extern "C" {
     fn mkfifo(path: *const std::ffi::c_char, mode: Mode) -> i32;
 }
 
-/// `mode_t`: 16 bits on Darwin, 32 on Linux. The width matters: Apple's arm64
-/// convention has the caller extend a sub-word argument.
+/// Platform `mode_t` width (16-bit on Darwin, 32-bit on Linux).
 #[cfg(target_vendor = "apple")]
 type Mode = u16;
 #[cfg(not(target_vendor = "apple"))]
@@ -425,11 +417,7 @@ mod tests {
         assert_eq!(failing.calls, 2);
     }
 
-    /// One look answers at once: bytes and an interrupt are read past, a read
-    /// that would block is a lifeline still held (`None`, after exactly those
-    /// calls), and end-of-file or a failed read is the cut. NEGATIVE CONTROL: the
-    /// held answer — a look that took a would-block for a cut would end a broker
-    /// whose launcher lives.
+    /// `look` drains available bytes and returns `None` on `WouldBlock` or `Some(Cut)` on EOF/error.
     #[test]
     fn a_look_answers_at_once_and_only_end_of_file_or_a_failure_is_a_cut() {
         let mut held = Script {
@@ -461,10 +449,7 @@ mod tests {
         );
     }
 
-    /// [`OnWake`] reads a real lifeline without blocking: not cut at any wake
-    /// while the launcher's end lives, cut (end-of-file) once it is dropped. Its
-    /// descriptor is checked non-blocking before any look, so a watch that would
-    /// block fails here instead of hanging the binary in `read(2)`.
+    /// [`OnWake`] reports `None` while the launcher holds the lifeline and `Cut::Closed` after it drops.
     #[test]
     fn a_lifeline_read_on_wake_is_cut_only_after_the_launcher_lets_go() {
         let dir = scratch("on-wake");
@@ -476,9 +461,6 @@ mod tests {
         assert!(watch.cut().is_none(), "a held lifeline is not cut");
         assert!(watch.cut().is_none(), "nor at the next wake");
         lifeline.cut();
-        // End-of-file may lag the cut: a spawn on another test thread holds
-        // copies of every descriptor until its exec. The deadline is a hang
-        // detector.
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let cut = loop {
             if let Some(cut) = watch.cut() {

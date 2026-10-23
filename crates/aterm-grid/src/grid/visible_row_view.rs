@@ -1,15 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Display-offset-aware per-row reads, shared by the render snapshot and text extraction.
-//!
-//! Scrolled back (`display_offset > 0`), [`Grid::row`] returns historical cells, but the
-//! coordinate-keyed extras accessors (`cell_render_data`, `push_complex_char_at`,
-//! `CellExtras::get`) read the live extras map at the raw visible row, while scrolled-off
-//! extras live in `ring_extras`, the lazy buffer or the tiered store. [`VisibleRowView`]
-//! resolves live-vs-history once per row and routes history rows through
-//! [`Grid::materialize_scrollback_row_full`], so every tier reads correctly paired extras.
 
 use std::sync::Arc;
 
@@ -26,9 +18,7 @@ pub enum VisibleRowView<'a> {
         screen_row: u16,
         row: &'a Row,
     },
-    /// A scrolled-off history row, materialized (cells + paired extras). Shared: a
-    /// scrolled-back viewport reads the same row every frame, so materialization is memoized
-    /// per absolute row (`viewport_row_cache`) and handed out from `&self`.
+    /// A scrolled-off history row, materialized (cells + paired extras).
     History { mat: Arc<MaterializedRow> },
     /// No such row (out of range, or the history index was unavailable).
     Empty,
@@ -66,7 +56,7 @@ impl<'a> CellDataView<'a> {
     }
 
     /// Base codepoint for a complex cell (the first scalar of the complex
-    /// string). Mirrors [`CellRenderData::complex_char`] for both tiers.
+    /// string).
     #[must_use]
     #[inline]
     pub fn complex_base(self) -> Option<char> {
@@ -78,8 +68,7 @@ impl<'a> CellDataView<'a> {
         }
     }
 
-    /// The cell's [`CellExtra`] (underline color, hyperlink). For combining marks and cluster
-    /// tails use [`marks`](Self::marks): live and history store them differently.
+    /// The cell's [`CellExtra`] (underline color, hyperlink).
     #[must_use]
     #[inline]
     pub const fn cell_extra(self) -> Option<&'a CellExtra> {
@@ -91,11 +80,6 @@ impl<'a> CellDataView<'a> {
 
     /// The overlay marks for the render fold: combining diacritics, or the trailing scalars
     /// of an emoji cluster (ZWJ / skin tone / flag).
-    ///
-    /// A live cell keeps `(base, combining marks)` split, so this is `combining()`. A
-    /// materialized cell folds the grapheme into its complex string (base = first scalar), so
-    /// the marks are that string's tail plus any separately stored combining marks. Borrowed,
-    /// so repainting cached history does not allocate; clone the iterator for a second pass.
     #[inline]
     pub fn marks(self) -> impl Iterator<Item = char> + Clone + 'a {
         let extra = self.cell_extra();
@@ -248,8 +232,6 @@ impl<'a> VisibleRowView<'a> {
                     let ch = cell.char();
                     out.push(if ch == '\0' { ' ' } else { ch });
                 }
-                // Combining marks, gated on HAS_EXTRAS so an overwritten cell's stale
-                // entry is skipped.
                 if cell.has_extras()
                     && !grid.storage.extras.is_empty()
                     && let Some(extra) = grid.storage.extras.get(CellCoord::new(*screen_row, col))
@@ -282,20 +264,13 @@ impl<'a> VisibleRowView<'a> {
 }
 
 impl Grid {
-    /// Resolve a viewport row against `display_offset`: [`Live`] when the viewport is not
-    /// scrolled past it, else [`History`], materialized through the 3-tier reader. At
-    /// `display_offset == 0` always `Live` with `screen_row == visible_row`.
-    ///
-    /// [`Live`]: VisibleRowView::Live
-    /// [`History`]: VisibleRowView::History
-    /// [`Empty`]: VisibleRowView::Empty
+    /// Resolve a viewport row against `display_offset`: [`VisibleRowView::Live`] when the viewport is not
+    /// scrolled past it, else [`VisibleRowView::History`], materialized through the 3-tier reader.
     #[must_use]
     #[inline]
     pub fn visible_row_view(&self, visible_row: u16) -> VisibleRowView<'_> {
         let d = self.display_offset();
         if usize::from(visible_row) >= d {
-            // `Grid::row` display-maps the cells; the live extras key is
-            // `visible_row - display_offset`, which cannot underflow here.
             let screen_row = visible_row.saturating_sub(u16::try_from(d).unwrap_or(0));
             match self.row(visible_row) {
                 Some(row) => VisibleRowView::Live {
@@ -306,7 +281,6 @@ impl Grid {
                 None => VisibleRowView::Empty,
             }
         } else {
-            // rev_idx 0 is the newest scrolled-off line.
             let rev_idx = d - 1 - usize::from(visible_row);
             match self.materialized_history_row(rev_idx, self.cols()) {
                 Some(mat) => VisibleRowView::History { mat },
@@ -316,13 +290,9 @@ impl Grid {
     }
 
     /// The history row `rev_idx` lines above the live screen (0 = the newest scrolled-off
-    /// line), materialized as a scrolled-back viewport row is ([`History`]) but read whatever
+    /// line), materialized as a scrolled-back viewport row is ([`VisibleRowView::History`]) but read whatever
     /// the viewport shows: socket introspection's read of a history row's cells (`cell
-    /// abs=<n>`), which pairs with the live frame's reads of the screen. [`Empty`] for a row
-    /// the history does not hold.
-    ///
-    /// [`History`]: VisibleRowView::History
-    /// [`Empty`]: VisibleRowView::Empty
+    /// abs=<n>`), which pairs with the live frame's reads of the screen.
     #[must_use]
     pub fn history_row_view(&self, rev_idx: usize) -> VisibleRowView<'_> {
         match self.materialized_history_row(rev_idx, self.cols()) {
@@ -333,9 +303,7 @@ impl Grid {
 
     /// The absolute row number of the history row at `rev_idx` (0 = newest scrolled-off line),
     /// or `None` when it cannot be computed exactly: one above the top live line,
-    /// `absolute_row_counter - visible_rows`. Absolute numbers only count up and are never
-    /// reused, so the memo keys on them without eviction bookkeeping. `checked_*`, because
-    /// saturation would alias distinct rows onto one memo slot.
+    /// `absolute_row_counter - visible_rows`.
     fn history_absolute_row(&self, rev_idx: usize) -> Option<u64> {
         let top_live = self
             .storage
@@ -346,12 +314,8 @@ impl Grid {
 
     /// The materialized history row at `rev_idx`, from the memo when it provably describes
     /// this history, else materialized and memoized; `None` only when the row does not exist.
-    /// The frame path has no damage gate, so without the memo every repaint of a motionless
-    /// scrolled-back viewport (cursor blink, effects frames) would rematerialize every row.
     fn materialized_history_row(&self, rev_idx: usize, cols: u16) -> Option<Arc<MaterializedRow>> {
         let Some(abs_row) = self.history_absolute_row(rev_idx) else {
-            // Unkeyable (the absolute counter has not passed the viewport yet): read through,
-            // uncached.
             #[cfg(any(test, debug_assertions))]
             super::count_viewport_row_materialize();
             return self
@@ -365,8 +329,6 @@ impl Grid {
             visible_rows: self.storage.visible_rows,
         };
         if let Some(hit) = self.viewport_cache.lookup(epoch, abs_row) {
-            // A stale hit is a wrong glyph on screen, so debug builds re-materialize every hit
-            // and compare (see `viewport_row_cache`).
             #[cfg(debug_assertions)]
             {
                 let fresh = self.materialize_scrollback_row_full(rev_idx, cols);
@@ -378,9 +340,6 @@ impl Grid {
             }
             return Some(hit);
         }
-        // The memo borrow lives inside `lookup`/`store`, never across this materialize, so no
-        // read path re-enters it. Counted here on the miss, not in
-        // `materialize_scrollback_row_full`, which the debug check calls on every hit.
         #[cfg(any(test, debug_assertions))]
         super::count_viewport_row_materialize();
         let fresh = Arc::new(self.materialize_scrollback_row_full(rev_idx, cols)?);
@@ -389,8 +348,7 @@ impl Grid {
     }
 
     /// [`visible_row_view`](Self::visible_row_view) ignoring `display_offset`: always the live
-    /// on-screen row. Socket introspection (`cell`/`screen`/`cells`) and live text extraction
-    /// read this frame, so a colour/attr/wide read never pairs with a scrolled-back row.
+    /// on-screen row.
     #[must_use]
     pub fn screen_row_view(&self, screen_row: u16) -> VisibleRowView<'_> {
         match self.row_at_screen(screen_row) {
@@ -412,7 +370,7 @@ impl Grid {
 
     /// The ring row at display index `visible_row` with no viewport bound: the
     /// row just past the viewport (`visible_row == rows`) whose DEC line size
-    /// the incoming-row apron reads. `None` past the ring.
+    /// the incoming-row apron reads.
     #[must_use]
     pub fn row_past_viewport(&self, visible_row: u16) -> Option<&Row> {
         self.storage.row_past_viewport(visible_row)
@@ -473,7 +431,6 @@ mod viewport_cache_tests {
     use super::VisibleRowView;
     use crate::Grid;
 
-    /// A 3-row grid with `lines` numbered lines pushed into ring history.
     fn grid_with_history(lines: usize) -> Grid {
         let mut grid = Grid::new(3, 8);
         for i in 0..lines {
@@ -486,7 +443,6 @@ mod viewport_cache_tests {
         grid
     }
 
-    /// The shared row behind a history viewport row; panics on a live one.
     fn history_row(grid: &Grid, visible_row: u16) -> Arc<super::MaterializedRow> {
         match grid.visible_row_view(visible_row) {
             VisibleRowView::History { mat } => mat,
@@ -494,7 +450,6 @@ mod viewport_cache_tests {
         }
     }
 
-    /// The row's text, read the way the render/text leaves read it.
     fn row_text(grid: &Grid, visible_row: u16) -> String {
         let view = grid.visible_row_view(visible_row);
         let mut out = String::new();
@@ -506,15 +461,12 @@ mod viewport_cache_tests {
         out
     }
 
-    /// The memo keys on row identity, not viewport position: a row keeps its materialization
-    /// across a one-line scroll.
     #[test]
     fn a_scrolled_row_keeps_its_materialization_at_its_new_viewport_index() {
         let mut grid = grid_with_history(40);
         grid.scroll_display(10);
         let before = history_row(&grid, 1);
         let text_before = row_text(&grid, 1);
-        // One line further back: what was viewport row 1 is now viewport row 2.
         grid.scroll_display(1);
         let after = history_row(&grid, 2);
         assert_eq!(
@@ -528,7 +480,6 @@ mod viewport_cache_tests {
         );
     }
 
-    /// A content change drops the whole memo.
     #[test]
     fn a_content_change_invalidates_every_memoized_row() {
         let mut grid = grid_with_history(40);
@@ -548,9 +499,6 @@ mod viewport_cache_tests {
         );
     }
 
-    /// Output arriving while scrolled back grows history under a fixed `display_offset`, so
-    /// the content under the viewport slides up a row; the memo follows the content, not the
-    /// index.
     #[test]
     fn a_line_arriving_while_scrolled_back_reshuffles_rows_correctly() {
         let mut grid = grid_with_history(40);
@@ -558,7 +506,6 @@ mod viewport_cache_tests {
         let text_row0 = row_text(&grid, 0);
         let text_row1 = row_text(&grid, 1);
         assert_ne!(text_row0, text_row1, "the fixture rows are not distinct");
-        // One more line into history; the viewport does not move.
         grid.carriage_return();
         for ch in "NEW".chars() {
             grid.write_char(ch);
@@ -577,7 +524,6 @@ mod viewport_cache_tests {
         );
     }
 
-    /// Memoized rows equal a fresh materialization over a scrub mixing hits and misses.
     #[test]
     fn memoized_rows_match_a_fresh_materialize_across_a_scrub() {
         let mut grid = grid_with_history(60);
@@ -599,8 +545,6 @@ mod viewport_cache_tests {
                      fresh materialization"
                 );
             }
-            // One line toward live per pass: two of the three rows were built last pass
-            // (hits), one is new (a miss).
             grid.scroll_display(-1);
         }
     }

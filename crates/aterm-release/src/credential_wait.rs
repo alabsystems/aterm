@@ -521,7 +521,7 @@ mod tests {
         aterm_tempfile::stand_in(&askpass, "#!/bin/sh\n: > asked\necho answer\n")
             .expect("lay the askpass");
         let core_askpass = format!("core.askPass={}", askpass.display());
-        let mut git = command("git");
+        let mut git = command(aterm_uds::os_path!("git"));
         let mut child = ask_no_one(&mut git)
             .current_dir(dir.path())
             .env("PATH", path)

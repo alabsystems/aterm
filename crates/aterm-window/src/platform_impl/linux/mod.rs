@@ -4,11 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/mod.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (The X11 types are first-party
-// aterm-x11's, and the event loops answer no `AsFd`: the X11 loop waits in a poll(2) over two
-// descriptors, not one epoll descriptor an embedder could watch, and no aterm crate embeds the
-// loop.)
-
 #![cfg(free_unix)]
 
 #[cfg(all(not(x11_platform), not(wayland_platform)))]
@@ -78,12 +73,9 @@ impl ApplicationName {
 #[derive(Clone, Debug, Default)]
 pub struct PlatformSpecificWindowAttributes {
     pub name: Option<ApplicationName>,
-    /// The launcher's startup-notification token (`DESKTOP_STARTUP_ID` on X11,
-    /// `XDG_ACTIVATION_TOKEN` on Wayland): X11 names it on the window and ends the launch sequence
-    /// with it once the window maps; Wayland activates the surface with it.
+    /// The launcher's startup-notification token (`DESKTOP_STARTUP_ID` on X11, `XDG_ACTIVATION_TOKEN` on Wayland).
     pub activation_token: Option<String>,
-    /// The X11 window's background (`0x00RRGGBB`) and top-left gravity
-    /// (`platform::x11::WindowAttributesExtX11`).
+    /// The X11 window's background (`0x00RRGGBB`) and top-left gravity.
     pub x11_background: Option<u32>,
 }
 
@@ -169,7 +161,6 @@ pub enum MonitorHandle {
     Wayland(wayland::MonitorHandle),
 }
 
-/// Dispatch over the three event-loop backends.
 macro_rules! any_backend {
     (match $what:expr; $enum:ident ( $($c1:tt)* ) => $x:expr; as $enum2:ident ) => {
         match $what {
@@ -444,16 +435,13 @@ impl Window {
         Some(x11_or_wayland!(match self; Window(w) => w.primary_monitor()?; as MonitorHandle))
     }
 
-    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
-    /// the Linux half): the window's X11 or Wayland handles, which `window::Window` hands out
-    /// through first-party `aterm_types::native_window::HasNativeWindow`.
+    /// The window's native X11 or Wayland handles.
     #[inline]
     pub fn native_window(&self) -> aterm_types::native_window::NativeWindow {
         x11_or_wayland!(match self; Window(window) => window.native_window())
     }
 
-    /// The opt-in `rwh_06` window handle: [`Self::native_window`]'s answer in raw-window-handle's
-    /// words, so the two cannot name different windows.
+    /// The opt-in `rwh_06` window handle.
     #[cfg(feature = "rwh_06")]
     #[inline]
     pub fn raw_window_handle_rwh_06(&self) -> Result<rwh_06::RawWindowHandle, rwh_06::HandleError> {
@@ -631,7 +619,7 @@ impl<T: 'static> EventLoop<T> {
         let xconn = match X11_BACKEND.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Ok(xconn) => xconn.clone(),
             Err(err) => {
-                return Err(EventLoopError::Os(os_error!(OsError::XNotSupported(err.clone()))))
+                return Err(EventLoopError::Os(os_error!(OsError::XNotSupported(err.clone()))));
             },
         };
 

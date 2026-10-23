@@ -94,15 +94,7 @@ fn ts_param(ty: &Ty, trailing: bool) -> (String, bool) {
     }
 }
 
-// Prefix colliding or reserved parameter names with `_` so they never shadow body identifiers.
-/// The JS names of `f`'s parameters: the Rust names the descriptor records,
-/// which the `.d.ts` and JSDoc show as wasm-bindgen's glue does. A name takes
-/// a leading `_` (wasm-bindgen's `_this`) until it is no reserved word, no
-/// other parameter's name and no identifier `f`'s body reads, so a legal Rust
-/// name can neither coalesce with another nor shadow what the body calls:
-/// `wasm`, a helper, a class it wraps, a host global. The body is read as
-/// written with `$` placeholder parameters; `class` is the class a member's
-/// body names itself by.
+/// The JS names of `f`'s parameters, prefixed with `_` when needed to avoid reserved words, duplicates, or identifiers read by `f`'s body.
 fn param_names(f: &Func, class: Option<&str>) -> Vec<String> {
     let placeholders: Vec<String> = (0..f.params.len()).map(|i| format!("arg${i}")).collect();
     let mut code = body(&mut Needs::default(), f, &placeholders, "");
@@ -125,9 +117,7 @@ fn param_names(f: &Func, class: Option<&str>) -> Vec<String> {
     out
 }
 
-/// The identifiers `code` reads: every identifier token but a property name
-/// after a lone `.`. Over-reading (a word in a string) only ever escapes a
-/// parameter that needed none.
+/// The non-property identifier tokens `code` reads.
 fn read_names(code: &str) -> BTreeSet<&str> {
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_' || b == b'$';
     let bytes = code.as_bytes();
@@ -151,9 +141,7 @@ fn read_names(code: &str) -> BTreeSet<&str> {
     out
 }
 
-// Escape `*/` so the literal is safe inside the self-types header comment.
-/// JSON strings are JS string literals too. Escaping the comment terminator
-/// also makes the same literal safe in the self-types header comment.
+/// Format `text` as a JS string literal with `*/` escaped for header comments.
 fn literal(text: &str) -> String {
     aterm_json::to_string(text)
         .expect("a string serializes to JSON")
@@ -276,7 +264,6 @@ impl Needs {
                         ],
                         [format!("ptr${i}"), format!("len${i}")],
                     ),
-                    // The model refuses any other parameter type.
                     _ => (vec![], [zero.clone(), zero]),
                 }
             }
@@ -897,9 +884,7 @@ mod tests {
         generate(&iface, "lifetime").js
     }
 
-    /// `gl-lifetimes.mjs` on the glue `js`, in a page: whether it held, and
-    /// what the page printed (or why it failed). A failing run keeps its
-    /// fixture root for reading when `keep` says so.
+    /// Run `gl-lifetimes.mjs` on `js` in a headless page and return whether it held along with console output.
     #[cfg(unix)]
     fn drive_lifetimes(js: &str, keep: bool) -> (bool, String) {
         let dir = aterm_tempfile::Builder::new()
@@ -929,10 +914,7 @@ mod tests {
         (ran.is_ok(), console)
     }
 
-    /// Actual generated imports retire only their context/program's owned
-    /// strings and uniform locations. The page's fixture supplies RAM GL and
-    /// Wasm-export mocks and fences the network, a real GPU, timers and the
-    /// real Wasm engine for the glue's whole run.
+    /// Generated imports retire only their context or program's owned strings and uniform locations.
     #[cfg(unix)]
     #[test]
     fn context_strings_and_program_locations_retire_with_their_owner() {
@@ -951,10 +933,7 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROL for the fixture's fence: glue that reaches the
-    /// network as it is imported, or a real canvas's GPU context in
-    /// `context_create`, fails the fixture by name, as node's sandbox failed
-    /// it with a ReferenceError.
+    /// Glue that reaches the network on import or a real canvas GPU context in `context_create` fails the fixture fence.
     #[cfg(unix)]
     #[test]
     fn glue_that_reaches_the_network_or_a_real_gpu_fails_the_gl_fixture() {

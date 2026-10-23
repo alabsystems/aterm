@@ -167,9 +167,7 @@ tape_arg_debug!(
     ResetAsk,
     ResetEnd,
     UsageWindow,
-    // `occupancy_pace`'s rule: a closed enum, printed as its variant.
     RuleId,
-    // `occupancy_said`'s word: closed words and plain numbers, no `Instant`.
     OccupancySaid,
 );
 
@@ -226,10 +224,7 @@ const fn bad(why: &'static str) -> CodecError {
     CodecError { at: 0, why }
 }
 
-/// `value` as JSON bytes, or no bytes where it has no JSON form. The mirrors
-/// hold strings, numbers, booleans, and lists and options of them, which
-/// always serialize, and a transcript's path ([`TranscriptWire`]), which
-/// serializes only when it is UTF-8.
+/// `value` as JSON bytes, or no bytes where it has no JSON form.
 fn json<T: Serialize>(value: &T) -> Vec<u8> {
     aterm_json::to_vec(value).unwrap_or_default()
 }
@@ -788,12 +783,7 @@ struct RoomWire {
 
 /// `occupancy_pace`'s answer on a tape: its word ([`PaceGrant::word`]), as a
 /// JSON string, and a re-read board's as `{"room": <reading>}` (the reading
-/// as `occupancy` tapes it). A word this build does not know is refused. AN
-/// OLDER TAPE (slice 1's, whose pace re-read nothing) holds a word for every
-/// answer, read as before: its `granted` to a slot rule types the line as it
-/// was decided, as that build typed it (`PaceGrant::slot_answer`), so the
-/// tape replays as recorded. No absent form: a build without the door typed
-/// no fact line, so a replay that reaches the door diverges there.
+/// as `occupancy` tapes it).
 impl TapeValue for PaceGrant {
     fn to_tape(&self) -> Vec<u8> {
         match self {
@@ -935,8 +925,7 @@ impl TapeValue for Option<LastTurn> {
     }
 }
 
-/// [`RepoWork`] as a tape holds it. A tape recorded before the probe read
-/// the remote's default branch holds no `unlanded` or `main_ref`: none known.
+/// [`RepoWork`] as a tape holds it.
 #[derive(Serialize, Deserialize)]
 struct RepoWorkWire {
     repo: String,
@@ -1067,9 +1056,7 @@ impl TapeValue for Option<AgentMemory> {
     }
 }
 
-/// `transcript`'s answer as a tape holds it: the file and its tail. A path
-/// that is not UTF-8 has no JSON form, so its answer is one a replay cannot
-/// take, and says so.
+/// `transcript`'s answer as a tape holds it: the file and its tail.
 #[derive(Serialize, Deserialize)]
 struct TranscriptWire {
     path: PathBuf,

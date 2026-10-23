@@ -720,8 +720,6 @@ fn self_instance_sock(self_sid: Option<&str>) -> Option<String> {
 }
 
 fn self_instance_sock_in(dir: &Path, self_sid: Option<&str>) -> Option<String> {
-    // Only a sid the wire's grammar reads as one (`s-<hex>`) is looked up, so a
-    // weird env value can never path-traverse out of the graph dir.
     graph_entry_sock_in(dir, aterm_types::control_request::Sid::parse(self_sid?)?)
 }
 
@@ -2096,8 +2094,6 @@ impl ForeignFacts {
     }
 
     /// Whether `kill` is offered for it: only an instance its lineage proves launchd adopted.
-    /// One whose parent is launchd or init and nothing says which keeps its words and gets no
-    /// `kill`: it may be one launchd started.
     const fn orphaned(&self) -> bool {
         matches!(
             self,
@@ -2419,7 +2415,6 @@ fn duplicate_sids(sessions: &[FleetSession]) -> Vec<(String, Vec<u32>)> {
     let mut claims: std::collections::HashMap<&str, Vec<u32>> = std::collections::HashMap::new();
     for session in sessions {
         let Some(sid) = session.sid() else {
-            // Distinct branch.
             continue; // a row too short to carry one — the listing skips it too
         };
         let pids = claims.entry(sid).or_insert_with(|| {
@@ -2557,7 +2552,6 @@ fn discovery_report(dir: DirOutcome, probes: &[(u32, String, Probe)]) -> (String
                     " — another user's directory, or a sandbox refusing it"
                 }
             } else if err.kind() == io::ErrorKind::NotADirectory {
-                // `ENOTDIR` names any component of the path, not only the last.
                 " — that path, or one above it, is not a directory"
             } else {
                 ""
@@ -4323,7 +4317,6 @@ pub fn search_incomplete_note(tail: &str) -> Option<String> {
             "moving" => "the screen's rows moved during the search; search again",
             "changed" => "the terminal changed while the search ran",
             "older" => DEPTH,
-            // Where the screen was, and whether its frame was whole: neither is a cause.
             word if word.starts_with("screen_first=") || word.starts_with("frame=") => continue,
             _ => "the server reported an unrecognized search completeness cause",
         };

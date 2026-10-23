@@ -139,8 +139,6 @@ impl ColorPalette {
     #[inline]
     #[must_use]
     pub const fn get(&self, index: u8) -> Rgb {
-        // `as usize`, not `usize::from`: Trust cannot see into the trait call and leaves the
-        // bounds obligation unproved, while the primitive cast proves it.
         self.cache[index as usize]
     }
 
@@ -194,8 +192,6 @@ impl ColorPalette {
         &self.overrides
     }
 
-    /// The default color for an index; `const fn` so [`DEFAULT_COLOR_TABLE`] is built at
-    /// compile time.
     const fn compute_default_color(index: u8) -> Rgb {
         match index {
             0..=7 => Self::ANSI_COLORS[index as usize],
@@ -293,7 +289,6 @@ impl ColorPalette {
                 _ => None,
             }
         } else {
-            // No-op / fallback.
             crate::x11_colors::lookup(spec)
         }
     }
@@ -342,8 +337,6 @@ impl ColorPalette {
     }
 }
 
-/// Default RGB for every 256-color index, built at compile time from
-/// [`ColorPalette::compute_default_color`].
 static DEFAULT_COLOR_TABLE: [Rgb; 256] = {
     let mut table = [Rgb::new(0, 0, 0); 256];
     let mut i: u16 = 0;
@@ -375,10 +368,6 @@ mod tests {
         }
     }
 
-    /// On Windows blue is ink and a background alike, and bright blue is its
-    /// lighter sibling: blue clears 3.5:1 as ink on Default's background, the
-    /// default foreground clears 3:1 and white 4.5:1 on it, and bright blue is
-    /// lighter than blue at 7:1 or more.
     #[test]
     fn windows_blues_read_as_ink_and_as_a_background() {
         let page = Rgb::new(0x11, 0x13, 0x18);
@@ -401,10 +390,6 @@ mod tests {
         assert_eq!(shipped == historical, !cfg!(windows));
     }
 
-    /// On Windows the normal chromatic tones other than blue (which is tuned
-    /// as a background) are one family: green, yellow and cyan are One
-    /// Dark's, like red and magenta, so a diff's additions (green) carry the
-    /// weight its deletions (red) do.
     #[test]
     fn windows_normal_tones_are_one_family() {
         let page = Rgb::new(0x11, 0x13, 0x18);
@@ -432,12 +417,6 @@ mod tests {
         assert_eq!(shipped == xterm, !cfg!(windows));
     }
 
-    /// On Windows each chromatic bright is its normal, lighter, so bold-as-bright
-    /// text changes brightness and not hue: the same `OkLCh` hue within 10°
-    /// (red, blue and the One Dark four), and for green, yellow, magenta and
-    /// cyan a lightness step of +0.10 to +0.14 that stands the pair apart
-    /// (`OkLab` 0.11 or more and 1.45:1, where the others need 0.05) and keeps
-    /// at least 0.85 of the normal's chroma.
     #[test]
     fn windows_brights_are_their_normals_lighter() {
         use crate::scheme_signature::{chroma_hue, oklab, oklab_distance};
@@ -587,7 +566,6 @@ mod tests {
         }
     }
 
-    /// The OSC 4/10/11 reply spelling, and parse(format(c)) == c.
     #[test]
     fn format_color_spec_is_the_16_bit_spelling_and_round_trips() {
         assert_eq!(
@@ -613,8 +591,6 @@ mod tests {
         }
     }
 
-    /// The dense cache agrees with `overrides` at every index after every mutation, including
-    /// removing a middle entry, where `swap_remove` moves another override into its slot.
     #[test]
     fn palette_cache_agrees_with_overrides_after_mutations() {
         fn assert_coherent(p: &ColorPalette, what: &str, overrides: usize) {

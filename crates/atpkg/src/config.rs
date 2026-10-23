@@ -154,8 +154,7 @@ pub fn auto_update_note(auto_update: bool, enabled: Option<bool>) -> String {
     }
 }
 
-/// The line a retired `[packages]` key gets: at load (once per process, [`admit_packages`])
-/// and from doctor.
+/// The line a retired `[packages]` key gets: at load (once per process, [`admit_packages`]) and from doctor.
 fn retired_key_note(key: &str) -> String {
     match key {
         "channel" => "[packages] channel is retired — atpkg reads the one `stable` channel; \
@@ -256,7 +255,7 @@ pub fn config_path() -> Option<PathBuf> {
         .map(|h| h.join(".config/aterm/aterm.toml"))
 }
 
-/// The `[machine]` table: the machine settings `aterm pkg machine apply` applies at first open and keeps applied. atpkg applies them; the GUI only renders the resulting `machine-settings:` row.
+/// The `[machine]` table: the machine settings `aterm pkg machine apply` applies at first open and keeps applied.
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct MachineConfig {
@@ -312,8 +311,7 @@ impl MachineConfig {
     }
 }
 
-/// Deserialization wrapper for the `[packages]` table alone; every other table of
-/// `aterm.toml` is ignored (the GUI owns that schema).
+/// Deserialization wrapper for the `[packages]` table alone; every other table of `aterm.toml` is ignored (the GUI owns that schema).
 #[derive(Default, serde::Deserialize)]
 #[serde(default)]
 struct PackagesOnly {
@@ -488,9 +486,7 @@ pub fn parse_packages_at(text: &str, dev_seams: bool, home: Option<&Path>) -> Pa
     }
 }
 
-/// When `text` is not valid TOML, say so once for every table read from it and answer
-/// true: the parser fails the whole file, so a per-table line would blame a table that
-/// has nothing wrong with it.
+/// When `text` is not valid TOML, say so once for every table read from it and answer true: the parser fails the whole file, so a per-table line would blame a table that has nothing wrong with it.
 fn say_not_toml(text: &str) -> bool {
     match not_toml_note(text) {
         Some(note) => {
@@ -622,7 +618,6 @@ fn read_config_text(path: &Path) -> Option<String> {
 }
 
 fn load_from_path(path: &Path) -> PackagesConfig {
-    // Absent or unreadable ⇒ defaults.
     read_config_text(path).map_or_else(PackagesConfig::default, |t| parse_packages(&t))
 }
 
@@ -653,8 +648,7 @@ pub fn cached() -> &'static PackagesConfig {
 #[cfg(test)]
 mod tests {
 
-    /// `agents_auto_prime` resolves as the window resolves it: only a boolean `false`
-    /// turns it off; no key, a non-boolean and a file that does not parse are the default.
+    /// `agents_auto_prime` resolves as the window resolves it: only a boolean `false` turns it off; no key, a non-boolean and a file that does not parse are the default.
     #[test]
     fn agents_auto_prime_is_off_only_for_a_written_false() {
         use super::parse_agents_auto_prime as prime;
@@ -697,8 +691,7 @@ mod tests {
 
     use super::*;
 
-    /// `unix` (a rooted `/…` path) as an absolute path on this host: Windows roots it
-    /// on a drive, since `/opt/…` alone is drive-relative there.
+    /// `unix` (a rooted `/…` path) as an absolute path on this host: Windows roots it on a drive, since `/opt/…` alone is drive-relative there.
     fn abs(unix: &str) -> String {
         if cfg!(windows) {
             format!("C:{unix}")
@@ -748,8 +741,7 @@ mod tests {
         );
     }
 
-    /// A typo in `[packages]` never re-arms the acting `[machine]` defaults: each table is
-    /// parsed on its own, and an unreadable `[machine]` table falls to the inert reading.
+    /// A typo in `[packages]` never re-arms the acting `[machine]` defaults: each table is parsed on its own, and an unreadable `[machine]` table falls to the inert reading.
     #[test]
     fn a_packages_typo_never_re_arms_the_machine_defaults() {
         let typo = "[packages]\nauto_install = \"yes\"\n[machine]\n\
@@ -812,8 +804,7 @@ mod tests {
         );
     }
 
-    /// `auto_update` is folded into `enabled`: its `false` still reads as off, whatever
-    /// `enabled` says, and doctor names the rename; `true` changes nothing.
+    /// `auto_update` is folded into `enabled`: its `false` still reads as off, whatever `enabled` says, and doctor names the rename; `true` changes nothing.
     #[test]
     fn a_retired_auto_update_false_still_switches_automatic_updates_off() {
         let old = parse_packages("[packages]\nauto_update = false\n");
@@ -837,9 +828,7 @@ mod tests {
         assert!(!parse_packages("[packages]\nenabled = false\n").enabled());
     }
 
-    /// The rename is said only where a rename parses: with `enabled` already written,
-    /// renaming `auto_update` would write a duplicate key, a file atpkg reads as automatic
-    /// updates on.
+    /// The rename is said only where a rename parses: with `enabled` already written, renaming `auto_update` would write a duplicate key, a file atpkg reads as automatic updates on.
     #[test]
     fn the_auto_update_note_never_asks_for_a_duplicate_key() {
         let both = parse_packages("[packages]\nenabled = true\nauto_update = false\n");
@@ -876,9 +865,7 @@ mod tests {
         );
     }
 
-    /// A prefix this build ignores stops unattended installs: a shipped binary drops a
-    /// `[packages] prefix` naming another store, and until the line goes the seed and the
-    /// set completion install nothing.
+    /// A prefix this build ignores stops unattended installs: a shipped binary drops a `[packages] prefix` naming another store, and until the line goes the seed and the set completion install nothing.
     #[test]
     fn an_ignored_prefix_stops_unattended_installs_until_the_line_is_removed() {
         let home = Path::new("/Users//someone");
@@ -929,8 +916,7 @@ mod tests {
         );
     }
 
-    /// One install consent: `auto_install` wins when written, else the retired
-    /// `seed_install`, else on; a table we could not read is off.
+    /// One install consent: `auto_install` wins when written, else the retired `seed_install`, else on; a table we could not read is off.
     #[test]
     fn one_install_consent_migrates_both_retired_spellings() {
         let consent = |toml: &str| parse_packages(toml).auto_install();
@@ -963,8 +949,7 @@ mod tests {
         );
     }
 
-    /// `channel` and `include` are retired: parsed as any value (a stale key never fails
-    /// the table), never read, and named by doctor.
+    /// `channel` and `include` are retired: parsed as any value (a stale key never fails the table), never read, and named by doctor.
     #[test]
     fn retired_channel_and_include_are_ignored_and_named() {
         let cfg = parse_packages(
@@ -994,8 +979,7 @@ mod tests {
         );
     }
 
-    /// A shipped binary drops `prefix`, `account` and every `owner/repo` link at load; a
-    /// checkout link stays.
+    /// A shipped binary drops `prefix`, `account` and every `owner/repo` link at load; a checkout link stays.
     #[test]
     fn a_shipped_binary_drops_the_development_settings() {
         let text = "[packages]\nprefix = \"/opt/pkg\"\naccount = \"fork-org\"\n\
@@ -1042,9 +1026,7 @@ mod tests {
         assert!(cfg.unreadable);
     }
 
-    /// A `[packages]` table we could not read must not widen: the install consent defaults
-    /// true and `exclude` empty, so its defaults would switch on the multi-GB paths those
-    /// keys block.
+    /// A `[packages]` table we could not read must not widen: the install consent defaults true and `exclude` empty, so its defaults would switch on the multi-GB paths those keys block.
     #[test]
     fn an_unreadable_packages_table_never_widens_the_download_gates() {
         let typed = parse_packages("[packages]\nauto_install = false\nenabled = \"yes\"\n");
@@ -1108,8 +1090,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `[reroute].announce` defaults on, `false` silences, and a table that does not parse
-    /// announces.
+    /// `[reroute].announce` defaults on, `false` silences, and a table that does not parse announces.
     #[test]
     fn reroute_announce_defaults_on_and_a_typo_announces() {
         assert!(parse_reroute("").announce());
@@ -1122,8 +1103,7 @@ mod tests {
         );
     }
 
-    /// `[reroute].strict` defaults off (warn and run); only an explicit `true` refuses, and
-    /// a value that does not parse is the default.
+    /// `[reroute].strict` defaults off (warn and run); only an explicit `true` refuses, and a value that does not parse is the default.
     #[test]
     fn reroute_strict_defaults_off_and_only_true_turns_it_on() {
         assert!(!parse_reroute("").strict());

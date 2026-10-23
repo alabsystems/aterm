@@ -10,7 +10,7 @@ use super::device::{Current, GlDevice, GlShared};
 use super::ffi::{self, GLenum, GLint, GLuint};
 use crate::device_layer::{SamplerKind, TexelFormat};
 
-/// A texel format's GL spelling: internal format, upload format and type, and bytes per texel.
+/// A texel format's GL spelling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GlFormat {
     pub(crate) internal: GLenum,
@@ -50,20 +50,14 @@ pub(crate) struct GlTexture {
     shared: Arc<GlShared>,
     pub(crate) name: GLuint,
     pub(crate) format: GlFormat,
-    /// The texels in use, from the origin: a pass's viewport, and the bounds of a copy, an
-    /// upload and a readback.
+    /// The texels in use, from the origin.
     pub(crate) width: u32,
     pub(crate) height: u32,
     /// The storage behind them, at least `width` x `height` ([`GlDevice::texture_2d_resizing`]).
     stored: (u32, u32),
-    /// Whether the storage is `SRGB8_ALPHA8` standing for the native plan's `Rgba8Unorm` texture
-    /// with its sRGB alias: drawn and sampled raw (the Unorm view) or encoded (the sRGB view) per
-    /// pass, through `EXT_sRGB_write_control` / `EXT_texture_sRGB_decode`.
+    /// Whether the storage is `SRGB8_ALPHA8` standing for `Rgba8Unorm`.
     pub(crate) views: bool,
-    /// The framebuffer object with this texture at `COLOR_ATTACHMENT0`, made
-    /// on the first pass, copy or readback that needs one (0: none yet). An
-    /// atomic so a texture can sit in a shared sprite cache; GL itself is
-    /// serialized by the device's guard.
+    /// The framebuffer object with this texture at `COLOR_ATTACHMENT0`.
     fbo: AtomicU32,
 }
 
@@ -91,8 +85,7 @@ impl GlTexture {
         self.stored != (self.width, self.height)
     }
 
-    /// Let this texture go once the frame is out ([`GlDevice::free_retired`]) instead of now:
-    /// on NVIDIA a free costs about as much as a mint, and a resize's frame paid both.
+    /// Let this texture go once the frame is out ([`GlDevice::free_retired`]) instead of now.
     pub(crate) fn retire(mut self) {
         let names = [
             std::mem::take(&mut self.name),
@@ -113,8 +106,7 @@ impl GlTexture {
         }
         let gl = cur.gl();
         let mut fbo = 0;
-        // SAFETY: the context is current; out-pointer live; the texture name belongs to this
-        // context and has storage.
+        // SAFETY: the context is current.
         let status = unsafe {
             (gl.gen_framebuffers)(1, &raw mut fbo);
             (gl.bind_framebuffer)(ffi::GL_FRAMEBUFFER, fbo);
@@ -242,13 +234,7 @@ impl Drop for GlSampler {
 }
 
 impl GlDevice {
-    /// `slot`'s texture at `width` x `height`, made as [`Self::texture_2d`] makes it: minted at
-    /// that size where the slot is empty, else the first texels of the storage there where it
-    /// holds them and they are a quarter of it or more, else minted a quarter larger per side.
-    /// A window resized once is resized again (a drag is a size per motion), and on NVIDIA a
-    /// mint, its first draw and the free of the one it replaces took 13 ms at 1100x800 and
-    /// about 30 at 3336x1310 (the desk, 2026-10-22); a drag inside the storage mints nothing.
-    /// Returns whether the texels in use are undefined: a mint or a new size.
+    /// `slot`'s texture at `width` x `height`, made as [`Self::texture_2d`] makes it.
     pub(crate) fn texture_2d_resizing(
         &self,
         slot: &mut Option<GlTexture>,
@@ -295,8 +281,7 @@ impl GlDevice {
         Ok(true)
     }
 
-    /// Delete the textures retired since the last call ([`GlTexture::retire`]): after a frame is
-    /// posted, and before the next is encoded where nothing posts.
+    /// Delete the textures retired since the last call ([`GlTexture::retire`]).
     pub(crate) fn free_retired(&self) {
         let names = std::mem::take(
             &mut *self
@@ -313,8 +298,7 @@ impl GlDevice {
         };
         let gl = cur.gl();
         for [texture, fbo] in names {
-            // SAFETY: names made on this context, retired by their only holder; deleting is
-            // always legal.
+            // SAFETY: names made on this context, retired by their only holder.
             unsafe {
                 if fbo != 0 {
                     (gl.delete_framebuffers)(1, &raw const fbo);
@@ -324,8 +308,7 @@ impl GlDevice {
         }
     }
 
-    /// The storage format of a `format` texture with the view `alias`, and whether it is the
-    /// sRGB storage standing for both.
+    /// The storage format of a `format` texture with the view `alias`.
     fn storage_of(
         &self,
         format: TexelFormat,
@@ -364,8 +347,7 @@ impl GlDevice {
         let cur = self.enter()?;
         let gl = cur.gl();
         let mut name = 0;
-        // SAFETY: the context is current; dimensions checked against the device's maximum; one
-        // level of a sized internal format.
+        // SAFETY: the context is current.
         unsafe {
             (gl.gen_textures)(1, &raw mut name);
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, name);
@@ -407,8 +389,7 @@ impl GlDevice {
         self.upload_region(tex, 0, y0, width, rows, bytes, bytes_per_row)
     }
 
-    /// Upload the `w × h` region at `(x, y)` from `bytes`, rows `bytes_per_row` apart, at unpack
-    /// alignment 1 (an R8 region of odd width is legal).
+    /// Upload the `w × h` region at `(x, y)` from `bytes`, rows `bytes_per_row` apart.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn upload_region(
         &self,
@@ -444,9 +425,7 @@ impl GlDevice {
         }
         let cur = self.enter()?;
         let gl = cur.gl();
-        // SAFETY: the context is current; the region is inside the texture and `bytes` covers it at
-        // the stated row length (checked above). The unpack state is set for this call and
-        // restored.
+        // SAFETY: the context is current.
         unsafe {
             (gl.bind_texture)(ffi::GL_TEXTURE_2D, tex.name);
             (gl.pixel_storei)(ffi::GL_UNPACK_ALIGNMENT, 1);
@@ -574,9 +553,7 @@ impl GlDevice {
         let cur = self.enter()?;
         let fbo = tex.fbo(&cur)?;
         let gl = cur.gl();
-        // SAFETY: the context is current; `out` holds `height` rows of `padded` bytes and the pack
-        // row length is `padded / 4` texels, so the copy stays inside it; the pack state is
-        // restored.
+        // SAFETY: the context is current.
         unsafe {
             (gl.bind_framebuffer)(ffi::GL_READ_FRAMEBUFFER, fbo);
             (gl.pixel_storei)(ffi::GL_PACK_ALIGNMENT, 4);
@@ -604,7 +581,6 @@ mod tests {
     use super::*;
     use crate::device_layer::{ClearColor4, FrameLoad};
 
-    /// Clear `tex` to `rgba` with one pass.
     fn clear(dev: &GlDevice, tex: &GlTexture, [r, g, b, a]: [f64; 4]) {
         let uniforms = dev
             .buffer(GlBufferRole::Uniform, 256)
@@ -617,7 +593,6 @@ mod tests {
         frame.submit().expect("submitted");
     }
 
-    /// The names waiting for [`GlDevice::free_retired`].
     fn retired(dev: &GlDevice) -> Vec<[GLuint; 2]> {
         dev.shared()
             .retired
@@ -626,11 +601,6 @@ mod tests {
             .clone()
     }
 
-    /// A RESIZED TEXTURE KEEPS ITS STORAGE WHILE THAT HOLDS THE NEW SIZE: the
-    /// first mint is exact; a size past the storage mints a quarter more per
-    /// side and retires the old texture until `free_retired`; a size inside
-    /// mints nothing and a pass clears only the texels in use; a size under a
-    /// quarter of the storage, or another format, mints again.
     #[test]
     fn a_resized_texture_keeps_its_storage_while_that_holds_the_new_size() {
         let dev = device();

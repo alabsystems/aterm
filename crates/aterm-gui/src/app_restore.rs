@@ -1092,8 +1092,6 @@ impl App {
                 Ok(guard) => guard,
                 Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => {
-                    // Presentation metadata only: a reflow/compression lock must not freeze
-                    // quit or update, so omit cwd/title and keep the layout and session id.
                     return (None, String::new());
                 }
             };
@@ -1875,8 +1873,6 @@ impl App {
             }
         }
         if minted_any {
-            // The tables changed on the main thread: run the `Wake::ConnectionsChanged` body
-            // directly (marks, map, ❯ count).
             self.refresh_connection_surfaces();
         }
     }
@@ -3181,8 +3177,6 @@ impl App {
                     self.mark_status_dirty();
                     "; that pane's identity went to the shell it names, which runs in another pane"
                 } else {
-                    // Nothing moved: the leaf carries no identity, the shell
-                    // already wears it, or a driver wrote every field it differs in.
                     ""
                 }
             }
@@ -3223,8 +3217,6 @@ impl App {
                 .slog_mut()
                 .seed_lineage(leaf.lineage.as_deref());
         } else if shell.handoff_local_id.is_none() {
-            // A bootstrap already served under its sid may have readers: an owed
-            // log wake rang its watchers under the timeline lock.
             let _ = note_restored(shell, leaf.sid.as_deref(), leaf.lineage.as_deref());
         } else if let Some(other) = leaf
             .local_id

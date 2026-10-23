@@ -1,5 +1,4 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
@@ -17,8 +16,6 @@ fn bloom_no_false_negatives() {
         assert!(bloom.might_contain(item), "False negative for '{item}'");
     }
 
-    // Every 1- and 2-byte key (the index's short keys), alone in a fresh filter and
-    // all together in one.
     let keys: Vec<Vec<u8>> = (0..=u8::MAX)
         .map(|a| vec![a])
         .chain((0..=u8::MAX).flat_map(|a| (0..=u8::MAX).map(move |b| vec![a, b])))
@@ -50,7 +47,6 @@ fn bloom_false_positive_rate() {
         }
     }
 
-    // Sized for ~1%; 5% allows for variance.
     let fpr = f64::from(false_positives) / 10000.0;
     assert!(fpr < 0.05, "FPR too high: {:.2}%", fpr * 100.0);
 }
@@ -88,7 +84,6 @@ fn bloom_estimated_fpr() {
 
 #[test]
 fn bloom_with_size_rounding() {
-    // Sizes round up to a multiple of 64, at least 64.
     let bloom = BloomFilter::with_size(100);
     assert_eq!(bloom.num_bits(), 128);
 
@@ -104,8 +99,6 @@ fn bloom_with_size_rounding() {
     let bloom = BloomFilter::with_size(0);
     assert_eq!(bloom.num_bits(), 64);
 
-    // num_bits is a multiple of 64 and exactly the words allocated, which
-    // `bits[bit_idx / 64]` in set_bit/get_bit relies on.
     for n in 0..=4096 {
         for bloom in [BloomFilter::with_size(n), BloomFilter::with_capacity(n)] {
             assert_eq!(bloom.num_bits() % 64, 0, "{n}");
@@ -118,7 +111,6 @@ fn bloom_with_size_rounding() {
 /// Extremely large capacity values must be capped rather than overflow.
 #[test]
 fn bloom_large_capacity_no_overflow() {
-    // This would overflow `num_u64s * 64` without the cap.
     let bloom = BloomFilter::with_capacity(usize::MAX);
     assert!(bloom.num_bits() > 0, "must produce a positive bit count");
     assert!(

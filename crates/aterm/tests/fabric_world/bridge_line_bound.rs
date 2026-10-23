@@ -1,31 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A delivery line over the request-line bound is a verdict, never a loss, and a
-//! refused verdict is not answered with another.
-//!
-//! `deliver`'s body budget is sized from the writer's request-line bound, but
-//! `via=` sits on the same line, taken verbatim off a stranger's record (up to
-//! the broker's 16 MiB ceiling). When the prefix alone passes the bound the
-//! writer refuses the line; that LOCAL refusal must earn the sender a verdict
-//! and an `ev`, not be filed as a transport failure the next group commit
-//! steps over. The `undeliverable` verdict is itself an addressed, refusable
-//! record, so answering a refused verdict with another would be an unbounded
-//! publish loop.
-//!
-//! Every test here runs over the REAL binaries — a guarded broker, a headless
-//! `aterm`, and the bridge child aterm launches itself.
+//! Tests that oversized delivery lines earn verdicts without losing records or looping.
 
 use crate::harness;
 
 use harness::{FLEET, World, until};
 
-/// An oversized `via=` earns a verdict, and the record is never silently lost.
-///
-/// 2 000 comma-joined 34-byte principals, each valid (`valid_principal`), longer
-/// together than a control request line, which only the writer can know. The poison
-/// record earns an `ev undeliverable … reason=via`, the sender is told on the lane a
-/// `p/` principal drains, and the ordinary note behind it lands.
 #[test]
 fn an_oversized_via_earns_a_verdict_and_the_ordinary_note_behind_it_lands() {
     let w = World::boot("r2via", &[]);
@@ -50,12 +31,10 @@ fn an_oversized_via_earns_a_verdict_and_the_ordinary_note_behind_it_lands() {
         .publish(6_200, 2, &subject, b"v=1 t=1 text=second")
         .expect("publish the ordinary note behind it");
 
-    // The ordinary note lands: one poison record does not stop the drain.
     until("the ordinary note behind the poison one to land", || {
         w.inbox(&a).into_iter().find(|r| r.contains("text=second"))
     });
 
-    // The poison record has a verdict on the log.
     let verdict = until("the verdict for the refused record", || {
         w.ev()
             .into_iter()
@@ -66,7 +45,6 @@ fn an_oversized_via_earns_a_verdict_and_the_ordinary_note_behind_it_lands() {
         "the reason must name the field that could not be sent: {verdict}"
     );
 
-    // And the sender is told, on the lane §6.3 gives a `h-*` principal.
     let lane = format!("/f/{FLEET}/in/p/h-sender/{}/undeliverable", w.node);
     until("the sender's own verdict row", || {
         let (rows, _) = w.read(|c| c.fetch(0, &lane, 64)).ok()?;
@@ -76,13 +54,11 @@ fn an_oversized_via_earns_a_verdict_and_the_ordinary_note_behind_it_lands() {
         })
     });
 
-    // And the poison record was never delivered as a row.
     assert!(
         !w.inbox(&a).iter().any(|r| r.contains("text=hi")),
         "a record the bridge refused must not also be delivered"
     );
 
-    // The lane survived.
     assert!(
         w.verb("status").header().contains("fabric=connected"),
         "the bridge's control connection must survive an oversized field: {}",
@@ -90,14 +66,6 @@ fn an_oversized_via_earns_a_verdict_and_the_ordinary_note_behind_it_lands() {
     );
 }
 
-/// A `deliver` line over the bound is a verdict, not a transport failure.
-///
-/// Every variable-length field on the line is bounded, so no peer record reaches the
-/// total-line check; it guards a field added later.
-/// `ATERM_LINK_FAULT=oversize-deliver-line` pads one line past the bound from inside
-/// the process (one shot, across restarts). `Ctl`'s refusal (`InvalidInput`, nothing
-/// written, lane alive) must not map to `Delivery::Unaccounted`, reserved for a lane
-/// that is gone.
 #[test]
 fn a_deliver_line_over_the_bound_is_a_verdict_not_a_transport_failure() {
     let w = World::boot_with(
@@ -124,7 +92,6 @@ fn a_deliver_line_over_the_bound_is_a_verdict_not_a_transport_failure() {
         "an unsendable line is refused as oversize, not filed as a lost lane: {verdict}"
     );
 
-    // The lane is alive and the drain continues: the fault is one-shot.
     w.god()
         .publish(6_300, 2, &subject, b"v=1 t=1 text=after")
         .expect("publish the record behind it");
@@ -138,21 +105,12 @@ fn a_deliver_line_over_the_bound_is_a_verdict_not_a_transport_failure() {
     );
 }
 
-/// A verdict never earns a verdict.
-///
-/// The per-sender quota refuses the 65th unlisted row from one `from=`, and the
-/// bridge's notice to the sender is itself a record, addressed to the same session
-/// under the same full `from=`, and refused in turn: unexempted, an unbounded publish
-/// loop any in-session client could arm with 65 `post`s. The bridge records that the
-/// verdict was not answered (`unnotified … reason=verdict`), and stops.
 #[test]
 fn a_refused_verdict_is_recorded_and_answered_with_nothing() {
     let w = World::boot("r2loop", &[]);
     w.wait_ready();
     let (a, _b) = w.two_sessions();
 
-    // 65 posts from this session to itself: the ring's per-sender quota refuses the
-    // 65th, and its verdict comes back under the same full `from=` key.
     for i in 0..65 {
         let reply = w.verb(&format!("@{a} post to=@{a} kind=note m{i}"));
         assert!(reply.ok(), "post {i}: {}", reply.header());
@@ -168,8 +126,6 @@ fn a_refused_verdict_is_recorded_and_answered_with_nothing() {
         "the record that was not answered is named: {marker}"
     );
 
-    // And the loop is bounded: every `undeliverable` on this node's own inbox lanes
-    // is a notice the bridge published.
     let mut c = w.god();
     let (rows, _) = c
         .fetch(0, &format!("/f/{FLEET}/in/{}/>", w.node), 4_096)

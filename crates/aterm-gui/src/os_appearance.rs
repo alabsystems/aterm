@@ -15,13 +15,10 @@ pub(crate) enum OsAppearanceSource {
     Inert,
     /// A development build's launch reading, from `$ATERM_OS_APPEARANCE` (`dark`|`light`, [`aterm_types::dev_seam!`]).
     Injected(Appearance),
-    /// This platform's reader: `NSApp.effectiveAppearance` on macOS (the `AppleInterfaceStyle`
-    /// default before any window), the XDG portal or GNOME's gsettings key on other unix, the
-    /// window theme on Windows.
+    /// Platform appearance reader (`NSApp.effectiveAppearance`, XDG portal/gsettings, or window theme).
     Platform,
 }
 
-/// The development seam naming an injected launch appearance.
 const LAUNCH_SEAM: &str = "ATERM_OS_APPEARANCE";
 
 impl OsAppearanceSource {
@@ -125,8 +122,6 @@ pub(crate) fn parse_appearance_word(word: &str) -> Option<Appearance> {
     }
 }
 
-/// Whether this build accepts an injected flip (`appearance dark|light`): a
-/// development build only, like every `dev_seam!`.
 const INJECTION_ENABLED: bool = cfg!(any(debug_assertions, feature = "dev-seams"));
 
 /// The `appearance [dark|light]` control verb, on a control worker.
@@ -144,8 +139,6 @@ pub(crate) fn cmd_appearance(proxy: &EventLoopProxy<Wake>, rest: &str) -> String
     }
 }
 
-/// The `appearance` verb's arguments: none (read), or one `dark`|`light` to
-/// inject, which only a build with `injection` admits.
 fn appearance_request(rest: &str, injection: bool) -> Result<Option<Appearance>, &'static str> {
     let mut words = rest.split_whitespace();
     let set = match (words.next(), words.next()) {
@@ -216,22 +209,13 @@ fn platform_observe(proxy: &EventLoopProxy<Wake>) -> Option<OsAppearanceObserver
 mod desktop {
     use aterm_types::Appearance;
 
-    /// The portal's settings interface, on the session bus.
     const PORTAL_DEST: &str = "org.freedesktop.portal.Desktop";
     const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
     const APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
     const COLOR_SCHEME_KEY: &str = "color-scheme";
-    /// GNOME's own key, read where no portal answers.
     const GNOME_SCHEMA: &str = "org.gnome.desktop.interface";
 
-    /// How long one read may take. The launch read runs on the main thread
-    /// before the first window, so it is bounded well under a visible delay;
-    /// a slower desktop answers "unknown" and the engine default stands until
-    /// the watcher's own read lands.
     const READ_BOUND: std::time::Duration = std::time::Duration::from_millis(200);
-
-    /// How long the watcher's portal read may take, on its own thread: `gdbus`'s
-    /// own call timeout (`--timeout=1`, [`portal_read_args`]).
     const WATCH_READ_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// The portal's `color-scheme` value.
@@ -298,7 +282,6 @@ mod desktop {
         ]
     }
 
-    /// One portal read within `bound`.
     fn read_portal(bound: std::time::Duration) -> Option<Appearance> {
         crate::platform::read_bounded_stdout("gdbus", &portal_read_args(), bound)
             .as_deref()
@@ -306,7 +289,6 @@ mod desktop {
             .and_then(portal_color_scheme)
     }
 
-    /// One bounded gsettings read.
     fn read_gsettings() -> Option<Appearance> {
         crate::platform::read_bounded_stdout(
             "gsettings",
@@ -341,7 +323,7 @@ mod desktop {
         read_portal(READ_BOUND)
     }
 
-    /// A long-running watcher (`gdbus monitor`, `gsettings monitor`) TETHERED to this process.
+    /// A long-running watcher (`gdbus monitor`, `gsettings monitor`) tethered to this process.
     pub(super) struct Tethered {
         child: aterm_uds::spawnfd::Child,
         /// The tether: dropping it ends the watcher.
@@ -356,8 +338,6 @@ mod desktop {
         }
     }
 
-    /// The shell around a tethered watcher: start it, drop this shell's own
-    /// stdout, wait for the tether to close, then end it.
     const TETHER_SCRIPT: &str =
         r#""$@" & pid=$!; exec >/dev/null; read -r _line || :; kill "$pid" 2>/dev/null; wait"#;
 
@@ -476,12 +456,9 @@ mod mac {
     use crate::Wake;
     use crate::appkit::{self, MainThread};
 
-    /// The key path observed on `NSApp`.
     const KEY_PATH: &str = "effectiveAppearance";
 
-    /// The appearance a `-bestMatchFromAppearancesWithNames:` answer names:
-    /// dark for `NSAppearanceNameDarkAqua`, light for anything else it picked
-    /// (only Aqua is offered), `None` for no match.
+    /// Map a `-bestMatchFromAppearancesWithNames:` answer to an [`Appearance`].
     ///
     /// # Safety
     /// `best` must be nil or a live `NSString`.
@@ -588,9 +565,6 @@ mod mac {
             const NAME: &str = "ATermOsAppearanceTarget";
             type Ivars = OsAppearanceIvars;
 
-            /// `v@:@@@^v`. Registered for one key path on one object, so
-            /// every call is an appearance change; options are 0, so `change`
-            /// is not read.
             @sel(observeValueForKeyPath:ofObject:change:context:)
             fn observe_value(
                 &self,
@@ -657,10 +631,6 @@ mod mac {
 
         use aterm_types::Appearance;
 
-        /// The KVO callback the runtime dispatches reaches the relay: the
-        /// class is registered under its name, and a real
-        /// `observeValueForKeyPath:ofObject:change:context:` send runs the
-        /// Rust body.
         #[test]
         fn the_kvo_callback_runs_the_relay() {
             use aterm_objc::{ClassType, class};
@@ -700,8 +670,6 @@ mod mac {
             assert_eq!(hits.load(Ordering::SeqCst), 1);
         }
 
-        /// The best-match answer maps DarkAqua to dark and Aqua to light;
-        /// nil is no reading.
         #[test]
         fn best_match_names_map_to_appearances() {
             // SAFETY: AppKit's own name globals, and nil.
@@ -718,7 +686,6 @@ mod mac {
             }
         }
 
-        /// `AppleInterfaceStyle = Dark` is dark; absent (empty) is light.
         #[test]
         fn the_interface_style_default_maps() {
             assert_eq!(super::style_appearance("Dark"), Appearance::Dark);
@@ -736,8 +703,6 @@ mod tests {
     use super::{OsAppearanceSource, parse_appearance_word};
     use aterm_types::Appearance;
 
-    /// The portal's three values: prefer-dark, prefer-light and no preference
-    /// (light, as GNOME draws it); an unknown value is no reading.
     #[test]
     fn the_portal_mapping_covers_prefer_dark_prefer_light_and_none() {
         assert_eq!(portal_color_scheme(1), Some(Appearance::Dark));
@@ -750,8 +715,6 @@ mod tests {
         );
     }
 
-    /// `gdbus call` prints Read's double variant and ReadOne's single one;
-    /// an error prints neither.
     #[test]
     fn a_portal_read_parses_both_variant_depths() {
         assert_eq!(parse_portal_read("(<<uint32 1>>,)\n"), Some(1));
@@ -764,8 +727,6 @@ mod tests {
         );
     }
 
-    /// Only the appearance key's `SettingChanged` is a reading; another
-    /// setting's signal on the same interface is not.
     #[test]
     fn a_portal_signal_is_read_only_for_the_color_scheme_key() {
         let line = "/org/freedesktop/portal/desktop: org.freedesktop.portal.Settings.SettingChanged \
@@ -784,7 +745,6 @@ mod tests {
         assert_eq!(parse_portal_signal("(<<uint32 1>>,)"), None, "not a signal");
     }
 
-    /// GNOME's key, as `get` and `monitor` print it.
     #[test]
     fn the_gsettings_fallback_maps_gnome_color_scheme() {
         assert_eq!(parse_gsettings("'prefer-dark'\n"), Some(Appearance::Dark));
@@ -797,7 +757,6 @@ mod tests {
         assert_eq!(parse_gsettings("No such key “color-scheme”\n"), None);
     }
 
-    /// Headless and test Apps read nothing and follow no window theme.
     #[test]
     fn the_inert_source_reads_nothing() {
         let inert = OsAppearanceSource::Inert;
@@ -814,8 +773,6 @@ mod tests {
         );
     }
 
-    /// A development build's injected launch reading is what launch builds
-    /// for, on any lane, and nothing is observed after it.
     #[test]
     fn an_injected_launch_reading_wins_and_observes_nothing() {
         for headless in [true, false] {
@@ -830,8 +787,6 @@ mod tests {
         }
     }
 
-    /// The verb reads bare, injects one word, and refuses anything else; a
-    /// shipped build (no injection) refuses the injection but still reads.
     #[test]
     fn the_appearance_verb_parses_and_gates_injection() {
         use super::appearance_request;

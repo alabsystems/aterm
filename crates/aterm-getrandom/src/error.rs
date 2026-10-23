@@ -186,10 +186,6 @@ mod tests {
     use super::Error;
     use std::io;
 
-    /// What aterm-uds can hand back maps to upstream's codes: a positive errno
-    /// stays that errno, a non-positive one is ERRNO_NOT_POSITIVE, and an error
-    /// with none (`read_exact` on a device that ended; the Windows arm's text)
-    /// is UNEXPECTED, upstream's answer to an EOF on the device.
     #[test]
     fn an_aterm_uds_error_maps_to_upstreams_codes() {
         let os = |n| Error::from_io(&io::Error::from_raw_os_error(n));

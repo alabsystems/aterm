@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Lock-order census: the lock-graph sense of L0-DEADLOCK, as a fail-closed obligation (docs/L0-CATALOG.md, the L0-DEADLOCK row).
+//! Lock-order census: the lock-graph sense of L0-DEADLOCK, as a fail-closed obligation.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -384,7 +384,6 @@ fn param_is_raw_ptr(sig: &str, name: &str) -> bool {
         if at > 0 {
             let prev = sig.as_bytes()[at - 1];
             if prev.is_ascii_alphanumeric() || prev == b'_' {
-                // `_input_ptr: ` must not match `input_ptr: `.
                 continue;
             }
         }
@@ -937,7 +936,6 @@ fn impl_spans(text: &str) -> Vec<ImplSpan> {
             continue;
         };
         if !(after.starts_with('<') || after.starts_with(char::is_whitespace)) {
-            // `implements_x()`, `impl_from!(..)` — not a block header.
             continue;
         }
         let mut header = String::new();
@@ -957,7 +955,6 @@ fn impl_spans(text: &str) -> Vec<ImplSpan> {
         };
         let opener = strip_line_comment(lines[open]);
         let end = if opener.matches('{').count() == opener.matches('}').count() {
-            // `unsafe impl Send for Foo {}` — the whole block is one line.
             open
         } else {
             let close = format!("{}}}", " ".repeat(indent));
@@ -1049,9 +1046,6 @@ fn resolve_receiver(line: &str, dot: usize, ctx: &SiteCtx<'_>) -> Option<String>
             if let Some(chain) = self_rooted_chain(line, dot)
                 && let Some(ty) = ctx.impl_ty()
             {
-                // `Ty::self` / `Ty::0` cannot collide with a plain receiver or a
-                // vendored `<crate>::<recv>` identity: plain resolution never
-                // returns `self` or a tuple index.
                 return Some(format!("{ty}::{chain}"));
             }
             if let Some((_, aliased)) = ctx.aliases.get(seg) {
@@ -1156,7 +1150,6 @@ fn guard_is_final_value(line: &str, acq: &RawAcq) -> bool {
             i += 1;
         }
         if i >= bytes.len() || bytes[i] == b';' || line[i..].starts_with("else") {
-            // statement end (let-else diverges; the guard is bound)
             return true;
         }
         if bytes[i] != b'.' {
@@ -1174,8 +1167,6 @@ fn guard_is_final_value(line: &str, acq: &RawAcq) -> bool {
             return false;
         }
         let Some(close) = match_paren(line, open) else {
-            // The adapter's argument spans lines (`unwrap_or_else(|p| {` …): the
-            // guard is bound (erring toward more tracked holds).
             return true;
         };
         i = close + 1;
@@ -1214,7 +1205,6 @@ fn classify_line(line: &str) -> LineKind {
             .take_while(|c| c.is_alphanumeric() || *c == '_')
             .collect();
         if var == "_" {
-            // `let _ = lock()` drops the guard at once.
             return LineKind::Other;
         }
         let after = rest[var.len()..].trim_start_matches(')').trim_start();
@@ -1409,13 +1399,10 @@ fn held_call_targets(line: &str) -> (Vec<TrustedCall>, Vec<FieldRecvCall>) {
             || GUARD_HELPERS.iter().any(|h| h.symbol == name)
             || STANDARD_METHOD_NAMES.contains(&name)
         {
-            // Guard helpers and standard acquisition methods are direct
-            // acquisitions; treating them as callees would double-count.
             continue;
         }
         let start = idx - name.len();
         if line[..start].trim_end().ends_with("fn") {
-            // a definition, not a call
             continue;
         }
         if start > 0 && bytes[start - 1] == b'.' {
@@ -1518,7 +1505,6 @@ fn takes_self(body: &[String]) -> bool {
     let after = after.strip_prefix("&mut ").unwrap_or(after);
     let after = after.strip_prefix('&').unwrap_or(after);
     let after = if let Some(rest) = after.strip_prefix('\'') {
-        // `&'a self` / `&'a mut self`: skip the lifetime token.
         rest.split_once(' ').map_or("", |(_, r)| r)
     } else {
         after
@@ -1661,10 +1647,6 @@ fn scan_fn(
                 excerpt.push('…');
             }
             let identity = if vocab.is_some() {
-                // A vocabulary interior keeps its unique per-site node: `self`
-                // there is every caller's lock. (Its impl self type is an
-                // UNQUALIFIABLE_SELF_TYPES wrapper anyway; the registry checks
-                // depend on this.)
                 None
             } else {
                 match (file.namespace, &r.identity) {
@@ -4296,7 +4278,7 @@ mod tests {
             .collect();
         let mut files = crate::scan_set::test_fixtures::workspace_manifests(&extras);
         files.extend(synth_helper_files().into_iter().filter(|(p, _)| {
-            // keep ONE manifest set (with the new dep)
+            // keep ONE manifest set
             !p.ends_with("Cargo.toml")
         }));
         files.push((

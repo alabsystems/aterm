@@ -637,8 +637,7 @@ fn apply_chain_rule(
     Some(())
 }
 
-/// Runs a rule's nested lookups at their sequence positions, keeping the
-/// positions after each in step with whatever it added or removed.
+/// Runs a rule's nested lookups at their sequence positions, keeping the positions after each in step with whatever it added or removed.
 fn apply_lookup(
     ctx: &mut ApplyContext,
     input_len: usize,

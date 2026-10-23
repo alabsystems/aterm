@@ -4,10 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/atoms.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by the aterm project in 2026; see the repository NOTICE. (The atoms are interned
-// in one round trip through first-party `aterm-x11`, where upstream used x11rb's
-// `atom_manager!`: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
-
 //! Collects every atom used by the platform implementation.
 
 use core::ops::Index;
@@ -23,8 +19,6 @@ macro_rules! atom_manager {
             $($name,)*
         }
 
-        /// Every atom's name, in `AtomName` order: the literal where one is
-        /// given, else the identifier.
         const NAMES: &[&[u8]] = &[$(atom_manager!(@name $name $(:$lit)?),)*];
     };
     (@name $name:ident) => { stringify!($name).as_bytes() };
@@ -32,7 +26,6 @@ macro_rules! atom_manager {
 }
 
 atom_manager! {
-    // General Use Atoms
     CARD32,
     Incr: b"INCR",
     UTF8_STRING,
@@ -43,7 +36,6 @@ atom_manager! {
     WM_STATE,
     XIM_SERVERS,
 
-    // Assorted ICCCM Atoms
     _NET_WM_ICON,
     _NET_WM_MOVERESIZE,
     _NET_WM_NAME,
@@ -58,20 +50,15 @@ atom_manager! {
     _NET_WM_STATE_MAXIMIZED_VERT,
     _NET_WM_WINDOW_TYPE,
 
-    // The resize sync protocol (`sync_request.rs`).
     _NET_WM_SYNC_REQUEST,
     _NET_WM_SYNC_REQUEST_COUNTER,
 
-    // Startup notification (the launchee's side, `startup_notify.rs`).
     _NET_STARTUP_INFO_BEGIN,
     _NET_STARTUP_INFO,
     _NET_STARTUP_ID,
 
-    // The one WM window type a window is given (WC.8: the others left with
-    // `with_x11_window_type`, and `_XEMBED` with `with_embed_parent_window`).
     _NET_WM_WINDOW_TYPE_NORMAL,
 
-    // Drag-N-Drop Atoms
     XdndAware,
     XdndEnter,
     XdndLeave,
@@ -85,7 +72,6 @@ atom_manager! {
     TextUriList: b"text/uri-list",
     None: b"None",
 
-    // Miscellaneous Atoms
     _GTK_THEME_VARIANT,
     _MOTIF_WM_HINTS,
     _NET_ACTIVE_WINDOW,
@@ -120,16 +106,13 @@ impl Index<AtomName> for Atoms {
     }
 }
 
-pub(crate) use AtomName::*;
-// Make sure `None` is still defined.
 pub(crate) use core::option::Option::None;
+pub(crate) use AtomName::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// The names go to the server as written, the two literal ones included,
-    /// and in the order `AtomName` indexes.
     #[test]
     fn every_name_is_interned_in_index_order() {
         assert_eq!(NAMES.len(), _XSETTINGS_SETTINGS as usize + 1);

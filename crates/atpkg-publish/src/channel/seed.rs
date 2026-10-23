@@ -63,7 +63,7 @@ pub fn describe(receipt: &str) -> String {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let mut cmd = aterm_uds::spawnfd::command("git");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     cmd.arg("-C")
         .arg(dir)
         .args(args)

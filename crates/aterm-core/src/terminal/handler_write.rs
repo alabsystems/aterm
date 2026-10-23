@@ -21,8 +21,6 @@ fn char_width(c: char, cjk: bool) -> usize {
     if (0x20..0x7F).contains(&cp) || (!cjk && (0xA0..0x0300).contains(&cp)) {
         1
     } else if (0x4E00..0xA000).contains(&cp) {
-        // Uniformly East Asian Wide in both modes (checked exhaustively by
-        // `fast_path_width_matches_table`).
         2
     } else if (0x3000..0x4E00).contains(&cp) {
         // U+3000-U+4DFF (CJK symbols, kana, bopomofo, compatibility jamo, Yijing
@@ -35,16 +33,12 @@ fn char_width(c: char, cjk: bool) -> usize {
             aterm_grapheme::char_width(c)
         }
     } else if (0xAC00..0xD7A4).contains(&cp) {
-        // Hangul Syllables — always width 2
         2
     } else if (0x1F300..0x1F700).contains(&cp) {
-        // SMP Emoji blocks (Misc Symbols, Emoticons, Ornamental Dingbats, Transport).
         smp_emoji_width(cp)
     } else if (0x2600..0x27C0).contains(&cp) {
-        // BMP Misc Symbols + Dingbats (✨ U+2728, ⚡ U+26A1, zodiac, etc.).
         bmp_emoji_width(cp, cjk)
     } else if (0x20000..0x2FA20).contains(&cp) || (0x30000..0x323B0).contains(&cp) {
-        // CJK Extensions B-H and the Compatibility Ideographs Supplement.
         2
     } else if cjk {
         aterm_grapheme::char_width_cjk(c)
@@ -131,8 +125,6 @@ impl TerminalHandler<'_> {
         self.grid.damage_selection_output(origin);
     }
 
-    /// `write_char` without the output-damage bracket; split so every early
-    /// return below stays inside the bracket.
     fn write_char_body(&mut self, c: char) {
         let translated = self.charset.translate(c);
 
@@ -334,7 +326,6 @@ impl TerminalHandler<'_> {
                 }
                 self.write_char_core(c, width);
             } else if !cjk && (0xA0..0x300).contains(&cp) {
-                // U+00A0-U+02FF: width 1 outside CJK mode.
                 self.grid.write_narrow_autowrap_fast(c, colors, flags);
             } else {
                 let width = char_width(c, cjk);
@@ -375,9 +366,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Shared write path: insert, write at cursor, apply extras, advance. Extras
-    /// (hyperlinks, non-BMP overflow, underline colors, RGB) are applied before
-    /// the cursor advances, since an autowrap scroll would move the written row.
     fn write_char_core(&mut self, c: char, width: usize) {
         let mut flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
@@ -425,7 +413,6 @@ impl TerminalHandler<'_> {
             }
             if self.modes.insert_mode {
                 if !self.modes.auto_wrap && self.grid.cursor_col().saturating_add(1) >= ecols {
-                    // Wide char doesn't fit — no-op, matching xterm.
                     return;
                 }
                 self.grid
@@ -471,7 +458,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Apply hyperlink, underline color, RGB, and extended flags to written cell(s).
     fn apply_cell_extras_preflagged(&mut self, row: u16, col: u16, width: usize) {
         let flags = if self.style.protected {
             self.style.flags.union(CellFlags::PROTECTED)
@@ -534,17 +520,13 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// The cell a zero-width mark attaches to: [`Self::preceding_cell`], or with
-    /// none (column 0 of a row that is not a soft-wrap continuation) the cell
-    /// under the cursor, as in xterm (`use_col = char_was_written ?
-    /// last_written_col : cur_col`).
+    /// The cell a zero-width mark attaches to: [`Self::preceding_cell`], or the cell under the cursor when none exists.
     #[inline]
     fn combining_target_cell(&self) -> (u16, u16) {
         self.preceding_cell()
             .unwrap_or((self.grid.cursor_row(), self.grid.cursor_col()))
     }
 
-    /// Find the previous effective cell, skipping wide continuation cells.
     fn preceding_cell(&self) -> Option<(u16, u16)> {
         let row = self.grid.cursor_row();
         let col = self.grid.cursor_col();
@@ -579,9 +561,6 @@ impl TerminalHandler<'_> {
         Some((final_row, final_col))
     }
 
-    /// Add a combining character to the cell it belongs to: the base in the
-    /// previous cell (the main cell of a wide character), or the cell under the
-    /// cursor when there is none (see [`Self::combining_target_cell`]).
     fn add_combining_to_previous_cell(&mut self, combining: char) {
         let (row, col) = self.combining_target_cell();
         self.grid.cell_extra_mut(row, col).add_combining(combining);
@@ -591,8 +570,6 @@ impl TerminalHandler<'_> {
         self.grid.mark_content_cell(row, col);
     }
 
-    /// Whether the previous cell ends with ZWJ, so the next emoji joins it into
-    /// one grapheme (e.g. 👨 + ZWJ + 💻).
     fn should_combine_with_previous_zwj(&self) -> bool {
         const ZWJ: char = '\u{200D}';
 
@@ -610,10 +587,6 @@ impl TerminalHandler<'_> {
         })
     }
 
-    /// Widen the previous cell from 1 to 2 cells when VS16 (U+FE0F) follows an
-    /// emoji-capable base (as kitty, WezTerm and foot do): set WIDE on the base,
-    /// write a WIDE_CONTINUATION spacer in the next column, and advance the
-    /// cursor.
     fn widen_previous_cell_for_vs16(&mut self) {
         let Some((row, col)) = self.preceding_cell() else {
             return;
@@ -701,8 +674,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Copy the base cell's rendition-valued extras (truecolor fg/bg and the
-    /// SGR 58 underline colour) onto the spacer a VS16 widening created.
     fn mirror_vs16_spacer_extras(&mut self, row: u16, lead: u16, spacer: u16) {
         let lead_cell = self.grid.cell(row, lead).copied();
         let fg = lead_cell
@@ -718,8 +689,6 @@ impl TerminalHandler<'_> {
             .cell_extra(row, lead)
             .and_then(crate::grid::CellExtra::underline_color_u32);
         if fg.is_none() && bg.is_none() && underline.is_none() {
-            // Nothing to carry — and no empty entry (or HAS_EXTRAS bit) created
-            // for the overwhelmingly common plain emoji.
             return;
         }
         let extra = self.grid.cell_extra_mut(row, spacer);
@@ -734,8 +703,6 @@ impl TerminalHandler<'_> {
         }
     }
 
-    /// Narrow the previous cell from 2 to 1 cell when VS15 (U+FE0E) follows a
-    /// wide emoji: clear WIDE on the base and empty the spacer.
     fn narrow_previous_cell_for_vs15(&mut self) {
         let Some((row, col)) = self.preceding_cell() else {
             return;
@@ -774,8 +741,6 @@ impl TerminalHandler<'_> {
         self.grid.damage_mut().mark_cell(row, cont_col);
     }
 
-    /// Combine an emoji skin tone modifier (U+1F3FB-U+1F3FF) into the previous
-    /// emoji cell.
     fn try_combine_skin_tone_modifier(&mut self, modifier: char) -> bool {
         let Some((row, col)) = self.preceding_cell() else {
             return false;
@@ -812,8 +777,6 @@ impl TerminalHandler<'_> {
         true
     }
 
-    /// Combine the second regional indicator of a flag pair into the first RI's
-    /// cell, so `🇺🇸` is one 2-cell grapheme.
     fn try_combine_regional_indicator(&mut self, ri: char) -> bool {
         let Some((row, col)) = self.preceding_cell() else {
             return false;
@@ -861,7 +824,7 @@ const fn is_emoji_skin_tone_modifier(c: char) -> bool {
     matches!(c as u32, 0x1F3FB..=0x1F3FF)
 }
 
-/// Whether `c` is eligible for VS16 emoji presentation widening ([`aterm_grapheme::is_vs16_emoji_capable`]).
+/// Whether `c` is eligible for VS16 emoji presentation widening.
 #[inline]
 pub(crate) fn is_vs16_emoji_capable(c: char) -> bool {
     aterm_grapheme::is_vs16_emoji_capable(c)
@@ -874,9 +837,6 @@ mod tests {
 
     const ENGLAND: &str = "\u{1F3F4}\u{E0067}\u{E0062}\u{E0065}\u{E006E}\u{E0067}\u{E007F}";
 
-    /// `text` written into a fresh 1×8 terminal in one `process` call (the bulk
-    /// arms) and one scalar per call (the per-char writer); the two grids must
-    /// agree.
     fn whole_and_fragmented(text: &str) -> [Terminal; 2] {
         let mut whole = Terminal::new(1, 8);
         whole.process(text.as_bytes());
@@ -888,9 +848,6 @@ mod tests {
         [whole, fragmented]
     }
 
-    /// A tag character (U+E0000..U+E007F) or Variation Selectors Supplement
-    /// scalar (U+E0100..U+E01EF) is zero-width: it attaches to the preceding
-    /// cell and the cursor does not advance.
     #[test]
     fn tag_and_vs_supplement_attach_to_the_previous_cell() {
         for (text, mark, x_col) in [
@@ -923,9 +880,6 @@ mod tests {
         }
     }
 
-    /// A combining mark with no cell to its left lands on the cell under the
-    /// cursor and never vanishes: `printf 'abc\r'` then U+0301 accents the 'a',
-    /// as in xterm.
     #[test]
     fn a_combining_mark_with_no_cell_to_its_left_lands_on_the_cursor_cell() {
         for (input, col, base) in [
@@ -954,8 +908,6 @@ mod tests {
         }
     }
 
-    /// After a cursor motion that leaves a cell to the left, the mark goes to
-    /// that cell (the positional rule).
     #[test]
     fn a_combining_mark_after_a_cursor_motion_uses_the_cell_to_the_left() {
         let mut term = Terminal::new(1, 8);
@@ -973,8 +925,6 @@ mod tests {
         );
     }
 
-    /// England: 🏴 + gbeng + CANCEL TAG is one two-cell grapheme whose six
-    /// tags all attach to the lead cell (well under `MAX_COMBINING`).
     #[test]
     fn subdivision_flag_occupies_two_cells() {
         for term in whole_and_fragmented(&format!("{ENGLAND}X")) {
@@ -993,11 +943,6 @@ mod tests {
         }
     }
 
-    /// VS16 widens exactly the bases Unicode gives an emoji presentation
-    /// sequence (`Emoji=Yes`, `Emoji_Presentation=No`): `⬆️` is two cells, as
-    /// `wcwidth`, `string-width` and every other terminal count it, so the
-    /// program that wrote it puts its next character where the grid does; `✓️`
-    /// has no such sequence and stays one cell.
     #[test]
     fn vs16_widens_exactly_the_text_default_emoji() {
         for (text, wide, x_col) in [
@@ -1021,10 +966,6 @@ mod tests {
         }
     }
 
-    /// A syllable spelled in conjoining jamo is one two-cell cluster (UAX #29
-    /// GB6-GB8) whichever block its vowel and final come from: Hangul Jamo
-    /// Extended-B's V and T are zero-width like U+1160..U+11FF, as glibc and
-    /// unicode-width have them.
     #[test]
     fn extended_b_vowels_and_finals_join_the_syllable() {
         for text in [
@@ -1041,10 +982,6 @@ mod tests {
         }
     }
 
-    /// Exhaustive parity guard for the width fast paths: `char_width` must
-    /// agree with the `aterm_grapheme` table for every codepoint of each block
-    /// it special-cases, in both ambiguous-width modes, since
-    /// reflow/materialize/fill recompute width from the table.
     #[test]
     fn fast_path_width_matches_table() {
         let blocks: &[(&str, std::ops::Range<u32>)] = &[
@@ -1088,7 +1025,6 @@ mod tests {
         }
     }
 
-    /// Absolute widths at the fast path's edge cases, independent of the table.
     #[test]
     fn known_cjk_width_regressions() {
         assert_eq!(char_width('\u{4DC0}', false), 2);
@@ -1116,7 +1052,6 @@ mod tests {
         assert_eq!(char_width('\u{9FFF}', false), 2);
     }
 
-    /// End to end with `ambiguous_width = "wide"`: an EAW=A symbol from U+2600..
     #[test]
     fn ambiguous_misc_symbols_take_two_cells_in_wide_mode() {
         use crate::config::TerminalConfig;
@@ -1135,10 +1070,6 @@ mod tests {
         assert_eq!(term.cursor().col, 2);
     }
 
-    /// A skin tone folds only onto a base wide by emoji presentation, never onto
-    /// one `ambiguous_width = "wide"` widened: ⛹🏽 (U+26F9 is East Asian
-    /// Ambiguous and an emoji modifier base) is 2 + 2 cells in wide mode, as 1 + 2
-    /// in narrow, and keeps that layout through a checkpoint carry and history.
     #[test]
     fn skin_tone_folds_onto_an_emoji_presentation_base_in_both_width_modes() {
         use crate::config::TerminalConfig;
@@ -1200,9 +1131,6 @@ mod tests {
         }
     }
 
-    /// End-to-end pin for the wide-glyph wrap tail, driven as bytes so the SGR
-    /// state, the BCE cursor template and the glyph colours share one source
-    /// (the coupling `Grid::blank_wide_wrap_tail` relies on).
     #[test]
     fn a_wide_glyph_wrapping_off_the_last_column_repaints_the_orphan_it_bisects() {
         let mut term = Terminal::new(3, 10);

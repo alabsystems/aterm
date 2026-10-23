@@ -21,7 +21,7 @@ struct Publication {
     sync_parent: bool,
 }
 
-/// Whether `name` is one ordinary path component that every backend may hand a handle-relative call
+/// Whether `name` is one ordinary path component that every backend may hand a handle-relative call.
 pub(crate) fn is_one_component(name: &OsStr) -> bool {
     validate_component(name).is_ok()
 }
@@ -1251,7 +1251,7 @@ mod imp {
             Ok(())
         }
 
-        /// A new private append-only file (the session journal's segment, `session_log_journal_fs`)
+        /// A new private append-only file (the session journal's segment, `session_log_journal_fs`).
         pub(crate) fn create_new_append_private(&self, name: &OsStr) -> io::Result<std::fs::File> {
             self.create_new_private_with(name, OFlags::WRONLY | OFlags::APPEND)
         }
@@ -1583,10 +1583,7 @@ mod imp {
         Ok(file)
     }
 
-    /// Open a retained read guard for an artifact. Unlike the write and directory guards it
-    /// shares `FILE_SHARE_DELETE`: Windows checks sharing both ways, and a live write guard holds
-    /// `DELETE_ACCESS` for its whole life (it publishes and rolls back through it), so a mask
-    /// without DELETE fails with ERROR_SHARING_VIOLATION on an artifact this process still holds.
+    /// Open a retained read guard for an artifact.
     fn open_regular_file_with_identity(path: &Path) -> io::Result<(std::fs::File, FileIdentity)> {
         let file = std::fs::OpenOptions::new()
             .access_mode(GENERIC_READ)
@@ -1954,9 +1951,6 @@ mod imp {
             &self,
             name: &OsStr,
         ) -> io::Result<std::fs::File> {
-            // NTFS refuses to rename a directory above a retained handle and
-            // the open proves its lock sits inside the retained directory, so
-            // the path-validated open is already capability-stable.
             self.open_namespace_lock_with_create(name, false)
         }
 
@@ -3113,7 +3107,7 @@ mod windows_tests {
         names
     }
 
-    /// REGRESSION: a recording is a `child` directory, which shares delete,
+    /// A recording is a `child` directory, which shares delete,
     /// and between two frame writes nothing is open inside it — so another
     /// process can rename it aside and put a junction in its place.
     #[test]

@@ -8,7 +8,6 @@ use super::{Cell, CellFlags, PackedColor, PackedColors};
 
 impl Cell {
     /// Create a cell from an ASCII byte (hot path, no checks).
-    /// Precondition: `byte` is printable ASCII (0x20..=0x7E).
     #[must_use]
     #[inline]
     pub const fn from_ascii_fast(byte: u8) -> Self {
@@ -20,8 +19,6 @@ impl Cell {
     }
 
     /// A styled cell from an ASCII byte, with no char translation or width check.
-    /// Preconditions: `byte` is printable ASCII (0x20..=0x7E) and `colors` needs no
-    /// RGB overflow.
     #[must_use]
     #[inline]
     pub const fn from_ascii_styled(byte: u8, colors: PackedColors, flags: CellFlags) -> Self {
@@ -32,8 +29,7 @@ impl Cell {
         }
     }
 
-    /// Create a cell from a character. A non-BMP character is stored as U+FFFD;
-    /// its text needs the overflow mechanism.
+    /// Create a cell from a character.
     #[must_use]
     #[inline]
     #[allow(
@@ -57,8 +53,7 @@ impl Cell {
         }
     }
 
-    /// Create a cell with colours and flags. For RGB, the colours mark RGB
-    /// mode and the values live in the CellExtras overflow.
+    /// Create a cell with colours and flags.
     #[must_use]
     #[inline]
     #[allow(
@@ -82,8 +77,7 @@ impl Cell {
         }
     }
 
-    /// Reconstruct a cell from its raw field values (checkpoint restore),
-    /// bypassing validation so COMPLEX cells round-trip losslessly.
+    /// Reconstruct a cell from its raw field values.
     #[must_use]
     #[inline]
     pub const fn from_raw_parts(char_data: u16, colors: PackedColors, flags: CellFlags) -> Self {
@@ -94,16 +88,14 @@ impl Cell {
         }
     }
 
-    /// Convert a PackedColor pair to PackedColors (for bulk operations that
-    /// pre-compute colours).
+    /// Convert a PackedColor pair to PackedColors (for bulk operations that pre-compute colours).
     #[must_use]
     #[inline]
     pub const fn convert_colors(fg: PackedColor, bg: PackedColor) -> PackedColors {
         Self::convert_legacy_colors(fg, bg)
     }
 
-    /// Convert a PackedColor pair to PackedColors. RGB sets only the mode bits;
-    /// the value lives in CellExtras.
+    /// Convert a PackedColor pair to PackedColors.
     #[inline]
     const fn convert_legacy_colors(fg: PackedColor, bg: PackedColor) -> PackedColors {
         let mut colors = PackedColors::DEFAULT;
@@ -123,8 +115,7 @@ impl Cell {
         colors
     }
 
-    /// Create a cell with an overflow index for a complex character; the string
-    /// lives in CellExtras.
+    /// Create a cell with an overflow index for a complex character.
     #[cfg(test)]
     #[must_use]
     #[inline]
@@ -141,10 +132,6 @@ impl Cell {
 mod tests {
     use super::{Cell, CellFlags, PackedColor, PackedColors};
 
-    // EMPTY / default / from_ascii_fast / from_ascii_styled / new / with_style,
-    // and the from_raw_parts round trip
-
-    /// Assert one side of `colors` reads back as the legacy `want` colour.
     fn assert_side_matches(
         label: &str,
         (default, indexed, rgb, index): (bool, bool, bool, u8),
@@ -162,7 +149,6 @@ mod tests {
 
     #[test]
     fn value_constructors_store_exactly_what_they_are_given() {
-        // The blank cell, three ways: a space, default colours, no flags.
         for blank in [Cell::EMPTY, Cell::default(), Cell::from_ascii_fast(b' ')] {
             assert_eq!(blank.char(), ' ');
             assert_eq!(blank.char_data(), u16::from(b' '));
@@ -174,7 +160,6 @@ mod tests {
             assert!(blank.is_empty());
         }
 
-        // Every ASCII byte through the two byte constructors.
         let styles = [
             (PackedColors::DEFAULT, CellFlags::empty()),
             (
@@ -200,9 +185,6 @@ mod tests {
             }
         }
 
-        // `new` and `with_style`: a BMP char (NUL, ASCII, CJK, hiragana, U+FFFF)
-        // is stored as itself; one above the BMP (emoji, mathematical bold A) is
-        // stored as U+FFFD. Neither sets COMPLEX.
         let chars = [
             ('\0', '\0'),
             ('A', 'A'),
@@ -268,7 +250,6 @@ mod tests {
                         assert_side_matches(&label, fg_read, fg);
                         assert_side_matches(&label, bg_read, bg);
 
-                        // The raw constructor rebuilds the cell losslessly.
                         let back = Cell::from_raw_parts(cell.char_data(), colors, cell.flags());
                         assert_eq!(back.char_data(), cell.char_data(), "{label}");
                         assert_eq!(back.colors(), colors, "{label}");

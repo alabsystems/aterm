@@ -122,7 +122,6 @@ macro_rules! num_as_copysign_self {
             E: Error,
         {
             {
-                // Preserve sign of NaN. The `as` produces a nondeterministic sign.
                 let sign = if v.is_sign_positive() { 1.0 } else { -1.0 };
                 Ok((v as Self::Value).copysign(sign))
             }
@@ -532,12 +531,6 @@ where
             marker: PhantomData,
         })
     }
-
-    // The Some variant's repr is opaque, so we can't play cute tricks with its
-    // tag to have deserialize_in_place build the content in place unconditionally.
-    //
-    // FIXME: investigate whether branching on the old value being Some to
-    // deserialize_in_place the value is profitable (probably data-dependent?)
 }
 
 impl<'de, T> Deserialize<'de> for Vec<T>
@@ -660,7 +653,6 @@ impl<'de, T> Visitor<'de> for ArrayVisitor<[T; 0]> {
     }
 }
 
-// Does not require T: Deserialize<'de>.
 impl<'de, T> Deserialize<'de> for [T; 0] {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

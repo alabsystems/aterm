@@ -307,7 +307,7 @@ impl RestHost {
     /// that origin, the token in [`GIT_TOKEN_ENV`] of git's environment alone.
     fn git_command(&self, args: &[OsString]) -> Result<Command, HostError> {
         let token = self.token()?;
-        let mut cmd = aterm_uds::spawnfd::command("git");
+        let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
         cmd.args(["-c", "credential.helper="])
             .env_remove(GIT_TOKEN_ENV)
             .env_remove("GITHUB_TOKEN")
@@ -768,7 +768,7 @@ mod tests {
             1,
             "no file but the token's own"
         );
-        let mut planted = aterm_uds::spawnfd::command("git");
+        let mut planted = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
         planted.env("GIT_PASSWORD", secret);
         planted.arg(format!("https://x:{secret}@github.com/o/r.git"));
         assert_eq!(shows(&planted, secret).len(), 2);

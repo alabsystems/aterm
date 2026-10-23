@@ -2,16 +2,11 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-// Production unwrap() is forbidden; tests opt out at the crate root so a
-// missing per-module allow cannot slip past clippy.
 #![warn(clippy::unwrap_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-// The anchor attributes are `macro_rules!` ones where Cargo resolved no proc macro
-// under them (crates/aterm-spec-anchor/anchor_rules.rs).
 #![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
-//! Terminal grid model: `Grid`, `GridStorage`, `MaterializedRow`, cells, rows,
-//! damage tracking and page storage.
+//! Terminal grid model: [`Grid`], [`MaterializedRow`], cells, rows, damage and page storage.
 
 pub mod cell;
 pub(crate) mod cell_colors;
@@ -21,9 +16,7 @@ pub mod damage;
 pub mod extra;
 pub mod extra_collection;
 mod extra_collection_shifts;
-/// Page-backed storage internals. Exposed under `debug_assertions` for
-/// downstream property tests; production uses [`Row`] and
-/// [`PageStore`] (re-exported at the crate root).
+/// Page-backed storage internals ([`Row`], [`PageStore`]).
 #[cfg(any(test, debug_assertions))]
 pub mod page;
 #[cfg(not(any(test, debug_assertions)))]
@@ -50,7 +43,6 @@ pub use grid::{
 pub use grid::{MaterializedRow, materialize_from_line, stored_line_cells};
 pub use grid::{PendingScrollbackReflow, ReflowStep, ReflowedScrollback};
 
-// Re-export primary types at crate root for convenience.
 pub use cell::{Cell, CellFlags, PackedColor, PackedColors};
 pub use damage::{
     Damage, DamageBoundsIterator, DamagedRowIterator, LineDamageBounds, RowDamageBounds,
@@ -64,11 +56,9 @@ pub use extra::{
 pub use page::PageStore;
 pub use row::{LineSize, Row, RowFlags};
 
-// Page-level constants and aliases other crates use.
 pub use page::PAGE_SIZE;
 pub use page::PageId;
 
-// Cursor, scroll region, and grid state types.
 pub use cursor::{Cursor, SavedCursor};
 pub use scroll_region::{HorizontalMargins, ScrollRegion};
 #[cfg(any(test, debug_assertions))]
@@ -79,7 +69,6 @@ pub use state::{
     ROW_BAND_MOVES_PER_BATCH, ResizeShape, RowBandMove, RowBandMoves, SelectionDamage, knob,
 };
 
-// Terminal style types shared with checkpoint system.
 pub mod terminal_style;
 pub use terminal_style::{CurrentStyle, SavedCursorState};
 
@@ -98,17 +87,13 @@ pub const fn row_u16(idx: usize) -> u16 {
     }
 }
 
-/// Maximum visible rows a [`Grid`] will hold. Constructors and
-/// [`Grid::resize`] clamp both dimensions to `1..=MAX_GRID_ROWS/COLS`, so a
-/// hostile `u16::MAX × u16::MAX` resize cannot allocate billions of cells.
+/// Maximum visible rows a [`Grid`] will hold ([`Grid::resize`]).
 pub const MAX_GRID_ROWS: u16 = 4096;
 
-/// Maximum columns a [`Grid`] will hold; see [`MAX_GRID_ROWS`].
+/// Maximum columns a [`Grid`] will hold ([`MAX_GRID_ROWS`]).
 pub const MAX_GRID_COLS: u16 = 4096;
 
-/// Whether column `col` holds a tab stop in a fresh grid: every eighth column
-/// from 8, the VT100's power-on stops. Hosts that carry a grid's stops as a
-/// difference from the default (`aterm-gui`'s keeper META) read this too.
+/// Whether column `col` holds a tab stop in a fresh grid.
 #[must_use]
 #[inline]
 pub const fn is_default_tab_stop(col: usize) -> bool {

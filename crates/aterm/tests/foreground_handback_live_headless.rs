@@ -14,13 +14,11 @@ use crate::headless_boot::{self, Instance};
 use crate::live_ctl::Ctl;
 use crate::standin;
 
-/// The real test that dispatches this lane's child jobs before its parent body.
 const ENTRY: &str = "foreground_handback_live_headless::zsh_hands_a_killed_holders_modes_back_once";
 
 const ZSH: &[&str] = &["/bin/zsh", "-f", "-i"];
 const BASH: &[&str] = &["/bin/bash", "--norc", "--noprofile", "-i"];
 
-/// What a killed holder must leave: the host's values.
 const HANDED_BACK: &[(&str, &str)] = &[
     ("alt_screen", "false"),
     ("cursor_visible", "true"),
@@ -32,7 +30,6 @@ const HANDED_BACK: &[(&str, &str)] = &[
     ("sync_output", "false"),
 ];
 
-/// The modes a killed Claude Code left armed.
 const INCIDENT_MODES: &[u8] =
     b"\x1b[?1049h\x1b[?1003h\x1b[?1006h\x1b[>5u\x1b[>4;2m\x1b[?2004h\x1b[?1004h\x1b[?25l\x1b[?2026h";
 
@@ -110,12 +107,10 @@ impl Job {
         })
     }
 
-    /// The command line a shell runs it from.
     fn line(self) -> String {
         standin::shell_line(ENTRY, &self.spec())
     }
 
-    /// Play the job in this process; never returns.
     fn play(self) -> ! {
         match self {
             Job::Incident => {
@@ -124,9 +119,8 @@ impl Job {
                 kill_self()
             }
             Job::Armed(arm, n) => {
-                // SAFETY: the default disposition, then this thread's mask: a
-                // SIGINT sent to the job's group reaches this thread whatever
-                // the inherited mask of the others.
+                // SAFETY: the default disposition, then this thread's mask: a SIGINT sent to the
+                // job's group reaches this thread whatever the inherited mask of the others.
                 unsafe {
                     libc::signal(libc::SIGINT, libc::SIG_DFL);
                     let mut set: libc::sigset_t = std::mem::zeroed();
@@ -146,9 +140,8 @@ impl Job {
                 standin::exit(0)
             }
             Job::Vim => {
-                // Checked: a vim that did not run is never answered, so the lane cannot
-                // pass having run no vim (docs/DESIGN-init-system-2026-10-20.md §8,
-                // rule 5).
+                // Checked: a vim that did not run is never answered, so the lane cannot pass having
+                // run no vim (docs/DESIGN-init-system-2026-10-20.md §8, rule 5).
                 let ran = aterm_spec::host::find_tool("vim").map(|vim| {
                     #[expect(
                         clippy::disallowed_types,
@@ -171,25 +164,20 @@ impl Job {
     }
 }
 
-/// End this process by SIGKILL, as a killed holder ends. The signal may land after `kill`
-/// returns (another thread can take it), so this thread waits for it.
 fn kill_self() -> ! {
     // SAFETY: a signal to this process; SIGKILL cannot be caught.
     unsafe {
         libc::kill(libc::getpid(), libc::SIGKILL);
     }
     loop {
-        // SAFETY: `pause` blocks this thread until a signal arrives; the
-        // SIGKILL sent above ends the process there.
+        // SAFETY: `pause` blocks this thread until a signal arrives; the SIGKILL sent above ends
+        // the process there.
         unsafe {
             libc::pause();
         }
     }
 }
 
-/// [`Job::Holder`]. The child is forked only once aterm has answered the
-/// holder, so the modes were read as the holder's; the child is answered
-/// before it exits, so aterm saw its group hold the terminal.
 fn holder() -> ! {
     // SAFETY: SIGTTOU ignored, so the holder may take the terminal back from its child's group.
     unsafe {
@@ -233,7 +221,6 @@ fn holder() -> ! {
     kill_self()
 }
 
-/// Play the [`Job`] named in [`standin::ENV`], or return to the parent test.
 fn play_standin_if_asked() {
     let Some(spec) = standin::spec() else { return };
     match Job::parse(&spec) {
@@ -254,7 +241,6 @@ enum Holder {
     Job,
 }
 
-/// One shell in its own headless instance.
 struct Shell {
     inst: Instance,
     ctl: Ctl,
@@ -345,7 +331,6 @@ impl Shell {
         self.ctl.expect_on_screen(&format!("settled-{n}"));
     }
 
-    /// The `modes-restored` events so far.
     fn handbacks(&mut self) -> Vec<String> {
         self.ctl
             .counted("timeline 500")
@@ -359,8 +344,6 @@ impl Shell {
         self.handbacks().len()
     }
 
-    /// The modes now, as `(name, value)` pairs from `want`'s names, for
-    /// comparison with `want`.
     fn modes_of(&mut self, want: &[(&str, &str)]) -> (BTreeMap<String, String>, bool) {
         let modes = self.ctl.modes();
         let all = want
@@ -409,7 +392,6 @@ impl Shell {
         );
     }
 
-    /// SIGSTOP or SIGCONT the instance itself.
     fn signal_instance(&self, sig: libc::c_int) {
         let pid = libc::pid_t::try_from(self.inst.child.id()).expect("a pid");
         // SAFETY: a signal to the instance this test spawned and has not reaped.
@@ -417,15 +399,12 @@ impl Shell {
     }
 }
 
-/// [`HANDED_BACK`] plus bracketed paste as the shell itself leaves it.
 fn handed_back(bracketed_paste: &'static str) -> Vec<(&'static str, &'static str)> {
     let mut want = HANDED_BACK.to_vec();
     want.push(("bracketed_paste", bracketed_paste));
     want
 }
 
-/// A FIFO at `path` held open read-write by the returned file, so a write
-/// to it waits for the reader the shell opens, never for this test.
 fn held_fifo(path: &Path) -> std::fs::File {
     let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("a C path");
     // SAFETY: a valid NUL-terminated path.
@@ -443,9 +422,6 @@ fn held_fifo(path: &Path) -> std::fs::File {
         .expect("hold the FIFO read-write")
 }
 
-/// A killed holder under zsh: after `zsh: killed` the modes are back at the host's values,
-/// zle's own bracketed paste is on again, and the timeline holds exactly one handback, which
-/// keeps 1007.
 #[test]
 fn zsh_hands_a_killed_holders_modes_back_once() {
     play_standin_if_asked();
@@ -465,8 +441,6 @@ fn zsh_hands_a_killed_holders_modes_back_once() {
     sh.assert_handbacks("the next job's exit is the next handback", 2);
 }
 
-/// One-shots that set a display mode on purpose keep it after they exit, and
-/// `tput smcup; cmd` runs `cmd` on the alternate screen: nothing is recorded.
 #[test]
 fn zsh_keeps_the_display_modes_a_one_shot_sets() {
     let mut sh = Shell::boot("zd", ZSH);
@@ -504,8 +478,6 @@ fn zsh_keeps_the_display_modes_a_one_shot_sets() {
     sh.assert_handbacks("the whole wrapper records nothing", 0);
 }
 
-/// vim's own exit resets what it armed: run as an answered job, a clean exit
-/// records nothing.
 #[test]
 fn zsh_records_nothing_for_a_clean_vim_exit() {
     let vim = aterm_spec::host::need_tool("vim");
@@ -522,8 +494,6 @@ fn zsh_records_nothing_for_a_clean_vim_exit() {
     assert!(bare <= 1, "a bare vim exit records at most one: {bare}");
 }
 
-/// Ctrl-Z of a job that armed mouse tracking hands nothing back (the job
-/// lives), `fg` finds its mouse still on, and only its death hands back.
 #[test]
 fn zsh_a_stopped_job_keeps_its_modes_until_it_dies() {
     let mut sh = Shell::boot("zs", ZSH);
@@ -552,10 +522,6 @@ fn zsh_a_stopped_job_keeps_its_modes_until_it_dies() {
     sh.assert_handbacks("the death edge is one handback", 1);
 }
 
-/// The same leaderless pipeline stopped and then `bg`'d runs on with no
-/// member stopped: a command the shell runs meanwhile makes two foreground
-/// edges at which the job is a bystander, gone only when its whole group is,
-/// so its modes stay and `fg` finds them.
 #[test]
 fn zsh_a_bgd_leaderless_pipeline_keeps_its_modes_beside_a_command() {
     let mut sh = Shell::boot("zb", ZSH);
@@ -595,9 +561,6 @@ fn zsh_a_bgd_leaderless_pipeline_keeps_its_modes_beside_a_command() {
     sh.assert_handbacks("the bg'd pipeline's death is one handback", 1);
 }
 
-/// A live holder that hands the terminal to its own child and takes it back
-/// keeps its alternate screen, mouse and hidden cursor; its death is one
-/// handback, and no handback names 1007.
 #[test]
 fn zsh_a_live_holder_keeps_its_modes_across_its_child() {
     let mut sh = Shell::boot("zh", ZSH);
@@ -622,9 +585,6 @@ fn zsh_a_live_holder_keeps_its_modes_across_its_child() {
     sh.assert_handbacks("the holder's death is one handback", 1);
 }
 
-/// A one-shot whose bytes the reader reads only after zsh took the terminal back is parsed as
-/// the shell's, so its handback is lost (the documented residual), and only its own: the next
-/// job, which re-arms mouse reporting and dies, is handed back once.
 #[test]
 fn zsh_a_missed_one_shot_loses_only_its_own_handback() {
     let mut sh = Shell::boot("zm", ZSH);
@@ -672,7 +632,6 @@ fn zsh_a_missed_one_shot_loses_only_its_own_handback() {
     sh.assert_handbacks("the re-arming job's death is one handback", 1);
 }
 
-/// A killed holder under macOS's /bin/bash 3.2, which has no bracketed paste.
 #[test]
 fn bash_hands_a_killed_holders_modes_back_once() {
     let mut sh = Shell::boot("bi", BASH);

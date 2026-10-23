@@ -151,7 +151,7 @@ fn capture(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Facts, String> 
 }
 
 fn git(dir: &Path, args: &[&str], isolate: bool) -> Result<Vec<u8>, String> {
-    let mut cmd = command("git");
+    let mut cmd = command(aterm_uds::os_path!("git"));
     cmd.args(args).current_dir(dir);
     if isolate {
         for var in REPO_ENV {
@@ -339,7 +339,7 @@ fn pin_motion(root: &Path, index: &[IndexEntry]) -> PinMotion {
 /// `git merge-base --is-ancestor`: exit 0 yes, 1 no, anything else an error,
 /// which [`git`] cannot tell apart from "no".
 fn is_ancestor(dir: &Path, ancestor: &str, descendant: &str) -> Result<bool, String> {
-    let mut cmd = command("git");
+    let mut cmd = command(aterm_uds::os_path!("git"));
     cmd.args(["merge-base", "--is-ancestor", ancestor, descendant])
         .current_dir(dir);
     for var in REPO_ENV {
@@ -1223,7 +1223,7 @@ mod tests {
         }
 
         fn run(&self, dir: &Path, args: &[&str]) -> String {
-            let mut cmd = command("git");
+            let mut cmd = command(aterm_uds::os_path!("git"));
             cmd.args([
                 "-c",
                 "user.name=t",

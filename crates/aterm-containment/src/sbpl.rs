@@ -9,7 +9,7 @@ use crate::policy::Capabilities;
 use std::path::{Path, PathBuf};
 
 /// Fixed absolute path to `/usr/bin/sandbox-exec`.
-pub const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+pub const SANDBOX_EXEC_PATH: &str = aterm_uds::os_path!("sandbox-exec");
 
 /// Defines [`MACH_LOOKUP_ALLOWLIST`] and [`BASE_PROFILE`] from one list of
 /// global names, so the names the profile allows and the names its proofs read

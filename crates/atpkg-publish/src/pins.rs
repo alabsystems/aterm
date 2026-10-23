@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The channel's pins as a target sees them, read through the client's own
-//! `Channel::for_target` rather than a second reader of the grammar.
+//! Target-resolved channel pin queries.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -11,9 +10,7 @@ use atpkg::Channel;
 use crate::error::{Error, Result};
 use crate::triple::Triple;
 
-/// The builds `triples` resolve together: per target, `pin` with that target's overlay
-/// laid over it (`Channel::for_target`). A program two targets resolve to different builds
-/// is refused, not collapsed: one build cannot carry rows for both.
+/// Resolves the channel's pins across `triples` via [`Channel::for_target`].
 ///
 /// # Errors
 ///
@@ -45,9 +42,7 @@ pub fn for_targets(channel: &Channel, triples: &[Triple]) -> Result<BTreeMap<Str
     Ok(resolved.into_iter().map(|(p, (b, _))| (p, b)).collect())
 }
 
-/// Every `(program, build)` some client can resolve from this channel: `pin` and every
-/// `pin_by_target` overlay. An overlay masks a `pin` build for its own target only, so
-/// both stay live; whatever serves every target at once (the public mirror) walks this.
+/// Every `(program, build)` reachable from `pin` or any `pin_by_target` overlay.
 #[must_use]
 pub fn union(channel: &Channel) -> BTreeSet<(String, u64)> {
     channel

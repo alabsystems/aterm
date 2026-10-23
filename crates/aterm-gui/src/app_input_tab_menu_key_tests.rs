@@ -45,10 +45,7 @@ pub(super) fn close(pipe: [i32; 2]) {
     }
 }
 
-/// Shift+F10 is terminfo `kf22`, a key legacy applications bind, so an
-/// unedited config lets it through: no card, the press not booked as
-/// consumed, and exactly `ESC[21;2~` on the PTY. Under
-/// `tab_menu_chord = "on"` the same press pops the card and writes nothing.
+/// By default, Shift+F10 (`kf22`) passes through to the PTY; `tab_menu_chord = "on"` claims it.
 #[cfg(unix)]
 #[test]
 fn shift_f10_reaches_the_program_by_default() {
@@ -71,7 +68,6 @@ fn shift_f10_reaches_the_program_by_default() {
         "the program receives terminfo kf22"
     );
 
-    // Negative control: the opt-in claims it, and the PTY stays silent.
     app.config.tab_menu_chord = Some("on".to_string());
     app.on_key(wid, named(NamedKey::F10));
     assert!(
@@ -85,9 +81,6 @@ fn shift_f10_reaches_the_program_by_default() {
     close(pipe);
 }
 
-/// Under `tab_menu_chord = "on"` Shift+F10 is the Windows-wide "context
-/// menu for the focused thing" chord; bare F10 is a terminal function key
-/// and is never claimed.
 #[test]
 fn shift_f10_pops_the_menu_and_bare_f10_does_not() {
     let (mut app, wid) = app_with_strip();
@@ -105,7 +98,6 @@ fn shift_f10_pops_the_menu_and_bare_f10_does_not() {
     );
 }
 
-/// ↑/↓ walk enabled actions only, and the walk is a cycle.
 #[test]
 fn arrows_step_the_highlight_over_enabled_actions_only() {
     let (mut app, wid) = app_with_strip();
@@ -131,8 +123,6 @@ fn arrows_step_the_highlight_over_enabled_actions_only() {
     assert!(lit(&app).is_some());
 }
 
-/// A key the menu does not own dismisses it and is swallowed — it must not
-/// also type into the terminal the user believed was behind a menu.
 #[test]
 fn an_unowned_key_dismisses_without_reaching_the_terminal() {
     let (mut app, wid) = app_with_strip();
@@ -140,8 +130,6 @@ fn an_unowned_key_dismisses_without_reaching_the_terminal() {
     assert!(app.windows[&wid].tab_menu.is_some());
     app.on_key(wid, named(NamedKey::Tab));
     assert!(app.windows[&wid].tab_menu.is_none(), "dismissed");
-    // The press is booked as consumed, which keeps its release from leaking an orphan report to
-    // a Kitty-protocol app.
     assert!(
         app.windows[&wid]
             .consumed_press_keys
@@ -150,14 +138,12 @@ fn an_unowned_key_dismisses_without_reaching_the_terminal() {
     );
 }
 
-/// A client that negotiated the enhancement that makes the Menu key (kitty `57363`) reportable
-/// keeps it: chrome claims only a key nobody downstream can hear. Driven by a real `CSI > 1 u`.
+/// A client that negotiated Kitty `DISAMBIGUATE_ESCAPE_CODES` keeps the Menu key (`57363`).
 #[test]
 fn a_kitty_client_that_negotiated_for_the_menu_key_keeps_it() {
     let (mut app, wid) = app_with_strip();
     let term = app.pool.get(0).expect("session 0").term.clone();
 
-    // No negotiation: the key reaches nobody, so chrome claims it.
     app.on_key(wid, named(NamedKey::ContextMenu));
     assert!(
         app.windows[&wid].tab_menu.is_some(),
@@ -165,7 +151,6 @@ fn a_kitty_client_that_negotiated_for_the_menu_key_keeps_it() {
     );
     app.on_key(wid, named(NamedKey::Escape));
 
-    // The app pushes disambiguate — exactly what a kitty-aware TUI sends.
     crate::term_lock(&term).process(b"\x1b[>1u");
     app.on_key(wid, named(NamedKey::ContextMenu));
     assert!(
@@ -173,7 +158,6 @@ fn a_kitty_client_that_negotiated_for_the_menu_key_keeps_it() {
         "a negotiated Menu key belongs to the application, not the chrome"
     );
 
-    // Pop the flags back off and the chord is aterm's again.
     crate::term_lock(&term).process(b"\x1b[<u");
     app.on_key(wid, named(NamedKey::ContextMenu));
     assert!(
@@ -182,10 +166,7 @@ fn a_kitty_client_that_negotiated_for_the_menu_key_keeps_it() {
     );
 }
 
-/// ⇧F10 encodes as `ESC[21;2~` in plain legacy, which is why the default
-/// never claims it. Under `tab_menu_chord = "on"` only
-/// `REPORT_ALL_KEYS_AS_ESC` buys it back automatically; disambiguate alone
-/// does not, or the opted-in chord would vanish under every modern TUI.
+/// Under `tab_menu_chord = "on"`, only `REPORT_ALL_KEYS_AS_ESC` overrides Shift+F10.
 #[test]
 fn shift_f10_defers_only_to_report_all_keys() {
     let (mut app, wid) = app_with_strip();
@@ -209,9 +190,6 @@ fn shift_f10_defers_only_to_report_all_keys() {
     );
 }
 
-/// The escape hatch: the chord is not a rebindable `Action`, so
-/// `tab_menu_chord` is the only knob. Its middle value (also the default
-/// when absent) keeps the Menu key and surrenders ⇧F10; `on` claims both.
 #[test]
 fn the_config_knob_hands_each_spelling_back() {
     let shift_f10 = |app: &mut App, wid| {
@@ -254,8 +232,6 @@ fn the_config_knob_hands_each_spelling_back() {
     );
 }
 
-/// A bare modifier press does not dismiss the card; otherwise the ⇧ half of
-/// ⇧F10 would close the menu the chord is about to re-open.
 #[test]
 fn a_bare_modifier_press_leaves_the_card_up() {
     let (mut app, wid) = app_with_strip();
@@ -282,9 +258,6 @@ fn a_bare_modifier_press_leaves_the_card_up() {
     );
 }
 
-/// Focus loss dismisses the card: it is modal over pointer and keyboard,
-/// so left up across an alt-tab it would overpaint output, swallow keys
-/// and eat the first click back.
 #[test]
 fn losing_focus_dismisses_the_card() {
     let (mut app, wid) = app_with_strip();

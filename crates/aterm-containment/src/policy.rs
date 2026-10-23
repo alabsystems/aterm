@@ -19,8 +19,7 @@ pub struct Capabilities {
     pub process: ProcessCapability,
 }
 
-/// The mode → capabilities mapping: pure `const` functions, specified by this module's tests
-/// over every mode and every ordered pair of modes.
+/// Containment mode to capability mapping.
 #[derive(Debug, Clone, Copy)]
 pub struct ContainmentPolicy;
 
@@ -73,7 +72,6 @@ impl ContainmentPolicy {
 mod tests {
     use super::*;
 
-    /// For every pair of modes, the lower never holds more of any capability.
     #[test]
     fn test_monotonic_capabilities() {
         let modes = [
@@ -98,11 +96,8 @@ mod tests {
         }
     }
 
-    /// The policy table as raw discriminants, so a drift in the encoding or the mapping fails.
-    /// Safety narrows nothing on the network: no level promises filtering that nothing does.
     #[test]
     fn test_numeric_policy_table() {
-        // [mode_level] -> (net, fs, proc)
         let table: [(u8, [u8; 3]); 3] = [
             (0, [0, 0, 0]), // Containment
             (1, [1, 1, 1]), // Safety

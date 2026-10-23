@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance for the Settings Packages worker reducer.
-//!
-//! The test drives the genuine shipping [`PackagesService`], projects its
-//! single-flight state and rendered result class, and validates each accepted
-//! transition against the derived `NativePackagesWorker` model. The one fact the
-//! service cannot report about itself, the outcome the last verb's worker
-//! reported, is kept beside it by [`Packages`]. Rejected stale and
-//! wrong-operation completions, a false-success presentation, an abort that
-//! leaves its verb busy, and a refresh that erases the verb's result are
-//! independent negative controls.
+//! Conformance tests for the Settings Packages worker reducer.
 
 #![cfg(test)]
 
@@ -27,7 +18,6 @@ fn report(outcome: &str) -> PackagesStatusReport {
     report_with_rows(outcome, &[])
 }
 
-/// A report whose record carries `rows` (program, state) as a pass wrote them.
 fn report_with_rows(outcome: &str, rows: &[(&str, &str)]) -> PackagesStatusReport {
     let programs = rows
         .iter()
@@ -65,10 +55,6 @@ fn report_with_rows(outcome: &str, rows: &[(&str, &str)]) -> PackagesStatusRepor
     PackagesStatusReport::from_parts(true, true, "fp".to_string(), Some(&status), &[])
 }
 
-/// The genuine service plus `expected_result`: the outcome (1 success, 2
-/// failure) the last verb's worker reported, cleared when a verb begins. A
-/// refresh reports none, so it leaves `expected_result` alone, and the service
-/// must too (`RefreshKeepsVerbResult`).
 struct Packages {
     service: PackagesService,
     expected_result: u8,
@@ -168,7 +154,6 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
         .expect("start package check");
     assert_transition(&model, before, packages.observe(), "BeginCheck");
 
-    // A completion for the wrong kind cannot clear the genuine reservation.
     let reserved = packages.observe();
     assert!(!packages.finish(
         check_sequence,
@@ -182,7 +167,6 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
         "the model guard rejects the same wrong-kind completion"
     );
 
-    // Nor may an otherwise matching completion with a stale sequence settle it.
     assert!(!packages.finish(
         check_sequence + 1,
         PackagesWorkerCompletion::command(
@@ -199,7 +183,6 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
     assert!(packages.finish(
         check_sequence,
         PackagesWorkerCompletion::command(
-            // Deliberately retain the old success: the process outcome must win.
             report("up to date"),
             PackagesCommandOutcome::Failed {
                 operation: PackagesBusy::Check,
@@ -212,7 +195,6 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
     assert_eq!(failed.real.last_result, 2);
     assert_eq!(failed.real.presented_result, 2);
 
-    // A status-only pass imports fresh facts without erasing that user result.
     let before = packages.observe();
     let refresh_sequence = packages.begin(None).unwrap();
     assert_transition(&model, before, packages.observe(), "BeginRefresh");
@@ -225,8 +207,6 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
     assert_transition(&model, before, refreshed, "FinishRefresh");
     assert_eq!(refreshed.real.last_result, 2);
 
-    // Negative control: a `finish` that assigns the refresh's absent command
-    // over `last_command` erases the verb's result. Neither admitted nor safe.
     let mut erased = project(&model, refreshed);
     erased.insert("last_operation", 0);
     erased.insert("last_result", 0);
@@ -258,24 +238,16 @@ fn real_packages_service_conforms_for_refresh_failure_preservation_and_success()
     assert_transition(&model, before, aborted, "Abort");
     assert_eq!(packages.service.busy(), None, "abort releases the verb too");
 
-    // Negative control: an abort that clears `inflight` but keeps `busy` would
-    // project the check as still running with no worker behind it.
     let mut stuck_busy = project(&model, aborted);
     stuck_busy.insert("operation", 2);
     assert_eq!(admits(&model, &project(&model, before), &stuck_busy), None);
     assert!(!model.check_invariant("SingleFlightHasOneKind", &stuck_busy));
 
-    // Independent negative control: the historical stale-success rendering is
-    // neither invariant-safe nor an admitted post-state for the real failure.
     let mut false_success = project(&model, failed);
     false_success.insert("presented_result", 1);
     assert!(!model.check_invariant("FinalResultIsPresented", &false_success));
 }
 
-/// A failing row shows the attention headline only when no verb result exists; a
-/// verb completed over the same failing record keeps its own headline
-/// (`FinalResultIsPresented`). Negative control: the attention line in place of a
-/// completed check's headline.
 #[test]
 fn a_failing_row_is_presented_as_attention_never_as_a_verb_result() {
     use crate::packages_screen::{ATTENTION_PREFIX, presented_result_of};

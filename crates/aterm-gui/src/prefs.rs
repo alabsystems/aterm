@@ -29,13 +29,13 @@ pub(crate) const EDIT_THEME: &str = "theme";
 pub(crate) const EDIT_CURSOR_STYLE: &str = "cursor_style";
 pub(crate) const EDIT_CURSOR_BLINK: &str = "cursor_blink";
 pub(crate) const EDIT_CURSOR_MOMENTUM_GLOW: &str = "cursor_momentum_glow";
-/// The RETIRED cursor-effects master (`Config::cursor_trail`).
+/// The retired cursor-effects master (`Config::cursor_trail`).
 pub(crate) const RETIRED_CURSOR_TRAIL: &str = "cursor_trail";
 /// The two settings [`RETIRED_CURSOR_TRAIL`] reads as.
 pub(crate) const RETIRED_CURSOR_TRAIL_SUCCESSORS: [&str; 2] =
     [EDIT_CURSOR_TRAIL_STYLE, EDIT_CURSOR_MOMENTUM_GLOW];
 pub(crate) const EDIT_CURSOR_TRAIL_STYLE: &str = "cursor_trail_style";
-/// THE STYLE OFF REPLACED.
+/// The style `off` replaced.
 pub(crate) const EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF: &str = "cursor_trail_style_before_off";
 pub(crate) const EDIT_TRAIL_SOUNDS: &str = "trail_sounds";
 /// Tone-melody toggle (`Config::tone_melody`, default ON).
@@ -51,12 +51,12 @@ pub(crate) const EDIT_BELL_SOUND: &str = "bell_sound";
 /// The curse bonk's two gates.
 pub(crate) const EDIT_SPARKLE_BONK: &str = "sparkle_words.profanity.bonk";
 pub(crate) const EDIT_SPARKLE_BONK_DETONATION: &str = "sparkle_words.profanity.bonk_detonation";
-/// PRISM WAKE's pip (`[output_streak] sound`, default ON; `docs/DESIGN-output-streak-2026-08-30.md` §7).
+/// Prism wake's pip (`[output_streak] sound`, default ON).
 pub(crate) const EDIT_OUTPUT_STREAK_SOUND: &str = "output_streak.sound";
-/// PRISM WAKE's switch (`[output_streak] enabled`).
+/// Prism wake's switch (`[output_streak] enabled`).
 pub(crate) const EDIT_OUTPUT_STREAK_ENABLED: &str = "output_streak.enabled";
 
-/// PRESENCE: the `[presence]` leaf the View menu's needs switch writes.
+/// The `[presence]` leaf the View menu's needs switch writes.
 pub(crate) const EDIT_PRESENCE_RIM: &str = "presence.rim";
 
 /// Every config key that changes what aterm sounds like, and nothing else.
@@ -127,7 +127,7 @@ pub(crate) fn trail_color_default_words(
         .map_or_else(|| TRAIL_COLOR_CURSOR_LABEL.to_string(), str::to_string)
 }
 
-/// WHAT THE TRAIL COLOUR ROWS DO for the cursor style aterm.toml spells `style_raw`.
+/// Trail colour note for the cursor style aterm.toml spells `style_raw`.
 pub(crate) fn trail_color_note(style_raw: &str, block: bool, cursor_color_pinned: bool) -> String {
     use aterm_effects::cursor_fx::{glow_color_follows_live_cursor, own_trail_color};
     use aterm_effects::cursor_glow::GlowStyle;
@@ -332,9 +332,9 @@ pub(crate) const RETIRED_PACKAGES_AUTO_UPDATE: &str = "packages.auto_update";
 pub(crate) const RETIRED_PACKAGES_SEED_INSTALL: &str = "packages.seed_install";
 /// `[update] enabled`.
 pub(crate) const EDIT_UPDATE_ENABLED: &str = "update.enabled";
-/// The ONE name of [`EDIT_UPDATE_ENABLED`]'s switch.
+/// The name of [`EDIT_UPDATE_ENABLED`]'s switch.
 pub(crate) const UPDATE_CHECK_LABEL: &str = aterm_update_core::settings::CHECK_LABEL;
-/// The ONE name of `[update] auto_apply`'s switch, as [`UPDATE_CHECK_LABEL`] is the check switch's.
+/// The name of `[update] auto_apply`'s switch, as [`UPDATE_CHECK_LABEL`] is the check switch's.
 pub(crate) const UPDATE_INSTALL_LABEL: &str = aterm_update_core::settings::INSTALL_LABEL;
 /// `[reroute] announce`.
 pub(crate) const EDIT_REROUTE_ANNOUNCE: &str = "reroute.announce";
@@ -389,7 +389,7 @@ pub(crate) fn agent_switch(key: &str) -> Option<Program> {
     aterm_phase::program_of(word).filter(|p| p.harness_table() && p.name() == word)
 }
 
-/// The names a row is searched by as its OWN, beside its label and key (`native_config_language::query_match_rank`).
+/// The names a row is searched by as its own, beside its label and key (`native_config_language::query_match_rank`).
 pub(crate) fn own_names_of(key: &str) -> [Option<&'static str>; 2] {
     if let Some(agent) = agent_switch(key) {
         [Some(agent.name()), Some(folded_product(agent.product()))]
@@ -504,9 +504,9 @@ pub(crate) const EDIT_WINDOW_COLORSPACE: &str = "window_colorspace";
 pub(crate) const EDIT_RESTORE_SESSION: &str = "restore_session";
 /// Opt-in shell custody, read at launch.
 pub(crate) const EDIT_KEEPER_ENABLED: &str = "keeper.enabled";
-/// Session activity on disk (on by default, D3), read at launch.
+/// Session activity on disk (on by default), read at launch.
 pub(crate) const EDIT_SESSION_LOG_JOURNAL: &str = "session_log.journal";
-/// Live activity in terminal tab tooltips and menus (on by default, D6).
+/// Live activity in terminal tab tooltips and menus (on by default).
 pub(crate) const EDIT_SESSION_LOG_CLAUSE: &str = "session_log.clause";
 /// OpenType feature requests (`Config::font_features`) — a [`LIST_KEYS`] row.
 pub(crate) const EDIT_FONT_FEATURES: &str = "font_features";
@@ -549,14 +549,14 @@ pub(crate) fn manual_only_key(key: &str) -> bool {
         || key == "sparkle_words.feline.style"
 }
 
-/// One SCALAR leaf of a nested config table (`[update]` / `[sparkle_words]` (+ sub-tables) / `[matrix_rain]`).
+/// One scalar leaf of a nested config table (`[update]` / `[sparkle_words]` (+ sub-tables) / `[matrix_rain]`).
 pub(crate) struct NestedLeaf {
     pub(crate) key: &'static str,
     pub(crate) label: &'static str,
     pub(crate) kind: EditKind,
 }
 
-/// Every REGISTERED nested scalar leaf.
+/// Every registered nested scalar leaf.
 pub(crate) const NESTED_LEAVES: &[NestedLeaf] = &[
     NestedLeaf {
         key: EDIT_KEEPER_ENABLED,
@@ -1041,7 +1041,7 @@ pub(crate) fn cursor_trail_style_canonical(token: &str) -> Option<&'static str> 
     spellings::canonical(token)
 }
 
-/// How a Preferences key should be TYPED in the written TOML.
+/// How a Preferences key should be typed in the written TOML.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum EditKind {
     Float,
@@ -1925,7 +1925,6 @@ fn fold_retired_cursor_trail(
     };
     doc.remove(RETIRED_CURSOR_TRAIL);
     let Some(master) = master else {
-        // Not true or false: it never read, so nothing to carry over.
         return;
     };
     let decorative = crate::app_config::DEFAULT_DECORATIVE_EFFECTS;
@@ -1971,7 +1970,7 @@ pub(crate) fn typed_toml_item(
     typed_item(key, raw)
 }
 
-/// THE VALUE THAT MEANS UNSET.
+/// The value that means unset.
 pub(crate) fn unset_literal(field: &EditField) -> Option<String> {
     if field.key == "ai" || field.key.starts_with("ai.") {
         return None;
@@ -2036,7 +2035,7 @@ pub(crate) fn is_unset_literal(field: &EditField, value: &str) -> bool {
     }
 }
 
-/// THE ONE "A VALUE EQUAL TO ITS DEFAULT REMOVES THE KEY" RULE, for every writer.
+/// Whether each edit in `edits` sets a value equivalent to unsetting the key.
 pub(crate) fn unset_equivalent_edits(
     existing_toml: &str,
     edits: &[(&str, Option<String>)],
@@ -2084,7 +2083,7 @@ fn retired_successor_pairs() -> impl Iterator<Item = (&'static str, &'static str
     )
 }
 
-/// THE SETTINGS A RETIRED SPELLING STILL AUTHORS in `text`.
+/// The settings a retired spelling still authors in `text`.
 pub(crate) fn retired_authored_keys(text: &str) -> std::collections::BTreeSet<&'static str> {
     let mut authored = std::collections::BTreeSet::new();
     let Ok(doc) = text.parse::<aterm_toml::edit::DocumentMut>() else {
@@ -2283,7 +2282,7 @@ fn integer_domain(key: &str) -> std::ops::RangeInclusive<i64> {
     }
 }
 
-/// Would the writer take `raw` for `key`? Its own check, for a caller that refuses a value before it reaches the file.
+/// Validates whether the writer accepts `raw` for `key`.
 pub(crate) fn check_edit_value(key: &str, raw: &str) -> Result<(), PrefsEditError> {
     typed_item(key, raw).map(|_| ())
 }
@@ -2385,7 +2384,7 @@ fn whole_number(raw: &str) -> Option<i64> {
         })
 }
 
-/// THE ONE SPELLING OF A NUMBER A FRACTIONAL ([`EditKind::Float`]) SETTING WRITES.
+/// TOML value written for a fractional ([`EditKind::Float`]) setting.
 pub(crate) fn written_number(value: f64) -> aterm_toml::edit::Value {
     exact_whole(value).map_or_else(
         || aterm_toml::edit::Value::from(value),
@@ -2575,7 +2574,6 @@ fn typed_item(key: &str, raw: &str) -> Result<aterm_toml::edit::Item, PrefsEditE
             } else if key == EDIT_DISPLAY_FONT
                 && let Some(canon) = aterm_render::display_face_canonical_id(trimmed)
             {
-                // A case-variant id is AUTHORED as its canonical spelling.
                 Value::from(canon)
             } else {
                 let canon = options
@@ -3377,7 +3375,7 @@ pub(crate) fn shared_row_notes<'a>(
         .collect()
 }
 
-/// WHEN A SAVED CHANGE TAKES EFFECT, where that is not at once.
+/// When a saved change takes effect, where that is not at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum ApplicationTiming {
     AfterRestart,
@@ -3486,11 +3484,8 @@ pub(crate) fn security_label(key: &str) -> &'static str {
         EDIT_SECURE_KEYBOARD_ENTRY => "Secure Keyboard Entry (block keystroke snooping)",
         EDIT_ALLOW_WINDOW_OPS => {
             if cfg!(target_os = "linux") {
-                // The manipulation half is wired on Linux.
                 "Allow programs to resize the window and read its title and size"
             } else {
-                // No host callback off Linux: reports only, which include the
-                // engine's pixel answers (CSI 14 t, CSI 16 t), hence "size".
                 "Allow programs to read the window title and size"
             }
         }
@@ -3539,7 +3534,7 @@ pub(crate) struct Range {
     pub(crate) step: f64,
 }
 
-/// THE UNIT A NUMERIC SETTING IS COUNTED IN, as the suffix its number takes (" px", " ms", "%", "×", " cells").
+/// The unit a numeric setting is counted in, as the suffix its number takes (" px", " ms", "%", "×", " cells").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct NumericUnit {
     pub(crate) one: &'static str,
@@ -3595,7 +3590,7 @@ fn numeric_symbol(key: &str) -> Option<&'static str> {
     })
 }
 
-/// HOW A NUMBER READS.
+/// Formatted display string for a numeric setting value.
 pub(crate) fn numeric_reading(key: &str, value: f64, shown: &str) -> Option<String> {
     if key == EDIT_CURSOR_TRAIL_BLOOM_STRENGTH {
         return Some(format!("{:.0}%", value * 100.0));
@@ -4305,7 +4300,6 @@ fn apply_theme_typography(
             continue;
         }
         if matches!(field.kind, EditKind::Bool) {
-            // A checkbox shows the state in force.
             field.seed = Some(value);
         } else {
             field.placeholder = format!("{value} (from theme {theme_label})");

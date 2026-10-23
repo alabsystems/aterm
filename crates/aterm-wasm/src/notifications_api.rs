@@ -3,17 +3,6 @@
 
 //! OSC 9 / 99 / 777 desktop notifications on [`WebTerminal`](crate::WebTerminal):
 //! an authorization passthrough plus a poll drain (JSON out, `None` when empty).
-//!
-//! The engine delivers notifications only through its host callbacks, never the OSC
-//! event queue, so [`wire_notification_queue`] routes both callbacks into a bounded
-//! queue that
-//! [`WebTerminal::take_notifications`](crate::WebTerminal::take_notifications)
-//! drains. The engine's gate stays fail-closed: the handlers return before any
-//! callback runs until the host passes `true` to
-//! [`WebTerminal::authorize_notifications`](crate::WebTerminal::authorize_notifications).
-//!
-//! Shared with `aterm-gpu-web`, which mounts this file by `#[path]`;
-//! [`WebTerminal`](crate::WebTerminal) is each crate's own terminal type.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -23,19 +12,15 @@ use aterm_types::osc::{Notification, NotificationUrgency};
 
 use crate::json_string;
 
-/// Drain handle shared with the engine callbacks, which must be `Send + 'static`
-/// (hence `Arc<Mutex<..>>` on single-threaded wasm).
+/// Drain handle shared with the engine callbacks, which must be `Send + 'static` (hence `Arc<Mutex<..>>` on single-threaded wasm).
 pub(crate) type NotificationQueue = Arc<Mutex<VecDeque<Notification>>>;
 
 /// Cap on undrained notifications, matching the engine's `MAX_PENDING_NOTIFICATIONS`.
-/// Overflow refuses the new notification rather than evicting old ones.
 pub(crate) const MAX_QUEUED_NOTIFICATIONS: usize = 64;
 
-/// Wire the OSC 9 and OSC 99 / 777 notification callbacks into a fresh bounded
-/// queue and return its drain handle. Called once at construction.
+/// Wire the OSC 9 and OSC 99 / 777 notification callbacks into a fresh bounded queue and return its drain handle.
 pub(crate) fn wire_notification_queue(term: &mut Terminal) -> NotificationQueue {
     let queue: NotificationQueue = Arc::new(Mutex::new(VecDeque::new()));
-    // OSC 9 carries a bare message: a body with no title, as the native host maps it.
     let q = Arc::clone(&queue);
     term.set_notification_callback(move |message| {
         enqueue(
@@ -53,7 +38,6 @@ pub(crate) fn wire_notification_queue(term: &mut Terminal) -> NotificationQueue 
     queue
 }
 
-/// Append one notification, refusing the new one at the cap.
 fn enqueue(queue: &NotificationQueue, notification: Notification) {
     let mut q = queue.lock().expect("notification queue poisoned");
     if q.len() < MAX_QUEUED_NOTIFICATIONS {
@@ -61,8 +45,7 @@ fn enqueue(queue: &NotificationQueue, notification: Notification) {
     }
 }
 
-/// Drain the queue into the `take_notifications` JSON array; `None` when
-/// nothing is pending.
+/// Drain the queue into the `take_notifications` JSON array; `None` when nothing is pending.
 pub(crate) fn drain_notifications_json(queue: &NotificationQueue) -> Option<String> {
     let mut q = queue.lock().expect("notification queue poisoned");
     if q.is_empty() {
@@ -72,8 +55,6 @@ pub(crate) fn drain_notifications_json(queue: &NotificationQueue) -> Option<Stri
     Some(format!("[{}]", objects.join(",")))
 }
 
-/// One notification as `{"id","title","body","urgency"}` (string or `null`; urgency
-/// `"low"|"normal"|"critical"`).
 fn notification_json(n: &Notification) -> String {
     let field = |v: &Option<String>| v.as_deref().map_or_else(|| "null".to_string(), json_string);
     format!(
@@ -90,30 +71,20 @@ const fn urgency_label(urgency: NotificationUrgency) -> &'static str {
     match urgency {
         NotificationUrgency::Low => "low",
         NotificationUrgency::Critical => "critical",
-        // Normal, plus any future non_exhaustive variant, reads as normal.
         _ => "normal",
     }
 }
 
-/// The JS-visible surface. Each crate expands it onto its own terminal
-/// type, under its own export attribute, with `web_terminal_impl!`: the
-/// attribute names the JS class after the impl's type, which this shared
-/// file cannot spell.
 macro_rules! bind {
     ($terminal:ident, $export:ident) => {
         #[cfg_attr(target_arch = "wasm32", $export)]
         impl $terminal {
-            /// Authorize (`true`) or revoke (`false`) OSC 9 / 99 / 777 notifications; the
-            /// engine is fail-closed until authorized. Already-queued notifications stay
-            /// drainable after a revoke.
+            /// Authorize (`true`) or revoke (`false`) OSC 9 / 99 / 777 notifications; the engine is fail-closed until authorized.
             pub const fn authorize_notifications(&mut self, allowed: bool) {
                 self.term.set_allow_notifications(allowed);
             }
 
-            /// Drain pending notifications as a JSON array of
-            /// `{"id","title","body","urgency"}` objects; `None` when nothing is pending.
-            /// OSC 9's bare message arrives as `body` with no title. The queue is bounded,
-            /// so poll after `process`.
+            /// Drain pending notifications as a JSON array of `{"id","title","body","urgency"}` objects; `None` when nothing is pending.
             pub fn take_notifications(&mut self) -> Option<String> {
                 drain_notifications_json(&self.notifications)
             }
@@ -142,7 +113,6 @@ mod tests {
     #[test]
     fn unauthorized_notifications_never_enqueue() {
         let mut t = crate::system_font_terminal(24, 80, 16.0);
-        // No authorize call: the engine's fail-closed default must hold.
         t.process(b"\x1b]9;nope\x07");
         t.process(b"\x1b]99;u=2;nope\x07");
         t.process(b"\x1b]777;notify;Nope;Nope\x07");
@@ -150,7 +120,6 @@ mod tests {
             t.take_notifications().is_none(),
             "unauthorized notifications must never reach the queue"
         );
-        // Revoking after a grant restores the engine's fail-closed gate.
         t.authorize_notifications(true);
         t.authorize_notifications(false);
         t.process(b"\x1b]9;still nope\x07");
@@ -198,7 +167,6 @@ mod tests {
             "overflow notifications are refused, not evicting old ones"
         );
         assert!(t.take_notifications().is_none(), "drain empties the queue");
-        // The queue accepts again after a drain.
         t.process(b"\x1b]9;after\x07");
         assert!(
             t.take_notifications()

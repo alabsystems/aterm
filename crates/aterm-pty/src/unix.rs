@@ -10,7 +10,7 @@ use std::ptr;
 
 use crate::{ShellHangup, ShellIdentity, SpawnedShell, build_child_env};
 
-const SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+const SANDBOX_EXEC_PATH: &str = aterm_uds::os_path!("sandbox-exec");
 
 /// [`spawn_shell_with_pid`] minus the pid, with the hardened default limits.
 #[cfg(test)]

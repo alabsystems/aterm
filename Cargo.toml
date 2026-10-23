@@ -12,7 +12,7 @@ members = ["crates/*"]
 default-members = [
     "crates/agh", "crates/agh-fake", "crates/amacs", "crates/amacs-files", "crates/amacs-term",
     "crates/aterm", "crates/aterm-a11y", "crates/aterm-agent", "crates/aterm-alloc", "crates/aterm-aos", "crates/aterm-arrayvec",
-    "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-buffer",
+    "crates/aterm-bidi", "crates/aterm-bits", "crates/aterm-bootstrap-verify", "crates/aterm-buffer",
     "crates/aterm-caffeine", "crates/aterm-cap",
     "crates/aterm-cfg-if", "crates/aterm-cg", "crates/aterm-cli", "crates/aterm-codec",
     "crates/aterm-conformance", "crates/aterm-containment", "crates/aterm-control",
@@ -79,7 +79,7 @@ bundle = []
 update_channel = "alabsystems/aterm"
 
 [workspace.package]
-version = "0.122.0"
+version = "0.123.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -122,6 +122,7 @@ aterm-alloc = { path = "crates/aterm-alloc" }
 aterm-aos = { path = "crates/aterm-aos" }
 aterm-bidi = { path = "crates/aterm-bidi" }
 aterm-bits = { path = "crates/aterm-bits" }
+aterm-bootstrap-verify = { path = "crates/aterm-bootstrap-verify" }
 aterm-cap = { path = "crates/aterm-cap" }
 aterm-census = { path = "crates/aterm-census" }
 aterm-cg = { path = "crates/aterm-cg" }

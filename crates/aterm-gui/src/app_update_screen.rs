@@ -15,10 +15,8 @@ fn source_is_automatic(source: &str) -> bool {
     source.starts_with("automatic")
 }
 
-/// Serializes tests that access the process-wide scratch update ledger
-/// (`ATERM_UPDATE_ROOT`), whose standing slots (`last_apply_failure_target_build`)
-/// are single-valued across parallel tests. Absorbs poison so one panicking test
-/// does not cascade.
+/// Serializes tests that access the process-wide scratch update ledger (`ATERM_UPDATE_ROOT`),
+/// absorbing poison so one panicking test does not cascade.
 #[cfg(test)]
 pub(crate) static UPDATE_LEDGER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -86,14 +84,11 @@ impl App {
     }
 }
 
-/// `true` while the `ATERM_DEBUG_SEAMLESS_REEXEC` dev seam is armed (always `false`
-/// in release builds). Re-execs the running binary through the seamless handoff
-/// and adopt path.
+/// Whether the `ATERM_DEBUG_SEAMLESS_REEXEC` dev seam is armed (always `false` in
+/// release builds) to re-exec the running binary through seamless handoff.
 pub(crate) fn debug_seamless_reexec_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ARMED.get_or_init(|| {
-        // Read the environment directly (`env_flag_engaged` rejects unset, empty, and "0")
-        // rather than calling `debug_seamless_reexec_armed` recursively inside `OnceLock`.
         let on = aterm_types::control_socket::env_flag_engaged(
             aterm_types::dev_seam!("ATERM_DEBUG_SEAMLESS_REEXEC")
                 .map(|v| v.to_string_lossy().into_owned())
@@ -132,8 +127,7 @@ pub(crate) const UPDATE_WAITS_FOR_YOU: &str = "Update waits for you";
 /// [`App::apply_posture_with`] is testable without mutating process environment.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ApplyPostureEnv {
-    /// Why in-session handoff is unavailable ([`App::seamless_handoff_unavailable`]).
-    /// When `Some`, cold apply is refused while any PTY is open.
+    /// Reason in-session handoff is unavailable ([`App::seamless_handoff_unavailable`]).
     pub(crate) handoff_unavailable: Option<crate::app_update_handoff::HandoffUnavailable>,
     /// Configured `[update] auto_apply` policy.
     pub(crate) auto_apply: crate::app_config::AutoApplySetting,
@@ -185,9 +179,8 @@ impl App {
         };
     }
 
-    /// Record progress for an unattended background download without raising a band row.
-    /// Republishes whole-MB progress to open Settings views only when the text changes.
-    /// Returns `true` when handled quietly.
+    /// Record unattended background download progress without raising a band row,
+    /// republishing whole-MB progress to open Settings views and returning `true` when handled quietly.
     fn note_quiet_update_progress(&mut self, progress: &aterm_update::Progress) -> bool {
         use aterm_update::Progress as P;
         let quiet = match progress {
@@ -275,7 +268,6 @@ impl App {
         staged_build: Option<u64>,
     ) -> crate::update_apply_trouble::ApplyRetry {
         use crate::update_apply_trouble::ApplyRetry;
-        // A standing environmental block's remedy takes precedence over the ledger's last failure reason.
         if let Some(remedy) =
             staged_build.and_then(|build| self.auto_apply_environment_remedy(build))
         {
@@ -314,7 +306,6 @@ impl App {
         use crate::app_config::AutoApplySetting;
         use crate::update_words::{ApplyPosture as P, AutoApplyVeto};
         if let Some(why) = env.handoff_unavailable {
-            // Carry the policy veto into `HandoffOff` so it does not promise a cold apply when vetoed.
             let veto = match env.auto_apply {
                 AutoApplySetting::OffByConfig => Some(AutoApplyVeto::Config),
                 AutoApplySetting::On if env.nudge_seam => Some(AutoApplyVeto::Env {
@@ -409,7 +400,6 @@ impl App {
             .unwrap_or_default();
         let downloading = downloading.map(|flow| flow.id);
         let msg = crate::update_words::progress(progress, posture, &flow_version);
-        // Announce a staged build at most once per `(build, posture)`.
         let staged_key = match (progress, posture) {
             (aterm_update::Progress::Staged { build, .. }, Some(posture)) => {
                 Some((*build, posture))
@@ -459,8 +449,6 @@ impl App {
                 return;
             }
         };
-        // Byte-count ticks under identical wording restate the live row in place without
-        // logging; phase changes supersede the row.
         let same_words = self
             .live_update_flow()
             .and_then(|flow| self.messages.live(flow.id))
@@ -472,9 +460,8 @@ impl App {
         }
     }
 
-    /// Update the live ready row's wording when `build`'s [`ApplyPosture`] changes.
-    /// Withdraws the row if the posture becomes log-only, or raises the ready decision
-    /// once if the lane just stopped with no row up.
+    /// Update the live ready row's wording when `build`'s [`ApplyPosture`] changes,
+    /// withdrawing a log-only row or raising the ready decision once if the lane stopped.
     pub(crate) fn restate_staged_bar_posture(&mut self, build: u64) {
         let posture = self.apply_posture_for(build);
         self.restate_staged_bar_posture_in(build, posture);
@@ -609,7 +596,6 @@ impl App {
             } else {
                 self.apply_native_update(crate::native_updater_service::ApplyMode::Immediate)
             };
-            // Debug re-exec routes through `react_to_update_apply_outcome` to avoid writing the durable ledger.
             if debug_seamless {
                 self.react_to_update_apply_outcome("manual", outcome.clone(), true);
             } else {
@@ -672,8 +658,6 @@ impl App {
         target_build: u64,
     ) {
         let current_build = self.native_updater_service.snapshot().current_build;
-        // Record any queued schedule standing note after `record_apply_failure` (which clears
-        // prior refusals); a refusal outcome supersedes the note.
         let standing = self.apply_schedule_standing.take();
         match apply_ledger_verdict(outcome) {
             ApplyLedgerVerdict::Failed(message) => {
@@ -720,7 +704,6 @@ impl App {
         open_details: bool,
         attempted: Option<u64>,
     ) {
-        // Scheduled retries stay log-only; only actionable blockers or a stopped lane raise a band row.
         let staged = self
             .native_updater_service
             .snapshot()
@@ -762,7 +745,6 @@ impl App {
             }
             crate::native_app::UpdateOutcome::Deferred { reason } => {
                 aterm_log::info!("update apply ({source}) deferred: {reason}");
-                // Restore any row rewritten to "installing", and raise a decision row only if the lane stopped.
                 self.retire_update_installing();
                 if open_details {
                     let _ = self
@@ -795,7 +777,6 @@ impl App {
                     let _ = self
                         .open_settings_tab(crate::native_settings::SettingsRoute::SoftwareUpdate);
                 } else if retry_scheduled {
-                    // When a retry is scheduled, restate the flow row and log the capture refusal.
                     self.retire_charging_surge();
                     if let Some((staged_build, _)) = &staged {
                         self.restate_staged_bar_posture(*staged_build);
@@ -855,7 +836,6 @@ impl App {
                             ));
                         }
                     } else {
-                        // Standing block remedy takes precedence over the attempt's raw failure message.
                         let detail = self
                             .person_remedy_for(staged_build)
                             .or_else(|| {
@@ -896,7 +876,6 @@ impl App {
                             false,
                         ));
                     }
-                    // Withdraw any ready row for the consumed artifact.
                     self.retire_staged_update_row(false);
                 }
             }
@@ -1050,7 +1029,6 @@ impl App {
             self.record_message(msg);
             return;
         }
-        // Withdraw any live ready row before posting an outcome that carries `Install now`.
         if msg
             .actions
             .iter()
@@ -1060,8 +1038,6 @@ impl App {
             self.update_flow = None;
             self.withdraw_message(id);
         }
-        // Resolve a distinct prior held outcome before superseding it; identical words
-        // re-anchor the existing row in place.
         let normalized = msg.clone().normalized();
         let repeats = self
             .messages
@@ -1130,8 +1106,7 @@ impl App {
     }
 
     /// Mark the update row as installing before building the handoff carry (adding a row
-    /// only for explicit user-initiated applies). The upgrade rim starts later at reader
-    /// park ([`Self::charge_upgrade_rim_at_park`]).
+    /// only for explicit user-initiated applies; the upgrade rim starts at [`Self::charge_upgrade_rim_at_park`]).
     #[cfg(any(unix, test))]
     pub(crate) fn begin_update_installing(&mut self, explicit: bool) {
         use crate::messages_host::FlowPhase;
@@ -1143,7 +1118,6 @@ impl App {
             .map(|staged| staged.version.clone())
             .unwrap_or_default();
         let installing = crate::update_words::installing(&version);
-        // Preflight passed: withdraw any standing user-blocker wait row before building carry.
         self.update_wait_said = false;
         if let Some(id) = self
             .messages
@@ -1152,7 +1126,6 @@ impl App {
         {
             self.messages.withdraw(id, std::time::Instant::now());
         }
-        // On a held press re-entry, keep the pre-install row snapshot captured on the first entry.
         if self
             .live_update_flow()
             .is_some_and(|flow| flow.phase == FlowPhase::Installing)
@@ -1215,7 +1188,6 @@ impl App {
             }
         }
         self.retire_charging_surge();
-        // Defer row geometry sync to the trailing outcome/handoff wake to avoid a double re-grid.
         self.request_redraw_all_windows();
     }
 
@@ -1289,9 +1261,8 @@ enum ApplyLedgerVerdict {
     Silent,
 }
 
-/// Map an [`UpdateOutcome`] to its [`ApplyLedgerVerdict`]. `Accepted` and
-/// `InstalledNeedsRelaunch` are `Silent`: apply success is confirmed only by
-/// `confirm_boot_health` on the new build.
+/// Map an [`UpdateOutcome`] to its [`ApplyLedgerVerdict`] (`Accepted` and
+/// `InstalledNeedsRelaunch` are `Silent` until `confirm_boot_health` confirms boot).
 fn apply_ledger_verdict(outcome: &UpdateOutcome) -> ApplyLedgerVerdict {
     match outcome {
         UpdateOutcome::Failed { message } => ApplyLedgerVerdict::Failed(message.clone()),

@@ -20,8 +20,7 @@ pub(crate) fn now_s() -> u64 {
     aterm_time::unix_secs().unwrap_or(0)
 }
 
-/// How long `Not today` holds an upgrade (`--defer`): a day. It lapses on
-/// its own, and an upgrade still behind is shown again when it does.
+/// How long `Not today` holds an upgrade (`--defer`): a day.
 pub(crate) const NOT_TODAY_S: u64 = 24 * 3_600;
 
 /// An upgrade action pressed by the owner on a tab.
@@ -33,8 +32,7 @@ pub(crate) struct WordAsk {
     pub(crate) to: String,
     /// Which word.
     pub(crate) word: UpgradeWord,
-    /// The conversation of the tab's row for `to` at the press
-    /// ([`App::send_upgrade_word`]; empty: none).
+    /// The conversation of the tab's row for `to` at the press.
     pub(crate) session: String,
 }
 
@@ -63,8 +61,6 @@ impl WordAsk {
 #[derive(Clone)]
 pub(crate) struct WordWriter(Arc<WriteFn>);
 
-/// The writer's body: the tab's upgrade as the word left it, or why nothing
-/// was written.
 type WriteFn = dyn Fn(&WordAsk) -> Result<Row, String> + Send + Sync;
 
 impl WordWriter {
@@ -166,10 +162,6 @@ pub(crate) fn word_writer_at(home: PathBuf, state: PathBuf, sock: Option<String>
     })
 }
 
-/// The host's last rows `shown` with a pressed word's answer `row` laid in over its own
-/// conversation's row in its tab, each judged again at `now` (`Row::reread`: the awake clock
-/// as it stands, the host's grace kept); `None` when that conversation has no row there (the
-/// host's own rows may have landed first).
 fn laid_in(shown: &[Row], row: Row, now: u64) -> Option<Vec<Row>> {
     let mut rows = shown.to_vec();
     let at = rows
@@ -215,14 +207,10 @@ struct StallRow {
     place: String,
 }
 
-/// Whether a stall's `said` is a restart in flight that has not moved
-/// (`stuck:<what>`, `upgrade_drive::Row::stall`).
 fn stuck(said: &str) -> bool {
     said.starts_with("stuck:")
 }
 
-/// One waiting record's words: its title, its detail and the owner's words
-/// it offers.
 type WaitingSaid = (String, Vec<String>, Vec<Intent>);
 
 /// Which way a stall's entry changed shape ([`reshaped`]).
@@ -234,8 +222,6 @@ enum Reshape {
     ToRow,
 }
 
-/// Whether `fresh` is `posted`'s same stall and target in the other shape (`/row` ⇄
-/// `/record`; the shape is part of what was said), and which way.
 fn reshaped(posted: &str, fresh: &str) -> Option<Reshape> {
     let flip = |from: &str, to: &str, way: Reshape| {
         let (was, is) = (posted.strip_suffix(from)?, fresh.strip_suffix(to)?);
@@ -244,9 +230,6 @@ fn reshaped(posted: &str, fresh: &str) -> Option<Reshape> {
     flip("/row", "/record", Reshape::ToRecord).or_else(|| flip("/record", "/row", Reshape::ToRow))
 }
 
-/// A stall record's first detail line (`behind for 7 h: its own work runs`,
-/// `Row::stall_words`) saying `age` instead; `None` for a line that says no
-/// age.
 fn aged(line: &str, age: &str) -> Option<String> {
     let rest = line.strip_prefix("behind for ")?;
     Some(match rest.split_once(':') {
@@ -255,16 +238,8 @@ fn aged(line: &str, age: &str) -> Option<String> {
     })
 }
 
-/// How long the host's rows may lag a word written ([`UpgradeView::worded`]):
-/// the word's own announcement asks the host to look again, and a look takes
-/// well under a second; a minute covers a busy machine, and a host that has
-/// still not read the word by then is believed.
 const WORD_LAG: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// One word written ([`UpgradeView::worded`]): the row it came back with, when it landed,
-/// and the phase it was pressed on when the word itself moved the phase (a Defer or Skip
-/// ends an announcement, `--now` re-arms a round that gave up), which a host row read
-/// before the word still carries.
 type Worded = (Row, std::time::Instant, Option<Phase>);
 
 /// Window-side cache of live agent upgrade rows and menus.
@@ -322,8 +297,6 @@ pub(crate) struct UpgradeView {
 }
 
 impl UpgradeView {
-    /// What the view shows is stale (a press refused because its round stopped): ask the
-    /// host to look again at its next wake.
     fn look_again(&mut self) {
         #[cfg(test)]
         {
@@ -332,9 +305,6 @@ impl UpgradeView {
         crate::harness_host::look_at_upgrades_soon();
     }
 
-    /// A word written, from its own row ([`Self::worded`]), and the phase the view's row
-    /// for its tab had when it was pressed, where the word moved it: the view's rows take
-    /// the word's only after this.
     fn word_landed(&mut self, row: &Row) {
         if row.request_at != 0 {
             let pressed_on = self
@@ -350,10 +320,6 @@ impl UpgradeView {
         }
     }
 
-    /// The host's rows, with the owner's words they were read too soon to carry. The host
-    /// reads the upgrades and a word is written, both off the winit thread, so a summary
-    /// read between two tabs' words can arrive after every word landed and read the later
-    /// tabs overdue again.
     fn words_landed(&mut self, rows: &mut [Row]) {
         self.worded.retain(|tab, (word, at, pressed_on)| {
             at.elapsed() < WORD_LAG
@@ -418,7 +384,6 @@ impl UpgradeView {
     }
 }
 
-/// A row's menu section, when a word would do something.
 fn menu_of(row: &Row, now: u64) -> Option<crate::session_chrome::UpgradeMenu> {
     let words = message_reporters::agent_upgrade_words(row, now);
     (!words.is_empty()).then(|| crate::session_chrome::UpgradeMenu {
@@ -429,8 +394,6 @@ fn menu_of(row: &Row, now: u64) -> Option<crate::session_chrome::UpgradeMenu> {
     })
 }
 
-/// Whether the owner saw a stalled row through (the once-only rule): read (its hold
-/// folded) or dismissed.
 const fn seen_through(record: &aterm_messages::LogRecord) -> bool {
     matches!(
         record.retired(),
@@ -554,8 +517,6 @@ impl App {
         let _ = self.send_upgrade_word(WordAsk::new(sid, to, word));
     }
 
-    /// The waiting record: recorded when its words change, never a row, and stable across
-    /// looks.
     fn record_upgrade_waiting(&mut self, rows: &[Row], now: u64) {
         let waiting: Vec<&Row> = rows
             .iter()
@@ -604,11 +565,6 @@ impl App {
         self.record_message(msg);
     }
 
-    /// The row this stall already has from before this process (whose view of it went with
-    /// the process that kept it): a row under the stall's key still on the band (carried
-    /// across the handoff), or, off it, the latest record under that key when it is the
-    /// same stall ([`message_reporters::same_stall`]) and the owner saw it through (read or
-    /// dismissed).
     fn stall_already_shown(&self, msg: &aterm_messages::Message) -> Option<MessageId> {
         let key = msg.key.as_deref()?;
         if msg.hold == aterm_messages::Hold::LogOnly {
@@ -627,9 +583,6 @@ impl App {
             .then_some(record.id)
     }
 
-    /// The record this stall already has from before this process: a tab whose upgrade asks
-    /// on its own has a record for its entry, which each restart or update handoff would
-    /// otherwise record again.
     fn stall_already_recorded(
         &self,
         key: &str,
@@ -648,10 +601,6 @@ impl App {
         .then_some(record.id)
     }
 
-    /// The end of a stall whose row is down already: `posted`'s row was read or dismissed
-    /// before the stall ended, so there is no live row to resolve, and the same stall back
-    /// would be taken for the row already seen ([`Self::stall_already_shown`]) and never
-    /// shown.
     fn record_stall_over(
         &mut self,
         posted: &StallRow,
@@ -686,9 +635,6 @@ impl App {
         ));
     }
 
-    /// Aterm's own faults in the upgrade, told once each: a wait aterm does not classify, a
-    /// notice its screen keeps refusing, a record no look has visited, a relaunched agent
-    /// that never idles, a record with no progress in a day.
     fn note_upgrade_faults(&mut self, rows: &[Row], now: u64) {
         use aterm_agent::harness::upgrade_drive::Attention;
         let faults: BTreeMap<String, (&Row, aterm_agent::harness::upgrade_drive::Need)> = rows
@@ -711,10 +657,6 @@ impl App {
         }
     }
 
-    /// The upgrade's exceptions: rows the classifier calls a `Digest`
-    /// ([`upgrade_drive::Row::attention`]) reach the exceptions digest ("To look at") as one
-    /// dismissable line per kind of wait, never a band row, tab mark, menu-bar row or
-    /// notification.
     fn note_upgrade_exceptions(&mut self, rows: &[Row], now: u64) {
         let spots: Vec<(&Row, message_reporters::UpgradeSpot)> = rows
             .iter()
@@ -724,10 +666,6 @@ impl App {
         self.except_replace(aterm_messages::exceptions::Family::Upgrade, &entries);
     }
 
-    /// Whether the stall `posted` stands for is now `fresh`, the same stall and target in
-    /// the other shape ([`reshaped`]), only while its entry is what that shape turns: a row
-    /// still on the glass (one the owner put down is not raised for it), a record still a
-    /// record, and never under a stuck restart's words.
     fn entry_reshaped(
         &self,
         posted: &StallRow,
@@ -755,9 +693,6 @@ impl App {
         fits.then_some(way)
     }
 
-    /// A stall's record re-worded in place ([`App::reword_record`]): in `msg`'s words where
-    /// they were drawn for the capsules the record keeps; otherwise only its age moves, so
-    /// its words never offer a button it does not have.
     fn reword_stall_record(
         &mut self,
         id: MessageId,
@@ -788,9 +723,6 @@ impl App {
         let _ = self.reword_record(id, &msg);
     }
 
-    /// One entry per stalled tab (a row only for an interrupt); a tab that recovered has
-    /// its entry resolved, and a stall the owner already has from before this process is
-    /// not posted again ([`Self::stall_already_shown`]).
     fn post_upgrade_stalls(&mut self, shown: &[Row], rows: &[Row], now: u64) {
         let stalled: BTreeMap<String, (&Row, String)> = shown
             .iter()
@@ -1206,7 +1138,7 @@ impl App {
         }
     }
 
-    /// Human-readable tab location for `sid` (e.g. `in tab 2`).
+    /// Human-readable tab location for `sid` (such as `in tab 2`).
     pub(crate) fn upgrade_place(&self, sid: &str) -> String {
         self.upgrade_spot(sid).place
     }
@@ -1266,11 +1198,6 @@ impl App {
         }
     }
 
-    /// The pane word of session `sid`'s leaf in the tab that shows it among
-    /// the tab's agent sessions the Harness page admits
-    /// ([`agent_pane_word`]) — or, with `every_pane`, among all its panes
-    /// ([`pane_word`]) — or `None` where that tab holds one such, or none
-    /// shows it.
     fn session_pane(&self, sid: &str, every_pane: bool) -> Option<String> {
         let local_of = |view: &crate::tab_model::ViewId| {
             self.view_store
@@ -1386,10 +1313,6 @@ impl App {
     }
 }
 
-/// Whether the session `row` moves runs a build older than `managed`: the build it is
-/// moving from, or, once relaunched (its relaunch line typed the target, even while it
-/// waits for the idle point) or done, the one it moved onto, whatever its row targets
-/// next.
 fn runs_older(row: &Row, managed: &str) -> bool {
     use aterm_agent::harness::upgrade::Version;
     let runs = if matches!(row.phase, Phase::Done | Phase::Relaunched { .. }) {
@@ -1403,8 +1326,6 @@ fn runs_older(row: &Row, managed: &str) -> bool {
     }
 }
 
-/// Whether two version strings name the same build: equal as versions
-/// (`2.1` is `2.1.0`), or, where either does not parse, as text.
 fn same_build(a: &str, b: &str) -> bool {
     use aterm_agent::harness::upgrade::Version;
     match (Version::parse(a), Version::parse(b)) {
@@ -1413,8 +1334,6 @@ fn same_build(a: &str, b: &str) -> bool {
     }
 }
 
-/// Pane words for the Harness page's already admitted agent identities:
-/// the same table predicate its rows use.
 fn agent_pane_word<T>(
     tree: &crate::tab_model::SplitTree<T>,
     is_target: impl Fn(&T) -> bool,
@@ -1476,8 +1395,6 @@ mod tests {
     use crate::toolchain_words::PerAgent;
     use aterm_agent::harness::upgrade::{Agent, Request};
 
-    /// A pending upgrade `behind_for` behind, waiting on a notice behind a full queue: a
-    /// wait `Upgrade now` still moves once it is overdue.
     fn row(tab: &str, behind_for: u64) -> Row {
         let now = now_s();
         Row {
@@ -1494,9 +1411,6 @@ mod tests {
         }
     }
 
-    /// An agent the upgrade ended and could not bring back: the one state that takes a band
-    /// row (`Row::attention`, `Interrupt`, kind `agent-down`), whose action is the resume
-    /// command.
     fn gone(tab: &str) -> Row {
         Row {
             behind_since: now_s() - 7 * 3_600,
@@ -1504,7 +1418,6 @@ mod tests {
         }
     }
 
-    /// The records of the harness tag whose title says `part`.
     fn records_titled(app: &App, part: &str) -> Vec<(String, Vec<String>)> {
         harness_records(app)
             .into_iter()
@@ -1521,12 +1434,6 @@ mod tests {
             .collect()
     }
 
-    /// LC-9 OF — `status upgrade=` NAMES THE TAB'S NEWEST
-    /// MOVE: a tab whose earlier move finished (a fresh restart onto a new
-    /// conversation, shown for ten minutes) and whose newer move — the new
-    /// conversation's — failed has two rows, handed in session-id order; the
-    /// first was taken, so `upgrade=` said `done` while the agent was down
-    /// (measured on the base in the real-Claude lab, 2026-10-15, `s2l2`).
     #[test]
     fn status_names_the_tabs_newest_move() {
         let mut app = App::headless_for_test();
@@ -1578,8 +1485,6 @@ mod tests {
         );
     }
 
-    /// A wait flipping between the ladder's comfort and a floor is recorded once each; a
-    /// new floor is news, and after nothing waits, the same wait is news again.
     #[test]
     fn a_wait_flipping_between_comfort_and_a_floor_is_recorded_once_each() {
         let claude = |tab: &str, wait: &str| Row {
@@ -1619,7 +1524,6 @@ mod tests {
         assert_eq!(lines(&app).len(), 3, "{:?}", lines(&app));
     }
 
-    /// Two registered tabs, as `(local id, sid)`.
     fn two_tabs(app: &App) -> [(u64, String); 2] {
         let mut store = app.store.write().unwrap();
         let (a, b) = (
@@ -1635,8 +1539,6 @@ mod tests {
         ids
     }
 
-    /// An ended agent's row offers `Show tab N`, restated with its place when the tab moves
-    /// windows.
     #[test]
     fn an_ended_agents_row_takes_the_owner_to_its_tab() {
         let mut app = App::headless_for_test();
@@ -1720,8 +1622,6 @@ mod tests {
         assert!(nowhere.actions.is_empty(), "{:?}", nowhere.actions);
     }
 
-    /// A refused press on an interrupt's row keeps the row's buttons and stands through a
-    /// look that moves nothing; once the tab moves, the look restates it.
     #[test]
     fn a_refused_press_on_an_interrupts_row_stands_until_its_tab_moves() {
         let (mut app, [_, _, c]) = three_tabs();
@@ -1776,8 +1676,6 @@ mod tests {
         );
     }
 
-    /// A headless app with three tabs in its one window, and each tab's
-    /// session id (`s-<hex>`), in strip order.
     fn three_tabs() -> (App, [String; 3]) {
         let mut app = App::headless_for_test();
         let wid = crate::WindowId(0);
@@ -1811,8 +1709,6 @@ mod tests {
         cols.rsplit(' ').next().unwrap_or_default().to_string()
     }
 
-    /// Each tab's `upgrade=` column is its own row; a tab with none reads `-`, and a row
-    /// that leaves the summary leaves the column.
     #[test]
     fn each_tab_carries_its_own_upgrade_column() {
         let mut app = App::headless_for_test();
@@ -1824,13 +1720,11 @@ mod tests {
         assert_eq!(upgrade_column(&app, a), "upgrade=-", "gone with its row");
     }
 
-    /// `rows` in the order the host hands them over: by conversation.
     fn by_session(mut rows: Vec<Row>) -> Vec<Row> {
         rows.sort_by(|x, y| x.session.cmp(&y.session));
         rows
     }
 
-    /// How many harness records are titled `title`, exactly.
     fn records_exactly(app: &App, title: &str) -> usize {
         harness_records(app)
             .iter()
@@ -1838,19 +1732,14 @@ mod tests {
             .count()
     }
 
-    /// The title of `row`'s finished move's record (`agent_upgrade_done`).
     fn done_title(app: &App, row: &Row) -> String {
         message_reporters::agent_upgrade_done(row, &app.upgrade_place(&row.tab)).title
     }
 
-    /// The finished words of a stall of `row`'s tab whose move went through
-    /// (`agent_upgrade_went_through`).
     fn went_through_title(app: &App, row: &Row) -> String {
         message_reporters::agent_upgrade_went_through(row, &app.upgrade_place(&row.tab))
     }
 
-    /// The title of the record a stall of `row`'s tab, put down, ends with
-    /// while the tab still holds a round (`agent_upgrade_stall_over`).
     fn asks_again_title(app: &App, row: &Row) -> String {
         message_reporters::agent_upgrade_stall_over(
             row.agent,
@@ -1862,11 +1751,6 @@ mod tests {
         .title
     }
 
-    /// A TAB'S `upgrade=` IS ITS NEWEST MOVE, NOT ITS FIRST CONVERSATION
-    /// (LC-9): the host hands over every conversation's row,
-    /// by session id, and a tab can hold a conversation's finished move
-    /// (shown ten minutes) beside the newer one the tab runs now, whose own
-    /// move failed after its exit.
     #[test]
     fn a_tabs_upgrade_column_is_its_newest_move_not_its_first_conversation() {
         let now = now_s();
@@ -1929,8 +1813,6 @@ mod tests {
         assert!(column.starts_with("upgrade=done/2.1.282/"), "{column}");
     }
 
-    /// A TAB'S BAND ROW AND COLUMN NAME THE SAME MOVE (LC-9): two moves of
-    /// one tab that each ended their agent.
     #[test]
     fn a_tabs_band_row_and_column_name_the_same_move() {
         let now = now_s();
@@ -1967,10 +1849,6 @@ mod tests {
         assert_eq!(named(&app, a, &sid_a), (older.clone(), older));
     }
 
-    /// A WORD LANDING KEEPS EVERY CONVERSATION'S ROW (the review of LC-9):
-    /// the window re-applies its own rows with a word's answer laid in, and a
-    /// tab can hold two conversations — one aterm's own fault stands on,
-    /// beside the newer one the word answers.
     #[test]
     fn a_word_landing_keeps_every_conversations_row() {
         let now = now_s();
@@ -2062,11 +1940,6 @@ mod tests {
         }
     }
 
-    /// A RESTART IN FLIGHT SPEAKS FOR ITS TAB, AND ITS STALL ENDS AS GONE
-    /// THROUGH (the review of LC-9): a move's agent the upgrade ended takes
-    /// its row; then its relaunch lands late, the move restarting again, and
-    /// the fresh relaunch's conversation is minted in the tab behind a newer
-    /// build before that move is done.
     #[test]
     fn a_restart_in_flight_speaks_for_its_tab_and_ends_as_went_through() {
         let now = now_s();
@@ -2150,11 +2023,6 @@ mod tests {
         }
     }
 
-    /// A CONVERSATION PENDING BESIDE A MOVE STILL DOWN NEVER ENDS ITS ROW (the
-    /// review of LC-9, LC-2's rule): the owner's agent back in the tab is
-    /// proven there by environment alone, which the host never takes for the
-    /// tab's agent, so the move's `agent-down` row stands; that agent's own
-    /// conversation, behind, has a pending record in the tab.
     #[test]
     fn a_conversation_pending_beside_a_move_down_never_ends_its_row() {
         let now = now_s();
@@ -2229,11 +2097,6 @@ mod tests {
         );
     }
 
-    /// A PRESSED WORD NAMES THE CONVERSATION WHOSE ROW ITS TAB SHOWED (the
-    /// review of LC-9): the harness's own read has no roster and can rank
-    /// another conversation of the tab first, so the word carries the row's
-    /// conversation to the writer (`upgrade_drive::ask_for` writes that
-    /// record).
     #[test]
     fn a_pressed_word_names_the_conversation_its_tab_showed() {
         use aterm_messages::UpgradeWord;
@@ -2270,8 +2133,6 @@ mod tests {
         }
     }
 
-    /// A frozen tab with an agent in front is never counted for the hook to type; the same
-    /// tab at its shell is.
     #[test]
     fn a_frozen_tab_running_an_agent_is_never_counted_for_the_hook() {
         let mut app = App::headless_for_test();
@@ -2351,9 +2212,6 @@ mod tests {
         );
     }
 
-    /// An agent known only by its screen reader under a runtime still owns
-    /// its prompt: the installed-agents advice must defer its shell hook until
-    /// that agent exits.
     #[test]
     fn a_node_hosted_agent_known_by_its_reader_keeps_its_prompt_out_of_the_shell_hook_advice() {
         use aterm_phase::Program;
@@ -2433,8 +2291,6 @@ mod tests {
         }
     }
 
-    /// Only a session that will move on its own is said to move; overdue, gave-up or
-    /// skipped ones stay behind, counted by the build they run, native copies included.
     #[test]
     fn only_a_session_running_an_older_build_that_moves_on_its_own_is_said_to_move() {
         let mut app = App::headless_for_test();
@@ -2485,9 +2341,6 @@ mod tests {
         assert_eq!(fresh.tabs_behind(), TabsBehind::default());
     }
 
-    /// A CODEX SESSION IS BEHIND THE MANAGED CODEX: the count read only Claude Code's
-    /// version and dropped every Codex row, so a Codex tab on an older build than the
-    /// managed codex left the record "current" and was named nowhere.
     #[test]
     fn a_codex_session_behind_the_managed_codex_is_counted_and_named() {
         let mut app = App::headless_for_test();
@@ -2553,9 +2406,6 @@ mod tests {
         );
     }
 
-    /// "Are current" is never said while a session runs an older build (counted by the
-    /// build it runs); sessions moved, done or relaunched onto the installed build (even
-    /// stuck past `STALE_S`) leave it "current".
     #[test]
     fn the_install_is_not_current_while_a_session_runs_an_older_build() {
         let current = |rows: Vec<Row>| {
@@ -2626,8 +2476,6 @@ mod tests {
         assert!(current(vec![past_it, done_onto_it]));
     }
 
-    /// One install is one record, its tab counts re-worded in place; a new version is a new
-    /// record.
     #[test]
     fn one_install_is_one_record_whose_counts_move_in_place() {
         let mut app = App::headless_for_test();
@@ -2659,8 +2507,6 @@ mod tests {
         assert_eq!(managed(&app).len(), 2, "a new version is a new record");
     }
 
-    /// A managed record evicted from the ring (`LOG_CAP`) is written again when its words
-    /// move; the same words again write nothing.
     #[test]
     fn a_managed_record_gone_from_the_ring_is_written_again() {
         let mut app = App::headless_for_test();
@@ -2706,8 +2552,6 @@ mod tests {
         );
     }
 
-    /// A tab measured two jobs running to put a foreign copy first counts as shadowed,
-    /// never "from before this update"; one job's reading counts nothing.
     #[test]
     fn a_tab_measured_frozen_is_shadowed_not_from_before_this_update() {
         use crate::session_status::program::PathVerdict;
@@ -2733,8 +2577,6 @@ mod tests {
         assert!(!app.store.read().unwrap().has_frozen_path(a), "no mark");
     }
 
-    /// A move recorded days after its relaunch names when it happened (`Row::moved_at`);
-    /// one recorded minutes after says nothing more, is recorded once, and is never a row.
     #[test]
     fn a_move_finished_days_later_names_when_it_happened() {
         use crate::message_reporters::moved_line;
@@ -2804,8 +2646,6 @@ mod tests {
         assert_eq!(app.messages.live_rows().count(), 0, "a record, never a row");
     }
 
-    /// A [`WordWriter`] that answers `answer` and hands every word it is
-    /// asked to write to the returned receiver.
     fn recording(
         answer: impl Fn(&WordAsk) -> Result<Row, String> + Send + Sync + 'static,
     ) -> (WordWriter, std::sync::mpsc::Receiver<WordAsk>) {
@@ -2817,8 +2657,6 @@ mod tests {
         (writer, rx)
     }
 
-    /// The newest log record keyed for `tab`'s upgrade, live or not: what a
-    /// wait leaves in Settings ▸ Messages (with the owner's words as buttons).
     fn record_id_of(app: &App, tab: &str) -> Option<MessageId> {
         let key = format!("harness.upgrade.{tab}");
         app.messages
@@ -2829,7 +2667,6 @@ mod tests {
             .map(|r| r.id)
     }
 
-    /// The live band row keyed for `tab`'s upgrade.
     fn row_of(app: &App, tab: &str) -> Option<(MessageId, aterm_messages::Message)> {
         let key = format!("harness.upgrade.{tab}");
         app.messages
@@ -2838,8 +2675,6 @@ mod tests {
             .map(|l| (l.id, l.msg.clone()))
     }
 
-    /// A stop that repeats is one calm record through its re-armed rounds, never a row,
-    /// mark or re-post, ending at Done.
     #[test]
     fn a_stop_that_repeats_is_one_record_across_its_rearms_and_ends_at_done() {
         let mut app = App::headless_for_test();
@@ -2905,8 +2740,6 @@ mod tests {
         );
     }
 
-    /// A shutdown hung past `upgrade_drive::HUNG_EXIT_AFTER_S` takes one row (`Press
-    /// Ctrl-C in that tab`), restated in place while stuck and resolved once it moves.
     #[test]
     fn a_restart_that_sticks_keeps_one_row_while_stuck_and_resolves_once_it_moves() {
         let mut app = App::headless_for_test();
@@ -2938,8 +2771,6 @@ mod tests {
         );
     }
 
-    /// A stuck restart's row put down, whose restart then moves again, ends on the record
-    /// as `… moves again in its tab`, never as asking again; one left up is resolved.
     #[test]
     fn a_stuck_row_put_down_ends_on_the_record_as_moving_again_never_asking() {
         let mut app = App::headless_for_test();
@@ -2994,9 +2825,6 @@ mod tests {
         assert_eq!(recorded(&app, a), ended, "Done adds nothing under the key");
     }
 
-    /// Press button `action` of the record `id` on the Settings ▸ Messages
-    /// page, the way a click there does (`perform_message_act`): a wait is a
-    /// record, and its buttons are the owner's words.
     fn press_record(app: &mut App, id: MessageId, action: u8) {
         let outcome = app.perform_message_act(crate::WindowId(0), id.raw(), action);
         assert!(
@@ -3012,14 +2840,11 @@ mod tests {
         app.upgrade_view.row_for(tab).map(|r| r.request.clone())
     }
 
-    /// Row `id`'s record: its title, mark and detail as the log keeps them.
     fn record_of(app: &App, id: MessageId) -> (String, aterm_messages::Severity, Vec<String>) {
         let rec = app.messages.log().get(id).expect("on record");
         (rec.title.clone(), rec.severity, rec.detail.clone())
     }
 
-    /// An overdue tab's menu offers `Upgrade now` while a full queue holds the notice and
-    /// stops once it waits on the READY answer, which `--now` does not waive.
     #[test]
     fn an_overdue_tabs_menu_follows_what_moves_it_now() {
         use aterm_messages::UpgradeWord::{NotToday, Now, Skip};
@@ -3050,8 +2875,6 @@ mod tests {
         assert_eq!(app.messages.revision(), revision, "nothing to restate");
     }
 
-    /// A record whose agent then ended takes a row at once (no snooze capsule); back to
-    /// asking on its own, the row is withdrawn, never `✓`.
     #[test]
     fn a_stall_that_turns_into_an_ended_agent_takes_a_row_and_one_asking_on_its_own_leaves_the_glass()
      {
@@ -3107,8 +2930,6 @@ mod tests {
         assert_eq!(waiting.len(), 2, "the wait's record, then its record again");
     }
 
-    /// A word's answer never brings back a row the host has since dropped; with the row
-    /// still in the view, the answer's row takes its place.
     #[test]
     fn a_words_answer_never_brings_back_a_row_the_host_dropped() {
         let mut app = App::headless_for_test();
@@ -3140,8 +2961,6 @@ mod tests {
         );
     }
 
-    /// Words are written one at a time in press order ([`WordQueue`]): the second never
-    /// enters the writer before the first leaves.
     #[test]
     fn the_owners_words_are_written_one_at_a_time_in_the_order_pressed() {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -3156,7 +2975,6 @@ mod tests {
                 o.store(true, Ordering::SeqCst);
             }
             if ask.word == UpgradeWord::Now {
-                // The first word waits, as on a step holding the lock.
                 let _ = held.lock().unwrap_or_else(|p| p.into_inner()).recv();
             }
             i.fetch_sub(1, Ordering::SeqCst);
@@ -3190,8 +3008,6 @@ mod tests {
         assert_eq!(order, [UpgradeWord::Now, UpgradeWord::NotToday]);
     }
 
-    /// A word refused on a wait's record is a gesture-failure row that carries the press to
-    /// try again, and the host's same rows post the wait no row.
     #[test]
     fn a_refused_word_on_a_waits_record_is_a_gesture_failure_row() {
         use aterm_messages::Hold;
@@ -3229,8 +3045,6 @@ mod tests {
         );
     }
 
-    /// A press refused with `stopped:` is a gesture-failure row naming when it retries, and
-    /// asks the host to look again; a lock-busy refusal does not.
     #[test]
     fn a_press_refused_because_its_round_stopped_says_so_and_looks_again() {
         let mut app = App::headless_for_test();
@@ -3263,8 +3077,6 @@ mod tests {
         );
     }
 
-    /// Through the real `ask_for`, `Skip version` for a build the upgrade moved past leaves
-    /// the state file untouched and says so; the next row's skip is written.
     #[test]
     fn a_press_on_a_record_whose_upgrade_moved_on_lands_on_nothing() {
         let dir = std::env::temp_dir().join(format!(
@@ -3317,9 +3129,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// One waiting session's record offers `Upgrade now` and `Not today` only while that
-    /// upgrade takes them: the owner's `--now` landing elsewhere disables `Upgrade now`, a
-    /// newer target disables both.
     #[test]
     fn one_waiting_session_offers_its_words_while_its_upgrade_takes_them() {
         use crate::native_app::MessageActOutcome;
@@ -3412,7 +3221,6 @@ mod tests {
 
     const KEY_WAITING: &str = message_reporters::KEY_AGENT_UPGRADE;
 
-    /// The AGENT UPGRADE rows of a composed tab menu: (build, word).
     fn upgrade_items(
         entries: &[crate::session_chrome::TabMenuEntry],
     ) -> Vec<(String, aterm_messages::UpgradeWord)> {
@@ -3427,11 +3235,6 @@ mod tests {
             .collect()
     }
 
-    /// A tab's context menu offers its upgrade's words, and a choice writes the word for the
-    /// session and build the card showed, never re-resolved to the pane focused when the
-    /// click lands (a split tab's agents commonly move to the same build, so the harness's
-    /// target check cannot catch it); no row, no section; a session no longer in that tab
-    /// drops the word.
     #[test]
     fn a_tabs_menu_word_is_for_the_session_and_build_its_card_showed() {
         use aterm_messages::UpgradeWord::{NotToday, Now, Skip};
@@ -3503,9 +3306,6 @@ mod tests {
         );
     }
 
-    /// `tab`'s upgrade as a stall that stands as a row: the agent the upgrade ended and
-    /// could not bring back (`Interrupt`, `agent-down`), the only state that takes the
-    /// band.
     fn refused(tab: &str) -> Row {
         Row {
             phase: Phase::Failed("stale-exit".to_string()),
@@ -3516,8 +3316,6 @@ mod tests {
         }
     }
 
-    /// A stall answered with a word is quiet for the day (`STANDING_QUIET`); another tab's
-    /// stall is news.
     #[test]
     fn a_stall_answered_with_a_word_is_quiet_for_the_day() {
         let mut app = App::headless_for_test();
@@ -3554,8 +3352,6 @@ mod tests {
         assert!(row_of(&app, "s-b").is_some(), "another tab: a row");
     }
 
-    /// A refusal put off with `Not today` from the tab menu, across a re-arm, is a row again
-    /// once the deferral runs out; with no word the re-arm keeps the row down.
     #[test]
     fn a_refusal_the_owner_put_off_from_the_tab_menu_is_news_when_it_returns() {
         use aterm_messages::UpgradeWord;
@@ -3598,9 +3394,6 @@ mod tests {
         assert!(row_of(&app, "s-a").is_some(), "back: a row");
     }
 
-    /// After a restart a dismissed row stays down (a carried row is kept in its slot:
-    /// `carried_rows_are_withdrawn_once_every_tab_is_seen_never_fixed`); a row left up
-    /// unread comes back once, an ended stall back is news, a dismissed one quiet a day.
     #[test]
     fn a_stall_the_owner_saw_is_not_posted_again_after_a_restart() {
         let dir = std::env::temp_dir().join(format!("aterm-upgrade-rows-{}", std::process::id()));
@@ -3648,10 +3441,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A successor of an aterm that left `left` up: each posted there, then
-    /// carried across the handoff exactly as an update carries them
-    /// (`MessageCenter::carried` → `seed_carried`), before the successor's
-    /// host has looked at anything.
     fn successor_carrying(left: &[aterm_messages::Message]) -> (App, Vec<MessageId>) {
         let mut parent = App::headless_for_test();
         let ids = left
@@ -3673,8 +3462,6 @@ mod tests {
         (successor, ids)
     }
 
-    /// A give-up row as an earlier build posted it: `Couldn't upgrade Claude · no READY
-    /// answer after 4 notices`, keyed on its tab.
     fn gave_up_row(tab: &str) -> aterm_messages::Message {
         aterm_messages::Message::new(
             aterm_messages::tags::HARNESS,
@@ -3688,11 +3475,6 @@ mod tests {
         .key(&message_reporters::agent_upgrade_key(tab))
     }
 
-    /// A tab the host leaves as it stands (its record could not be read,
-    /// `upgrade_drive::View::refresh_keeping`) keeps what the window shows of
-    /// it: the row an earlier process left up for it is not withdrawn, and this
-    /// process's own row for it stands; every other tab is renewed
-    /// (host-8).
     #[test]
     fn a_tab_left_as_it_stands_keeps_its_rows_and_the_rest_are_renewed() {
         let (carried, other, mine) = ("s-carried", "s-other", "s-mine");
@@ -3729,10 +3511,6 @@ mod tests {
         assert!(app.upgrade_view.rows.is_empty());
     }
 
-    /// A TAB LEFT AS IT STANDS RAISES NO STALL OFF THE ROW THE WINDOW HOLDS FOR
-    /// IT (host-8, the review of its first cut): its record
-    /// cannot be read, so the window keeps its last row for it — and that row,
-    /// read at the window's `now`, ages.
     #[test]
     fn a_tab_left_as_it_stands_raises_no_stall_off_the_row_the_window_holds() {
         let tab = "s-held";
@@ -3753,9 +3531,6 @@ mod tests {
         assert_eq!(row_of(&app, tab).map(|(id, _)| id), Some(id), "kept");
     }
 
-    /// Rows carried across a handoff stand until the host's first look, then are withdrawn
-    /// (never `✓`) unless a stall still stands the same way or a restart is in flight; only
-    /// rows under one tab's upgrade key are swept.
     #[test]
     fn carried_rows_are_withdrawn_once_every_tab_is_seen_never_fixed() {
         let now = now_s();
@@ -3926,9 +3701,6 @@ mod tests {
         others_stand(&app, "a's stall back");
     }
 
-    /// A re-armed round meeting the same refusal is one stall (its dismissed row stays
-    /// down); a tab that left has its end recorded, so its return is a row again (across a
-    /// restart: `a_stall_the_owner_saw_is_not_posted_again_after_a_restart`).
     #[test]
     fn a_stall_that_ended_while_its_row_was_down_is_news_when_it_returns() {
         let mut app = App::headless_for_test();
@@ -3959,8 +3731,6 @@ mod tests {
         assert!(row_of(&app, a).is_none(), "dismissed, and never over");
     }
 
-    /// A tab suspended for an hour: the digest's per-tab wait (`Row::attention`,
-    /// `Digest`, kind `suspended`).
     fn suspended(tab: &str) -> Row {
         Row {
             wait: "not-foreground".to_string(),
@@ -3969,7 +3739,6 @@ mod tests {
         }
     }
 
-    /// The entries "To look at" holds, by key.
     fn to_look_at(app: &App) -> Vec<(String, aterm_messages::DigestEntry)> {
         app.messages
             .digest()
@@ -3979,8 +3748,6 @@ mod tests {
             .collect()
     }
 
-    /// A wait only the owner can end is a digest line per tab (with `Show tab`), never a
-    /// row or mark; one dismissal files both.
     #[test]
     fn a_wait_only_the_owner_ends_is_a_line_of_the_digest_and_no_row() {
         let (mut app, [a, b, c]) = three_tabs();
@@ -4040,8 +3807,6 @@ mod tests {
         );
     }
 
-    /// A digest line ends ten minutes after the look that stops naming it, `Resolved` at
-    /// the digest's clock (`settle_messages`); three tabs on their own work are one line.
     #[test]
     fn a_line_ends_when_the_wait_ends_and_many_tabs_are_one_line() {
         let (mut app, [a, b, c]) = three_tabs();
@@ -4095,8 +3860,6 @@ mod tests {
         );
     }
 
-    /// A round re-armed after a give-up its own work holds neither promises nor offers
-    /// `Upgrade now` (`Row::will_ask_again`); one held by a full queue keeps it.
     #[test]
     fn a_rearmed_own_work_round_promises_no_upgrade_now() {
         use aterm_messages::UpgradeWord;
@@ -4125,7 +3888,6 @@ mod tests {
         assert!(message_reporters::agent_upgrade_words(&queued, now).contains(&UpgradeWord::Now));
     }
 
-    /// No wait, an hour, a day or nine days behind, takes a row: each is a record.
     #[test]
     fn no_wait_at_any_age_takes_a_row() {
         let mut app = App::headless_for_test();
@@ -4163,8 +3925,6 @@ mod tests {
         assert_eq!(app.messages.wanted_rows(), 0, "nothing wants the glass");
     }
 
-    /// Aterm's own fault is one Warn record and one log line however many looks see it;
-    /// once it ends, its return is a new record.
     #[test]
     fn a_fault_is_recorded_once_and_a_returning_one_is_news() {
         let mut app = App::headless_for_test();
@@ -4191,9 +3951,6 @@ mod tests {
         assert_eq!(told(&app), 2, "its return is news");
     }
 
-    /// Three rounds of asking, give-up, rest and re-armed looks (a person, a draft) leave one
-    /// record under the tab's key, its age moving, nothing on glass; a day behind it is the
-    /// same record, and the move's end leaves it history.
     #[test]
     fn a_waiting_upgrade_is_one_entry_through_its_rounds() {
         use aterm_agent::harness::upgrade::GAVE_UP;
@@ -4327,8 +4084,6 @@ mod tests {
         );
     }
 
-    /// An entry whose words carry no age is not restated as it ages: the posted age is
-    /// `Row::age_said`, not `Row::behind_for`.
     #[test]
     fn a_held_back_entrys_age_restates_nothing() {
         let mut app = App::headless_for_test();
@@ -4373,9 +4128,6 @@ mod tests {
         assert_eq!(same.id, id);
     }
 
-    /// The stall rows of the re-word test: tab `s-a`, `h` hours (and a minute) behind,
-    /// 2.1.283 → 2.1.284: asking on its own at its own work (announced, `background`, a
-    /// shell under it), given up and resting, and re-armed at its own work.
     struct Shapes {
         now: u64,
     }
@@ -4431,7 +4183,6 @@ mod tests {
         }
     }
 
-    /// Every entry under tab `s-a`'s key, oldest first.
     fn entries_of_s_a(app: &App) -> Vec<aterm_messages::LogRecord> {
         app.messages
             .log()
@@ -4441,10 +4192,6 @@ mod tests {
             .collect()
     }
 
-    /// A re-worded record keeps its words with its buttons (day five, D21): one waiting
-    /// upgrade's record, re-worded in place as it ages through Announced →
-    /// Failed(GAVE_UP) → Pending and back, keeps the buttons it was written with, and at a
-    /// look that offers other buttons its words past the age line stand.
     #[test]
     fn a_reworded_record_keeps_its_words_with_its_buttons() {
         let shapes = Shapes { now: now_s() };
@@ -4515,11 +4262,6 @@ mod tests {
         }
     }
 
-    /// THE PANE WORD (design §10.3.3, item 9): across a side-by-side split
-    /// with one agent each side, `left pane` and `right pane`; down a stacked
-    /// one, `top pane` and `bottom pane`; where a side holds two agents,
-    /// each agent's place among the tab's leaves (`pane N`), so no two
-    /// agents of one tab share a word.
     #[test]
     fn the_pane_word_tells_each_agent_of_a_tab_apart() {
         use crate::tab_model::{SplitAxis, SplitTree};
@@ -4584,8 +4326,6 @@ mod tests {
         assert_eq!(word(&flat, 2, &all).as_deref(), Some("pane 2"));
     }
 
-    /// The actual admission-to-pane formatter counts every identity the
-    /// Harness page lists, including codex-alab watched beside.
     #[test]
     fn the_pane_words_count_admitted_watchers_and_leave_refused_programs_out() {
         use crate::tab_model::{SplitAxis, SplitTree};

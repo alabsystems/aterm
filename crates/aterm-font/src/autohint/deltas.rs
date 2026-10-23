@@ -3,8 +3,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
 // Derived from skrifa 0.46.2 src/outline/glyf/deltas.rs and modified by the
-// aterm project in 2026: specialized to integer points and 16.16 deltas (the
-// unscaled loader's types), every index checked.
+// aterm project in 2026.
 // See ../../LICENSE-FONTATIONS for the upstream license.
 
 //! Glyph `gvar` deltas at a variation instance, including FreeType IUP interpolation.
@@ -53,7 +52,6 @@ pub(crate) fn simple_glyph(
         return Err(ReadError);
     }
     if gvar.glyph_variation_data(glyph_id).is_err() {
-        // Malformed variation data leaves deltas unchanged.
         return Ok(());
     };
     let SimpleGlyph {
@@ -62,7 +60,6 @@ pub(crate) fn simple_glyph(
         contours,
     } = glyph;
     compute_deltas_for_glyph(gvar, glyph_id, coords, deltas, |scalar, tuple, deltas| {
-        // Work on 16.16 points with HAS_DELTA cleared.
         for ((flag, point), iup_point) in flags.iter_mut().zip(points).zip(&mut iup_buffer[..]) {
             *iup_point = point.map(Fixed::from_i32);
             flag.clear_marker(PointMarker::HAS_DELTA);
@@ -87,7 +84,6 @@ fn compute_deltas_for_glyph(
         *delta = Default::default();
     }
     let Ok(Some(var_data)) = gvar.glyph_variation_data(glyph_id) else {
-        // Empty variation data for a glyph is not an error.
         return Ok(());
     };
     for (tuple, scalar) in var_data.active_tuples_at(coords) {
@@ -100,7 +96,6 @@ fn compute_deltas_for_glyph(
     Ok(())
 }
 
-// FreeType ttgxvar.c `tt_interpolate_deltas`.
 fn interpolate_deltas(
     points: &[Point<i32>],
     flags: &[PointFlags],
@@ -157,7 +152,6 @@ struct Jiggler<'a> {
 }
 
 impl Jiggler<'_> {
-    // FreeType ttgxvar.c `tt_delta_shift`.
     fn shift(&mut self, range: RangeInclusive<usize>, ref_ix: usize) -> Option<()> {
         let ref_in = self.points.get(ref_ix)?.map(Fixed::from_i32);
         let ref_out = self.out_points.get(ref_ix)?;
@@ -174,7 +168,6 @@ impl Jiggler<'_> {
         Some(())
     }
 
-    // FreeType ttgxvar.c `tt_delta_interpolate`.
     fn interpolate(&mut self, range: RangeInclusive<usize>, ref_points: RefPoints) -> Option<()> {
         if range.is_empty() {
             return Some(());
@@ -189,7 +182,6 @@ impl Jiggler<'_> {
                 let in2 = Fixed::from_i32(self.points.get(ref2_ix)?.$coord);
                 let out1 = self.out_points.get(ref1_ix)?.$coord;
                 let out2 = self.out_points.get(ref2_ix)?.$coord;
-                // Coincident reference points with differing deltas infer a zero delta.
                 if in1 != in2 || out1 == out2 {
                     let scale = if in1 != in2 {
                         (out2 - out1) / (in2 - in1)
@@ -225,7 +217,6 @@ impl Jiggler<'_> {
 
 #[cfg(test)]
 mod tests {
-    // skrifa 0.46.2 src/outline/glyf/deltas.rs `shift` and `interpolate`.
     use super::*;
 
     fn make_points(tuples: &[(i32, i32)]) -> Vec<Point<i32>> {

@@ -1,19 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The seam-tiling law: every anti-aliased procedural glyph (diagonals
-//! U+2571–2573, arcs U+256D–2570, Powerline U+E0B0–E0BF, wedges
-//! U+1FB3C–1FB6F) keeps hard 0/255 cell-edge texels at every cell size. A
-//! fractional edge texel would blend differently on the CPU and GPU sRGB paths
-//! and draw a half-covered line where two cells meet.
-//!
-//! This file checks the invariant (`edge = 1 => out ∈ {0, MAX}`) against the
-//! rasterizer over an exhaustive `1..=16 × 1..=16` lattice, where seam
-//! rounding can break, plus larger sentinels.
+//! Verifies that anti-aliased procedural glyphs have hard `0`/`255` cell-edge texels.
 
 use aterm_render::procedural;
 
-/// Exhaustive lattice 1..=16 on both axes, plus larger odd/even sentinels.
 fn sizes() -> Vec<(usize, usize)> {
     let mut v: Vec<(usize, usize)> = (1..=16usize)
         .flat_map(|w| (1..=16usize).map(move |h| (w, h)))
@@ -38,8 +29,6 @@ fn aa_chars() -> impl Iterator<Item = char> {
         .map(|cp| char::from_u32(cp).unwrap())
 }
 
-/// The seam-tiling law: every cell-edge texel of every AA glyph is 0 or 255,
-/// at every lattice size.
 #[test]
 fn aa_family_cell_edge_texels_are_hard() {
     for (w, h) in sizes() {

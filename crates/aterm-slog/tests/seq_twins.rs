@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE TWINS: every hand sequence of
-//! `turn_replays.rs` and `transcript_replays.rs` that the `.seq` corpus
-//! holds is run both ways, the Rust test (every assert of it) and its
-//! `.seq` file, and the two take the same PATH: step for step the same
-//! host call, the same model projection after it (the turn model's on the
-//! screen rig, the join's on the transcript rig) and the same records
-//! appended; and the same final window. Both copies stay: the twin is what
-//! lets a later step drop a Rust copy (5B-4, under T5).
-//!
-//! The path is recorded by the rigs themselves while [`record`] runs: each
-//! rig (`conformance_turn::Rig`, `transcript_replays`' and `seq_replay`'s
-//! `TxRig`) notes every host call it makes, and hands its path over when
-//! it is dropped. Off (every other test), nothing is noted.
-//!
-//! A host call is named by what it hands the tracker: the screen rig's
-//! [`Step`](crate::conformance_turn::Step) (so the model drive's own step,
-//! T29), and a transcript rig's verdict, wait, or `TxEvent` with its
-//! `TxPos`, the source's state and the time ([`see_step`], [`wait_step`],
-//! [`tx_step`]). Time passing with no wake, a state or file moving, and an
-//! input noted are no call: their effect is in the next call's name, its
-//! projection or its records.
-//!
-//! NEGATIVE CONTROLS: a ported file with one step altered (a screen
-//! twin's half for an elapse, a transcript twin's row read at another
-//! time), with its last step dropped, or replayed against another test's
-//! twin, each fail; and two paths with nothing recorded on them are no
-//! twins.
+//! Equivalence harness verifying that each ported `.seq` file matches its Rust replay test.
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -38,8 +12,8 @@ use aterm_spec::interp::State;
 
 use crate::seq_replay::{Broken, RigKind, Seq, corpus, replay};
 
-/// One host call of a rig: its name, the model state after it, and the
-/// records it appended (encoded at the content tier).
+/// One host call of a rig: its name, the model state after it, and the records it appended (encoded
+/// at the content tier).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Took {
     pub step: String,
@@ -92,8 +66,7 @@ pub fn lines_since(log: &Log, seq0: u64) -> Vec<String> {
     read.recs.into_iter().map(enc).collect()
 }
 
-/// Run `f` with recording on: the path of every rig it made, in the order
-/// the rigs were made. A panic in `f` (a failed assert) is `f`'s.
+/// Run `f` with recording on: the path of every rig it made, in the order the rigs were made.
 pub fn record(f: impl FnOnce()) -> Vec<Path> {
     DIED.with(|d| d.borrow_mut().clear());
     ON.with(|o| o.set(true));
@@ -112,8 +85,7 @@ pub fn see_step(v: Verdict, detail: Option<&str>, now: u64) -> String {
     format!("{now} see {v:?} {detail:?}")
 }
 
-/// A transcript rig's wait of `ms` from test ms `now` (the wake fires when
-/// due).
+/// A transcript rig's wait of `ms` from test ms `now` (the wake fires when due).
 pub fn wait_step(ms: u64, now: u64) -> String {
     format!("{now} wait {ms}")
 }
@@ -128,8 +100,7 @@ pub fn adopt_step(line: &str, now: u64) -> String {
     format!("{now} adopt {line}")
 }
 
-/// How two paths differ, the first difference named; `whole` compares the
-/// final windows too.
+/// How two paths differ, the first difference named; `whole` compares the final windows too.
 pub fn same(seq: &Path, rust: &Path, whole: bool) -> Result<(), String> {
     if seq.steps.is_empty() || rust.steps.is_empty() {
         return Err("a path with no host call on it is no twin (was it recorded?)".to_string());
@@ -159,9 +130,7 @@ pub fn same(seq: &Path, rust: &Path, whole: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// A Rust hand test and the corpus files its rigs are, in the order it
-/// makes them. `tail` names what the Rust test does past its last host
-/// call that a `.seq` does not say (its final window is then not compared).
+/// A Rust hand test and the corpus files its rigs are, in the order it makes them.
 pub struct Twin {
     pub name: &'static str,
     pub rust: fn(),
@@ -207,12 +176,9 @@ pub fn check_twins(twins: &[Twin], all: &[Seq]) -> Result<BTreeSet<&'static str>
     Ok(held)
 }
 
-// ---- the twins --------------------------------------------------------
-
 use crate::turn_replays as tr;
 
 /// Every hand sequence of `turn_replays.rs`, against its corpus files.
-/// (`clause_words_fit_their_bytes` is no sequence: it stays, T5.)
 pub const TURN_TWINS: &[Twin] = &[
     Twin {
         name: "claude_turn_with_an_approval_box",
@@ -305,12 +271,7 @@ pub const TURN_TWINS: &[Twin] = &[
 
 use crate::transcript_replays as xr;
 
-/// The hand sequences of `transcript_replays.rs` the corpus holds, against
-/// its files. Not held, and why: `the_worst_tracker_line_fits_a_carry_line`
-/// (no sequence: one carry line read and written back, no rig; kept, T5).
-/// The mail mark one writes by hand and the run's close another makes are
-/// the corpus's `turn-mail` and `close-run` (6A-6): records of the log
-/// alone, no host call on either path.
+/// The hand sequences of `transcript_replays.rs` the corpus holds, against its files.
 pub const TX_TWINS: &[Twin] = &[
     Twin {
         name: "a_prompt_confirms_the_screens_turn_in_its_window",
@@ -553,10 +514,6 @@ pub const TX_TWINS: &[Twin] = &[
     },
 ];
 
-/// Every ported hand sequence takes its Rust twin's path, step for step,
-/// and ends in its window: every `turn_replays` sequence (14 tests, 15
-/// rigs) and 35 of `transcript_replays`' 36 tests (46 rigs; the 36th is no
-/// sequence).
 #[test]
 fn each_ported_sequence_folds_as_its_rust_twin() {
     let all = corpus();
@@ -575,10 +532,6 @@ fn each_ported_sequence_folds_as_its_rust_twin() {
     }
 }
 
-/// NEGATIVE CONTROLS: a ported file with one step altered, or its last
-/// step dropped, no longer takes its twin's path; nor does a file against
-/// another test's twin; nor a file ported through a log-only line (6A-6)
-/// with that line gone.
 #[test]
 fn an_altered_step_fails_its_twin() {
     use crate::seq_replay::Ev;
@@ -598,7 +551,6 @@ fn an_altered_step_fails_its_twin() {
         f(&mut s);
         seq_path(&s).and_then(|p| same(&p, &rust, true))
     };
-    // A half for an elapse: the same time, no wake.
     let swapped = altered(&|s| {
         let i = s
             .lines
@@ -625,7 +577,6 @@ fn an_altered_step_fails_its_twin() {
         seq_path(other).and_then(|p| same(&p, &rust, true)).is_err(),
         "another test's file"
     );
-    // A transcript twin whose row is read at another time.
     let tx = TX_TWINS
         .iter()
         .find(|t| t.name == "a_prompt_confirms_the_screens_turn_in_its_window")
@@ -647,10 +598,6 @@ fn an_altered_step_fails_its_twin() {
         seq_path(&moved).and_then(|p| same(&p, &txr, true)).is_err(),
         "a row read at another time"
     );
-    // 6A-6: the twins ported through a log-only line (`turn-mail`,
-    // `close-run`). With that line gone (its file's expects with it, so
-    // only the twin judges), or with the last step dropped, the file no
-    // longer takes its twin's path.
     for name in [
         "a_turn_end_closes_the_turn_and_then_amends_its_numbers",
         "a_closed_run_takes_no_transcript_row",
@@ -691,7 +638,6 @@ fn an_altered_step_fails_its_twin() {
             "{name}: its last step dropped"
         );
     }
-    // Paths recorded with nothing on them are no twins.
     let empty = Path {
         steps: Vec::new(),
         lines: txr.lines.clone(),

@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The declarations against the system's libxkbcommon (the Linux lane's
-//! Ubuntu): every keysym aterm-xkb names is libxkbcommon's for its C name; a
-//! US keymap built from names types `a` and, with Shift, `A`; dead acute then
-//! `e` composes `é`; and on an X server (`$DISPLAY`) a keymap and state come
-//! from its XKB. Each check that needs what the machine lacks (the library,
-//! the keyboard data, a compose table, a display) says SKIP and returns.
+//! Declarations checked against the system's `libxkbcommon`.
 
 #![cfg(target_os = "linux")]
 
@@ -18,7 +13,6 @@ use aterm_xkb::{
     context_flags, key_direction, keysym_flags, keysym_utf8, mod_name, state_component,
 };
 
-/// The evdev keycode of the `a` key (KEY_A 30, plus 8).
 const KEY_A: u32 = 38;
 
 #[test]
@@ -39,7 +33,6 @@ fn every_keysym_is_libxkbcommons() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    // Negative control: a name libxkbcommon does not know is NoSymbol.
     // SAFETY: a NUL-terminated name.
     let none = unsafe { (xkb.keysym_from_name)(c"aterm_no_such_keysym".as_ptr(), 0) };
     assert_eq!(none, aterm_xkb::NO_SYMBOL);
@@ -97,7 +90,6 @@ fn a_us_keymap_types_and_shifts() {
             (xkb.state_serialize_mods)(state, state_component::MODS_DEPRESSED),
             1 << shift
         );
-        // The key itself moves the state too.
         (xkb.state_update_mask)(state, 0, 0, 0, 0, 0, 0);
         (xkb.state_update_key)(state, 50, key_direction::DOWN); // Shift_L
         assert_eq!((xkb.state_key_get_one_sym)(state, KEY_A), 0x41);

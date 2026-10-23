@@ -30,18 +30,14 @@ const POLICY_SIG: &str = "aterm-policy-appcast.toml.sig";
 const MAX_TRIAL_STARTS: u32 = crate::LINUX_TRIAL_LAUNCHES;
 /// What a copy that is not enrolled, or whose enrollment never finished, says.
 const ENABLE_REMEDY: &str = "Run `aterm update enable` to turn on updates for this copy";
-/// What a pass says when another aterm holds this copy's update lock past the wait
-/// ([`Context::lock`]): nothing was checked, so it is no failed check
-/// ([`crate::linux_notice::Record::Busy`]).
+/// Message when another aterm holds this copy's update lock ([`Context::lock`]).
 const LOCK_BUSY: &str = "Another aterm is updating this copy right now; try again when it \
     finishes (an `aterm update` command stopped with Ctrl-Z holds it until it is resumed or \
     ended)";
 /// What a locked pass says when the record it found enrolled is gone under the lock.
 const MISSING_ENROLLMENT: &str = "missing enrollment";
 
-/// A replaced executable waits for one start of it to confirm it ([`confirm`]): a
-/// window's or a terminal session's, whichever comes first (a copy used only from
-/// the terminal never opens a window).
+/// Status message while a replaced executable waits for a window or session start to confirm it.
 fn installed_pending(version: &str) -> String {
     format!(
         "aterm {version} is installed \u{2014} the next aterm you start finishes it; existing \
@@ -89,8 +85,7 @@ struct Context {
     candidate_hashed: std::sync::Arc<std::sync::Mutex<Option<(FileStamp, String)>>>,
 }
 
-/// Which file, and which bytes of it, a digest was read from. A rename over the file (as
-/// every writer of the candidate does) changes its inode, and a length change its size.
+/// Inode and metadata stamp of the file a candidate digest was read from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FileStamp {
     dev: u64,
@@ -112,8 +107,7 @@ impl FileStamp {
     }
 }
 
-/// Capture the canonical executable path before the first replacement. On Linux
-/// current_exe() later names the unlinked old inode with a " (deleted)" suffix.
+/// Canonical executable path captured before the first replacement.
 static CONTEXT: OnceLock<Result<Context, String>> = OnceLock::new();
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -139,25 +133,16 @@ struct Trial {
     phase: Phase,
     starts: u32,
     healthy: bool,
-    /// When the latest counted start began (Unix seconds; `0` for none). A start over the
-    /// budget rolls back only once this one can no longer confirm itself
-    /// ([`crate::linux_trial::start_rolls_back`]): a burst of session starts is all counted
-    /// before the first prompt confirms.
+    /// Unix seconds when the latest counted start began (`0` for none).
     #[serde(default)]
     last_start_unix: i64,
-    /// The same moment on the steady clock, with the boot it counts on
-    /// ([`crate::linux_trial::Steady`]), so the next start, in another process, reads the
-    /// age on a clock no NTP step moves ([`crate::linux_trial::judged_now`]).
+    /// Steady-clock timestamp and boot ID of the latest counted start ([`crate::linux_trial::Steady`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_start_steady: Option<Steady>,
-    /// A window start of this trial confirmed it. Until one has, window starts go on
-    /// counting, and roll the install back past the budget, even once a terminal session
-    /// confirmed the trial: a session's prompt proves the session lane only
-    /// ([`crate::linux_trial::Lanes`]).
+    /// Whether a window start of this trial has confirmed it ([`crate::linux_trial::Lanes`]).
     #[serde(default)]
     window_proven: bool,
-    /// The trial a prepared install displaced, put back if the install is abandoned before
-    /// its rename ([`recover`]); dropped once the rename lands.
+    /// Trial displaced by a prepared install, restored if the install is abandoned before rename ([`recover`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     displaced: Option<Box<Trial>>,
 }
@@ -226,14 +211,10 @@ struct State {
     /// that ran.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     rejected_unstarted: bool,
-    /// The build whose trial ended at a crash loop no rollback could answer
-    /// ([`rollback_refusal`], at the start past the budget in [`count_start_locked`]): it
-    /// stays installed though no start of it finished.
+    /// Build whose trial ended in a crash loop when rollback was refused ([`rollback_refusal`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kept_unproven: Option<u64>,
-    /// What each crash loop's end says — a rollback or a build kept — until a check loop
-    /// with a window to tell takes them ([`take_unsaid_trial_ends`],
-    /// U21).
+    /// Unreported crash-loop trial end notices awaiting a check loop with a window ([`take_unsaid_trial_ends`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     unsaid_trial_ends: Vec<String>,
     outcome: String,
@@ -375,9 +356,7 @@ impl Context {
         })
     }
 
-    /// The durable state record. Not named `read`: the lock-order census knows a
-    /// lock by its method name, and a state read held across `install_locked`'s
-    /// own read would look like a re-entrant `context` lock.
+    /// Read the durable state record (named `read_state` rather than `read` to stay distinct from lock helpers).
     fn read_state(&self) -> Result<Option<State>, String> {
         let path = self.dir.join("state.toml");
         if !path.try_exists().map_err(|e| e.to_string())? {
@@ -445,16 +424,13 @@ enum KeptCopy {
     Missing,
     /// Not a regular file.
     NotAFile,
-    /// A file the rollback's own open refuses on sight: another user's, writable by group
-    /// or others, too big, not executable, setuid/setgid, or one it may not read.
+    /// A file refused by [`file_is_safe`] or unreadable by this user.
     Unsafe,
     /// A file the rollback may open, with this digest.
     Digest(String),
 }
 
-/// What is at `backup`. `Err` only for a read that did not finish and may on a later try (an
-/// I/O error, an interrupted call, no descriptor free); every answer about the file itself is
-/// a [`KeptCopy`].
+/// Inspect `backup` for rollback eligibility, returning `Err` only for transient I/O errors.
 fn kept_copy(backup: &Path) -> Result<KeptCopy, String> {
     match fs::symlink_metadata(backup) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(KeptCopy::Missing),
@@ -508,8 +484,7 @@ fn sync_dir(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("sync {}: {e}", path.display()))
 }
 
-/// [`sync_dir`], only ordered ([`aterm_durable::ordered_dir`]). On Linux, where this lane
-/// runs, that is the same full `fsync(2)`, so each caller names only what it needs.
+/// Ordered directory sync ([`aterm_durable::ordered_dir`]).
 fn ordered_dir(path: &Path) -> Result<(), String> {
     aterm_durable::ordered_dir(path).map_err(|e| format!("sync {}: {e}", path.display()))
 }
@@ -546,9 +521,7 @@ fn fresh_written(
     }
 }
 
-/// The stems [`fresh_file`]'s callers name their files with. Each writer holds the
-/// copy's update lock for as long as its file exists, so one found under the lock is
-/// a dead writer's ([`sweep_stale_temps`]).
+/// File stems created by [`fresh_file`] while holding the update lock ([`sweep_stale_temps`]).
 const TEMP_STEMS: [&str; 6] = [
     "record",
     "download",
@@ -671,9 +644,7 @@ fn verify_binary(
     })
 }
 
-/// The signed digest is checked before this function is called. A short,
-/// environment-independent identity command proves loader viability and the
-/// exact compiled release identity without enrolling or starting a terminal.
+/// Run `update identity` on an authenticated candidate to verify loader viability and compiled release identity.
 fn probe_candidate(
     path: &Path,
     manifest: &Manifest,
@@ -738,9 +709,7 @@ fn probe_candidate(
     result
 }
 
-/// Why a candidate whose identity probe exited unsuccessfully cannot install: the first
-/// line it printed on stderr, said as "can't run on this system" when that is the dynamic
-/// loader refusing it (a release linked against a newer glibc than this system has).
+/// Format the refusal reason when a candidate's identity probe exits non-zero.
 fn probe_exit_refusal(version: &str, path: &Path, status: &str, stderr: &str) -> String {
     let Some(said) = stderr.lines().map(str::trim).find(|line| !line.is_empty()) else {
         return format!("aterm {version} failed when checked here ({status})");
@@ -1410,9 +1379,7 @@ fn rollback_with_checkpoint(
     Ok(())
 }
 
-/// The record of `trial` rolled back: the build refused from now on, whether it was a
-/// crash loop's rollback ([`rolls_back_unstarted`]), and, for one, the words the first
-/// check loop with a window to tell says ([`State::unsaid_trial_ends`]).
+/// Record `trial`'s rollback in `state` and queue any crash-loop notice ([`State::unsaid_trial_ends`]).
 fn record_rollback(state: &mut State, trial: &Trial) {
     state.rejected_build = state.rejected_build.max(trial.new.build);
     state.rejected_unstarted = rolls_back_unstarted(trial);
@@ -1424,9 +1391,7 @@ fn record_rollback(state: &mut State, trial: &Trial) {
     }
 }
 
-/// How many crash loops' ends the record keeps unsaid ([`State::unsaid_trial_ends`]): a
-/// release a copy cannot start ends one trial, so more than this many unsaid means no
-/// window has opened on the copy across several releases, and the oldest go.
+/// Maximum number of unreported crash-loop trial ends kept in [`State::unsaid_trial_ends`].
 const UNSAID_TRIAL_ENDS_KEPT: usize = 4;
 
 /// Keep `words`, one crash loop's end, on the record until a window is told
@@ -1440,16 +1405,12 @@ fn keep_unsaid_trial_end(state: &mut State, words: String) {
     state.unsaid_trial_ends.drain(..over);
 }
 
-/// Whether rolling `trial` back ends a crash loop: its starts spent the budget without
-/// proving it ([`crate::linux_trial::start_rolls_back`]'s count, the only one the start
-/// lane rolls back at, [`count_start_locked`]).
+/// Whether rolling `trial` back ends an unconfirmed crash loop ([`count_start_locked`]).
 fn rolls_back_unstarted(trial: &Trial) -> bool {
     trial.starts > MAX_TRIAL_STARTS
 }
 
-/// Why `trial` can never be rolled back, or `None` when nothing rules it out: the build it
-/// would restore is below the signed minimum-build floor (a yank), or its kept copy is gone
-/// or no longer that build.
+/// Reason `trial` cannot be rolled back (below [`State::min_build`] or missing/invalid backup), or `None`.
 fn rollback_refusal(
     context: &Context,
     state: &State,
@@ -1543,7 +1504,7 @@ pub fn apply() -> Result<String, String> {
     apply_locked(context, &mut state, &proof, PRODUCTION_PINS)
 }
 
-/// A window of this executable is starting (the GUI entry's boot lane, or, for a launch that could not vouch for its display before opening it, the moment its event loop opened it: `crate::linux_window_opened`).
+/// Record a window start of this executable in the boot or window-open lane (`crate::linux_window_opened`).
 pub fn boot(current_build: u64, current_commit: &str) -> crate::ApplyOutcome {
     let result = context().and_then(|context| {
         boot_in(
@@ -1671,10 +1632,7 @@ fn defer_still_moves(own: &StartClock, now: &StartClock) -> bool {
 /// ([`defer_session_verdict`]): the confirmer's own retry pace.
 const SESSION_DEFER_RETRY: Duration = Duration::from_secs(1);
 
-/// [`defer_session_verdict`]'s tries of moving the stamp `own`: `attempt` until it answers
-/// (`Ok`: moved or refused, either final), retrying a failure after
-/// `pause(SESSION_DEFER_RETRY)` while `own` may still move ([`defer_still_moves`]) and
-/// `pause` says go on (`false` once the shell has spoken).
+/// Retry moving `own`'s start stamp via `attempt` while [`defer_still_moves`] and `pause` hold.
 fn defer_session_verdict_retrying(
     own: &StartClock,
     mut attempt: impl FnMut() -> Result<bool, String>,
@@ -1703,12 +1661,7 @@ fn defer_session_verdict_retrying(
     }
 }
 
-/// [`defer_session_verdict`] against `context`, for the tests: under the lock, move the
-/// pending trial's stamp to `now` when it is still `own` (the same build and commit, this
-/// process running the file on trial, a trial the session lane still owes, its stamp not
-/// moved since), only later than `own` and while `own` is still young
-/// ([`crate::linux_trial::defer_moves`]): a settled stamp is a verdict due, which a late
-/// deferral must not take back.
+/// [`defer_session_verdict`] against `context`: advance the pending trial's stamp from `own` to `now` if still eligible ([`crate::linux_trial::defer_moves`]).
 fn defer_session_verdict_in(
     context: &Context,
     current_build: u64,
@@ -1786,10 +1739,7 @@ fn session_started_in(
         .map(|(starts_trial, _)| starts_trial)
 }
 
-/// [`session_started`] against `context`, so a test drives the session lane on a fixture
-/// copy: whether this start is one of the trial's, and the stamp it left when it was one of
-/// the budget's starts ([`crate::linux_trial::start_stamp`]), which
-/// [`defer_session_verdict_in`] may move forward.
+/// [`session_started`] against `context`, returning whether the start counted toward the trial and its recorded [`StartClock`].
 fn session_started_stamping_in(
     context: &Context,
     current_build: u64,
@@ -1849,9 +1799,7 @@ fn boot_locked(
     )
 }
 
-/// Count one start of this executable, from `lane`, against a pending trial, at `now` (read
-/// holding the lock this count runs under: [`session_started_stamping_in`]); `true` when
-/// this process is a start of that trial (and should confirm it).
+/// Count one start from `lane` against a pending trial at `now`, returning `true` when this process should confirm it.
 fn count_start_locked(
     context: &Context,
     state: &mut State,
@@ -2117,11 +2065,7 @@ fn authenticate_tag(
     Ok(manifest)
 }
 
-/// The channel head, authenticated, and the held stage proved again under whatever roster
-/// that authentication admitted, whatever verdict the head itself gets: `authorize_one`
-/// saves the ratcheted `roster_floor` before it judges the head's appcast, signer,
-/// attribution, policy ordering and tag, so a refused head has still moved the floor, and
-/// the reroot ([`reroot_held_stage_proof`]) runs on both arms.
+/// Authenticate the channel head and reroot any held stage proof under the admitted roster ([`reroot_held_stage_proof`]).
 fn authenticate_head(
     context: &Context,
     state: &mut State,
@@ -2171,14 +2115,7 @@ fn check_locked(
         .as_ref()
         .is_some_and(|trial| trial.phase == Phase::Installed && !trial.healthy)
     {
-        // No check: the channel is not read while a trial is pending. A check holds
-        // the update lock through its download and its probe of the new build, and the
-        // starts that judge the trial wait for that lock at most half a second (no
-        // start stalls on an update), so a check now would leave them uncounted: a
-        // crash loop rolled back later, a healthy start's confirmation lost
-        // (`a_trial_start_made_while_a_check_holds_the_lock_counts_nothing`). A
-        // failure streak still on record keeps its reason, which is still the last
-        // check's.
+        // Skip channel checks while a trial is pending so download/probe lock holds do not contend with trial starts.
         if state.failing_checks == 0 {
             state.outcome = format!(
                 "aterm {} is installed \u{2014} the next aterm you start finishes it; update \
@@ -2286,10 +2223,7 @@ fn check_locked(
     Ok(Checked::Channel)
 }
 
-/// A held stage is proved again under the roster this check admitted. `authorize_one`
-/// ratchets `roster_floor` on every check, even of a head with nothing to install, while
-/// the held stage keeps the proof it was staged with, whose older roster `apply` would
-/// then refuse as a replay (`Rollback`).
+/// Re-verify and save a held stage's proof under `head`'s roster so `apply` does not reject an older `roster_floor`.
 fn reroot_held_stage_proof(
     context: &Context,
     state: &mut State,
@@ -2316,9 +2250,7 @@ fn reroot_held_stage_proof(
     }
 }
 
-/// Whether the candidate on disk serves `manifest` without a download: its bytes are the
-/// very artifact the authenticated manifest names, and a stage on record is one that may
-/// still install and is that release.
+/// Whether the candidate on disk matches `manifest` and any recorded stage remains admissible.
 fn reusable_stage(
     context: &Context,
     state: &State,
@@ -2345,8 +2277,7 @@ fn automatic_apply_allowed(source: &Source, provider: &crate::CheckSettingsProvi
     current.source == *source && current.auto_apply
 }
 
-/// Retire presentation authority before changing its bytes/proof. A failed
-/// download admission or identity probe must never resurrect an older stage.
+/// Clear `state.staged` before replacing candidate bytes or proofs.
 fn clear_stage(context: &Context, state: &mut State) -> Result<(), String> {
     if state.staged.take().is_some() {
         context.save(state)?;
@@ -2354,9 +2285,7 @@ fn clear_stage(context: &Context, state: &mut State) -> Result<(), String> {
     Ok(())
 }
 
-/// Why [`automatic_apply_allowed`] holds a stage, read from the same provider. The
-/// install switch is named as Settings paints it
-/// ([`aterm_update_core::settings::install_switch_off`]), never by its key.
+/// Reason [`automatic_apply_allowed`] held a stage, using the UI label for the install switch ([`aterm_update_core::settings::install_switch_off`]).
 fn apply_held_reason(source: &Source, provider: &crate::CheckSettingsProvider) -> String {
     match provider() {
         None => "the update settings couldn\u{2019}t be confirmed".to_string(),
@@ -2381,8 +2310,7 @@ fn held_stage(context: &Context, state: &mut State, why: &str) -> Result<String,
     Ok(state.outcome.clone())
 }
 
-/// A stage buys no replacement authority. Both the initial decision and the
-/// final post-probe/pre-rename boundary sample the current source/apply policy.
+/// Verify and probe a candidate, then either hold it as staged or apply it if [`automatic_apply_allowed`] still holds.
 fn finish_candidate(
     context: &Context,
     state: &mut State,
@@ -2456,10 +2384,7 @@ pub(crate) fn check_with_settings(
     check_recording(current_build, provider, force).0
 }
 
-/// [`check_with_settings`], and what the record made of the pass. The record counts a
-/// failure only once the save after the check lands, so a failure before it (the pre-I/O
-/// save refused by a full or read-only filesystem, a record or settings that will not
-/// read) is counted by the background loop itself ([`crate::linux_notice::Record::Lost`]).
+/// [`check_with_settings`], plus the [`crate::linux_notice::Record`] classification and whether the lock was acquired.
 fn check_recording(
     current_build: u64,
     provider: &crate::CheckSettingsProvider,

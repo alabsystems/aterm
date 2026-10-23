@@ -43,23 +43,16 @@ unsafe extern "system" {
     fn DragQueryFileW(hdrop: isize, ifile: u32, file: *mut u16, cch: u32) -> u32;
 }
 
-/// UTF-16 text with a trailing NUL.
 const CF_UNICODETEXT: u32 = 13;
-/// Explorer file-copy DROPFILES block read by [`get_paths`].
 const CF_HDROP: u32 = 15;
-/// `DragQueryFileW` file-count index sentinel.
 const DRAG_QUERY_COUNT: u32 = 0xFFFF_FFFF;
-/// Movable global memory for clipboard allocations.
 const GMEM_MOVEABLE: u32 = 0x0002;
 
-/// Bounded `OpenClipboard` retry count and backoff.
 const OPEN_ATTEMPTS: u32 = 5;
 const OPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(10);
 
-/// RAII guard for the open clipboard so every early return closes it.
 struct OpenGuard;
 
-/// Message-only window (`HWND_MESSAGE`) owning clipboard writes on any thread.
 struct ClipboardOwner(isize);
 
 impl ClipboardOwner {
@@ -103,7 +96,6 @@ impl Drop for OpenGuard {
     }
 }
 
-/// Open the clipboard with the bounded retry loop; `None` when it stays held.
 fn open_clipboard(owner: isize) -> Option<OpenGuard> {
     for attempt in 0..OPEN_ATTEMPTS {
         // SAFETY: owner is 0 or a live same-thread HWND; OpenGuard's Drop closes it.
@@ -186,7 +178,6 @@ pub(crate) fn get_paths() -> Option<Vec<String>> {
     (!paths.is_empty()).then_some(paths)
 }
 
-/// Normalize LF to CRLF without doubling existing CRLF.
 fn to_crlf(text: &str) -> std::borrow::Cow<'_, str> {
     if text.contains('\n') {
         std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\n', "\r\n"))
@@ -208,7 +199,6 @@ pub(crate) fn set(text: &str) -> bool {
     )
 }
 
-/// Populate and publish `CF_UNICODETEXT` while owner and `OpenGuard` are live.
 fn set_open(units: &[u16], bytes: usize) -> bool {
     // SAFETY: the clipboard is open (guard live). GlobalAlloc/GlobalLock give a writable, movable
     // buffer of at least `bytes`; the copy stays in bounds. After a successful SetClipboardData the
@@ -240,10 +230,8 @@ fn set_open(units: &[u16], bytes: usize) -> bool {
 mod tests {
     use super::*;
 
-    /// Marks the child run of [`round_trip_on_a_private_station`].
     const CHILD: &str = "ATERM_TEST_CLIPBOARD_PRIVATE_STATION";
 
-    /// Runs [`round_trip_on_a_private_station`] in a child on a private window station so `WinSta0`'s clipboard is untouched.
     #[test]
     fn the_real_clipboard_round_trips_on_a_private_window_station() {
         if std::env::var_os(CHILD).is_some() {
@@ -271,7 +259,6 @@ mod tests {
         assert!(text.contains("PRIVATE-STATION-ROUND-TRIP-OK"), "{text}");
     }
 
-    /// The parent's child role: it enters the private station before any clipboard call.
     fn round_trip_on_a_private_station() {
         station::enter_private();
         station::empty();
@@ -303,7 +290,6 @@ mod tests {
         println!("PRIVATE-STATION-ROUND-TRIP-OK");
     }
 
-    /// Private window station and desktop for isolated clipboard tests.
     mod station {
         #[link(name = "user32")]
         unsafe extern "system" {
@@ -335,10 +321,8 @@ mod tests {
 
         const WINSTA_ALL_ACCESS: u32 = 0x37F;
         const GENERIC_ALL: u32 = 0x1000_0000;
-        /// `GetUserObjectInformationW`'s name index.
         const UOI_NAME: i32 = 2;
 
-        /// The name of `object` (a window station or desktop).
         fn name_of(object: isize) -> String {
             let mut buf = [0u16; 256];
             let mut needed = 0u32;
@@ -438,7 +422,6 @@ mod tests {
         }
     }
 
-    /// Write a test `CF_HDROP` (`DROPFILES` header + double-NUL UTF-16 path list).
     fn set_hdrop_for_test(paths: &[&str]) -> bool {
         let mut block: Vec<u16> = vec![20, 0, 0, 0, 0, 0, 0, 0, 1, 0];
         for p in paths {
@@ -477,7 +460,6 @@ mod tests {
         true
     }
 
-    /// Outbound normalization is pure and testable without the clipboard.
     #[test]
     fn to_crlf_converts_lf_without_doubling_crlf() {
         assert_eq!(to_crlf("a\nb"), "a\r\nb");

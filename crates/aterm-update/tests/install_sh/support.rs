@@ -76,6 +76,51 @@ pub fn install_sh() -> PathBuf {
     root().join("tools/install.sh")
 }
 
+/// The names of install.sh's bootstrap verifier pin
+/// (crates/aterm-bootstrap-verify's `pin::KEYS`).
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "this suite empties the pin only in its Linux-only tests"
+    )
+)]
+pub const VERIFIER_PIN: [&str; 4] = [
+    "LINUX_VERIFIER_REPO",
+    "LINUX_VERIFIER_TAG",
+    "LINUX_VERIFIER_SHA256_X86_64",
+    "LINUX_VERIFIER_SHA256_AARCH64",
+];
+
+/// A copy of install.sh at `rel` under `scratch` with its bootstrap verifier pin emptied,
+/// whatever it pins: the script an architecture with no pinned digest runs, whose verifier
+/// is the embedded one. A test of that verifier's whole run uses it, so committing a pin
+/// changes no such test.
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "this suite empties the pin only in its Linux-only tests"
+    )
+)]
+pub fn unpinned_install_sh(scratch: &Scratch, rel: &str) -> PathBuf {
+    let text = read(&install_sh());
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    for key in VERIFIER_PIN {
+        let prefix = format!("{key}=");
+        let at: Vec<usize> = (0..lines.len())
+            .filter(|n| lines[*n].starts_with(&prefix))
+            .collect();
+        assert_eq!(at.len(), 1, "install.sh sets {key} on one line of its own");
+        lines[at[0]] = format!("{key}=\"\"");
+    }
+    let mut unpinned = lines.join("\n");
+    unpinned.push('\n');
+    let file = scratch.write(rel, unpinned);
+    chmod(&file, 0o755);
+    file
+}
+
 /// The installer's floor: macOS's stock bash 3.2 where it exists, else PATH's bash.
 pub fn bash() -> PathBuf {
     let stock = Path::new("/bin/bash");

@@ -47,10 +47,8 @@ macro_rules! impl_pod_zeroable_primitive {
             // patterns of the appropriate size are valid values of the type,
             // and the all-zero bit pattern corresponds to the value `0` /
             // `0.0` which is always valid.
-
             unsafe impl Zeroable for $t {}
             // SAFETY: see above — `$t` is `Copy + 'static`, has a canonical layout, and every bit pattern is a valid value.
-
             unsafe impl Pod for $t {}
         )*
     };
@@ -62,19 +60,15 @@ impl_pod_zeroable_primitive!(f32, f64);
 
 // SAFETY: `()` is a ZST; there are no bytes, so trivially every bit pattern (i.e. the empty one) is
 // valid and all-zero is sound.
-
 unsafe impl Zeroable for () {}
 // SAFETY: see above.
-
 unsafe impl Pod for () {}
 
 // SAFETY: `[T; N]` has layout `T` repeated `N` times with no extra padding
 // (stable guarantee). If every `T` byte pattern is valid, so is every
 // `[T; N]` byte pattern. Same argument for `Zeroable`.
-
 unsafe impl<T: Zeroable, const N: usize> Zeroable for [T; N] {}
 // SAFETY: see above; additionally `[T; N]: Copy` when `T: Copy`, and `[T; N]` is `'static` when `T: 'static`.
-
 unsafe impl<T: Pod, const N: usize> Pod for [T; N] {}
 
 /// Reason a byte cast failed at runtime.
@@ -148,10 +142,6 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
 
     if a_size == 0 || b_size == 0 {
         if a_size == b_size {
-            // Empty slice of B. Use a fresh empty slice (dangling, aligned)
-            // rather than rebuilding one at `src`'s address: `src` need not
-            // be aligned for `B` here, and an empty slice's address is not
-            // observable through the slice API.
             return Ok(&[]);
         }
         return Err(PodCastError::SizeMismatch);
@@ -170,10 +160,7 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
     let out_len = byte_len / b_size;
     let ptr_b = ptr_a.cast::<B>();
     if (ptr_b as usize) == 0 {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
-        // the pointer cast; behavior is unchanged. (Integer compare instead
-        // of `is_null()`: the latter is an unlowerable call boundary.)
+        // Non-null proof for the verifier across the pointer cast.
         return Ok(&[]);
     }
     // SAFETY: the checks above (all on this path) verified:
@@ -194,9 +181,7 @@ pub fn try_cast_slice<A: Pod, B: Pod>(src: &[A]) -> Result<&[B], PodCastError> {
 pub const fn bytes_of<T: Pod>(value: &T) -> &[u8] {
     let ptr = core::ptr::from_ref(value).cast::<u8>();
     if ptr.is_null() {
-        // Unreachable: a pointer derived from a reference is never null. The
-        // guard hands the verifier the non-null fact it cannot carry across
-        // the pointer cast; behavior is unchanged.
+        // Non-null proof for the verifier across the pointer cast.
         return &[];
     }
     // SAFETY: `ptr` is non-null (guarded above), trivially aligned for `u8`,

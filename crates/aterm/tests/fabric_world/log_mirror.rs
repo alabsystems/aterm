@@ -1,25 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS MIRROR END TO END (`docs/DESIGN-session-log-2026-10-15.md` §5.5):
-//! a real headless aterm, its real bridge and a guarded
-//! broker. With `--log off` it writes nothing anywhere; by default (`auto`,
-//! over the world's broker, which retains by aterm's default rules)
-//! it mirrors as `--log turns` does, and over a broker
-//! that retains nothing it mirrors nothing and says `mirror=unretained`. With
-//! the mirror on every session's bus-class records reach its `ev` face, each `(ep, seq)`
-//! once in the reader's view, `ms` dense, with one exact cover
-//! per hole an eviction made, no host or content text crossing,
-//! and `aterm fabric brief` folding what the bus holds. Every wait is a
-//! one-minute hang detector.
-//!
-//! crashes — a bridge killed at each step of a batch, a broker
-//! restart (or a power loss that moves the log) with a pin outstanding — are
-//! `aterm-link`'s deterministic simulation's (`sim`): it kills the real bridge
-//! at every I/O step of every seed with the mirror on and holds the reader's
-//! view to the same laws, no raw duplicate where the log never moved among
-//! them. This world keeps the real instance's side: the GUI's take and
-//! landing, astream's own dedup, a real process tree.
+//! End-to-end tests for session log mirroring to the fabric bus.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -27,14 +9,12 @@ use aterm_slog::bus::BusSpace;
 
 use super::harness::{FLEET, World, until};
 
-/// A world whose bridge mirrors (`serve --log turns`), ready.
 fn turns(tag: &str, env: &[(&str, &str)]) -> World {
     let w = World::boot_flags_with(tag, &["--log", "turns"], env);
     w.wait_ready();
     w
 }
 
-/// Every body on `face`, oldest first.
 fn bodies(w: &World, face: &str) -> Vec<String> {
     w.read(|c| {
         let mut out = Vec::new();
@@ -53,9 +33,6 @@ fn bodies(w: &World, face: &str) -> Vec<String> {
     .unwrap_or_else(|e| panic!("read {face}: {e}"))
 }
 
-/// A session's mirror as a reader holds it: the view of each seq space, and
-/// how many bodies the bus holds of each `(ep, seq)` (a raw duplicate count:
-/// a rate, never a law).
 struct Mirrored {
     spaces: BTreeMap<u32, BusSpace>,
     raw: BTreeMap<(u32, u64), usize>,
@@ -85,7 +62,6 @@ fn mirrored(w: &World, sid: &str) -> Mirrored {
     m
 }
 
-/// The session's live turn-class seqs, as its own `log class=turn` lists them.
 fn turn_class(w: &World, sid: &str) -> BTreeSet<u64> {
     let r = w.verb(&format!("@{sid} log class=turn"));
     assert!(r.ok(), "log: {}", r.header());
@@ -95,9 +71,6 @@ fn turn_class(w: &World, sid: &str) -> BTreeSet<u64> {
         .collect()
 }
 
-/// QUIESCENT AND COMPLETE (QuiescentMirrorComplete): every live turn-class
-/// record of the session is a record on the bus, and the newest space's `ms`
-/// are dense.
 fn complete(w: &World, sid: &str) -> Option<Mirrored> {
     let live = turn_class(w, sid);
     let m = mirrored(w, sid);
@@ -106,7 +79,6 @@ fn complete(w: &World, sid: &str) -> Option<Mirrored> {
     (space.holes().is_empty() && live.iter().all(|s| held.contains(s))).then_some(m)
 }
 
-/// A claim the session's log carries (a bus-class `mark`).
 fn mark(w: &World, sid: &str, kind: &str) {
     let r = w.verb(&format!("@{sid} mark - {kind} word=review"));
     assert!(r.ok(), "mark {kind}: {}", r.header());
@@ -118,17 +90,11 @@ fn claims(w: &World, sid: &str, n: usize) {
     }
 }
 
-/// Sessions write claims and one exits; then, past a drain barrier through
-/// the same bridge, whether the bus holds no `v=2` body on any face and the
-/// state dir no `logpin` and none of its durable copies (`logkey`,
-/// `logfloor`): what a bridge that does not mirror leaves.
 fn mirrors_nothing(w: &World) {
     let (a, b) = w.two_sessions();
     claims(w, &a, 3);
     claims(w, &b, 3);
     assert!(w.verb(&format!("@{b} close")).ok());
-    // The bridge's own `ev` records still flow; give it a round to publish
-    // whatever it would: a drain barrier through the same bridge.
     w.drained(&a);
     let all = bodies(w, &format!("/f/{FLEET}/pub/>"));
     assert!(
@@ -141,11 +107,6 @@ fn mirrors_nothing(w: &World) {
     }
 }
 
-/// a bridge with `--log off` (`[fabric] log = "off"`,
-/// the opt-out) mirrors nothing: no
-/// `v=2` body on any face, no `logpin` and none of its durable copies, and
-/// `fabric status` says nothing of a mirror. NEGATIVE CONTROL, run: `off`
-/// read as `auto` fails it.
 #[test]
 fn log_off_mirrors_nothing_and_writes_nothing() {
     let w = World::boot_flags_with("lm-off", &["--log", "off"], &[]);
@@ -155,13 +116,6 @@ fn log_off_mirrors_nothing_and_writes_nothing() {
     assert!(!fs.header().contains("bridge_log="), "{}", fs.header());
 }
 
-/// THE DEFAULT MIRRORS TURNS (owner decision D4):
-/// with no `--log` and no `[fabric] log`, over the world's broker,
-/// which retains by aterm's default rules and advertises them in its
-/// `Hello`, every live turn-class record of a session reaches its `ev` face,
-/// once, `ms` dense, and `fabric status` says the mirror is on. NEGATIVE
-/// CONTROL, run: an attach that does not follow the broker (no
-/// `mirror_attached`) fails it.
 #[test]
 fn the_default_mirrors_turns() {
     let w = World::boot("lm-default", &[]);
@@ -184,12 +138,6 @@ fn the_default_mirrors_turns() {
     );
 }
 
-/// THE DEFAULT FOLLOWS THE BROKER: over
-/// `World::without_retention`'s broker, which retains nothing and advertises
-/// no rule, the default bridge mirrors nothing — no `v=2` body, no `logpin`,
-/// `logkey` or `logfloor` — and `fabric status` says `bridge_log=auto
-/// mirror=unretained`. NEGATIVE CONTROL, run: an `auto` mirror that does not
-/// ask the broker's `Hello` (the gate always open) fails it.
 #[test]
 fn the_default_over_an_unretaining_broker_mirrors_nothing_and_says_so() {
     let w = World::without_retention("lm-unret");
@@ -203,9 +151,6 @@ fn the_default_over_an_unretaining_broker_mirrors_nothing_and_says_so() {
     );
 }
 
-/// TURNS LAND ONCE, DENSE: two sessions' claims and the second's exit reach
-/// their faces, each record once on the bus, every live turn-class record
-/// there, `ms` dense, and `fabric status` says the mirror is on.
 #[test]
 fn turns_land_once_with_ms_dense() {
     let w = turns("lm-on", &[]);
@@ -235,10 +180,6 @@ fn turns_land_once_with_ms_dense() {
         "{}",
         fs.header()
     );
-    // the pin's key and total have their
-    // durable copies, written by the real bridge on the real filesystem — the
-    // key in `logkey` (owner-only, one line), and a floor at or above the
-    // total in `logfloor` — so a power cut that tears the pin stops nothing.
     let pin = until("a pin between batches", || {
         let text = std::fs::read_to_string(w.state.join("logpin")).ok()?;
         aterm_link::mirror::Pin::parse(&text)
@@ -271,7 +212,6 @@ fn turns_land_once_with_ms_dense() {
         "the floor {floor} covers the total {}",
         pin.total
     );
-    // The second session exits: its close reaches the bus too.
     assert!(w.verb(&format!("@{b} close")).ok());
     until("the closed session's close on the bus", || {
         let m = mirrored(&w, &b);
@@ -279,9 +219,6 @@ fn turns_land_once_with_ms_dense() {
         let (fold, _) = space.fold();
         fold.state().closed.is_some().then_some(())
     });
-    // once its close has landed its `ev` face is retired — out of
-    // the last-value index, its subject back in the node's budget — and its
-    // records stay in the log, fetchable.
     let face = format!("/f/{FLEET}/pub/{}/{b}/ev", w.node);
     until("the closed session's ev face to be retired", || {
         let rows = w.read(|c| c.last(&face, "", 8)).ok()?.0;
@@ -290,10 +227,6 @@ fn turns_land_once_with_ms_dense() {
     assert!(mirrored(&w, &b).v2 > 0, "the records stay");
 }
 
-/// with the broker away, a small ring evicts the claims the mark
-/// quota retires; once it is back, the bridge backfills each hole with ONE
-/// exact cover — the covers disjoint, never two of one hole, and every `ms`
-/// a record's or a cover's.
 #[test]
 fn absent_then_present_backfills_one_exact_cover_per_hole() {
     let mut w = turns("lm-ev", &[("ATERM_SLOG_RING", "24,65536")]);
@@ -331,9 +264,6 @@ fn absent_then_present_backfills_one_exact_cover_per_hole() {
     );
 }
 
-/// No host or content text crosses: a note's text, an OSC title, a command
-/// line and the cwd stay local; no mail party, kind or offset key is on any
-/// body.
 #[test]
 fn no_host_or_content_text_reaches_the_bus() {
     let w = turns("lm-leak", &[]);
@@ -364,8 +294,6 @@ fn no_host_or_content_text_reaches_the_bus() {
     }
 }
 
-/// `aterm fabric brief` folds what the bus holds, with the GUI's own `brief`
-/// saying the same need.
 #[test]
 fn fabric_brief_folds_what_the_bus_holds() {
     let w = turns("lm-brief", &[]);

@@ -1,16 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Glyph codegen (docs/cat-art-v4-design.md §1).
+//! Glyph codegen.
 
 use aterm_scene::vector::{FIXED_ONE, PathCmd};
 
-/// The kinds that make it into the roster (in emit order: heads, then specials, then
-/// accessories).
+/// The kinds that make it into the roster (in emit order: heads, then specials, then accessories).
 const INCLUDED_KINDS: &[&str] = &["head", "special", "accessory"];
 
-/// Canonical `role` vocabulary → Rust variant, in fixed painter-role order
-/// (docs/cat-art-v4-design.md §0).
+/// Canonical `role` vocabulary to Rust variant, in fixed painter-role order.
 const ROLE_VOCAB: &[(&str, &str)] = &[
     ("outline", "Outline"),
     ("coat", "Coat"),
@@ -30,7 +28,7 @@ const ROLE_VOCAB: &[(&str, &str)] = &[
     ("detail", "Detail"),
 ];
 
-/// Canonical `recolor` vocabulary → variant (§2.1). Filtered to what the roster uses.
+/// Canonical `recolor` vocabulary to variant.
 const RECOLOR_VOCAB: &[(&str, &str)] = &[
     ("coat", "Coat"),
     ("coat_shade", "CoatShade"),
@@ -38,8 +36,7 @@ const RECOLOR_VOCAB: &[(&str, &str)] = &[
     ("fixed", "Fixed"),
 ];
 
-/// Canonical `kind` vocabulary → variant. Only [`INCLUDED_KINDS`] are ever emitted, but
-/// the table also validates that an included asset's kind is a known one.
+/// Canonical `kind` vocabulary to variant.
 const KIND_VOCAB: &[(&str, &str)] = &[
     ("head", "Head"),
     ("special", "Special"),
@@ -47,20 +44,16 @@ const KIND_VOCAB: &[(&str, &str)] = &[
     ("prop", "Prop"),
 ];
 
-/// The authored-asset schema is path-only: unknown keys fail closed for roster
-/// glyphs, so a `text`, `label` or `font` field is never mistaken for artwork or
-/// silently ignored.
+/// The authored-asset schema is path-only.
 const GLYPH_KEYS: &[&str] = &["id", "kind", "viewbox", "anchor", "layer", "excluded"];
 const ANCHOR_KEYS: &[&str] = &["eye_y", "center_x", "word_top", "attach"];
 const LAYER_KEYS: &[&str] = &["role", "ref_fill", "recolor", "paths"];
 
-/// One emitted layer: role + recolor variant names, its source `ref_fill` (packed
-/// `0x00RR_GGBB`), and its quantized paths.
+/// One emitted layer: role and recolor variant names, packed `ref_fill`, and quantized paths.
 struct Layer {
     role: &'static str,
     recolor: &'static str,
-    /// The layer's reference colour: baked verbatim for `Recolor::Fixed`;
-    /// `Coat`/`Iris` layers bake a ramp colour instead.
+    /// The layer's reference colour.
     fill: u32,
     /// Each path is a sequence of `PathSeg` literal strings (e.g. `PathSeg::Move(1,2)`).
     paths: Vec<Vec<String>>,
@@ -73,8 +66,7 @@ struct Glyph {
     kind_rank: usize,
     kind: &'static str,
     variant: String,
-    /// Viewbox width/height, quantized to a fixed thousandth. Runtime layout
-    /// preserves the authored art's proportions without parsing asset TOML.
+    /// Viewbox width/height, quantized to a fixed thousandth.
     aspect_x1000: u16,
     eye_y: u16,
     center_x: u16,
@@ -158,7 +150,6 @@ fn glyph_from_doc(doc: &aterm_toml::Value, name: &str) -> Result<Option<Glyph>, 
         .and_then(aterm_toml::Value::as_str)
         .ok_or_else(|| format!("{name}: missing `kind`"))?;
     let Some(kind_rank) = INCLUDED_KINDS.iter().position(|k| *k == kind_str) else {
-        // Not a roster kind (prop / unknown / …): held out, not an error.
         return Ok(None);
     };
     reject_unknown_keys(doc, GLYPH_KEYS, name, "glyph")?;
@@ -300,8 +291,7 @@ fn quantize_path(cmds: &[PathCmd], vw: f32, vh: f32) -> Vec<String> {
         .collect()
 }
 
-/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`. The integer rule is the
-/// same on every host (no platform float variance in the const data).
+/// `round(v / extent * FIXED_ONE)`, clamped to `0..=FIXED_ONE`.
 fn quant(v: f32, extent: f32) -> u16 {
     let q = (v / extent * f32::from(FIXED_ONE)).round();
     q.clamp(0.0, f32::from(FIXED_ONE)) as u16
@@ -314,8 +304,7 @@ fn quant_frac(f: f32) -> u16 {
         .clamp(0.0, f32::from(FIXED_ONE)) as u16
 }
 
-/// Snake-case asset id → UpperCamel Rust variant (`s1_00` → `S100`, `spec_maneki` →
-/// `SpecManeki`, `acc_bow` → `AccBow`).
+/// Snake-case asset id to UpperCamel Rust variant.
 fn variant_name(id: &str) -> String {
     let mut out = String::with_capacity(id.len());
     let mut cap = true;
@@ -354,7 +343,7 @@ fn num(v: &aterm_toml::Value) -> f32 {
         .unwrap_or(0.0)
 }
 
-/// Render the final Rust source. Deterministic given ordered `glyphs`.
+/// Render the final Rust source.
 fn emit(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(HEADER);
@@ -426,9 +415,7 @@ fn emit(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Render the pet roster source: [`emit`]'s drawlist rows as a separate
-/// `PetGlyphId` / `PET_GLYPH_IDS` / `PET_GLYPHS` roster that imports the cat
-/// module's shape types, so there is one `GlyphDef` shape in the crate.
+/// Render the pet roster source.
 fn emit_pet(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(PET_HEADER);
@@ -463,9 +450,7 @@ fn emit_pet(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// Render the dog roster source: [`emit`]'s drawlist rows as a separate
-/// `DogGlyphId` / `DOG_GLYPH_IDS` / `DOG_GLYPHS` roster importing the cat
-/// module's shape types.
+/// Render the dog roster source.
 fn emit_dog(glyphs: &[Glyph]) -> String {
     let mut s = String::new();
     s.push_str(DOG_HEADER);
@@ -551,8 +536,7 @@ fn emit_animal_roster(glyphs: &[Glyph]) -> String {
     s
 }
 
-/// The `GlyphDef { … }` rows every roster table shares, so no two rosters can
-/// drift in drawlist encoding.
+/// Emit the `GlyphDef` rows shared across roster tables.
 fn emit_glyph_rows(s: &mut String, glyphs: &[Glyph]) {
     for g in glyphs {
         s.push_str(&format!("    // {} ({})\n", g.variant, g.id));
@@ -704,8 +688,7 @@ pub struct GlyphDef {
 
 ";
 
-/// The `gen_*` examples' asset-dir reader, compiled into the drift tests so
-/// they regenerate from the same texts (dev-only; the engine reads no file).
+/// The `gen_*` examples' asset-dir reader.
 #[cfg(test)]
 #[path = "../examples/support/asset_dir.rs"]
 mod asset_dir;
@@ -744,7 +727,7 @@ mod tests {
         );
     }
 
-    /// Cat drift gate (§1): the regenerated source equals `cat_glyphs_gen.rs`.
+    /// The regenerated source equals `cat_glyphs_gen.rs`.
     #[test]
     fn cat_glyphs_gen_matches_assets() {
         let generated =

@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! The cutter seals the successor's handoff policy into the bundle.
-//!
-//! An older aterm trusts `Contents/Resources/aterm-handoff-policy.toml` in the release it hands
-//! its sessions to only because the code signature seals it, which holds only if the cutter
-//! writes it before signing. This runs the real bundle and signing steps in the cut's order and
-//! proves the file is there byte for byte and sealed.
 
 use crate::bundle;
 #[cfg(target_os = "macos")]
@@ -28,7 +23,6 @@ fn repo_root() -> PathBuf {
 /// in its default tier: `Ok` when the seal is intact.
 #[cfg(target_os = "macos")]
 fn verify_seal(app: &Path) -> Result<(), String> {
-    // Under a hang detector: a codesign that stops answering fails in a minute.
     let out = aterm_uds::deadline::output_until(
         aterm_uds::spawnfd::command("/usr/bin/codesign")
             .args(["--verify", "--deep", "--strict"])
@@ -50,7 +44,6 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
         BUNDLE_PATH, PolicyRead, SOURCE_PATH, read_from_bundle,
     };
 
-    // Signing and verifying a copy of an Apple binary wait on trustd.
     aterm_uds::deadline::require_trust_service();
     let repo = repo_root();
     let scratch = std::env::temp_dir().join(format!(
@@ -59,7 +52,6 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
     ));
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).expect("scratch");
-    // Any signable Mach-O proves the same about the seal as the cut's universal `aterm`.
     let exe = scratch.join("aterm-bin");
     std::fs::copy("/usr/bin/true", &exe).expect("a Mach-O to bundle");
     let spec = bundle::BundleSpec {
@@ -72,7 +64,6 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
         aterm_bin: exe,
     };
 
-    // The release's order: the build lays the bundle out, the cut signs it.
     let app = scratch.join("aterm.app");
     bundle::assemble_at(&spec, &app).expect("the bundle step");
     let placed = app.join(BUNDLE_PATH);
@@ -90,7 +81,6 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
         "a producer reads the sealed policy as schema 1"
     );
 
-    // Sealed: a policy edited after signing breaks the bundle's signature.
     let mut tampered = source.clone();
     tampered.extend_from_slice(b"carry = \"repaint\"\n");
     std::fs::write(&placed, &tampered).expect("tamper");
@@ -102,8 +92,6 @@ fn the_cutter_seals_the_handoff_policy_into_the_bundle_before_it_signs() {
     let _ = std::fs::remove_dir_all(&scratch);
 }
 
-/// The bundle step re-judges the policy bytes it places, so a file edited after the gate cannot
-/// slip into the bundle.
 #[test]
 fn the_bundle_step_refuses_a_policy_no_producer_could_follow() {
     let scratch = std::env::temp_dir().join(format!(

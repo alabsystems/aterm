@@ -306,10 +306,40 @@ impl Default for LookPolicy {
 }
 
 impl LookPolicy {
+    /// Refresh the focused pane's cached raw program claim from `block` (the pane's current block, else its last) without cloning it.
+    #[inline]
+    pub fn resolve_claim(
+        &mut self,
+        session: u64,
+        block: Option<&OutputBlock>,
+    ) -> Option<&AppIdentity> {
+        self.claim.resolve(session, block)
+    }
+
     /// The focused pane's raw program claim, read off `block` (the pane's current block, else its last) under the host's terminal lock.
     #[inline]
     pub fn claim(&mut self, session: u64, block: Option<&OutputBlock>) -> Option<AppIdentity> {
-        self.claim.resolve(session, block).cloned()
+        self.resolve_claim(session, block).cloned()
+    }
+
+    /// [`Self::verdict`] reading the focused pane's already-resolved [`Self::resolve_claim`] in place, avoiding a per-frame [`AppIdentity`] clone across the terminal lock.
+    #[inline]
+    pub fn verdict_from_resolved_claim(
+        &mut self,
+        favourite: Option<KittyLook>,
+        launch: KittyLook,
+        now: Instant,
+    ) -> KittyLook {
+        let app = self
+            .tenure
+            .observe(self.claim.identity.as_ref(), now)
+            .map(|i| i.look);
+        let (look, rung) = companion_precedence(favourite, app, launch);
+        self.rung = rung;
+        if rung != CompanionRung::Program {
+            self.tenure.note_non_program_verdict();
+        }
+        look
     }
 
     /// The companion verdict: `raw` (the focused pane's claim) through the tenure gate, then [`companion_precedence`].

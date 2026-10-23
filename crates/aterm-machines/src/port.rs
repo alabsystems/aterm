@@ -528,6 +528,13 @@ pub trait System: Sync {
         false
     }
 
+    /// When `pid` started, in unix seconds, as the kernel recorded it for any uid's process
+    /// (what `ps -o lstart=` printed), or `None` when there is no such process.
+    fn process_started(&self, pid: u32) -> Option<u64> {
+        let _ = pid;
+        None
+    }
+
     /// Spawn a detached child gated on a one-byte stdin start token.
     fn stage_detached(
         &self,
@@ -1278,6 +1285,10 @@ impl System for Live {
         aterm_uds::process::pid_alive(pid)
     }
 
+    fn process_started(&self, pid: u32) -> Option<u64> {
+        aterm_sysprobe::kproc::record(pid).map(|r| r.start_s)
+    }
+
     fn stage_detached(
         &self,
         cmd: &Cmd,
@@ -1564,6 +1575,8 @@ mod fake {
         directory_flush_errors: Mutex<BTreeMap<PathBuf, io::ErrorKind>>,
         links: Mutex<BTreeMap<PathBuf, PathBuf>>,
         alive: Mutex<Vec<u32>>,
+        /// Each pid's start second ([`Fake::born`]).
+        born: Mutex<BTreeMap<u32, u64>>,
         /// The effective uid the fake reports (0 = root, the agent's case).
         pub euid: u32,
         /// The clock.
@@ -2017,6 +2030,12 @@ mod fake {
         /// Mark `pid` as a live process.
         pub fn alive(&self, pid: u32) -> &Self {
             self.alive.lock().unwrap().push(pid);
+            self
+        }
+
+        /// Record that `pid` started at `unix` seconds ([`System::process_started`]).
+        pub fn born(&self, pid: u32, unix: u64) -> &Self {
+            self.born.lock().unwrap().insert(pid, unix);
             self
         }
 
@@ -2585,6 +2604,10 @@ mod fake {
 
         fn pid_alive(&self, pid: u32) -> bool {
             self.alive.lock().unwrap().contains(&pid)
+        }
+
+        fn process_started(&self, pid: u32) -> Option<u64> {
+            self.born.lock().unwrap().get(&pid).copied()
         }
 
         fn stage_detached(

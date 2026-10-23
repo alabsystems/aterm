@@ -1,30 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! THE SESSION JOURNAL'S FILES (`docs/DESIGN-session-log-2026-10-15.md`
-//! §5.3, phase 2B): everything the journal does to the disk, behind one
-//! trait so the writer and the reader run the same on a real directory
-//! ([`PinnedJournalFs`]) and on a test's ([`MemFs`], with faults injected).
-//!
-//! The rules:
-//! - The directory is `<logs>/session-log`, pinned (`crate::pinned_dir`):
-//!   every operation is relative to the retained descriptor, so a symlink
-//!   anywhere in the path, or a directory swapped in later, is never
-//!   followed. The writer creates it 0700 and resets a wider mode; one owned
-//!   by someone else, or a symlink, is refused. A reader only ever opens an
-//!   existing one ([`PinnedJournalFs::open`] with `create = false`).
-//! - Every process writes only its own fresh files: a segment is created
-//!   `O_CREAT|O_EXCL|O_NOFOLLOW|O_APPEND|O_CLOEXEC`, 0600, checked a singly
-//!   linked regular file ([`JournalFs::create_segment`]).
-//! - An instance's liveness is its `<inst>.lock`, created under a dot-pending
-//!   name, `flock`ed `LOCK_EX`, then renamed into place (never over an
-//!   existing name), so no reader ever sees an unlocked live lock
-//!   ([`JournalFs::lock_instance`]). The lock is taken through
-//!   `HeldAdvisoryLock`, whose drop lets go by `LOCK_UN`. A filesystem
-//!   without `flock` refuses it, and the journal does not start.
-//! - Removal ([`JournalFs::remove`]) unlinks through the retained directory
-//!   only a regular, singly linked file of this user whose identity is the
-//!   one the caller listed: never through a symlink, never a hard link.
+//! Filesystem operations for the session journal behind [`JournalFs`].
 
 use std::io;
 
@@ -75,12 +52,12 @@ pub(crate) trait Appender: Send {
 
 /// The journal's directory.
 pub(crate) trait JournalFs: Send + Sync {
-    /// Lock `inst` for its journal's life (module docs). `Err`: no journal.
+    /// Lock `inst` for its journal's life.
     fn lock_instance(&self, inst: &Inst) -> io::Result<Box<dyn Held>>;
     /// The clean end: remove `inst`'s lock file (exactly the one `held`
     /// holds), then let go.
     fn unlock_instance(&self, inst: &Inst, held: Box<dyn Held>);
-    /// Create a NEW segment `name` (module docs).
+    /// Create a new segment `name`.
     fn create_segment(&self, name: &str) -> io::Result<Box<dyn Appender>>;
     /// Visit at most `max` of the directory's names (those that are UTF-8),
     /// in directory order, holding none: `true` when some were left
@@ -107,12 +84,6 @@ pub(crate) trait JournalFs: Send + Sync {
 
 /// The directory's names, at most `aterm_slog::journal::LIST_MAX`, and
 /// whether that bound cut the listing.
-///
-/// A fn of `&dyn JournalFs`, not a provided method: Trust's seal check reads
-/// a provided method at its own `Self`, where `scan` names no one body, and
-/// refuses `HarnessPolicySeal.cell` (harness_policy_cell_island.rs) over the
-/// `&mut dyn FnMut` it hands on. Through the `dyn`, each impl's `scan` is
-/// read where the `dyn` is made.
 #[cfg(unix)]
 pub(crate) fn list(fs: &dyn JournalFs) -> io::Result<Listing> {
     let mut names = Vec::new();
@@ -177,8 +148,6 @@ mod real {
         }
 
         fn sync(&mut self) -> io::Result<()> {
-            // Ordered: a reader drops a torn tail and reads a missing `#fin` as a crash;
-            // the only order needed is segment n before n+1.
             aterm_durable::ordered(&self.0)
         }
     }
@@ -197,11 +166,7 @@ mod real {
     }
 
     impl PinnedJournalFs {
-        /// `<logs>/session-log`, pinned. `create`: the writer's, which makes
-        /// it (0700) when absent and resets a wider mode on its own; a reader
-        /// passes `false` and gets `Ok(None)` for a directory that does not
-        /// exist, creating nothing. A symlink, a non-directory
-        /// or another user's directory is an `Err`.
+        /// `<logs>/session-log`, pinned.
         pub(crate) fn open(logs: &Path, create: bool) -> io::Result<Option<PinnedJournalFs>> {
             let logs = match PinnedDir::open_resolved(logs) {
                 Ok(dir) => dir,
@@ -256,7 +221,6 @@ mod real {
                 let _ = self.dir.remove_file_if_exists(pending);
                 return Err(error);
             }
-            // Ordered, as `sync_dir`: liveness is the flock, which no reboot keeps.
             let _ = self.dir.sync_ordered();
             Ok(Box::new(Lock(held)))
         }
@@ -327,8 +291,6 @@ mod real {
             if !file.metadata().is_ok_and(|md| md.uid() == self.euid) {
                 return Liveness::Unknown;
             }
-            // A probe that lets go on every path before its close (clippy.toml:
-            // the flock release rule).
             #[expect(
                 clippy::disallowed_methods,
                 reason = "a probe: released by `unlock` below before the close"
@@ -361,9 +323,6 @@ mod real {
         }
 
         fn sync_dir(&self) -> io::Result<()> {
-            // Ordered: a segment is created exclusively and retention runs again at
-            // start; liveness is a flock, dead after a reboot, and a reader drops a torn
-            // tail and reads a missing `#fin` as a crash.
             self.dir.sync_ordered()
         }
 
@@ -373,11 +332,7 @@ mod real {
     }
 }
 
-/// THE TEST DIRECTORY: an in-memory journal directory with the faults a
-/// disk has (ENOSPC after `k` bytes, a short write, EIO, EACCES, EINTR,
-/// EAGAIN, a write that blocks on a barrier) and the shapes a hostile one has
-/// (a symlink, a hard link, a foreign owner), each injected by a test. Its
-/// errnos are POSIX, like [`real`]'s.
+/// An in-memory journal directory with fault injection for tests.
 #[cfg(test)]
 #[cfg(unix)]
 pub(crate) mod mem {

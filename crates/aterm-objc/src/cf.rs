@@ -5,21 +5,6 @@
 //! retain/release, and the few objects the windowing backend reads — a list of
 //! display modes, a keyboard layout's bytes, a display's UUID, a pixel-encoding
 //! string.
-//!
-//! Declarations under Apple's names, plus two owners ([`CFUUID`], [`CFString`])
-//! where a +1 is held past one call. Each opaque `…Ref` points at its own
-//! zero-sized type, so a `CFArrayRef` does not pass where a `CFStringRef` is
-//! wanted.
-//!
-//! **The SDK is the authority.** `tests/cf_sdk.rs` reads this file as source
-//! and has clang hold every alias, struct field, constant, static and
-//! prototype to the headers, for `arm64` and `x86_64` (`aterm-cg`'s
-//! `tests/cg_sdk.rs` does the same for CoreGraphics, with the same probe).
-//!
-//! It replaces the `core-foundation` crates in the vendored winit fork
-//! (`docs/AUDIT-third-party-2026-10-15.md`, winit-core step 3). The run-loop
-//! timer is not here: it is [`crate::wake_timer`]'s alone (the `runloop-timer`
-//! guard in `aterm-census --guards`).
 
 #![allow(non_camel_case_types, non_snake_case, non_upper_case_globals)]
 
@@ -27,9 +12,7 @@ use std::ffi::c_void;
 use std::fmt;
 use std::ptr::NonNull;
 
-/// Zero-sized `#[repr(C)]` types that only ever sit behind a pointer
-/// CoreFoundation owns: never constructed here, `!Send`, `!Sync` and `!Unpin`.
-/// Exported for `aterm-cg`, whose CoreGraphics types have the same shape.
+/// Zero-sized `#[repr(C)]` types that only ever sit behind a pointer CoreFoundation owns.
 #[doc(hidden)]
 #[macro_export]
 macro_rules! opaque {
@@ -67,11 +50,7 @@ pub type CFRunLoopMode = CFStringRef;
 pub type CFRunLoopActivity = CFOptionFlags;
 pub type CFRunLoopRunResult = i32;
 
-/// The observer callout. `"C-unwind"` because winit's observers are defined
-/// that way (a Rust panic is caught inside them, an `NSException` contained):
-/// the ABI string tells rustc only whether the callee may unwind, so this is
-/// the same C function pointer CoreFoundation calls, minus a transmute at the
-/// registration site.
+/// The observer callout (`"C-unwind"`).
 pub type CFRunLoopObserverCallBack =
     extern "C-unwind" fn(CFRunLoopObserverRef, CFRunLoopActivity, *mut c_void);
 
@@ -264,8 +243,7 @@ impl CFString {
         self.0.as_ptr()
     }
 
-    /// The whole string, read as its UTF-16 code units in one copy. A lone
-    /// surrogate, which no UTF-8 can carry, reads as U+FFFD.
+    /// The whole string, read as its UTF-16 code units in one copy.
     fn read(&self) -> String {
         let s = self.as_ptr();
         // SAFETY: `self` holds a live CFString.

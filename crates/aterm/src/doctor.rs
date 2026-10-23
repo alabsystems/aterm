@@ -1,32 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `aterm doctor`, composed here (docs/DESIGN-init-system-2026-10-20.md §3.4, §5, S5):
-//! aterm-cli's rows as items ([`aterm_cli::doctor`]), the packages' repair items
-//! ([`atpkg::converge::repair`], the doctor's pass) and `aterm pkg doctor`'s rows, its
-//! packages view.
-//!
-//! - Bare `aterm doctor` applies the `relay` and `asked` items (the 2026-10-14
-//!   fix-by-default ruling) under a TRY-lock of the store. An install pass holding the
-//!   lock is a note ("an install pass holds the store; nothing was repaired"): the items
-//!   stand aside, no journal line is written, and unresolved work exits 1 (never 75).
-//!   A lock that cannot be taken for another reason holds every change back: a warning.
-//!   Every change is journaled ([`aterm_converge::FileJournal`] under the account's state
-//!   root).
-//! - `--read-only` probes and plans: nothing is written, the lock is not taken. So does a
-//!   shell that is not the account's own (root, another `$HOME`, a private state root:
-//!   `Requires::Account`), whose rows name each change it left.
-//! - `--json` prints every row in the one report schema; `--only <id,...>` narrows the
-//!   items and the packages' rows to those ids, families or layers (the shell is always
-//!   read as a prerequisite), and a word that names nothing is the usage refusal, said
-//!   before anything is read or handed over.
-//! - Exit 0 means the selected checks are satisfied or explicitly not applicable;
-//!   planned, manual, blocked, deferred, unknown and failed checks exit 1. JSON carries
-//!   the shared readiness summary as well as the separate shell-usability row. Use
-//!   `--read-only --only base.shell.starts` to check only whether the shell can start.
-//! - `--check`, `--apply` and `--restore` are the macOS fleet settings profile alone
-//!   ([`cli::settings`], docs/DESIGN-macos-doctor-2026-10-19.md): no item runs, and the
-//!   report (or its `--json` document) is on stdout whatever the exit.
+//! `aterm doctor` entry point, convergence runner, and macOS base init items.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -59,13 +34,11 @@ pub(crate) fn main_entry(rest: &[OsString]) -> ExitCode {
         }
     };
     if let Some(action) = args.settings {
-        // A fleet collector parses every answer, drift and failure included: stdout.
         let (text, code) = cli::settings(action, args.json);
         return cli::answer(&text, code, true);
     }
     let ground = atpkg::store::resolve_configured()
         .map(|layout| Arc::new(Ground::of_process(layout, Pass::Doctor)));
-    // The Developer Tools row is aterm-cli's, read once: the packages view never reads it.
     let packages = || {
         ground
             .as_ref()
@@ -132,8 +105,6 @@ enum How {
 /// Run `aterm doctor` as `args` asks over `ports`.
 pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     let tokens = &args.only;
-    // Every word is checked before anything is read or handed over: one that names no
-    // doctor row (on any platform), no repair item and no packages row is the refusal.
     let (repairs, missed) = match ports.ground {
         Some(ground) => aterm_converge::select(repair::items(ground), tokens),
         None => (Vec::new(), tokens.clone()),
@@ -163,7 +134,6 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
 
     let own = ports.not_own_account.is_none();
     let gathered = (ports.gather)(own && !args.read_only && cli::hands_over(tokens));
-    // The shell is always read, even when the requested scope is narrower.
     let fact_tokens: Vec<String> = if tokens.is_empty() {
         Vec::new()
     } else {
@@ -175,9 +145,6 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     };
     let (facts, _) = aterm_converge::select(gathered.items(), &fact_tokens);
 
-    // The store lock: tried, never waited on (design §3.2), and not taken where nothing
-    // is changed. An install pass holding it makes every item stand aside; a lock that
-    // cannot be taken otherwise holds every change back.
     let mut lock = None;
     let how = match ports.ground {
         _ if args.read_only || !own => How::Planned,
@@ -214,7 +181,6 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     };
     let mut journal: Box<dyn Journal> = match ports.state {
         Some(state) if how == How::Applied => Box::new(aterm_converge::FileJournal::under(state)),
-        // Planned, stood aside, held back, or no state root: nothing is changed unrecorded.
         _ => Box::new(aterm_converge::ReadOnly),
     };
     let scope = Scope {
@@ -241,9 +207,6 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     }
     drop(lock);
 
-    // The packages view, read after the repair: a row the items already ran is theirs
-    // (the Developer Tools row is aterm-cli's). Readiness includes every remaining row,
-    // without changing the essential/advisory policy used by `aterm pkg doctor`.
     let changed = fact_rows
         .iter()
         .chain(&repair_rows)
@@ -276,9 +239,6 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     {
         refused.push(missing_store);
     }
-    // A recognized selector is not evidence that its check ran. This includes a
-    // platform-specific row omitted by the gatherer; only an explicit NotApplicable
-    // result can make it green.
     for token in tokens {
         if !fact_rows
             .iter()
@@ -355,7 +315,6 @@ pub(crate) fn run(args: &Args, ports: &Ports<'_>) -> Ran {
     }
 }
 
-/// Missing evidence must be a row, not an empty successful report.
 fn unmeasured(id: &str, family: &str, layer: Option<Layer>, why: String) -> ItemReport {
     ItemReport {
         id: id.to_owned(),
@@ -478,9 +437,9 @@ impl Item for AiAccountsItem {
                 .count();
             let state = store.load(env.now).map(|(s, _)| s).unwrap_or_default();
             let own_label = bound.row_for_login(None).map(|r| r.label.as_str());
-            let next_hint = accounts::sign_in_next(&bound, &state, &enrolled, own_label, env.now)
-                .filter(|(_, has_email)| *has_email && ready < bound.rows.len())
-                .map(|(label, _)| format!("; next: `aterm harness accounts renew {label}`"))
+            let next_hint = accounts::renew_next(&bound, &state, &enrolled, own_label, env.now)
+                .filter(|_| ready < bound.rows.len())
+                .map(|label| format!("; next: `aterm harness accounts renew {label}`"))
                 .unwrap_or_default();
             return Probe::Ok {
                 now: format!(
@@ -608,15 +567,10 @@ fn init_base_over(ground: &Arc<Ground>, applies: bool) -> aterm_machines::init::
     }
 }
 
-/// Whether `token` names `row` ([`aterm_converge::selects`]).
 fn named_by(token: &str, row: &ItemReport) -> bool {
     aterm_converge::selects(token, &row.id, &row.family, row.layer)
 }
 
-/// The repair items' row: what was restored, what would be, what could not be and why.
-/// A run that stood aside or held its changes back says why first, and then what each
-/// item would have changed; so does a run outside the account's own shell (`hold`, the
-/// line its held rows carry). `None` when no repair item ran.
 fn repair_section(rows: &[ItemReport], how: &How, hold: Option<&str>) -> Option<Section> {
     if rows.is_empty() {
         return None;
@@ -632,7 +586,6 @@ fn repair_section(rows: &[ItemReport], how: &How, hold: Option<&str>) -> Option<
         How::HeldBack(line) => (Some(line.as_str()), true),
         How::Applied | How::Planned => (None, false),
     };
-    // A held-back change's why: what is not as laid, then this suffix.
     let held_back = match how {
         How::HeldBack(line) => format!("; not changed: {line}"),
         _ => String::new(),
@@ -656,8 +609,6 @@ fn repair_section(rows: &[ItemReport], how: &How, hold: Option<&str>) -> Option<
                     row.from.as_deref().unwrap_or("not as laid")
                 ));
             }
-            // What it would have changed, or (waiting on an item that stood aside) what
-            // it waits for.
             Outcome::Blocked if row.stood_aside.is_some() => lines.push(format!(
                 "{}: {}",
                 row.title,
@@ -666,14 +617,12 @@ fn repair_section(rows: &[ItemReport], how: &How, hold: Option<&str>) -> Option<
                     .unwrap_or(why)
                     .trim_end_matches([':', ' ']))
             )),
-            // Named, never made, from a shell not the account's own.
             Outcome::Blocked if hold == Some(why) => {
                 held = true;
                 warn = true;
                 let from = row.from.as_deref().unwrap_or("not as laid");
                 lines.push(format!("{}: {from}", row.title));
             }
-            // Named, never made, past a lock that could not be taken.
             Outcome::Blocked if !held_back.is_empty() && why.ends_with(&held_back) => {
                 warn = true;
                 lines.push(format!(
@@ -692,8 +641,6 @@ fn repair_section(rows: &[ItemReport], how: &How, hold: Option<&str>) -> Option<
             }
         }
     }
-    // The first line is joined in front, never inserted: `Vec::insert` is a call whose
-    // panic-freedom the verifier cannot establish, even at index 0.
     let first = lead.or_else(|| hold.filter(|_| held));
     if first.is_none() && lines.is_empty() {
         lines.push("nothing to restore".to_owned());

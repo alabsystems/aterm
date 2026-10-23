@@ -70,8 +70,6 @@ impl From<Transform> for Affine {
     }
 }
 
-/// Flatten a glyph's outline into pixel-space contours (a flat polyline per
-/// contour), transforming every point through `xform`.
 struct OutlineCollector {
     xform: Affine,
     contours: Vec<Vec<(f32, f32)>>,
@@ -163,8 +161,6 @@ fn lerp_premul(c0: RgbaColor, c1: RgbaColor, u: f32) -> RgbaColor {
     )
 }
 
-/// Collect a gradient color line into (offset, color) pairs sorted by offset
-/// (the spec allows unsorted stops; aterm-font hands them through raw).
 fn collect_stops(iter: impl Iterator<Item = ColorStop>) -> Vec<(f32, RgbaColor)> {
     let mut v: Vec<(f32, RgbaColor)> = iter.map(|s| (s.stop_offset, s.color)).collect();
     v.sort_by(|a, b| a.0.total_cmp(&b.0));
@@ -190,7 +186,6 @@ const fn linear_projection(dx: f32, dy: f32, rx: f32, ry: f32) -> Option<(f32, f
     }
 }
 
-/// A gradient color line resolved to concrete, sorted stops.
 struct ColorRamp {
     extend: GradientExtend,
     /// (offset, straight-alpha color), ascending by offset, never empty.
@@ -198,7 +193,6 @@ struct ColorRamp {
 }
 
 impl ColorRamp {
-    /// Sample the ramp at parameter `t`, extend-mapped over the stop range.
     fn sample(&self, t: f32) -> RgbaColor {
         let first = self.stops[0];
         let last = self.stops[self.stops.len() - 1];
@@ -208,8 +202,6 @@ impl ColorRamp {
         let (lo, hi) = (first.0, last.0);
         let span = hi - lo;
         if span <= 0.0 {
-            // All stops coincide; the portion above the shared offset shows the
-            // last stop, and that is where pad extension lands.
             return last.1;
         }
         let t = match self.extend {
@@ -240,8 +232,6 @@ impl ColorRamp {
     }
 }
 
-/// Per-pixel gradient geometry in paint space (the coordinate system active
-/// when the paint was applied).
 enum GradientKind {
     /// `p0` plus the projected gradient vector `q` ([`linear_projection`]);
     /// `inv_q2` is `1/(q·q)`.
@@ -271,7 +261,6 @@ enum GradientKind {
     },
 }
 
-/// A gradient fill: geometry + color ramp + the device→paint inverse transform.
 struct GradientFill {
     kind: GradientKind,
     ramp: ColorRamp,
@@ -279,8 +268,6 @@ struct GradientFill {
 }
 
 impl GradientFill {
-    /// The gradient color under device pixel center `(x, y)`, or `None` where
-    /// the gradient is undefined (outside a one-sided radial cone).
     fn sample_at(&self, x: f32, y: f32) -> Option<RgbaColor> {
         let (ux, uy) = self.inv.apply(x, y);
         let t = match self.kind {
@@ -350,13 +337,11 @@ impl GradientFill {
     }
 }
 
-/// A resolved layer fill: one solid color, or a per-pixel gradient.
 enum FillSource {
     Solid(RgbaColor),
     Gradient(GradientFill),
 }
 
-/// RGBA8 accumulator + the aterm-font COLR painter state.
 struct ColrCanvas<'a> {
     face: &'a Face<'a>,
     w: usize,
@@ -372,7 +357,6 @@ struct ColrCanvas<'a> {
 }
 
 impl ColrCanvas<'_> {
-    /// src-over composite `color` at coverage `cov` (0..=1) into pixel (x,y).
     fn blend(&mut self, x: usize, y: usize, color: RgbaColor, cov: f32) {
         if x >= self.w || y >= self.h {
             return;
@@ -390,9 +374,6 @@ impl ColrCanvas<'_> {
         self.buf[i + 3] = ((sa + da * (1.0 - sa)) * 255.0).round() as u8;
     }
 
-    /// Scanline-fill the pending PaintGlyph outline (in the affine captured by
-    /// `outline_glyph`, not paint-time `cur`) with `src`: 4× vertical supersampling,
-    /// analytic horizontal coverage, nonzero winding.
     fn fill_pending(&mut self, src: &FillSource) {
         let Some((gid, clip_xform)) = self.pending.take() else {
             return;
@@ -474,9 +455,6 @@ impl ColrCanvas<'_> {
         }
     }
 
-    /// Resolve a `Paint` into a fill. Ill-formed gradient geometry (coincident linear
-    /// points, coincident radial circles, an empty sweep) is `None`: the spec says the
-    /// layer does not render.
     fn resolve_paint(&self, paint: &Paint) -> Option<FillSource> {
         let (extend, stops, kind) = match paint {
             Paint::Solid(c) => return Some(FillSource::Solid(*c)),
@@ -550,11 +528,6 @@ impl ColrCanvas<'_> {
 
 impl<'a> Painter<'a> for ColrCanvas<'a> {
     fn outline_glyph(&mut self, glyph_id: GlyphId) {
-        // Snapshot `cur` now: the PaintGlyph clip lives in this space, and a transform
-        // pushed in its subtree moves only the gradient geometry. Fluent's 🔥 depends on
-        // it: warping the outline through its mirroring paint transforms samples the pad
-        // ramps at their alpha-0 ends and all but erases the glyph. Nested PaintGlyph
-        // clips are not intersected (the module's src-over simplification).
         self.pending = Some((glyph_id, self.cur));
     }
     fn paint(&mut self, paint: Paint<'a>) {
@@ -579,7 +552,8 @@ impl<'a> Painter<'a> for ColrCanvas<'a> {
     fn pop_layer(&mut self) {}
 }
 
-/// Rasterize the COLR color glyph `gid` into an `w×h` RGBA8 buffer (fitted by [`colr_fit`], y-flipped).
+/// Rasterize the COLR color glyph `gid` into an `w×h` RGBA8 buffer (fitted by [`colr_fit`],
+/// y-flipped).
 pub(crate) fn rasterize_colr(face: &Face, gid: GlyphId, w: usize, h: usize) -> Option<Vec<u8>> {
     rasterize_colr_run(face, &[(gid, 0.0, 0.0)], w, h)
 }
@@ -629,9 +603,6 @@ impl UnitBox {
     }
 }
 
-/// The glyph's LAYOUT box: its advance across, and down the face's line
-/// widened to its global ink box, so no glyph of the face loses its top or
-/// its descent.
 fn layout_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
     let upem = f32::from(face.units_per_em());
     if upem <= 0.0 {
@@ -657,8 +628,6 @@ fn layout_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
     })
 }
 
-/// Where `gid` paints, at most: its COLRv1 clip box, else its outline's box,
-/// else its layout box.
 fn paint_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
     let clip = face
         .tables()
@@ -683,9 +652,6 @@ fn paint_box(face: &Face, gid: GlyphId) -> Option<UnitBox> {
         .or_else(|| layout_box(face, gid))
 }
 
-/// The face's EMOJI FRAME: the COLRv1 clip box of its 😀 (U+1F600), the
-/// square a full-size emoji of the face is drawn in, when the face declares
-/// one.
 fn emoji_frame(face: &Face) -> Option<UnitBox> {
     let gid = face.glyph_index('\u{1F600}')?;
     let b = face.tables().colr?.clip_box(gid, &[])?;
@@ -698,8 +664,6 @@ fn emoji_frame(face: &Face) -> Option<UnitBox> {
     frame.is_proper().then_some(frame)
 }
 
-/// The base transform that draws the font-unit run `glyphs` (each `(gid, x,
-/// y)`: an origin, y up) into a `w × h` pixel box, y down.
 fn colr_fit(face: &Face, glyphs: &[(GlyphId, f32, f32)], w: usize, h: usize) -> Option<Affine> {
     let mut content: Option<UnitBox> = None;
     for &(gid, x, y) in glyphs {
@@ -745,7 +709,7 @@ fn colr_fit(face: &Face, glyphs: &[(GlyphId, f32, f32)], w: usize, h: usize) -> 
     })
 }
 
-/// Rasterize the COLR glyphs `glyphs` (each `(gid, x, y)`: its origin in font units, y up — the shaper's pen plus offsets) into one `w × h` RGBA8 buffer, fitted by [`colr_fit`].
+/// Rasterizes the positioned COLR `glyphs` run into a `w × h` RGBA8 buffer.
 pub(crate) fn rasterize_colr_run(
     face: &Face,
     glyphs: &[(GlyphId, f32, f32)],
@@ -790,8 +754,6 @@ pub(crate) fn rasterize_colr_run(
     Some(buf)
 }
 
-/// Convert a premultiplied RGBA8 accumulator to straight alpha in place. Opaque and
-/// transparent pixels are already correct and are skipped, so opaque output is byte-exact.
 fn unpremultiply_straight(buf: &mut [u8]) {
     for px in buf.as_chunks_mut::<4>().0 {
         let a = u32::from(px[3]);
@@ -805,8 +767,6 @@ fn unpremultiply_straight(buf: &mut [u8]) {
     }
 }
 
-/// Add `amount` coverage to `cov` over the half-open pixel span `[x0, x1)`, with
-/// fractional coverage at the partially-covered end pixels.
 fn add_span(cov: &mut [f32], x0: f32, x1: f32, amount: f32) {
     let (x0, x1) = (x0.max(0.0), x1.min(cov.len() as f32));
     if x1 <= x0 {
@@ -845,15 +805,6 @@ mod tests {
         (cols, rows)
     }
 
-    /// WINDOWS' COLOUR EMOJI FIT THEIR BOX WHOLE, AND FILL IT. Segoe UI Emoji
-    /// draws each glyph centered in an advance wider than its em, with
-    /// descents below the line, so the emoji of an agent's reply (✅ ❌ ⭐ ⚡ ⏳
-    /// 😀 🚀 👍, and ⚠ ❤ asked for with VS16), fitted into the Windows
-    /// default's two-cell box (18 x 23 px), keep a clear texel on every side —
-    /// nothing cut off — sit centered across it within a pixel, and the
-    /// full-bleed ones span at least 15 of its 18 columns (the face's emoji
-    /// frame less a pixel of air each side; the layout-box fit drew them 14
-    /// wide).
     #[test]
     #[cfg(windows)]
     fn segoe_ui_emoji_glyphs_draw_whole_and_centred_in_their_box() {
@@ -893,9 +844,6 @@ mod tests {
         );
     }
 
-    /// A ZWJ FAMILY IS ITS MEMBERS SIDE BY SIDE. Segoe UI Emoji shapes 👨‍👩‍👧
-    /// to three colour glyphs, the last with no advance of its own (it stands
-    /// after the woman by its outline alone).
     #[test]
     #[cfg(windows)]
     fn a_segoe_family_paints_every_member_inside_its_box() {
@@ -965,8 +913,6 @@ mod tests {
         assert_eq!(m.apply(0.0, 0.0), (6.0, 8.0));
     }
 
-    /// `tests/fixtures/colr_1.ttf`: the googlefonts/color-fonts COLRv1 test font
-    /// (Apache-2.0) that ttf-parser 0.25.1 ships in its `tests/fonts`.
     fn colr_test_font() -> &'static [u8] {
         include_bytes!("../tests/fixtures/colr_1.ttf")
     }
@@ -1056,8 +1002,6 @@ mod tests {
         f: 0.0,
     };
 
-    /// A fixture gradient stop: offset plus raw RGBA (named to keep clippy's complex-type
-    /// lint quiet).
     type RawStop = (f32, (u8, u8, u8, u8));
 
     fn ramp(extend: GradientExtend, stops: &[RawStop]) -> ColorRamp {
@@ -1195,8 +1139,6 @@ mod tests {
         fn pop_layer(&mut self) {}
     }
 
-    /// The most distinct colours in any horizontal or vertical run of constant alpha
-    /// (α ≥ 128, ≥ 8 px).
     fn max_constant_alpha_run_spread(rgba: &[u8], w: usize, h: usize) -> usize {
         let px = rgba.as_chunks::<4>().0;
         assert_eq!(px.len(), w * h);
@@ -1234,8 +1176,6 @@ mod tests {
         best
     }
 
-    /// A pure-gradient glyph sweeps many colours, not one per layer (a gradient flattened to
-    /// its first stop renders flat).
     #[test]
     fn colr_gradient_renders_a_colour_spread() {
         let bytes = colr_test_font();

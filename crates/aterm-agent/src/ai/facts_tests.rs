@@ -205,9 +205,13 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
     let m27_dir = store.login_dir("m27").expect("m27 dir");
     std::fs::create_dir_all(&m27_dir).expect("mkdir m27");
     let roster_path = b.dir.path().join("accounts.toml");
+    let plain_dir = store.login_dir("plain").expect("plain dir");
+    std::fs::create_dir_all(&plain_dir).expect("mkdir plain");
     let roster_toml = format!(
         "[[account]]\nlabel = \"m27-3\"\nclass = \"dedicated\"\nemail = \"m27-3@example.test\"\n\n\
+         [[account]]\nlabel = \"plain\"\nclass = \"dedicated\"\ndir = {:?}\n\n\
          [[account]]\nlabel = \"m27\"\nclass = \"dedicated\"\ndir = {:?}\nemail = \"m27@example.test\"\n",
+        plain_dir.display().to_string(),
         m27_dir.display().to_string()
     );
     std::fs::write(&roster_path, &roster_toml).expect("roster");
@@ -293,5 +297,19 @@ fn claude_accounts_surfaces_next_sign_in_and_prefers_ready_enrolled_row() {
         view_signed_out.next_sign_in.as_deref(),
         Some("m27"),
         "when m27 is signed out and m27-3 is limited, next_sign_in falls back to m27 itself"
+    );
+
+    // Also verify when all rows have explicit `dir` and `m27` is NotEnrolled (no `.credentials.json`).
+    std::fs::remove_file(m27_dir.join(".credentials.json")).expect("unenroll m27");
+    let f_unenrolled = gather(&m, &CLAUDE);
+    let view_unenrolled = f_unenrolled
+        .accounts
+        .expect("accounts view with unenrolled explicit dir");
+    assert_eq!(view_unenrolled.label, "m27");
+    assert!(!view_unenrolled.made);
+    assert_eq!(
+        view_unenrolled.next_sign_in.as_deref(),
+        Some("m27"),
+        "when m27 is NotEnrolled and m27-3 is limited, next_sign_in falls back to m27"
     );
 }

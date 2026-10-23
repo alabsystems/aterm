@@ -1,14 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Page storage: 64 KB pages that [`PageStore`] bump-allocates typed
-//! [`PageSlice`]s from, with a free list of recycled pages
-//! ([`PageStore::preheat`] fills it ahead of use).
-//!
-//! [`Page`] is crate-internal. [`PageSlice`] is reachable for downstream test
-//! scaffolding under `debug_assertions` but is not re-exported at the crate
-//! root or through the `aterm-core` facade; production consumers use
-//! [`Row`](crate::Row) and [`PageStore`].
+//! Page storage: 64 KB pages that [`PageStore`] bump-allocates typed [`PageSlice`]s from.
 #![allow(
     clippy::large_stack_arrays,
     reason = "64KB page buffers are intentional for memory-mapped scrollback"
@@ -31,14 +24,14 @@ pub(crate) struct Page {
     data: UnsafeCell<[u8; PAGE_SIZE]>,
 }
 
-// SAFETY: `Page` is `Send`: its only field is plain bytes with no thread-affine
-// resources, and `PageStore` hands each byte range to at most one `PageSlice`.
+// SAFETY: `Page` is `Send`: its only field is plain bytes with no thread-affine resources, and
+// `PageStore` hands each byte range to at most one `PageSlice`.
 unsafe impl Send for Page {}
 
-// SAFETY: `Page` is `Sync`: its bytes are reached only through `PageSlice`s over
-// disjoint ranges (`as_slice` under `&self`, `as_mut_slice` under `&mut self`),
-// `alloc_page`'s zeroing under `&mut PageStore`, and test code's raw `data_ptr`
-// accesses, whose callers guarantee exclusivity; no byte range is mutated concurrently.
+// SAFETY: `Page` is `Sync`: its bytes are reached only through `PageSlice`s over disjoint ranges
+// (`as_slice` under `&self`, `as_mut_slice` under `&mut self`), `alloc_page`'s zeroing under `&mut
+// PageStore`, and test code's raw `data_ptr` accesses, whose callers guarantee exclusivity; no byte
+// range is mutated concurrently.
 unsafe impl Sync for Page {}
 
 const fn _assert_send<T: Send>() {}
@@ -64,8 +57,6 @@ impl Page {
     }
 
     /// Get a mutable pointer to the page data.
-    ///
-    /// Writing through it requires that no other reference to the bytes exists.
     #[inline]
     pub(crate) const fn data_ptr(&self) -> *mut u8 {
         self.data.get().cast()
@@ -91,7 +82,6 @@ pub struct Offset<T> {
     _marker: PhantomData<T>,
 }
 
-// Manual Copy/Clone: derive would require `T: Copy`.
 #[cfg(any(test, debug_assertions))]
 impl<T> Copy for Offset<T> {}
 #[cfg(any(test, debug_assertions))]
@@ -125,8 +115,7 @@ impl<T> Offset<T> {
 /// Logical page identifier.
 pub type PageId = usize;
 
-/// A typed slice allocated within a page. Production consumers use
-/// [`Row`](crate::Row) as their safe boundary.
+/// A typed slice allocated within a page.
 #[derive(Debug)]
 pub struct PageSlice<T> {
     ptr: NonNull<T>,
@@ -198,14 +187,13 @@ impl<T> DerefMut for PageSlice<T> {
 }
 
 // SAFETY: `PageSlice<T>` is `Send` when `T: Send`: it uniquely owns its `[T]` range
-// (`PageStore::alloc_slice` hands out disjoint ranges) inside a `Page`, which is `Send`
-// and outlives its slices (`Row::new`'s contract). Moving it moves that ownership; `len`
-// and `page_id` are plain data.
+// (`PageStore::alloc_slice` hands out disjoint ranges) inside a `Page`, which is `Send` and
+// outlives its slices (`Row::new`'s contract). Moving it moves that ownership; `len` and `page_id`
+// are plain data.
 unsafe impl<T: Send> Send for PageSlice<T> {}
 
-// SAFETY: `PageSlice<T>` is `Sync` when `T: Sync`: shared access only yields `&[T]`
-// (`as_slice`), and `as_mut_slice` needs `&mut PageSlice<T>`, which the borrow checker
-// keeps exclusive.
+// SAFETY: `PageSlice<T>` is `Sync` when `T: Sync`: shared access only yields `&[T]` (`as_slice`),
+// and `as_mut_slice` needs `&mut PageSlice<T>`, which the borrow checker keeps exclusive.
 unsafe impl<T: Sync> Sync for PageSlice<T> {}
 
 #[path = "page_store.rs"]

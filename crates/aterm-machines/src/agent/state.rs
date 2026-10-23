@@ -147,18 +147,34 @@ impl Holder {
 /// When `pid` started, as one word.
 #[must_use]
 pub fn started(sys: &dyn System, pid: u32) -> Option<String> {
-    let ran = sys
-        .run(
-            &crate::port::Cmd::new("/usr/bin/env")
-                .args(["TZ=UTC0", "/bin/ps", "-o", "lstart=", "-p"])
-                .arg(pid.to_string()),
-        )
-        .ok()?;
-    if !ran.success() {
-        return None;
-    }
-    let word = ran.out().split_whitespace().collect::<Vec<_>>().join("_");
-    (!word.is_empty()).then_some(word)
+    sys.process_started(pid).map(lstart_word)
+}
+
+/// `unix` seconds as `ps -o lstart=` prints them in UTC under the C locale (`%a %b %e %T
+/// %Y`, the day unpadded once the spaces are `_`): `Fri_Oct_16_22:36:10_2026`.
+#[must_use]
+pub fn lstart_word(unix: u64) -> String {
+    const DAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let (days, secs) = (unix / 86_400, unix % 86_400);
+    let (year, month, day) =
+        aterm_types::rfc3339::civil_from_days(i64::try_from(days).unwrap_or(0));
+    let weekday = usize::try_from(days % 7)
+        .ok()
+        .and_then(|i| DAYS.get(i))
+        .unwrap_or(&"?");
+    let month = usize::try_from(month - 1)
+        .ok()
+        .and_then(|i| MONTHS.get(i))
+        .unwrap_or(&"?");
+    format!(
+        "{weekday}_{month}_{day}_{:02}:{:02}:{:02}_{year}",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
 }
 
 /// Whether `h`'s process is still the one that took the lock.
@@ -403,7 +419,7 @@ pub fn save_managed(sys: &dyn System, layout: &Layout, m: &Managed) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::port::{Fake, Ran};
+    use crate::port::Fake;
 
     fn layout() -> Layout {
         Layout { root: "/A".into() }
@@ -463,14 +479,8 @@ mod tests {
         let fake = Fake::root();
         fake.file("/A/state/run.lock", stale);
         fake.alive(10);
-        fake.on(
-            "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 10",
-            Ran::ok("Sat Oct 17 08:01:02 2026    \n"),
-        );
-        fake.on(
-            "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 11",
-            Ran::ok("Sat Oct 17 08:05:00 2026    \n"),
-        );
+        fake.born(10, 1_792_224_062);
+        fake.born(11, 1_792_224_300);
         assert_eq!(busy(&fake, &layout()), None);
         assert!(!running(&fake, &layout(), "1-1"));
         assert_eq!(take_lock(&fake, &layout(), "2-2", 11).unwrap(), Lock::Taken);
@@ -481,10 +491,7 @@ mod tests {
         let fake = Fake::root();
         fake.file("/A/state/run.lock", stale);
         fake.alive(10);
-        fake.on(
-            "/usr/bin/env TZ=UTC0 /bin/ps -o lstart= -p 10",
-            Ran::ok("Fri Oct 16 22:36:10 2026    \n"),
-        );
+        fake.born(10, 1_792_190_170);
         assert_eq!(busy(&fake, &layout()).as_deref(), Some("1-1"));
         assert_eq!(
             take_lock(&fake, &layout(), "2-2", 11).unwrap(),
@@ -494,6 +501,55 @@ mod tests {
         fake.file("/A/state/run.lock", stale);
         fake.alive(10);
         assert_eq!(busy(&fake, &layout()).as_deref(), Some("1-1"));
+    }
+
+    /// A start reads as the word `ps -o lstart=` printed under `TZ=UTC0`, which a lock of an
+    /// earlier agent holds: the kernel's record, formatted here.
+    #[test]
+    fn a_start_is_the_word_ps_printed() {
+        assert_eq!(lstart_word(0), "Thu_Jan_1_00:00:00_1970");
+        assert_eq!(lstart_word(951_782_400), "Tue_Feb_29_00:00:00_2000");
+        assert_eq!(lstart_word(1_792_190_170), "Fri_Oct_16_22:36:10_2026");
+        assert_eq!(lstart_word(1_792_224_062), "Sat_Oct_17_08:01:02_2026");
+        // NEGATIVE CONTROL: a second later is another start.
+        assert_ne!(lstart_word(1_792_190_171), lstart_word(1_792_190_170));
+    }
+
+    /// `/bin/ps -o lstart= -p <pid>` under `TZ=UTC0`, the reader [`started`] replaced, as
+    /// its oracle: `None` when it does not answer. `zone` is the `TZ` it runs under.
+    #[cfg(target_os = "macos")]
+    fn ps_says(pid: u32, zone: &str) -> Option<String> {
+        let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("ps"))
+            .env("TZ", zone)
+            .env("LC_ALL", "C")
+            .args(["-o", "lstart=", "-p"])
+            .arg(pid.to_string())
+            .output()
+            .ok()?;
+        let word = String::from_utf8_lossy(&out.stdout)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join("_");
+        (out.status.success() && !word.is_empty()).then_some(word)
+    }
+
+    /// The kernel's start of this process, its parent and launchd (root's, which the old
+    /// `ps` read too) is what `ps` says. NEGATIVE CONTROL: `ps` under another zone says
+    /// another word, so the comparison can fail; a pid no process holds reads `None`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_kernel_start_is_what_ps_says() {
+        let live = crate::port::Live::new();
+        let me = std::process::id();
+        let parent = aterm_uds::process::read_process_parent(i32::try_from(me).unwrap())
+            .expect("this process's parent");
+        for pid in [me, parent, 1] {
+            let ours = started(&live, pid).expect("the kernel's record");
+            assert_eq!(Some(ours.clone()), ps_says(pid, "UTC0"), "pid {pid}");
+            assert_ne!(Some(ours), ps_says(pid, "Asia/Tokyo"), "pid {pid}");
+        }
+        assert_eq!(started(&live, 2_147_483_647), None);
+        assert_eq!(ps_says(2_147_483_647, "UTC0"), None);
     }
 
     #[test]

@@ -1,19 +1,10 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-
 //! Tests for display-offset damage computation.
 
 use super::Damage;
 use super::display_offset::{DisplayOffsetDamage, compute_display_offset_damage};
 
-/// The display-offset classification is exact for every delta and size: every
-/// (old, new) over 0..=48 at every size 0..=40 and the `u16` edge, plus offset
-/// pairs at the `u16::MAX` scale, give `None` exactly when the offsets agree,
-/// `Full` exactly when the delta covers the screen, `TopRows(n)` (scrolled up)
-/// with `0 < n < rows`, `BottomRows` (scrolled down) with
-/// `0 < start < end == rows`, and `min(delta, rows)` damaged rows, with neither
-/// `u16::try_from(..).expect()` firing.
 #[test]
 fn display_offset_damage_classifies_every_delta_and_size() {
     let check = |old: usize, new: usize, rows: u16| {
@@ -62,7 +53,6 @@ fn display_offset_damage_classifies_every_delta_and_size() {
     }
 }
 
-/// Each class marks exactly its rows.
 #[test]
 fn apply_display_offset_damage_marks_exactly_its_rows() {
     let apply = |class| {

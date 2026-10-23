@@ -82,9 +82,7 @@ fn cause(s: &Snapshot, id: CauseId) -> Candidate {
 const SPOTLIGHT: CauseId = CauseId::Activity(ActivityId::Spotlight);
 const STARTUP: CauseId = CauseId::Context(Context::Startup);
 
-/// RD's 10:32 moment: Spotlight covers `mds` and `mds_stores`, 1420 of 3300
-/// (over the floor's 500 and 330), 722 ‰ deferred, and runs after start-up:
-/// all its CPU is from leads born within a minute of userspace's start.
+/// Spotlight covers `mds` and `mds_stores`, 1420 of 3300, 722 ‰ deferred, and runs after start-up.
 #[test]
 fn spotlight_holds_on_its_vouched_members_after_start_up() {
     let s = snap(&spotlight_1032());
@@ -222,7 +220,7 @@ fn a_tabs_work_is_its_cause_and_never_after_start_up() {
 
 /// A tab's work above the floor beside a larger load no cause names:
 /// services' uncovered 3.79 cores are unexplained and the headline, never
-/// the tab's 0.72, which is minor (RD §5.3).
+/// the tab's 0.72, which is minor.
 #[test]
 fn a_small_cause_never_stands_for_a_large_uncovered_load() {
     let s = snap(&busier(busier(calm_1510(), 1210, 600), 430, 3600));
@@ -247,8 +245,7 @@ fn a_small_cause_never_stands_for_a_large_uncovered_load() {
     );
 }
 
-/// aterm itself as the largest part above the floor. NEGATIVE: at 10:32,
-/// aterm's own 0.20.
+/// aterm itself as the largest part above the floor.
 #[test]
 fn aterm_work_holds_when_aterm_itself_is_the_largest_part() {
     let mut scene = calm_1510();
@@ -854,9 +851,7 @@ fn the_clause_shows_after_ten_seconds_and_goes_after_thirty() {
     assert_eq!(h.step(26_000, &o, &split), None);
 }
 
-/// The clause's floor: a core and 40 % of the busy CPU outside aterm. 39 %,
-/// or 0.9 core, gives none; Spotlight at 42 % beside an app's work at 45 %
-/// gives none, and at 45 % beside 42 % the clause.
+/// The clause's floor: a core and 40 % of the busy CPU outside aterm.
 #[test]
 fn the_clause_needs_a_core_and_two_fifths_and_names_one_cause() {
     let shown = |o: &[OpenCause], split: &CoalSplit| {
@@ -1152,9 +1147,6 @@ fn the_memory_account_reads_the_tabs_footprint() {
         "2.5 GiB each, 5 GiB in all"
     );
     assert_eq!(both(Some(9 << 29)), Role::Part, "4.5 GiB, larger");
-    // A role that turns on a coalition whose footprint is unread is unread
-    // (main if the tab is the largest part, else part); one read larger
-    // settles it, and one that holds either way stands.
     assert_eq!(both(None), Role::Unavailable("not_sampled"), "unread");
     assert_eq!(
         beside(4 << 30, Some(5 << 29), None),
@@ -1171,8 +1163,6 @@ fn the_memory_account_reads_the_tabs_footprint() {
         Role::Minor,
         "under 1 GiB either way"
     );
-    // Before the lane's first window no coalition is read yet: warming, as
-    // the CPU's role is then, the tab's own footprint read.
     let cold = last(&readings(4 << 30)[..2]);
     assert!(
         cold.why.is_none() && cold.coal_lane.on(),
@@ -1333,10 +1323,8 @@ fn the_machines_contexts_are_the_snapshots_not_the_windows() {
 }
 
 /// With the lane off the facts are each whole reading's split by
-/// subtraction: a whole reading that makes none (an owner outside aterm
-/// unread, as on Linux) carries none, so the split and the tab's share read
-/// `not_sampled`, never the last reading's figures as if they were now (RD
-/// §3.2).
+/// subtraction: a whole reading that makes none carries none, so the split
+/// and the tab's share read `not_sampled`.
 #[test]
 fn with_the_lane_off_a_reading_with_no_split_carries_no_facts() {
     let mut series = read_calm(Scene {
@@ -1395,8 +1383,7 @@ fn a_tab_no_reading_read_is_unread_never_none() {
 }
 
 /// A misread turns the lane off for good, and with it every episode and the
-/// clause: with the lane off no covering cause holds, so the Deck names none
-/// (RD §3.3), not for the 30 s an open episode stays open failing either.
+/// clause.
 #[test]
 fn a_misread_ends_the_episodes_and_the_clause() {
     let mut series = read_calm(spotlight_1032()).series(5);

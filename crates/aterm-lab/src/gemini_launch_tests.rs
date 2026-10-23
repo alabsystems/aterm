@@ -13,9 +13,6 @@ use super::{Agent, Launch, launch, put_text};
 use crate::run::Run;
 use crate::util::shell_quote;
 
-// Each outer test owns a whole child process group and its scratch directory.
-// The child runs our scripts and the system's cat in place: no installed
-// agent or aterm is launched.
 fn check_launch(agent: Agent, test: &str) {
     const CHILD: &str = "ATERM_LAB_LAUNCH_FIXTURE";
     if let Some(root) = std::env::var_os(CHILD) {
@@ -27,16 +24,8 @@ fn check_launch(agent: Agent, test: &str) {
         .prefix("at.launch-")
         .tempdir_in("/tmp")
         .unwrap();
-    // The scripts the child runs are files this test writes, and macOS
-    // assesses each one's first exec, one scan at a time machine-wide: on a
-    // loaded host that exec waits out the whole queue, and the child runs two
-    // (behind about 80 queued scans the sampler's first exec took 11.4 s and
-    // the fake client's 9.4 s, a 0.6-0.9 s fixture 21 s; that a busy host's
-    // queue has held one past this minute is inferred from the gemini and agy
-    // failures in loaded verify runs, not reproduced). Written and run once
-    // here, unclocked, under their own hang detector, so the hang detector
-    // below times the launch and not the queue. The fake agent is never run:
-    // nothing here, or in the launch, may run it.
+    // Run `first_exec` on the two fixture scripts before starting the timed
+    // child so macOS's first-exec assessment does not count against `MUST_HAPPEN`.
     let fixture = Fixture::at(root.path());
     fixture.write_programs();
     first_exec(&fixture.sampler, &[]);
@@ -62,9 +51,6 @@ fn check_launch(agent: Agent, test: &str) {
     assert!(String::from_utf8_lossy(&out.stdout).contains("launch fixture completed"));
 }
 
-/// The fixture's files under the scratch directory the outer test made: the
-/// parent writes the programs ([`Fixture::write_programs`]), the child runs
-/// the launches against them.
 struct Fixture {
     /// The control socket, under the lexical `/tmp/at.*` directory the door
     /// requires.

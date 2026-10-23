@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Settings ▸ Themes: the chooser (highlight is the trial), the strip that never moves, the trial lane's two endings (one write on Keep; no write, byte for byte, on every way of reverting), community themes kept through the pack, Save as theme's round trip, the Customize sheet, and the page's rows in the compiled tree.
+//! Tests for Settings ▸ Themes chooser, trial lane, community themes, Save as theme, and Customize sheet.
 
 use super::*;
 use crate::settings_preview::theme_card::Section;
@@ -4061,7 +4061,6 @@ fn a_landing_the_keyboard_took_over_is_let_go_as_drawn() {
     );
 }
 
-/// Draw this thread's frames at `scale` text.
 fn set_text_scale(scale: f32) {
     crate::native_appearance::install_preferences(
         crate::native_appearance::AppearancePreferences {
@@ -4071,8 +4070,6 @@ fn set_text_scale(scale: f32) {
     );
 }
 
-/// How much of the control `key` a screen paints, its paint clipped where
-/// the screen cuts it, and how tall the control is.
 fn shown_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> (f32, f32) {
     let part = compiled
         .paint
@@ -4086,21 +4083,10 @@ fn shown_of(compiled: &crate::native_ui::CompiledUi, key: &str) -> (f32, f32) {
     (part, rect_of(compiled, key).height)
 }
 
-/// A LANDING THE KEYBOARD TOOK OVER IS SPENT: Themes opened on Nord with the
-/// keyboard already on its Community disclosure draws the disclosure, and
-/// every frame after it before any event — a shorter window, 2× text, then
-/// the first window again — keeps the disclosure in view, whole where the
-/// frame before showed it whole (else no less of it), and a frame drawn
-/// again as it was draws the same screen. Landed again, the list went back
-/// up to Nord and took the disclosure off the screen: 1284x714 made
-/// 1284x700 down to 380, 1144x700 and 864x700 made 600 down to 380, and
-/// each drawn at 2× text.
 #[test]
 fn a_landing_the_keyboard_took_over_stays_let_go_when_the_list_is_measured_again() {
     const PACK: &str = "settings/showcase/pack";
     let shown = |compiled: &crate::native_ui::CompiledUi| shown_of(compiled, PACK);
-    // The window's width, and the first frame's height and text size and
-    // the next's.
     let mut cases = Vec::new();
     for (width, tall, shorter) in [
         (
@@ -4155,14 +4141,6 @@ fn a_landing_the_keyboard_took_over_stays_let_go_when_the_list_is_measured_again
     });
 }
 
-/// A STATUS THAT COMES WHILE A LANDING WAITS LEAVES THE KEYBOARD'S CONTROL
-/// WHOLE (R2 of the keeping rules, #92): Themes on Nord at 178x348 at 2×
-/// text, the keyboard on its Community disclosure before the first frame
-/// (the landing on Nord giving way to it), then a status before any event.
-/// The bar shortens itself for the disclosure's row as well as for the row
-/// the landing still waits to show ([`SettingsViewState::note_status_room`]):
-/// sized for Nord's row alone, it left the disclosure's 89pt row an 82pt
-/// list, off the screen.
 #[test]
 fn a_status_while_a_landing_waits_leaves_the_keyboards_control_whole() {
     const PACK: &str = "settings/showcase/pack";
@@ -4192,42 +4170,16 @@ fn a_status_while_a_landing_waits_leaves_the_keyboards_control_whole() {
     );
 }
 
-/// THE KEYBOARD'S CONTROL STAYS IN VIEW WHERE A FRAME LISTS WHAT THE LAST
-/// PINNED: the chooser's filter over the list and the strip's Done under the
-/// demo are pinned where the page has room and are the list's stops where it
-/// has not, and a frame before any event that lists the one the keyboard is
-/// on, the frame before having drawn it pinned and whole, shows it whole —
-/// and drawn again draws the same screen. Customize pressed before the first
-/// frame at 444x180 at 2× text (its landing giving way to Done), then
-/// 1095x700 or 584x348, then 444x180 again, put Done 240pt or 180pt over the
-/// list's top; opened at 1095x700 or 584x348 (Done pinned, the landing's row
-/// not on the sheet), then 444x180, left Done under the list's bottom; the
-/// keyboard on the filter before the first frame, at 444x180 (1× and 2×) or
-/// 300x160 (2×), then 1284x714, then the first size again, left the filter
-/// over the list's top. A LANDING MEASURED AGAIN GIVES WAY AS ITS FIRST
-/// SCREEN WOULD HAVE: the keyboard on the filter before the first frame,
-/// drawn at 1284x714 (the filter pinned, Nord whole, nothing to give way
-/// to), then at 444x180 (1×, 2×), 300x160 or 584x348 (2×), draws the screen
-/// that window draws first, the filter whole; it landed on Nord again, the
-/// filter off the screen. With an event between the two frames (the
-/// keyboard put on the filter again), which lets the landing go, the filter
-/// no screen has listed counts as shown whole, and the shorter window shows
-/// it whole too.
 #[test]
 fn the_keyboards_control_stays_in_view_where_a_frame_lists_what_the_last_pinned() {
     const DONE: &str = "settings/showcase/customize-done";
     const FILTER: &str = "settings/showcase/filter";
-    // What a case holds beyond keeping the control in view.
     #[derive(Clone, Copy, Debug, PartialEq)]
     enum Also {
         Nothing,
-        // Its last frame is the screen its window draws first.
         DrawnFirst,
-        // An event comes after its first frame.
         Settled,
     }
-    // The theme in use, the control the keyboard is on before the first
-    // frame, each frame's width, height and text size, and what else holds.
     let mut cases = Vec::new();
     for theme in ["Dracula", "GitHub Light"] {
         let short = (444.0, 180.0, 2.0);
@@ -4268,8 +4220,6 @@ fn the_keyboards_control_stays_in_view_where_a_frame_lists_what_the_last_pinned(
                 AppEvent::FocusChanged(Some(UiKey::new(*key))),
             );
         };
-        // A view on the theme, the keyboard put on `key` before its first
-        // frame, at `scale` text.
         let opened = |scale: f32| {
             set_text_scale(scale);
             let (service, mut runtime, instance, view) =
@@ -4332,7 +4282,6 @@ fn the_keyboards_control_stays_in_view_where_a_frame_lists_what_the_last_pinned(
     });
 }
 
-/// The chooser's rows a screen draws whole in the list, by slug.
 fn rows_whole(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
     drawn_rows(compiled)
         .into_iter()
@@ -4344,9 +4293,6 @@ fn rows_whole(compiled: &crate::native_ui::CompiledUi) -> Vec<String> {
         .collect()
 }
 
-/// A view on Nord with the keyboard on the chooser's filter, drawn first at
-/// `at`, then the wheel gone four lines down the list, and the screen it
-/// left — the filter out of view where the list lists it.
 fn wheeled_past_the_filter(
     at: (f32, f32, f32),
 ) -> (
@@ -4380,22 +4326,9 @@ fn wheeled_past_the_filter(
     (service, runtime, instance, view, wheeled)
 }
 
-/// A CONTROL A WINDOW PINNED COMES BACK WHOLE FROM THE WHEEL'S PLACE: Themes
-/// on Nord with the keyboard on the filter, the wheel gone down the list
-/// past it, then windows that pin the filter over the list — the screen the
-/// person last saw shows it whole — and the first window again, with no
-/// event between, shows the filter whole: nothing the person did not do
-/// takes it out of view (R2 of the keeping rules, a pinned control shown
-/// whole), and the list leaves the wheel's place no further than R2 needs,
-/// for the screen that starts at the filter's stop (R4). Held at the wheel's
-/// place, as this test asked before the rules counted a pinned control as
-/// shown whole, 444x180 again drew hearth and linen and the filter 0 of its
-/// 32pt.
 #[test]
 fn a_control_a_window_pinned_comes_back_whole_from_the_wheels_place() {
     const FILTER: &str = "settings/showcase/filter";
-    // The window the wheel turns in, at its text size, and the windows
-    // drawn after it, at that text size, before it again.
     let cases = [
         ((444.0, 180.0, 1.0), vec![(584.0, 348.0)]),
         ((444.0, 180.0, 1.0), vec![(444.0, 420.0)]),
@@ -4464,16 +4397,6 @@ fn a_control_a_window_pinned_comes_back_whole_from_the_wheels_place() {
     });
 }
 
-/// A WHEEL OVER A PINNED CONTROL LEAVES IT WHOLE IN A SHORTER WINDOW, AND
-/// ITS PLACE COMES BACK IN THE WIDE ONE: the keyboard on the filter, pinned
-/// over Themes' list at 1284x714, the wheel gone down the list, and the
-/// window made 444x180 with no event between. The screen the person last
-/// saw showed the filter whole, and nothing they did takes it out of view,
-/// so the shorter window, which lists it, shows it whole; made 1284x714
-/// again, the list is where the wheel left it, as nothing needs it moved
-/// there. (Kept at the wheel's place, 444x180 left the filter above its
-/// screen, and this test held it so until the keeping rules put the
-/// keyboard's control first.)
 #[test]
 fn a_wheel_over_a_pinned_control_leaves_it_whole_in_a_shorter_window() {
     const FILTER: &str = "settings/showcase/filter";

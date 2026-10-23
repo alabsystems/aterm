@@ -2,11 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Host-side Claude Code composer footer resolver, cache, and glass splice.
-//!
-//! Resolves session model, effort, git branch, account label, subscription quota, and
-//! token usage off-thread ([`request_footer`]), caches per-pane screen readings
-//! ([`PaneTextCache`]), and splices the formatted facts, harness lights, and `YOLO`
-//! pill relabel into the composer rule with an undo record ([`FooterUndo`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -41,8 +36,7 @@ pub(crate) fn drawn_for(program: Option<&str>) -> bool {
         })
 }
 
-/// One pane's painted light block, held until the write says whether its row
-/// reached the scratch (only a light the glass shows gets a hit).
+/// One pane's painted light block.
 struct Lit {
     session: u64,
     frame_row: usize,
@@ -54,14 +48,11 @@ struct Lit {
     /// The frame columns of the title slot's words (empty: no title).
     title: std::ops::Range<usize>,
     block: crate::claude_lights::Block,
-    /// The write put its row on the frame: its hits are noted.
+    /// The write put its row on the frame.
     shown: bool,
 }
 
-/// One pane's composed top rule to write: its cells at `col` of frame row
-/// `frame_row` (leaf `leaf_index`'s [`ComposedTop`]) less the run of them
-/// left on the glass (`glass`, [`ComposedTop::glass`]), as [`rule_edits`],
-/// `ground` the pane's blank.
+/// One pane's composed top rule to write ([`ComposedTop`], [`ComposedTop::glass`], [`rule_edits`]).
 struct TopWrite {
     frame_row: usize,
     col: usize,
@@ -70,8 +61,7 @@ struct TopWrite {
     glass: std::ops::Range<usize>,
 }
 
-/// The top-effort key's target on a top rule: frame columns `cols` of frame
-/// row `frame_row` (`term_row` in the window's grid).
+/// The top-effort key's target on a top rule.
 struct TopHit {
     frame_row: usize,
     term_row: usize,
@@ -80,9 +70,7 @@ struct TopHit {
     ghost: bool,
 }
 
-/// A top line's lockup on the glass, the hover title's target (design §7):
-/// frame columns `cols` of frame row `frame_row` (`term_row` in the window's
-/// grid), a target only where the write at `edit_col` took.
+/// A top line's lockup on the glass, the hover title's target (design §7).
 struct MarkWrite {
     frame_row: usize,
     term_row: usize,
@@ -91,13 +79,7 @@ struct MarkWrite {
     session: u64,
 }
 
-/// What one pane's top line is spliced with ([`App::splice_top_line`],
-/// design §6.2): the pane, its leaf and session and the group the key's
-/// evidence is kept for, the program its lockup names (the identified
-/// agent) and the build the host proves it ([`top_build`]), the pane's
-/// blank, the harness switch and the theme the line wears, whether the
-/// footer holds the program's facts (the hover title's version), and the
-/// window's cell and the marks' ink.
+/// What one pane's top line is spliced with ([`App::splice_top_line`], [`top_build`]).
 struct TopLineAt {
     leaf_index: usize,
     session: u64,
@@ -127,55 +109,40 @@ struct AgyRowEdit {
 pub(crate) struct SpliceLists {
     panes: Vec<FooterPane>,
     seen: Vec<SeenPane>,
-    /// Panes whose composer is on the glass with no plain rule glyph to
-    /// write into (a selection over the whole rule): nothing is painted,
-    /// but the keyboard's chord is still the lights'.
+    /// Panes whose composer is on the glass with no plain rule glyph to write into.
     bare: Vec<u64>,
     /// The rules' compositions, written as [`rule_edits`].
     rules: Vec<RuleWrite>,
     /// agy's glass-only transcript markdown edits.
     agy_edits: Vec<AgyRowEdit>,
-    /// Claude's mode pills relabelled `YOLO on`/`YOLO off`
-    /// ([`collect_pill_relabel`]), their cells in `relabel_cells`.
+    /// Claude's mode pills relabelled `YOLO on`/`YOLO off` ([`collect_pill_relabel`]).
     relabels: Vec<RelabelWrite>,
     relabel_cells: Vec<RenderCell>,
-    /// The composer top rules' compositions, written as their cells
-    /// borrowed from the panes' footers ([`ComposedTop`]).
+    /// The composer top rules' compositions ([`ComposedTop`]).
     tops: Vec<TopWrite>,
-    /// The top-effort key's targets each top rule would put on the glass
-    /// (Claude's tag, aterm's ghost): targets once the glass shows them
-    /// ([`TopHit`]).
+    /// The top-effort key's targets each top rule would put on the glass ([`TopHit`]).
     top_hits: Vec<TopHit>,
-    /// Sessions whose top rule showed Claude's top-effort tag for a process
-    /// not yet noted as having shown it (`SessionFacts::top_seen`).
+    /// Sessions whose top rule showed Claude's top-effort tag for a process not yet noted as having
+    /// shown it.
     top_seen: Vec<(u64, i32)>,
-    /// The lockups each top line would put on the glass: the hover title's
-    /// targets once their write took ([`MarkWrite`]).
+    /// The lockups each top line would put on the glass ([`MarkWrite`]).
     marks: Vec<MarkWrite>,
-    /// The leaves whose top line alone was read (Gemini CLI's, Codex's:
-    /// no footer facts): their rows and composition are kept as a footer's
-    /// are ([`PaneTextCache::retain_active`]).
+    /// The leaves whose top line alone was read ([`PaneTextCache::retain_active`]).
     top_only: Vec<usize>,
-    /// The harness switches this splice drew on composer top rules, each
-    /// noted as reachable once its write reached the glass.
+    /// The harness switches this splice drew on composer top rules.
     border_toggles: Vec<crate::claude_lights::BorderSwitch>,
     lit: Vec<Lit>,
-    /// The facts each rule's write would put on the glass: targets once the
-    /// write took ([`FactWrite`]).
+    /// The facts each rule's write would put on the glass ([`FactWrite`]).
     facts: Vec<FactWrite>,
     /// The rule row's coverable cells ([`rule_mask_into`]), one pane's at a time.
     mask: Vec<bool>,
-    /// Sessions whose log the launch card's amend moved: their watchers are
-    /// woken after the frame.
+    /// Sessions whose log the launch card's amend moved.
     log_owed: Vec<u64>,
     /// The agents panels this frame lights (`crate::claude_panel`).
     panels: Vec<crate::claude_panel::PanelLeaf>,
 }
 
-/// One pane's composition for its composer rule ([`compose_rule_spans`],
-/// kept in the pane's [`PaneFooter`] on leaf `leaf_index`): its cells at
-/// `col` of frame row `frame_row`, `ground` the pane's blank, and `glass`
-/// the cells of it the rule already draws.
+/// One pane's composition for its composer rule ([`compose_rule_spans`], [`PaneFooter`]).
 struct RuleWrite {
     frame_row: usize,
     col: usize,
@@ -184,16 +151,11 @@ struct RuleWrite {
     glass: std::ops::Range<usize>,
 }
 
-/// One fact a rule's write would put on the glass (`footer::fact_spans`,
-/// laid at the rule's column): a target only where the edit that carries
-/// it — the rule's tail, its facts — took (`write_edits`), as a light's
-/// hits are only where its block did ([`Lit::shown`]).
+/// One fact a rule's write would put on the glass ([`Lit::shown`]).
 struct FactWrite {
     frame_row: usize,
     term_row: usize,
-    /// The column of the edit that writes the facts: the rule's own column,
-    /// or the tail's past the rule glyphs the glass already shows
-    /// ([`rule_edits`]).
+    /// The column of the edit that writes the facts ([`rule_edits`]).
     edit_col: usize,
     session: u64,
     cols: (usize, usize),
@@ -225,12 +187,10 @@ impl SpliceLists {
     }
 }
 
-/// One Claude Code pane's composer rule, gathered under the window borrow
-/// and painted after it (the lights need `&mut App`).
+/// One Claude Code pane's composer rule.
 struct FooterPane {
     session: u64,
-    /// The pane's leaf, whose [`PaneFooter`] holds what the footer shows
-    /// (the facts, filled from the kept launch card) and its composition.
+    /// The pane's leaf ([`PaneFooter`]).
     leaf_index: usize,
     frame_row: usize,
     /// The same row as a window grid row.
@@ -238,26 +198,20 @@ struct FooterPane {
     col_off: usize,
     /// The pane columns aterm may write into (`footer::rule_run`).
     run: std::ops::Range<usize>,
-    /// One of the rule's own glyph cells: what the separator between the
-    /// lights and the facts is drawn with.
+    /// One of the rule's own glyph cells.
     rule: RenderCell,
     blank: RenderCell,
-    /// The session's own Autopilot word and its view, read once this frame
-    /// (`App::session_autopilot_for`): what the harness's chips say (`crate::claude_lights`).
+    /// The session's own Autopilot word and its view.
     autopilot: (
         Option<aterm_agent::supervise::Autopilot>,
         crate::autopilot::AutopilotView,
     ),
-    /// Whether Claude's mode pill reads `YOLO on`/`YOLO off` on this pane's
-    /// glass: the relabel collected under [`relabels_pill`]'s gate
-    /// ([`collect_pill_relabel`]'s answer, review G2), what the mode light's
-    /// word follows (`crate::claude_lights`, review C8).
+    /// Whether Claude's mode pill reads `YOLO on`/`YOLO off` on this pane's glass
+    /// ([`relabels_pill`], [`collect_pill_relabel`]).
     relabelled: bool,
 }
 
-/// A visible Claude Code pane and the lights' reading of its rows, held
-/// until the lights have observed this frame and the cache has dropped panes
-/// that left it.
+/// A visible Claude Code pane and the lights' reading of its rows.
 struct SeenPane {
     leaf_index: usize,
     session: u64,
@@ -273,8 +227,7 @@ pub(crate) struct PaneTextCache {
     panes: Vec<Option<CachedPaneText>>,
     /// Each leaf's footer as earlier frames composed it.
     footers: Vec<PaneFooter>,
-    /// The last rebuild's number: each rebuild of a pane's rows takes the
-    /// next ([`CachedPaneText::text_gen`]).
+    /// The last rebuild's number ([`CachedPaneText::text_gen`]).
     rebuilds: u64,
     /// The rows a rebuild found changed ([`Self::rows`]), reused.
     changed: Vec<usize>,
@@ -291,9 +244,7 @@ struct PaneTextKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PaneTextRegion {
-    /// Rows of window chrome before the terminal cells, as the caller's
-    /// `frame_rows - ws.rows` calculates it (not `scratch.rows`, which may
-    /// include a host prepend).
+    /// Rows of window chrome before the terminal cells.
     strip: usize,
     row_off: usize,
     col_off: usize,
@@ -304,115 +255,58 @@ struct PaneTextRegion {
 struct CachedPaneText {
     key: PaneTextKey,
     rows: Arc<Vec<String>>,
-    /// This rebuild's number, unique in the cache: the same number means the same cells, so
-    /// the harness card keeps its layout without looking at them (`crate::claude_card`).
+    /// This rebuild's number, unique in the cache.
     text_gen: u64,
-    /// The footer's and the lights' readings of `rows`: taken in the rebuild, or kept from
-    /// the last where no row they read changed ([`Readings::after`]).
+    /// The footer's and the lights' readings of `rows` ([`Readings::after`]).
     readings: Readings,
-    /// The Claude Code build the vendor-drift check last read these readings
-    /// for ([`note_vendor_drift`], by a hash of its version): checked again
-    /// only for another build or new readings.
+    /// The Claude Code build the vendor-drift check last read these readings for
+    /// ([`note_vendor_drift`]).
     drift: std::cell::Cell<Option<u64>>,
-    /// The launch card on `rows` for the footer's open model or effort, the
-    /// reader that read it and the rows it was read from
-    /// (`footer::launch_card_read`): read at most once per rebuild, and only
-    /// while the facts leave one open ([`PaneTextCache::footer_card`]).
+    /// The launch card on `rows` for the footer's open model or effort
+    /// ([`PaneTextCache::footer_card`]).
     footer_card: std::cell::OnceCell<Option<(aterm_phase::Program, aterm_phase::LaunchCardRead)>>,
-    /// Claude Code's context indicator on `rows`, per cent left, where it
-    /// shows it (`aterm_phase::phase::context_left_shown`), for the footer's
-    /// context fact: read at most once per rebuild, and only for a Claude
-    /// Code pane ([`PaneTextCache::context_reading`]).
+    /// Claude Code's context indicator on `rows` ([`PaneTextCache::context_reading`]).
     ctx_reading: std::cell::OnceCell<Option<u8>>,
-    /// Whether `rows` say Claude Code's indicator has gone
-    /// (`footer::context_gone`): read at most once per rebuild, and only
-    /// while a reading is shown and `rows` show none
-    /// ([`PaneTextCache::indicator_gone`]).
+    /// Whether `rows` say Claude Code's indicator has gone ([`PaneTextCache::indicator_gone`]).
     ctx_gone: std::cell::OnceCell<bool>,
-    /// The signed-in account on `rows`: agy's launch card's
-    /// (`aterm_phase::agy::launch_card_account`) or Muse Code's `/status`
-    /// card's (`aterm_phase::muse::status_card_account`): read at most once
-    /// per rebuild, and only while the footer shows an account
-    /// ([`PaneTextCache::screen_account`]).
+    /// The signed-in account on `rows` ([`PaneTextCache::screen_account`]).
     account: std::cell::OnceCell<Option<(String, Option<String>)>>,
-    /// Muse Code's weekly quota on `rows`, as the footer's words
-    /// (`aterm_phase::muse::usage_card_weekly`): read at most once per
-    /// rebuild, and only while the footer shows an account
-    /// ([`PaneTextCache::usage_weekly`]).
+    /// Muse Code's weekly quota on `rows` ([`PaneTextCache::usage_weekly`]).
     weekly: std::cell::OnceCell<Option<aterm_phase::muse::UsageCardWeekly>>,
-    /// Muse Code's subscription tier on `rows`, where a card names one
-    /// with no account row for it to ride on
-    /// (`aterm_phase::muse::subscription_card_plan`): read at most once
-    /// per rebuild, and only while the footer shows an account
-    /// ([`PaneTextCache::subscription_plan`]).
+    /// Muse Code's subscription tier on `rows` ([`PaneTextCache::subscription_plan`]).
     plan: std::cell::OnceCell<Option<String>>,
-    /// The rule's coverable run and its glyph on frame row `.0`
-    /// ([`rule_mask`], `footer::rule_run`): taken at most once per rebuild —
-    /// the scratch it was read off is the one `key`'s tokens name — and kept
-    /// past one where the engine's revisions vouch its row's cells unchanged
-    /// and no image is placed on it ([`Self::stamps`]).
+    /// The rule's coverable run and its glyph on frame row `.0` ([`rule_mask`], [`Self::stamps`]).
     rule_run: std::cell::Cell<Option<KeptRun>>,
-    /// The top rule's plain run on frame row `.frame_row` ([`read_top_run`]):
-    /// taken at most once per rebuild, and kept as [`Self::rule_run`] is.
+    /// The top rule's plain run on frame row `.frame_row` ([`read_top_run`], [`Self::rule_run`]).
     top_run: std::cell::Cell<Option<KeptTop>>,
-    /// Gemini CLI's top line on `rows`, its live zone's `─` rule
-    /// (`aterm_phase::gemini::top_rule`, behind the reader's panic fence):
-    /// read at most once per rebuild, and only for a Gemini pane
-    /// ([`top_line`]).
+    /// Gemini CLI's top line on `rows` ([`top_line`]).
     gemini_top: std::cell::OnceCell<Option<usize>>,
-    /// Codex's top line on `rows`, its composer slab's top pad row
-    /// (`aterm_phase::codex::composer_pad`, behind the reader's panic
-    /// fence): a candidate its cells must prove ([`TopLine::Slab`]), read at
-    /// most once per rebuild, and only for a Codex pane ([`top_line`]).
+    /// Codex's top line on `rows` ([`TopLine::Slab`], [`top_line`]).
     codex_pad: std::cell::OnceCell<Option<usize>>,
-    /// The harness card's reading of `rows` (`crate::claude_card::read_card`): taken at most
-    /// once per rebuild and only when a card is wanted, or kept from the last rebuild where
-    /// no row it reads changed (`CardReading::holds`); shared with every frame that reuses
-    /// the rows, never copied.
+    /// The harness card's reading of `rows`.
     card: std::cell::OnceCell<crate::claude_card::CardReading>,
-    /// The last reading's card, until this rebuild's reading is taken: an
-    /// equal card is the same one, shared (a card that moved back allocates
-    /// nothing), and the LAST rebuild's own is held through rows the reader
-    /// does not place it on (`crate::claude_card::read_card`).
+    /// The last reading's card, until this rebuild's reading is taken.
     card_before: std::cell::Cell<Option<crate::claude_card::CardBefore>>,
-    /// The agents panel's reading of `rows` and the frame they were read
-    /// from (`crate::claude_panel::read_panel`): taken at most once per
-    /// rebuild, and only where the panel's gate holds ([`PaneTextCache::agents_panel`]).
+    /// The agents panel's reading of `rows` and the frame they were read from
+    /// ([`PaneTextCache::agents_panel`]).
     panel: std::cell::OnceCell<Option<Arc<crate::claude_panel::PanelRead>>>,
-    /// The last reading's panel, until this rebuild's is taken: an equal
-    /// reading is the same one, shared, and the panel's fold is not run for
-    /// it (`App::compose_claude_panels`).
+    /// The last reading's panel, until this rebuild's is taken.
     panel_before: std::cell::Cell<Option<Arc<crate::claude_panel::PanelRead>>>,
-    /// Claude Code's update notice under the card on `rows`
-    /// (`aterm_phase::update_notice_scan`, for the harness banner drawn over
-    /// it): scanned at most once per rebuild, only under a decorated card —
-    /// or kept from the last rebuild where no row it read changed
-    /// (`aterm_phase::update_notice_unmoved`).
+    /// Claude Code's update notice under the card on `rows`.
     notice: std::cell::Cell<Option<(usize, Option<aterm_phase::NoticeScan>)>>,
-    /// The engine's revisions of the rows `rows` were read from
-    /// ([`RowStamps`]): what lets the next rebuild skip every row whose
-    /// cells they vouch did not change — and keep [`Self::rule_run`] where
-    /// its row is one of them.
+    /// The engine's revisions of the rows `rows` were read from ([`RowStamps`],
+    /// [`Self::rule_run`]).
     stamps: RowStamps,
 }
 
-/// The D-2 row revisions of the scratch a pane's rows were read from
-/// (`RenderInput::row_rev`), one per pane row, and the lane they belong to
-/// ([`StampLane`]: `None` where the scratch's stamps vouch for nothing).
+/// The D-2 row revisions of the scratch a pane's rows were read from ([`StampLane`]).
 #[derive(Debug, Default)]
 struct RowStamps {
     lane: Option<StampLane>,
     revs: Vec<u64>,
 }
 
-/// What two scratches' row revisions must share to be compared — the
-/// clauses of `aterm_render::row_revisions_comparable`, which the renderer
-/// itself skips an unchanged row's cells by: the engine's lane (non-zero:
-/// one terminal's clock), the frame's geometry and its host rows
-/// (`row_shift`: a strip that grew moves every engine row), the screen (the
-/// alternate keeps its own grid and clock) and the rows' identity (`base_y`:
-/// a scroll moves rows under unmoved stamps; `absolute_row_revision`: a
-/// renumbering).
+/// What two scratches' row revisions must share to be compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StampLane {
     lane: u64,
@@ -425,10 +319,7 @@ struct StampLane {
 }
 
 impl StampLane {
-    /// `scratch`'s lane, where its stamps vouch for its rows: an engine fill
-    /// with a lane over every row, no host cell written since (`snapshot_seq
-    /// == shifted_fill_seq`: the tab strip's blessed prepend alone), its
-    /// rows in logical order, at the live screen.
+    /// `scratch`'s lane, where its stamps vouch for its rows.
     fn of(scratch: &RenderInput) -> Option<Self> {
         #[cfg(test)]
         if !READ_BY_STAMP.with(std::cell::Cell::get) {
@@ -454,10 +345,7 @@ impl StampLane {
 
 #[cfg(test)]
 thread_local! {
-    /// Row revisions vouch for unchanged rows ([`StampLane::of`]): off,
-    /// every rebuild compares every row and reads its rule's run anew — the
-    /// glass the tests compare the stamped rebuilds' against
-    /// ([`read_every_row_in`]).
+    /// Row revisions vouch for unchanged rows ([`StampLane::of`], [`read_every_row_in`]).
     static READ_BY_STAMP: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
@@ -470,9 +358,7 @@ pub(crate) fn read_every_row_in<R>(f: impl FnOnce() -> R) -> R {
     out
 }
 
-/// Whether frame row `frame_row` of `scratch` holds an image placement:
-/// what no row revision vouches for, so a run read off a row with one is
-/// never kept across a rebuild.
+/// Whether frame row `frame_row` of `scratch` holds an image placement.
 fn has_images(scratch: &RenderInput, frame_row: usize) -> bool {
     scratch
         .images
@@ -480,9 +366,7 @@ fn has_images(scratch: &RenderInput, frame_row: usize) -> bool {
         .is_some_and(|row| !row.is_empty())
 }
 
-/// A composer rule's run read off frame row `frame_row` ([`CachedPaneText::rule_run`]): the
-/// coverable cells `start..end` and the rule's glyph, `None` where the row holds no rule to
-/// write into.
+/// A composer rule's run read off frame row `frame_row` ([`CachedPaneText::rule_run`]).
 #[derive(Debug, Clone, Copy)]
 struct KeptRun {
     frame_row: usize,
@@ -492,32 +376,28 @@ struct KeptRun {
 }
 
 impl KeptRun {
-    /// The frame row it was read off, where it may be kept past its
-    /// rebuild: read off a row with no image on it.
+    /// The frame row it was read off, where it may be kept past its rebuild.
     fn row(&self) -> Option<usize> {
         (!self.images).then_some(self.frame_row)
     }
 }
 
-/// A composer top line's plain run read off frame row `frame_row` as a line
-/// of kind `line` for a pane ground `bg` ([`CachedPaneText::top_run`]):
-/// `None` where the row holds none a brand edit may write on.
+/// A composer top line's plain run read off frame row `frame_row` as a line of kind `line` for a
+/// pane ground `bg` ([`CachedPaneText::top_run`]).
 #[derive(Debug, Clone, Copy)]
 struct KeptTop {
     frame_row: usize,
     line: TopLine,
     bg: [u8; 3],
     run: Option<TopRun>,
-    /// Claude's own top-effort tag on the row, its key's frame columns
-    /// (`footer::top_rule_tag`).
+    /// Claude's own top-effort tag on the row, its key's frame columns (`footer::top_rule_tag`).
     tag: Option<(usize, usize)>,
     /// The row held an image placement when it was read.
     images: bool,
 }
 
 impl KeptTop {
-    /// The frame row it was read off, where it may be kept past its
-    /// rebuild: read off a row with no image on it.
+    /// The frame row it was read off, where it may be kept past its rebuild.
     fn row(&self) -> Option<usize> {
         (!self.images).then_some(self.frame_row)
     }
@@ -535,31 +415,21 @@ impl std::fmt::Debug for CachedPaneText {
     }
 }
 
-/// The footer's and the lights' readings of one pane's rows, each by construction a
-/// function of the composer's frame and the rows under its bottom rule alone
-/// ([`read_pane`]): the rule and the mode row under it (`footer::mode_row_under`), and the
-/// mode the lights' pill names and whether one is drawn (`lights::reading_under`).
+/// The footer's and the lights' readings of one pane's rows ([`read_pane`]).
 #[derive(Debug, Clone, Copy)]
 struct Readings {
-    /// The composer's frame and the rows its search read; `None` where the
-    /// search panicked (no reading is then kept: each rebuild reads anew).
+    /// The composer's frame and the rows its search read.
     reach: Option<aterm_phase::phase::FrameReach>,
-    /// The footer's: where its rule is, and whether a mode row this build
-    /// reads sits under it.
+    /// The footer's: where its rule is, and whether a mode row this build reads sits under it.
     rule: FooterRead,
     /// The lights'.
     lights: LightsRead,
-    /// Claude's mode pill under the bottom rule, where it reads `YOLO on`
-    /// or `YOLO off` on the glass (`footer::relabel_under`): read with the
-    /// rule and kept with it, so a frame at rest reads no row for it
-    /// ([`collect_pill_relabel`]).
+    /// Claude's mode pill under the bottom rule ([`collect_pill_relabel`]).
     relabel: Option<footer::Relabel>,
 }
 
 impl Readings {
-    /// These readings brought up to `rows`, where `changed` lists the rows changed since:
-    /// kept where no changed row is one they read, else read anew; also whether they were
-    /// kept.
+    /// These readings brought up to `rows`.
     fn after(self, session: u64, rows: &[String], changed: &[usize]) -> (Readings, bool) {
         let Some(reach) = self.reach else {
             return (read_pane(session, rows, None), false);
@@ -586,10 +456,7 @@ impl Readings {
     }
 }
 
-/// Read pane `session`'s `rows` for the footer and the lights, each reader behind the
-/// reader's panic fence (`crate::reader_guard`): the composer's frame (`found`, where the
-/// caller has searched for it) and, under its bottom rule, the footer's mode row
-/// ([`read_footer`]) and the lights' pill.
+/// Read pane `session`'s `rows` for the footer and the lights ([`read_footer`]).
 fn read_pane(
     session: u64,
     rows: &[String],
@@ -628,16 +495,14 @@ fn read_pane(
 }
 
 impl PaneTextCache {
-    /// A removed leaf must not retain a transcript (or grow this cache over a
-    /// long sequence of tab layouts).
+    /// A removed leaf must not retain a transcript.
     fn trim(&mut self, leaves: usize) {
         self.panes.truncate(leaves);
         self.footers.truncate(leaves);
     }
 
-    /// A pane that no longer shows a Claude footer must not keep its old
-    /// transcript resident just because another pane still has one — nor its
-    /// facts or its composition.
+    /// A pane that no longer shows a Claude footer must not keep its old transcript resident just
+    /// because another pane still has one.
     fn retain_active(
         &mut self,
         active: impl Fn(usize) -> bool,
@@ -668,9 +533,7 @@ impl PaneTextCache {
         }
     }
 
-    /// Leaf `leaf_index`'s rows, read as Claude Code's, rebuilt only where the
-    /// scratch's revision, the session or the region moved, with their
-    /// readings: Claude Code's footer and lights.
+    /// Leaf `leaf_index`'s rows.
     fn rows(
         &mut self,
         leaf_index: usize,
@@ -883,15 +746,12 @@ impl PaneTextCache {
         text
     }
 
-    /// The footer's and the lights' readings of leaf `leaf_index`'s cached
-    /// rows ([`Self::rows`] took them).
+    /// The footer's and the lights' readings of leaf `leaf_index`'s cached rows ([`Self::rows`]).
     fn readings(&self, leaf_index: usize) -> Option<Readings> {
         Some(self.panes.get(leaf_index)?.as_ref()?.readings)
     }
 
-    /// The vendor-drift check ([`note_vendor_drift`]) of leaf `leaf_index`'s cached rows for
-    /// build `version`: run once per reading of them and build, since running it again could
-    /// only find what it found and log nothing.
+    /// The vendor-drift check ([`note_vendor_drift`]).
     fn note_drift(&self, leaf_index: usize, session: u64, version: Option<&str>) {
         use std::hash::{Hash, Hasher};
         let Some(Some(cached)) = self.panes.get(leaf_index) else {
@@ -905,11 +765,7 @@ impl PaneTextCache {
         }
     }
 
-    /// The launch card on leaf `leaf_index`'s cached rows, while they are
-    /// `session`'s, for the footer's open model or effort, with the reader
-    /// that read it and its rows (`footer::launch_card_read`, behind the
-    /// reader's panic fence): read at most once per rebuild of the rows,
-    /// every frame that reuses them sharing the reading.
+    /// The launch card on leaf `leaf_index`'s cached rows.
     fn footer_card(
         &self,
         leaf_index: usize,
@@ -935,12 +791,7 @@ impl PaneTextCache {
             .as_ref()
     }
 
-    /// Claude Code's context indicator on leaf `leaf_index`'s cached rows,
-    /// per cent left, where the screen shows it
-    /// (`aterm_phase::phase::context_left_shown`: above the composer, or at
-    /// the end of 2.1.305's mode row; behind the reader's panic fence): read
-    /// at most once per rebuild of the rows, every frame that reuses them
-    /// sharing the reading — a frame at rest scans nothing.
+    /// Claude Code's context indicator on leaf `leaf_index`'s cached rows.
     fn context_reading(&self, leaf_index: usize) -> Option<u8> {
         let cached = self.panes.get(leaf_index)?.as_ref()?;
         *cached.ctx_reading.get_or_init(|| {
@@ -954,10 +805,7 @@ impl PaneTextCache {
         })
     }
 
-    /// Whether leaf `leaf_index`'s cached rows say Claude Code's context
-    /// indicator has gone, as after `/compact` (`footer::context_gone`,
-    /// behind the reader's panic fence; `false` where it panicked or there
-    /// are no rows): read at most once per rebuild of the rows.
+    /// Whether leaf `leaf_index`'s cached rows say Claude Code's context indicator has gone.
     fn indicator_gone(&self, leaf_index: usize) -> bool {
         let Some(Some(cached)) = self.panes.get(leaf_index) else {
             return false;
@@ -973,12 +821,7 @@ impl PaneTextCache {
         })
     }
 
-    /// The signed-in account on leaf `leaf_index`'s cached rows, its email
-    /// and its plan: Muse Code's `/status` card's
-    /// (`aterm_phase::muse::status_card_account`), any other `agent`'s
-    /// agy's launch card's (`aterm_phase::agy::launch_card_account`), behind
-    /// the reader's panic fence: read and copied at most once per rebuild of
-    /// the rows.
+    /// The signed-in account on leaf `leaf_index`'s cached rows, its email and its plan.
     fn screen_account(
         &self,
         leaf_index: usize,
@@ -1006,9 +849,7 @@ impl PaneTextCache {
             .map(|(email, plan)| (email.as_str(), plan.as_deref()))
     }
 
-    /// Muse Code's weekly quota on leaf `leaf_index`'s cached rows, as the
-    /// footer's words (`aterm_phase::muse::usage_card_weekly`, behind the
-    /// reader's panic fence): read at most once per rebuild of the rows.
+    /// Muse Code's weekly quota on leaf `leaf_index`'s cached rows.
     fn usage_weekly(&self, leaf_index: usize) -> Option<(&str, Option<&str>)> {
         let cached = self.panes.get(leaf_index)?.as_ref()?;
         cached
@@ -1026,9 +867,7 @@ impl PaneTextCache {
             .map(|weekly| (weekly.text.as_str(), weekly.reset.as_deref()))
     }
 
-    /// Muse Code's subscription tier on leaf `leaf_index`'s cached rows
-    /// (`aterm_phase::muse::subscription_card_plan`, behind the reader's
-    /// panic fence): read at most once per rebuild of the rows.
+    /// Muse Code's subscription tier on leaf `leaf_index`'s cached rows.
     fn subscription_plan(&self, leaf_index: usize) -> Option<&str> {
         let cached = self.panes.get(leaf_index)?.as_ref()?;
         cached
@@ -1045,9 +884,8 @@ impl PaneTextCache {
             .as_deref()
     }
 
-    /// The run of leaf `leaf_index`'s composer rule on frame row `frame_row` of `scratch`
-    /// that aterm may cover, and the rule's glyph ([`rule_mask_into`] into `mask`,
-    /// `footer::rule_run`): read off the scratch at most once per rebuild of the pane's rows.
+    /// The run of leaf `leaf_index`'s composer rule on frame row `frame_row` of `scratch` that
+    /// aterm may cover ([`rule_mask_into`]).
     fn rule_run(
         &self,
         leaf_index: usize,
@@ -1081,13 +919,8 @@ impl PaneTextCache {
         run.map(|(start, end, rule)| (start..end, rule))
     }
 
-    /// The plain run of leaf `leaf_index`'s composer top line (pane row
-    /// `top_rule` of `region`, a line of kind `line`) on `scratch`
-    /// ([`read_top_run`]) and, on a rule, Claude's top-effort tag on it, its
-    /// key's frame columns (`footer::top_rule_tag` of the pane's rows, behind
-    /// the reader's panic fence): read at most once per rebuild of the pane's
-    /// rows, as [`Self::rule_run`] is, and kept past one whose revisions vouch
-    /// the row unchanged.
+    /// The plain run of leaf `leaf_index`'s composer top line ([`read_top_run`],
+    /// [`Self::rule_run`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "the pane, its row and the line kind, as the read is keyed"
@@ -1142,8 +975,7 @@ impl PaneTextCache {
         }
     }
 
-    /// Where leaf `leaf_index`'s cached rows put `program`'s top line, and
-    /// its kind ([`top_line`]).
+    /// Where leaf `leaf_index`'s cached rows put `program`'s top line ([`top_line`]).
     fn top_line(
         &self,
         leaf_index: usize,
@@ -1152,9 +984,7 @@ impl PaneTextCache {
         top_line(program, self.panes.get(leaf_index)?.as_ref()?)
     }
 
-    /// Leaf `leaf_index`'s top rule composed from `key`
-    /// ([`PaneFooter::compose_top`]), its mark's content from the window's
-    /// kept ones.
+    /// Leaf `leaf_index`'s top rule composed from `key` ([`PaneFooter::compose_top`]).
     fn compose_top(&mut self, leaf_index: usize, key: TopKey) -> &ComposedTop {
         let Self { footers, marks, .. } = self;
         footers[leaf_index].compose_top(key, marks)
@@ -1172,8 +1002,7 @@ impl PaneTextCache {
             .map_or(&[], |f| f.top.cells.as_slice())
     }
 
-    /// Leaf `leaf_index`'s footer, `session`'s: a pane that shows another
-    /// session starts afresh.
+    /// Leaf `leaf_index`'s footer, `session`'s.
     fn footer(&mut self, leaf_index: usize, session: u64) -> &mut PaneFooter {
         if self.footers.len() <= leaf_index {
             self.footers
@@ -1221,7 +1050,8 @@ impl PaneTextCache {
         Some((read, cached.text_gen))
     }
 
-    /// Returns the parsed agents panel beneath `bottom` for `leaf_index` while its rows belong to `session`.
+    /// Returns the parsed agents panel beneath `bottom` for `leaf_index` while its rows belong to
+    /// `session`.
     pub(crate) fn agents_panel(
         &self,
         leaf_index: usize,
@@ -1283,45 +1113,32 @@ impl PaneTextCache {
     }
 }
 
-/// One pane's footer as earlier frames composed it (a leaf's, in [`PaneTextCache`]): the
-/// facts as the session's timeline held them and as the rule shows them, and the rule
-/// composed from them.
+/// One pane's footer as earlier frames composed it (a leaf's, in [`PaneTextCache`]).
 #[derive(Debug, Default)]
 struct PaneFooter {
     session: u64,
-    /// What [`Self::shown`] is made of: the facts the timeline holds for the
-    /// group in front, the launch card it keeps for them, the `[claude_footer]
-    /// usage` switch, and the facts the person hid in the session by a click
-    /// (`crate::claude_facts`).
+    /// What [`Self::shown`] is made of: the facts the timeline holds for the group in front.
     from: Option<(FooterFacts, Option<aterm_phase::LaunchCard>, bool, FactMask)>,
-    /// The live upgrade's note the timeline holds for the pane, whose words
-    /// the rule lays in ([`Self::lay_upgrade`]).
+    /// The live upgrade's note the timeline holds for the pane ([`Self::lay_upgrade`]).
     note: Option<footer::UpgradeNote>,
-    /// What the rule shows: `from`'s facts filled from its card where
-    /// nothing newer decided them (`FooterFacts::filled_from`), under its
-    /// usage switch ([`with_usage_switch`]), its hidden facts laid in
-    /// (`FooterFacts::off`), with the upgrade's words this frame says.
+    /// What the rule shows ([`with_usage_switch`]).
     shown: FooterFacts,
-    /// Bumped on every change of `shown`; the kept chips' room and composition are keyed by
-    /// it.
+    /// Bumped on every change of `shown`.
     shown_gen: u64,
-    /// The repaint key's term for `from` ([`fingerprint`]), taken
-    /// with it: the key asks for it every frame ([`Self::fingerprint_of`]).
+    /// The repaint key's term for `from` ([`fingerprint`], [`Self::fingerprint_of`]).
     fp: u64,
-    /// `footer::chips_room` of `shown` at `room` cells: `(shown_gen, room,
-    /// chips_room)`.
+    /// `footer::chips_room` of `shown` at `room` cells.
     chips: Option<(u64, usize, usize)>,
     /// The rule composed from `shown`.
     rule: ComposedRule,
     /// The composer's top rule as the frames before composed it.
     top: ComposedTop,
-    /// Whether `shown` names a Claude Code build that takes the top-effort
-    /// key's toggle: `(shown_gen, typed)` ([`Self::key_typed`]).
+    /// Whether `shown` names a Claude Code build that takes the top-effort key's toggle
+    /// ([`Self::key_typed`]).
     typed: Option<(u64, bool)>,
 }
 
-/// A footer rule as [`PaneFooter::compose`] composed it, and what it was
-/// composed from.
+/// A footer rule as [`PaneFooter::compose`] composed it, and what it was composed from.
 #[derive(Debug, Default)]
 struct ComposedRule {
     key: Option<RuleKey>,
@@ -1338,15 +1155,12 @@ struct RulePaint {
     /// The title slot's words in `cells` (empty: none drawn).
     title: std::ops::Range<usize>,
     glass: std::ops::Range<usize>,
-    /// Where the facts' cells start in `cells`, and where each fact lies in
-    /// them past that start's blank (`footer::fact_spans`): what the
-    /// pointer can act on, once the write took ([`FactWrite`]).
+    /// Where the facts' cells start in `cells` ([`FactWrite`]).
     facts_at: usize,
     spans: footer::FactSpans,
     account: Option<(u16, u16)>,
-    /// The facts' native emoji clusters and combining marks at their
-    /// columns in `cells` (`footer::SetFacts`), published only where the
-    /// write took ([`FooterUndo::publish_text`]).
+    /// The facts' native emoji clusters and combining marks at their columns in `cells`
+    /// ([`FooterUndo::publish_text`]).
     clusters: Vec<(usize, Box<str>)>,
     combining: Vec<(usize, Box<[char]>)>,
 }
@@ -1359,16 +1173,11 @@ struct RuleKey {
     rule: RenderCell,
     blank: RenderCell,
     mark_fg: [u8; 3],
-    /// The fact the pointer or the keyboard's selection is on, drawn lit
-    /// (`claude_lights::WindowLights::lit_fact`): a hover's start and end
-    /// compose once each, a frame under it none.
+    /// The fact the pointer or the keyboard's selection is on, drawn lit.
     lit: Option<FactKind>,
 }
 
-/// Every part of a chips' block (`claude_lights::Block`) a composition
-/// reads: its chips and titles, laid in its cells, how much of the rule it
-/// holds and whether its title is a reason — and the fit that laid the block
-/// it was copied from or found equal to (`Block::fit`).
+/// Every part of a chips' block.
 #[derive(Debug, Default)]
 struct BlockCopy {
     lights: Vec<RenderCell>,
@@ -1381,11 +1190,7 @@ struct BlockCopy {
 }
 
 impl BlockCopy {
-    /// Whether `block` is this copy's, cell for cell: known by its fit's
-    /// number where it has one and it is this copy's (a block the window's
-    /// fit kept, every frame its key stands), else compared part by part —
-    /// and an equal block's number taken, so the next frame of it compares
-    /// no cell.
+    /// Whether `block` is this copy's.
     fn is(&mut self, block: &crate::claude_lights::Block) -> bool {
         if block.fit() != 0 && block.fit() == self.fit {
             return true;
@@ -1416,10 +1221,7 @@ impl BlockCopy {
 }
 
 impl PaneFooter {
-    /// Take in the facts the timeline holds (`facts`), the launch card it
-    /// keeps for them (`card`), the usage switch and the facts the person
-    /// hid (`off`): what the rule shows is made anew only where one of them
-    /// moved — a copy of each then, none at rest.
+    /// Take in the facts the timeline holds.
     fn note_facts(
         &mut self,
         facts: &FooterFacts,
@@ -1445,9 +1247,7 @@ impl PaneFooter {
         self.from = Some((facts.clone(), card.cloned(), usage, off));
     }
 
-    /// The repaint key's term ([`fingerprint`]) for `session`'s `facts`, the `card` the
-    /// timeline keeps for them and the usage switch, where they are the ones this footer
-    /// holds: hashed when they were taken in, so the key compares instead of hashing again.
+    /// The repaint key's term ([`fingerprint`]).
     fn fingerprint_of(
         &self,
         session: u64,
@@ -1472,8 +1272,7 @@ impl PaneFooter {
         }
     }
 
-    /// Lay in the upgrade's words for a composer that holds a draft (`Some(true)`) or none
-    /// (`Some(false)`); `None` lays no words (no note, or the turn holds the move).
+    /// Lay in the upgrade's words for a composer that holds a draft.
     fn lay_upgrade(&mut self, draft: Option<bool>) {
         let words = draft.and_then(|draft| self.note.as_ref()?.words(draft));
         if self.shown.upgrade.as_ref() != words {
@@ -1487,9 +1286,7 @@ impl PaneFooter {
         &self.shown
     }
 
-    /// Whether the facts shown name a Claude Code build newer than 2.1.303
-    /// — one whose `/effort` takes the top-effort key's session toggle —
-    /// compared once per change of them, never per frame.
+    /// Whether the facts shown name a Claude Code build newer than 2.1.303.
     fn key_typed(&mut self) -> bool {
         match self.typed {
             Some((at, typed)) if at == self.shown_gen => typed,
@@ -1505,14 +1302,12 @@ impl PaneFooter {
         }
     }
 
-    /// The facts the timeline holds for the group in front, as published
-    /// (none of the card's fill): what a key's latch was taken against.
+    /// The facts the timeline holds for the group in front.
     fn published(&self) -> Option<&FooterFacts> {
         self.from.as_ref().map(|(facts, ..)| facts)
     }
 
-    /// The facts' owner where they leave the model or the effort open: the owner a launch
-    /// card may be kept for.
+    /// The facts' owner where they leave the model or the effort open.
     fn card_owner(&self) -> Option<&footer::FactsOwner> {
         let (facts, _, _, _) = self.from.as_ref()?;
         (facts.model_open || facts.effort_open)
@@ -1525,8 +1320,7 @@ impl PaneFooter {
         self.from.as_ref()?.1.as_ref()
     }
 
-    /// The most cells the chips may take in a rule of `room` cells
-    /// (`footer::chips_room`), kept while the facts and the room stand.
+    /// The most cells the chips may take in a rule of `room` cells.
     fn chips_room(&mut self, room: usize) -> usize {
         match self.chips {
             Some((shown_gen, at, chips)) if shown_gen == self.shown_gen && at == room => chips,
@@ -1538,11 +1332,7 @@ impl PaneFooter {
         }
     }
 
-    /// The composer's top line composed from `key` ([`compose_top`], its
-    /// hover title naming the shown facts' version) and its mark's sprite
-    /// ([`mark_layer`], its content kept in `marks`): kept while `key` is the
-    /// last frame's — a frame at rest composes nothing, seals nothing and
-    /// allocates nothing — else composed anew into the kept buffer.
+    /// The composer's top line composed from `key` ([`compose_top`], [`mark_layer`]).
     fn compose_top(&mut self, key: TopKey, marks: &mut MarkContents) -> &ComposedTop {
         if self.top.key != Some(key) {
             let version = (key.title_gen != 0)
@@ -1555,11 +1345,7 @@ impl PaneFooter {
         &self.top
     }
 
-    /// The rule's composition in `room` cells with the chips' `block`, the
-    /// rule's own glyph `rule`, the pane's `blank` and the marks' `mark_fg`
-    /// (`footer::fit_rule`, [`compose_rule_spans`]): kept while every one of
-    /// them, the facts and every cell of the block are the last frame's,
-    /// else composed anew; `lit`, the fact drawn lit, is part of the key.
+    /// The rule's composition in `room` cells with the chips' `block` ([`compose_rule_spans`]).
     fn compose(
         &mut self,
         room: usize,
@@ -1616,10 +1402,7 @@ impl PaneFooter {
     }
 }
 
-/// What a frame reads of a pane's composed rule ([`PaneFooter::compose`]):
-/// its cells' count, where the chips start, the run of the rule's own
-/// glyphs in it, where the facts start and where each fact lies past that
-/// start's blank.
+/// What a frame reads of a pane's composed rule ([`PaneFooter::compose`]).
 #[derive(Debug, Clone)]
 struct Composed {
     cells: usize,
@@ -1632,9 +1415,7 @@ struct Composed {
     account: Option<(u16, u16)>,
 }
 
-/// Whether `text` reads as `cells`' chars (`None`: a row the frame does not hold, read as
-/// empty), compared as UTF-8 bytes with no char decoded: every keystroke compares every
-/// cell of the pane, and most are one byte.
+/// Whether `text` reads as `cells`' chars.
 fn same_text(text: &str, cells: Option<&[RenderCell]>) -> bool {
     let Some(cells) = cells else {
         return text.is_empty();
@@ -1658,8 +1439,7 @@ fn same_text(text: &str, cells: Option<&[RenderCell]>) -> bool {
     rest.is_empty()
 }
 
-/// The loop proxy [`post_changed`] wakes through. Installed once at launch; a
-/// headless test App installs nothing and a post is then a no-op.
+/// The loop proxy [`post_changed`] wakes through.
 static PROXY: OnceLock<EventLoopProxy<Wake>> = OnceLock::new();
 
 /// Installs the event-loop proxy used to post `Wake::ClaudeFooter` notifications.
@@ -1674,28 +1454,19 @@ pub(crate) fn post_changed(session: u64) {
     }
 }
 
-/// The follow-up reads after every request, measured from it. Two cases need
-/// them, and both were seen on a dev build (2026-09-24): Claude Code writes
-/// `sessions/<pid>.json` a moment AFTER it takes the foreground, so the read
-/// that fires on first sight of `claude` found nothing (now the registry
-/// watch's to catch, [`crate::claude_registry`]); and a turn's final
-/// transcript row lands as the screen settles, after the last sweep that
-/// asked.
+/// The follow-up reads after every request, measured from it ([`crate::claude_registry`]).
 const FOLLOW_UPS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(6)];
 
-/// Why one read ran: the `registry-read` dev row's `cause=`, which a live
-/// measurement counts (card engine §3.10, §8).
+/// Why one read ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Cause {
     /// A request ([`request_footer`]).
     Ask,
     /// One of [`FOLLOW_UPS`].
     FollowUp,
-    /// The registry watch saw the process's Claude dir move
-    /// ([`Command::RowsMoved`]).
+    /// The registry watch saw the process's Claude dir move ([`Command::RowsMoved`]).
     Event,
-    /// A registry watch was newly placed for the process's Claude dir: what
-    /// was written before it is read now, what follows by its event.
+    /// A registry watch was newly placed for the process's Claude dir.
     Placed,
     /// The idle clock ([`IDLE_RECHECK`], [`WALL_RECHECK`]).
     Idle,
@@ -1714,26 +1485,22 @@ impl Cause {
     }
 }
 
-/// How many times one turn places registry watches and reads what they were
-/// placed for ([`Resolver::settle`]): a placement can find the next level or
-/// the row itself there, which is placed and read in the next round.
+/// How many times one turn places registry watches and reads what they were placed for
+/// ([`Resolver::settle`]).
 const PLACE_ROUNDS: usize = 8;
 
-/// How often a Claude Code session's facts are re-read while nothing asks, and
-/// for how long after the last ask.
+/// How often a Claude Code session's facts are re-read while nothing asks.
 const IDLE_RECHECK: Duration = Duration::from_secs(15);
 const WATCH_FOR: Duration = Duration::from_secs(10 * 60);
 
-/// How often a session is re-read past [`WATCH_FOR`] while its footer shows
-/// a limit wall or weekly percentage and its Claude Code process lives: a wall whose
-/// reset passes, or cached quota that expires, leaves the glass within this.
+/// How often a session is re-read past [`WATCH_FOR`] while its footer shows a limit wall or weekly
+/// percentage and its Claude Code process lives.
 const WALL_RECHECK: Duration = Duration::from_secs(60);
 
 /// How long the resolver's roster answers from its last read ([`RosterMemo`]).
 const ROSTER_RECHECK: Duration = Duration::from_secs(10);
 
-/// The re-read interval of a session last asked for at `asked`: the idle
-/// clock within its watch, the wall clock past it.
+/// The re-read interval of a session last asked for at `asked`.
 fn recheck_after(now: std::time::Instant, asked: std::time::Instant) -> Duration {
     if now.saturating_duration_since(asked) < WATCH_FOR {
         IDLE_RECHECK
@@ -1742,10 +1509,7 @@ fn recheck_after(now: std::time::Instant, asked: std::time::Instant) -> Duration
     }
 }
 
-/// Whether a session last asked for at `asked` is still watched: within
-/// [`WATCH_FOR`] of the ask, or past it while its footer shows a wall or weekly percentage
-/// and its process is alive (`walled_alive`, asked only then: liveness, not a
-/// start time, so a sessions file a crash left behind cannot keep it running).
+/// Whether a session last asked for at `asked` is still watched ([`WATCH_FOR`]).
 fn still_watched(
     now: std::time::Instant,
     asked: std::time::Instant,
@@ -1774,16 +1538,14 @@ impl LogWake {
     }
 }
 
-/// A session's log moved off the loop in a way the loop must follow (its
-/// settle tick, the clause in its chrome).
+/// A session's log moved off the loop in a way the loop must follow.
 fn post_log_moved(session: u64) {
     if let Some(proxy) = PROXY.get() {
         let _ = proxy.send_event(Wake::SessionLogMoved { session });
     }
 }
 
-/// One resolution: the session, its timeline and the Claude Code process,
-/// and what a moved log wakes ([`LogWake`]).
+/// One resolution: the session ([`LogWake`]).
 #[derive(Clone)]
 struct Job {
     session: u64,
@@ -1794,20 +1556,16 @@ struct Job {
 
 enum Command {
     Request(Job),
-    /// `None` retires the session; a group-specific stop cannot erase a
-    /// replacement Claude process that was requested before it arrived.
+    /// `None` retires the session.
     Stop {
         session: u64,
         pgid: Option<i32>,
     },
-    /// The registry watch saw the Claude dir `dir`'s rows move
-    /// ([`crate::claude_registry`]): each process awaited there is read once.
+    /// The registry watch saw the Claude dir `dir`'s rows move ([`crate::claude_registry`]).
     RowsMoved {
         dir: PathBuf,
     },
-    /// The registry watch saw a level outside a `sessions/` move: the turn
-    /// places the watches again, and reads only under a Claude dir where
-    /// that placed one ([`Resolver::settle`]).
+    /// The registry watch saw a level outside a `sessions/` move ([`Resolver::settle`]).
     LevelMoved,
 }
 
@@ -1820,12 +1578,11 @@ impl From<crate::claude_registry::Told> for Command {
     }
 }
 
-/// The one background thread footer facts are read on, started on first use
-/// and shared by both askers (the status sweep, and `session_program`'s
-/// resolver the moment it names Claude Code).
+/// The one background thread footer facts are read on, started on first use and shared by both
+/// askers.
 static RESOLVER: Mutex<Option<Sender<Command>>> = Mutex::new(None);
 
-/// Requests an off-thread footer-fact refresh for `pgid` into `timeline`, scheduling follow-up reads.
+/// Requests an off-thread footer-fact refresh for `pgid` into `timeline`.
 pub(crate) fn request_footer(
     session: u64,
     timeline: &Arc<Mutex<SessionTimeline>>,
@@ -1879,8 +1636,6 @@ pub(crate) fn request_footer(
         .as_ref()
         .is_some_and(|tx| tx.send(Command::Request(job)).is_err())
     {
-        // The thread is gone (it ends only when the channel closes, so this is
-        // a panic in a read); start a fresh one next time.
         *slot = None;
     }
 }
@@ -1905,7 +1660,8 @@ thread_local! {
     /// Thread-local log of sessions passed to [`stop_session`] in tests.
     pub(crate) static STOPPED_SESSIONS: std::cell::RefCell<Vec<u64>> =
         const { std::cell::RefCell::new(Vec::new()) };
-    /// Thread-local capture buffer for `(session, pgid)` requests passed to [`request_footer`] in tests.
+    /// Thread-local capture buffer for `(session, pgid)` requests passed to [`request_footer`] in
+    /// tests.
     pub(crate) static CAPTURED_ASKS: std::cell::RefCell<Option<Vec<(u64, i32)>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -1926,10 +1682,7 @@ struct WatchSchedule {
     watched: HashMap<u64, Watch>,
 }
 
-/// One watched session: its latest job, when it was last ASKED for and last
-/// READ — the idle re-reads ([`IDLE_RECHECK`]) run off these — and whether
-/// its process is AWAITED: its last read found no registry row, so the
-/// registry watch looks out for it ([`crate::claude_registry`]).
+/// One watched session: its latest job ([`IDLE_RECHECK`], [`crate::claude_registry`]).
 struct Watch {
     job: Job,
     asked: std::time::Instant,
@@ -1949,17 +1702,14 @@ struct Accepted {
 }
 
 impl WatchSchedule {
-    /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask,
-    /// unless `walled_alive` — asked only then — says the session's footer
-    /// shows a wall or weekly percentage and its process lives ([`still_watched`]).
+    /// Drop the watches whose time is up: [`WATCH_FOR`] after the last ask ([`still_watched`]).
     fn prune(&mut self, now: std::time::Instant, mut walled_alive: impl FnMut(u64, &Job) -> bool) {
         self.watched.retain(|session, watch| {
             still_watched(now, watch.asked, || walled_alive(*session, &watch.job))
         });
     }
 
-    /// When the next read is owed on a clock: a follow-up or an idle
-    /// re-read.
+    /// When the next read is owed on a clock.
     fn next(&self, now: std::time::Instant) -> Option<std::time::Instant> {
         self.owed
             .iter()
@@ -1976,8 +1726,7 @@ impl WatchSchedule {
         job.session == session && pgid.is_none_or(|pgid| job.pgid == pgid)
     }
 
-    /// Collapse queued requests while respecting a stop's position in the
-    /// channel, and gather the Claude dirs the registry watch told.
+    /// Collapse queued requests while respecting a stop's position in the channel.
     fn accept(&mut self, commands: impl IntoIterator<Item = Command>) -> Accepted {
         let mut latest: HashMap<u64, Job> = HashMap::new();
         let mut accepted = Accepted::default();
@@ -2020,8 +1769,8 @@ impl WatchSchedule {
         true
     }
 
-    /// Watch `job`, asked for and read at `asked`, that read having found
-    /// its process's registry row (`row`) or not.
+    /// Watch `job`, asked for and read at `asked`, that read having found its process's registry
+    /// row.
     fn watch(&mut self, job: Job, asked: std::time::Instant, row: bool) {
         self.owed
             .retain(|(_, pending)| pending.session != job.session);
@@ -2052,8 +1801,7 @@ impl WatchSchedule {
             .map(|watch| watch.job.clone())
     }
 
-    /// The job of each session in `sessions` whose process is awaited, in
-    /// session order.
+    /// The job of each session in `sessions` whose process is awaited, in session order.
     fn awaited_in(&self, sessions: &HashSet<u64>) -> Vec<Job> {
         let mut jobs: Vec<Job> = sessions
             .iter()
@@ -2065,8 +1813,7 @@ impl WatchSchedule {
         jobs
     }
 
-    /// `session` was read at `at`, the read having found its process's
-    /// registry row (`row`) or not.
+    /// `session` was read at `at`, the read having found its process's registry row.
     fn read(&mut self, session: u64, at: std::time::Instant, row: bool) {
         if let Some(watch) = self.watched.get_mut(&session) {
             watch.read = at;
@@ -2074,21 +1821,14 @@ impl WatchSchedule {
         }
     }
 
-    /// Whether `job`'s process is awaited as a read of it starts: its watch
-    /// is for another process or none (a process never read is awaited), or
-    /// its last read found no row.
+    /// Whether `job`'s process is awaited as a read of it starts.
     fn awaits(&self, job: &Job) -> bool {
         self.watched
             .get(&job.session)
             .is_none_or(|watch| watch.job.pgid != job.pgid || watch.awaiting)
     }
 
-    /// One pass of the resolver thread ([`Resolver::turn`]) over the asks it
-    /// just took (`latest`) and what is owed: each ask is read and watched,
-    /// then each follow-up due at the pass's instant, then each awaited
-    /// process of a session in `moved` (its Claude dir's rows moved) that
-    /// this pass has not read yet — once, however many events told it —
-    /// then each idle re-read due then.
+    /// One pass of the resolver thread ([`Resolver::turn`]).
     fn serve(
         &mut self,
         latest: Vec<Job>,
@@ -2122,19 +1862,15 @@ impl WatchSchedule {
     }
 }
 
-/// How many Claude Code processes the resolver keeps transcript caches for
-/// at once ([`ProcessTails`]).
+/// How many Claude Code processes the resolver keeps transcript caches for at once
+/// ([`ProcessTails`]).
 const MAX_KEPT: usize = 64;
 
-/// How often the resolver asks the kernel whether the processes it keeps
-/// caches for, and no longer watches, still live ([`ProcessTails`]).
+/// How often the resolver asks the kernel whether the processes it keeps caches for, and no longer
+/// watches, still live ([`ProcessTails`]).
 const SWEEP_EVERY: Duration = Duration::from_secs(30);
 
-/// The transcript caches (`footer::TailCache`: what the process decided, whether its model
-/// is pinned) of the Claude Code processes the resolver has read, keyed by process (group
-/// and kernel start), not by watch: a watch lapses after [`WATCH_FOR`] and ends at every
-/// stop (ctrl-z, another program in front), while the process and its pin outlive both,
-/// and a fresh cache cannot see a pin made before a `/resume`.
+/// The transcript caches ([`WATCH_FOR`]).
 #[derive(Default)]
 struct ProcessTails {
     kept: HashMap<(i32, Option<u64>), KeptTail>,
@@ -2181,11 +1917,7 @@ impl ProcessTails {
         &mut kept.cache
     }
 
-    /// Drop the caches whose process has left for good, as `schedule` now
-    /// watches: one with no start time once its session's watch no longer
-    /// reads its group; one with a start, at most every [`SWEEP_EVERY`],
-    /// once `alive` (the kernel, [`birth_seconds`]) no longer finds a process
-    /// of its group born then.
+    /// Drop the caches whose process has left for good ([`SWEEP_EVERY`], [`birth_seconds`]).
     fn retain(
         &mut self,
         schedule: &WatchSchedule,
@@ -2208,10 +1940,7 @@ impl ProcessTails {
     }
 }
 
-/// The resolver thread: each request is read at once and again at each
-/// follow-up, a process whose registry row no read has found yet whenever
-/// the registry watch sees its Claude dir move, and the thread sleeps exactly
-/// until the next clock read is owed or a command comes in.
+/// The resolver thread.
 fn run(rx: &std::sync::mpsc::Receiver<Command>, registry: crate::claude_registry::RegistryWatch) {
     let mut resolver = Resolver::new(registry, LIVE);
     loop {
@@ -2237,19 +1966,14 @@ fn run(rx: &std::sync::mpsc::Receiver<Command>, registry: crate::claude_registry
     }
 }
 
-/// The resolver thread's whole state ([`run`]): its schedule; per session,
-/// the process known for it, its usage fold and its wall mark; per process,
-/// its transcript tail; the one roster; the registry watch over the rows it
-/// awaits; and what a read asks outside Claude Code's own files ([`Asks`]).
+/// The resolver thread's whole state ([`run`]): its schedule ([`Asks`]).
 struct Resolver {
-    /// Per session: its latest job, when it was last ASKED for, when it was
-    /// last READ — the idle re-reads ([`IDLE_RECHECK`]) run off this — and
-    /// whether its process is awaited ([`Watch`]).
+    /// Per session: its latest job ([`IDLE_RECHECK`], [`Watch`]).
     schedule: WatchSchedule,
     known: HashMap<u64, Identity>,
     /// Per PROCESS: its transcript-tail memo, kept while the process lives.
     tails: ProcessTails,
-    /// Per watched session: its usage fold, released with the watch.
+    /// Per watched session.
     folds: HashMap<u64, footer::FooterCache>,
     /// Sessions whose footer has a wall or weekly percentage to expire on the slow clock.
     walled: HashSet<u64>,
@@ -2273,9 +1997,7 @@ impl Resolver {
         }
     }
 
-    /// Before the thread sleeps at `now`: the watches whose time is up go,
-    /// with what the reads hold for their sessions, the tails of processes
-    /// gone, and the registry watches nothing awaits now.
+    /// Before the thread sleeps at `now`.
     fn retain(&mut self, now: std::time::Instant) {
         let walled = &self.walled;
         self.schedule.prune(now, |session, job| {
@@ -2301,13 +2023,8 @@ impl Resolver {
         self.schedule.next(now)
     }
 
-    /// One turn over `commands`, the batch the thread just took: a stop
-    /// forgets its session ([`forget`]; the process's tail stays while it
-    /// lives, since a stopped group may come back with its pin,
-    /// [`ProcessTails`]); the asks, the follow-ups due, the processes whose
-    /// rows moved and the idle re-reads due are read
-    /// ([`WatchSchedule::serve`]); and the registry watch is settled on what
-    /// is awaited after them ([`Self::settle`]).
+    /// One turn over `commands` ([`forget`], [`ProcessTails`], [`WatchSchedule::serve`],
+    /// [`Self::settle`]).
     fn turn(
         &mut self,
         commands: impl IntoIterator<Item = Command>,
@@ -2346,10 +2063,7 @@ impl Resolver {
     }
 
     /// Place the registry watches the awaited processes need
-    /// ([`crate::claude_registry::RegistryWatch::reconcile`]), then read
-    /// each process awaited under a Claude dir where one was newly placed
-    /// ([`Cause::Placed`]): what was written before the watch is found by
-    /// that read, what follows by its event.
+    /// ([`crate::claude_registry::RegistryWatch::reconcile`], [`Cause::Placed`]).
     fn settle(&mut self, clock: &mut impl FnMut() -> std::time::Instant) {
         for _ in 0..PLACE_ROUNDS {
             let fresh: HashSet<PathBuf> = self
@@ -2376,8 +2090,7 @@ impl Resolver {
         }
     }
 
-    /// The awaited processes whose Claude dir a read has resolved: what the
-    /// registry watch looks out for.
+    /// The awaited processes whose Claude dir a read has resolved.
     fn awaited(&self) -> Vec<crate::claude_registry::Awaited> {
         let mut awaited: Vec<_> = self
             .schedule
@@ -2418,9 +2131,7 @@ impl Resolver {
     }
 }
 
-/// The resolver's state one read touches: per session, the process known
-/// for it, its usage fold and its wall mark; per process, its tail; the one
-/// roster; and what a read asks outside Claude Code's own files.
+/// The resolver's state one read touches: per session.
 struct Reads<'a> {
     known: &'a mut HashMap<u64, Identity>,
     tails: &'a mut ProcessTails,
@@ -2431,8 +2142,8 @@ struct Reads<'a> {
 }
 
 impl Reads<'_> {
-    /// Read `job`'s session for `cause` and keep it in the walled set
-    /// exactly while its published footer has a wall or weekly percentage.
+    /// Read `job`'s session for `cause` and keep it in the walled set exactly while its published
+    /// footer has a wall or weekly percentage.
     fn resolve(&mut self, job: &Job, cause: Cause, awaited: bool) -> bool {
         let found = resolve_and_post(
             self.known,
@@ -2467,7 +2178,7 @@ impl Reads<'_> {
     }
 }
 
-/// Side-channel session metadata (working directory, repo root, traffic, and in-flight subagents) published alongside footer facts.
+/// Side-channel session metadata.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FactSide {
     /// Current working directory of the session's Bash tool or launch environment.
@@ -2476,13 +2187,11 @@ pub(crate) struct FactSide {
     pub(crate) repo_root: Option<PathBuf>,
     /// Token traffic time-series view from the usage fold, if available.
     pub(crate) traffic: Option<Arc<aterm_agent::harness::session_usage::TrafficView>>,
-    /// The fold and generation `traffic` was built at
-    /// (`footer::FooterCache::traffic_generation`).
+    /// The fold and generation `traffic` was built at.
     built_at: Option<(u64, u64)>,
     /// Active subagents and workflow tool calls in flight from the usage fold.
     pub(crate) flights: Option<Arc<aterm_agent::harness::flight::FlightTable>>,
-    /// The fold and generation `flights` was built at
-    /// (`footer::FooterCache::flight_generation`).
+    /// The fold and generation `flights` was built at (`footer::FooterCache::flight_generation`).
     flights_at: Option<(u64, u64)>,
 }
 
@@ -2520,8 +2229,7 @@ impl FactSide {
     }
 }
 
-/// What a [`side_after`] read found of the fold: the traffic's generation
-/// and the flight table's, each with what builds it.
+/// What a [`side_after`] read found of the fold.
 struct SideFold<T, F> {
     generation: Option<(u64, u64)>,
     traffic: T,
@@ -2529,11 +2237,8 @@ struct SideFold<T, F> {
     flights: F,
 }
 
-/// The side for a read that found `cwd` and `repo_root` and a fold whose
-/// parts are at `fold`'s generations: `held` itself (the same `Arc`) when
-/// none of them moved, else a new one, each of the traffic and the flight
-/// table `held`'s own where its generation did not move and built anew where
-/// it did.
+/// The side for a read that found `cwd` and `repo_root` and a fold whose parts are at `fold`'s
+/// generations.
 fn side_after<T, F>(
     held: Option<&Arc<FactSide>>,
     cwd: Option<PathBuf>,
@@ -2582,8 +2287,7 @@ pub(crate) const REGISTRY_READ: &str = "registry-read";
 /// What one read found, for the resolver's own state.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct Found {
-    /// The process's registry row answered the read ([`footer::read_pid`]
-    /// gave facts): the process is awaited until a read it is true for.
+    /// The process's registry row answered the read ([`footer::read_pid`] gave facts).
     row: bool,
     /// Its published wall or weekly percentage still needs clock-driven expiry.
     timed: bool,
@@ -2598,9 +2302,7 @@ fn note_wall(walled: &mut HashSet<u64>, session: u64, timed: bool) {
     }
 }
 
-/// Forget what the resolver's reads hold for `session` (its process, its usage fold and its
-/// wall mark) once the schedule has stopped its watch ([`stop_session`] from a closed tab,
-/// [`stop`] for a group that left).
+/// Forget what the resolver's reads hold for `session` ([`stop_session`], [`stop`]).
 fn forget(
     session: u64,
     known: &mut HashMap<u64, Identity>,
@@ -2612,9 +2314,7 @@ fn forget(
     walled.remove(&session);
 }
 
-/// What the resolver knows about one Claude Code process for its whole life: its kernel
-/// start (the pid-reuse guard), the Claude Code directory its exec environment named (one
-/// `KERN_PROCARGS2` read per process), and what its command line and environment say
+/// What the resolver knows about one Claude Code process for its whole life
 /// ([`footer::launch_facts_of`], [`login_of_args`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Identity {
@@ -2622,20 +2322,14 @@ struct Identity {
     started: Option<u64>,
     dir: Option<PathBuf>,
     launch: LaunchFacts,
-    /// The image (`startedAt`) `launch`, `login` and `argv` were read for;
-    /// `None` until a registry entry named one and that read answered.
+    /// The image (`startedAt`) `launch`.
     launch_for: Option<Option<u64>>,
-    /// What the process's exec environment says of its login; `None` where
-    /// it could not be read or reads empty.
+    /// What the process's exec environment says of its login.
     login: Option<accounts::ProcessLogin>,
-    /// The process's argv, `argv[0]` first, from the same `KERN_PROCARGS2` read as `launch`
-    /// (empty where it could not be read): the launch flags the frozen-program remedy's
-    /// resume line carries ([`aterm_agent::harness::resume::of_entry`]).
+    /// The process's argv ([`aterm_agent::harness::resume::of_entry`]).
     argv: Vec<String>,
-    /// The head of the task a `spawn agent=` worker was started with, read
-    /// once per image from the file its exec environment names
-    /// (`ATERM_TASK_FILE`, [`crate::survey::task_prompt_of_env`]): the
-    /// survey's `prompt=` for a tasked session.
+    /// The head of the task a `spawn agent=` worker was started with, read once per image from the
+    /// file its exec environment names ([`crate::survey::task_prompt_of_env`]).
     task: Option<String>,
     /// The image and settings directory the stored-login verdict belongs to.
     login_checked_for: Option<(Option<u64>, PathBuf)>,
@@ -2645,8 +2339,7 @@ struct Identity {
     env_stamp: Option<[u8; 32]>,
 }
 
-/// The kernel's start time of `pid`, unix seconds, where this platform can
-/// read it for a process of ours.
+/// The kernel's start time of `pid`.
 fn birth_seconds(pid: i32) -> Option<u64> {
     #[cfg(unix)]
     {
@@ -2691,8 +2384,7 @@ fn login_of_args(args: Option<&atpkg::caller_shell::ProcArgs>) -> Option<account
     accounts::ProcessLogin::of_exec_env(&args?.env)
 }
 
-/// Reuse an image's auth verdict only for its exact captured environment. Lengths
-/// separate entries, and no raw credential value is retained in the identity cache.
+/// Reuse an image's auth verdict only for its exact captured environment.
 fn exec_env_stamp(env: &[String]) -> [u8; 32] {
     let mut digest = aterm_digest::Sha256::new();
     for entry in env {
@@ -2702,19 +2394,17 @@ fn exec_env_stamp(env: &[String]) -> [u8; 32] {
     digest.finalize()
 }
 
-/// The accounts roster as the resolver last read it, for the footer's label
-/// ([`accounts::footer_label`]).
+/// The accounts roster as the resolver last read it ([`accounts::footer_label`]).
 #[derive(Default)]
 struct RosterMemo {
     /// When `load` was last asked.
     read: Option<std::time::Instant>,
-    /// What it answered. A lone row can bind a named login's profile identity.
+    /// What it answered.
     roster: Option<accounts::Roster>,
 }
 
 impl RosterMemo {
-    /// The roster; `load` is asked at most every
-    /// [`ROSTER_RECHECK`].
+    /// The roster; `load` is asked at most every [`ROSTER_RECHECK`].
     fn at(
         &mut self,
         now: std::time::Instant,
@@ -2731,9 +2421,7 @@ impl RosterMemo {
     }
 }
 
-/// The roster beside the `aterm.toml` this window loads
-/// ([`accounts::default_roster_path`]): one bounded read, through this
-/// machine's logins (`accounts::Store::bound`).
+/// The roster beside the `aterm.toml` this window loads ([`accounts::default_roster_path`]).
 fn live_roster() -> Option<accounts::Roster> {
     if cfg!(test) {
         return None;
@@ -2748,9 +2436,7 @@ fn live_roster() -> Option<accounts::Roster> {
         .ok()
 }
 
-/// What a read asks outside Claude Code's own files: a process's exec read,
-/// the accounts roster and the person's home (the resume line's `HOME` is
-/// judged against its `.claude`).
+/// What a read asks outside Claude Code's own files.
 #[derive(Clone, Copy)]
 struct Asks {
     args: fn(i32) -> Option<atpkg::caller_shell::ProcArgs>,
@@ -2767,10 +2453,7 @@ const LIVE: Asks = Asks {
     stored_login: crate::harness_netprobe::stored_login_of_agent,
 };
 
-/// [`resolve_into`], then wake the loop when the facts moved — and, when the
-/// moved facts carry a repository read the kernel refused with `EPERM`, post that
-/// too, so the App can raise its consent attention for this session
-/// (`Wake::ProtectedRead`; the App decides whether the path is protected).
+/// [`resolve_into`], then wake the loop when the facts moved.
 fn resolve_and_post(
     known: &mut HashMap<u64, Identity>,
     tails: &mut ProcessTails,
@@ -2824,9 +2507,7 @@ fn resolve_and_post(
     found
 }
 
-/// A zone's offset from UTC at the instant `unix` (`None`: the local zone), by
-/// `aterm_agent::supervise::limit::offset_at`, `None` for a zone this machine does not know
-/// (the wall then shows nothing, never a guess).
+/// A zone's offset from UTC at the instant `unix`.
 fn offset_at_cached(zone: Option<&str>, unix: i64) -> Option<i64> {
     static ANSWERS: Mutex<Vec<OffsetAnswer>> = Mutex::new(Vec::new());
     let mut answers = ANSWERS.lock().unwrap_or_else(|p| p.into_inner());
@@ -2839,13 +2520,10 @@ fn offset_at_cached(zone: Option<&str>, unix: i64) -> Option<i64> {
     )
 }
 
-/// One remembered offset: the zone (`None`: local), the instant, when it
-/// was read, and the offset.
+/// One remembered offset.
 type OffsetAnswer = (Option<String>, i64, std::time::Instant, i64);
 
-/// [`offset_at_cached`] over `answers` at `now`, asking `read` on a miss. Only an answer is
-/// kept: a read that failed (a `date` that could not be spawned under process pressure) is
-/// asked again next time rather than hiding a standing wall for the hour an answer is kept.
+/// [`offset_at_cached`] over `answers` at `now`, asking `read` on a miss.
 fn cached_offset(
     answers: &mut Vec<OffsetAnswer>,
     zone: Option<&str>,
@@ -2873,10 +2551,7 @@ fn cached_offset(
     Some(offset)
 }
 
-/// Read `identity`'s facts and publish them on `timeline`: `Some` when they
-/// MOVED, carrying the working directory whose repository read was refused, if
-/// one was; and what the read [`Found`] — the process's registry row, and
-/// whether the footer the timeline now shows carries a limit wall.
+/// Read `identity`'s facts and publish them on `timeline`: `Some` when they MOVED ([`Found`]).
 fn resolve_into(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
@@ -2923,7 +2598,7 @@ fn resolve_into(
     (moved, found, logged)
 }
 
-/// [`resolve_into`]'s footer half: read `identity`'s facts and publish them.
+/// [`resolve_into`]'s footer half.
 fn resolve_facts(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
@@ -2940,8 +2615,7 @@ fn resolve_facts(
     resolve_facts_at(timeline, identity, tail, fold, roster, asks, &clock)
 }
 
-/// The same worker read with an explicit clock, so quota expiry can be driven without
-/// sleeps or changing the process's wall clock.
+/// The same worker read with an explicit clock.
 fn resolve_facts_at(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
@@ -2962,8 +2636,7 @@ fn resolve_facts_at(
     )
 }
 
-/// The resolver's process-directory capability, passed explicitly so an
-/// owned fixture never probes an arbitrary process bearing its example pid.
+/// The resolver's process-directory capability.
 fn resolve_facts_at_with_cwd(
     timeline: &Arc<Mutex<SessionTimeline>>,
     identity: &mut Identity,
@@ -3288,8 +2961,7 @@ fn resolve_facts_at_with_cwd(
     )
 }
 
-/// One known reset occurrence has arrived. Shared by the resolver and a
-/// new frame observation; an unplaced reset never expires on a guess.
+/// One known reset occurrence has arrived.
 fn muse_weekly_expired(reset_at: Option<i64>, now: i64) -> bool {
     reset_at.is_some_and(|at| at <= now)
 }
@@ -3305,8 +2977,7 @@ fn muse_weekly_reset_at(reset: &str, clock: &footer::ReadClock<'_>) -> Option<i6
     ))
 }
 
-/// Admit one card observation. An unchanged reset reuses its occurrence
-/// and its expiry tombstone; settled frames need no clock, parsing or copy.
+/// Admit one card observation.
 fn muse_weekly_observation<'a>(
     (weekly, reset): (&'a str, Option<&'a str>),
     kept: Option<&aterm_agent::harness::profile::SubscriptionDisplay>,
@@ -3349,9 +3020,7 @@ fn needs_recheck(timeline: &SessionTimeline) -> bool {
     })
 }
 
-/// The model the footer shows for `facts`, or for the facts `timeline` keeps where this
-/// read found none: their own, else their launch card's
-/// ([`FooterFacts::filled_model_effort`]).
+/// The model the footer shows for `facts` ([`FooterFacts::filled_model_effort`]).
 fn shown_model(timeline: &SessionTimeline, facts: Option<&FooterFacts>) -> Option<String> {
     let kept = timeline.claude_footer();
     let facts = facts.or(kept)?;
@@ -3431,9 +3100,7 @@ pub(crate) fn fingerprint(
     h.finish() | 1
 }
 
-/// `facts` as the rule shows them under the `[claude_footer] usage` switch
-/// (`Config::claude_footer_usage`, on by default): off, only a standing limit wall is kept
-/// of the `Σ` segment (`UsageFacts::wall_only`).
+/// `facts` as the rule shows them under the `[claude_footer] usage` switch.
 fn with_usage_switch(facts: &mut FooterFacts, usage: bool) {
     if !usage {
         facts.usage = facts
@@ -3459,8 +3126,7 @@ fn rule_mask(
     Some((mask, rule))
 }
 
-/// [`rule_mask`] into `mask`, cleared first and its buffer reused so a frame allocates
-/// nothing for it; returns the rule cell.
+/// [`rule_mask`] into `mask`.
 fn rule_mask_into(
     mask: &mut Vec<bool>,
     scratch: &RenderInput,
@@ -3489,10 +3155,7 @@ fn rule_mask_into(
     Some(rule)
 }
 
-/// The cells aterm writes into `room` cells of the rule for one pane, and where in them the
-/// lights' chips start: the lights (` <chips>  <title> `) at the left end, the rule's own
-/// glyphs, then ` <facts> ` at the right end; without lights the facts alone, so a rule at
-/// rest is written only where the facts are.
+/// The cells aterm writes into `room` cells of the rule for one pane.
 fn compose_rule_spans(
     fit: &footer::RuleFit,
     block: Option<&crate::claude_lights::Block>,
@@ -3648,9 +3311,7 @@ fn compose_rule(
     (paint.cells, paint.lights_at)
 }
 
-/// One rule's edits for [`write_edits`]: its `cells` at `col` of frame row `row`, less the
-/// run `glass` of them ([`compose_rule_spans`]), so the lights and the facts go as two
-/// edits.
+/// One rule's edits for [`write_edits`] ([`compose_rule_spans`]).
 fn rule_edits<'a>(
     row: usize,
     col: usize,
@@ -3673,9 +3334,7 @@ fn rule_edits<'a>(
 
 const _: () = assert!(footer::NUDGES_PER_CELL == aterm_core::terminal::Script::NUDGES_PER_CELL);
 
-/// How far the values' ink is lifted from Claude's rule gray toward the
-/// pane's text colour: a third of the way, so the small, low facts read
-/// without effort and still stand below the conversation's text.
+/// How far the values' ink is lifted from Claude's rule gray toward the pane's text colour.
 const VALUE_LIFT: f32 = 1.0 / 3.0;
 
 /// Lifts rule `gray` toward pane foreground `ink` for legible footer fact values.
@@ -3690,8 +3349,7 @@ fn mix(a: [u8; 3], b: [u8; 3], t: f32) -> [u8; 3] {
     })
 }
 
-/// The scratch facts one footer write is valid against: every token a fill,
-/// a prepend, a compose or another host write moves.
+/// The scratch facts one footer write is valid against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Tokens {
     snapshot_seq: u64,
@@ -3730,12 +3388,11 @@ impl Tokens {
 struct RowUndo {
     frame_row: usize,
     col_off: usize,
-    /// The row's length before the write (the engine trims trailing blanks,
-    /// so the write may have padded it).
+    /// The row's length before the write.
     len_before: usize,
-    /// The cells the write replaced — the part of the span the row had.
+    /// The cells the write replaced.
     before: Vec<RenderCell>,
-    /// The cells the write put there: the undo's proof they are still there.
+    /// The cells the write put there.
     painted: Vec<RenderCell>,
     /// The row's D-2 revision before the write, when the write cleared it.
     rev_before: Option<u64>,
@@ -3793,17 +3450,16 @@ impl<T: Clone + Eq> TextUndo<T> {
     }
 }
 
-/// Saved cell state and splice token enabling zero-cost undo of the last footer splice on a window's scratch.
+/// Saved cell state and splice token enabling zero-cost undo of the last footer splice on a
+/// window's scratch.
 #[derive(Debug, Default)]
 pub(crate) struct FooterUndo {
-    /// The write on the glass: `None` once [`undo`] consumed it, or when
-    /// nothing was written.
+    /// The write on the glass ([`undo`]).
     write: Option<WriteSeal>,
-    /// Its rows, `rows[..live]`; the rest are spare buffers.
+    /// Its rows, `rows[..live]`.
     rows: Vec<RowUndo>,
     live: usize,
-    /// The rows of the write whose glass columns are not the grid's (a
-    /// relabelled pill, [`GlassColumns`]): gone with the write.
+    /// The rows of the write whose glass columns are not the grid's ([`GlassColumns`]).
     glass: GlassColumns,
 }
 
@@ -3841,8 +3497,7 @@ impl FooterUndo {
             .map(|r| (r.frame_row, r.col_off, r.painted.len()))
     }
 
-    /// Add native text only where this splice actually wrote its cells. A skipped
-    /// vendor-owned span gets no metadata, and undo verifies these exact payloads.
+    /// Add native text only where this splice actually wrote its cells.
     fn publish_text(
         &mut self,
         scratch: &mut RenderInput,
@@ -3886,7 +3541,7 @@ impl FooterUndo {
         }
     }
 
-    /// The rows the write on the glass wrote; none once it is undone.
+    /// The rows the write on the glass wrote.
     fn written(&self) -> &[RowUndo] {
         if self.write.is_some() {
             &self.rows[..self.live]
@@ -3986,9 +3641,7 @@ impl crate::accessibility::CellRows for ProgramCells<'_> {
     }
 }
 
-/// The pane's exact terminal extraction that supplied its cells to this frame. The
-/// terminal can mutate between that extraction and the footer splice; reading it again
-/// would contend with the PTY writer and mix generations.
+/// The pane's exact terminal extraction that supplied its cells to this frame.
 fn frame_source<'a>(
     ws: &'a crate::WindowState,
     route: VisibleContentRoute,
@@ -4009,7 +3662,8 @@ fn frame_source<'a>(
     (source.terminal_id != 0).then_some(source)
 }
 
-/// Restores cells overwritten by the previous footer splice on `scratch` if the scratch token still matches.
+/// Restores cells overwritten by the previous footer splice on `scratch` if the scratch token still
+/// matches.
 pub(crate) fn undo(slot: &mut FooterUndo, scratch: &mut RenderInput) -> bool {
     slot.glass.clear();
     let Some(seal) = slot.write.take() else {
@@ -4083,9 +3737,8 @@ fn touches<T>(channel: &[Vec<(usize, T)>], row: usize, span: &std::ops::Range<us
         .is_some_and(|entries| entries.iter().any(|(col, _)| span.contains(col)))
 }
 
-/// Write each `(frame_row, col, cells, ground)` edit into `scratch` and keep in `slot` the
-/// record [`undo`] needs (none when nothing was written), its rows reusing the buffers the
-/// last consumed write left.
+/// Write each `(frame_row, col, cells, ground)` edit into `scratch` and keep in `slot` the record
+/// [`undo`] needs.
 fn write_edits<'a>(
     slot: &mut FooterUndo,
     scratch: &mut RenderInput,
@@ -4169,7 +3822,7 @@ fn write_edits<'a>(
 }
 
 impl App {
-    /// Computes the combined repaint fingerprint of footer facts, lights, card, and panel state for window `wid`.
+    /// Computes the combined repaint fingerprint of footer facts.
     pub(crate) fn claude_footer_fp(
         &self,
         wid: WindowId,
@@ -4288,16 +3941,7 @@ impl App {
         fp
     }
 
-    /// WHAT aterm DRAWS FOR `session`'s TOP-EFFORT KEY on its top rule
-    /// (design §10.6.14), `tag` Claude's own on the row as the frame read it:
-    /// for a Claude Code that takes the key's toggle alone (`stated` is
-    /// `None` for any other: [`PaneFooter::key_typed`]), the ghost where
-    /// Claude draws no tag — only on evidence the key exists for the
-    /// process (the facts `stated` it, the tag was seen for `pgid`, or this
-    /// session's own press of it is in flight) and not latched off for the
-    /// process and its `model` by Claude's refusal — lit while hovered; the
-    /// mark `◐` while the press runs, `▸` while the keyboard selects the
-    /// key.
+    /// WHAT aterm DRAWS FOR `session`'s TOP-EFFORT KEY on its top rule ([`PaneFooter::key_typed`]).
     fn key_face(
         &self,
         ws: &crate::WindowState,
@@ -4332,11 +3976,7 @@ impl App {
         }
     }
 
-    /// The harness switch and the theme GEMINI CLI's or CODEX's top line
-    /// (`prog`) wears, under `session`'s Autopilot `reading` for its admitted
-    /// `agent` (design §6.2): a switch only where the host admits the agent
-    /// and a host is — never for a vendor `codex`, which no host admits — and
-    /// the theme only where a switch stands.
+    /// The harness switch and the theme GEMINI CLI's or CODEX's top line.
     fn bare_top_harness(
         &self,
         ws: &crate::WindowState,
@@ -4369,11 +4009,7 @@ impl App {
         (switch, theme.filter(|_| switch.is_some()))
     }
 
-    /// The repaint key's term for GEMINI CLI's or CODEX's top line
-    /// (`prog`, `session`'s, its admitted `agent`): what its switch and theme
-    /// are made of ([`Self::bare_top_harness`]) and the pointer over the
-    /// switch or the lockup — each a change of the line with no grid damage,
-    /// which the footer's facts carry for the others.
+    /// The repaint key's term for GEMINI CLI's or CODEX's top line ([`Self::bare_top_harness`]).
     fn bare_top_term(
         &self,
         ws: &crate::WindowState,
@@ -4395,12 +4031,7 @@ impl App {
                 .rotate_left(23)
     }
 
-    /// SPLICE ONE PANE'S TOP LINE (design §6.2): Claude Code's, agy's and
-    /// Muse Code's composer top rule, Gemini CLI's live-zone rule, Codex's
-    /// slab pad ([`top_line`]), its run read once per rebuild of the rows and
-    /// kept with them, and its composition kept while what it is made of
-    /// holds ([`PaneFooter::compose_top`]): a frame at rest reads, composes
-    /// and allocates nothing for it.
+    /// SPLICE ONE PANE'S TOP LINE (design §6.2) ([`top_line`], [`PaneFooter::compose_top`]).
     fn splice_top_line(
         &self,
         ws: &crate::WindowState,
@@ -4550,7 +4181,7 @@ impl App {
         }
     }
 
-    /// Splices the Claude footer, mode-pill relabel, and harness lights into each visible agent pane in `wid`.
+    /// Splices the Claude footer.
     pub(crate) fn splice_claude_footer(
         &mut self,
         wid: WindowId,
@@ -4564,8 +4195,7 @@ impl App {
         });
     }
 
-    /// The same splice with a lazy observation clock: only a newly named
-    /// Muse reset forces it, never an unrelated or settled drawer.
+    /// The same splice with a lazy observation clock.
     fn splice_claude_footer_at(
         &mut self,
         wid: WindowId,
@@ -4612,8 +4242,7 @@ impl App {
         }
     }
 
-    /// [`Self::splice_claude_footer`] on the window's lists (`lists`, empty
-    /// on entry).
+    /// [`Self::splice_claude_footer`] on the window's lists (`lists`, empty on entry).
     fn splice_claude_footer_with(
         &mut self,
         wid: WindowId,
@@ -5453,11 +5082,6 @@ impl App {
                     claude_card.paint_layer(input_scratch, layer.clone());
                 }
             }
-            // So with the marks the glass draws (`BandIcon::glass_mark`: the
-            // switch's `● ○ ◐`, the chips' `○ ◐ ◌ ⊘ ⤓`, the card's line's), in
-            // every cell aterm's own writes put there — the card's line and
-            // banner, the rules, the top lines — and in none of the vendor's
-            // text a relabel or a transcript edit moved.
             for r in claude_footer_undo.written() {
                 let vendor = lists
                     .agy_edits
@@ -5609,8 +5233,7 @@ impl App {
     }
 }
 
-/// A pane's footer reading: where the composer's bottom rule is, and whether
-/// a mode row this build reads sits under it.
+/// A pane's footer reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RuleRead {
     rule: usize,
@@ -5627,8 +5250,7 @@ fn read_rule_row(rows: &[String]) -> FooterRead {
     read_rule_under(rows, aterm_phase::phase::FrameReach::of(rows))
 }
 
-/// [`read_rule_row`] for a frame already found (`reach`): its bottom rule, and whether a
-/// mode row sits under it, read from the rows under the rule alone.
+/// [`read_rule_row`] for a frame already found (`reach`).
 fn read_rule_under(rows: &[String], reach: aterm_phase::phase::FrameReach) -> FooterRead {
     reach.rules().map(|(_, rule)| RuleRead {
         rule,
@@ -5636,9 +5258,7 @@ fn read_rule_under(rows: &[String], reach: aterm_phase::phase::FrameReach) -> Fo
     })
 }
 
-/// Vendor drift, logged: a Claude Code pane whose composer has a pill-shaped mode row
-/// under it that this build does not read (`footer::opens_with_pill_glyph` but no
-/// `footer::pill_indicator`).
+/// Vendor drift, logged.
 fn note_vendor_drift(session: u64, version: Option<&str>, rows: &[String]) {
     static LOGGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
     let unread =
@@ -5665,9 +5285,7 @@ fn note_vendor_drift(session: u64, version: Option<&str>, rows: &[String]) {
 /// How many distinct unreadable rows (per build) one run logs.
 const DRIFT_ROWS_LOGGED: usize = 16;
 
-/// The row under the composer that opens with a pill glyph but names no pill
-/// this build knows — `None` for every screen the footer can read, and for
-/// one with no composer (a box is up) or nothing pill-shaped under it.
+/// The row under the composer that opens with a pill glyph but names no pill this build knows.
 fn unread_pill_row(rows: &[String]) -> Option<String> {
     let (_, bottom) = aterm_phase::phase::composer_rules(rows)?;
     let row = rows
@@ -5679,9 +5297,7 @@ fn unread_pill_row(rows: &[String]) -> Option<String> {
         .then(|| row.trim_end().to_owned())
 }
 
-/// The harness switch's letter at `t` (`0..=1` along its glyphs,
-/// `SwitchInk::Arc`) in the session's
-/// theme `palette` on the pane whose blank cell is `blank`.
+/// The harness switch's letter at `t` ([`legible_on`]).
 fn brand_letter_fg(
     palette: aterm_effects::harness_card::CardPalette,
     t: f32,
@@ -5690,32 +5306,23 @@ fn brand_letter_fg(
     let bg = u32::from_be_bytes([0, blank.bg[0], blank.bg[1], blank.bg[2]]);
     let rgb = |c: u32| [(c >> 16) as u8, (c >> 8) as u8, c as u8];
     if aterm_effects::harness_card::dark_ground(bg) {
-        mix(rgb(palette.letter(t, true)), blank.fg, 0.25)
+        legible_on(mix(rgb(palette.letter(t, true)), blank.fg, 0.25), blank.bg)
     } else {
         rgb(palette.letter_on(t, bg))
     }
 }
 
-/// A composer top rule's plain run ([`read_top_run`]): `len` cells of the
-/// rule's own glyph `rule` from frame column `col`, none of them a cluster,
-/// a combining mark or an image.
+/// A composer top rule's plain run ([`read_top_run`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TopRun {
     col: usize,
     len: usize,
     rule: RenderCell,
-    /// Muse Code's rule at rest is labelled (`── Voice input (⌥ + v to
-    /// start) ──…`, `aterm_phase::muse::is_idle_voice_rule`): where that
-    /// label stands, untouched, the whole rule from its first `─` to its
-    /// last or to the label's closing blank, whichever ends later, label
-    /// and all (frame column, cells), and the label's cells from that
-    /// column, its closing blank too — what the lockup takes where it fits
-    /// there ([`laid_run`]).
+    /// Muse Code's rule at rest is labelled ([`laid_run`]).
     voice: Option<VoiceRule>,
 }
 
-/// Muse Code's whole idle voice rule ([`TopRun::voice`]): `len` cells from
-/// frame column `col`, of which the label takes the first `label`.
+/// Muse Code's whole idle voice rule ([`TopRun::voice`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VoiceRule {
     col: usize,
@@ -5723,8 +5330,7 @@ struct VoiceRule {
     label: usize,
 }
 
-/// THE RUN A TOP LINE IS LAID ON ([`compose_top`]), and how many of its
-/// cells from its left a label takes that the composition writes over.
+/// THE RUN A TOP LINE IS LAID ON ([`compose_top`]).
 fn laid_run(key: &TopKey) -> (TopRun, usize) {
     let run = key.run;
     let lockup = cli_mark(key.program).map(|mark| mark.lockup_cells(key.build));
@@ -5738,34 +5344,28 @@ fn laid_run(key: &TopKey) -> (TopRun, usize) {
     }
 }
 
-/// The ghost's first cell in a run of `len` cells under `face`, where it is
-/// drawn: right-aligned, one `─` after it.
+/// The ghost's first cell in a run of `len` cells under `face`, where it is drawn.
 fn ghost_at(len: usize, face: KeyFace) -> Option<usize> {
     face.ghost
         .filter(|_| len >= GHOST_RUN)
         .map(|_| len - GHOST_CELLS - 1)
 }
 
-/// The harness's span in a run of `len` cells under `face`: the run, short
-/// of the ghost ([`ghost_at`]).
+/// The harness's span in a run of `len` cells under `face` ([`ghost_at`]).
 fn top_span(len: usize, face: KeyFace) -> usize {
     ghost_at(len, face).unwrap_or(len)
 }
 
-/// What a CLI's top line is drawn as ([`top_line`], [`read_top_run`]): what
-/// aterm writes its lockup and switch on.
+/// What a CLI's top line is drawn as ([`top_line`], [`read_top_run`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TopLine {
-    /// A `─` rule on the pane's ground: Claude Code's, agy's and Muse Code's
-    /// composer top rule, Gemini CLI's live-zone rule.
+    /// A `─` rule on the pane's ground.
     Rule,
-    /// A tinted pad row: Codex's composer slab's top pad, every cell a blank
-    /// on the slab's own ground — Codex's surface, never tinted.
+    /// A tinted pad row: Codex's composer slab's top pad.
     Slab,
 }
 
-/// WHERE `program`'S TOP LINE IS on a pane's cached rows, and its kind: one
-/// exhaustive match, so a new program does not compile until it is placed.
+/// WHERE `program`'S TOP LINE IS on a pane's cached rows, and its kind.
 fn top_line(program: aterm_phase::Program, cached: &CachedPaneText) -> Option<(usize, TopLine)> {
     use aterm_phase::Program;
     let session = cached.key.session;
@@ -5804,8 +5404,7 @@ fn top_line(program: aterm_phase::Program, cached: &CachedPaneText) -> Option<(u
 }
 
 /// Whether a selection reaches the pane's columns of frame row `frame_row`
-/// ([`App::splice_top_line`]): the renderer draws a selection over the
-/// cells, so no cell read shows it.
+/// ([`App::splice_top_line`]).
 fn top_line_selected(scratch: &RenderInput, frame_row: usize, region: PaneTextRegion) -> bool {
     scratch
         .selection_row_span(frame_row)
@@ -5814,8 +5413,7 @@ fn top_line_selected(scratch: &RenderInput, frame_row: usize, region: PaneTextRe
         })
 }
 
-/// The rightmost plain run of the composer's top line (pane row `top_rule`
-/// of `region`) on `scratch`, by its kind:
+/// The rightmost plain run of the composer's top line.
 fn read_top_run(
     scratch: &RenderInput,
     region: PaneTextRegion,
@@ -5937,8 +5535,7 @@ fn read_top_run(
     })
 }
 
-/// THE HARNESS SWITCH'S PAINT on one pane's composer top rule
-/// ([`compose_top`]): what it says, and whether the pointer is over it.
+/// THE HARNESS SWITCH'S PAINT on one pane's composer top rule ([`compose_top`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct SwitchPaint {
     face: crate::autopilot::HarnessSwitch,
@@ -5946,37 +5543,30 @@ struct SwitchPaint {
     version: Option<&'static str>,
 }
 
-/// How one cell of a harness switch's face is inked ([`switch_face`],
-/// [`switch_cell`]).
+/// How one cell of a harness switch's face is inked ([`switch_face`], [`switch_cell`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SwitchInk {
-    /// A glyph of the switch's words and state on a line that wears a theme,
-    /// at its stop of the theme's arc (`0..=255`): glyph `k` of the `n` from
-    /// the switch's first letter through its state word, blanks skipped,
-    /// stands at `t = k/(n−1)` ([`SwitchFace::on_arc`]).
+    /// A glyph of the switch's words and state on a line that wears a theme
+    /// ([`SwitchFace::on_arc`]).
     Arc(u8),
     /// The switch's label (`alab harness`), and the face's blanks.
     Label,
     /// The lit state, `● on`: the accent.
     Lit,
-    /// The state the switch is in when off, `○ off`: the label's quiet ink.
+    /// The state the switch is in when off, `○ off`.
     Unlit,
-    /// A letter of the `on` button: the ground's ink on the button's fill.
+    /// A letter of the `on` button.
     Button,
-    /// A cap of the button (`▐`, `▌`): its fill as ink on the ground, so the
-    /// button's ends are half a cell, a pill.
+    /// A cap of the button (`▐`, `▌`).
     Cap,
-    /// `◐ turning on`: the accent, quieted and floored to 4.5:1
-    /// ([`turning_ink`]).
+    /// `◐ turning on`: the accent, quieted and floored to 4.5:1 ([`turning_ink`]).
     Turning,
 }
 
-/// The cells a switch face may take: the widest, ` alab harness v0.1 ○ off ▐ on ▌ `.
+/// The cells a switch face may take.
 const SWITCH_FACE_MAX: usize = 34;
 
-/// One harness switch face as laid ([`switch_face`]): its cells and where
-/// its parts lie in them — the switch itself (label and state, the
-/// accessibility tree's switch node) and the `on` button.
+/// One harness switch face as laid ([`switch_face`]): its cells and where its parts lie in them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SwitchFace {
     cells: [(char, SwitchInk); SWITCH_FACE_MAX],
@@ -6005,11 +5595,7 @@ impl SwitchFace {
         }
     }
 
-    /// The face on a line that wears a theme: each glyph of the switch's own
-    /// cells (its words and its state, blanks skipped) takes its stop of the
-    /// theme's arc, `t = k/(n−1)` for glyph `k` of `n` ([`SwitchInk::Arc`]),
-    /// so the switch's first glyph meets the rule's `t = 0` and its last the
-    /// tail's `t = 1` ([`compose_top`]).
+    /// The face on a line that wears a theme ([`SwitchInk::Arc`], [`compose_top`]).
     fn on_arc(&mut self) {
         let span = self.switch.clone();
         let n = self.cells[span.clone()]
@@ -6028,13 +5614,10 @@ impl SwitchFace {
     }
 }
 
-/// How many forms a switch face has, widest first ([`switch_face`]'s
-/// `tier`): each gives up words, never the switch, so the switch — the
-/// only door to turning the harness on from the pane — goes last.
+/// How many forms a switch face has, widest first ([`switch_face`]).
 const SWITCH_TIERS: usize = 4;
 
-/// THE HARNESS SWITCH'S FACE, `tier` steps down from its widest
-/// (`0..SWITCH_TIERS`; `None` past the face's last form):
+/// THE HARNESS SWITCH'S FACE.
 fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
     use crate::autopilot::HarnessSwitch;
     let mut f = SwitchFace {
@@ -6111,9 +5694,7 @@ fn switch_face(paint: SwitchPaint, tier: usize) -> Option<SwitchFace> {
     Some(f)
 }
 
-/// The off switch's `on` button ([`switch_face`]): a pill, `▐ on ▌`, its
-/// letters the ground's ink on the accent's fill, its caps half a cell of
-/// the fill on the ground.
+/// The off switch's `on` button ([`switch_face`]).
 fn push_on_button(f: &mut SwitchFace) {
     f.push("\u{2590}", SwitchInk::Cap);
     f.push(" on ", SwitchInk::Button);
@@ -6131,12 +5712,7 @@ fn fitted_switch_face(paint: SwitchPaint, room: usize) -> Option<(usize, SwitchF
         .find(|(_, face)| face.len + 4 <= room)
 }
 
-/// A face cell in its ink on `blank`'s ground. Where the line wears a theme
-/// (`palette`), the switch's glyphs walk its arc ([`SwitchInk::Arc`]) in the
-/// switch's letter law ([`brand_letter_fg`]: Cruise's spectrum, Land's
-/// sunset, Off's white moonbow, the print law's inks on paper) — bold while
-/// on, regular while off (hands off reads quieter), and quieted 30% toward
-/// the ground while it turns on.
+/// A face cell in its ink on `blank`'s ground ([`SwitchInk::Arc`], [`brand_letter_fg`]).
 fn switch_cell(
     ch: char,
     ink: SwitchInk,
@@ -6206,12 +5782,7 @@ fn switch_cell(
     cell
 }
 
-/// THE SETTLING SWITCH'S INK (`◐ turning on`, [`switch_cell`]): `ink` — a
-/// glyph's stop of the theme's arc, or the bare switch's accent — quieted
-/// 30% toward the ground (§4.2), then floored back to 4.5:1 against it, its
-/// hue kept (§8): the words a person reads to see the harness turning on
-/// stay text, and the quieting, the regular weight and `◐` are the state's
-/// cue.
+/// THE SETTLING SWITCH'S INK (`◐ turning on`, [`switch_cell`]): `ink`.
 fn turning_ink(ink: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     legible_on(mix(ink, ground, 0.3), ground)
 }
@@ -6245,28 +5816,19 @@ const fn pack_rgb(c: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, c[0], c[1], c[2]])
 }
 
-/// THE FACTS' WORDS' INKS on a pane (§8): made from what the pane itself
-/// gives the glass — the program's rule `gray`, the pane's ink and its
-/// ground — not from the instance theme, yet no surer to read: a program's
-/// grey is chosen for no theme in particular, and on a light tab it sits
-/// near the paper (Claude's `#999999` panel grey read 2.66:1 on Default
-/// Light, its values 4.30:1).
+/// THE FACTS' WORDS' INKS on a pane (§8): made from what the pane itself gives the glass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FactInks {
-    /// A value at rest: the grey lifted [`VALUE_LIFT`] toward the ink
-    /// ([`value_fg`]), floored to 4.5:1 ([`legible_on`]): words the owner
-    /// reads.
+    /// A value at rest ([`VALUE_LIFT`], [`value_fg`], [`legible_on`]).
     value: [u8; 3],
     /// A lit value: the pane's ink, floored the same way.
     lit: [u8; 3],
-    /// A word greyed on purpose: a hidden fact's `off`, the key's ghost at
-    /// rest ([`greyed_on`]).
+    /// A word greyed on purpose ([`greyed_on`]).
     stub: [u8; 3],
 }
 
 impl FactInks {
-    /// The inks under a rule drawn in `gray`, on a pane whose ink is `ink`,
-    /// laid on `ground`.
+    /// The inks under a rule drawn in `gray`, on a pane whose ink is `ink`, laid on `ground`.
     fn of(gray: [u8; 3], ink: [u8; 3], ground: [u8; 3]) -> Self {
         let value = legible_on(value_fg(gray, ink), ground);
         Self {
@@ -6277,26 +5839,17 @@ impl FactInks {
     }
 }
 
-/// [`FactInks::stub`] under a rule drawn in `gray` on `blank`'s pane: a
-/// greyed word's ink, as the tests outside this module read it. Unix only, as its one
-/// reader is (`claude_top_key_tests.rs`); on Windows it would be dead code.
+/// [`FactInks::stub`] under a rule drawn in `gray` on `blank`'s pane.
 #[cfg(all(test, unix))]
 pub(crate) fn greyed_ink(gray: [u8; 3], blank: RenderCell) -> [u8; 3] {
     FactInks::of(gray, blank.fg, blank.bg).stub
 }
 
-/// How far a greyed word is quieted from the live value toward the ground
-/// where the program's grey reads no quieter than the value
-/// ([`greyed_on`]): the share the harness switch's quiet label is quieted by
-/// ([`switch_cell`]).
+/// How far a greyed word is quieted from the live value toward the ground where the program's grey
+/// reads no quieter than the value ([`greyed_on`], [`switch_cell`]).
 const GREYED_QUIET: f32 = 0.3;
 
-/// A WORD GREYED ON PURPOSE on `ground` — a hidden fact's `off` (owner: a
-/// clicked-off fact shows "greyed out text and say off"), the top-effort
-/// key's ` KEY off ` ghost — quieter than the live `value` beside it, but
-/// still read: the program's `gray` as it drew its rule, floored to 3:1
-/// along its own hue ([`visible_on`]), which keeps it below the value, held
-/// to 4.5:1.
+/// A WORD GREYED ON PURPOSE on `ground` ([`visible_on`]).
 fn greyed_on(gray: [u8; 3], value: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     let ink = if reads_on(gray, ground) < reads_on(value, ground) {
         gray
@@ -6306,8 +5859,7 @@ fn greyed_on(gray: [u8; 3], value: [u8; 3], ground: [u8; 3]) -> [u8; 3] {
     visible_on(ink, ground)
 }
 
-/// The mark a program's top line wears ([`aterm_effects::cli_marks`]): one
-/// exhaustive match, so a new program does not compile until it is placed.
+/// The mark a program's top line wears ([`aterm_effects::cli_marks`]).
 const fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
     match program {
         aterm_phase::Program::Claude => Some(CliMark::Claude),
@@ -6319,13 +5871,7 @@ const fn cli_mark(program: aterm_phase::Program) -> Option<CliMark> {
     }
 }
 
-/// The build a top line's `program` runs, as the host proves it (design
-/// §6.2): ALab's for a Codex the host admits as `agent` — codex-alab, by
-/// its proven self-claim, aterm's copy of its record or its ALab image
-/// (`crate::harness_host::admitted_as`), the admission that gives its line
-/// the switch — so its lockup reads `codex-alab` ([`CliMark::name`]); the
-/// vendor's for a vendor `codex`, which no host admits, and for every other
-/// program.
+/// The build a top line's `program` runs ([`CliMark::name`]).
 const fn top_build(program: aterm_phase::Program, agent: Option<aterm_phase::Program>) -> Build {
     match (program, agent) {
         (aterm_phase::Program::Codex, Some(aterm_phase::Program::Codex)) => Build::Alab,
@@ -6336,16 +5882,13 @@ const fn top_build(program: aterm_phase::Program, agent: Option<aterm_phase::Pro
 /// What a top line's lockup shows on a rung of the ladder ([`Rung`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lockup {
-    /// The icon and the CLI's name, `[##]claude ` (`CliMark::lockup_cells`),
-    /// or its ALab build's, `[##]codex-alab `.
+    /// The icon and the CLI's name.
     Full,
     /// The icon alone, `[##]` (`cli_marks::ICON_RUN`).
     Icon,
 }
 
-/// One rung of THE NARROW LADDER ([`ladder`]): the switch's form (`None`:
-/// none drawn), the lockup (`None`: none), the cells before the lockup (its
-/// first cell's place in the span) and the span the rung needs.
+/// One rung of THE NARROW LADDER ([`ladder`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Rung {
     tier: Option<usize>,
@@ -6354,14 +5897,10 @@ struct Rung {
     need: usize,
 }
 
-/// The most rungs a ladder has: a full rung a switch tier, then the icon,
-/// the icon compact and the switch alone.
+/// The most rungs a ladder has: a full rung a switch tier.
 const LADDER_MAX: usize = SWITCH_TIERS + 3;
 
-/// THE NARROW LADDER of a top line whose switch is `switch` (`None`: no
-/// switch, no host to turn a harness on) and whose lockup takes `lockup`
-/// cells (`None`: the program wears no mark), widest first; the first rung
-/// a span holds wins ([`lay_top`]).
+/// THE NARROW LADDER of a top line whose switch is `switch` ([`lay_top`]).
 fn ladder(switch: Option<SwitchPaint>, lockup: Option<usize>) -> ([Rung; LADDER_MAX], usize) {
     let none = Rung {
         tier: None,
@@ -6451,10 +5990,7 @@ fn first_fit(span: usize, rungs: &[Rung]) -> Option<Rung> {
     rungs.iter().copied().find(|r| r.need <= span)
 }
 
-/// THE LADDER LAID ([`ladder`]): the rung a span of `span` cells takes for
-/// a line whose switch is `switch` and whose lockup takes `lockup` cells,
-/// and the switch's face on it; `None` where no rung fits, and the line
-/// stays the vendor's.
+/// THE LADDER LAID ([`ladder`]).
 fn lay_top(
     span: usize,
     switch: Option<SwitchPaint>,
@@ -6469,17 +6005,7 @@ fn lay_top(
     Some((rung, face))
 }
 
-/// What a composer top line is composed from ([`compose_top`]): where it
-/// is and its kind (a rule, or Codex's slab, whose blank is then `blank`),
-/// its run, the program whose mark the lockup wears and the build whose
-/// name it prints ([`top_build`]), the harness switch it
-/// shows (`None`: no host, no switch), the theme it wears (`None`: bare,
-/// the harness's glass not worn), the pane's blank, the marks' ink, what
-/// aterm draws for the top-effort key there, what the mark's sprite is laid
-/// with — the window's cell in device pixels and the pane's box in grid
-/// pixels, its clip — and the hover title's: whether the pointer is on the
-/// lockup, and the footer's `shown_gen` while it is and the footer holds
-/// the program's facts, whose version the title names (`0`: none).
+/// What a composer top line is composed from ([`compose_top`]) ([`top_build`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TopKey {
     frame_row: usize,
@@ -6499,51 +6025,38 @@ struct TopKey {
     title_gen: u64,
 }
 
-/// What aterm draws for the top-effort key on a top rule (design §10.6.14): none
-/// of Claude's own ink — its tag is never restyled.
+/// What aterm draws for the top-effort key on a top rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct KeyFace {
-    /// aterm's ` KEY off ` ghost in Claude's slot, the key off: `Some(lit)`,
-    /// lit while the pointer is on it.
+    /// aterm's ` KEY off ` ghost in Claude's slot, the key off.
     ghost: Option<bool>,
-    /// Claude's own tag on the row: its key's frame columns.
+    /// Claude's own tag on the row.
     tag: Option<(usize, usize)>,
-    /// `◐` while a press of the key is in flight, `▸` while the keyboard
-    /// selects it: in the `─` cell left of the ghost's or the tag's leading
-    /// blank.
+    /// `◐` while a press of the key is in flight, `▸` while the keyboard selects it.
     mark: Option<char>,
 }
 
-/// The ghost's cells: ` KEY off `.
+/// The ghost's cells.
 const GHOST_CELLS: usize = aterm_primer::CLAUDE_TOP_EFFORT_KEY.len() + 6;
 
-/// The shortest run the ghost is drawn in: itself, the `─` after it as
-/// Claude leaves one after its tag, and the rule's lead of `─` before it.
+/// The shortest run the ghost is drawn in: itself.
 const GHOST_RUN: usize = GHOST_CELLS + 1 + footer::RULE_LEAD;
 
-/// The ghost's glyphs, in order: the key spelled by its one const.
+/// The ghost's glyphs, in order.
 fn ghost_chars() -> impl Iterator<Item = char> {
     std::iter::once(' ')
         .chain(aterm_primer::CLAUDE_TOP_EFFORT_KEY.chars())
         .chain(" off ".chars())
 }
 
-/// A composer top rule as [`PaneFooter::compose_top`] composed it: the
-/// cells to write at frame column `col` (none: the rule stays the vendor's),
-/// the run of them the write leaves on the glass (`glass`, [`rule_edits`]),
-/// the harness switch as laid in them, the ghost's glyphs' frame columns
-/// where it is drawn, the lockup's frame columns (pads included; empty: none
-/// laid) and its icon's first, and the mark's sprite over the icon's cells —
-/// one layer per pane, kept while the key holds, so a frame at rest hands
-/// the renderer the same `Arc` ([`mark_layer`]).
+/// A composer top rule as [`PaneFooter::compose_top`] composed it: the cells to write at frame
+/// column `col` ([`rule_edits`], [`mark_layer`]).
 #[derive(Debug, Default)]
 struct ComposedTop {
     key: Option<TopKey>,
     cells: Vec<RenderCell>,
     col: usize,
-    /// Indices into `cells`: on a bare line, the vendor's own cells between
-    /// the lockup and the first cell aterm draws after it, which the write
-    /// leaves out ([`compose_top`]); empty where there is none.
+    /// Indices into `cells`: on a bare line ([`compose_top`]).
     glass: std::ops::Range<usize>,
     switch: Option<LaidSwitch>,
     ghost: Option<(usize, usize)>,
@@ -6552,10 +6065,7 @@ struct ComposedTop {
     mark: Option<aterm_core::render::FxLayer>,
 }
 
-/// Where [`compose_top`] laid a harness switch, in frame columns: its form
-/// ([`switch_face`]'s tier), every cell a press acts on, the switch's own
-/// cells and an off switch's `on` button — what the splice records as the
-/// `crate::claude_lights::BorderSwitch` once the write takes.
+/// Where [`compose_top`] laid a harness switch ([`switch_face`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LaidSwitch {
     tier: usize,
@@ -6564,15 +6074,12 @@ struct LaidSwitch {
     button: Option<std::ops::Range<usize>>,
 }
 
-/// The context fact's words for an indicator reading `pct` per cent left
-/// (`aterm_phase::phase::context_left_shown`): `ctx 84% left`.
+/// The context fact's words for an indicator reading `pct` per cent left.
 fn context_words(pct: u8) -> String {
     format!("ctx {pct}% left")
 }
 
-/// The reading the context fact's words `shown` say ([`context_words`]'s
-/// inverse), or `None` for none or any other words: compared with the
-/// screen's reading each frame without allocating.
+/// The reading the context fact's words `shown` say ([`context_words`]).
 fn context_left_of(shown: Option<&str>) -> Option<u8> {
     shown?
         .strip_prefix("ctx ")?
@@ -6586,21 +6093,15 @@ const fn rgb_of(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
-/// THE CLI'S TOP LINE — Claude Code's, agy's and Muse Code's composer top
-/// rule, Gemini CLI's live-zone rule, Codex's composer slab's top pad
-/// ([`top_line`]) — composed from `key` into `top` (owner, 2026-10-21:
-/// "each CLI has an emoji-sized icon and color on the left side of the top
-/// line of CLI to standardize"):
+/// THE CLI'S TOP LINE ([`top_line`]).
 fn compose_top(key: &TopKey, top: &mut ComposedTop, version: Option<&str>) {
     compose_top_in(key, top, version, TITLE_LEAD);
 }
 
-/// The `─` the hover title leaves before the switch (or the span's end),
-/// as the lockup's resting rungs leave: two.
+/// The `─` the hover title leaves before the switch.
 const TITLE_LEAD: usize = 2;
 
-/// [`compose_top`] with the hover title leaving `title_lead` `─` before the
-/// switch: the tests' control lets it into the switch's lead.
+/// [`compose_top`] with the hover title leaving `title_lead` `─` before the switch.
 fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, title_lead: usize) {
     #[cfg(test)]
     crate::work_counts::footer_top_composed();
@@ -6849,8 +6350,7 @@ fn compose_top_in(key: &TopKey, top: &mut ComposedTop, version: Option<&str>, ti
     }
 }
 
-/// THE HOVER TITLE's words ([`hover_title`]): the product, its version
-/// where one is named, and their cells.
+/// THE HOVER TITLE's words ([`hover_title`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct HoverTitle<'a> {
     product: &'a str,
@@ -6859,7 +6359,7 @@ struct HoverTitle<'a> {
 }
 
 impl HoverTitle<'_> {
-    /// The title's glyphs: `Claude Code 2.1.304`.
+    /// The title's glyphs.
     fn chars(&self) -> impl Iterator<Item = char> + '_ {
         self.product.chars().chain(
             self.version
@@ -6869,10 +6369,7 @@ impl HoverTitle<'_> {
     }
 }
 
-/// The widest hover title (design §7) whose words fit `room` cells:
-/// `<product> <version>`, else the product alone (where no `version` is
-/// held, or the version leaves no room); `None` where neither fits, and the
-/// name stays.
+/// The widest hover title.
 fn hover_title<'a>(
     product: &'a str,
     version: Option<&'a str>,
@@ -6895,13 +6392,11 @@ fn hover_title<'a>(
         })
 }
 
-/// The contents of the marks' sprites ([`aterm_effects::cli_marks::content`])
-/// the window's panes were last laid with, by mark, fit and ground: a pane
-/// reopening on a ground it was laid on seals nothing.
+/// The contents of the marks' sprites ([`aterm_effects::cli_marks::content`]).
 #[derive(Debug, Default)]
 struct MarkContents(Vec<MarkContent>);
 
-/// One kept sprite content: its mark, fit and ground, and the content.
+/// One kept sprite content.
 type MarkContent = (
     CliMark,
     aterm_effects::cli_marks::Fit,
@@ -6913,8 +6408,7 @@ impl MarkContents {
     /// How many contents are kept.
     const KEPT: usize = 2 * CliMark::ALL.len();
 
-    /// `mark`'s content at `fit` on `ground`: the kept one, or one sealed
-    /// now and kept, the oldest let go past [`Self::KEPT`].
+    /// `mark`'s content at `fit` on `ground` ([`Self::KEPT`]).
     fn content(
         &mut self,
         mark: CliMark,
@@ -6937,8 +6431,7 @@ impl MarkContents {
     }
 }
 
-/// Pane `pane`'s box in grid pixels for a window cell of `cell` device
-/// pixels: a mark sprite's clip, so it never draws past its pane.
+/// Pane `pane`'s box in grid pixels for a window cell of `cell` device pixels.
 fn pane_grid_px(
     cell: (u16, u16),
     pane: crate::claude_card::PaneGeom,
@@ -6966,12 +6459,7 @@ pub(crate) const fn top_mark_id(session: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// THE MARK'S SPRITE for a top rule composed from `key` into `top`
-/// (design §6.4): where the lockup laid its icon, the program's mark at the
-/// fit law's master and scale for the window's cell
-/// (`cli_marks::fit`), over its inks floored on the pane's ground, laid at
-/// the icon's first cell in grid pixels and clipped to the pane, over the
-/// glyphs (the card's kitty's slot) by the byte-exact law.
+/// THE MARK'S SPRITE for a top rule composed from `key` into `top` (design §6.4).
 fn mark_layer(
     key: &TopKey,
     top: &ComposedTop,
@@ -7022,8 +6510,7 @@ pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> (String, O
     (words(&face.switch), face.button.as_ref().map(words))
 }
 
-/// Whether `row` is an agy tool-call header (`● Ran (…)`, `● Explored …`,
-/// `● Edited …`, `● Read(…)`, etc.) rather than an assistant prose reply.
+/// Whether `row` is an agy tool-call header.
 fn is_agy_tool_call_row(row: &str) -> bool {
     let Some(rest) = row.strip_prefix("● ") else {
         return false;
@@ -7052,10 +6539,7 @@ fn is_agy_tool_call_row(row: &str) -> bool {
         && rest.trim_end().ends_with(')')
 }
 
-/// Render inline markdown (`***bold italic***`, `**bold**`, `*italic*`,
-/// `` `code` ``, `[label](url)`) into `out` with clear visual distinction
-/// (inline code pill background and tinted foreground, underlined links,
-/// recursive inline spans) without changing row height.
+/// Render inline markdown.
 fn push_agy_inline_markdown(
     text: &str,
     base: RenderCell,
@@ -7165,16 +6649,13 @@ fn push_agy_inline_markdown(
     changed
 }
 
-/// THE INKS agy's and Muse Code's transcript is rewritten in
-/// ([`render_agy_markdown_row`]), made once per pane per frame
-/// ([`collect_agy_transcript_edits`]) from the pane's blank, the program's
-/// rule grey and the instance theme's accent.
+/// THE INKS agy's and Muse Code's transcript is rewritten in ([`render_agy_markdown_row`],
+/// [`collect_agy_transcript_edits`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct MarkdownInks {
-    /// The accent as a graphic: a reply's lead `●` or `◆`, a checked box's
-    /// `✓`, a bullet's `•`.
+    /// The accent as a graphic.
     mark: [u8; 3],
-    /// The accent as letters: an ordered item's number.
+    /// The accent as letters.
     number: [u8; 3],
     /// An H1 heading: primary accent lifted toward the pane's ink.
     h1: [u8; 3],
@@ -7182,26 +6663,24 @@ struct MarkdownInks {
     h2: [u8; 3],
     /// Inline code: warm amber-gold lifted toward the pane's ink, on [`Self::code_bg`].
     code: [u8; 3],
-    /// Inline code's pill: the ground 16% toward the rule's grey.
+    /// Inline code's pill.
     code_bg: [u8; 3],
     /// A link: sky-blue lifted toward the pane's ink.
     link: [u8; 3],
-    /// An H3 or H4 heading: refined lavender-slate lifted toward the pane's ink.
+    /// An H3 or H4 heading.
     h3: [u8; 3],
-    /// A quiet glyph, an unchecked box's `☐` and a nested bullet's `◦`: the
-    /// rule's grey lifted [`VALUE_LIFT`] toward the pane's ink, as a graphic.
+    /// A quiet glyph, an unchecked box's `☐` and a nested bullet's `◦` ([`VALUE_LIFT`]).
     quiet: [u8; 3],
-    /// A quote's words: the same lift, as letters.
+    /// A quote's words.
     quote: [u8; 3],
-    /// The rule's grey: a horizontal rule, a quote's bar.
+    /// The rule's grey.
     rule: [u8; 3],
     /// A sent user message in `agy` (replacing raw VGA `#5c5cff`).
     user: [u8; 3],
 }
 
 impl MarkdownInks {
-    /// The inks on `blank`'s pane, under a rule drawn in `rule` and the
-    /// instance's `accent`.
+    /// The inks on `blank`'s pane, under a rule drawn in `rule` and the instance's `accent`.
     fn of(blank: RenderCell, rule: RenderCell, accent: [u8; 3]) -> Self {
         let ground = blank.bg;
         let code_bg = mix(ground, rule.fg, 0.16);
@@ -7228,11 +6707,7 @@ impl MarkdownInks {
     }
 }
 
-/// Format one non-fenced row of an assistant reply (`● …`, `◆ …`, or 2-space
-/// continuation) with clear visual distinction across H1/H2/H3 headings,
-/// inline code pills, markdown links, nested bullets, checkboxes, ordered
-/// lists, horizontal rules, and quotes while keeping 1-to-1 row height so the
-/// screen never blows up.
+/// Format one non-fenced row of an assistant reply.
 fn render_agy_markdown_row(
     row: &str,
     max_cols: usize,
@@ -7411,23 +6886,17 @@ fn render_agy_markdown_row(
     Some(out)
 }
 
-/// Whether Claude's mode pill is relabelled on this pane's glass
-/// (`footer::YOLO_ON`, `footer::YOLO_OFF`): on a Claude Code pane whose
-/// composer border aterm draws — `bordered`, the border's own predicate
-/// (`crate::autopilot::harness_theme` is some: Off's white included), as for
-/// [`compose_top`] and the agents panel.
+/// Whether Claude's mode pill is relabelled on this pane's glass ([`compose_top`]).
 fn relabels_pill(program: aterm_phase::Program, bordered: bool) -> bool {
     program == aterm_phase::Program::Claude && bordered
 }
 
-/// The repaint key's term for a pane's harness theme: none, or which palette.
+/// The repaint key's term for a pane's harness theme.
 fn theme_term(theme: Option<aterm_effects::harness_card::CardPalette>) -> u64 {
     theme.map_or(0, |p| 1 + p as u64)
 }
 
-/// One relabelled pill ([`collect_pill_relabel`]): its cells, a range of
-/// the splice's shared buffer, written at `col` of `frame_row`, and the
-/// glass→grid shift its write leaves.
+/// One relabelled pill ([`collect_pill_relabel`]).
 struct RelabelWrite {
     frame_row: usize,
     col: usize,
@@ -7455,8 +6924,7 @@ impl GlassShift {
     }
 }
 
-/// The most rows of shifted columns a window keeps: one per pane, for as
-/// many panes as share a window before the rest go unrelabelled.
+/// The most rows of shifted columns a window keeps.
 const GLASS_SHIFTS: usize = 8;
 
 /// Per-window collection of [`GlassShift`] mappings from the last footer splice.
@@ -7489,14 +6957,8 @@ impl GlassColumns {
     }
 }
 
-/// Collect the relabel of Claude's mode pill `relabel` under pane rows
-/// `rows`' bottom rule, as the pane's readings keep it
-/// (`footer::relabel_under`, read with the rule): `⏵⏵ bypass permissions
-/// on` reads `YOLO on`, `⏸ manual mode on` `YOLO off`, in Claude's own
-/// pill cells' style, and the row's left items after it packed left behind
-/// the label (`  YOLO on · 14 shells · ← for agents …`), the blanks they left
-/// at their run's end; a right-hand notice past the run's gap stays where
-/// Claude drew it.
+/// Collect the relabel of Claude's mode pill `relabel` under pane rows `rows`' bottom rule
+/// ([`GLASS_SHIFTS`]).
 #[allow(clippy::too_many_arguments)]
 fn collect_pill_relabel(
     scratch: &RenderInput,
@@ -7510,7 +6972,8 @@ fn collect_pill_relabel(
 ) -> bool {
     let term_row = region.row_off + relabel.row;
     let frame_row = region.strip + term_row;
-    if relabel.run_end > region.cols
+    if out.len() >= GLASS_SHIFTS
+        || relabel.run_end > region.cols
         || chrome_owned(term_row)
         || scratch.any_selection()
         || (scratch.cursor_visible && scratch.cursor_row == frame_row)
@@ -7564,8 +7027,8 @@ fn collect_pill_relabel(
     true
 }
 
-/// Whether row 0 of `rows[..limit]` begins inside a fenced code block whose
-/// opening fence scrolled off above the top of the viewport.
+/// Whether row 0 of `rows[..limit]` begins inside a fenced code block whose opening fence scrolled
+/// off above the top of the viewport.
 fn starts_in_code_block(
     rows: &[String],
     limit: usize,
@@ -7643,9 +7106,8 @@ fn starts_in_code_block(
     before_f0 <= after_f0
 }
 
-/// Find the top row of a bottom `agy` approval or question dialog when the composer
-/// rules are absent (either a parsed bottom prompt box or a full-width `─` rule
-/// under an explicit box title at the bottom of the screen).
+/// Find the top row of a bottom `agy` approval or question dialog when the composer rules are
+/// absent.
 fn agy_bottom_dialog_top(rows: &[String], max_rows: usize, cols: usize) -> Option<usize> {
     let n = rows.len().min(max_rows);
     if let Some(prompt) = aterm_phase::agy::prompt(&rows[..n]) {
@@ -7678,9 +7140,7 @@ fn agy_bottom_dialog_top(rows: &[String], max_rows: usize, cols: usize) -> Optio
     None
 }
 
-/// Collect glass-only undoable markdown edits for an `agy` or `muse` pane. Row
-/// text alone does not prove startup or tool-output provenance, so no transcript
-/// row is deleted as cruft.
+/// Collect glass-only undoable markdown edits for an `agy` or `muse` pane.
 #[allow(clippy::too_many_arguments)]
 fn collect_agy_transcript_edits(
     scratch: &RenderInput,
@@ -7975,9 +7435,7 @@ fn collect_agy_transcript_edits(
     }
 }
 
-/// `read` over pane `session`'s rows inside the reader's panic fence
-/// (`crate::reader_guard`): a panic is warned once and read as no rule, so the vendor's
-/// own rows are left as drawn (the seam the tests inject a panicking reader through).
+/// `read` over pane `session`'s rows inside the reader's panic fence (`crate::reader_guard`).
 fn read_footer(
     session: u64,
     rows: &[String],
@@ -7986,7 +7444,7 @@ fn read_footer(
     crate::reader_guard::read_or_none(session, "Claude Code footer", rows, || read(rows)).flatten()
 }
 
-/// Reconstructs the display string of `row` on the glass, inserting spaces between subscript fact runs.
+/// Reconstructs the display string of `row` on the glass.
 #[cfg(test)]
 pub(crate) fn read_glass(row: &[RenderCell]) -> String {
     use aterm_core::terminal::Script;
@@ -8170,13 +7628,6 @@ pub(crate) mod rig {
 mod tests {
     use super::*;
 
-    /// THE SWITCH'S FORMS ([`switch_face`], owner 2026-10-20: "there needs
-    /// to be an \"on\" button drawn for the claude harness"; 2026-10-21:
-    /// "alab harness on"): one switch in every state, naming the harness
-    /// alone — no program word, no wordmark — its words given up before the
-    /// switch, every off form keeping `▐ on ▌`; each narrowest form is as
-    /// wide as hb-int's (6, 8 and 6 cells), and the fitter takes the widest
-    /// form that leaves two rule cells either side.
     #[test]
     fn the_switch_faces_give_words_up_before_the_switch() {
         use crate::autopilot::{HarnessSwitch, SwitchOff};
@@ -8243,13 +7694,25 @@ mod tests {
                 " \u{25d0} on ",
             ]
         );
-        for face in [
-            HarnessSwitch::On,
-            HarnessSwitch::Off(SwitchOff::Session),
-            HarnessSwitch::Turning,
-        ] {
-            for f in faces(paint(face)) {
-                assert!(f.len <= SWITCH_FACE_MAX, "{face:?}: {:?}", f.text());
+        let versions = std::iter::once(None).chain(
+            aterm_phase::Program::ALL
+                .into_iter()
+                .map(|p| p.harness_version()),
+        );
+        for version in versions {
+            for face in [
+                HarnessSwitch::On,
+                HarnessSwitch::Off(SwitchOff::Session),
+                HarnessSwitch::Turning,
+            ] {
+                let p = SwitchPaint {
+                    face,
+                    hover: false,
+                    version,
+                };
+                for f in faces(p) {
+                    assert!(f.len < SWITCH_FACE_MAX, "{face:?}: {:?}", f.text());
+                }
             }
         }
         let off = paint(HarnessSwitch::Off(SwitchOff::Session));
@@ -8268,14 +7731,6 @@ mod tests {
         }
     }
 
-    /// THE SWITCH'S ARC READS ON PAPER: every colour a glyph of the harness
-    /// switch can take on a line that wears a theme (`SwitchInk::Arc`,
-    /// [`brand_letter_fg`]), in every theme the border wears (Cruise's
-    /// spectrum, Land's sunset, Off's moonbow), reads at 4.5:1 or more
-    /// against every light built-in's ground — a pure hue (one channel at
-    /// zero) as the card's line letters are under Cruise and Land, a silver
-    /// under Off; on a dark ground a letter is the palette's letter ink
-    /// lifted a quarter toward the pane's ink.
     #[test]
     fn the_switch_arc_reads_on_paper() {
         use aterm_effects::color_math::relative_luminance;
@@ -8360,10 +7815,6 @@ mod tests {
         assert!(quieted < 3.0, "CONTROL: the quieting alone, {quieted:.2}");
     }
 
-    /// THE FOOTER STANDS WHERE THE HOST SUPERVISES CLAUDE CODE OR AGY BY NAME:
-    /// the predicate was the literal `claude`, so a `claude-code` argv0, which
-    /// the host supervised as Claude Code, got no footer, no chips and no
-    /// harness card.
     #[test]
     fn the_footer_is_drawn_for_every_name_the_host_supervises_as_claude_code() {
         use crate::session_timeline::AgentPublication;
@@ -8411,11 +7862,6 @@ mod tests {
         assert!(!drawn_for(Some("codex")) && !drawn_for(None));
     }
 
-    /// THE CHIPS NEVER TOUCH OTHER INK (main's 35d8c4ca7, 2026-09-28, a
-    /// private window on 2.1.284): drawn on Claude's mode row, a chip was
-    /// glued to the `◐ medium · /effort` tail Claude right-aligns there in
-    /// auto mode, and main kept one cell clear
-    /// wherever the pane had slack.
     #[test]
     fn the_chips_keep_a_blank_cell_on_each_side_at_every_width() {
         let blank = cell(' ', [200, 200, 200]);
@@ -8581,8 +8027,6 @@ mod tests {
         assert!(model.action_enabled("IdleRead", &state));
     }
 
-    /// A process's transcript cache outlives a [`WATCH_FOR`] lapse and a stop: a model pinned
-    /// at `/resume A` is still named at `/resume B`.
     #[test]
     fn a_watch_lapse_keeps_the_processs_pin() {
         use std::time::{Instant, UNIX_EPOCH};
@@ -8836,8 +8280,6 @@ mod tests {
         read_glass(row)
     }
 
-    /// The cells a footer reading (` ◆ Opus 5.5 xhigh   ⌂ ~/aterm `: its facts
-    /// [`footer::GAP`] spaces apart) takes set: its line, and a blank cell either side.
     fn cells_for(reading: &str) -> usize {
         let segments: Vec<footer::Segment> = reading
             .trim()
@@ -8850,7 +8292,6 @@ mod tests {
         footer::segments_width(&segments) + 2
     }
 
-    /// A cell's ink and rendition, without where its glyph is nudged to.
     fn unplaced(cell: RenderCell) -> RenderCell {
         match cell.script {
             aterm_core::terminal::Script::Sub { .. } => RenderCell {
@@ -8871,8 +8312,6 @@ mod tests {
         }
     }
 
-    /// A reader that panics on a pane's rows paints no rule and the frame goes on. Control:
-    /// the real reader finds the rule and its mode row on the same rows.
     #[test]
     fn a_reader_panic_paints_no_footer_row() {
         let rows = vec![
@@ -8894,9 +8333,6 @@ mod tests {
         assert!(read_footer(9, &rows, boom).is_none(), "every frame");
     }
 
-    /// The footer's layout in a rule: one space either side, three between values, the
-    /// rule's last glyph kept; bold `Script::Sub` facts, values lifted [`VALUE_LIFT`] toward
-    /// the pane's ink, marks the accent mixed halfway toward the rule's gray.
     #[test]
     fn the_rule_carries_the_owners_footer() {
         let blank = cell(' ', [200, 200, 200]);
@@ -8948,8 +8384,6 @@ mod tests {
         assert_eq!(cells[1].script, aterm_core::terminal::Script::Normal);
     }
 
-    /// The facts are painted where `footer::set_facts` sets them: a blank cell, the line's
-    /// cells, a blank cell, each glyph nudged to its place and every other cell blank.
     #[test]
     fn the_facts_are_painted_where_they_are_set() {
         let blank = cell(' ', [200, 200, 200]);
@@ -8983,9 +8417,6 @@ mod tests {
         );
     }
 
-    /// A LIT FACT'S UNDERLINE LIES UNDER ITS INK (lab, 2026-10-20: on the
-    /// model and the effort it sat about a glyph off the text, on the path it
-    /// ran two to three cells past it, the clicks landing right).
     #[test]
     fn a_lit_facts_underline_lies_under_its_ink() {
         use aterm_core::terminal::{Script, UnderlineStyle};
@@ -9087,9 +8518,6 @@ mod tests {
         }
     }
 
-    /// `⎆ <label>` stands between the model and the path, mark and label in their inks, whole
-    /// or not at all (a clipped label would name another account), and nothing else moves for
-    /// it.
     #[test]
     fn the_rule_names_the_account_between_the_model_and_the_path() {
         let blank = cell(' ', [200, 200, 200]);
@@ -9156,8 +8584,6 @@ mod tests {
         );
     }
 
-    /// A branch or directory name can be wide: it takes a lead cell and a
-    /// continuation, and the layout counts both.
     #[test]
     fn wide_names_take_two_cells() {
         let wide = FooterFacts {
@@ -9211,9 +8637,6 @@ mod tests {
         }
     }
 
-    /// Every fact's mark takes one ink, the wall's, its `♻` and `Σ`'s among
-    /// them; what a narrow rule gives up, and in what order, is
-    /// `footer::fit_rule`'s (its own tests).
     #[test]
     fn the_wall_and_usage_marks_take_the_marks_ink() {
         let blank = cell(' ', [200, 200, 200]);
@@ -9234,9 +8657,6 @@ mod tests {
         }
     }
 
-    /// The offset cache keeps an answer for an hour and no failure at all: a `date` that
-    /// could not run is asked again on the next read, so one failed spawn does not hide a
-    /// standing wall for an hour.
     #[test]
     fn the_offset_cache_keeps_answers_and_asks_again_after_a_failure() {
         let mut answers = Vec::new();
@@ -9264,9 +8684,6 @@ mod tests {
         );
     }
 
-    /// The resolver's clocks: the idle re-read within the watch, the wall's slower one past
-    /// it, and past it only while a wall shows and its process lives (liveness is asked
-    /// only then).
     #[test]
     fn a_walled_live_session_stays_watched_on_the_slow_clock() {
         let asked = std::time::Instant::now();
@@ -9304,8 +8721,6 @@ mod tests {
         assert!(schedule.watched.is_empty(), "no wall: the watch ends");
     }
 
-    /// A retired session's resolver state goes whole: its fold, its watch,
-    /// the follow-ups owed and its wall mark — another session's stays.
     #[test]
     fn forgetting_a_session_drops_its_fold_and_watch() {
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -9376,9 +8791,6 @@ mod tests {
         assert!(schedule.watched.contains_key(&2));
     }
 
-    /// A group that leaves the foreground (Claude Code suspended, or another
-    /// program in front) releases its session's fold with the watch; the fold
-    /// is rebuilt from the transcript when Claude Code is asked for again.
     #[test]
     fn a_group_leaving_the_foreground_releases_its_fold() {
         let timeline = Arc::new(Mutex::new(SessionTimeline::default()));
@@ -9422,7 +8834,6 @@ mod tests {
         );
     }
 
-    /// A roster of two: this machine's own login and one with a directory.
     fn two_accounts() -> accounts::Roster {
         let row = |label: &str, dir: Option<&str>| accounts::Row {
             label: label.into(),
@@ -9435,7 +8846,6 @@ mod tests {
         }
     }
 
-    /// One process's exec read with `env` as its `KEY=value` entries.
     fn args_of(env: &[&str]) -> atpkg::caller_shell::ProcArgs {
         atpkg::caller_shell::ProcArgs {
             argv: vec!["claude".into()],
@@ -9444,7 +8854,6 @@ mod tests {
         }
     }
 
-    /// The exec read of a process under the login directory `dir`.
     fn login_under(dir: &str) -> Option<accounts::ProcessLogin> {
         let login = format!("{}={dir}", accounts::LOGIN_ENV);
         login_of_args(Some(&args_of(&["HOME=/home/someone", &login])))
@@ -9452,9 +8861,6 @@ mod tests {
 
     use super::rig::{claude_home, scratch_home};
 
-    /// The login is read only off an environment that was read: no read, and one that reads
-    /// empty, name no login ("no variable set" would mean the default one, labelling a
-    /// process nobody read).
     #[test]
     fn an_environment_that_was_not_read_names_no_login() {
         assert_eq!(login_of_args(None), None, "no read");
@@ -9721,10 +9127,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The resolver's roster is read on the first ask, answered from memory
-    /// within [`ROSTER_RECHECK`] and read again after it: a footer read costs
-    /// no file read of its own, and a roster edited under a running window
-    /// shows within one period.
     #[test]
     fn the_roster_is_read_at_most_every_recheck() {
         let t0 = std::time::Instant::now();
@@ -9780,13 +9182,10 @@ mod tests {
         assert_eq!(asked.get(), 6);
     }
 
-    /// The exec read of a process on this machine's own login.
     fn on_main(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
         Some(args_of(&["HOME=/home/someone"]))
     }
 
-    /// The exec read of a process under `work-2`'s login directory, started
-    /// as `claude --resume`.
     fn on_work(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
         let login = format!("{}=/logins/work-2", accounts::LOGIN_ENV);
         Some(atpkg::caller_shell::ProcArgs {
@@ -9795,8 +9194,6 @@ mod tests {
         })
     }
 
-    /// An identity as [`resolve_and_post`] builds one: the directory, and
-    /// nothing read of the image yet.
     fn unread(pid: i32, claude: &std::path::Path) -> Identity {
         Identity {
             pid,
@@ -9813,8 +9210,6 @@ mod tests {
         }
     }
 
-    /// One read of `identity`: the account the timeline then shows — `None`
-    /// for no footer, `Some(None)` for a footer that names no account.
     fn account_after(
         identity: &mut Identity,
         roster: &mut RosterMemo,
@@ -10427,7 +9822,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// The read that answers carries the label of the row the process's login names.
     #[test]
     fn a_read_that_answers_is_given_its_account() {
         const PID: i32 = 4242;
@@ -10498,9 +9892,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// THE SURVEY'S EXCERPTS are published beside the facts by the read that
-    /// answers, from the same tail read: the newest prompt and words, none
-    /// painted (the facts compare equal with or without them).
     #[test]
     fn a_read_publishes_the_excerpts_beside_the_facts() {
         const PID: i32 = 4243;
@@ -10560,12 +9951,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// THE SIDE RIDES BESIDE THE FACTS: a read publishes the absolute cwd
-    /// (the registry's, outside any repository: no root) and no traffic
-    /// before the session has a transcript; a read that moved nothing
-    /// republishes the SAME side, the facts unchanged, so nothing repaints;
-    /// and a new side on the timeline leaves the facts as they were (a
-    /// republish of them moves nothing).
     #[test]
     fn the_side_rides_beside_the_facts() {
         const PID: i32 = 4244;
@@ -10675,10 +10060,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The login is the registered image's: what the process was started with before Claude
-    /// Code wrote its registry row may be a launcher's (a shim named `claude` that sets
-    /// variables and execs in place), so the login and command line are read at the first
-    /// row whatever the identity held, and again when a row names a new image.
     #[test]
     fn the_login_is_the_registered_images() {
         const PID: i32 = 4242;
@@ -10723,9 +10104,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A rule cell counts as the rule's only while it is the rule's own glyph
-    /// in the rule's own colours with nothing in a side channel: a label in
-    /// another colour, a selection's background and a cluster are ink.
     #[test]
     fn only_plain_rule_glyphs_are_coverable() {
         let mut s = RenderInput::empty();
@@ -10761,8 +10139,6 @@ mod tests {
         assert!(rule_mask(&s, 0, 0, 20).is_none());
     }
 
-    /// A scratch as an engine fill leaves it: every reuse token armed, a live
-    /// revision lane, rows trimmed of trailing blanks.
     fn engine_fill(rows: usize) -> RenderInput {
         let mut s = RenderInput::empty();
         s.rows = rows;
@@ -10783,7 +10159,6 @@ mod tests {
         s
     }
 
-    /// [`write_edits`] of owned edits into a fresh slot.
     fn written(
         s: &mut RenderInput,
         edits: Vec<(usize, usize, Vec<RenderCell>, RenderCell)>,
@@ -10799,8 +10174,6 @@ mod tests {
         slot
     }
 
-    /// A write undone and made again fills the rows the last one left and allocates nothing,
-    /// the cells and the undo exactly as a fresh slot's.
     #[test]
     fn a_footer_written_again_allocates_nothing() {
         let mut s = engine_fill(4);
@@ -10895,8 +10268,6 @@ mod tests {
         assert!(!slot.is_written());
     }
 
-    /// The footer comes off exactly and the scratch is an engine fill again: the state
-    /// DMG-1's scoped refill, the effect-only reuse and D-2's stamp compare all require.
     #[test]
     fn the_undo_gives_back_the_engine_fill_exactly() {
         let mut s = engine_fill(4);
@@ -10921,11 +10292,6 @@ mod tests {
         assert_eq!(s.row_rev, vec![100, 101, 102, 103]);
     }
 
-    /// THE PROGRAM'S CELLS UNDER THE GLASS (review G3,
-    /// [`FooterUndo::program_cells`]): read without writing, every row reads
-    /// in every column window what the undo puts back — a span over a row's
-    /// text as the text it covered, a span past a row's trimmed end as the
-    /// row ending where it ended — and nothing is allocated.
     #[test]
     fn the_program_cells_read_what_the_undo_puts_back() {
         let mut s = engine_fill(4);
@@ -10965,8 +10331,6 @@ mod tests {
         assert_eq!(text(&mut slot.program_cells(&s, 1, 0..40)), presented);
     }
 
-    /// Anything else writing after the footer — or a refill that moved no
-    /// token but changed the cells — and the undo changes nothing.
     #[test]
     fn a_scratch_touched_since_is_left_alone() {
         let painted = row_of("  footer", [1, 1, 1]);
@@ -10988,10 +10352,6 @@ mod tests {
         assert_eq!(s.cells[2][3].ch, 'X');
     }
 
-    /// A composition with chips goes on as two edits ([`rule_edits`]), the rule's own glyphs
-    /// between the chips and the facts left as the glass shows them: the same glass and tokens
-    /// as the whole composition written, undone to the same engine fill, for the chips' and
-    /// the facts' cells alone, none written over itself.
     #[test]
     fn a_rule_with_chips_is_written_where_it_changes() {
         let rule = cell('\u{2500}', [5, 5, 5]);
@@ -11051,8 +10411,6 @@ mod tests {
         );
     }
 
-    /// Two panes side by side write one frame row; the undo peels them off
-    /// newest first, down to the engine's trimmed length.
     #[test]
     fn two_writes_on_one_row_come_off_in_order() {
         let mut s = engine_fill(2);
@@ -11066,8 +10424,6 @@ mod tests {
         assert_eq!(s.cells, original);
     }
 
-    /// A mid-rule span comes off exactly, its D-2 stamp with it; a span past a trimmed row is
-    /// padded with the pane's blank, and the undo gives the trimmed length back.
     #[test]
     fn a_span_in_the_rule_row_comes_off_exactly() {
         let mut s = engine_fill(4);
@@ -11102,8 +10458,6 @@ mod tests {
         assert_eq!(s.cells, original);
     }
 
-    /// A span holding a grapheme cluster is not the plain row the planner
-    /// read, and the undo could not restore a removed cluster: no write.
     #[test]
     fn a_span_with_side_channel_content_is_not_written() {
         let mut s = engine_fill(2);
@@ -11118,8 +10472,6 @@ mod tests {
         assert_eq!(s.snapshot_seq, 40, "nothing written, nothing declared");
     }
 
-    /// A scratch some other host already wrote is not re-blessed: the
-    /// renderer's stamp compare stays off, exactly as that write left it.
     #[test]
     fn only_an_untouched_engine_fill_keeps_its_stamps() {
         let mut s = engine_fill(2);
@@ -11134,8 +10486,6 @@ mod tests {
         assert_eq!(s.snapshot_seq, 41, "back to the other write's own bump");
     }
 
-    /// Under a blessed chrome prepend the footer keeps the stamp compare on, and the
-    /// production order (footer undo, then the strip's inverse) gives back the engine fill.
     #[test]
     fn a_blessed_chrome_prepend_keeps_the_stamps_and_its_inverse() {
         let mut s = engine_fill(3);
@@ -11168,8 +10518,6 @@ mod tests {
         assert_eq!(s.snapshot_seq, s.engine_fill_seq);
     }
 
-    /// The drift check names only a pill-shaped row this build cannot read:
-    /// never a screen the footer reads, never a box, never plain text.
     #[test]
     fn only_an_unreadable_pill_row_is_drift() {
         let screen = |mode_row: &str| -> Vec<String> {
@@ -11189,9 +10537,6 @@ mod tests {
         assert_eq!(unread_pill_row(&["$ ls".to_owned()]), None, "no composer");
     }
 
-    /// The measured 2.1.283 screen `name` (`src/fixtures` of aterm-phase,
-    /// 80x24), at `cols` columns: every full-width rule rebuilt at that
-    /// width, its label kept at the right end.
     fn claude_rows(name: &str, cols: usize) -> Vec<String> {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../aterm-phase/src/fixtures")
@@ -11214,9 +10559,6 @@ mod tests {
         rows
     }
 
-    /// The SGR a row is drawn in, as Claude draws it: rules dim, a rule's
-    /// label and the mode pill in hues of their own, the rest of the mode
-    /// row dim — so a cell the footer wrongly took shows up in its colour.
     fn painted(row: &str) -> String {
         const RULE: &str = "\x1b[38;2;90;90;90m";
         const LABEL: &str = "\x1b[38;2;200;120;255m";
@@ -11262,8 +10604,6 @@ mod tests {
         assert!(timeline.set_claude_footer(4242, None, Some(facts)));
     }
 
-    /// One frame through the capture route's splices (the terminal arm of
-    /// `App::render_image`): extract, the strip, then the footer.
     fn frame(app: &mut App, wid: WindowId) {
         frame_with_clock(app, wid, None);
     }
@@ -11304,9 +10644,6 @@ mod tests {
         app.windows[&wid].input_scratch.cells.len() - usize::from(app.windows[&wid].rows)
     }
 
-    /// Over the measured 2.1.283 screens at 80, 131 and 150 columns the facts end the rule
-    /// in the footer's inks, only plain rule glyphs are covered, and Claude's own row under
-    /// the rule is byte for byte what it drew.
     #[test]
     fn the_facts_go_into_the_rule_and_claudes_row_stays_whole() {
         let footer_text = " \u{25C6} Opus 5.5 xhigh   \u{2302} ~/aterm   \u{2387} main \u{2500}";
@@ -11411,8 +10748,6 @@ mod tests {
         );
     }
 
-    /// Nothing is painted where no composer is drawn: a dialog or a picker that replaced it
-    /// (the effort-switch box).
     #[test]
     fn no_composer_no_footer() {
         let (mut app, wid, session) = glass(80);
@@ -11450,9 +10785,6 @@ mod tests {
         );
     }
 
-    /// In a split pane the footer goes into the Claude pane's own rule, inside its columns,
-    /// and gives way to its width (a half-width rule cuts a long path to its last
-    /// directory); the sibling's cells on that row are untouched.
     #[test]
     fn a_split_panes_rule_carries_its_own_footer() {
         let (mut app, wid, session) = glass(80);
@@ -11504,8 +10836,6 @@ mod tests {
         );
     }
 
-    /// The launch card fills only what nothing since the start named; a transcript's word
-    /// outranks it.
     #[test]
     fn a_launch_card_fills_only_an_open_footer() {
         let (mut app, wid, session) = glass(80);
@@ -11607,11 +10937,6 @@ mod tests {
         );
     }
 
-    /// A CARD QUOTED UNDER THE DRAWER'S OWN IS NOT KEPT (card engine §3.8:
-    /// the footer keeps only the reading the gate admitted): a tool's output
-    /// quoting a launch card — another build's, or the very build's — sits
-    /// under the drawer's own card, where the footer's reader takes the last
-    /// row naming a banner.
     #[test]
     fn a_card_quoted_under_the_drawers_own_is_not_kept() {
         for quoted in ["2.1.200", "2.1.283"] {
@@ -11673,9 +10998,6 @@ mod tests {
         }
     }
 
-    /// THE NEWEST CARD WINS, AND ONLY THE DRAWER'S: while the facts stay
-    /// open the card is read on every rebuild of the pane's text, and a
-    /// newer reading of the drawer's own replaces the kept one.
     #[test]
     fn a_newer_launch_card_replaces_the_kept_one() {
         let open = FooterFacts {
@@ -11745,9 +11067,6 @@ mod tests {
         );
     }
 
-    /// The held move's note leads the rule in the marks' ink, worded for the composer (a dim
-    /// suggestion is no draft), never while a turn runs; a look that only restamps the person
-    /// owes no frame.
     #[test]
     fn a_move_the_person_holds_leads_the_rule_until_it_goes() {
         use aterm_agent::harness::upgrade::Phase;
@@ -11911,8 +11230,6 @@ mod tests {
         );
     }
 
-    /// Facts that differ only in the account key differently, with the usage switch on or
-    /// off, and publish as a move.
     #[test]
     fn the_account_moves_the_repaint_key() {
         let on = |label: &str| FooterFacts {
@@ -11934,8 +11251,6 @@ mod tests {
         assert_ne!(app.claude_footer_fp(wid, &plan), main);
     }
 
-    /// A PTY update between grid extraction and host chrome must not move the
-    /// footer onto a newer viewport or recolour it from newer OSC defaults.
     #[test]
     fn footer_uses_the_cell_frames_viewport_and_blank_after_terminal_moves() {
         let mut app = App::headless_for_test();
@@ -12200,9 +11515,6 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// AGY'S MODEL FOLLOWS ITS OWN STATUS ROW (card engine §3.8): agy's
-    /// facts leave the model open, and agy's own status row under its
-    /// composer names the model it runs on.
     #[test]
     fn agy_follows_its_own_status_row_once_its_card_is_gone() {
         let rule = "\u{2500}".repeat(120);
@@ -12396,12 +11708,6 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// A NARROW PANE KEEPS MUSE CODE'S LOCKUP, SWITCH AND FACTS (the lab of
-    /// 2026-10-22, Muse Code 1.4.11 at 40 columns down to 26,
-    /// `aterm_phase::muse::fixtures::IDLE_NARROW`): under 40 columns the
-    /// idle voice label leaves its top rule fewer than ten `─`, and read as
-    /// no rule the composer was lost and the pane wore nothing of aterm's —
-    /// no lockup, no switch, no facts, and the harness read no agent.
     #[test]
     fn a_narrow_pane_keeps_muses_lockup_switch_and_facts() {
         let frames =
@@ -12489,12 +11795,6 @@ mod tests {
         }
     }
 
-    /// MUSE CODE'S SIGNED-IN CARDS POPULATE THE FOOTER (owner, 2026-10-21;
-    /// measured on 1.4.11 signed in): the login store has given the
-    /// account address, and a `/usage` card alone over the composer fills
-    /// its tier and `weekly 29% left` beside it — `/status` need not be
-    /// opened first — while the top rule's lockup stands where its idle
-    /// `Voice input` label was.
     #[test]
     fn muse_signed_in_cards_populate_the_footer() {
         let (mut app, wid, session) = glass(160);
@@ -12813,8 +12113,6 @@ mod tests {
         host.shutdown_and_join();
     }
 
-    /// NO `ctx auto` (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.4.3 item 5):
-    /// the context fact is a reading or nothing.
     #[test]
     fn a_pane_with_no_context_reading_draws_no_context_fact() {
         const COLS: usize = 240;
@@ -13006,12 +12304,6 @@ mod tests {
         );
     }
 
-    /// A READING GOES WITH CLAUDE CODE'S INDICATOR. The rule draws
-    /// `◐ ctx 61% left` while 2.1.306's mode row ends with `61% until auto-compact`, and keeps
-    /// it while Claude Code's `◐ medium · /effort` holds the indicator's slot, while the `/`
-    /// menu stands in the mode row's place and while a box stands over the composer; once the
-    /// mode row stands with its slot empty (as after `/compact`) the fact goes, from
-    /// the rule and from the session's facts, and comes back with the indicator.
     #[test]
     fn a_context_reading_goes_when_claude_code_stops_showing_it() {
         const COLS: usize = 160;
@@ -13122,12 +12414,6 @@ mod tests {
         );
     }
 
-    /// THE SINGLE TOGGLE TURNS THE HARNESS WHITE AND BACK, for Claude Code,
-    /// agy and Muse Code: Off (one call, the running session's) takes the
-    /// harness's hands off — agy's transcript goes back to its raw cells —
-    /// and turns its glass white: the composer's switch says `○ off` and the
-    /// launch card says `autopilot ○ off`; the same call again is Cruise,
-    /// the switch `● on` and the card Cruise's.
     #[test]
     fn single_toggle_turns_the_harness_white_and_back_for_claude_agy_and_muse() {
         let rule = "\u{2500}".repeat(160);
@@ -13367,18 +12653,6 @@ mod tests {
         }
     }
 
-    /// THE COMPOSER BORDER WEARS THE CARD'S PALETTE (owner, 2026-10-19: "I
-    /// want a white themed for 'off' and that this theme is incorporated into
-    /// the persistent harness border"; 2026-10-21: "alab harness on" in
-    /// rainbow): Cruise's rule runs the spectrum's whole arc BACKWARD over
-    /// the gap between the lockup and the switch — `t = 1` at the lockup down
-    /// to `t = 0` at the switch, whose glyphs walk it forward again — its
-    /// lead and tail at `t = 1`, so true blue shows in the gap; Land's is the
-    /// sunset, warm in every cell; Off's is the moonbow, near neutral in
-    /// every cell, its switch saying `○ off` with its `on` button and no
-    /// wordmark (owner, 2026-10-20), as white with its claim given back (the
-    /// real host's Off) as with it — and a press on that switch turns the
-    /// harness back on (Cruise).
     #[test]
     fn the_composer_border_wears_the_cards_palette() {
         use aterm_agent::supervise::Autopilot;
@@ -13872,10 +13146,6 @@ mod tests {
         assert!(scratch.any_selection());
         assert!(collect(&scratch).is_empty());
 
-        // Scrolled viewport (`top_rule: None`) with an orphaned closing fence from a
-        // code block whose opening ` ```rust ` scrolled off above row 0: rows inside
-        // the scrolled-off code block stay literal, while markdown rows below the
-        // closing fence render as rich text even without a visible composer rule.
         let scrolled_rows = [
             "  let **literal_in_scrolled_code** = 1;",
             "  ```",
@@ -13926,9 +13196,6 @@ mod tests {
             "  \u{2022} Scrolled bold and code item"
         );
 
-        // Scrolled viewport with an orphaned closing fence at row 1 followed by a second
-        // bare code block at rows 4..6: fence parity stays aligned so prose between and
-        // after the blocks renders while both code blocks stay literal.
         let multi_block_rows = [
             "  let **literal_block_1** = 1;",
             "  ```",
@@ -13976,9 +13243,6 @@ mod tests {
             "only markdown rows between and after the two code blocks (2, 3, 7) are styled"
         );
 
-        // Scrolled viewport with markdown prose above an unclosed bare opening fence
-        // whose closing fence scrolled off the bottom of the viewport: prose above the
-        // fence still renders as rich text while code below it stays literal.
         let bottom_open_rows = [
             "  ## Overview Above Fence",
             "  - **First** item",
@@ -14023,10 +13287,6 @@ mod tests {
             "markdown above unclosed bottom fence renders (0, 1); code below fence stays literal"
         );
 
-        // Scrolled viewport (`top_rule: None`) in an 80-col pane containing an earlier
-        // full-width rule and a 60-col user separator rule at the bottom row (whose `>`
-        // row scrolled off below the viewport): markdown rows below the earlier rule must
-        // still render as rich text instead of being truncated by `agy_bottom_dialog_top`.
         let rule_80 = "\u{2500}".repeat(80);
         let rule_60 = "\u{2500}".repeat(60);
         let scrolled_rule_rows = [
@@ -14074,10 +13334,6 @@ mod tests {
             "markdown rows both above (0) and below (2, 3) a rule in a scrolled viewport render"
         );
 
-        // In a split-pane frame (`col_off > 0`), a visible cursor in an adjacent pane
-        // (`cursor_col < col_off`) on the same `frame_row` must not skip markdown rendering
-        // in the agy pane, whereas a cursor inside the agy pane (`col_off..col_off + cols`)
-        // does skip its row.
         let mut split_scratch = RenderInput::empty();
         split_scratch.cols = 120;
         split_scratch.rows = 1;

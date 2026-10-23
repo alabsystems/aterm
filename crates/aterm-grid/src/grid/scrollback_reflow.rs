@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Off-screen scrollback reflow: rewrap history [`Line`]s on a width change alongside
-//! [`super::reflow`].
+//! Off-screen scrollback reflow on width changes.
 
 use aterm_rle::Rle;
 use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColorSpan};
@@ -11,10 +10,10 @@ use aterm_scrollback::{CellAttrs, HyperlinkSpan, ImageSpan, Line, UnderlineColor
 use super::Grid;
 
 impl Grid {
-    /// Extract the whole off-screen scrollback as logical [`Line`]s.
     // COST: UNBOUNDED(ring+tiered-history-lines) — materializes the entire
     // off-screen scrollback. Must stay behind the `resize_offloading_scrollback`
     // detach on any main-thread-reachable path (`aterm-census --mainloop`).
+    /// Extract the whole off-screen scrollback as logical [`Line`]s.
     pub(super) fn take_scrollback_lines(&mut self) -> Vec<Line> {
         self.drain_lazy_buffer();
         let mut lines = Vec::new();
@@ -37,16 +36,16 @@ impl Grid {
         lines
     }
 
-    /// Extract only the ring's scrollback rows as logical [`Line`]s (oldest first).
     // COST: O(ring-scrollback-rows): bounded by the ring capacity (a
     // construction-time constant), not by session history.
+    /// Extract only the ring's scrollback rows as logical [`Line`]s (oldest first).
     pub(super) fn take_ring_scrollback_lines(&mut self) -> Vec<Line> {
         self.take_older_ring_scrollback_lines(0)
     }
 
-    /// Extract the ring's scrollback rows but the `keep` newest as logical [`Line`]s.
     // COST: O(ring-scrollback-rows): bounded by the ring capacity (a
     // construction-time constant), not by session history.
+    /// Extract the ring's scrollback rows but the `keep` newest as logical [`Line`]s.
     pub(super) fn take_older_ring_scrollback_lines(&mut self, keep: usize) -> Vec<Line> {
         let ring_scrollback = self.storage.ring_buffer_scrollback();
         let take = ring_scrollback.saturating_sub(keep);
@@ -76,8 +75,8 @@ impl Grid {
         lines
     }
 
-    /// How many of the ring's newest scrollback rows an offloaded width change holds back.
     // COST: O(held rows): the scan stops at the cell budget.
+    /// How many of the ring's newest scrollback rows an offloaded width change holds back.
     pub(super) fn ring_rows_to_hold_back(&self, cells: usize) -> usize {
         let ring = self.storage.ring_buffer_scrollback();
         let cols = usize::from(self.storage.cols).max(1);
@@ -113,8 +112,6 @@ impl Grid {
                 }
             }
             if self.storage.lazy_buffer.is_empty() {
-                // No overflow pending: drain_lazy_buffer would early-return, but
-                // budget enforcement and display-offset clamping must still run.
                 self.enforce_scrollback_budget_and_clamp();
             } else {
                 self.drain_lazy_buffer();
@@ -187,8 +184,6 @@ impl Grid {
         added
     }
 
-    /// Build a single scrollback [`Row`](crate::Row) plus its preserved extras
-    /// from a [`Line`] at the new width, reusing the unscroll fill path.
     fn build_scrollback_row(
         &mut self,
         line: &Line,
@@ -213,11 +208,8 @@ pub(super) fn history_row_len(row: &crate::Row, successor: Option<&crate::Row>) 
     }
 }
 
-/// Maximum display columns a logical line may span before accumulation stops,
-/// guarding against pathological inputs.
 const MAX_LOGICAL_WIDTH: usize = crate::MAX_GRID_COLS as usize * crate::MAX_GRID_ROWS as usize;
 
-/// One display-cell's worth of content extracted from a source [`Line`].
 struct Unit<'a> {
     /// The grapheme text for the cell (base char plus combining marks / zwj).
     text: &'a str,
@@ -231,8 +223,8 @@ struct Unit<'a> {
     width: u16,
 }
 
-/// Rewrap scrollback [`Line`]s to `new_cols`, keeping hard newlines and content.
 // COST: UNBOUNDED(session-history-cells) — rewraps O(total cells) of history.
+/// Rewrap scrollback [`Line`]s to `new_cols`, keeping hard newlines and content.
 #[must_use]
 pub(super) fn reflow_scrollback_lines(lines: &[Line], new_cols: u16) -> Vec<Line> {
     let new_cols = new_cols.max(1);
@@ -314,10 +306,10 @@ pub(super) fn rewrap_cell_row(
     (rows, point)
 }
 
-/// The newest `rows` rows of [`reflow_scrollback_lines`]`(lines, new_cols)`.
 // COST: O(rows × new_cols + one logical line): every logical line rewrapped
 // but the oldest one visited yields only kept rows, at most `new_cols` cells
 // each.
+/// The newest `rows` rows of [`reflow_scrollback_lines`]`(lines, new_cols)`.
 #[must_use]
 pub(super) fn reflow_newest_rows(lines: &[Line], new_cols: u16, rows: usize) -> Vec<Line> {
     let mut runs: Vec<Vec<Line>> = Vec::new();
@@ -358,10 +350,6 @@ pub(super) fn reflow_scrollback_lines_reference(lines: &[Line], new_cols: u16) -
     out
 }
 
-/// Wrap-invariance gate for the clone-through fast path: true only for a line of printable
-/// ASCII (so byte length is display width) that fits `new_cols`, with no stored WIDE flag
-/// and no hyperlink, SGR 58 underline-colour or inline-image spans, which the rebuild may
-/// widen, re-coalesce or clip where a clone would not. The caller checks it is one row.
 fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
     if line.hyperlinks().is_some_and(|spans| !spans.is_empty())
         || line
@@ -372,8 +360,6 @@ fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
         return false;
     }
     let Some(text) = line.as_str() else {
-        // Non-UTF-8 content: the rebuild path maps it to a blank line; never
-        // clone it through.
         return false;
     };
     if text.len() > new_cols as usize || !text.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
@@ -386,9 +372,6 @@ fn rewrap_passthrough_eligible(line: &Line, new_cols: u16) -> bool {
     })
 }
 
-/// Flatten a logical-line run into display-cell units (accumulated in the
-/// caller-owned `units` scratch buffer), then re-split to `new_cols`-wide
-/// output [`Line`]s (first not wrapped, rest wrapped).
 fn emit_logical_line<'a>(
     run: &'a [Line],
     new_cols: u16,
@@ -430,8 +413,6 @@ fn emit_logical_line<'a>(
     carry_image_spans(run, new_cols, out, first_out);
 }
 
-/// Re-attach a logical line's inline-image spans to the rewrapped output,
-/// clipped to the new width.
 fn carry_image_spans(run: &[Line], new_cols: u16, out: &mut [Line], first_out: usize) {
     let [line] = run else {
         return;
@@ -453,7 +434,6 @@ fn carry_image_spans(run: &[Line], new_cols: u16, out: &mut [Line], first_out: u
     target.set_images(clipped);
 }
 
-/// Decompose a [`Line`] into per-display-cell units (text + attrs + hyperlink).
 fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
     let Some(text) = line.as_str() else {
         return;
@@ -508,7 +488,6 @@ fn collect_units<'a>(line: &'a Line, units: &mut Vec<Unit<'a>>) {
     }
 }
 
-/// Build an output [`Line`] from a slice of display-cell units.
 fn build_line(units: &[Unit<'_>], wrapped: bool) -> Line {
     let mut text = String::with_capacity(
         units
@@ -587,9 +566,6 @@ mod tests {
         l
     }
 
-    /// A rewrap joins each soft-wrapped run into its logical line and splits
-    /// it at the new width (first row unwrapped, the rest continuations), never
-    /// across a hard newline or through a wide char, and keeps a blank line.
     #[test]
     fn rewrap_resplits_each_logical_line_at_the_new_width() {
         type Rows<'a> = &'a [(&'a str, bool)];
@@ -636,8 +612,6 @@ mod tests {
         assert_eq!(round_trip[0].as_str(), Some("The quick brown fox jumps"));
     }
 
-    /// Hyperlink and underline-colour spans follow their cells across a split,
-    /// and a cell in the gap between two spans carries neither.
     #[test]
     fn rewrap_keeps_spans_on_their_cells_across_a_split() {
         use std::sync::Arc;
@@ -720,8 +694,6 @@ mod tests {
         assert_eq!(out[0].as_str(), Some("\u{231A}\u{FE0E}Z"));
     }
 
-    /// Cell-for-cell semantic equality: text, wrap flag, per-char attrs, and
-    /// per-column hyperlink / underline-colour answers.
     fn assert_semantically_equal(fast: &[Line], reference: &[Line]) {
         assert_eq!(fast.len(), reference.len(), "line counts diverge");
         for (idx, (a, b)) in fast.iter().zip(reference).enumerate() {
@@ -756,10 +728,6 @@ mod tests {
         }
     }
 
-    /// Over a corpus mixing every gate dimension (eligible short ASCII, blanks,
-    /// soft-wrapped runs, CJK, VS15, hyperlinks, underline colours, stored
-    /// WIDE attrs, wrap-changing long lines), the passthrough path is
-    /// cell-for-cell identical to the full reference, and the fast path fires.
     #[test]
     fn reflow_passthrough_matches_full_path_on_mixed_corpus() {
         use std::sync::Arc;
@@ -819,8 +787,6 @@ mod tests {
         }
     }
 
-    /// Passthrough reach, other side: inputs whose wrap points can change, or
-    /// whose width the byte length cannot prove, never take the passthrough.
     #[test]
     fn reflow_passthrough_never_fires_on_wrap_changing_input() {
         let _ = crate::test_counters::take_reflow_passthrough_lines();
@@ -850,9 +816,6 @@ mod tests {
         );
     }
 
-    /// `reflow_newest_rows` is the tail of the whole rewrap, for every row
-    /// count up to past the whole output: over runs that narrow and widen, an
-    /// orphaned continuation at the front, wide cells and blank rows.
     #[test]
     fn reflow_newest_rows_is_the_tail_of_the_whole_rewrap() {
         let mut corpus = vec![styled("orphan tail", true)];

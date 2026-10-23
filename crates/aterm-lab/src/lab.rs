@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A lab's life: `up` (the stub, the black-hole proxy and the jailed private headless aterm, each in a session of its own with no controlling terminal), `down` (everything ended by pid, the scratch removed, the logs kept), `ps`, and launching the managed Claude Code in the lab's first tab.
+//! Lifecycle management (`up`, `down`, `ps`) for isolated lab instances.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
@@ -25,7 +25,7 @@ fn api_key() -> String {
     format!("sk-ant-api03-LABLABLAB{}AA", "A".repeat(85))
 }
 
-/// The FAKE claude.ai OAuth token of `claude TAG --subscriber`: no credential anywhere; it goes only where `ANTHROPIC_BASE_URL` points (the stub), and the jail keeps every other connect on loopback.
+/// The FAKE claude.ai OAuth token of `claude TAG --subscriber`: no credential anywhere.
 pub fn oauth_token() -> String {
     format!("sk-ant-oat01-LABLABLAB{}AA", "A".repeat(80))
 }
@@ -37,13 +37,13 @@ pub struct UpOpts {
     pub survey: bool,
     /// `LAB_TRUST=1`: the folder trust seeded (no dialog).
     pub trust: bool,
-    /// `LAB_FIRST_RUN=1`: leave the one-time first-run notice (and its default-mode nudge) on the screen.
+    /// `LAB_FIRST_RUN=1`.
     pub first_run: bool,
-    /// `LAB_RESTORE=1`: the headless-restore seam.
+    /// `LAB_RESTORE=1`.
     pub restore: bool,
-    /// `LAB_HARNESS_KEYS`: extra `[harness]` lines.
+    /// `LAB_HARNESS_KEYS`.
     pub harness_keys: String,
-    /// `LAB_ATERM_TOML`: written at the top of the scratch `aterm.toml`.
+    /// `LAB_ATERM_TOML`.
     pub aterm_toml: String,
     /// `LAB_COLS` (144).
     pub cols: String,
@@ -51,15 +51,16 @@ pub struct UpOpts {
     pub lines: String,
     /// `LAB_SCALE`: the instance's `--scale`.
     pub scale: Option<String>,
-    /// `LAB_PROXY=dead`: the proxy at the dead port 9 instead of the black hole.
+    /// `LAB_PROXY=dead`.
     pub proxy_dead: bool,
-    /// The lab is the verb's own: its instance and stub hold a lifeline to this process and end with it, however it ends (a lab `up` makes outlives it).
+    /// The lab is the verb's own.
     pub lifeline: bool,
-    /// `LAB_INSTANCE_ENV='K=V K=V'`: variables the lab's instance gets at each launch of it ([`instance_env`] says which).
+    /// `LAB_INSTANCE_ENV='K=V K=V'` ([`instance_env`]).
     pub instance_env: String,
-    /// `LAB_CLOCK=1`: the lab's sleep clock loaded into its instance and its Claude Code ([`crate::clock`]), which `sleep` steps.
+    /// `LAB_CLOCK=1`: the lab's sleep clock loaded into its instance and its Claude Code
+    /// ([`crate::clock`]).
     pub clock: bool,
-    /// The lab's instance OPENS A WINDOW on this desk, in the same jail ([`windowed`]): a verb's own choice (`forever --window`), never the environment's.
+    /// The lab's instance OPENS A WINDOW on this desk, in the same jail ([`windowed`]).
     pub window: bool,
 }
 
@@ -93,7 +94,7 @@ impl UpOpts {
     }
 }
 
-/// The managed Claude Code, launched by path (not through its shim): the last path of the arrow chain `aterm pkg which claude` prints under a clean environment (`claude → <shim> → <store binary> — managed <ver> — …`, [`pkg_which`]), or `$LAB_CLAUDE`.
+/// The managed Claude Code, launched by path (not through its shim) ([`pkg_which`]).
 /// # Errors
 /// Neither names an executable.
 pub fn find_claude() -> Result<String, String> {
@@ -108,9 +109,7 @@ pub fn find_claude() -> Result<String, String> {
 }
 
 /// The managed Claude Code of the package store the lab's facts `p` name
-/// ([`crate::paths::Paths::store_home`], the account's whatever `HOME` says),
-/// as `aterm` reports it ([`pkg_which`]).
-///
+/// ([`crate::paths::Paths::store_home`], [`pkg_which`]).
 /// # Errors
 /// `aterm` could not be run, or named no managed Claude Code.
 fn store_claude(p: &crate::paths::Paths, aterm: &Path) -> Result<String, String> {
@@ -123,13 +122,13 @@ fn store_claude(p: &crate::paths::Paths, aterm: &Path) -> Result<String, String>
     })
 }
 
-/// The store binary of a `pkg which claude` line: the path after its last `→`.
+/// The store binary of a `pkg which claude` line.
 #[must_use]
 pub fn managed_claude(line: &str) -> Option<String> {
     managed_bin("claude", line)
 }
 
-/// The store binary of a `pkg which <name>` line: the path after its last `→`.
+/// The store binary of a `pkg which <name>` line.
 #[must_use]
 pub fn managed_bin(name: &str, line: &str) -> Option<String> {
     let rest = line.strip_prefix(&format!("{name} → "))?;
@@ -140,23 +139,18 @@ pub fn managed_bin(name: &str, line: &str) -> Option<String> {
     (!last.is_empty()).then(|| last.to_string())
 }
 
-/// The store binary of the managed `name`: the last path of `aterm pkg which <name>`'s arrow chain under a clean environment (not the atpkg shim, [`pkg_which`]).
+/// The store binary of the managed `name` ([`pkg_which`]).
 pub(crate) fn managed_store_bin(name: &str) -> Option<String> {
     managed_store_bin_in(paths(), paths().need_aterm().ok()?, name)
 }
 
 /// [`managed_store_bin`] in the package store the lab's facts `p` name
-/// ([`crate::paths::Paths::store_home`]), as `aterm` reports it.
+/// ([`crate::paths::Paths::store_home`]).
 fn managed_store_bin_in(p: &crate::paths::Paths, aterm: &Path, name: &str) -> Option<String> {
     managed_bin(name, &pkg_which(aterm, p.store_home(), name).ok()?)
 }
 
-/// The first line `aterm pkg which <name>` prints, run under a clean
-/// environment whose `HOME` is `home`: the home whose package store holds the
-/// managed agents ([`crate::paths::Paths::store_home`], the account's), never
-/// the caller's `HOME`, which under a scratch `HOME` holds no store and would
-/// leave every agent to a `LAB_*` variable set by hand.
-///
+/// The first line `aterm pkg which <name>` prints ([`crate::paths::Paths::store_home`]).
 /// # Errors
 /// `aterm` could not be run.
 fn pkg_which(aterm: &Path, home: &str, name: &str) -> Result<String, String> {
@@ -175,13 +169,18 @@ fn pkg_which(aterm: &Path, home: &str, name: &str) -> Result<String, String> {
 
 /// `c` by its physical path when it is executable, else `None`.
 fn executable_at(c: String) -> Option<String> {
-    if c.is_empty() || !crate::sys::executable(&c) {
+    executable_by(c, crate::sys::executable)
+}
+
+/// [`executable_at`], with `runs` saying which paths are executable.
+fn executable_by(c: String, runs: impl Fn(&str) -> bool) -> Option<String> {
+    if c.is_empty() || !runs(&c) {
         return None;
     }
     Some(fs::canonicalize(&c).map_or(c, |p| p.to_string_lossy().into_owned()))
 }
 
-/// The managed Codex, the same way: the last path of `aterm pkg which codex`'s arrow chain (the store binary, not the atpkg shim), or `$LAB_CODEX`.
+/// The managed Codex, the same way.
 #[must_use]
 pub fn find_codex() -> Option<String> {
     let c = match std::env::var("LAB_CODEX") {
@@ -191,20 +190,24 @@ pub fn find_codex() -> Option<String> {
     executable_at(c)
 }
 
-/// The Gemini CLI under test: `$LAB_GEMINI`, else Homebrew's `/opt/homebrew/bin/gemini`, by its physical path (the bundle's script, which runs Homebrew's node by its shebang).
+/// The Gemini CLI under test: `$LAB_GEMINI` alone, by its physical path.
 #[must_use]
 pub fn find_gemini() -> Option<String> {
-    let c = std::env::var("LAB_GEMINI")
-        .ok()
-        .filter(|c| !c.is_empty())
-        .map_or_else(
-            || "/opt/homebrew/bin/gemini".to_string(),
-            |c| crate::paths::from_caller(&c),
-        );
-    executable_at(c)
+    gemini_named(std::env::var("LAB_GEMINI").ok())
 }
 
-/// The Antigravity CLI under test: `$LAB_AGY`, else the managed store's `agy` (the last path of `aterm pkg which agy`'s arrow chain).
+/// [`find_gemini`] on `$LAB_GEMINI`'s value, read by the caller.
+fn gemini_named(named: Option<String>) -> Option<String> {
+    gemini_named_by(named, crate::sys::executable)
+}
+
+/// [`gemini_named`], with `runs` saying which paths are executable.
+fn gemini_named_by(named: Option<String>, runs: impl Fn(&str) -> bool) -> Option<String> {
+    let c = named.filter(|c| !c.is_empty())?;
+    executable_by(crate::paths::from_caller(&c), runs)
+}
+
+/// The Antigravity CLI under test.
 #[must_use]
 pub fn find_agy() -> Option<String> {
     let c = match std::env::var("LAB_AGY") {
@@ -214,7 +217,7 @@ pub fn find_agy() -> Option<String> {
     executable_at(c)
 }
 
-/// The Muse Code under test: `$LAB_MUSE`, else the managed store's `muse` (the last path of `aterm pkg which muse`'s arrow chain), by its physical path (a store's `current` link resolved).
+/// The Muse Code under test.
 #[must_use]
 pub fn find_muse() -> Option<String> {
     let c = match std::env::var("LAB_MUSE") {
@@ -224,7 +227,7 @@ pub fn find_muse() -> Option<String> {
     executable_at(c)
 }
 
-/// `text` when it is a version (a digit, then letters, digits, `.`, `+` and `-`), else `?`: a version names files, and what printed it ran in the jail.
+/// `text` when it is a version (a digit, then letters, digits, `.`, `+` and `-`), else `?`.
 #[must_use]
 pub fn clean_ver(text: &str) -> String {
     let ok = text.chars().next().is_some_and(|c| c.is_ascii_digit())
@@ -234,7 +237,7 @@ pub fn clean_ver(text: &str) -> String {
     if ok { text.to_string() } else { "?".into() }
 }
 
-/// Gemini CLI's version: the `version` of the `@google/gemini-cli` package its script sits in (read through no link), else `--version`'s last word, inside the jail.
+/// Gemini CLI's version.
 #[must_use]
 pub fn gemini_version(run: &Run, bin: &str) -> String {
     let v = Path::new(bin)
@@ -257,7 +260,7 @@ pub fn gemini_version(run: &Run, bin: &str) -> String {
     }
 }
 
-/// agy's version: the `version = "…"` of the record atpkg keeps beside its store build (`<build>.vendor`, read through no link), else `--version`'s last word, inside the jail.
+/// agy's version: the `version = "…"` of the record atpkg keeps beside its store build.
 #[must_use]
 pub fn agy_version(run: &Run, bin: &str) -> String {
     let vendor = Path::new(bin)
@@ -275,11 +278,7 @@ pub fn agy_version(run: &Run, bin: &str) -> String {
     }
 }
 
-/// `--version`'s last word of Gemini CLI or agy, run in the jail with the
-/// agent's own scratch HOME seeded first ([`crate::gemini::seed`]): agy
-/// without its provider seed signs in with a Google account in a browser, so
-/// neither runs before its seed, `--version` included (`?` when the seed
-/// could not be written).
+/// `--version`'s last word of Gemini CLI or agy ([`crate::gemini::seed`]).
 fn seeded_version(run: &Run, agent: crate::gemini::Agent, bin: &str) -> String {
     if crate::gemini::seed(run, agent, &crate::gemini::Launch::default()).is_err() {
         return "?".into();
@@ -299,14 +298,14 @@ pub fn vendor_version(text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The build Muse Code's `--version` names: `Muse Code 1.4.10 (1.4.10-R6427.1)` → `1.4.10-R6427.1`, the text in its parentheses (the name its fixtures carry).
+/// The build Muse Code's `--version` names.
 #[must_use]
 pub fn muse_build(version_line: &str) -> Option<&str> {
     let (_, rest) = version_line.split_once('(')?;
     rest.split_once(')').map(|(b, _)| b.trim())
 }
 
-/// Muse Code's version: the `version = "…"` of the record atpkg keeps beside its store build (`<build>.vendor`, read through no link), else the build `muse --version` names ([`muse_build`]), inside the jail.
+/// Muse Code's version ([`muse_build`]).
 #[must_use]
 pub fn muse_version(run: &Run, bin: &str) -> String {
     let vendor = Path::new(bin)
@@ -324,7 +323,7 @@ pub fn muse_version(run: &Run, bin: &str) -> String {
     }
 }
 
-/// `<bin> --version` run INSIDE the lab's jail, where the witness watches it, from the scratch with the scratch HOME (the lab runs no agent build unjailed, whatever wrote it): the word `pick` chooses of its first line.
+/// `<bin> --version` run INSIDE the lab's jail.
 #[must_use]
 pub fn jailed_version(run: &Run, bin: &str, pick: fn(&str) -> Option<&str>) -> String {
     jailed_version_in(run, bin, &run.w.join("home"), pick)
@@ -344,7 +343,7 @@ fn jailed_version_in(run: &Run, bin: &str, home: &Path, pick: fn(&str) -> Option
     clean_ver(out.lines().next().and_then(pick).unwrap_or(""))
 }
 
-/// The Codex version atpkg's package file beside the build names (`<build>/codex-package.json`, read through no link), else `codex --version`'s last word, inside the jail.
+/// The Codex version atpkg's package file beside the build names.
 #[must_use]
 pub fn codex_version(run: &Run, bin: &str) -> String {
     let pkg = Path::new(bin)
@@ -371,23 +370,17 @@ fn need_sandbox() -> Result<(), String> {
     }
 }
 
-/// The lab's own program, copied into the run directory at `up`
-/// (`bin/aterm-lab`): the egress witness and the stub start from it, the
-/// shim's `security` and `open` lead to it, and the relay is a copy of it.
+/// The lab's own program, copied into the run directory at `up` (`bin/aterm-lab`).
 const BIN: &str = "bin/aterm-lab";
 
-/// Written beside [`BIN`] once a program started from it showed it ran: the
-/// stub's ready byte, which code running from that file writes.
+/// Written beside [`BIN`] once a program started from it showed it ran.
 const BIN_RAN: &str = "bin/ran";
 
-/// Written in `relay/` once the relay copied there showed it ran (it made
-/// its log, `relay.log`, which each launch behind it removes first).
+/// Written in `relay/` once the relay copied there showed it ran.
 const RELAY_RAN: &str = "relay/ran";
 
-/// Whether a directory of copies of the lab's program may be removed: one
-/// started from it showed it ran (`ran`), or the directory is older than the
-/// first-exec hang at `now` ([`aterm_uds::deadline::FIRST_EXEC_HANG`]), so no
-/// assessment of a copy in it is still going.
+/// Whether a directory of copies of the lab's program may be removed
+/// ([`aterm_uds::deadline::FIRST_EXEC_HANG`]).
 fn copies_may_go(dir: &Path, ran: bool, now: std::time::SystemTime) -> bool {
     let Ok(made) = fs::symlink_metadata(dir).and_then(|m| m.modified()) else {
         return true;
@@ -397,8 +390,7 @@ fn copies_may_go(dir: &Path, ran: bool, now: std::time::SystemTime) -> bool {
         .is_ok_and(|age| age >= aterm_uds::deadline::FIRST_EXEC_HANG)
 }
 
-/// The words for a directory of copies kept because none was shown to run:
-/// `{LAB} <verb> <tag>` removes it once it may go.
+/// The words for a directory of copies kept because none was shown to run.
 fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
     format!(
         "KEPT {}: the lab's program copied there was started and never showed it ran, so macOS \
@@ -409,9 +401,7 @@ fn kept_copies(dir: &Path, verb: &str, tag: &str) -> String {
     )
 }
 
-/// Remove the directories of copies of the lab's program in `run_dir`
-/// (`relay/`, `bin/`) that may go at `now` ([`copies_may_go`]); the ones
-/// kept.
+/// Remove the directories of copies of the lab's program in `run_dir` ([`copies_may_go`]).
 fn sweep_copies(run_dir: &Path, relay_ran: bool, now: std::time::SystemTime) -> Vec<PathBuf> {
     let mut kept = Vec::new();
     for (d, ran) in [
@@ -428,8 +418,7 @@ fn sweep_copies(run_dir: &Path, relay_ran: bool, now: std::time::SystemTime) -> 
     kept
 }
 
-/// The end of `down`, once its scratch is gone: the copies that may go
-/// ([`sweep_copies`]), the run directory's own files, then the directory.
+/// The end of `down`, once its scratch is gone ([`sweep_copies`]).
 fn clear_run_dir(run_dir: &Path, relay_ran: bool, tag: &str, now: std::time::SystemTime) {
     let kept = sweep_copies(run_dir, relay_ran, now);
     for dir in &kept {
@@ -456,15 +445,12 @@ fn clear_run_dir(run_dir: &Path, relay_ran: bool, tag: &str, now: std::time::Sys
     let _ = fs::remove_dir(run_dir);
 }
 
-/// Whether `up` started a program from the lab's copy of its own program
-/// ([`BIN`]: the witness or the stub) that has not shown it ran
-/// ([`BIN_RAN`]).
+/// Whether `up` started a program from the lab's copy of its own program ([`BIN`], [`BIN_RAN`]).
 fn bin_unproven(run: &Run) -> bool {
     (run.sampler_pid > 0 || run.stub_pid > 0) && !run.run.join(BIN_RAN).exists()
 }
 
-/// Undo a half-made lab (its pids, everything in its jail, its socket dir and
-/// run directory); the failure to return.
+/// Undo a half-made lab (its pids, everything in its jail, its socket dir and run directory).
 fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
     let unproven = bin_unproven(run);
     let sig = if unproven {
@@ -497,9 +483,7 @@ fn abort(run: &Run, pids: &[i32], msg: &str) -> Fail {
     Fail::die(msg)
 }
 
-/// A lifeline for a child of a lab this verb owns: the far end of a FIFO in
-/// the run directory, which jailed code cannot write, to be its stdin with
-/// [`lifeline_flag`] (`None` when not `armed`).
+/// A lifeline for a child of a lab this verb owns ([`lifeline_flag`]).
 fn lifeline_end(run: &Run, armed: bool) -> std::io::Result<Option<fs::File>> {
     if !armed {
         return Ok(None);
@@ -518,15 +502,11 @@ fn lifeline_flag() -> Vec<String> {
     vec![aterm_uds::lifeline::FLAG.to_string(), "0".to_string()]
 }
 
-/// How long a jailed child the lab started may take to say it is ready (its
-/// `--ready-fd` byte): a hang detector, never a latency budget.
+/// How long a jailed child the lab started may take to say it is ready (its `--ready-fd` byte).
 const READY_HANG: Duration = Duration::from_secs(60);
 
-/// `sandbox-exec -f <jail> env -i <vars> <program…>` as a std `Command`, in a
-/// session of its own, started in the scratch, its output appended to `out`,
-/// every descriptor above stdio stripped first (`InheritNothing`): the jailed
-/// launch [`launch_ready`] and [`launch_window`] spawn.
-///
+/// `sandbox-exec -f <jail> env -i <vars> <program…>` as a std `Command` ([`launch_ready`],
+/// [`launch_window`]).
 /// # Errors
 /// `out` could not be opened.
 fn jailed_command(
@@ -559,15 +539,10 @@ fn jailed_command(
     Ok(cmd)
 }
 
-/// A WINDOWED instance launched in the jail ([`jailed_command`]): a window
-/// takes no ready signal (`--ready-fd` is a headless launch's, refused for a
-/// window a person sees come up), so it is ready once its control socket
-/// answers `version` through the lab's door, asked every 250 ms up to `hang`
-/// (the hang detector). `pid` is set to the child's as soon as it is spawned,
-/// so a caller's cleanup ends it.
+/// A WINDOWED instance launched in the jail ([`jailed_command`]).
 /// # Errors
-/// The launch failed, the child ended before its socket answered, it did not
-/// answer within `hang`, or the run was interrupted (`interrupted`).
+/// The launch failed, the child ended before its socket answered, it did not answer within `hang`,
+/// or the run was interrupted (`interrupted`).
 fn launch_window(
     run: &Run,
     vars: &[(String, String)],
@@ -591,14 +566,9 @@ fn launch_window(
     )
 }
 
-/// A window's readiness ([`launch_window`]): `answers` (its control socket
-/// answered `version`) is asked first, then `alive` (the child still runs),
-/// then the hang detector `hang`; between the asks, `pause` (250 ms, which
-/// fails `interrupted` on an interrupt).
-///
+/// A window's readiness ([`launch_window`]).
 /// # Errors
-/// The child ended before an answer, nothing answered within `hang`, or
-/// `pause` failed.
+/// The child ended before an answer, nothing answered within `hang`, or `pause` failed.
 fn until_answered(
     mut answers: impl FnMut() -> bool,
     mut alive: impl FnMut() -> bool,
@@ -620,7 +590,7 @@ fn until_answered(
     }
 }
 
-/// Why `o` cannot bring a lab up, before anything is made: a windowed lab (`forever --window`) under `LAB_RESTORE=1`, since the headless-restore seam is a headless instance's.
+/// Why `o` cannot bring a lab up, before anything is made.
 #[must_use]
 pub(crate) fn opts_refused(o: &UpOpts) -> Option<&'static str> {
     (o.window && o.restore).then_some(
@@ -628,9 +598,11 @@ pub(crate) fn opts_refused(o: &UpOpts) -> Option<&'static str> {
     )
 }
 
-/// `sandbox-exec -f <jail> env -i <vars> <program…>`, in a session of its own, started in the scratch, its output appended to `out` — its `program` handed a READY SIGNAL (`aterm_agent::ready`: `--ready-fd <n>` appended, a FIFO in the run directory, which the jail cannot write), spawned and kept ([`procs::keep_forked`]), and waited on: its pid once the child wrote its byte.
+/// `sandbox-exec -f <jail> env -i <vars> <program…>` ([`procs::keep_forked`]).
 /// # Errors
-/// The launch failed, or the child closed its signal with nothing said (it exited, or it has nothing to offer), said nothing within `hang` (the hang detector: [`READY_HANG`], or the first-exec hang for a fresh copy), or the run was interrupted (`interrupted`).
+/// The launch failed, or the child closed its signal with nothing said (it exited, or it has
+/// nothing to offer), said nothing within `hang` (the hang detector: [`READY_HANG`], or the
+/// first-exec hang for a fresh copy), or the run was interrupted (`interrupted`).
 pub(crate) fn launch_ready(
     run: &Run,
     vars: &[(String, String)],
@@ -679,7 +651,7 @@ pub(crate) fn launch_ready(
     }
 }
 
-/// `path` opened for appending, twice: a child's stdout and stderr.
+/// `path` opened for appending, twice.
 fn append_to_std(path: &Path) -> std::io::Result<(std::process::Stdio, std::process::Stdio)> {
     let f = fs::OpenOptions::new()
         .create(true)
@@ -689,11 +661,7 @@ fn append_to_std(path: &Path) -> std::io::Result<(std::process::Stdio, std::proc
     Ok((std::process::Stdio::from(f), std::process::Stdio::from(g)))
 }
 
-/// What the lab itself sets in its instance's environment (`env -i` drops
-/// everything else): the shim's PATH, the jail's HOME, XDG dirs and state
-/// root, the open recorder as `BROWSER` with its log, the headless-restore
-/// seam when the lab runs under it (`SEAM=1`), the harness tape, and the
-/// sleep clock when the lab is up with it (`CLOCK=1`: [`crate::clock::vars`]).
+/// What the lab itself sets in its instance's environment ([`crate::clock::vars`]).
 fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
     let w = run.w.to_string_lossy().into_owned();
     let mut vars: Vec<(String, String)> = [
@@ -725,9 +693,7 @@ fn lab_vars(run: &Run, user: &str) -> Vec<(String, String)> {
     vars
 }
 
-/// Whether the lab sets `name` for its instance itself, under any of its
-/// switches ([`lab_vars`] of a lab under the headless-restore seam): a name
-/// `LAB_INSTANCE_ENV` never hands it.
+/// Whether the lab sets `name` for its instance itself ([`lab_vars`]).
 fn lab_sets(name: &str) -> bool {
     let probe = Run {
         seam: "1".into(),
@@ -737,9 +703,13 @@ fn lab_sets(name: &str) -> bool {
     lab_vars(&probe, "").iter().any(|(k, _)| k == name)
 }
 
-/// `LAB_INSTANCE_ENV` read: `NAME=VALUE` words, each a variable the lab's OWN instance gets at every launch of it (`up`'s, `restore`'s and `crash`'s relaunches), after what the lab sets ([`lab_vars`]); nothing else the lab starts gets them.
+/// `LAB_INSTANCE_ENV` read: `NAME=VALUE` words ([`lab_vars`]).
 /// # Errors
-/// A word that is no `NAME=VALUE`, a name outside those kinds (`TMPDIR`, an `ATERM_DEBUG_*` or `ATERM_DEV_*` seam, or the occupancy nudge's seam, [`NUDGE_SEAM`](aterm_agent::supervise::occupancy::rules::NUDGE_SEAM)) or one the lab sets, a name given twice, an empty value or one with a control character, or a `TMPDIR` that is not absolute.
+/// A word that is no `NAME=VALUE`, a name outside those kinds (`TMPDIR`, an `ATERM_DEBUG_*` or
+/// `ATERM_DEV_*` seam, or the occupancy nudge's seam,
+/// [`NUDGE_SEAM`](aterm_agent::supervise::occupancy::rules::NUDGE_SEAM)) or one the lab sets, a
+/// name given twice, an empty value or one with a control character, or a `TMPDIR` that is not
+/// absolute.
 pub fn instance_env(spec: &str) -> Result<Vec<(String, String)>, String> {
     let refuse = |m: String| Err(format!("LAB_INSTANCE_ENV: {m}"));
     let mut out: Vec<(String, String)> = Vec::new();
@@ -775,7 +745,7 @@ pub fn instance_env(spec: &str) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
-/// The instance's environment at every launch: what the lab sets ([`lab_vars`]), then what `up` recorded of `LAB_INSTANCE_ENV` ([`instance_env`], read off the record, never the caller's environment).
+/// The instance's environment at every launch ([`lab_vars`], [`instance_env`]).
 /// # Errors
 /// The record holds what `instance_env` refuses (an `env.sh` edited by hand).
 pub(crate) fn instance_vars(run: &Run, user: &str) -> Result<Vec<(String, String)>, String> {
@@ -784,13 +754,13 @@ pub(crate) fn instance_vars(run: &Run, user: &str) -> Result<Vec<(String, String
     Ok(vars)
 }
 
-/// Whether the lab's instance opens a window (`WINDOW=1`, `forever --window`): the windowed twin of the headless instance, for what only a window carries (`hwkey`, the OS event queue a key press takes).
+/// Whether the lab's instance opens a window (`WINDOW=1`, `forever --window`).
 #[must_use]
 pub(crate) fn windowed(run: &Run) -> bool {
     run.window == "1"
 }
 
-/// The instance's command line: `aterm --headless`, the lifeline's flag when it holds one, then the lab's own socket, project dir and grid (and `--scale`): the same at `up` and at each relaunch on the same record.
+/// The instance's command line.
 pub(crate) fn instance_argv(
     run: &Run,
     aterm: &str,
@@ -833,7 +803,7 @@ pub(crate) fn instance_argv(
     prog
 }
 
-/// The private headless instance (jailed): scratch HOME, XDG and state, the harness at its defaults ([`instance_vars`], [`instance_argv`]).
+/// The private headless instance (jailed) ([`instance_vars`], [`instance_argv`]).
 pub fn start_instance(run: &mut Run, scale: Option<&str>, armed: bool) -> Result<(), String> {
     let aterm = run.need_aterm()?.to_string_lossy().into_owned();
     let vars = instance_vars(run, &paths().user)?;
@@ -864,7 +834,7 @@ pub fn start_instance(run: &mut Run, scale: Option<&str>, armed: bool) -> Result
     Ok(())
 }
 
-/// Whether `pid` is a live process of the lab `run`: its command line names the lab's run directory or its socket directory (each with its `/`).
+/// Whether `pid` is a live process of the lab `run`.
 #[must_use]
 pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
     let marks = [
@@ -884,13 +854,7 @@ pub(crate) fn names_this_lab(run: &Run, pid: i32) -> bool {
     }
 }
 
-/// Whether `up` may make the lab `run` names at `now`: no lab of its tag is
-/// up (no `env.sh`), and no copy of the lab's program an earlier lab of the
-/// tag left is still unproven. Such copies (an aterm-lab before this one's
-/// `down` dropped `env.sh` while keeping them) go once they may
-/// ([`sweep_copies`]); until then the tag waits. So `up` never lays its copy
-/// over a file whose first exec macOS may still be assessing, and never
-/// hands the new lab an older lab's relay.
+/// Whether `up` may make the lab `run` names at `now` ([`sweep_copies`]).
 /// # Errors
 /// Why the tag cannot come up now.
 fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
@@ -910,12 +874,11 @@ fn room_for(run: &Run, now: std::time::SystemTime) -> Result<(), Fail> {
     }
 }
 
-/// Bring a lab up (nothing printed); the record of it.
+/// Bring a lab up (nothing printed).
 /// # Errors
 /// Why it could not come up (whatever it had started is taken down first).
 #[allow(clippy::too_many_lines)]
 pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
-    // options that conflict are refused first, before anything is made or caught
     if let Some(why) = opts_refused(o) {
         return Err(Fail::usage(why));
     }
@@ -1225,11 +1188,7 @@ pub fn up(tag: &str, o: &UpOpts) -> Result<Run, Fail> {
     Ok(run)
 }
 
-/// A lab's scratch `aterm.toml`: `LAB_ATERM_TOML` (`aterm_toml`) leads, so
-/// its root keys (`font_family`, `font_px`) stay at the root, ahead of every
-/// table; the update and package lanes off; `LAB_HARNESS_KEYS`
-/// (`harness_keys`) under `[harness]`; and the audible bell off unless
-/// `LAB_ATERM_TOML` sets `bell_sound` ([`crate::instance::bell_off`]).
+/// A lab's scratch `aterm.toml`: `LAB_ATERM_TOML` ([`crate::instance::bell_off`]).
 pub(crate) fn scratch_aterm_toml(aterm_toml: &str, harness_keys: &str) -> String {
     crate::instance::bell_off(&format!(
         "{aterm_toml}\n[update]\nenabled = false\n[packages]\nenabled = false\n[harness]\nprobe_api = false\n{harness_keys}\n"
@@ -1369,7 +1328,7 @@ pub fn cmd_up(args: &[String]) -> Res {
     Ok(0)
 }
 
-/// Take a lab down: everything in the lab's jail ended (found by its mark, an orphan too, and only a pid that is still OURS: a process in this jail, or one whose command line names this lab), the witness last, once the jail is empty; the scratch removed, the logs kept.
+/// Take a lab down: everything in the lab's jail ended.
 /// # Errors
 /// No such lab, or an `env.sh` whose scratch is not its own.
 pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
@@ -1542,10 +1501,7 @@ pub fn down(tag: &str, keep_dumps: bool) -> Result<PathBuf, Fail> {
     Ok(keep)
 }
 
-/// What `lab up` writes for its TAB SHELLS in scratch `w`: Gemini CLI's
-/// wrapper (`<run>/gbin/gemini`, which runs `gemini_bin`) where the lab has
-/// one, and `home/.zshrc`, the profile every tab's shell reads
-/// ([`tab_profile`], the stub at `port`).
+/// What `lab up` writes for its TAB SHELLS in scratch `w` ([`tab_profile`]).
 fn put_tab_shell(w: &Path, run: &Path, gemini_bin: &str, port: &str) {
     let gbin = (!gemini_bin.is_empty()).then(|| run.join("gbin"));
     if let Some(dir) = &gbin {
@@ -1561,7 +1517,7 @@ fn put_tab_shell(w: &Path, run: &Path, gemini_bin: &str, port: &str) {
     );
 }
 
-/// THE LAB'S TAB SHELLS' STARTUP FILE (`<scratch>/home/.zshrc`, every tab's shell reads it at its start): the lab's prompt, and Gemini CLI's environment as a person who runs it on an API key keeps it in their profile — the lab's fake key ([`crate::gemini::LAB_GEMINI_KEY`]) and `GOOGLE_GEMINI_BASE_URL` the stub at `port` (`NO_BROWSER` too, and no Google Cloud credential variable), and, where the lab has a Gemini CLI, its wrapper's directory `gbin` leading `PATH`, so the word `gemini` runs the lab's build.
+/// THE LAB'S TAB SHELLS' STARTUP FILE ([`crate::gemini::LAB_GEMINI_KEY`]).
 #[must_use]
 pub fn tab_profile(port: &str, gbin: Option<&Path>) -> String {
     let mut s = String::from("PROMPT='lab$ '\n");
@@ -1662,7 +1618,6 @@ pub fn cmd_ps(args: &[String]) -> Res {
         );
     }
     for t in tags {
-        // a run directory torn down between the listing and its read is no longer a lab
         if let Err(f) = ps_one(&t) {
             eprintln!("aterm-lab: {}", f.msg.unwrap_or_default());
         }
@@ -1722,7 +1677,7 @@ pub fn parse_launch(args: &[String]) -> Result<Launch, String> {
     Ok(l)
 }
 
-/// The launcher the tab runs (`sh claude.sh`): it ends in `exec`, so the tab's process IS the real binary, launched by path (not through the managed shim, which would add its own environment); behind the relay with `--relay`.
+/// The launcher the tab runs.
 #[must_use]
 pub fn launcher(run: &Run, l: &Launch) -> String {
     let q = shell_quote;
@@ -1782,21 +1737,13 @@ pub fn launcher(run: &Run, l: &Launch) -> String {
     s
 }
 
-/// Whether the relay copied into the lab's run directory ran: an earlier
-/// launch recorded it ([`RELAY_RAN`]), or the relay made its log, which each
-/// launch behind it removes first (`relay.log`, read through no link).
+/// Whether the relay copied into the lab's run directory ran ([`RELAY_RAN`]).
 fn relay_shown_running(run: &Run) -> bool {
     run.run.join(RELAY_RAN).exists()
         || crate::sys::scratch_read(&run.w.join("relay.log")).is_ok_and(|b| b.is_some())
 }
 
-/// Lay the relay for a launch behind it: this program under the name `node`,
-/// copied where jailed code cannot write (`relay/node`), ONCE per lab. The
-/// copy is the same file at every launch (the lab's program does not change
-/// while it is up), and a later launch never replaces it: an earlier launch's
-/// relay may still be starting from it, its first exec under assessment, and
-/// a file renamed over or removed then crashes `syspolicyd`. A relay that
-/// made its log ran, which is recorded before the log goes ([`RELAY_RAN`]).
+/// Lay the relay for a launch behind it ([`RELAY_RAN`]).
 /// # Errors
 /// The copy could not be made.
 fn lay_relay(run: &Run) -> Result<(), Fail> {
@@ -1821,7 +1768,7 @@ fn lay_relay(run: &Run) -> Result<(), Fail> {
     Ok(())
 }
 
-/// Type the launch line of the managed Claude Code into the lab's first tab; the `launched: …` line that says what was launched.
+/// Type the launch line of the managed Claude Code into the lab's first tab.
 /// # Errors
 /// The launch line could not be typed, or the relay could not be laid.
 pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
@@ -1834,7 +1781,6 @@ pub fn launch_claude(run: &Run, l: &Launch) -> Result<String, Fail> {
         lay_relay(run)?;
     }
     if l.subscriber {
-        // The key helper comes out of the settings, so the fake OAuth login is the one Claude Code uses.
         crate::verbs::settings_merge(run, &J::obj([("apiKeyHelper", J::Null)]))?;
     }
     let script = run.run.join("claude.sh");
@@ -1883,14 +1829,39 @@ pub fn cmd_claude(args: &[String]) -> Res {
 mod tests {
     use super::*;
 
-    /// THE TAB SHELLS' PROFILE CARRIES GEMINI CLI'S KEY: a line typed into a
-    /// tab's shell as a Gemini CLI's relaunch is (`HOME=<its home> gemini
-    /// --resume <id>`, its `HOME` alone) runs the lab's build with the lab's
-    /// fake key and the stub's base URL, read here off a stand-in build that
-    /// prints what it was handed, under zsh sourcing the profile as a tab's
-    /// shell reads it — the very `home/.zshrc` and `gbin/gemini` `lab up`
-    /// writes ([`put_tab_shell`]), so `up` writing any other profile fails
-    /// it.
+    #[test]
+    fn gemini_cli_is_the_one_lab_gemini_names() {
+        let asked = std::cell::RefCell::new(Vec::<String>::new());
+        let every = |p: &str| {
+            asked.borrow_mut().push(p.to_owned());
+            true
+        };
+        assert_eq!(gemini_named_by(None, every), None);
+        assert_eq!(gemini_named_by(Some(String::new()), every), None);
+        assert_eq!(*asked.borrow(), Vec::<String>::new(), "no path asked after");
+        let brew = "/opt/homebrew/bin/gemini";
+        let at =
+            fs::canonicalize(brew).map_or(brew.to_owned(), |p| p.to_string_lossy().into_owned());
+        assert_eq!(gemini_named_by(Some(brew.to_owned()), every), Some(at));
+        assert_eq!(*asked.borrow(), [brew], "the named path, and it alone");
+        let tmp = aterm_tempfile::tempdir().unwrap();
+        let dir = tmp.path().canonicalize().unwrap();
+        let build = dir.join("gemini");
+        std::fs::write(&build, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&build, fs::Permissions::from_mode(0o755)).unwrap();
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(&build, &link).unwrap();
+        let named = |p: &Path| gemini_named(Some(p.to_string_lossy().into_owned()));
+        let physical = Some(build.to_string_lossy().into_owned());
+        assert_eq!(named(&build), physical);
+        assert_eq!(named(&link), physical);
+        assert_eq!(gemini_named(None), None);
+        assert_eq!(gemini_named(Some(String::new())), None);
+        let plain = dir.join("plain");
+        std::fs::write(&plain, "not a program").unwrap();
+        assert_eq!(named(&plain), None);
+    }
+
     #[test]
     fn a_line_typed_in_a_tab_shell_runs_gemini_with_the_labs_key() {
         let tmp = aterm_tempfile::tempdir().unwrap();
@@ -1944,10 +1915,6 @@ mod tests {
         );
     }
 
-    /// Every lab's scratch Claude Code settings carry the settings witness: a
-    /// `ConfigChange` hook that runs the run directory's `config-change.sh`
-    /// (written from outside the jail), beside the fake key helper and the
-    /// env.
     #[test]
     fn a_lab_ups_claude_settings_carry_the_settings_witness_hook() {
         let run = Run {
@@ -1986,9 +1953,6 @@ mod tests {
         );
     }
 
-    /// `lab up`'s scratch `aterm.toml` starts with the audible bell off, and
-    /// `LAB_ATERM_TOML` can turn it back on (`bell_sound = true`, the one key
-    /// the file then holds).
     #[test]
     fn a_lab_up_config_starts_with_the_audible_bell_off() {
         let read =
@@ -2018,9 +1982,6 @@ mod tests {
         );
     }
 
-    /// `ps <tag>` AND `down <tag>` OF A LAB THAT IS DOWN NAME THAT TAG
-    /// : each refuses with the lab `<tag>` is not up, never
-    /// the default lab's words, and `down` touches no lab.
     #[test]
     fn ps_and_down_of_a_lab_that_is_down_name_its_tag() {
         let gone = "ki1016-ps-gone";
@@ -2117,9 +2078,6 @@ mod tests {
         assert!(!opens_recorded(&arg_words, &run), "{arg_only}");
     }
 
-    /// The words of a launcher's `exec` command as `sh` reads them: its
-    /// continuation lines joined, split at blanks outside quotes, single and
-    /// double quotes and backslashes removed.
     fn exec_words(script: &str) -> Vec<String> {
         let line = script
             .split_once("exec ")
@@ -2160,10 +2118,6 @@ mod tests {
         words
     }
 
-    /// Whether `env`'s assignments in a launcher's words (those between `env`
-    /// and the program it runs) route every open of the program to the open
-    /// recorder: the shim leads `PATH` (a bare-name `open`), `BROWSER` is the
-    /// shim's `open`, and `LAB_OPEN_LOG` is the scratch's `open.log`.
     fn opens_recorded(words: &[String], run: &Run) -> bool {
         let Some(env) = words.iter().position(|w| w == "env") else {
             return false;
@@ -2219,8 +2173,6 @@ mod tests {
         assert_eq!(managed_bin("muse", "codex → /x — managed 1 — y"), None);
     }
 
-    /// A package linked from a checkout (`aterm pkg link codex <pkg>`, as the
-    /// owner links codex-alab) names its binary at the chain's end too.
     #[test]
     fn a_dev_linked_package_names_its_binary() {
         let line = "codex → /S/pkg/bin/codex → /D/artifacts/codex/0.164.0-dev.1+g51ba34fe1/bin/codex — dev-linked (managed from that checkout, not the index)";
@@ -2251,13 +2203,6 @@ mod tests {
             .collect()
     }
 
-    /// `LAB_INSTANCE_ENV` hands the lab's instance `TMPDIR` and dev seams
-    /// alone (the `ATERM_DEBUG_*` and `ATERM_DEV_*` stems, and the occupancy
-    /// nudge's seam by its name, no other seam of another name), in the
-    /// order given, and never a name the lab sets itself (its jail's HOME,
-    /// XDG dirs, state root and PATH, the harness tape, or the
-    /// headless-restore seam `LAB_RESTORE=1` owns, whether or not this lab
-    /// runs under it).
     #[test]
     fn the_instance_is_handed_tmpdir_and_dev_seams_alone() {
         assert_eq!(instance_env(""), Ok(Vec::new()));
@@ -2323,9 +2268,6 @@ mod tests {
         }
     }
 
-    /// Every launch of the instance gets what the lab sets and then what `up`
-    /// recorded of `LAB_INSTANCE_ENV`: read off the record, so a relaunch
-    /// gets the same whatever its caller's environment.
     #[test]
     fn every_launch_hands_the_instance_what_up_recorded() {
         let vars = instance_vars(&recorded("TMPDIR=/tmp", "0"), "owner").unwrap();
@@ -2355,10 +2297,6 @@ mod tests {
         }
     }
 
-    /// THE STORE IS LOOKED UP IN THE ACCOUNT'S HOME UNDER A SCRATCH `HOME`:
-    /// `aterm pkg which` reads the package store under the `HOME` it is given,
-    /// and a scratch `HOME` holds none, so the lab hands that one call the
-    /// account's home (the account database's, [`crate::paths::Paths::store_home`]).
     #[test]
     fn the_store_lookup_is_handed_the_account_home_under_a_scratch_home() {
         let top = aterm_tempfile::Builder::new()
@@ -2420,19 +2358,12 @@ mod tests {
         assert_eq!(only.store_home(), scratch.display().to_string());
     }
 
-    /// Whether a shell's environment routes an agent's URL open to the open
-    /// recorder: its log (`LAB_OPEN_LOG`) is the scratch's `open.log`, and the
-    /// opener is the shim's `open`: `BROWSER` when it is set (Claude Code opens
-    /// `$BROWSER <url>`), else the bare-name `open` the shell finds (`which`).
     fn opens_logged(browser: &str, log: &str, which: &str, run: &Run) -> bool {
         let shim = run.run.join("shim/open").display().to_string();
         let opener = if browser.is_empty() { which } else { browser };
         log == format!("{}/open.log", run.w.display()) && opener == shim
     }
 
-    /// `BROWSER`, `LAB_OPEN_LOG` and `command -v open` as a login zsh started
-    /// with exactly `vars` (`env -i`) reads them: the shell a session the
-    /// instance spawns runs in, after `/etc/zprofile`'s `path_helper`.
     fn login_shell_reads(vars: &[(String, String)], cwd: &Path) -> Vec<String> {
         let mut cmd = aterm_uds::spawnfd::command("/bin/zsh");
         cmd.env_clear()
@@ -2463,11 +2394,6 @@ mod tests {
             .collect()
     }
 
-    /// A SESSION THE INSTANCE SPAWNS OPENS THROUGH THE RECORDER: a worker's
-    /// Claude Code (`spawn agent=claude`) is typed into a login shell the
-    /// instance spawned, never behind `claude.sh`, and that shell's
-    /// `path_helper` puts the shim LAST, so its bare-name `open` is
-    /// `/usr/bin/open`, which the jail refuses and nothing logs.
     #[test]
     fn a_session_the_instance_spawns_opens_through_the_recorder() {
         let top = aterm_tempfile::Builder::new()
@@ -2513,11 +2439,6 @@ mod tests {
         );
     }
 
-    /// THE SLEEP CLOCK GOES WHERE `LAB_CLOCK=1` PUTS IT: every launch of the
-    /// instance of a lab up with it (`up`'s and each relaunch's, off the
-    /// record) loads it, and `claude.sh` hands it to Claude Code past the
-    /// shell that drops it; a lab up without it hands it to neither, and
-    /// neither `LAB_INSTANCE_ENV` nor `claude -e` may name its variables.
     #[test]
     fn the_sleep_clock_reaches_the_instance_and_claude_code_of_a_lab_up_with_it_alone() {
         let mut run = recorded("TMPDIR=/tmp", "0");
@@ -2569,9 +2490,6 @@ mod tests {
         assert!(lab_sets("DYLD_INSERT_LIBRARIES") && lab_sets("LABCLOCK_DIR"));
     }
 
-    /// The instance's command line is the lab's own socket, project dir and
-    /// grid at `up` and at each relaunch on the same record; the lifeline's
-    /// flag only for an instance that holds one.
     #[test]
     fn the_relaunch_runs_the_instance_on_the_lab_s_own_socket_and_grid() {
         let run = recorded("", "0");
@@ -2601,10 +2519,6 @@ mod tests {
         );
     }
 
-    /// A WINDOWED LAB'S INSTANCE (`forever --window`) opens a window: no
-    /// `--headless` and no lifeline flag (a window refuses `--lifeline-fd`),
-    /// the same socket, project dir and grid after its program; where it
-    /// holds a lifeline, the lab's own keeper leads the line and holds it.
     #[test]
     fn a_windowed_lab_s_instance_opens_a_window_its_keeper_holding_the_lifeline() {
         let tail = [
@@ -2653,9 +2567,6 @@ mod tests {
         }
     }
 
-    /// A WINDOWED LAB UNDER `LAB_RESTORE=1` IS REFUSED, as a usage error and
-    /// before anything is made: the headless-restore seam is a headless
-    /// instance's.
     #[test]
     fn a_windowed_lab_under_the_restore_seam_is_refused_before_anything_is_made() {
         let o = |window, restore| UpOpts {
@@ -2677,8 +2588,6 @@ mod tests {
         }
     }
 
-    /// A WINDOW IS READY ONCE ITS CONTROL SOCKET ANSWERS: an answer at the
-    /// third ask is ready, asked before whether the child lives.
     #[test]
     fn a_window_is_ready_once_its_socket_answers_and_never_on_a_dead_child_or_a_hang() {
         let asks = std::cell::Cell::new(0u32);
@@ -2714,9 +2623,6 @@ mod tests {
         assert_eq!(e, "interrupted");
     }
 
-    /// A pid is the lab's only while its command line names the lab's run or
-    /// socket directory: no pid of 1 or less, none whose command line names
-    /// another directory.
     #[test]
     fn a_pid_is_the_lab_s_only_while_its_command_line_names_the_lab() {
         let me = i32::try_from(std::process::id()).unwrap();
@@ -2736,8 +2642,6 @@ mod tests {
         assert!(names_this_lab(&ours, me), "{line}");
     }
 
-    /// A run directory under a private scratch dir, its scratch made, its
-    /// copy of the lab's program a plain file (nothing is started from it).
     fn half_made(root: &Path) -> Run {
         let root = fs::canonicalize(root).unwrap();
         let run = Run {
@@ -2752,11 +2656,6 @@ mod tests {
         run
     }
 
-    /// AN ABORTED `up` KEEPS A COPY NOTHING SHOWED RAN (r4g-1): a lab that
-    /// started its witness or stub from its fresh copy of the lab's program,
-    /// and was aborted before the stub's ready byte proved that copy ran,
-    /// keeps its run directory (macOS may still be assessing the copy's
-    /// first exec); once the stub said it ran, the abort removes it.
     #[test]
     fn an_aborted_up_keeps_a_copy_nothing_showed_ran() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -2786,8 +2685,6 @@ mod tests {
         }
     }
 
-    /// A directory of copies may go once one of them showed it ran, or once
-    /// it is older than the first-exec hang; a missing one may go.
     #[test]
     fn copies_go_once_shown_to_run_or_past_the_first_exec_hang() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -2803,10 +2700,6 @@ mod tests {
         assert!(copies_may_go(&root.path().join("gone"), false, made));
     }
 
-    /// A run directory as `down` leaves it for its last step: the scratch
-    /// gone, its own files (`env.sh` among them) there, its copy of the lab's
-    /// program shown to run or not, and a relay laid beside it or not; when
-    /// its copies were made.
     fn torn_down(root: &Path, bin_ran: bool, relay: bool) -> (Run, std::time::SystemTime) {
         let run = half_made(root);
         fs::remove_dir_all(&run.w).unwrap();
@@ -2824,17 +2717,10 @@ mod tests {
         (run, made.unwrap())
     }
 
-    /// Past the first-exec hang for copies made at `made` or within a minute
-    /// after it.
     fn past_the_hang(made: std::time::SystemTime) -> std::time::SystemTime {
         made + aterm_uds::deadline::FIRST_EXEC_HANG + Duration::from_secs(60)
     }
 
-    /// A DOWN THAT KEEPS A COPY KEEPS ITS LAB (r5u-1): a run directory whose
-    /// copy of the lab's program (the stub's or the relay's) nothing showed
-    /// ran keeps its `env.sh` beside that copy, so `ps` still lists the lab
-    /// and a later `down`, the first-exec hang past, removes the copy and the
-    /// directory.
     #[test]
     fn a_down_that_keeps_a_copy_keeps_its_lab_for_a_later_down() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -2852,18 +2738,12 @@ mod tests {
             let listed = if kept { vec![run.tag.clone()] } else { vec![] };
             assert_eq!(all_runs(state), listed, "{what}");
             if kept {
-                // the later `down`, once nothing can still be assessing either copy
                 clear_run_dir(&run.run, relay_ran, &run.tag, past_the_hang(made));
             }
             assert!(!run.run.exists(), "{what}: the later down finished");
         }
     }
 
-    /// AN UP NEVER LAYS ITS COPY OVER AN UNPROVEN ONE (r5u-1): a tag whose
-    /// run directory holds no `env.sh` but a copy an earlier lab left that
-    /// nothing showed ran waits, that copy in place, until the first-exec
-    /// hang has passed; then the copies go, so `up` copies onto a fresh path
-    /// and lays a fresh relay.
     #[test]
     fn an_up_waits_out_a_copy_an_earlier_lab_left_unproven() {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -2895,10 +2775,6 @@ mod tests {
         assert!(gone(&proven));
     }
 
-    /// THE RELAY'S COPY IS LAID ONCE AND NEVER REPLACED (r4g-1): a second
-    /// launch behind the relay keeps the file the first one started from
-    /// (the same inode), and records that relay ran once it made its log,
-    /// before that log goes.
     #[test]
     fn the_relay_is_laid_once_and_its_run_recorded() {
         use std::os::unix::fs::MetadataExt as _;

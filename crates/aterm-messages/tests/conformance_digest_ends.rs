@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1: the shipping `MessageCenter` follows the derived
-//! `ExceptionsDigestEnds` model in lock step, so the liveness
-//! `AnUnnamedEntryEnds` proven on the model is a property of the code. After
-//! every real step the center's `(open, missed, age)` equals the model's, where
-//! `missed` is "the center names a deadline" (`digest_deadline`) and `age`
-//! counts the clock in halves of `RESOLVE_AFTER`. The negative controls replay
-//! the two-look rule and the early end against the mutant models and show the
-//! real center is not what they describe.
+//! Conformance tests verifying that `MessageCenter` follows the `ExceptionsDigestEnds` model.
 
 use aterm_messages::need::{Fingerprint, LaterAsk, RESOLVE_AFTER, Reason, Resurface, Then, Why};
 use aterm_messages::{
@@ -49,8 +42,6 @@ impl Rng {
     }
 }
 
-/// The real center, one entry open and named, and what the harness knows of the
-/// run (the ghost `cause`, the tick count of the clock).
 struct Real {
     c: MessageCenter,
     now: Instant,
@@ -87,7 +78,6 @@ impl Real {
         WallStamp { unix_ms: self.wall }
     }
 
-    /// The model's variables, read off the real center.
     fn project(&self) -> State {
         let mut s = State::new();
         s.insert("open", i64::try_from(self.c.digest().len()).expect("small"));
@@ -96,7 +86,6 @@ impl Real {
         s.insert("age", self.age);
         s.insert("ended_age", self.ended_age);
         s.insert("frozen", 0);
-        // A clock that runs with no instant named for the loop to wake at.
         s.insert(
             "unwired",
             i64::from(self.t_miss.is_some() && self.c.digest_deadline().is_none()),
@@ -107,7 +96,6 @@ impl Real {
     fn step(&mut self, action: &str) {
         match action {
             "CauseEnds" => self.cause = 0,
-            // A look that does not name the entry: the reporter's whole answer is empty.
             "Miss" => {
                 let s = self.c.sync_digest(PREFIX, vec![], self.stamp(), self.now);
                 assert_eq!((s.pending_end, s.resolved), (1, 0), "{s:?}");
@@ -119,7 +107,6 @@ impl Real {
                     "the clock names the instant the loop wakes at"
                 );
             }
-            // A look that names it again: a flicker neither ends nor re-posts a fact.
             "Name" => {
                 let s = self
                     .c
@@ -129,8 +116,6 @@ impl Real {
                 self.age = 0;
                 assert!(self.c.digest_deadline().is_none());
             }
-            // Time passes; nothing else happens. Before the clock has run, neither the
-            // loop's settle nor a second empty look ends the entry or restarts the clock.
             "Tick" => {
                 self.now += tick();
                 self.wall += u64::try_from(tick().as_millis()).expect("fits");
@@ -147,7 +132,6 @@ impl Real {
                     );
                 }
             }
-            // The loop's wake at the deadline: no look is needed.
             "Settle" => {
                 assert!(
                     self.c.settle_digest(self.stamp(), self.now),
@@ -189,7 +173,6 @@ fn the_real_center_follows_the_model_in_lock_step() {
                 if enabled.is_empty() {
                     break; // the entry has ended: nothing more is enabled
                 }
-                // Lean on time and the wake so runs end; looks and flickers stay possible.
                 let leaning: Vec<&str> = enabled
                     .iter()
                     .copied()
@@ -236,9 +219,7 @@ fn the_real_center_follows_the_model_in_lock_step() {
     );
 }
 
-/// The mutant `TwoLooksToEnd` ends an entry only at a second missed look; the
-/// real center, given one empty look and the clock, ends it, which the mutant
-/// does not admit.
+/// One empty look followed by the deadline settles the entry, rejecting the `TwoLooksToEnd` mutant.
 #[test]
 fn the_second_editions_two_look_rule_is_not_this_code() {
     let model = exceptions_digest_ends_model();
@@ -249,7 +230,6 @@ fn the_second_editions_two_look_rule_is_not_this_code() {
     real.step("CauseEnds");
     assert!(model.fire("CauseEnds", &mut healthy));
     assert!(two.fire("CauseEnds", &mut mutant));
-    // One look, and no second look ever comes.
     real.step("Miss");
     assert!(model.fire("Miss", &mut healthy));
     assert!(two.fire("TwoLooksToEnd", &mut mutant));
@@ -271,7 +251,6 @@ fn the_second_editions_two_look_rule_is_not_this_code() {
         "the real center ended the entry with no second look"
     );
     assert_eq!(got, healthy);
-    // The mutant, holding the same look, cannot take the step the code took.
     let mut before = mutant.clone();
     before.insert("age", 2);
     assert_eq!(
@@ -295,15 +274,12 @@ fn the_second_editions_two_look_rule_is_not_this_code() {
     );
 }
 
-/// Two looks a few milliseconds apart (or the loop's settle) do not end a fact
-/// the reporter merely flickered (the mutant `EndsBeforeTheClockRan`), and a
-/// repeated empty look does not push the deadline out.
+/// Repeated empty looks before `RESOLVE_AFTER` neither end an entry early nor reset the deadline.
 #[test]
 fn a_flicker_is_not_an_end_and_a_repeated_look_does_not_move_the_clock() {
     let mut real = Real::new();
     real.step("Miss");
     let deadline = real.c.digest_deadline().expect("armed");
-    // repeated empty looks at once
     for _ in 0..3 {
         let s = real.c.sync_digest(PREFIX, vec![], real.stamp(), real.now);
         assert_eq!((s.pending_end, s.resolved), (1, 0));
@@ -315,11 +291,9 @@ fn a_flicker_is_not_an_end_and_a_repeated_look_does_not_move_the_clock() {
         1,
         "half the clock has run: still open"
     );
-    // named again: the clock is gone and the entry is unchanged
     real.step("Name");
     assert_eq!(real.c.digest().len(), 1);
     assert!(real.c.digest_deadline().is_none());
-    // a new miss starts a new clock, from its own instant
     real.now += tick();
     real.wall += u64::try_from(tick().as_millis()).expect("fits");
     real.step("Miss");

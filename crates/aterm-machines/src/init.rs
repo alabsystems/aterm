@@ -83,8 +83,7 @@ struct Options {
 }
 
 impl Options {
-    /// Whether this run converges the workstation layer: a bare `aterm init` or `--only
-    /// workstation`, never under `--develop` or `--no-develop`.
+    /// Whether this run converges the workstation layer.
     fn workstation(&self) -> bool {
         (self.only.is_empty() && self.develop.is_none())
             || self.only.iter().any(|word| word == "workstation")
@@ -147,16 +146,15 @@ fn options(args: &[OsString]) -> Result<Options, String> {
     Ok(options)
 }
 
-/// The base layer `aterm init` runs before its own items (design §4.2, S5).
+/// Base layer `aterm init` runs before its own items.
 pub struct Base {
     /// The items, in run order.
     pub items: Vec<Box<dyn aterm_converge::Item>>,
-    /// What keeps them safe to apply (the store lock), held while they run and released before `base.clt` and the workstation items.
+    /// Store lock held while base items run and released before `base.clt` and workstation items.
     pub held: Option<Box<dyn std::any::Any>>,
     /// `base.clt` ([`crate::init_clt`]), run once the lock is released.
     pub clt: Option<crate::init_clt::CommandLineTools>,
-    /// The toolset's `targo`, which `develop.workspace-tools@<path>` runs the checkout's
-    /// `verify provision` with ([`crate::init_develop::Targo`]).
+    /// Toolset `targo` used by `develop.workspace-tools@<path>` ([`crate::init_develop::Targo`]).
     pub targo: Option<crate::init_develop::Targo>,
 }
 
@@ -226,7 +224,6 @@ pub fn main_entry(
         print!("{USAGE}");
         return ExitCode::SUCCESS;
     }
-    // A develop word is checked against the checkouts once they are read.
     let composed = base(false);
     let unnamed = unnamed(&composed, &options.only);
     if !unnamed.is_empty() {
@@ -296,7 +293,6 @@ pub fn main_entry(
             } else if let (Outcome::Ok, Some(Layer::Develop), Some(now)) =
                 (row.outcome, row.layer, &row.to)
             {
-                // A checkout left as it is says why (dirty, ahead, diverged, …).
                 println!("    {now}");
             }
             if let Some(why) = &row.why {
@@ -318,8 +314,7 @@ const ONLY_WORDS: &str = "a base id such as base.clt or base.shell.rc, a family 
                           or pkg, or base; workstation; a develop id such as \
                           develop.checkout@~/aterm, a family such as checkout, or develop";
 
-/// The `--only` words that name nothing a run could compose: no base item, not
-/// `workstation`, and no develop word ([`crate::init_develop::names`]).
+/// Return `--only` words that match no base item, `workstation`, or develop selector.
 fn unnamed(base: &Base, only: &[String]) -> Vec<String> {
     base.unnamed(only)
         .into_iter()
@@ -342,9 +337,7 @@ impl From<String> for Refused {
     }
 }
 
-/// What the front door hands a run: the base layer (`true`: for a run that applies, which
-/// takes the store lock), the workstation's preparation ([`prepare_groups`]), the toolset's
-/// targo, and where `aterm init` was started.
+/// Front-door inputs for a converge pass.
 struct Front<'a> {
     base: &'a dyn Fn(bool) -> Base,
     groups: &'a Prepare<'a>,
@@ -352,14 +345,7 @@ struct Front<'a> {
     cwd: Option<&'a Path>,
 }
 
-/// The layers a run converges (design §4.1): base always; the workstation on a bare `aterm
-/// init` or `--only workstation`, never under `--develop` or `--no-develop`; develop when
-/// this Mac records it, `--develop` or `--no-develop` asks, or an `--only` word names it.
-/// The context refuses root (a fleet-style job) before any develop item is composed: the
-/// fleet never fetches, builds or runs checkout code as a user (§4.4). The develop layer
-/// never stops the base layer: a run whose `--only` names no develop word reads no profile
-/// (`--only base`, ship provision's audit), and a profile that cannot be read is one
-/// `develop.record` row saying why, with the base layer run as ever.
+/// Converge the requested base, workstation, and develop layers.
 fn converge(
     sys: &dyn System,
     options: &Options,
@@ -393,8 +379,6 @@ fn converge(
     } else {
         crate::init_develop::Composed::default()
     };
-    // A develop word must name one of this run's develop items, or nothing is changed
-    // (when the layer could not be read, its one row says why instead).
     let nothing: Vec<&str> = only
         .iter()
         .filter(|word| crate::init_develop::names(word))
@@ -423,14 +407,11 @@ fn converge(
             }
         )));
     }
-    // A run that leaves the workstation out reads and asks nothing of this login's settings
-    // (no keyboard list, no vault question).
     let groups = if workstation {
         (front.groups)(sys, &ctx, mode)?
     } else {
         Vec::new()
     };
-    // The store lock last: no question waits while it is held.
     Ok(run_layers(
         sys,
         &ctx,
@@ -446,9 +427,7 @@ fn converge(
     )?)
 }
 
-/// The exit status (design §3.3): 0 when complete; when the only incomplete rows stood
-/// aside, 75 on a lock, 77 on a permission not granted, 69 offline (in that order when
-/// mixed: what a lock held back was not attempted at all); else 1.
+/// Compute the exit status for `rows` under `action` (`0`, `75`, `77`, `69`, or `1`).
 fn status(rows: &[ItemReport], action: Action) -> u8 {
     use aterm_converge::StoodAside;
     if complete(rows, action) {
@@ -540,8 +519,7 @@ pub fn run_workstation_selected(
 pub struct Workstation {
     ctx: Ctx,
     items: Vec<Box<dyn Item>>,
-    /// Each item's before-images, or why they could not be taken
-    /// ([`Workstation::preference_changes`]); `None` until a pass takes them.
+    /// Each item's before-images, or why they could not be taken; `None` until taken.
     snapshots: Option<Vec<Result<PreferenceSnapshot, String>>>,
     /// The items this pass leaves alone ([`Workstation::hold`]), by id.
     held: Vec<(String, Hold)>,
@@ -582,11 +560,6 @@ pub struct Attempt {
 
 impl Workstation {
     /// Typed before-images of precisely the preference keys this pass would change.
-    ///
-    /// An item whose before-images cannot be taken (its plan fails, or a value it would
-    /// replace reads unusable) changes nothing in this pass, its own row saying why, and the
-    /// other items still run: a Dock with no aterm to pin (none in `/Applications` or
-    /// `~/Applications`, or a dev build) leaves Caps Lock, scrolling and widgets to apply.
     ///
     /// # Errors
     /// Two items would change the same key.
@@ -736,13 +709,10 @@ impl Workstation {
     }
 }
 
-/// The shared item still owns its policy and mutation. This wrapper checks that the
-/// durable recovery record describes the values it is about to replace, and records which
-/// items reached mutation.
+/// Wrapper that validates recovery before-images and records attempted items.
 struct Guard {
     inner: Box<dyn Item>,
-    /// The before-images saved for recovery, or why the pass could not take them; `None`
-    /// when the pass took no snapshot.
+    /// Saved before-images, or why the pass could not take them (`None` when unsnapshotted).
     before: Option<Result<PreferenceSnapshot, String>>,
     attempted: Arc<Mutex<Vec<(String, PreferenceSnapshot)>>>,
 }
@@ -752,8 +722,6 @@ impl Guard {
         let Some(before) = &self.before else {
             return Ok(());
         };
-        // No recovery record holds what this item would replace: it writes nothing, even
-        // when a later read of it succeeds.
         let before = before.as_ref().map_err(Clone::clone)?;
         let current = self.inner.preference_changes(sys, ctx)?;
         if current.len() == before.len()
@@ -1068,8 +1036,7 @@ type Group = (Vec<Box<dyn Item>>, Place);
 /// How a run prepares the workstation's groups ([`prepare_groups`], or a test's stand-in).
 type Prepare<'a> = dyn Fn(&dyn System, &Ctx, Mode) -> Result<Vec<Group>, String> + 'a;
 
-/// Preparation can read optional profiles and ask vault questions before an item is
-/// probed.
+/// Prepare workstation groups, reading optional profiles and prompting for vault credentials before probing.
 fn prepare_groups(sys: &dyn System, ctx: &Ctx, mode: Mode) -> Result<Vec<Group>, String> {
     if ctx.console.is_none() {
         return Ok(vec![(
@@ -1104,9 +1071,7 @@ impl Item for WorkstationAtConsole {
     }
 }
 
-/// What init converges after the base layer, in run order, each list with its place: all
-/// of it the workstation layer, which needs this Mac's console (design §3.2, §4.3): over
-/// SSH, or under another login's console, each is `Blocked` and nothing of it is read.
+/// Workstation item groups in run order, each paired with its [`Place`].
 fn groups(sys: &dyn System, ctx: &Ctx, secrets: Vec<Box<dyn Item>>) -> Result<Vec<Group>, String> {
     let place = workstation_place;
     Ok(vec![
@@ -1160,20 +1125,13 @@ fn run(
     )
 }
 
-/// How a run's second pass is narrowed: the `--only` words, and whether `develop.record`
-/// stays whatever they say (`--develop` and `--no-develop` ask for the record itself, and a
-/// profile that cannot be read is said by that row).
+/// Second-pass narrowing: `--only` selectors and whether `develop.record` is always kept.
 struct Narrowing<'a> {
     only: &'a [String],
     record: bool,
 }
 
-/// Run the `base` items, then `base.clt`, `groups` and `develop` in one pass (a
-/// `develop.workspace-tools@` waits for `base.clt`) narrowed by `narrowing`, against `sys`,
-/// each change journaled in `journal` before it is made. Every class applies; an item that
-/// needs the console runs only when this login holds it (`ctx.console`). What the base
-/// layer holds (the store lock) is released once its items have run: a later item can wait
-/// on a person.
+/// Run `base` items, release the store lock, and then run `base.clt`, `groups`, and `develop`.
 #[expect(
     clippy::too_many_arguments,
     reason = "one run's whole composition, each part its own input"
@@ -1198,8 +1156,6 @@ fn run_layers(
     let mut rows = aterm_converge::run_scoped(&items, mode, scope, journal, &mut |_| {})
         .map_err(|refused| refused.to_string())?;
     drop(held);
-    // `base.clt` once the lock is gone (its apply waits on a person's password), then the
-    // workstation items, then the develop items.
     let clt = clt
         .as_ref()
         .map(|clt| (clt as &dyn Item, crate::init_clt::place()));
@@ -1425,10 +1381,6 @@ mod tests {
         );
     }
 
-    /// The widgets rows (the `[consumer]` catalog's three, one key each) read only their
-    /// own domains: with Full Disk Access, the Window Manager's and Notification Center's
-    /// (three keys); without it (refused or not measured), the Window Manager's alone (two
-    /// keys), and no command names Notification Center's container.
     #[test]
     fn selected_widgets_do_not_read_keyboard_dock_trackpad_or_accounts() {
         let who = user("alice", 501);
@@ -1489,9 +1441,6 @@ mod tests {
         }
     }
 
-    /// The local pass carries the Full Disk Access its runner measured
-    /// ([`System::full_disk_access`]) into the items' context: `aterm init`, the doctor and
-    /// System State measure it once and hand it over through the port.
     #[test]
     fn the_runners_full_disk_access_reaches_the_widgets_row_through_the_port() {
         for full_disk_access in [None, Some(false), Some(true)] {
@@ -1555,10 +1504,6 @@ mod tests {
         }
     }
 
-    /// The follow-up group builds, of the selected rows, only an item for each key in
-    /// another app's container, under its row's id: for the widgets and the Dock,
-    /// Notification Center's widgets row, whose snapshot, plan and apply read its widget
-    /// list and no Window Manager or Dock key, and its run withholds nothing with the grant.
     #[test]
     fn the_withheld_group_reaches_only_the_keys_a_pass_without_the_grant_left_alone() {
         assert_eq!(
@@ -1704,8 +1649,6 @@ mod tests {
         }
     }
 
-    /// The trackpad item's preference read, answering `com.apple.swipescrolldirection`
-    /// saved as off.
     fn saved_off(sys: &Fake) {
         sys.on(
             "alice$ /usr/bin/defaults export -g -",
@@ -1713,7 +1656,6 @@ mod tests {
         );
     }
 
-    /// A context whose one user holds this Mac's console.
     fn at_console(alice: crate::model::User) -> Ctx {
         Ctx {
             console: Some(alice.clone()),
@@ -1784,9 +1726,6 @@ mod tests {
         }
     }
 
-    /// The workstation pass (`aterm doctor --apply`, a first launch's setup) journals each
-    /// change in the journal of the system it runs on: the fake's files hold the changed
-    /// item's line, and the item already as wanted writes none.
     #[test]
     fn a_workstation_pass_journals_in_the_journal_of_the_system_it_runs_on() {
         let sys = Fake::root();
@@ -1813,9 +1752,6 @@ mod tests {
         assert_eq!(ids, ["init.test.changes"]);
     }
 
-    /// An item whose probes and preference plans answer from lists (the last one repeats),
-    /// counting its applies and its runtime refreshes; with `aside`, each apply stands aside
-    /// on it.
     struct Counted {
         id: &'static str,
         probes: Mutex<Vec<Probe>>,
@@ -1898,9 +1834,6 @@ mod tests {
         }
     }
 
-    /// A held item's keys are no before-images of the pass: nothing of it changes, so
-    /// nothing of it is backed up for, or relaunched after, the pass, and a pass that
-    /// dies part way leaves no record naming a key nobody wrote.
     #[test]
     fn a_held_item_has_no_before_images() {
         let alice = user("alice", 501);
@@ -1937,17 +1870,6 @@ mod tests {
         );
     }
 
-    /// An item whose before-images cannot be taken (its plan fails, or a value it would
-    /// replace reads unusable) changes nothing and the other items still apply: one such
-    /// item once failed the whole pass. Its write stays refused when its plan reads cleanly
-    /// after the snapshot failed (what it read cleared in between), since no recovery
-    /// record holds what it would replace; the Dock's own case, whose probe fails as its
-    /// snapshot did, is `init_preferences`'
-    /// `a_dock_that_cannot_pin_aterm_leaves_the_other_desktop_rows_to_apply`. Negative
-    /// controls: `?` on the item's snapshot in `Workstation::preference_changes` fails the
-    /// pass; dropping the refused snapshot's error in `Guard::validate` applies both;
-    /// planning again there instead, and going ahead on a clean read, applies the cleared
-    /// one.
     #[test]
     fn an_item_without_before_images_changes_nothing_and_the_others_run() {
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1965,7 +1887,6 @@ mod tests {
             (item, applies)
         };
         let target = |domain: &str| Target::user(domain, "k", &alice);
-        // Its snapshot's plan fails; every later plan reads the key cleanly.
         let (cleared, cleared_applies) = item(
             "init.test.cleared",
             vec![
@@ -2035,11 +1956,6 @@ mod tests {
             .collect()
     }
 
-    /// A held item that would change probes `Blocked` (held back) or `NotApplicable` (left
-    /// as it is), naming what it reads now and the caller's line, and is neither applied,
-    /// refreshed nor journaled, and one that already reads correct stays `Ok`, while the
-    /// items not held run as before; only the items whose apply or refresh ran are
-    /// attempts, each saying whether it verified.
     #[test]
     fn a_held_item_changes_nothing_and_only_reached_items_are_attempts() {
         use std::sync::atomic::Ordering;
@@ -2116,10 +2032,6 @@ mod tests {
         );
     }
 
-    /// An apply that stood aside (a permission not granted yet: the account sign-out
-    /// without Accessibility) changed nothing, so it is no attempt: an unattended caller
-    /// that holds what did not verify must not hold it, and retries it once the grant
-    /// lands.
     #[test]
     fn an_apply_that_stood_aside_is_no_attempt() {
         let sys = Fake::root();
@@ -2203,9 +2115,6 @@ mod tests {
         assert!(rows.iter().all(|r| r.layer == Some(Layer::Workstation)));
     }
 
-    /// WHAT THE BASE LAYER HOLDS (the store lock) IS RELEASED once its items have run,
-    /// before the first workstation item is read: a workstation item can wait on a person,
-    /// or run `aterm pkg install` itself, and an install pass must not wait on it.
     #[test]
     fn what_the_base_layer_holds_is_released_before_a_workstation_item_is_read() {
         use std::sync::Arc;
@@ -2216,7 +2125,6 @@ mod tests {
                 self.0.store(true, Ordering::SeqCst);
             }
         }
-        /// A workstation item that notes, at each probe, whether the hold was released.
         struct Sees {
             released: Arc<AtomicBool>,
             saw: Arc<Mutex<Vec<bool>>>,
@@ -2531,8 +2439,6 @@ mod tests {
         assert!(options(&["--only=".into()]).is_err());
     }
 
-    /// `--only` keeps the base items its words name, `base.clt` among them, and a word that
-    /// names none is the surface's to refuse (`unnamed`) before anything runs.
     #[test]
     fn only_narrows_the_base_layer_and_names_the_words_it_does_not_know() {
         let base = || Base {
@@ -2564,9 +2470,6 @@ mod tests {
         assert!(all.items.len() == 1 && all.clt.is_some());
     }
 
-    /// `base.clt` runs in init's base pass after what the base layer holds is released (its
-    /// apply waits on a password), as an elevated base item; with no terminal it is
-    /// `Blocked` on `aterm init --only base.clt` and nothing runs.
     #[test]
     fn base_clt_runs_after_the_base_hold_is_released_and_blocks_without_a_terminal() {
         use std::sync::Arc;
@@ -2628,10 +2531,6 @@ mod tests {
         assert!(sys.calls().is_empty());
     }
 
-    /// THE CONSOLE GATE IS PER ITEM (S5): with another uid at this Mac's console (or none,
-    /// over SSH), init is not refused — a base item applies and is read back, and each
-    /// workstation item is `Blocked` with nothing of the console session read (no
-    /// `defaults`, no `hidutil`, no accounts).
     #[test]
     fn under_another_console_owner_a_base_item_applies_and_a_workstation_item_is_blocked() {
         let alice_at = |console_uid: u32| {
@@ -2716,8 +2615,6 @@ mod tests {
         );
     }
 
-    /// 75 when the only incomplete rows stood aside on a lock, 69 offline, 75 when both,
-    /// 1 when anything else is left, 0 when complete.
     #[test]
     fn a_run_left_only_by_stood_aside_rows_exits_75_77_or_69() {
         use aterm_converge::StoodAside;
@@ -2884,8 +2781,6 @@ mod tests {
         assert!(!complete(&[row], Action::Check));
     }
 
-    /// alice (uid 501) in her own shell, with the console's owner `console_uid`, and an
-    /// aterm checkout at `~/aterm` whose manifest is hers; `profile` is her init.toml.
     fn alice_with_checkout(console_uid: u32, profile: Option<&str>) -> Fake {
         let mut sys = Fake::root();
         sys.euid = 501;
@@ -2932,9 +2827,6 @@ mod tests {
         sys
     }
 
-    /// A run's front with an empty base layer (one `base.pkg.shims` item, already as
-    /// wanted, when `base_item`) and a workstation of one preference item, counting how
-    /// often each was composed.
     struct Composed {
         bases: std::sync::atomic::AtomicU32,
         workstations: std::sync::atomic::AtomicU32,
@@ -3003,10 +2895,6 @@ mod tests {
         }
     }
 
-    /// DEVELOP TOUCHES NO PREFERENCE (design §4.1): `--develop` at this Mac's console runs
-    /// base and develop only: the workstation is never composed, no row is a preference,
-    /// and nothing of this login's settings is read. Negative control: a bare `aterm init`
-    /// on the same fake composes the workstation and applies its preference item.
     #[test]
     fn develop_on_a_fake_system_applies_no_preference_item() {
         let develop = Options {
@@ -3048,10 +2936,6 @@ mod tests {
         );
     }
 
-    /// THE FLEET NEVER RUNS DEVELOP ITEMS (§4.4): a root run (what a fleet job is) of
-    /// `aterm init --develop` is refused before anything is composed, read or run: no base
-    /// layer, no profile write, no git. Negative control: the same run as alice composes and
-    /// runs the develop items, writing her profile and reading her checkout with git.
     #[test]
     fn a_fleet_style_run_as_root_is_refused_before_any_develop_item() {
         let develop = Options {
@@ -3098,10 +2982,6 @@ mod tests {
         );
     }
 
-    /// `--develop` and `--no-develop` exclude each other; `--only` takes base, workstation
-    /// and develop words before anything is read, and a develop word that names no checkout
-    /// this Mac records is refused (exit 2) once the record is read, before anything runs.
-    /// `--only workstation` composes the workstation alone.
     #[test]
     fn only_takes_workstation_and_develop_words_and_refuses_a_checkout_nobody_records() {
         assert!(options(&["--develop".into(), "--no-develop".into()]).is_err());
@@ -3176,7 +3056,6 @@ mod tests {
         assert_eq!(ids, ["init.test.dock"]);
         assert_eq!(rows[0].class, Some(Class::Preference));
         assert_eq!(rows[0].outcome, Outcome::Changed);
-        // Unrecorded, `--only develop` reads the record and says what makes one.
         let sys = alice_with_checkout(501, None);
         let rows = Composed::new().converge(&sys, &only("develop")).unwrap();
         assert_eq!(rows.len(), 1, "{rows:?}");
@@ -3190,13 +3069,6 @@ mod tests {
         );
     }
 
-    /// THE DEVELOP LAYER NEVER STOPS THE BASE LAYER: an init.toml that does not parse,
-    /// holds a table init does not know, records a relative checkout, or is group-writable
-    /// is one `develop.record` row (`Unknown`, saying why) on a bare run, at the console or
-    /// away from it, and the base layer runs as ever; `--only base` and `--only
-    /// base.pkg.shims` (what ship provision's audit and a repair name) read no profile at
-    /// all and compose no develop row. Negative control: the develop layer's own `compose`
-    /// refuses each of these profiles.
     #[test]
     fn a_profile_that_cannot_be_read_never_stops_the_base_layer() {
         for (profile, mode, why) in [
@@ -3264,7 +3136,6 @@ mod tests {
                     assert!(record.is_empty(), "{only:?}: {rows:?}");
                     assert_eq!(status(&rows, Action::Apply), 0);
                 }
-                // Negative control: the layer itself cannot be composed from this profile.
                 let ctx = local_context(&sys).unwrap();
                 let composed = crate::init_develop::compose(
                     &sys,
@@ -3284,10 +3155,6 @@ mod tests {
         }
     }
 
-    /// AN OFFLINE DEVELOP MACHINE EXITS 69: a recorded checkout whose origin's host cannot
-    /// be reached (no name resolution) stands aside offline, in an apply and in a check, so
-    /// the run exits 69 and its remedy is the next pass once online. Negative control: an
-    /// origin that refuses (no key) is `Unknown`, and the run exits 1.
     #[test]
     fn an_offline_develop_machine_exits_69_not_1() {
         use aterm_converge::StoodAside;
@@ -3347,9 +3214,6 @@ mod tests {
         }
     }
 
-    /// `--only` A CHECKOUT NAMES THAT CHECKOUT ALONE: with `~/aterm` and `~/aterm.old`
-    /// recorded, `--only develop.checkout@~/aterm` runs `~/aterm`'s item and never the other
-    /// one's. Control: the id without its path names both.
     #[test]
     fn an_only_word_with_its_path_names_that_checkout_alone() {
         let profile = "[develop]\ncheckouts = [\"~/aterm\", \"~/aterm.old\"]\n";
@@ -3376,9 +3240,6 @@ mod tests {
         );
     }
 
-    /// `--develop` RECORDS WHATEVER `--only` SAYS: `--develop --only tooling` runs the
-    /// record and the tools item. Negative control: `--only tooling` on the same recorded
-    /// Mac without `--develop` runs the tools item alone.
     #[test]
     fn develop_records_whatever_only_says() {
         let ids = |develop: Option<bool>, profile: Option<&str>| -> Vec<String> {

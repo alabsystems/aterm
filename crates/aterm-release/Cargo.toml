@@ -33,6 +33,9 @@ aterm-durable = { workspace = true }
 # The serde `Manifest` type is shared with the updater client, so publisher and client
 # agree by compilation; publish round-trips the bytes through the client's parser.
 aterm-update-core = { workspace = true }
+# The static bootstrap verifier a Linux worker builds beside the executable: its asset
+# name, its static build's flags and install.sh's pin, which the cut prints.
+aterm-bootstrap-verify = { workspace = true }
 # The x86_64 slice's Rosetta session holds an `aterm_uds::lifeline`: a cut killed
 # mid-drive takes the translated instance with it.
 aterm-uds = { workspace = true }

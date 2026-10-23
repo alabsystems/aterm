@@ -1,29 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 for `SupervisorNetworkWall` (aterm-spec `supervisor_network_wall_model`):
-//! the real turn-end decider (`decide_turn_end`, with its `TurnEndState`) driven
-//! along every reachable state of the model, so the answer to an API error the
-//! network caused (`ENOTFOUND`, or a reply cut off) is the model's, state for state.
-//!
-//! The world (`NetFails`, `NetReturns`) is invisible to the decider; the host's
-//! measure is the reading's `reach`; a wall appearing is the point observed with the
-//! vendor's retries as busy work; one tick is one minute, with the real ladders
-//! scaled to the model's constants (`net_backoff` = `Rung1`, `Rung2`; `down_hold` =
-//! `Hold`); `Act` is the decider's act, recorded with `acted`; `Taken` is an idle
-//! point with no wall after real work. The decider is asked at every state, as the
-//! loop asks at every due and every change of the host's measure (`reach_edge`).
-//!
-//! At every state the invariants hold, and at a shown wall the decider types exactly
-//! where `Act` is enabled, under the model's rule and in `wall_retry_text`'s words,
-//! and otherwise waits until exactly the tick `Act` would become enabled. Negative
-//! controls: `Buggy = 1` (acting at once whatever the measure) and `Carry = 1` (the
-//! hold's clock carried across appearances) each disagree somewhere.
-//!
-//! A reply past its output token maximum is no wall of this model's: since
-//! 2026-10-15 it is no cut-off (`ApiCause::Overlong`, the server's ladder, climbed
-//! across the work each try leads to), and the reader says so
-//! (`the_models_words_read_as_the_causes_it_stands_for`).
+//! Tier-1 for `SupervisorNetworkWall` (aterm-spec `supervisor_network_wall_model`): the real turn-end decider (`decide_turn_end`, with its `TurnEndState`) driven along every reachable state of the model, so the answer to an API error the network caused (`ENOTFOUND`, or a reply cut off) is the model's, state for state.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -43,8 +21,7 @@ use crate::common::cnst;
 type State = BTreeMap<&'static str, i64>;
 
 const MIN: Duration = Duration::from_secs(60);
-/// The vendor's own retries before it gives up (about 3 minutes): busy work short
-/// of the real `progress`.
+/// The vendor's own retries before it gives up (about 3 minutes): busy work short of the real `progress`.
 const VENDOR_RETRIES: Duration = Duration::from_secs(3 * 60);
 /// Real work between an act and the wall's next appearance: past `progress`.
 const REAL_WORK: Duration = Duration::from_secs(10 * 60);
@@ -59,9 +36,7 @@ fn minutes(m: &Model, name: &str) -> Duration {
     MIN * u32::try_from(cnst(m, name)).expect("a small constant")
 }
 
-/// The real policy's clocks, scaled so one model tick is one minute: the
-/// short ladder's two rungs, the hold, and the defaults' `progress` (5 min,
-/// between the vendor's retries and real work).
+/// The real policy's clocks, scaled so one model tick is one minute: the short ladder's two rungs, the hold, and the defaults' `progress` (5 min, between the vendor's retries and real work).
 fn timing(m: &Model) -> TurnEndTiming {
     TurnEndTiming {
         net_backoff: vec![minutes(m, "Rung1"), minutes(m, "Rung2")],
@@ -78,9 +53,7 @@ fn cause_of(st: &State) -> ApiCause {
     }
 }
 
-/// The screen the model state stands for: at a wall that shows, the
-/// vendor's message as the reader reads it, with the host's measure; else a
-/// worker at work (the act in flight, or its turn after the wall left).
+/// The screen the model state stands for: at a wall that shows, the vendor's message as the reader reads it, with the host's measure; else a worker at work (the act in flight, or its turn after the wall left).
 fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading {
     let showing = st["wall"] == 1;
     let cause = cause_of(st);
@@ -191,8 +164,7 @@ enum Verdict {
     Nothing,
 }
 
-/// The rule the model's `Act` at `st` is taken under (the branch its
-/// guard's disjunct names).
+/// The rule the model's `Act` at `st` is taken under (the branch its guard's disjunct names).
 fn model_rule(st: &State) -> &'static str {
     match (st["cause"], st["verdict"]) {
         (0, 2) => RULE_API_BACK,
@@ -202,9 +174,7 @@ fn model_rule(st: &State) -> &'static str {
     }
 }
 
-/// What the model says the decider does at `st`: at a wall that shows, the
-/// act where `Act` is enabled, else a wait until the first tick it is —
-/// found by moving `waited` alone, as time alone would.
+/// What the model says the decider does at `st`: at a wall that shows, the act where `Act` is enabled, else a wait until the first tick it is — found by moving `waited` alone, as time alone would.
 fn expected(m: &Model, st: &State) -> Verdict {
     if st["wall"] != 1 {
         return Verdict::Nothing;
@@ -223,8 +193,7 @@ fn expected(m: &Model, st: &State) -> Verdict {
     Verdict::Wait(MIN * u32::try_from(due - st["waited"]).unwrap())
 }
 
-/// What the real decider says at `st`, with the act's words checked: the
-/// wall's kind named, under the rule's own sentence.
+/// What the real decider says at `st`, with the act's words checked: the wall's kind named, under the rule's own sentence.
 fn verdict(a: &TurnEndAction, st: &State, now: Instant) -> Verdict {
     match a {
         TurnEndAction::Type { text, rule_id } => {
@@ -244,8 +213,7 @@ fn verdict(a: &TurnEndAction, st: &State, now: Instant) -> Verdict {
     }
 }
 
-/// Mirror one model action on the real side (the model has fired it). A buggy `Act`
-/// the real decider would not take returns `false`: the walk does not descend.
+/// Mirror one model action on the real side (the model has fired it).
 fn mirror(
     action: &str,
     before: &State,
@@ -280,9 +248,7 @@ fn mirror(
     true
 }
 
-/// Walk `m` against the real decider: every verdict word seen, and each state
-/// where the two disagree (`strict` fails at the first; otherwise they are
-/// collected, the negative control's).
+/// Walk `m` against the real decider: every verdict word seen, and each state where the two disagree (`strict` fails at the first; otherwise they are collected, the negative control's).
 fn walk(m: &Model, strict: bool) -> (BTreeMap<&'static str, usize>, Vec<State>) {
     let cfg = SupervisorConfig::default();
     let base = Instant::now() + Duration::from_secs(3600);
@@ -303,8 +269,6 @@ fn walk(m: &Model, strict: bool) -> (BTreeMap<&'static str, usize>, Vec<State>) 
                 assert!(m.check_invariant(inv.name, &st), "{} at {st:?}", inv.name);
             }
         }
-        // The loop's look at the point still showing: folded in again with
-        // no work (which changes nothing), then decided.
         let mut at = real.st.clone();
         let here = reading(&st, None, real.now);
         at.observe(&here, real.now);
@@ -356,8 +320,7 @@ fn tier1_the_real_decider_types_into_a_network_wall_exactly_where_the_model_allo
     }
 }
 
-/// Negative control: the `Buggy = 1` model (acting at once whatever the measure)
-/// types at a measured outage's appearance where the real decider waits the hold.
+/// Negative control: the `Buggy = 1` model (acting at once whatever the measure) types at a measured outage's appearance where the real decider waits the hold.
 #[test]
 fn the_buggy_model_disagrees_with_the_real_decider() {
     let m = supervisor_network_wall_model();
@@ -372,9 +335,6 @@ fn the_buggy_model_disagrees_with_the_real_decider() {
         disagree.len()
     );
 
-    // `Carry = 1` (the hold's clock carried across the episode's appearances) is not
-    // the real decider either: it measures the hold from each appearance, so a
-    // re-appearance under a Down measure waits the hold again where `Carry` types.
     let carry = aterm_spec::interp::with_consts(&m, &[("Carry", 1)]);
     let (_, carried) = walk(&carry, false);
     assert!(
@@ -386,10 +346,7 @@ fn the_buggy_model_disagrees_with_the_real_decider() {
     );
 }
 
-/// The words this bind hands the decider for each of the model's causes are
-/// the cause the reader reads them as — a reply cut off, a server never
-/// reached — and a reply past its output token maximum, which was a cut-off
-/// until 2026-10-15, is a cause of its own and none of this model's.
+/// The words this bind hands the decider for each of the model's causes are the cause the reader reads them as — a reply cut off, a server never reached — and a reply past its output token maximum, which was a cut-off until 2026-10-15, is a cause of its own and none of this model's.
 #[test]
 fn the_models_words_read_as_the_causes_it_stands_for() {
     let api = |cause| {

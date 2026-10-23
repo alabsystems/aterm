@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE SESSION JOURNAL ON BY DEFAULT (D3,
-//! ruled 2026-10-19), across real aterm processes sharing one
-//! scratch world whose config has NO `[session_log]` table:
-//!
-//! 1. A, a headless instance under the lab's desk seam
-//!    (`ATERM_DEBUG_HEADLESS_RESTORE` under a private `ATERM_STATE_HOME`:
-//!    `Desk::LabHeadless`, a window's desk), runs a shell-integration block
-//!    whose command line is `echo QZP6SECRET1 42` in its boot session (the
-//!    OSC 133/633 marks a shell with integration writes, all at once, so the
-//!    status sweep first sees it finished), waits until its log holds the
-//!    `cmd` run, and quits (`invoke Quit`). Its journal is
-//!    `<logs>/session-log/`: a 0700 folder holding `<inst>.1.slog` at 0600,
-//!    holding the run as `detail=echo` (the positive control), and the
-//!    command's second word is in no file of it.
-//! 2. B, started on the same roots, answers `log @<A's sid>` from that
-//!    journal: A's session closed `out=app-quit` by A's clean quit, which
-//!    only A's journal holds (B never ran that session).
-//! 3. A plain headless instance (no seam) keeps no desk and so no journal:
-//!    no `session-log` folder after its quit.
-//!
-//! NEGATIVE CONTROL: the same two launches with `[session_log] journal =
-//! false` make no folder, and B answers `log @<A's sid>` with `ERR`.
-//!
-//! Isolation is `support/launch_isolation.rs`'s (scratch HOME and XDG roots, a
-//! private control socket, every automatic lane off, `--no-reroute`). Every
-//! wait for something that must happen is a one-minute hang detector; each
-//! instance is killed by its own pid on drop.
+//! Session journal live headless test across real aterm processes sharing one scratch world.
 
 #![cfg(unix)]
 
@@ -107,8 +81,7 @@ fn journal_dir(root: &Path) -> PathBuf {
 }
 
 /// Boot one headless instance named `tag` in `root`, under the lab's desk
-/// seam when `lab`. A log or spawn refusal is COULD NOT RUN; an instance that
-/// exits or never listens panics (`headless_boot::await_ready`).
+/// seam when `lab`.
 fn boot(root: &Path, tag: &str, lab: bool) -> Proc {
     let sock = root.join(format!("run/aterm/{tag}.sock"));
     let log_path = root.join(format!("{tag}.log"));
@@ -157,8 +130,7 @@ fn boot_sid(ctl: &mut Ctl) -> String {
 }
 
 /// Quit `proc` as a person does (`invoke Quit`, which a headless instance
-/// takes without a confirm) and wait for it to end. The reply is not read:
-/// the instance may close the connection as it quits.
+/// takes without a confirm) and wait for it to end.
 fn quit(proc: &mut Proc) {
     let _ = Ctl::connect(&proc.sock).line("invoke Quit");
     let ended = aterm_spec::wait::within(HANG, Duration::from_millis(25), || {
@@ -184,9 +156,7 @@ fn marked_command(root: &Path) -> PathBuf {
 }
 
 /// The run of one world: A runs the secret's command, waits until its log
-/// holds the run, and quits; then B starts on the same roots. Returns A's
-/// sid and B's answer to `log @<it>` (its header and lines), with B still
-/// running.
+/// holds the run, and quits; then B starts on the same roots.
 fn a_then_b(root: &Path) -> (String, String, Vec<String>, Proc) {
     let script = marked_command(root);
     let mut a = boot(root, "a", true);
@@ -197,7 +167,6 @@ fn a_then_b(root: &Path) -> (String, String, Vec<String>, Proc) {
         ctl.expect_on_screen("ran-42");
         sid
     };
-    // A hang detector: the sweep logs the finished block as a `cmd` run.
     let req = format!("@{sid} log");
     let logged = aterm_spec::wait::within(HANG, Duration::from_millis(50), || {
         let (_, rows) = Ctl::connect(&a.sock).counted(&req);
@@ -209,8 +178,6 @@ fn a_then_b(root: &Path) -> (String, String, Vec<String>, Proc) {
     quit(&mut a);
     drop(a);
     let b = boot(root, "b", true);
-    // One connection for the header alone (an `ERR` has no body), and a
-    // fresh one to read an `OK`'s lines whole.
     let header = Ctl::connect(&b.sock).line(&req);
     let lines = if header.starts_with("OK") {
         Ctl::connect(&b.sock).counted(&req).1
@@ -235,9 +202,6 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
             & 0o777
     };
     assert_eq!(mode(&journal), 0o700, "the journal folder is private");
-    // Control readiness does not wait for B's journal writer. Wait for its
-    // first nonempty segment, with the existing hang detector, before the
-    // two-process roster assertion below.
     let b_prefix = format!("p{}-", b.child.id());
     let names = aterm_spec::wait::within(HANG, Duration::from_millis(25), || {
         let names: Vec<String> = std::fs::read_dir(&journal)
@@ -292,7 +256,6 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
         "A's own clean quit, from A's journal: {lines:?}"
     );
     drop(b);
-    // A plain headless instance keeps no desk, so no journal.
     let plain = scratch_world("plain", "");
     let mut c = boot(plain.path(), "c", false);
     quit(&mut c);
@@ -301,7 +264,6 @@ fn the_journal_is_on_by_default_and_answers_for_an_earlier_process() {
         !journal_dir(plain.path()).exists(),
         "a headless instance keeps no journal"
     );
-    // NEGATIVE CONTROL: the opt-out.
     let off = scratch_world("off", "[session_log]\njournal = false\n");
     let (sid, header, _, b) = a_then_b(off.path());
     assert!(

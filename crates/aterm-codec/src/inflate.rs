@@ -67,8 +67,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
-    /// Pull as many whole bytes as fit into the accumulator. The `<= 56` guard
-    /// keeps the shift below 64.
+    /// Pull as many whole bytes as fit into the accumulator.
     fn refill(&mut self) {
         let mut bits = self.bits_in_buffer;
         let mut buf = self.bit_buffer;
@@ -171,9 +170,7 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// Bits consulted by the flat root lookup table. Nine covers the whole fixed
-/// literal/length alphabet; longer codes fall back to the bit-at-a-time walk,
-/// so the table stays one flat level with no new error paths.
+/// Bits consulted by the flat root lookup table.
 const ROOT_BITS: u32 = 9;
 /// Entries in the root table: one per distinct `ROOT_BITS`-bit prefix.
 const ROOT_SIZE: usize = 1 << ROOT_BITS;
@@ -279,7 +276,6 @@ impl Huffman {
         for &c in count.iter().skip(1) {
             left = (left << 1).saturating_sub(i32::from(c));
             if left < 0 {
-                // over-subscribed code
                 return Err(InflateError::BadSymbol);
             }
         }
@@ -333,8 +329,7 @@ impl Huffman {
         self.decode_bitwise(br)
     }
 
-    /// Build this alphabet's root table if it does not have one yet. Called
-    /// once per block after `ROOT_BUILD_AFTER` symbols; kept out of line.
+    /// Build this alphabet's root table if it does not have one yet.
     #[cold]
     #[inline(never)]
     fn arm_root(&mut self) {
@@ -343,8 +338,7 @@ impl Huffman {
         }
     }
 
-    /// Decode one symbol one bit at a time (the `puff.c` walk). `#[inline]` so
-    /// an alphabet with no root table runs this with no extra call layer.
+    /// Decode one symbol one bit at a time (the `puff.c` walk).
     #[inline]
     fn decode_bitwise(&self, br: &mut BitReader) -> Result<u16, InflateError> {
         let mut code: i32 = 0;
@@ -539,8 +533,7 @@ fn inflate_block(
     block_loop::<true>(br, out, max_output, lit, dist, 0).map(|_| ())
 }
 
-/// The literal/match loop. `TABLE` selects the root-table decoder over the
-/// walk, so each phase compiles to a loop with only its own decoder.
+/// The literal/match loop.
 fn block_loop<const TABLE: bool>(
     br: &mut BitReader,
     out: &mut Vec<u8>,
@@ -596,8 +589,6 @@ fn block_loop<const TABLE: bool>(
             out.reserve(length);
             let start = cur - distance;
             if distance >= length {
-                // Non-overlapping: the source range is fully decoded, so the
-                // match is one memcpy.
                 out.extend_from_within(start..start.saturating_add(length));
             } else {
                 for i in 0..length {
@@ -703,15 +694,12 @@ fn adler32(data: &[u8]) -> u32 {
 #[inline]
 fn check_zlib_header(cmf: u8, flg: u8) -> Result<(), InflateError> {
     if (cmf & 0x0f) != 8 {
-        // CM must be 8 (DEFLATE)
         return Err(InflateError::BadZlibHeader);
     }
     if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
-        // FCHECK
         return Err(InflateError::BadZlibHeader);
     }
     if (flg & 0x20) != 0 {
-        // preset dictionary unsupported
         return Err(InflateError::BadZlibHeader);
     }
     Ok(())
@@ -731,15 +719,12 @@ pub fn zlib_decompress(input: &[u8], max_output: usize) -> Result<Vec<u8>, Infla
     let cmf = input[0];
     let flg = input[1];
     if (cmf & 0x0f) != 8 {
-        // CM must be 8 (DEFLATE)
         return Err(InflateError::BadZlibHeader);
     }
     if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
-        // FCHECK
         return Err(InflateError::BadZlibHeader);
     }
     if (flg & 0x20) != 0 {
-        // preset dictionary unsupported
         return Err(InflateError::BadZlibHeader);
     }
     let deflate = &input[2..input.len() - 4];
@@ -772,15 +757,12 @@ pub fn zlib_decompress_prefix(
     let cmf = input[0];
     let flg = input[1];
     if (cmf & 0x0f) != 8 {
-        // CM must be 8 (DEFLATE)
         return Err(InflateError::BadZlibHeader);
     }
     if ((u16::from(cmf) << 8) | u16::from(flg)) % 31 != 0 {
-        // FCHECK
         return Err(InflateError::BadZlibHeader);
     }
     if (flg & 0x20) != 0 {
-        // preset dictionary unsupported
         return Err(InflateError::BadZlibHeader);
     }
     let (out, used) = inflate_prefix(&input[2..], max_output)?;
@@ -823,8 +805,6 @@ mod tests {
         0x17, 0xc1, 0xd0, 0x5c, 0x27,
     ];
 
-    /// The prefix form reads the Adler-32 at the stream's end, ignores trailing
-    /// bytes, and reports where the stream ended.
     #[test]
     fn prefix_form_tolerates_bytes_after_the_stream() {
         for vector in [EMPTY, HELLO, STORED, BACKREFS, DYNAMIC] {
@@ -846,9 +826,6 @@ mod tests {
         }
     }
 
-    /// The whole-buffer form reads the Adler-32 where the DEFLATE data ends
-    /// (RFC 1950 §2.2): stray bytes before the input's last four make it refuse
-    /// the stream, as zlib does.
     #[test]
     fn whole_buffer_form_reads_the_checksum_where_the_stream_ends() {
         let stray_before_trailer = [
@@ -874,8 +851,6 @@ mod tests {
         }
     }
 
-    /// A corrupt checksum is still caught in the prefix form, and a stream that
-    /// ends before its own trailer is truncated, not silently accepted.
     #[test]
     fn prefix_form_still_checks_the_adler_and_the_length() {
         let mut bad = HELLO.to_vec();
@@ -892,9 +867,6 @@ mod tests {
         );
     }
 
-    /// Reference vectors: an empty stream, fixed-Huffman literals, a stored
-    /// block, fixed-Huffman back-references and a dynamic-Huffman block, plus the
-    /// bare DEFLATE body without its zlib wrapper.
     #[test]
     fn reference_vectors_decode() {
         let dynamic = "the quick brown fox jumps over the lazy dog while a programmer \
@@ -960,19 +932,13 @@ mod tests {
         assert!(left > 0);
     }
 
-    /// The stream from `incomplete_dynamic_huffman_rejected`: a malformed
-    /// dynamic block for the differential corpus.
     const INCOMPLETE_STREAM: &[u8] = &[
         0x78, 0x01, 0x05, 0xc0, 0x01, 0x09, 0x00, 0x00, 0x00, 0x80, 0xa0, 0x6d, 0xfd, 0x3f, 0x25,
         0x01, 0x00, 0x42, 0x00, 0x42,
     ];
 
-    /// Every zlib fixture here: stored, fixed and dynamic blocks plus a
-    /// rejected table.
     const CORPUS: &[&[u8]] = &[EMPTY, HELLO, STORED, BACKREFS, DYNAMIC, INCOMPLETE_STREAM];
 
-    /// The root table resolves the entire fixed literal/length alphabet (longest
-    /// code 9 bits = `ROOT_BITS`), filling every slot.
     #[test]
     fn root_table_resolves_every_fixed_literal_code() {
         let mut lit = fixed_lit();
@@ -1000,8 +966,6 @@ mod tests {
         }
     }
 
-    /// A code longer than `ROOT_BITS` leaves empty slots and still decodes,
-    /// through the fallback, identically.
     #[test]
     fn root_table_falls_back_for_codes_longer_than_root_bits() {
         let mut lengths = [0u16; 14];
@@ -1033,8 +997,6 @@ mod tests {
         }
     }
 
-    /// For every fixture, prefix and single-byte mutation, `inflate` and
-    /// `zlib_decompress` return the same `Result` with and without the table.
     #[test]
     fn table_and_bitwise_decoders_agree_on_corpus_prefixes_and_mutations() {
         let mut checked = 0usize;
@@ -1096,7 +1058,6 @@ mod tests {
         }
     }
 
-    /// RFC 1951 3.2.6 fixed literal/length code word for `sym`, MSB-first.
     fn fixed_lit_code(sym: u16) -> (u32, u32) {
         let mut lengths = [0u16; 288];
         for (i, len) in lengths.iter_mut().enumerate() {
@@ -1110,8 +1071,6 @@ mod tests {
         canonical_code_of(&lengths, sym as usize)
     }
 
-    /// Canonical code word for `want` under `lengths`, MSB-first, computed
-    /// independently of the code under test.
     fn canonical_code_of(lengths: &[u16], want: usize) -> (u32, u32) {
         let mut count = [0u32; MAXBITS + 2];
         for &l in lengths {
@@ -1139,8 +1098,6 @@ mod tests {
         (0, 0)
     }
 
-    /// Pack an MSB-first code word into DEFLATE's LSB-first byte order, padded
-    /// with enough trailing bytes that the reader never hits end-of-input.
     fn bits_to_bytes(code: u32, len: u32) -> Vec<u8> {
         let mut out = vec![0u8; 8];
         for i in 0..len {
@@ -1151,7 +1108,6 @@ mod tests {
         out
     }
 
-    /// One step of a deterministic LCG, so any failure reproduces exactly.
     fn next(state: &mut u64) -> u32 {
         *state = state
             .wrapping_mul(6_364_136_223_846_793_005)
@@ -1187,8 +1143,6 @@ mod tests {
         }
     }
 
-    /// Every strict prefix of a bare DEFLATE stream is `Truncated`: the
-    /// buffered bit reader never invents bits past the end of its input.
     #[test]
     fn every_strict_prefix_of_a_raw_stream_is_truncated() {
         for v in [EMPTY, HELLO, STORED, BACKREFS, DYNAMIC] {

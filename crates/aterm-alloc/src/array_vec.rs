@@ -57,8 +57,6 @@ impl<T, const N: usize> ArrayVec<T, N> {
     #[inline]
     #[must_use]
     pub const fn remaining_capacity(&self) -> usize {
-        // `len <= N` by invariant; `saturating_sub` makes the no-underflow obligation
-        // provable (identical result when the invariant holds).
         N.saturating_sub(self.len)
     }
 
@@ -84,8 +82,6 @@ impl<T, const N: usize> ArrayVec<T, N> {
             self.buf[len] = MaybeUninit::new(value);
             self.len = len.wrapping_add(1);
         } else {
-            // A const message (not `{N}`-formatted) so the contract_panic
-            // matcher can bind it.
             panic!("ArrayVec overflow: capacity exceeded");
         }
     }
@@ -420,10 +416,8 @@ impl<T: Clone, const N: usize> Clone for ArrayVec<T, N> {
         };
         self.as_mut_slice()[..prefix].clone_from_slice(&source.as_slice()[..prefix]);
         if prefix < self.len {
-            // `source` was shorter: drop our surplus tail.
             self.truncate(prefix);
         } else {
-            // `source` was longer (or equal): clone the difference in.
             self.extend_from_slice(&source.as_slice()[prefix..]);
         }
     }
@@ -445,9 +439,6 @@ impl<T: Eq, const N: usize> Eq for ArrayVec<T, N> {}
 
 impl<T, const N: usize> Drop for ArrayVec<T, N> {
     fn drop(&mut self) {
-        // Reuse `clear` (the bounds-clamped `truncate(0)`) instead of
-        // duplicating the slice — same drop-all-elements behaviour, no
-        // separate out-of-bounds obligation.
         self.clear();
     }
 }

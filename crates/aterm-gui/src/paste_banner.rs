@@ -3,19 +3,6 @@
 
 //! The multi-line-paste confirmation banner for platforms with no native alert (macOS asks
 //! through a window sheet, Windows through a `MessageBoxW`).
-//!
-//! The pending paste is parked on `App` ([`PendingPaste`]), so nothing reaches the PTY until it
-//! is answered, and this banner is spliced over the top grid rows with a sanitized preview and
-//! the answer keys. Enter delivers the parked text through the confirmed seam; Escape or a click
-//! on the banner drops it. Keys route through [`crate::alert_keys::confirm_key`], as the macOS
-//! sheet's do. There is no TTL: the banner stands until answered, and closing the window drops
-//! the parked text.
-//!
-//! The answer is bound to the session that asked. A tab click or `aterm ctl tab` can change the
-//! front session while the banner stands, so Enter delivers to the parked session, through the
-//! hidden-session seam if it is no longer in front.
-//!
-//! The row builder takes explicit `cols`/`panel_rows`, so it unit-tests without a window.
 
 use aterm_core::terminal::RenderCell;
 #[cfg(test)]
@@ -34,15 +21,12 @@ const MAX_PREVIEW_LINES: usize = MAX_BANNER_ROWS - 1;
 const MARGIN: usize = 2;
 const PREVIEW_INDENT: usize = MARGIN + 2;
 
-/// One parked multi-line paste awaiting an answer. `App` holds it as `Option<PendingPaste>`:
-/// `Some` means the banner is up, so there is at most one confirmation at a time. The text lives
-/// only here: dropping the entry is the cancel, so no exit path leaks an unconfirmed paste.
+/// One parked multi-line paste awaiting an answer.
 pub(crate) struct PendingPaste {
     /// The window the paste targets; only its keys answer, and the entry dies with the window.
     pub(crate) wid: crate::WindowId,
     /// The terminal session that fronted `wid` at the paste gesture, and the only one the answer
-    /// may reach. `None` when the window fronted native content, which keeps the ordinary
-    /// front-content routing.
+    /// may reach.
     pub(crate) session: Option<u64>,
     text: String,
     source: crate::input::Source,
@@ -61,7 +45,6 @@ pub(crate) fn next_question_serial() -> u64 {
 }
 
 impl PendingPaste {
-    // Built by `present_multiline_paste_banner` (neither macOS nor Windows) and by tests.
     #[cfg(any(test, not(any(target_os = "macos", windows))))]
     pub(crate) fn new(
         wid: crate::WindowId,
@@ -113,8 +96,7 @@ impl PendingPaste {
     }
 }
 
-/// `s` cut to `max` cells, ending in an ellipsis when it does not fit. The close-confirm panel
-/// uses it too.
+/// `s` cut to `max` cells, ending in an ellipsis when it does not fit.
 pub(crate) fn ellipsized(s: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -144,8 +126,7 @@ pub(crate) const ANSWER_KEYS: &str = "Enter pastes \u{00b7} Esc cancels";
 const ANSWER_KEYS_SHORT: &str = "Enter \u{00b7} Esc";
 
 /// Why the paste is asked about: the guard fires only when bracketed paste is off,
-/// so each line end submits. Named once for the band, its announcement, the macOS
-/// sheet and the Windows dialog.
+/// so each line end submits.
 pub(crate) const RISK: &str = "Each line may run as a command.";
 
 /// The accessible alert's description: the risk, then the answer keys.
@@ -156,8 +137,7 @@ pub(crate) fn announcement_detail() -> String {
 
 /// Row 0's title and the answer keys that fit beside it in `cols`: the risk goes
 /// first, then the verbs; `None` when even the short keys do not fit, and they take
-/// a row of their own. [`banner_rows`] paints by it and
-/// [`PendingPaste::wanted_rows`] sizes by it, so the two agree.
+/// a row of their own.
 fn title_row(text: &str, cols: usize) -> (String, Option<&'static str>) {
     let question = format!("!  {}", question(text));
     let with_risk = format!("{question}  {RISK}");
@@ -173,9 +153,7 @@ fn title_row(text: &str, cols: usize) -> (String, Option<&'static str>) {
     (question, keys)
 }
 
-/// The question the banner asks about `text`, as one sentence. The title row and the accessible
-/// alert's name both come from here, so they cannot claim different line counts. Words
-/// only: the painted warn mark is added by [`banner_rows`].
+/// The question the banner asks about `text`, as one sentence.
 pub(crate) fn question(text: &str) -> String {
     format!("Paste {}?", lines_words(paste_lines(text).len()))
 }
@@ -191,8 +169,7 @@ pub(crate) fn lines_words(n: usize) -> String {
 }
 
 /// The lines a paste would enter, split the way a shell reads them: LF, CRLF
-/// and a lone CR each end one. One trailing line end is not a line of its own
-/// (`make test\n` is one line, which its newline submits).
+/// and a lone CR each end one.
 pub(crate) fn paste_lines(text: &str) -> Vec<&str> {
     if text.is_empty() {
         return Vec::new();
@@ -202,8 +179,6 @@ pub(crate) fn paste_lines(text: &str) -> Vec<&str> {
     let mut parts = body.split('\n').peekable();
     let mut lines = Vec::new();
     while let Some(line) = parts.next() {
-        // A CR is half of a CRLF only when an LF followed it; the last
-        // segment's trailing CR ends a line of its own.
         let line = if parts.peek().is_some() {
             line.strip_suffix('\r').unwrap_or(line)
         } else {
@@ -215,9 +190,7 @@ pub(crate) fn paste_lines(text: &str) -> Vec<&str> {
 }
 
 /// Pure row builder: exactly `panel_rows` rows, each exactly `cols` wide, so the splice
-/// overwrites frame rows in place. Row 0 carries the [`question`] with the [`ANSWER_KEYS`]
-/// right-aligned; the rows below preview the paste body, sanitized and ellipsized, with a
-/// "+N more lines" tally when it overflows.
+/// overwrites frame rows in place.
 pub(crate) fn banner_rows(
     text: &str,
     cols: usize,
@@ -233,8 +206,6 @@ pub(crate) fn banner_rows(
     }
     let lines = paste_lines(text);
     let (title, row0_keys) = title_row(text, cols);
-    // The answer keys are written in `value`, not the dim `label`: every other key is
-    // swallowed, so they are the only way out and never drop.
     let mut first_preview = 1;
     if let Some(keys) = row0_keys {
         write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
@@ -250,8 +221,6 @@ pub(crate) fn banner_rows(
         write_str(&mut rows[1], cols, MARGIN, keys, c.value, c.bar_bg, true);
         first_preview = 2;
     } else {
-        // One row and no room for both: the keys keep their place at the right
-        // and the question is cut to what is left.
         let keys_col = cols.saturating_sub(ANSWER_KEYS_SHORT.chars().count() + MARGIN);
         let title = ellipsized(&title, keys_col.saturating_sub(MARGIN + 1));
         write_str(&mut rows[0], cols, MARGIN, &title, c.warn, c.bar_bg, true);
@@ -266,9 +235,6 @@ pub(crate) fn banner_rows(
         );
     }
 
-    // Preview capacity: every row after the title (and the keys, when they took a
-    // row), reserving the last for the "+N more" tally when the paste overflows
-    // and there is room to say so.
     let capacity = panel_rows.saturating_sub(first_preview);
     let overflow = lines.len() > capacity;
     let shown = if overflow && capacity >= 2 {
@@ -309,8 +275,6 @@ pub(crate) fn banner_rows(
             false,
         );
     }
-    // `write_str` rebuilds each cell without an overline, so the top edge is re-sealed here,
-    // in the label tone: the rule belongs to neither the warn title nor the answer keys.
     chrome_band::seal_band_top(&mut rows[0], c.seam);
     rows
 }
@@ -330,12 +294,9 @@ mod tests {
         assert_eq!(question("echo a\recho b"), "Paste 2 lines?");
         assert_eq!(question("a\r\nb\r\n"), "Paste 2 lines?");
         assert_eq!(question("a\nb\n"), "Paste 2 lines?");
-        // The guard asks about these, so the count must not read 1; CR and LF
-        // forms of the same text count alike.
         assert_eq!(question("a\r\r"), "Paste 2 lines?");
         assert_eq!(question("a\rb\r\r"), "Paste 3 lines?");
         assert_eq!(question("a\nb\n\n"), "Paste 3 lines?");
-        // One command plus its newline is asked about when unbracketed.
         assert_eq!(question("make test\n"), "Paste 1 line?");
         let rows = banner_rows("echo a\recho b", 80, 3, Theme::default());
         assert!(
@@ -367,8 +328,6 @@ mod tests {
                 .map(|(col, _)| col)
                 .collect::<Vec<_>>()
         );
-        // One tone: the row carries two inks, so a seam left to each cell's `fg` would change
-        // colour along the hairline.
         let seams: std::collections::BTreeSet<Option<[u8; 3]>> =
             question.iter().map(|cell| cell.overline_color).collect();
         assert_eq!(
@@ -386,7 +345,6 @@ mod tests {
             inks.len() > 1,
             "the question row is meant to carry two inks, so this proof is not vacuous: {inks:?}"
         );
-        // Only the top row is an edge; the preview rows sit inside the band.
         assert!(rows[1].iter().all(|cell| !cell.overline));
     }
 
@@ -407,7 +365,6 @@ mod tests {
         assert_eq!(pending.wanted_rows(80), MAX_BANNER_ROWS);
         let rows = banner_rows(&text, 80, MAX_BANNER_ROWS, Theme::default());
         let last = text_of(&rows[MAX_BANNER_ROWS - 1]);
-        // 5 rows = title + 3 preview lines + the tally for the remaining 17.
         assert!(last.contains("+17 more lines"), "{last:?}");
         assert!(text_of(&rows[3]).contains("line 2"), "three lines shown");
     }
@@ -450,8 +407,6 @@ mod tests {
                 "{cols} cols: {shown:?}"
             );
         }
-        // Too narrow for even the short keys beside the question: they take row 1,
-        // the band grows by that row, and every line is still previewed.
         let pending = PendingPaste::new(
             crate::WindowId(0),
             Some(11),
@@ -472,7 +427,6 @@ mod tests {
             "{:?}",
             text_of(&rows[4])
         );
-        // One command plus its newline is asked about, so it is shown too.
         let one = PendingPaste::new(
             crate::WindowId(0),
             Some(11),
@@ -487,7 +441,6 @@ mod tests {
             "{:?}",
             text_of(&rows[2])
         );
-        // A one-row band keeps the keys and cuts the question.
         let row0 = text_of(&banner_rows(text, 24, 1, Theme::default())[0]);
         assert!(row0.contains("Enter") && row0.contains("Esc"), "{row0:?}");
     }

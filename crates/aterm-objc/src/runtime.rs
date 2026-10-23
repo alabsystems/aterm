@@ -243,21 +243,12 @@ pub struct ObjcSuper {
     pub super_class: ClassPtr,
 }
 
-// The send entry points are `"C-unwind"`. An `NSException` raised inside a
-// send unwinds through the calling Rust frame as a foreign exception; under
-// `extern "C"` (`nounwind`) that frame has no landing pad, so its `Drop`s are
-// skipped, the process aborts with `failed to initiate panic`, or LLVM deletes
-// a `catch_unwind` around nounwind calls. `"C-unwind"` runs every destructor
-// on the way to [`crate::exception`]'s containment at no hot-path cost.
-// [`MsgFn`] is implemented for `unsafe extern "C-unwind" fn(..)` only, since
-// one `"C"` frame on the raise path loses the frames above it.
 #[link(name = "objc")]
 unsafe extern "C-unwind" {
-    /// Declared with no parameter list on purpose. Every call goes through
-    /// [`msg`], which casts it to the exact prototype of the selector.
+    /// Declared with no parameter list on purpose.
     fn objc_msgSend();
     /// Same discipline as [`objc_msgSend`], but the first argument is a
-    /// `*const ObjcSuper` rather than the receiver. Cast through [`msg_super`].
+    /// `*const ObjcSuper` rather than the receiver.
     fn objc_msgSendSuper();
 }
 
@@ -869,36 +860,6 @@ pub unsafe fn autorelease(obj: Id) -> Id {
 }
 
 /// An `@autoreleasepool` scope.
-///
-/// Not a bare RAII guard: `!Send` and `!Clone` do not imply LIFO drop order,
-/// and popping an outer pool before an inner one frees what the inner pool
-/// holds and then aborts in the runtime:
-///
-/// ```text
-/// Invalid or prematurely-freed autorelease pool … Invalid autorelease pools
-/// are a fatal error
-/// ```
-///
-/// So the token constructor is `unsafe` and [`autoreleasepool`]'s nested scopes
-/// are the safe API; an inner scope cannot outlive the outer one.
-///
-/// This does not compile:
-///
-/// ```compile_fail
-/// # use aterm_objc::AutoreleasePool;
-/// let outer = AutoreleasePool::new();
-/// let inner = AutoreleasePool::new();
-/// drop(outer);
-/// drop(inner);
-/// ```
-///
-/// The same intent, as scopes:
-///
-/// ```
-/// # use aterm_objc::autoreleasepool;
-/// let n = autoreleasepool(|_outer| autoreleasepool(|_inner| 7));
-/// assert_eq!(n, 7);
-/// ```
 pub struct AutoreleasePool(*mut c_void);
 
 impl AutoreleasePool {

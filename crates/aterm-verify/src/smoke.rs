@@ -129,7 +129,7 @@ pub fn retire_smoke_child(child: &mut Child) -> (bool, String) {
 pub(crate) fn exited_on_its_own(pid: u32) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(60);
     loop {
-        let stat = Command::new("ps")
+        let stat = Command::new(aterm_uds::os_path!("ps"))
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -164,7 +164,7 @@ pub fn reads_locked(ioreg: &str) -> bool {
 /// [`ACTIVATE_DEADLINE_SECS`] until `NSWorkspace` reports it frontmost.
 #[must_use]
 pub fn activate_macos_gui_pid(pid: u32) -> bool {
-    const SWIFT: &str = "/usr/bin/swift";
+    const SWIFT: &str = aterm_uds::os_path!("swift");
     if !Path::new(SWIFT).exists() {
         return false;
     }

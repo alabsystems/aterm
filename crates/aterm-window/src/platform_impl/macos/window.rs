@@ -6,9 +6,6 @@
 
 #![allow(clippy::unnecessary_cast)]
 
-// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
-// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
-// and its framework bindings.
 use aterm_objc::send::send_v;
 use aterm_objc::{autoreleasepool, sel, Bool, Id, MainThread, MainThreadBound};
 
@@ -44,17 +41,12 @@ impl Window {
         attributes: WindowAttributes,
     ) -> Result<Self, RootOsError> {
         let mtm = window_target.mtm;
-        // LOCAL PATCH (aterm): the display-free loop (`headless.rs`) has no application, so no
-        // window.
         let Some(app_delegate) = window_target.app_delegate() else {
             return Err(os_error!(super::OsError::CreationError(
                 "cannot create a window on a headless event loop: it has no display"
             )));
         };
-        let delegate = autoreleasepool(|_| {
-            // LOCAL PATCH (aterm), W9: `WindowDelegate::new` takes a witness now.
-            WindowDelegate::new(app_delegate, attributes, mtm)
-        })?;
+        let delegate = autoreleasepool(|_| WindowDelegate::new(app_delegate, attributes, mtm))?;
         Ok(Window {
             window: MainThreadBound::new(delegate.window().retained(), mtm),
             delegate: MainThreadBound::new(delegate, mtm),
@@ -62,7 +54,6 @@ impl Window {
     }
 
     pub(crate) fn maybe_queue_on_main(&self, f: impl FnOnce(&WindowDelegate) + Send + 'static) {
-        // For now, don't actually do queuing, since it may be less predictable
         self.maybe_wait_on_main(f)
     }
 
@@ -73,7 +64,7 @@ impl Window {
         self.delegate.get_on_main(|delegate| f(delegate))
     }
 
-    /// LOCAL PATCH (aterm), 2026-10-15: the content view behind `aterm_objc::HasNsView` (`platform/macos.rs`); nil off the main thread, where the `rwh_06` handle below answers `Unavailable`.
+    /// The content view behind `aterm_objc::HasNsView`; nil off the main thread.
     #[inline]
     pub(crate) fn ns_view(&self) -> Id {
         MainThread::new().map_or(Id::NIL, |mtm| self.delegate.get(mtm).ns_view())
@@ -121,7 +112,6 @@ impl From<u64> for WindowId {
     }
 }
 
-// LOCAL PATCH (aterm): declared by `aterm_objc::declare_class!`, where upstream used objc2's.
 aterm_objc::declare_class! {
     /// The `NSWindow` subclass every winit window on macOS is an instance of.
     #[derive(Debug)]
@@ -153,7 +143,7 @@ impl WinitWindow {
         WindowId(window.addr())
     }
 
-    /// A +1 handle to this window — objc2's `NSObjectProtocol::retain`, which this class no longer inherits.
+    /// A +1 handle to this window.
     pub(super) fn retained(&self) -> aterm_objc::Retained<Self> {
         // SAFETY: `self` borrows a live instance of this class, so `as_id()` is a live non-null receiver for `objc_retain`.
         unsafe { aterm_objc::Retained::retain(self.as_id()) }.expect("retaining a live WinitWindow")

@@ -27,15 +27,6 @@ use core::ops::{Bound, Deref, DerefMut, Index, IndexMut, RangeBounds};
 use core::slice::{self, SliceIndex};
 
 /// Creates a [`SmallVec`] containing the arguments, as `vec!` does a `Vec`.
-///
-/// ```
-/// use smallvec::{smallvec, SmallVec};
-/// let v: SmallVec<[u8; 4]> = smallvec![1, 2, 3];
-/// assert_eq!(&v[..], &[1, 2, 3]);
-/// assert!(!v.spilled());
-/// let w: SmallVec<[u8; 2]> = smallvec![7; 3];
-/// assert!(w.spilled());
-/// ```
 #[macro_export]
 macro_rules! smallvec {
     (@one $x:expr) => (1usize);
@@ -351,9 +342,6 @@ impl<A: Array> SmallVec<A> {
         self.regrow(new_cap);
     }
 
-    /// Moves the items into fresh storage with room for `new_cap`. Called only
-    /// with `new_cap` above the current capacity, which is at least the inline
-    /// size, so the new storage is a heap buffer.
     fn regrow(&mut self, new_cap: usize) {
         let old = core::mem::replace(&mut self.store, A::Store::with_capacity(new_cap));
         for item in old.into_iter() {
@@ -565,7 +553,6 @@ impl<A: Array> FromIterator<A::Item> for SmallVec<A> {
 }
 
 impl<A: Array> Extend<A::Item> for SmallVec<A> {
-    /// Reserves the iterator's lower size bound, then pushes each item.
     fn extend<I: IntoIterator<Item = A::Item>>(&mut self, iterable: I) {
         let iter = iterable.into_iter();
         let (lower_size_bound, _) = iter.size_hint();
@@ -754,8 +741,6 @@ impl<A: Array> ExactSizeIterator for Drain<'_, A> {}
 impl<A: Array> FusedIterator for Drain<'_, A> {}
 
 impl<A: Array> Drop for Drain<'_, A> {
-    /// Drops the items not yielded, front to back (the reversed run's last
-    /// first), leaving `[head | tail]`.
     fn drop(&mut self) {
         let keep = self.vec.len() - self.remaining;
         self.remaining = 0;

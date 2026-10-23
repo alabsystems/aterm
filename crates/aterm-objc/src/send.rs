@@ -1,25 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One `unsafe fn` per C prototype — the typed sends every call site needs — and [`checked_msg`], the checked cast they and every hand-written send are built on.
-//!
-//! # Ownership
-//!
-//! None of these retains, releases or autoreleases: an `alloc`/`new`/`copy`/`mutableCopy`
-//! result goes into [`crate::Obj`] or [`crate::Retained`]; anything else is borrowed until the
-//! enclosing [`crate::autoreleasepool`] pops.
-//!
+//! One `unsafe fn` per C prototype — the typed sends every call site needs.
 //! # Safety
-//!
-//! Every function is `unsafe` because the caller asserts that `sel` has the C prototype the
-//! function's name spells and that `recv` is a live receiver that responds to it. The wrong
-//! helper corrupts registers exactly as a wrong hand-written cast would.
+//! Every function is `unsafe` because the caller asserts that `sel` has the C prototype the function's name spells and that `recv` is a live receiver that responds to it. The wrong helper corrupts registers exactly as a wrong hand-written cast would.
 
 use std::ffi::CStr;
 
 use crate::{Bool, CGPoint, CGRect, CGSize, ClassPtr, Encode, Id, MsgFn, Sel};
 
-/// What a checked send may be addressed to: an object, or a class (whose methods are its metaclass's instance methods, which the check reads off the class's own class).
+/// What a checked send may be addressed to: an object, or a class.
 /// # Safety
 /// `receiver_id` must return the receiver unchanged, as the object pointer the runtime dispatches on.
 pub unsafe trait Receiver: Copy + Encode {
@@ -41,7 +31,7 @@ unsafe impl Receiver for ClassPtr {
     }
 }
 
-/// A send prototype [`checked_msg`] can build: `unsafe extern "C-unwind" fn(R, Sel, A0, …) -> Ret` with a [`Receiver`] first, the selector second, and an [`Encode`] type in every other position, up to fourteen arguments (the [`MsgFn`] ceiling).
+/// A send prototype [`checked_msg`] can build.
 /// # Safety
 /// Implemented here for exactly those function-pointer types; `get` returns a pointer of the implementing type whose call sends the message.
 pub unsafe trait CheckedFn: MsgFn {
@@ -49,25 +39,12 @@ pub unsafe trait CheckedFn: MsgFn {
     #[doc(hidden)]
     fn get() -> Self;
 
-    /// The `(self, _cmd, …)` method type this prototype sends, offsets aside (`v@:@?` for `fn(Id, Sel, BlockPtr)`): what the prototype check compares with the runtime's.
+    /// The `(self, _cmd, …)` method type this prototype sends, offsets aside.
     #[doc(hidden)]
     fn types() -> String;
 }
 
-/// [`crate::msg`], checked in a debug build at every call against the runtime's encoding of the method the receiver's class runs for the selector (the module's prototype check); the bare cast in a release build.
-///
-/// The returned pointer is called exactly as a [`crate::msg`] cast is:
-///
-/// ```no_run
-/// # use aterm_objc::{Id, Sel, checked_msg, sel};
-/// # let string: Id = Id::NIL;
-/// // SAFETY: `-length` is `-(NSUInteger)length` on a live NSString.
-/// let len = unsafe {
-///     let f: unsafe extern "C-unwind" fn(Id, Sel) -> usize = checked_msg();
-///     f(string, sel!(length))
-/// };
-/// ```
-///
+/// [`crate::msg`], checked in a debug build at every call against the runtime's encoding of the method the receiver's class runs for the selector.
 /// # Safety
 /// As [`crate::msg`]: `F` must be the exact C prototype of every selector the pointer is called with.
 #[inline]
@@ -243,7 +220,7 @@ unsafe fn mismatch(cls: ClassPtr, sel: Sel, runtime: &str, ours: &str) -> Option
     ))
 }
 
-/// THE PROTOTYPE CHECK, AHEAD OF TIME: whether a send cast to `F` can call the method `cls` runs for `sel`, compared exactly as [`checked_msg`]'s debug check compares it at the call, but without sending.
+/// THE PROTOTYPE CHECK, AHEAD OF TIME.
 /// # Safety
 /// `cls` must be a live class object.
 pub unsafe fn prototype_check<F: CheckedFn>(cls: ClassPtr, sel: Sel) -> Result<(), String> {
@@ -263,7 +240,7 @@ pub unsafe fn prototype_check<F: CheckedFn>(cls: ClassPtr, sel: Sel) -> Result<(
     }
 }
 
-/// The signatures an extended method type encoding records for its block arguments, in order, each the text between `@?<` and its `>`: `v40@0:8@"NSString"16@?<v@?@"UNNotificationSettings">24` gives `v@?@"UNNotificationSettings"`.
+/// The signatures an extended method type encoding records for its block arguments, in order, each the text between `@?<` and its `>`.
 #[must_use]
 pub fn block_signatures(extended: &str) -> Vec<String> {
     let b = extended.as_bytes();
@@ -293,7 +270,7 @@ pub fn block_signatures(extended: &str) -> Vec<String> {
     out
 }
 
-/// Whether a block of prototype `P` is the block `signature` describes (one of [`block_signatures`]), in every way the call ABI can feel: the [`prototype_check`] comparison for a block, whose first argument is the block itself (`@?`).
+/// Whether a block of prototype `P` is the block `signature` describes (one of [`block_signatures`]), in every way the call ABI can feel.
 pub fn block_check<P: crate::BlockFn>(signature: &str) -> Result<(), String> {
     let theirs = crate::strip_method_offsets(signature);
     let ours = P::types();
@@ -431,8 +408,7 @@ fn type_end(b: &[u8], i: usize) -> usize {
 
 /// `+alloc` on `cls` — a +1, zero-filled, uninitialised instance.
 /// # Safety
-/// `cls` must be a live, registered class. The result is +1 and the caller owes it exactly one
-/// `-init…` and one eventual release.
+/// `cls` must be a live, registered class. The result is +1 and the caller owes it exactly one `-init…` and one eventual release.
 #[must_use]
 pub unsafe fn alloc(cls: ClassPtr) -> Id {
     // SAFETY: `+alloc` is `-(id)(Class, SEL)` on every class in the runtime.
@@ -543,7 +519,7 @@ pub unsafe fn send_id_id(recv: Id, sel: Sel, a: Id) -> Id {
     }
 }
 
-/// `-(id)sel:(id)a b:(SEL)b c:(id)c` — `NSMenuItem`'s designated initializer shape (`initWithTitle:action:keyEquivalent:`).
+/// `-(id)sel:(id)a b:(SEL)b c:(id)c` — `NSMenuItem`'s designated initializer shape.
 /// # Safety
 /// See the module note, including the ownership paragraph.
 #[must_use]
@@ -615,7 +591,7 @@ pub unsafe fn send_bool_sel(recv: Id, sel: Sel, a: Sel) -> bool {
     }
 }
 
-/// `-(BOOL)sel:(id)a` — `-isEqual:`, `-conformsToProtocol:`, …
+/// `-(BOOL)sel:(id)a` — `-isEqual:`, `-conformsToProtocol:`, ….
 /// # Safety
 /// See the module note.
 #[must_use]
@@ -726,7 +702,7 @@ pub unsafe fn send_v_id_id_id(recv: Id, sel: Sel, a: Id, b: Id, c: Id) {
     }
 }
 
-/// `-(void)sel:(id)a b:(NSInteger)b c:(id)c` — `-[NSView addSubview:positioned:relativeTo:]`, whose middle argument is an `NSWindowOrderingMode`.
+/// `-(void)sel:(id)a b:(NSInteger)b c:(id)c`.
 /// # Safety
 /// See the module note.
 pub unsafe fn send_v_id_isize_id(recv: Id, sel: Sel, a: Id, b: isize, c: Id) {
@@ -761,7 +737,7 @@ pub unsafe fn send_point_point(recv: Id, sel: Sel, a: CGPoint) -> CGPoint {
     }
 }
 
-/// `-(NSPoint)sel:(NSPoint)a fromView:(id)b` — `-[NSView convertPoint:fromView:]`, where a nil `b` means window coordinates.
+/// `-(NSPoint)sel:(NSPoint)a fromView:(id)b` — `-[NSView convertPoint:fromView:]`.
 /// # Safety
 /// See the module note.
 #[must_use]
@@ -790,7 +766,7 @@ pub unsafe fn send_rect_rect_id(recv: Id, sel: Sel, a: CGRect, b: Id) -> CGRect 
     }
 }
 
-/// `-(id)sel:(NSUInteger)a` — `-[NSWindow standardWindowButton:]`, whose argument is an `NSWindowButton`: an `NSUInteger` enum, not an `NSInteger`.
+/// `-(id)sel:(NSUInteger)a`.
 /// # Safety
 /// See the module note, including the ownership paragraph.
 #[must_use]
@@ -802,7 +778,7 @@ pub unsafe fn send_id_usize(recv: Id, sel: Sel, a: usize) -> Id {
     }
 }
 
-/// `-(id)sel:(NSRect)a xRadius:(CGFloat)b yRadius:(CGFloat)c` — `+[NSBezierPath bezierPathWithRoundedRect:xRadius:yRadius:]`.
+/// `-(id)sel:(NSRect)a xRadius:(CGFloat)b yRadius:(CGFloat)c`.
 /// # Safety
 /// See the module note, including the ownership paragraph.
 #[must_use]
@@ -814,7 +790,7 @@ pub unsafe fn send_id_rect_f64_f64(recv: Id, sel: Sel, a: CGRect, b: f64, c: f64
     }
 }
 
-/// `-(id)sel:(CGFloat)a b:(CGFloat)b c:(CGFloat)c d:(CGFloat)d` — `+[NSColor colorWithSRGBRed:green:blue:alpha:]`.
+/// `-(id)sel:(CGFloat)a b:(CGFloat)b c:(CGFloat)c d:(CGFloat)d`.
 /// # Safety
 /// See the module note, including the ownership paragraph.
 #[must_use]
@@ -826,7 +802,7 @@ pub unsafe fn send_id_f64_f64_f64_f64(recv: Id, sel: Sel, a: f64, b: f64, c: f64
     }
 }
 
-/// `-(id)sel:(NSRect)a options:(NSUInteger)b owner:(id)c userInfo:(id)d` — `-[NSTrackingArea initWithRect:options:owner:userInfo:]`.
+/// `-(id)sel:(NSRect)a options:(NSUInteger)b owner:(id)c userInfo:(id)d`.
 /// # Safety
 /// See the module note, including the ownership paragraph.
 #[must_use]
@@ -892,8 +868,7 @@ pub unsafe fn send_v_id_isize(recv: Id, sel: Sel, a: Id, b: isize) {
 
 /// `-(void)sel:(id)a b:(id)b c:(NSUInteger)c d:(void *)d`.
 /// # Safety
-/// See the module note. `d` is not dereferenced here and must satisfy whatever the observing method
-/// assumes of it.
+/// See the module note. `d` is not dereferenced here and must satisfy whatever the observing method assumes of it.
 pub unsafe fn send_v_id_id_usize_ptr(
     recv: Id,
     sel: Sel,
@@ -934,8 +909,7 @@ pub unsafe fn send_v_id_sel_id_id(recv: Id, sel: Sel, a: Id, b: Sel, c: Id, d: I
 
 /// `+(id)sel:(const id *)a count:(NSUInteger)b`.
 /// # Safety
-/// See the module note, including the ownership paragraph. `a` must point to at least `b` live
-/// object pointers, none of them nil.
+/// See the module note, including the ownership paragraph. `a` must point to at least `b` live object pointers, none of them nil.
 #[must_use]
 pub unsafe fn send_id_idptr_usize(recv: Id, sel: Sel, a: *const Id, b: usize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -975,8 +949,7 @@ pub unsafe fn send_isize_usize(recv: Id, sel: Sel, a: usize) -> isize {
 
 /// `-(NSInteger)sel:(NSRect)a owner:(id)b userData:(void *)c assumeInside:(BOOL)d`.
 /// # Safety
-/// See the module note. `b` is not retained, so it must outlive the tracking rect or be removed
-/// first.
+/// See the module note. `b` is not retained, so it must outlive the tracking rect or be removed first.
 pub unsafe fn send_isize_rect_id_ptr_bool(
     recv: Id,
     sel: Sel,
@@ -1096,7 +1069,7 @@ pub unsafe fn send_id_usize_point_usize_f64_isize_id_id_id_bool_u16(
     }
 }
 
-/// `+[NSEvent otherEventWithType:location:modifierFlags:timestamp:windowNumber: context:subtype:data1:data2:]` — the application-defined event constructor.
+/// `+[NSEvent otherEventWithType:location:modifierFlags:timestamp:windowNumber: context:subtype:data1:data2:]`.
 /// # Safety
 /// See the module note, including the ownership paragraph — the result is +0 autoreleased, not +1.
 #[must_use]
@@ -1147,8 +1120,7 @@ pub unsafe fn send_f32(recv: Id, sel: Sel) -> f32 {
 
 /// `-(id)sel:(SEL)a`.
 /// # Safety
-/// See the module note, including the ownership paragraph. The result follows the invoked method's
-/// convention; the `+…Cursor` accessors return +0.
+/// See the module note, including the ownership paragraph. The result follows the invoked method's convention; the `+…Cursor` accessors return +0.
 #[must_use]
 pub unsafe fn send_id_sel(recv: Id, sel: Sel, a: Sel) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1172,8 +1144,7 @@ pub unsafe fn send_usize_usize(recv: Id, sel: Sel, a: usize) -> usize {
 
 /// `-(unsigned char *)sel` — an interior pointer into the receiver's storage.
 /// # Safety
-/// See the module note. The pointer is valid only while `recv` is alive and its buffer is not
-/// reallocated.
+/// See the module note. The pointer is valid only while `recv` is alive and its buffer is not reallocated.
 #[must_use]
 pub unsafe fn send_charptr(recv: Id, sel: Sel) -> *mut core::ffi::c_uchar {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1185,8 +1156,7 @@ pub unsafe fn send_charptr(recv: Id, sel: Sel) -> *mut core::ffi::c_uchar {
 
 /// `-(id)sel:(const void *)a length:(NSUInteger)b`.
 /// # Safety
-/// See the module note, including the ownership paragraph — an initialiser, so the result is +1.
-/// `a` must point to at least `b` readable bytes for the call; they are copied.
+/// See the module note, including the ownership paragraph — an initialiser, so the result is +1. `a` must point to at least `b` readable bytes for the call; they are copied.
 #[must_use]
 pub unsafe fn send_id_cptr_usize(recv: Id, sel: Sel, a: *const core::ffi::c_void, b: usize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1197,11 +1167,9 @@ pub unsafe fn send_id_cptr_usize(recv: Id, sel: Sel, a: *const core::ffi::c_void
     }
 }
 
-/// `-[NSBitmapImageRep initWithBitmapDataPlanes:pixelsWide:pixelsHigh: bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow: bitsPerPixel:]` — the ten-argument raw-bitmap initialiser.
+/// `-[NSBitmapImageRep initWithBitmapDataPlanes:pixelsWide:pixelsHigh: bitsPerSample:samplesPerPixel:hasAlpha:isPlanar:colorSpaceName:bytesPerRow: bitsPerPixel:]`.
 /// # Safety
-/// See the module note, including the ownership paragraph — an initialiser, so the result is +1.
-/// `a` must be null or point to `spp` plane pointers; `h` must be a live `NSColorSpaceName` (an
-/// `NSString`).
+/// See the module note, including the ownership paragraph — an initialiser, so the result is +1. `a` must be null or point to `spp` plane pointers; `h` must be a live `NSColorSpaceName` (an `NSString`).
 #[must_use]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn send_id_planeptr_isize_isize_isize_isize_bool_bool_id_isize_isize(
@@ -1265,8 +1233,7 @@ pub unsafe fn send_id_size(recv: Id, sel: Sel, a: CGSize) -> Id {
 
 /// `-(id)sel:(id)a hotSpot:(NSPoint)b`.
 /// # Safety
-/// See the module note, including the ownership paragraph — an initialiser, so the result is +1.
-/// `a` must be a live `NSImage`; the receiver retains it.
+/// See the module note, including the ownership paragraph — an initialiser, so the result is +1. `a` must be a live `NSImage`; the receiver retains it.
 #[must_use]
 pub unsafe fn send_id_id_point(recv: Id, sel: Sel, a: Id, b: CGPoint) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1278,8 +1245,7 @@ pub unsafe fn send_id_id_point(recv: Id, sel: Sel, a: Id, b: CGPoint) -> Id {
 
 /// `-(id)sel:(id)a withInteger:(NSInteger)b`.
 /// # Safety
-/// See the module note, including the ownership paragraph — the result is +0 and borrowed. `a` must
-/// be a live object of the class the selector expects.
+/// See the module note, including the ownership paragraph — the result is +0 and borrowed. `a` must be a live object of the class the selector expects.
 #[must_use]
 pub unsafe fn send_id_id_isize(recv: Id, sel: Sel, a: Id, b: isize) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1291,8 +1257,7 @@ pub unsafe fn send_id_id_isize(recv: Id, sel: Sel, a: Id, b: isize) -> Id {
 
 /// `-(id)sel:(NSUInteger)a withObject:(id)b`.
 /// # Safety
-/// See the module note, including the ownership paragraph — the result is +0 and borrowed. `b` must
-/// be nil or a live object of the expected class.
+/// See the module note, including the ownership paragraph — the result is +0 and borrowed. `b` must be nil or a live object of the expected class.
 #[must_use]
 pub unsafe fn send_id_usize_id(recv: Id, sel: Sel, a: usize, b: Id) -> Id {
     // SAFETY: the caller pins the prototype; this is the cast for it.
@@ -1304,8 +1269,7 @@ pub unsafe fn send_id_usize_id(recv: Id, sel: Sel, a: usize, b: Id) -> Id {
 
 /// `-(void)sel:(void *)a length:(NSUInteger)b`.
 /// # Safety
-/// See the module note. `a` must point at `b` writable bytes, and `b` must not exceed the
-/// receiver's length (`NSData` raises rather than truncating).
+/// See the module note. `a` must point at `b` writable bytes, and `b` must not exceed the receiver's length (`NSData` raises rather than truncating).
 pub unsafe fn send_v_ptr_usize(recv: Id, sel: Sel, a: *mut core::ffi::c_void, b: usize) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {
@@ -1348,8 +1312,7 @@ pub unsafe fn send_id_id_id_id(recv: Id, sel: Sel, a: Id, b: Id, c: Id) -> Id {
 
 /// `-(void)sel:(SEL)a`.
 /// # Safety
-/// See the module note. AppKit stores the selector and sends it to the target later; that the
-/// target answers it is the caller's obligation.
+/// See the module note. AppKit stores the selector and sends it to the target later; that the target answers it is the caller's obligation.
 pub unsafe fn send_v_sel(recv: Id, sel: Sel, a: Sel) {
     // SAFETY: the caller pins the prototype; this is the cast for it.
     unsafe {

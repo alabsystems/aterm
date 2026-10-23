@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pre-claim gates, each failing closed with its remedy before anything is committed or pushed, so a failed gate costs seconds rather than a ledger number.
+//! Pre-claim gates, each failing closed with its remedy before anything is committed or pushed.
 
 use aterm_uds::spawnfd::{Command, command};
 use std::env;
@@ -16,7 +16,7 @@ use crate::release::Refusal;
 /// Free-disk floor for the release's build and its cut.
 pub const MIN_FREE_DISK_GIB: u64 = 10;
 
-/// The Trust toolchain's stage2 tool dir (`targo`, `trustc`, `trustdoc`, …), found by atpkg's one resolution order ([`atpkg::toolchain::Toolchain::discover`]).
+/// The Trust toolchain's stage2 tool dir (`targo`, `trustc`, `trustdoc`, …), found by atpkg's one resolution order.
 pub fn trust_stage2_bin() -> Result<PathBuf> {
     let pinned = pin_first_success(&PINNED, resolve_trust_stage2_bin)?;
     if LEASE_ARMED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -25,7 +25,6 @@ pub fn trust_stage2_bin() -> Result<PathBuf> {
     Ok(pinned)
 }
 
-/// The one toolchain this process pinned ([`trust_stage2_bin`]).
 static PINNED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Pin `dir` as this process's Trust toolchain before anything resolves one.
@@ -36,7 +35,6 @@ pub fn pin_trust_stage2_bin(dir: &Path) -> Result<()> {
     pin_into(&PINNED, dir)
 }
 
-/// [`pin_trust_stage2_bin`] over `cell` (a test's own cell, the process's in production).
 fn pin_into(cell: &std::sync::OnceLock<PathBuf>, dir: &Path) -> Result<()> {
     let pinned = cell.get_or_init(|| dir.to_path_buf());
     if pinned == dir {
@@ -50,11 +48,9 @@ fn pin_into(cell: &std::sync::OnceLock<PathBuf>, dir: &Path) -> Result<()> {
     }
 }
 
-/// Whether this process is a cut ([`arm_toolchain_lease`]): only a cut leases the toolchain
-/// it pins.
 static LEASE_ARMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Arm [`hold_toolchain_lease`]: the next [`trust_stage2_bin`] leases the toolchain it answers with.
+/// Arm [`hold_toolchain_lease`].
 pub fn arm_toolchain_lease() {
     LEASE_ARMED.store(true, std::sync::atomic::Ordering::Relaxed);
 }
@@ -64,8 +60,6 @@ pub fn lease_toolchain(dir: &Path) {
     hold_toolchain_lease(dir);
 }
 
-/// The cut's lease on the toolchain it pinned ([`atpkg::lease`]), taken at the first pin
-/// after [`arm_toolchain_lease`] and held for the cut's life.
 fn hold_toolchain_lease(dir: &Path) {
     static LEASE: std::sync::OnceLock<Option<atpkg::lease::Lease>> = std::sync::OnceLock::new();
     LEASE.get_or_init(|| {
@@ -76,7 +70,6 @@ fn hold_toolchain_lease(dir: &Path) {
     });
 }
 
-/// [`hold_toolchain_lease`]'s lease under `prefix`, said on stderr either way it goes.
 fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
     let who = format!(
         "aterm-release (pid {}) \u{2014} a release cut",
@@ -102,9 +95,6 @@ fn take_cut_lease(prefix: &Path, dir: &Path) -> Option<atpkg::lease::Lease> {
     }
 }
 
-/// Return the cell's value, resolving it exactly once and only on success. Split out so a
-/// test can pin the property: a second call with a different resolver still answers the
-/// first path, so a mid-run seal cannot change what a running release compiles with.
 fn pin_first_success(
     cell: &std::sync::OnceLock<PathBuf>,
     resolve: impl FnOnce() -> Result<PathBuf>,
@@ -147,8 +137,7 @@ fn resolve_trust_stage2_bin() -> Result<PathBuf> {
 /// The way past a missing x86_64 slice, for a caller to append verbatim under its own `fix:` marker.
 pub const X86_SLICE_REMEDIES: &str = "rustup +stable target add x86_64-apple-darwin";
 
-/// How to build Trust from source, for every remedy that offers it: from the pinned Trust
-/// seed, then sealed.
+/// How to build Trust from source, for every remedy that offers it.
 macro_rules! trust_from_source {
     () => {
         "in a Trust checkout, python3 scripts/recreate_bootstrap.py --stage 2 --require-seed \
@@ -186,7 +175,7 @@ pub fn resolve_targo() -> Result<PathBuf> {
 
 /// The gate knobs that come off the `cut` command line.
 pub struct GateOpts {
-    /// Release version being cut, e.g. "0.2.0" — drives the tag gates.
+    /// Release version being cut, such as "0.2.0" — drives the tag gates.
     pub version: String,
     /// This cut publishes nowhere — `--dry-run` (no uploads at all).
     pub offline: bool,
@@ -206,13 +195,13 @@ pub struct GateReport {
     pub free_disk_gib: u64,
     /// `Some(version)` when the public update channel's source tree was read and carries exactly this version.
     pub channel_version: Option<String>,
-    /// How many running processes the staging-liveness gate read — the evidence behind "nothing runs out of a cut staging bundle".
+    /// How many running processes the staging-liveness gate read.
     pub processes_checked: usize,
     /// The published commit this cut releases — `None` for a dry run.
     pub published: Option<PublishedCheckout>,
 }
 
-/// Run every gate that depends on the cut's moment, in the transcript's order; the first failure wins.
+/// Run every gate that depends on the cut's moment, in the transcript's order.
 pub fn run_all(
     git: &dyn GitRunner,
     tree: &Path,
@@ -250,7 +239,7 @@ pub fn run_all(
     })
 }
 
-/// Refuse a release whose committed handoff policy (`publish/handoff-policy.toml`) the producers it is meant for could not follow, judged on the commit before anything is staged (`ship release`'s step 4, `ship check`).
+/// Refuse a release whose committed handoff policy (`publish/handoff-policy.toml`) the producers it is meant for could not follow, judged on the commit before anything is staged.
 ///
 /// # Errors
 /// The commit holds no policy, one producers could not follow, or one that drops what its predecessor sealed without retiring it.
@@ -299,10 +288,6 @@ impl std::fmt::Display for CutHandoffPolicy {
     }
 }
 
-/// Refuse a policy whose rescues name no producer that can follow them or bind builds not
-/// cut yet
-/// ([`PolicyFile::names_producers`](aterm_update_core::handoff_policy::PolicyFile::names_producers)
-/// over [`builds_handing_over`] in `tree`'s ledger; no build when nothing came before).
 fn sealed_policy_kept(
     git: &dyn GitRunner,
     tree: &GateTree<'_>,
@@ -431,9 +416,6 @@ fn sealed_policy_kept(
     Ok(CutHandoffPolicy { policy, retires })
 }
 
-/// Every build `ledger_text` claimed up to `release`'s newest claim: the builds whose
-/// producers can hand their sessions to the release that succeeds it (a cut claims past
-/// all of them, and a claim between `release`'s and the cut never shipped).
 fn builds_handing_over(ledger_text: &str, release: &str) -> Result<Vec<u64>> {
     let records = crate::ledger::parse(ledger_text)?;
     let Some(newest) = records
@@ -455,9 +437,6 @@ fn builds_handing_over(ledger_text: &str, release: &str) -> Result<Vec<u64>> {
         .collect())
 }
 
-/// The commit origin's `refs/tags/v<release>` names (the release that shipped, where
-/// [`predecessor_release`] found it), fetched into FETCH_HEAD alone when this repository
-/// lacks it.
 fn shipped_commit(git: &dyn GitRunner, release: &str) -> Result<String> {
     let tag = format!("refs/tags/v{release}");
     let listing = git_ok(
@@ -715,7 +694,7 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
         return Ok(CutTree { path, moved: true });
     }
     let common = |dir: &Path| -> Option<PathBuf> {
-        let out = command("git")
+        let out = command(aterm_uds::os_path!("git"))
             .arg("-C")
             .arg(dir)
             .args([
@@ -765,7 +744,6 @@ pub fn place_cut_tree(git: &dyn GitRunner, repo: &Path, commit: &str) -> Result<
     Ok(CutTree { path, moved })
 }
 
-/// The attributes that change the bytes a checkout writes or a blob is hashed from.
 const REWRITING_ATTRIBUTES: [&str; 6] = [
     "text",
     "eol",
@@ -775,9 +753,6 @@ const REWRITING_ATTRIBUTES: [&str; 6] = [
     "working-tree-encoding",
 ];
 
-/// Refuses a repository whose own `info/attributes` (the common dir's, so the cut tree's
-/// too) names an attribute that rewrites bytes ([`REWRITING_ATTRIBUTES`], set, unset or in
-/// a macro's definition).
 fn refuse_rewriting_info_attributes(git: &dyn GitRunner) -> Result<()> {
     let at = git_ok(
         git,
@@ -823,8 +798,6 @@ fn refuse_rewriting_info_attributes(git: &dyn GitRunner) -> Result<()> {
     }
 }
 
-/// Judge the cut tree both before and after a move. A removed ignore rule can
-/// expose files without establishing who wrote them, so preserve them and refuse.
 fn require_clean_cut_tree(path: &Path) -> Result<()> {
     let changes: Vec<String> = crate::clean::dirty_against_head(path)
         .ok_or_else(|| {
@@ -854,7 +827,6 @@ fn require_clean_cut_tree(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `path`, once its `HEAD` is proven to be `commit`.
 fn checked_head(path: &Path, commit: &str) -> Result<PathBuf> {
     let now = rev_parse(&crate::ledger::GitCli::new(path), "HEAD")?;
     if now != commit {
@@ -897,7 +869,7 @@ pub fn toolchain_trustc(toolchain: &str) -> &str {
         .map_or("unknown", |(_, commit)| commit)
 }
 
-/// [`cut_toolchain`]'s spelling for the toolchain whose `bin/` is `stage2` (canonical, as the gate records it).
+/// [`cut_toolchain`]'s spelling for the toolchain whose `bin/` is `stage2`.
 ///
 /// # Errors
 /// No such directory, or a trustc there that does not answer `-vV`.
@@ -940,7 +912,6 @@ pub struct VerifiedRecord {
     pub executable: String,
 }
 
-/// `(the record's path, commit's tree)` for `commit`.
 fn verified_path(git: &dyn GitRunner, commit: &str) -> Result<(PathBuf, String)> {
     let tree = rev_parse(git, &format!("{commit}^{{tree}}"))?;
     let path = crate::release::release_dir(git)
@@ -950,7 +921,7 @@ fn verified_path(git: &dyn GitRunner, commit: &str) -> Result<(PathBuf, String)>
     Ok((path, tree))
 }
 
-/// Record that `verify release` passed for `commit`'s tree on the executable `macho_sha256` ([`VerifiedRecord`]).
+/// Record that `verify release` passed for `commit`'s tree on the executable `macho_sha256`.
 ///
 /// # Errors
 /// git cannot name the tree or the common dir; any write.
@@ -979,7 +950,7 @@ pub fn record_verified(git: &dyn GitRunner, commit: &str, macho_sha256: &str) ->
     Ok(path)
 }
 
-/// Did these bytes, from this tree, pass every check a release requires? The one judge the release's resume, the cut, its sign step and `ship check` ask.
+/// Did these bytes, from this tree, pass every check a release requires?
 ///
 /// # Errors
 /// git cannot name the tree, or the record cannot be read at all: no answer either way.
@@ -1071,7 +1042,7 @@ pub enum Outcome {
     Pass(String),
     /// It ran, and a release of the commit would be refused: why, and the remedy.
     Refuse(Refusal),
-    /// It decided nothing (a missing tool, an engine that is not current, another commit's cutter), so it is never a pass.
+    /// It decided nothing (a missing tool, an engine that is not current, another commit's cutter).
     CouldNotRun(Refusal),
 }
 
@@ -1149,7 +1120,7 @@ impl Precheck {
             .collect()
     }
 
-    /// `ship check`'s exit: 0 every gate passed, 1 one would refuse, 3 none refused but one could not run (nothing it judges was decided).
+    /// `ship check`'s exit: 0 every gate passed, 1 one would refuse, 3 none refused but one could not run.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
         if !self.refused().is_empty() {
@@ -1193,7 +1164,7 @@ impl Precheck {
         out
     }
 
-    /// What `ship check` prints before its verdict: the header, then each gate (it prints them as each gate ends).
+    /// What `ship check` prints before its verdict: the header, then each gate.
     #[cfg(test)]
     #[must_use]
     pub fn transcript(&self) -> String {
@@ -1236,7 +1207,6 @@ pub fn precheck(git: &dyn GitRunner, rev: &str) -> Result<Precheck> {
     precheck_with(git, rev, crate::cutter::running())
 }
 
-/// [`precheck`] by a cutter whose verdict ([`crate::cutter::running`]) is `stamp`.
 fn precheck_with(
     git: &dyn GitRunner,
     rev: &str,
@@ -1311,7 +1281,7 @@ fn precheck_with(
     Ok(found)
 }
 
-/// The line for what [`handoff_fixture_gate_at`] found: `ship check`'s, `ship release`'s step 4 and the cut's.
+/// The line for what [`handoff_fixture_gate_at`] found.
 #[must_use]
 pub fn handoff_fixtures_line(found: Option<&HandoffFixtures>) -> String {
     match found {
@@ -1365,7 +1335,6 @@ pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result
     }
 }
 
-/// One raw read of `path` on the public channel ([`crate::github::raw`]), as the release org's token when present, else anonymously; its answer, whatever the status.
 fn channel_api(path: &str) -> Result<aterm_update_core::github_rest::Answer> {
     crate::github::raw(path)
         .map_err(|e| Error::new(format!("cannot read the public channel ({path}): {e}")))
@@ -1389,7 +1358,6 @@ impl std::fmt::Display for LockedMetadataError {
 }
 
 /// Prove the committed Cargo.lock resolves the workspace with no rewrite or network access.
-/// A failed Cargo invocation proves neither a stale lock nor a complete offline cache.
 pub fn locked_metadata_gate(repo: &Path) -> std::result::Result<(), LockedMetadataError> {
     locked_metadata_gate_with(repo, None)
 }
@@ -1588,7 +1556,7 @@ pub fn host_gate() -> Result<()> {
     }
 }
 
-/// Clean tree: the release commit is exactly the published commit plus the changelog roll and ledger line, and the claim checks this tree out onto it, so stray local edits are refused up front.
+/// Clean tree: the release commit is exactly the published commit plus the changelog roll and ledger line, and the claim checks this tree out onto it.
 pub fn clean_tree(git: &dyn GitRunner) -> Result<()> {
     let root = git_ok(git, &["rev-parse", "--show-toplevel"])?
         .stdout_utf8()
@@ -1624,7 +1592,7 @@ pub fn dirty_paths(root: &Path) -> Result<Vec<String>> {
         })
 }
 
-/// Every submodule initialised and checked out at exactly the commit `HEAD` records for it (`aterm-link` path-depends on crates inside `vendor/astream`).
+/// Every submodule initialised and checked out at exactly the commit `HEAD` records for it.
 pub fn submodules_at_gitlinks(git: &dyn GitRunner) -> Result<()> {
     let out = git_ok(git, &["submodule", "status", "--recursive"])?;
     let text = out.stdout_utf8();
@@ -1641,7 +1609,7 @@ pub fn submodules_at_gitlinks(git: &dyn GitRunner) -> Result<()> {
     )))
 }
 
-/// The `git submodule status` lines that are not at their gitlink: every line whose status column is not a space.
+/// The `git submodule status` lines that are not at their gitlink.
 pub fn submodules_off_gitlink(status: &str) -> Vec<&str> {
     status
         .lines()
@@ -1778,8 +1746,7 @@ pub fn own_cutter(
     own_cutter_of(git, crate::cutter::running(), commit)
 }
 
-/// [`own_cutter`] for a cutter whose verdict is `stamp`: the commit it is the build of,
-/// or why it is none.
+/// [`own_cutter`] for a cutter whose verdict is `stamp`.
 ///
 /// # Errors
 /// As [`own_cutter`].
@@ -1809,7 +1776,7 @@ fn own_cutter_of(
     }
 }
 
-/// [`own_cutter`] for a cutter that is the build of `stamp` — pure over the stamp, so every case is a test rather than a rebuild.
+/// [`own_cutter`] for a cutter that is the build of `stamp` — pure over the stamp.
 ///
 /// # Errors
 /// As [`own_cutter`].
@@ -1927,7 +1894,6 @@ pub fn changelog_gate_at(
     changelog_section_gate(&text, section).map(|found| (section.to_string(), found))
 }
 
-/// The one rule [`changelog_gate_at`] applies to a changelog's text.
 fn changelog_section_gate(text: &str, section: &str) -> Result<changelog::GateSummary> {
     if section == "Unreleased" {
         changelog::gate_unreleased(text)
@@ -1939,7 +1905,7 @@ fn changelog_section_gate(text: &str, section: &str) -> Result<changelog::GateSu
 /// Where each shipped release's handoff producer bytes are checked in, one directory per release (`v<version>/`) and one per desk inside it.
 pub const HANDOFF_FIXTURE_ROOT: &str = "crates/aterm-gui/tests/fixtures/handoff";
 
-/// How to add a release's fixtures — the one place the steps are written down, so the refusal points here rather than restating them.
+/// How to add a release's fixtures — the one place the steps are written down.
 pub const HANDOFF_FIXTURE_README: &str = "crates/aterm-gui/tests/fixtures/handoff/README.md";
 
 /// The guard that runs every fixture through the current consumer, and whose `PINNED_DESKS` table is what makes a lost fixture directory a red test.
@@ -1965,7 +1931,7 @@ pub fn handoff_fixture_gate_at(
     handoff_fixture_gate_in(git, &GateTree::Commit { git, commit }, version)
 }
 
-/// Where a gate reads the tree it judges: a commit's objects (`ship check`, [`precheck`], and `ship release`'s step 4).
+/// Where a gate reads the tree it judges: a commit's objects.
 pub(crate) enum GateTree<'a> {
     #[cfg(test)]
     Dir(&'a Path),
@@ -1993,7 +1959,7 @@ impl GateTree<'_> {
         }
     }
 
-    /// The directories directly under `dir` that hold a `parent.toml`, sorted; `None` when `dir` does not exist.
+    /// The directories directly under `dir` that hold a `parent.toml`, sorted.
     pub(crate) fn desks(&self, dir: &str) -> Result<Option<Vec<String>>> {
         match self {
             #[cfg(test)]
@@ -2037,7 +2003,6 @@ impl GateTree<'_> {
     }
 }
 
-/// [`handoff_fixture_gate_at`] over either kind of tree.
 fn handoff_fixture_gate_in(
     git: &dyn GitRunner,
     tree: &GateTree<'_>,
@@ -2049,8 +2014,6 @@ fn handoff_fixture_gate_in(
     }
 }
 
-/// The release a cut of `version` from `tree` succeeds: [`predecessor_release`]
-/// over `tree`'s ledger, "shipped" meaning its tag is on origin.
 fn predecessor_in(
     git: &dyn GitRunner,
     tree: &GateTree<'_>,
@@ -2068,9 +2031,6 @@ fn predecessor_in(
     predecessor_release(&ledger_text, version, &shipped)
 }
 
-/// The tags in `git ls-remote --tags` output, each with the commit it names:
-/// an annotated tag's peeled `^{}` row, else the tag's own row (a lightweight
-/// tag).
 fn tag_commits(listing: &str) -> std::collections::BTreeMap<String, String> {
     let mut tags = std::collections::BTreeMap::new();
     for line in listing.lines() {
@@ -2222,7 +2182,7 @@ pub(crate) fn pinned_desks(guard: &str) -> Result<Vec<(String, String)>> {
 /// One row of the guard's required desk set: `desk` is required of every release from `from` on.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RequiredDesk {
-    /// The first release held to it, as the ledger spells a version (`0.97.0`, the guard's `v` dropped).
+    /// The first release held to it, as the ledger spells a version.
     pub(crate) from: String,
     pub(crate) desk: String,
 }
@@ -2276,8 +2236,6 @@ pub(crate) fn required_desks(guard: &str) -> Result<Vec<RequiredDesk>> {
         .collect()
 }
 
-/// `X.Y.Z` as numbers, for ordering releases (never compared as strings:
-/// `0.100.0` is after `0.99.0`).
 fn version_triple(version: &str) -> Option<(u64, u64, u64)> {
     let mut parts = version.split('.').map(str::parse::<u64>);
     let triple = (
@@ -2299,7 +2257,7 @@ pub(crate) fn release_at_least(release: &str, floor: &str) -> Result<bool> {
     }
 }
 
-/// The release's fixture generator's own target directory in the tree it runs in (`crate::fixtures`).
+/// The release's fixture generator's own target directory in the tree it runs in.
 pub const HANDOFF_FIXTURE_GUARD_TARGET: &str = "target-fixture-guard";
 
 /// `targo --unverified test -p aterm-gui --lib --target-dir <target> -- <args>` in `tree`, with the build's steering variables (`RUSTFLAGS`, `RUSTC`, …) removed, as for the release build.
@@ -2345,7 +2303,7 @@ pub(crate) fn clear_path(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// What libtest's output says: the tests that passed and failed over every `test result:` line, and the failing tests by name.
+/// What libtest's output says.
 pub(crate) fn libtest_tally(stdout: &str) -> (usize, usize, Vec<&str>) {
     let mut passed = 0_usize;
     let mut failed = 0_usize;
@@ -2393,8 +2351,6 @@ pub(crate) fn build_error_lines(stderr: &str) -> String {
     }
 }
 
-/// One refusal shape for every way a predecessor's fixtures can be missing:
-/// what is missing and where the steps are.
 fn handoff_refusal(release: &str, missing: &str) -> Error {
     Error::new(format!(
         "the handoff fixtures of v{release}, the release this cut succeeds, are not checked in: \
@@ -2406,7 +2362,7 @@ fn handoff_refusal(release: &str, missing: &str) -> Error {
     ))
 }
 
-/// The release token must be present and GitHub must take it (`GET /user` names its login), before the build; a run that publishes nothing asks no one.
+/// The release token must be present and GitHub must take it (`GET /user` names its login), before the build.
 ///
 /// # Errors
 /// No token in its file, a token GitHub refuses, or no answer from GitHub.
@@ -2432,13 +2388,8 @@ pub fn github_identity_gate(offline: bool) -> Result<Option<String>> {
     Ok(user["login"].as_str().map(str::to_string))
 }
 
-/// trustc's own words for "the off-switch took effect": the gate asks the compiler, not a
-/// flag spelling, whether the native lane turned verification off.
 const OFF_SWITCH_NOTE: &str = "compiled WITHOUT Trust verification";
 
-/// The probe's source. It carries one real Level 0 obligation on purpose (divisor-is-zero
-/// on `numerator / denominator`): with none, both lanes print "0 obligations checked" and
-/// [`verification_off_verdict`] could not tell them apart.
 const PROBE_SRC: &str = "\
 pub fn divide(numerator: u32, denominator: u32) -> u32 {
     numerator / denominator
@@ -2449,8 +2400,6 @@ fn main() {
 }
 ";
 
-/// Did the native lane (`targo --unverified` under the repo's config) turn verification
-/// off in the trustc that just ran?
 fn verification_off_verdict(stderr: &str) -> Result<()> {
     if !stderr.contains(OFF_SWITCH_NOTE) {
         return Err(Error::new(format!(
@@ -2566,7 +2515,7 @@ pub fn x86_target_probe() -> Result<()> {
     ))
 }
 
-/// Which of `targets` upstream stable has no std installed for (`rustup +stable target list --installed`).
+/// Which of `targets` upstream stable has no std installed for.
 ///
 /// # Errors
 /// rustup cannot be run, or does not answer.
@@ -2596,7 +2545,7 @@ pub fn stable_targets_missing(targets: &[&str]) -> Result<Vec<String>> {
         .collect())
 }
 
-/// The proof, before the release's one build (`artifact::build`), that this builder can build the x86_64 slice (`target`, the stable `x86_64-apple-darwin` std) and run it (`rosetta`).
+/// The proof, before the release's one build (`artifact::build`), that this builder can build the x86_64 slice (`target`, the stable `x86_64-apple-darwin` std) and run it.
 pub(crate) fn universal_gate(
     target: impl FnOnce() -> Result<()>,
     rosetta: impl FnOnce() -> std::result::Result<(), String>,
@@ -2616,7 +2565,7 @@ pub(crate) const ROSETTA_REFUSAL: &str = "the universal build RUNS its x86_64 sl
      ships (an unexecuted slice is how every Intel-only fault reached a release), and Rosetta \
      does not run here — softwareupdate --install-rosetta --agree-to-license";
 
-/// Whether Rosetta runs a trivial x86_64 program here (`/usr/bin/arch -x86_64 /usr/bin/true`); `run` spawns, injected for tests.
+/// Whether Rosetta runs a trivial x86_64 program here (`/usr/bin/arch -x86_64 /usr/bin/true`).
 pub(crate) fn rosetta_runs(
     run: &mut dyn FnMut(&mut Command) -> std::io::Result<std::process::Output>,
 ) -> std::result::Result<(), String> {
@@ -2631,7 +2580,7 @@ pub(crate) fn rosetta_runs(
 
 /// Free-disk gate via `df -Pk` (POSIX output format; std has no statfs).
 pub fn disk_gate(repo: &Path) -> Result<u64> {
-    let out = command("df")
+    let out = command(aterm_uds::os_path!("df"))
         .arg("-Pk")
         .arg(repo)
         .output()
@@ -2673,8 +2622,6 @@ mod universal_gate_tests {
         }
     }
 
-    /// A missing stable target stops before Rosetta is asked, with the target remedies
-    /// laid out; both present pass.
     #[test]
     fn a_missing_target_stops_before_rosetta_is_asked() {
         universal_gate(
@@ -2685,9 +2632,6 @@ mod universal_gate_tests {
         assert!(universal_gate(|| Ok(()), || Ok(())).is_ok());
     }
 
-    /// The one Rosetta probe runs `/usr/bin/arch -x86_64 /usr/bin/true` (without
-    /// `-x86_64` it runs native and passes on any Mac); a failed spawn is the same
-    /// refusal as a failed run; only exit 0 passes.
     #[test]
     fn the_rosetta_probe_fails_closed() {
         let mut seen = Vec::new();
@@ -2718,8 +2662,6 @@ mod universal_gate_tests {
 mod cut_lease_tests {
     use super::*;
 
-    /// A cut leases the toolchain it pinned under the store's prefix (a lease atpkg's gc
-    /// and flip gate read, naming the cutter); a toolchain outside the prefix takes none.
     #[test]
     fn a_cut_leases_the_toolchain_it_pinned_and_nothing_else_does() {
         assert!(
@@ -2750,8 +2692,6 @@ mod submodule_tests {
     use crate::ledger::RunOut;
     use std::sync::Mutex;
 
-    /// A git that answers by argv rather than by position: these tests are about which
-    /// question is asked.
     struct FakeGit {
         answers: Mutex<Vec<(&'static str, RunOut)>>,
         calls: Mutex<Vec<String>>,
@@ -2820,8 +2760,6 @@ mod submodule_tests {
         );
     }
 
-    /// `checkout --detach` moves a gitlink and not the submodule checkout, and a linked
-    /// worktree starts with none: the alignment updates, then checks.
     #[test]
     fn aligning_updates_every_submodule_and_then_checks_the_result() {
         let git = FakeGit::new(vec![]);
@@ -2853,9 +2791,6 @@ mod submodule_tests {
         align_submodules(&git).expect_err("a stale astream must not be built");
     }
 
-    /// Against real git: a pin the bus's main carries is released; a pin pushed only to a
-    /// side branch checks out at its gitlink like any other and is refused, naming the
-    /// branch it is not on.
     #[test]
     fn only_a_pin_its_declared_branch_carries_is_released() {
         use crate::ledger::testing::{self, Git};
@@ -2920,8 +2855,6 @@ mod submodule_tests {
             .expect_err("a same-named tag cannot stand in for a missing branch");
     }
 
-    /// Unknown is not on: a fetch that fails, or an ancestry git cannot decide,
-    /// refuses with git's own why.
     #[test]
     fn an_unreadable_branch_refuses_and_an_undeclared_one_is_the_remotes_head() {
         let pin = "1".repeat(40);
@@ -2979,7 +2912,6 @@ mod cutter_identity_tests {
     const HEAD: &str = "2617295d1111111111111111111111111111aaaa";
     const OLDER: &str = "15f2b5b6bc51d9ef56e5e4fa50f434fca07f40ee";
 
-    /// A git that answers `rev-parse <c>^1` with `parent` and the diff with `changed`.
     struct Claimed {
         parent: &'static str,
         changed: &'static str,
@@ -3007,8 +2939,6 @@ mod cutter_identity_tests {
         }
     }
 
-    /// The commit's own binary is its cutter; another commit's binary is refused,
-    /// whatever moved between them.
     #[test]
     fn another_commits_binary_is_refused() {
         own_cutter_with(&unrelated(), HEAD, HEAD).expect("its own");
@@ -3020,8 +2950,6 @@ mod cutter_identity_tests {
         assert!(own_cutter_with(&docs, OLDER, HEAD).is_err());
     }
 
-    /// The claim commit is the claimed commit plus its ledger line and changelog roll, so
-    /// the claimed commit's cutter finishes it (a resume, an abandon, a recovery).
     #[test]
     fn a_claim_commit_is_finished_by_the_cutter_of_the_commit_it_claims() {
         let claim = Claimed {
@@ -3049,8 +2977,6 @@ mod cutter_identity_tests {
         assert!(own_cutter_with(&other_parent, OLDER, HEAD).is_err());
     }
 
-    /// "Cannot tell" refuses: a binary that is no commit's build is never any commit's
-    /// cutter, not even through a claim commit.
     #[test]
     fn a_binary_that_is_no_commits_build_fails_closed() {
         let claim = Claimed {
@@ -3067,8 +2993,6 @@ mod cutter_identity_tests {
         own_cutter_with(&claim, "unknown", HEAD).expect_err("not an id");
     }
 
-    /// A dry-run publishes nowhere, so it proceeds — but the gate says so; a real run
-    /// is refused.
     #[test]
     fn only_a_dry_run_proceeds_with_another_commits_cutter() {
         let other = "4444444444444444444444444444444444444444";
@@ -3111,9 +3035,6 @@ mod toolchain_pin_tests {
         assert_eq!(after, Path::new("/seal/beta/bin"));
     }
 
-    /// `ship release`'s prover, pinned before any resolution: every later ask of the
-    /// process answers it, never the store's current build — and a second, different
-    /// pin is refused rather than splitting the run across two compilers.
     #[test]
     fn a_release_pins_its_journaled_prover_before_any_resolution() {
         let cell: OnceLock<PathBuf> = OnceLock::new();
@@ -3146,8 +3067,6 @@ mod native_lane_probe_tests {
         );
     }
 
-    /// The value drift: the switch parses, the compiler verifies anyway. This is
-    /// the measured verifying output for [`PROBE_SRC`].
     #[test]
     fn a_switch_that_parsed_but_did_not_switch_is_refused() {
         let report = "=== Trust Verification Report (probe) ===\n\
@@ -3162,7 +3081,6 @@ mod tag_free_tests {
     use super::*;
     use crate::ledger::RunOut;
 
-    /// A checkout whose tag `v…` is (or is not) here and on origin.
     struct Tags {
         local: bool,
         on_origin: bool,
@@ -3186,7 +3104,6 @@ mod tag_free_tests {
         }
     }
 
-    /// A tag on origin, or a leftover local one, refuses the cut; a free tag passes.
     #[test]
     fn a_taken_tag_refuses_the_cut() {
         for (local, on_origin) in [(true, true), (true, false)] {
@@ -3206,8 +3123,6 @@ mod handoff_fixture_gate_tests {
     use crate::ledger::RunOut;
     use std::sync::Mutex;
 
-    /// A scratch repository laid out like the real one: the ledger at the root,
-    /// the guard's source and the fixture tree at their real relative paths.
     struct Scratch(aterm_tempfile::TempDir);
 
     impl Scratch {
@@ -3231,20 +3146,13 @@ mod handoff_fixture_gate_tests {
             }
             self.write(crate::ledger::LEDGER_FILE, &text);
         }
-        /// The guard's source, carrying `rows` in the real file's shape, and a
-        /// required desk set that starts at v0.97.0 (so it binds none of the
-        /// older releases these tests cut after).
         fn pins(&self, rows: &[(&str, &str)]) {
             self.pins_requiring(rows, "v0.97.0", &["history", "twelve-panes"]);
         }
-        /// [`Self::pins`] with the required desk set spelled out, every desk
-        /// required from `from` on.
         fn pins_requiring(&self, rows: &[(&str, &str)], from: &str, required: &[&str]) {
             let required: Vec<(&str, &str)> = required.iter().map(|desk| (from, *desk)).collect();
             self.pins_required_rows(rows, &required);
         }
-        /// [`Self::pins`] with the required rows spelled out, each with its own
-        /// floor.
         fn pins_required_rows(&self, rows: &[(&str, &str)], required: &[(&str, &str)]) {
             let mut text = String::from(
                 "/// Every `(release, desk)` checked in — \"pinned\".\n\
@@ -3268,8 +3176,6 @@ mod handoff_fixture_gate_tests {
         }
     }
 
-    /// Origin, as far as this gate asks it anything: its tag listing, in
-    /// `git ls-remote --tags` shape (annotated tags carry a peeled `^{}` row).
     struct Origin {
         tags: Vec<&'static str>,
         asked: Mutex<Vec<String>>,
@@ -3305,12 +3211,10 @@ mod handoff_fixture_gate_tests {
         }
     }
 
-    /// Every ledger version shipped: the rule under test is then the ledger walk.
     fn all_shipped(_: &str) -> bool {
         true
     }
 
-    /// [`handoff_fixture_gate_at`] over a scratch tree on disk laid out like a commit.
     fn handoff_fixture_gate(
         git: &dyn GitRunner,
         repo: &Path,
@@ -3324,8 +3228,6 @@ mod handoff_fixture_gate_tests {
             .expect_err("the cut must be refused before the claim");
     }
 
-    /// The case this gate exists for: v0.92.0 shipped and its directory was
-    /// never added.
     #[test]
     fn a_missing_release_directory_is_refused_naming_it() {
         let scratch = Scratch::new("missing");
@@ -3336,8 +3238,6 @@ mod handoff_fixture_gate_tests {
         refusal(&scratch, &origin, "0.93.0");
     }
 
-    /// A directory is not fixtures: without a `parent.toml` the guard has no
-    /// desk to run, so an empty or half-copied directory is refused too.
     #[test]
     fn a_directory_without_a_parent_toml_is_refused() {
         let scratch = Scratch::new("no-parent");
@@ -3352,8 +3252,6 @@ mod handoff_fixture_gate_tests {
         refusal(&scratch, &origin, "0.93.0");
     }
 
-    /// Desks on disk that the guard does not pin are the half-done step: the
-    /// guard runs them today, and nothing notices if they are lost tomorrow.
     #[test]
     fn a_release_the_guard_does_not_pin_is_refused() {
         let scratch = Scratch::new("unpinned");
@@ -3390,8 +3288,6 @@ mod handoff_fixture_gate_tests {
         assert_eq!(origin.asked.lock().expect("asked").len(), 1, "one listing");
     }
 
-    /// A recut re-claims the version it cuts, so the ledger's tail — once or
-    /// several times — is that version.
     #[test]
     fn a_recut_judges_the_release_before_the_version_it_recuts() {
         let once = "1 0.91.0\n2 0.92.0\n3 0.93.0\n";
@@ -3418,8 +3314,6 @@ mod handoff_fixture_gate_tests {
         assert_eq!(found.release, "0.92.0");
     }
 
-    /// docs/RELEASING.md's abandon-and-skip: 0.93.0 was claimed, abandoned (its
-    /// tag deleted) and the operator moved on to 0.94.0.
     #[test]
     fn a_claim_abandoned_and_skipped_is_passed_over() {
         let scratch = Scratch::new("abandoned");
@@ -3433,8 +3327,6 @@ mod handoff_fixture_gate_tests {
         assert_eq!(found.release, "0.92.0");
     }
 
-    /// Tags answer "did it ship", so an origin carrying none of the ledger's
-    /// releases cannot be read as "nothing to hand off from".
     #[test]
     fn an_origin_carrying_none_of_the_ledger_fails_closed() {
         let scratch = Scratch::new("foreign-origin");
@@ -3445,7 +3337,6 @@ mod handoff_fixture_gate_tests {
         refusal(&scratch, &origin, "0.93.0");
     }
 
-    /// The only `None`: a ledger that records nothing but this version.
     #[test]
     fn a_ledger_with_no_other_version_has_no_predecessor() {
         assert_eq!(
@@ -3454,9 +3345,6 @@ mod handoff_fixture_gate_tests {
         );
     }
 
-    /// The table is read from the guard's source, so what the parser accepts is
-    /// part of the gate: comments are not rows, other tables are not rows, and
-    /// a table it cannot find or pair up stops the cut.
     #[test]
     fn the_pinned_table_is_read_from_source_and_fails_closed() {
         let source = "const PINNED_DESKS: &[(&str, &str)] = &[\n\
@@ -3484,8 +3372,6 @@ mod handoff_fixture_gate_tests {
         }
     }
 
-    /// From the guard's floor on, a predecessor missing a required desk (not on disk, or on
-    /// disk and not pinned) refuses the cut, naming it.
     #[test]
     fn a_predecessor_missing_a_required_desk_is_refused() {
         let required = ["history", "stalled-sequence", "twelve-panes"];
@@ -3523,9 +3409,6 @@ mod handoff_fixture_gate_tests {
         assert_eq!(found.release, "0.97.0");
     }
 
-    /// Releases before the floor are frozen with the desks their generators
-    /// could make — v0.95.0 has no `stalled-sequence` — and are not held to
-    /// the set.
     #[test]
     fn a_release_before_the_floor_is_not_held_to_the_required_set() {
         let scratch = Scratch::new("required-floor");
@@ -3546,9 +3429,6 @@ mod handoff_fixture_gate_tests {
         assert!(release_at_least("0.97", "0.97.0").is_err(), "not X.Y.Z");
     }
 
-    /// With `split-sequences` required from v0.98.0 on, cutting after v0.97.0 (whose frozen
-    /// fixtures can never gain it) passes on its own desks, and cutting after v0.98.0 asks
-    /// for it.
     #[test]
     fn a_desk_added_for_a_later_release_asks_nothing_of_an_earlier_one() {
         let scratch = Scratch::new("required-per-desk");
@@ -3579,8 +3459,6 @@ mod handoff_fixture_gate_tests {
         assert_eq!(found.release, "0.98.0");
     }
 
-    /// The required set is read from the guard's source, and fails closed like
-    /// the pinned table: a table or floor it cannot find stops the cut.
     #[test]
     fn the_required_table_is_read_from_source_and_fails_closed() {
         let source = "const REQUIRED_DESKS: &[(&str, &str)] = &[\n\
@@ -3628,8 +3506,6 @@ mod handoff_policy_gate_tests {
     use super::*;
     use aterm_update_core::handoff_policy::SOURCE_PATH;
 
-    /// [`handoff_policy_gate_at`] over a scratch tree on disk: the bundle step's strict
-    /// read of the file, then what it must keep.
     fn handoff_policy_gate(
         git: &dyn GitRunner,
         repo: &Path,
@@ -3640,7 +3516,6 @@ mod handoff_policy_gate_tests {
         sealed_policy_kept(git, &GateTree::Dir(repo), predecessor, policy, &text)
     }
 
-    /// A cut with no predecessor asks git nothing; any call is a test failure.
     struct NoGit;
 
     impl GitRunner for NoGit {
@@ -3649,8 +3524,6 @@ mod handoff_policy_gate_tests {
         }
     }
 
-    /// A scratch repository holding only `publish/handoff-policy.toml`, removed
-    /// on drop.
     struct Scratch(aterm_tempfile::TempDir);
 
     impl Scratch {
@@ -3667,8 +3540,6 @@ mod handoff_policy_gate_tests {
         }
     }
 
-    /// The checked-in policy passes the strict read, so an edit it refuses fails here, in
-    /// the commit that made it.
     #[test]
     fn the_checked_in_policy_passes_the_gate() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3679,8 +3550,6 @@ mod handoff_policy_gate_tests {
             .expect("the checked-in policy is one producers can follow");
     }
 
-    /// Everything a producer would silently ignore refuses the cut instead, by name, before
-    /// a build number is claimed.
     #[test]
     fn a_policy_producers_could_not_follow_refuses_the_cut() {
         for (label, text, why) in [
@@ -3873,7 +3742,6 @@ mod published_commit_tests {
             );
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         }
-        /// Writes `files`, stages them with one `git add`, and commits.
         fn commit(&self, subject: &str, files: &[(&str, &str)]) -> String {
             for (path, body) in files {
                 let full = self.work().join(path);
@@ -3888,7 +3756,6 @@ mod published_commit_tests {
             self.run(&["commit", "-q", "--allow-empty", "-m", subject]);
             self.run(&["rev-parse", "HEAD"])
         }
-        /// A bare `origin` holding main as it stands now.
         fn publish_origin(&self) {
             let origin = self.root.path().join("origin.git");
             let out = testing::git()
@@ -3917,8 +3784,6 @@ mod published_commit_tests {
         }
     }
 
-    /// Peers pushed after `pub publish`: the cut tree still goes to the published commit,
-    /// their code stays on main and out of the tree, and the operator's checkout stays put.
     #[test]
     fn peer_pushes_after_the_publish_neither_block_the_cut_nor_leak_into_it() {
         let repo = Repo::new("peer-pushes");
@@ -3972,8 +3837,6 @@ mod published_commit_tests {
         assert_eq!(in_tree(&["rev-parse", "HEAD"]), published);
     }
 
-    /// Changing ignore rules or tracking an ignored path does not establish who
-    /// wrote its files: both artifacts and personal notes survive a refused move.
     #[test]
     fn a_move_preserves_ignored_work_when_rules_or_tracked_paths_change() {
         let run = |(case, leftovers, replacement): (&str, bool, bool)| {
@@ -4101,8 +3964,6 @@ mod published_commit_tests {
             .expect_err("a commit this repository does not have");
     }
 
-    /// The operator's uncommitted work neither blocks the cut nor is touched by it; changes
-    /// inside the cut tree refuse, since the cutter never discards work it did not make.
     #[test]
     fn the_operators_work_does_not_block_the_cut_and_a_dirty_cut_tree_refuses() {
         let repo = Repo::new("dirty");
@@ -4157,8 +4018,6 @@ mod published_commit_tests {
             .expect("a clean cut tree moves");
     }
 
-    /// A directory at the cut tree's path that is not this repository's worktree is
-    /// never touched — the cutter refuses and names it.
     #[test]
     fn a_foreign_directory_where_the_cut_tree_goes_is_refused_and_left_alone() {
         let repo = Repo::new("foreign");
@@ -4171,9 +4030,6 @@ mod published_commit_tests {
         assert_eq!(fs::read_to_string(foreign.join("keep")).unwrap(), "mine");
     }
 
-    /// The repository's own `info/attributes` outranks every setting the release passes: a
-    /// line that rewrites bytes refuses the cut before any tree is written, and one that
-    /// rewrites nothing leaves it to put the commit's bytes.
     #[test]
     fn an_info_attributes_line_that_rewrites_bytes_refuses_the_cut() {
         let repo = Repo::new("info-attrs");
@@ -4242,10 +4098,6 @@ mod published_commit_tests {
         assert!(newest_published_source("not json").is_err());
     }
 
-    /// `ship check` judges the named commit's objects and records, never this checkout,
-    /// with the cut's gates in the cut's order, runs every gate after the cutter identity
-    /// whatever the one before said, and names each that would refuse; a releasable commit
-    /// passes however far HEAD and the working tree have moved.
     #[test]
     fn ship_check_judges_the_named_commit_with_the_cuts_own_gates() {
         use aterm_update_core::handoff_policy::SOURCE_PATH;
@@ -4335,10 +4187,6 @@ mod published_commit_tests {
         assert!(precheck_with(&git, "no-such-commit", Ok(&patch)).is_err());
     }
 
-    /// A rescue a release sealed stays in every later one (RELEASING.md, "The handoff policy
-    /// a release seals"): dropping or narrowing it refuses, keeping or widening passes,
-    /// retiring its exact range under `[[retired]]` passes and says so, and a `[[retired]]`
-    /// entry naming a kept rescue refuses.
     #[test]
     fn a_cut_keeps_the_handoff_policy_its_predecessor_sealed() {
         use aterm_update_core::handoff_policy::SOURCE_PATH;
@@ -4471,7 +4319,6 @@ mod published_commit_tests {
         assert!(!said.contains("RETIRES"), "{said}");
     }
 
-    /// SEVERAL RESCUES, EACH KEPT UNTIL IT IS RETIRED.
     #[test]
     fn a_cut_that_drops_the_predecessors_producer_policy_is_refused() {
         use aterm_update_core::handoff_policy::SOURCE_PATH;
@@ -4535,9 +4382,6 @@ mod published_commit_tests {
         assert!(said.contains("RETIRES"), "{said}");
     }
 
-    /// `ship check` answers the cut's gates only with the commit's own cutter, whose rules
-    /// are the judged commit's: any other check runs the identity gate alone, NOT RUN with
-    /// the remedy, and exits 3.
     #[test]
     fn ship_check_answers_only_with_the_commits_own_cutter() {
         let repo = Repo::new("precheck-identity");
@@ -4585,9 +4429,6 @@ mod published_commit_tests {
 mod trust_from_source_tests {
     use super::*;
 
-    /// The from-source remedy names no home folder (a Trust checkout is wherever it was
-    /// cloned) and is atpkg's own command (`Toolchain::INSTALL_REMEDY`), so a release gate
-    /// and the doctor never give two remedies for one missing toolchain.
     #[test]
     fn the_from_source_remedy_names_no_home_folder_and_is_atpkgs_command() {
         for remedy in [TRUST_FROM_SOURCE, TRUST_TOOLCHAIN_REMEDIES] {

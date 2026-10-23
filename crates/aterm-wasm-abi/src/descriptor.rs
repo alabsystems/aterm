@@ -1,32 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The descriptor: what each `#[export]` tells the glue generator, carried in
-//! the module's `aterm_abi` custom section.
-//!
-//! `#[export]` emits one record per export as a `link_section` static in
-//! that section (the linker keeps those as they are; `#[used]` would add a
-//! second copy to the data segment), and the linker concatenates them.
-//! `verify glue` reads the section from the pre-bind module
-//! ([`decode`]), checks every record against the module's real export
-//! signatures, writes the JS glue and strips the section. A module without
-//! the section, or with a record of another [`VERSION`], is refused there,
-//! never guessed at.
-//!
-//! Record layout (integers little-endian):
-//!
-//! ```text
-//! record  = MAGIC "atab", VERSION u8, body length u32, body
-//! body    = kind u8, class str, js name str, symbol str, docs str,
-//!           [function kinds only] receiver u8, n u8, (name str, ty)^n, ty
-//! str     = length u32, UTF-8 bytes
-//! ty      = tag u8, payload (see [`tag`])
-//! ```
-//!
-//! Types are described by the traits, not by the tokens the macro saw: the
-//! macro emits `<T as Describe>::DESC` for each parameter and return type, so
-//! an alias or a `Self` still describes the type the export really takes.
-//! Records are assembled at compile time by [`record`] from [`Part`]s.
+//! Descriptor records for the `aterm_abi` wasm custom section ([`SECTION`], [`record`], [`decode`]).
 
 use std::fmt;
 
@@ -36,12 +11,7 @@ pub const SECTION: &str = "aterm_abi";
 /// The first four bytes of every record.
 pub const MAGIC: [u8; 4] = *b"atab";
 
-/// The record format this crate writes and the generator reads. Bump it with
-/// any change to the layout above, to a [`tag`], to a type's lowering
-/// ([`Ty::param_words`], [`Ty::ret_word`]) or to the return slot
-/// (`crate::mem`). Version 2: a throw is left in the return slot, not
-/// thrown through an `aterm_abi.throw` import. Version 3: a JS object
-/// parameter ([`tag::JS_OBJECT`], [`crate::js`]).
+/// The record format version this crate writes and the generator reads.
 pub const VERSION: u8 = 3;
 
 /// Bytes before a record's body: [`MAGIC`], [`VERSION`] and the body length.
@@ -49,7 +19,7 @@ pub const HEADER_LEN: usize = 9;
 
 /// Record kinds (the body's first byte).
 pub mod kind {
-    /// `#[export] struct`: a JS class. Its symbol is the class's free export.
+    /// `#[export] struct`: a JS class whose symbol is its free export.
     pub const CLASS: u8 = 1;
     /// `#[export] fn` at module level.
     pub const FUNCTION: u8 = 2;
@@ -73,7 +43,7 @@ pub mod receiver {
     pub const EXCLUSIVE: u8 = 2;
 }
 
-/// Type tags. A scalar is its tag alone; the others carry a payload.
+/// Type tags.
 pub mod tag {
     /// `()`, as a return type only.
     pub const UNIT: u8 = 0x01;
@@ -124,8 +94,7 @@ pub mod tag {
     pub const JS_OBJECT: u8 = 0x31;
 }
 
-/// A type's description, built at compile time: a tag and its payload in a
-/// fixed buffer, so generic impls (`Option<T>`) can compose them in a `const`.
+/// Compile-time encoded type description.
 #[derive(Clone, Copy)]
 pub struct TypeDesc {
     len: u8,
@@ -133,8 +102,7 @@ pub struct TypeDesc {
 }
 
 impl TypeDesc {
-    /// The longest description: a class name is at most this less a few
-    /// wrapper bytes. Exceeding it is a compile-time error.
+    /// Maximum encoded type description length in bytes.
     pub const CAP: usize = 96;
 
     /// A scalar (or `()`, `str`, `String`): its tag alone.
@@ -275,8 +243,7 @@ pub const fn record_len(parts: &[Part]) -> usize {
     n
 }
 
-/// The record for `parts`: [`MAGIC`], [`VERSION`], the body length, then
-/// each part's bytes. `N` must be [`record_len`]`(parts)`.
+/// Assemble a descriptor record of length `N` ([`record_len`]) from `parts`.
 #[inline]
 #[must_use]
 pub const fn record<const N: usize>(parts: &[Part]) -> [u8; N] {
@@ -310,9 +277,7 @@ pub const fn record<const N: usize>(parts: &[Part]) -> [u8; N] {
     out
 }
 
-/// A class's handle tag: FNV-1a/32 of its name, never 0 (0 marks a freed
-/// handle). Two classes of one name would share it; the generator refuses
-/// a module that exports two.
+/// Non-zero FNV-1a/32 handle tag for the class named `name`.
 #[must_use]
 pub const fn class_tag(name: &str) -> u32 {
     let bytes = name.as_bytes();
@@ -325,8 +290,6 @@ pub const fn class_tag(name: &str) -> u32 {
     }
     if h == 0 { 1 } else { h }
 }
-
-// Decoding: what the generator reads.
 
 /// A described type.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -446,8 +409,7 @@ impl Ty {
         })
     }
 
-    /// The two words a parameter of this type crosses as, or `None` when it
-    /// cannot be a parameter. The second word of a scalar is unused (0).
+    /// The two wasm words a parameter of this type crosses as, or `None` when unsupported.
     #[must_use]
     pub fn param_words(&self) -> Option<[ValType; 2]> {
         if let Some(w) = self.scalar_word() {
@@ -456,7 +418,6 @@ impl Ty {
         match self {
             Ty::Str | Ty::String => Some([ValType::I32, ValType::I32]),
             Ty::Slice(e) | Ty::Vec(e) if e.is_element() => Some([ValType::I32, ValType::I32]),
-            // The object's index in the glue's table; the second word is 0.
             Ty::JsObject(_) => Some([ValType::I32, ValType::I32]),
             Ty::Option(inner) => match &**inner {
                 t if t.is_scalar() => Some([ValType::I32, t.scalar_word()?]),
@@ -468,9 +429,7 @@ impl Ty {
         }
     }
 
-    /// The word a return of this type crosses as: `Some(None)` for `()`,
-    /// `None` when it cannot be returned. Whether the glue also reads the
-    /// return slot is [`Ty::ret_uses_slot`].
+    /// The wasm word a return of this type crosses as (`Some(None)` for `()`).
     #[must_use]
     pub fn ret_word(&self) -> Option<Option<ValType>> {
         if let Some(w) = self.scalar_word() {
@@ -613,8 +572,7 @@ impl fmt::Display for DecodeError {
 
 impl std::error::Error for DecodeError {}
 
-/// Every record in a section's bytes, in order. An empty section is no
-/// records; the caller decides whether that is an error.
+/// Decode every record in a section's bytes, in order.
 ///
 /// # Errors
 /// [`DecodeError`] for a foreign, truncated or malformed record, or one of
@@ -746,9 +704,7 @@ impl Reader<'_> {
         String::from_utf8(name.to_vec()).map_err(|_| format!("{what} is not UTF-8"))
     }
 
-    /// A type nested `depth` deep. A real description is at most
-    /// [`TypeDesc::CAP`] bytes, so nesting deeper than that is refused
-    /// before it can exhaust the stack.
+    /// Decode a type at nesting `depth`, refusing depth `>=` [`TypeDesc::CAP`].
     fn ty(&mut self, depth: usize) -> Result<Ty, String> {
         if depth >= TypeDesc::CAP {
             return Err(format!("a type nests deeper than {} levels", TypeDesc::CAP));
@@ -835,7 +791,6 @@ mod tests {
     /// order.
     #[test]
     fn records_round_trip_through_the_section() {
-        // kind, class "Item", js name "Item", symbol "item_free", no docs.
         const PARTS: &[Part] = &[
             Part::Bytes(&[kind::CLASS, 4, 0, 0, 0]),
             Part::Bytes(b"Item"),
@@ -885,7 +840,7 @@ mod tests {
         );
     }
 
-    /// NEGATIVE CONTROLS: what the generator must refuse is refused here.
+    /// Foreign, mismatched-version, truncated, and over-deep sections are refused.
     #[test]
     fn foreign_old_and_cut_sections_are_refused() {
         let body = head(kind::FUNCTION, "", "f", "f", "", receiver::NONE, 0);
@@ -919,7 +874,6 @@ mod tests {
             Err(DecodeError::Malformed { .. })
         ));
 
-        // A crafted run of OPTION tags is refused, not a stack overflow.
         let mut deep = vec![tag::OPTION; 1 << 20];
         deep.push(tag::U8);
         assert!(decode_ty(&deep).unwrap_err().contains("nests deeper"));

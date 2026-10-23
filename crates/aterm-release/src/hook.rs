@@ -242,7 +242,7 @@ pub fn cutter_command(
 }
 
 fn git_output(dir: &Path, env: &[(String, String)], args: &[&str]) -> Option<std::process::Output> {
-    command("git")
+    command(aterm_uds::os_path!("git"))
         .arg("-C")
         .arg(dir)
         .args(args)

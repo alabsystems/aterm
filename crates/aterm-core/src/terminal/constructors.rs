@@ -17,11 +17,6 @@ use super::transient_state::TransientState;
 use super::types::{CurrentStyle, TerminalModes, TerminalSize};
 use super::{CharacterSetState, KittyKeyboardState, Terminal, XtermKeyboardState};
 
-/// Source of process-unique engine identities for damage-scoped extraction.
-/// Starts at 1 so `0` stays the "never engine-filled" sentinel of
-/// [`RenderInput::empty`](crate::render::RenderInput::empty): an unstamped
-/// scratch never passes the continuity check. `Relaxed` suffices; only
-/// uniqueness is needed.
 static EXTRACT_IDENTITY_SOURCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl Terminal {
@@ -99,8 +94,6 @@ impl Terminal {
             damage_epoch_counted: false,
             extract_identity: EXTRACT_IDENTITY_SOURCE
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            // Gen 1, not 0: a fresh RenderInput's `extract_gen` is 0, so the first
-            // scoped extraction on any scratch takes the full-refill arm.
             extract_gen: 1,
             search_slot: None,
             search_index_rebuilds: 0,
@@ -115,18 +108,12 @@ impl Terminal {
             resize_journal: super::resize_journal::ResizeJournal::default(),
         };
 
-        // Sync `clipboard_auth` from the `modes.allow_osc52_*` bits set by
-        // `TerminalModes::new()` (both default to `false`, fail-closed; the host
-        // calls `authorize_clipboard_access` after wiring its clipboard).
-        // Routing through `authorize_*` keeps one source of truth.
         if terminal.modes.allow_osc52_set {
             terminal.clipboard_auth.authorize_write();
         }
         if terminal.modes.allow_osc52_query {
             terminal.clipboard_auth.authorize_query();
         }
-        // The fresh fold is not an empty word (negative flags default on), so
-        // publish the mirror from the real state.
         terminal.refresh_mode_mirror();
 
         terminal

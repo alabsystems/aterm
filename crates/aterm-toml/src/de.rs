@@ -3,22 +3,6 @@
 
 //! Deserialization: a `serde::Deserializer` over the parse tree, so the tree's
 //! `#[derive(Deserialize)]` models work unchanged.
-//!
-//! # Why this half exists at all
-//!
-//! aterm calls `from_str` 168 times, and 43 of those are typed
-//! (`from_str::<Config>`), standing on 161 `#[derive(Deserialize)]` models. A
-//! replacement that handed back an untyped value tree would mean rewriting all
-//! 161 by hand — so the replacement is a `Deserializer`, and serde stays the
-//! interface (first-party `crates/aterm-serde` since the audit's SP.6).
-//!
-//! # Spans
-//!
-//! The config editor underlines schema errors, not just syntax errors, so a
-//! failure raised deep inside a `Deserialize` impl has to come back carrying a
-//! byte range. Each node attaches its own span on the way out, and
-//! [`crate::Error::with_span`] keeps the FIRST one set — which is the innermost,
-//! most specific node that could have been at fault.
 
 use core::fmt;
 use core::ops::Range;
@@ -48,9 +32,7 @@ pub fn from_str<T: DeserializeOwned>(text: &str) -> Result<T> {
     ))
 }
 
-/// A position in the parse tree. Values and tables are separate arms because a
-/// table reached through `[header]` and one reached through `{ inline }` are
-/// different nodes carrying the same meaning.
+/// A position in the parse tree.
 #[derive(Clone, Copy)]
 enum Node<'a> {
     Missing,
@@ -226,13 +208,10 @@ impl<'de, 'a> serde::Deserializer<'de> for Deserializer<'a> {
     }
 }
 
-// ---- map and sequence access ----------------------------------------------
-
 struct TableAccess<'a, I> {
     source: Option<&'a str>,
     entries: I,
     /// The entry whose key was just handed out, held for `next_value_seed`.
-    /// The key rides along because the value may have no span of its own.
     pending: Option<(&'a Key, &'a Item)>,
 }
 
@@ -275,10 +254,7 @@ impl<'de, 'a, I: Iterator<Item = (&'a Key, &'a Item)>> MapAccess<'de> for TableA
     }
 }
 
-/// A sequence the visitor stopped reading early is an error, not a truncation: `[1, 2, 3]`
-/// into a `[u32; 2]` fails. serde's array and tuple visitors leave that check to the
-/// deserializer (as its `SeqDeserializer::end` does); a draining visitor (`Vec`, `Value`)
-/// always leaves `0`.
+/// Reject a sequence that the visitor stopped reading early.
 fn drained(left: usize, total: usize) -> Result<()> {
     if left == 0 {
         return Ok(());
@@ -338,12 +314,7 @@ impl<'de, 'a, I: Iterator<Item = &'a Table>> SeqAccess<'de> for TableSeqAccess<'
 }
 
 /// Feeds a table key to whatever the target type wants it as — a field
-/// identifier, a `String`, or a unit enum variant. TOML keys are strings, so a
-/// key type that is not one (an integer, a `bool`, a newtype or `Some` over
-/// one) is read through [`TextKeyDeserializer`], which reads it back from
-/// exactly the text the serializer spells it with (`7`, `-3`, `true`) and from
-/// no other: `007`, `+7`, `-0` and `True` reach the visitor as the strings they
-/// are, which it refuses.
+/// identifier, a `String`, or a unit enum variant.
 struct KeyDeserializer<'a> {
     source: Option<&'a str>,
     key: &'a Key,
@@ -450,8 +421,6 @@ impl<'de> serde::Deserializer<'de> for StringDeserializer {
         tuple_struct map struct enum identifier ignored_any
     }
 }
-
-// ---- enums ----------------------------------------------------------------
 
 struct UnitVariant<'a> {
     name: &'a str,
@@ -586,8 +555,6 @@ impl<'de> VariantAccess<'de> for VariantValue<'_> {
     }
 }
 
-// ---- the untyped value tree -----------------------------------------------
-
 impl<'de> serde::Deserialize<'de> for crate::Value {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
@@ -657,8 +624,6 @@ impl<'de> Visitor<'de> for ValueVisitor {
         let Some(first) = map.next_key::<String>()? else {
             return Ok(crate::Value::Table(table));
         };
-        // The date-time protocol: a one-entry map under the reserved field
-        // name is a date-time, not a table with a very odd key.
         if first == DATETIME_FIELD {
             let text: String = map.next_value()?;
             let parsed = text.parse().map_err(serde::de::Error::custom)?;
@@ -686,8 +651,7 @@ impl<'de> serde::Deserialize<'de> for crate::Table {
     }
 }
 
-/// Deserialize straight out of an already-parsed [`crate::Value`]. Routed through the edit
-/// tree, so one deserializer answers every coercion question.
+/// Deserialize straight out of an already-parsed [`crate::Value`].
 impl<'de> serde::Deserializer<'de> for crate::Value {
     type Error = Error;
 

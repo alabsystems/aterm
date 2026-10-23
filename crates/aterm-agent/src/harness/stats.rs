@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHAT THE HARNESS DID, folded from the ledgers it already writes, for Settings ▸ Harness (`docs/DESIGN-harness-autopilot-2026-10-15.md` §4, item 4).
+//! Harness activity statistics folded from the harness ledgers for Settings ▸ Harness.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -26,10 +26,6 @@ use crate::supervise::policy::turn_end::{
 };
 use crate::supervise::run::LINE_CHARS;
 
-/// How much older than the window's start a file's last write may be before
-/// [`stats_under`] leaves it unread: a row's time is taken just before it is
-/// appended, so a file written in the window was modified in it; the slack
-/// absorbs a clock that stepped between the two.
 const MTIME_SLACK_MS: i64 = 60_000;
 
 /// What the harness did over one window, folded from its ledgers.
@@ -37,7 +33,7 @@ const MTIME_SLACK_MS: i64 = 60_000;
 pub struct HarnessStats {
     /// The window's start, unix ms: rows at or after it count.
     pub since_ms: i64,
-    /// The sessions with at least one row in the window: the ledgers' and journals' `sid`, the upgrade ledger's `tab`.
+    /// The sessions with at least one row in the window.
     pub sessions: u32,
     /// Boxes the harness pressed yes (or its focused answer) on.
     pub approved: u64,
@@ -49,20 +45,19 @@ pub struct HarnessStats {
     pub answered: u64,
     /// Continuations typed at an ordinary turn end (Cruise).
     pub continued: u64,
-    /// Land's instruction and its nudges typed (`land@v1`, `land-nudge@v1`): land prompts, never landings.
+    /// Land's instruction and its nudges typed (`land@v1`, `land-nudge@v1`).
     pub land_prompts: u64,
-    /// Land's landings: the journal's `DONE … rule=land@v1` notes, one per landing at its first
-    /// note's time, never a restatement of it.
+    /// Land's landings: the journal's `DONE … rule=land@v1` notes, one per landing at its first note's time, never a restatement of it.
     pub landed: u64,
-    /// The work carried on past a wall: a usage reset, an API error, a reply cut off, a full context.
+    /// The work carried on past a wall.
     pub resumed: u64,
     /// Points handed to a person (a box, a question, a limit, a turn end).
     pub escalated: u64,
-    /// The worker's NEEDS YOU sets put on the person's screen (the journal's `NEEDS` lines whose entry went up, `attention=OK`).
+    /// The worker's NEEDS YOU sets put on the person's screen.
     pub needs_told: u64,
     /// How long escalations waited on a person, inside the window.
     pub human_wait_ms: u64,
-    /// How long the harness waited at a limit's wall, inside the window: each `wall-wait@v1` row to its end.
+    /// How long the harness waited at a limit's wall, inside the window.
     pub limit_wait_ms: u64,
     /// Agents started again on the build they ran.
     pub relaunched: u64,
@@ -70,7 +65,7 @@ pub struct HarnessStats {
     pub upgraded: u64,
     /// Every act of the approval ledger (`approved`, `declined`, `typed`) in the window, by its full rule id.
     pub by_rule: BTreeMap<String, u64>,
-    /// The fact lines the occupancy door typed in the window (`fact-<kind>@v1` `typed`), by their kind (`hold`): no act, so counted here alone.
+    /// The fact lines the occupancy door typed in the window (`fact-<kind>@v1` `typed`), by their kind.
     pub facts_told: BTreeMap<String, u64>,
     /// The fact lines it would have typed under `prompt`, booked under `observe` (`fact-would@v1`), by the kind of the rule each names.
     pub facts_would: BTreeMap<String, u64>,
@@ -121,7 +116,7 @@ pub struct Tally {
     pub upgraded: u64,
     /// When the newest escalation counted in the window was handed to a person (unix ms).
     pub last_escalated_ms: Option<i64>,
-    /// The session's own ledger or journal may have lost the window's start ([`HarnessStats::cut`] for its files alone).
+    /// The session's own ledger or journal may have lost the window's start.
     pub cut: bool,
 }
 
@@ -153,11 +148,8 @@ enum Wait {
     Limit,
 }
 
-/// The counts a window's totals and a session's share both keep.
 trait Counts {
-    /// The slot `count` adds to.
     fn slot(&mut self, count: Count) -> &mut u64;
-    /// The slot `wait` adds to.
     fn wait_slot(&mut self, wait: Wait) -> &mut u64;
 }
 
@@ -253,7 +245,7 @@ impl HarnessStats {
         }
     }
 
-    /// The pass is over: the last session's join is settled into [`Self::decided`], which keeps its newest [`DECIDED_KEEP`], oldest first.
+    /// The pass is over: the last session's join is settled into [`Self::decided`].
     pub fn end_reading(&mut self) {
         if let Some(decided) = self.decided.as_mut() {
             decided.settle_session();
@@ -261,14 +253,12 @@ impl HarnessStats {
         }
     }
 
-    /// No row of any file fell in the window: the page says the harness has done nothing there yet (a line that is no row says nothing).
+    /// No row of any file fell in the window: the page says the harness has done nothing there yet.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
         self.rows == 0
     }
 
-    /// `sid`'s share, made where this accumulator keeps shares and it has
-    /// none yet; `None` where it keeps none.
     fn tally(&mut self, sid: &str) -> Option<&mut Tally> {
         let shares = self.by_session.as_mut()?;
         if !shares.contains_key(sid) {
@@ -277,7 +267,6 @@ impl HarnessStats {
         shares.get_mut(sid)
     }
 
-    /// One `count` of `sid`'s: the window's total and the session's share.
     fn count(&mut self, sid: &str, count: Count) {
         bump(self.slot(count));
         if let Some(tally) = self.tally(sid) {
@@ -285,8 +274,6 @@ impl HarnessStats {
         }
     }
 
-    /// `ms` more of `sid`'s `wait`: the window's total and the session's
-    /// share.
     fn waited(&mut self, sid: &str, wait: Wait, ms: u64) {
         let total = self.wait_slot(wait);
         *total = total.saturating_add(ms);
@@ -296,7 +283,6 @@ impl HarnessStats {
         }
     }
 
-    /// An escalation of `sid`'s at `at` (unix ms) counted in the window.
     fn escalated_at(&mut self, sid: &str, at: i64) {
         self.count(sid, Count::Escalated);
         if let Some(tally) = self.tally(sid) {
@@ -304,8 +290,6 @@ impl HarnessStats {
         }
     }
 
-    /// `sid`'s own file may have lost the window's start: the window and the
-    /// session's share say so.
     fn cut_of(&mut self, sid: &str) {
         self.cut = true;
         if let Some(tally) = self.tally(sid) {
@@ -313,7 +297,6 @@ impl HarnessStats {
         }
     }
 
-    /// One row of `sid`'s in the window.
     fn row_of(&mut self, sid: &str) {
         self.rows = self.rows.saturating_add(1);
         if !self.open.seen.contains(sid) {
@@ -322,13 +305,11 @@ impl HarnessStats {
         }
     }
 
-    /// One act under `rule`.
     fn act(&mut self, rule: &str) {
         let n = self.by_rule.entry(rule.to_string()).or_insert(0);
         *n = n.saturating_add(1);
     }
 
-    /// `sid`'s journal says `line` of Land's landings; `inside`: the record is in the window.
     fn land(&mut self, sid: &str, line: LandLine, inside: bool) {
         match line {
             LandLine::Act => {
@@ -346,15 +327,10 @@ impl HarnessStats {
         }
     }
 
-    /// A badge of the loop's went up on `sid` at `at` (unix ms), or was
-    /// adopted: its person's wait opens, unless one is open already.
     fn badge_up(&mut self, sid: &str, at: i64) {
         self.open.human.entry(sid.to_string()).or_insert(at);
     }
 
-    /// The loop's entry on `sid` was taken down at `at` (unix ms): the
-    /// person's wait, if one is open, closes, and its part inside the window
-    /// counts.
     fn badge_down(&mut self, sid: &str, at: i64) {
         if let Some(start) = self.open.human.remove(sid) {
             self.waited(sid, Wait::Human, span_ms(start, at, self.since_ms));
@@ -362,14 +338,10 @@ impl HarnessStats {
     }
 }
 
-/// `n` plus one, saturating: a count never wraps.
 const fn bump(n: &mut u64) {
     *n = n.saturating_add(1);
 }
 
-/// The part of the wait from `start` to `end` (unix ms) that lies at or
-/// after `since_ms`, in ms; none for a wait that ended before the window or
-/// a clock that ran back.
 fn span_ms(start: i64, end: i64, since_ms: i64) -> u64 {
     u64::try_from(end.saturating_sub(start.max(since_ms))).unwrap_or(0)
 }
@@ -377,7 +349,7 @@ fn span_ms(start: i64, end: i64, since_ms: i64) -> u64 {
 /// How many decisions a window keeps ([`Decided::rows`]): the newest.
 pub const DECIDED_KEEP: usize = 64;
 
-/// How many characters of the agent's words a decision keeps, `…` after a cut ([`Decision::asked`], [`Decision::did`], [`Decision::why`]).
+/// How many characters of the agent's words a decision keeps, `…` after a cut.
 pub const DECIDED_CHARS: usize = 96;
 
 /// How close (ms) an unproven press of a command comes after the last press of that command in that session to be counted in its row (`×N`) rather than a row of its own.
@@ -390,7 +362,7 @@ pub enum DecisionKind {
     Chose,
     /// A question asked in prose, answered with the policy's text.
     Answered,
-    /// A box full power answered that no safe rule proved: its yes, or another of its options ([`Decision::did`]).
+    /// A box full power answered that no safe rule proved: its yes, or another of its options.
     Unproven,
     /// A box refused, with the reason the worker was given.
     Declined,
@@ -399,7 +371,6 @@ pub enum DecisionKind {
 }
 
 impl DecisionKind {
-    /// A byte that tells the kinds apart ([`Decision::id`]).
     const fn tag(self) -> u8 {
         match self {
             Self::Chose => 1,
@@ -411,7 +382,7 @@ impl DecisionKind {
     }
 }
 
-/// One choice the harness made in the person's name: when, in which session, what was asked of it and what it did.
+/// One choice the harness made in the person's name.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Decision {
     /// When it was made, unix ms.
@@ -426,9 +397,9 @@ pub struct Decision {
     pub said: bool,
     /// [`DecisionKind::Chose`]: the options chosen, `; ` between them.
     pub did: Box<str>,
-    /// [`DecisionKind::Chose`]: why that option (`the option marked Recommended`, else the policy's word).
+    /// [`DecisionKind::Chose`]: why that option.
     pub why: Option<Box<str>>,
-    /// How many presses the row holds: more than one only for a run of [`DecisionKind::Unproven`] presses.
+    /// How many presses the row holds.
     pub times: u32,
 }
 
@@ -454,7 +425,7 @@ impl Decision {
 /// The window's decisions ([`HarnessStats::decided`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Decided {
-    /// The newest [`DECIDED_KEEP`] the window held, oldest first (once the reading has ended: [`HarnessStats::end_reading`]).
+    /// The newest [`DECIDED_KEEP`] the window held, oldest first.
     pub rows: Vec<Decision>,
     /// How many the window held, kept or not (a run of presses is one).
     pub total: u64,
@@ -486,8 +457,6 @@ struct Join {
     runs: BTreeMap<RunKey, (i64, usize)>,
 }
 
-/// What unproven presses share to be one row: the command's whole head
-/// (before any cut), the option chosen, and the owner's switch.
 type RunKey = (String, Box<str>, &'static str);
 
 /// A review point a prose answer may have been decided at: an `EVENT` the
@@ -525,15 +494,10 @@ struct Dialog {
     keys: Vec<AnswerKey>,
 }
 
-/// An answer key a [`Dialog`] keeps: when it was written, its command
-/// (`<question> → <choice>`) and its reason.
 type AnswerKey = (i64, String, String);
 
-/// The answer keys a [`Dialog`] keeps: a dialog has a key a tab, and
-/// Claude Code's dialog holds at most four.
 const DIALOG_KEYS: usize = 16;
 
-/// One act of the approval ledger, as the join reads it.
 struct LedgerAct<'a> {
     ts: i64,
     outcome: Outcome,
@@ -545,9 +509,6 @@ struct LedgerAct<'a> {
 }
 
 impl Join {
-    /// A journal record of the session's, in the journal's order: where it
-    /// ends the loop run its review points were read in, the next run
-    /// begins.
     fn note_run(&mut self, r: &JournalRecord) {
         match r.kind.as_str() {
             "exit" | "timeout" => self.end_run(r.t),
@@ -564,16 +525,11 @@ impl Join {
         }
     }
 
-    /// The current loop run ended at `at` (unix ms).
     fn end_run(&mut self, at: i64) {
         self.run_ends.push(at);
         self.last_event_seq = None;
     }
 
-    /// The review point a prose answer typed at `ts` (unix ms) on the read
-    /// `seq` was decided at: the newest one journaled at or before `ts`, read
-    /// at or before `seq` (the point is read again before the answer goes),
-    /// in a loop run that had not ended before `ts`.
     fn point_at(&self, ts: i64, seq: u64) -> Option<&Point> {
         self.points.iter().rev().find(|point| {
             point.t <= ts
@@ -587,8 +543,6 @@ impl Join {
 }
 
 impl Decided {
-    /// A row of `sid`'s has come: where the join holds another session, that
-    /// session is settled first.
     fn session(&mut self, sid: &str) {
         if sid.is_empty() && self.join.sid.is_some() {
             return;
@@ -599,16 +553,12 @@ impl Decided {
         }
     }
 
-    /// A new decision of the session's; its place in [`Join::rows`].
     fn push(&mut self, decision: Decision) -> usize {
         self.total = self.total.saturating_add(1);
         self.join.rows.push(decision);
         self.join.rows.len() - 1
     }
 
-    /// A journal record inside the window: a dialog told (`chose`), a
-    /// review point whose words a prose answer may be joined to (`event`),
-    /// or a record that ends a loop run ([`Join::note_run`]).
     fn note_journal(&mut self, sid: &str, r: &JournalRecord) {
         self.session(sid);
         self.join.note_run(r);
@@ -661,9 +611,6 @@ impl Decided {
         }
     }
 
-    /// An act of the approval ledger inside the window: a dialog's answer
-    /// key (for the dialog told after it), a prose answer typed, an
-    /// unproven press, a refusal, a limit reset kept.
     fn note_ledger(&mut self, sid: &str, row: &LedgerAct<'_>) {
         let LedgerAct {
             ts,
@@ -772,8 +719,6 @@ impl Decided {
         }
     }
 
-    /// The session in the join is done: its dialogs take their keys' words,
-    /// its decisions join the window's, and its memory is dropped.
     fn settle_session(&mut self) {
         let mut join = std::mem::take(&mut self.join);
         for dialog in &join.dialogs {
@@ -787,8 +732,6 @@ impl Decided {
         }
     }
 
-    /// The newest [`DECIDED_KEEP`] rows kept, oldest first (a tie keeps the
-    /// files' order).
     fn keep_newest(&mut self) {
         self.rows.sort_by_key(|decision| decision.t_ms);
         let over = self.rows.len().saturating_sub(DECIDED_KEEP);
@@ -796,20 +739,13 @@ impl Decided {
     }
 }
 
-/// What a `CHOSE` and its answer key say: `<question> → <choice>`.
 const ARROW: &str = " \u{2192} ";
 
-/// What a `CHOSE` puts between the tabs it tells.
 const TABS: &str = " | ";
 
-/// What a press full power made with no safe rule's proof says first.
 const UNPROVEN: &str = "unproven:";
 
 impl Dialog {
-    /// `decision` worded from its tabs' answer keys — each key's whole
-    /// command, where the `CHOSE` names it ([`told_tabs`]) — and, for a tab
-    /// no key was read for, the `CHOSE`'s own words; where nothing of the
-    /// line names a tab, the line's own words as the question.
     fn settle(&self, decision: &mut Decision) {
         let cut = self.said.chars().count() >= LINE_CHARS;
         let (tabs, keys) = told_tabs(&self.said, &self.keys, cut);
@@ -837,13 +773,6 @@ impl Dialog {
     }
 }
 
-/// The tabs a `CHOSE`'s words `said` tell, in its order, each as `(question,
-/// choice)`, and the answer keys they were told from. The `CHOSE` joins its
-/// tabs' answers as the keys' commands hold them, ` | ` between them, then
-/// cuts the line at [`LINE_CHARS`] (`cut`), so each tab is read as the
-/// newest key not yet taken whose whole command (its controls spaces, as
-/// the line has them) the line holds there, followed by ` | ` or its end —
-/// or, the line `cut`, whose command begins with all the line has left.
 fn told_tabs<'a>(
     said: &'a str,
     keys: &'a [AnswerKey],
@@ -911,10 +840,6 @@ fn told_tabs<'a>(
     (tabs, told)
 }
 
-/// Why a dialog's options were taken, in a person's words: its tabs' keys'
-/// reasons where the writer's words say it of every one
-/// ([`CHOSE_RECOMMENDED`], [`CHOSE_UNMARKED`]; a tab of each kind says
-/// both), else the policy the owner's Question priority names.
 fn chose_why(reasons: &[&str], policy: &str) -> String {
     let (mut marked, mut unmarked) = (false, false);
     for reason in reasons {
@@ -944,9 +869,6 @@ fn chose_why(reasons: &[&str], policy: &str) -> String {
     }
 }
 
-/// The owner's switch an unproven press was made under, by its Settings
-/// words: full power (`Approve permission boxes: All`), or the rm circuit
-/// breaker's warned box under `safe` ([`WARNED_UNDER_SAFE`]).
 fn unproven_switch(reason: &str) -> &'static str {
     if reason.contains(WARNED_UNDER_SAFE) {
         "Approve permission boxes: Safe, with the rm warning"
@@ -955,12 +877,6 @@ fn unproven_switch(reason: &str) -> &'static str {
     }
 }
 
-/// A box's ledger command under `rule` as the box and the option full power
-/// chose: every rule but a one-shot allow ([`RULE_ALLOW_ONCE`]) and the
-/// trust dialog's ([`RULE_TRUST_ANY`]) names its option after the last
-/// [`SUBJECT_OPTION`] (`approval.rs`'s `answer`: `<box> => No, keep
-/// default`); those two name the box alone, and their option is its yes
-/// (`None`).
 fn box_option<'a>(rule: &str, command: &'a str) -> (&'a str, Option<&'a str>) {
     if matches!(rule, RULE_ALLOW_ONCE | RULE_TRUST_ANY) {
         return (command, None);
@@ -971,9 +887,6 @@ fn box_option<'a>(rule: &str, command: &'a str) -> (&'a str, Option<&'a str>) {
     }
 }
 
-/// What a prose answer typed under `rule` said, in a person's words: the
-/// land answer's and the priorities' gist, or the owner's `answer_text` as
-/// typed (`command`), cut inside its quotes so they close.
 fn prose_answer_words(rule: &str, command: &str) -> Box<str> {
     match rule {
         RULE_LAND_ANSWER => Box::from(
@@ -995,11 +908,6 @@ fn prose_answer_words(rule: &str, command: &str) -> Box<str> {
     }
 }
 
-/// A command's head: its first line that holds anything, ended after the
-/// delimiter word of a heredoc it opens, the box's drawing dropped (a title
-/// read from a border row, `▔▔▔`, is no words) — whole, as a run of presses
-/// is keyed by it, and as [`agent_words`] keeps it, ` …` after it where more
-/// follows (empty where nothing is left).
 fn command_head(command: &str) -> (String, Box<str>) {
     let mut lines = command
         .lines()
@@ -1022,15 +930,10 @@ fn command_head(command: &str) -> (String, Box<str>) {
     (head.to_string(), shown)
 }
 
-/// Whether `c` draws a box rather than says anything: the box-drawing
-/// characters and the block elements (U+2500 to U+259F).
 fn is_box_drawing(c: char) -> bool {
     ('\u{2500}'..='\u{259f}').contains(&c)
 }
 
-/// Where the delimiter word of the first heredoc `line` opens ends (`<<PY`,
-/// `<<-PY`, `<< 'PY'`, `<<"PY"`); `None` where it opens none (a here-string,
-/// `<<<hi`, is none: no word follows its `<<`).
 fn heredoc_opened(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut from = 0;
@@ -1070,7 +973,6 @@ pub fn agent_words(text: &str) -> Box<str> {
     agent_words_in(text, DECIDED_CHARS)
 }
 
-/// [`agent_words`], cut to `room` characters.
 fn agent_words_in(text: &str, room: usize) -> Box<str> {
     let mut out = String::new();
     let mut kept = 0_usize;
@@ -1099,9 +1001,6 @@ fn agent_words_in(text: &str, room: usize) -> Box<str> {
     atpkg::progress::sanitize_for_tty(&out, room).into_boxed_str()
 }
 
-/// Past an escape sequence whose `ESC` was read: a CSI (`ESC [` … its final
-/// byte), an OSC, DCS, SOS, PM or APC (to its BEL or `ESC \`), else the one
-/// character the escape names.
 fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     match chars.next() {
         Some('[') => skip_until_final(chars),
@@ -1120,7 +1019,6 @@ fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-/// Past a CSI's parameters to its final byte (`@` to `~`).
 fn skip_until_final(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     for c in chars.by_ref() {
         if ('\u{40}'..='\u{7e}').contains(&c) {
@@ -1129,13 +1027,11 @@ fn skip_until_final(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
-/// Whether `c` reorders the text around it (the bidirectional embeddings,
-/// overrides, isolates and marks): never drawn from the agent's words.
 const fn is_bidi_control(c: char) -> bool {
     matches!(c, '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
 }
 
-/// Fold one line of a session's approval ledger ([`crate::supervise::approvals::Row::to_json`]'s shape) into `acc`, over its window ([`HarnessStats::since_ms`]).
+/// Fold one line of a session's approval ledger ([`crate::supervise::approvals::Row::to_json`]'s shape) into `acc`, over its window.
 pub fn fold_ledger_line(acc: &mut HarnessStats, line: &str) {
     match row_and_time(line, "ts") {
         Some((v, ts)) => fold_ledger_row(acc, &v, ts),
@@ -1143,14 +1039,12 @@ pub fn fold_ledger_line(acc: &mut HarnessStats, line: &str) {
     }
 }
 
-/// Fold one approval ledger row `v`, written at `ts` (unix ms), into `acc`, over its window ([`HarnessStats::since_ms`]).
+/// Fold one approval ledger row `v`, written at `ts` (unix ms), into `acc`, over its window.
 pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     let text = |k: &str| v.get(k).and_then(Value::as_str);
     let sid = text("sid").unwrap_or_default();
     let rule = text("rule_id").unwrap_or("-");
     let outcome = text("decision").and_then(Outcome::from_word);
-    // A fact line is no act ([`approvals::is_fact_rule`]): it ends no limit wait and counts as
-    // none.
     let fact = approvals::is_fact_rule(rule);
     match outcome {
         Some(Outcome::Waiting) if rule == RULE_WALL_WAIT => {
@@ -1195,9 +1089,6 @@ pub fn fold_ledger_row(acc: &mut HarnessStats, v: &Value, ts: i64) {
     }
 }
 
-/// A fact row in the window: a line typed counts toward [`HarnessStats::facts_told`] by its
-/// kind, a would-be line toward [`HarnessStats::facts_would`] by the kind of the rule it names
-/// (`rule=<name>`); intents, skips and the hold's own rows count toward neither.
 fn fold_fact(acc: &mut HarnessStats, rule: &str, outcome: Option<Outcome>, reason: &str) {
     use crate::supervise::facts::FactKind;
     use crate::supervise::occupancy::rules::{RuleId, WOULD_RULE};
@@ -1219,7 +1110,6 @@ fn fold_fact(acc: &mut HarnessStats, rule: &str, outcome: Option<Outcome>, reaso
     *book.entry(kind.word().to_string()).or_insert(0) += 1;
 }
 
-/// `sid`'s limit wait, if one is open, closed at `at` (unix ms).
 fn close_limit(acc: &mut HarnessStats, sid: &str, at: i64) {
     if let Some(start) = acc.open.limit.remove(sid) {
         let ms = span_ms(start, at, acc.since_ms);
@@ -1239,9 +1129,6 @@ enum Escalation {
     Asked,
 }
 
-/// [`Escalation`] of an `ESCALATED` line's tail. A journal written while
-/// the loop still mailed a manager says a badge set again as `mail=skipped:
-/// <why>`, read the same.
 fn escalation_of(summary: &str) -> Escalation {
     if summary.split(' ').next() != Some("attention=OK") {
         return Escalation::Withheld;
@@ -1260,11 +1147,6 @@ fn escalation_of(summary: &str) -> Escalation {
     }
 }
 
-/// Whether a `CLEARED` line's tail took the loop's badge down: it ended a
-/// badge an escalation raised — a box's or a question's, the turn-end
-/// policy's, the memory measure's, one a restarted loop found stale or
-/// hidden ([`CLEARED_BADGES`]), or a limit episode's (`attention=<reply>
-/// <why>`) — and its reply confirms success (`OK`) or no entry (`none`).
 fn takes_badge_down(summary: &str) -> bool {
     let rest = match summary.split_once(' ') {
         Some((seq, rest)) if seq.starts_with("seq=") => rest,
@@ -1283,9 +1165,6 @@ fn takes_badge_down(summary: &str) -> bool {
     cleared_reply(reply)
 }
 
-/// Whether a `NEEDS` line's tail (`count=<k> attention=<reply> <need>`,
-/// [`crate::supervise::journal::NEEDS`]) says its entry went up: the reply
-/// is `OK`.
 fn needs_went_up(summary: &str) -> bool {
     summary
         .split(' ')
@@ -1293,14 +1172,10 @@ fn needs_went_up(summary: &str) -> bool {
         .is_some_and(|reply| reply.strip_suffix(':').unwrap_or(reply) == "OK")
 }
 
-/// The writer's successful unset reply, or its explicit report that it
-/// holds no entry.
 fn cleared_reply(reply: &str) -> bool {
     matches!(reply.strip_suffix(':').unwrap_or(reply), "OK" | "none")
 }
 
-/// Whether a journal record is an `ADOPTED` line ([`ADOPTED`]: kind
-/// `other`, the line's first word).
 fn is_adopted(r: &JournalRecord) -> bool {
     r.kind == "other" && r.line.split(' ').next() == Some(ADOPTED)
 }
@@ -1316,9 +1191,6 @@ enum LandLine {
     Restated,
 }
 
-/// [`LandLine`] of a journal record; `None` for every other line. Only a
-/// `continued`, `typed` or `other` record is looked at, and an `other`
-/// line's first words alone.
 fn land_line(r: &JournalRecord) -> Option<LandLine> {
     match r.kind.as_str() {
         "continued" | "typed" => {
@@ -1346,9 +1218,6 @@ fn land_line(r: &JournalRecord) -> Option<LandLine> {
     }
 }
 
-/// Whether an act's journaled words (`said`: the loop's line clips them to
-/// their first [`LINE_CHARS`] characters) open with Land's own: [`LAND`] or
-/// [`LAND_NUDGE`], as far as the line keeps them.
 fn opens_with_land_words(said: &str) -> bool {
     const LAND_SAID: &[u8] = LAND.as_bytes().split_at(clip_len(LAND)).0;
     const NUDGE_SAID: &[u8] = LAND_NUDGE.as_bytes().split_at(clip_len(LAND_NUDGE)).0;
@@ -1356,8 +1225,6 @@ fn opens_with_land_words(said: &str) -> bool {
     said.starts_with(LAND_SAID) || said.starts_with(NUDGE_SAID)
 }
 
-/// The byte length of `s`'s first [`LINE_CHARS`] characters: what of it a
-/// loop's line keeps.
 const fn clip_len(s: &str) -> usize {
     let bytes = s.as_bytes();
     let mut i = 0;
@@ -1375,9 +1242,6 @@ const fn clip_len(s: &str) -> usize {
     bytes.len()
 }
 
-/// Whether a journal record is a stall's hold that took the loop's badge
-/// down: a `FROZEN` line ([`FROZEN`]: kind `other`, the line's first word)
-/// whose `attention=<reply>` confirms success or no entry, as for CLEARED.
 fn frozen_takes_badge_down(r: &JournalRecord) -> bool {
     if r.kind != "other" || r.line.split(' ').next() != Some(FROZEN) {
         return false;
@@ -1397,7 +1261,7 @@ fn frozen_takes_badge_down(r: &JournalRecord) -> bool {
     cleared_reply(reply)
 }
 
-/// Fold a session journal's records ([`crate::supervise::journal`]) into `acc`, over its window ([`HarnessStats::since_ms`]).
+/// Fold a session journal's records ([`crate::supervise::journal`]) into `acc`, over its window.
 pub fn fold_journal(acc: &mut HarnessStats, recs: &[JournalRecord]) {
     for r in recs {
         let sid = r.sid.as_deref().unwrap_or_default();
@@ -1445,7 +1309,7 @@ pub fn fold_upgrade_line(acc: &mut HarnessStats, line: &str) {
     }
 }
 
-/// Fold one live upgrade ledger row `v`, written at unix second `t`, into `acc`, over its window ([`HarnessStats::since_ms`], unix ms).
+/// Fold one live upgrade ledger row `v`, written at unix second `t`, into `acc`, over its window.
 pub fn fold_upgrade_row(acc: &mut HarnessStats, v: &Value, t: i64) {
     if t.saturating_mul(1000) < acc.since_ms {
         return;
@@ -1466,8 +1330,6 @@ pub fn fold_upgrade_row(acc: &mut HarnessStats, v: &Value, t: i64) {
     }
 }
 
-/// Whether an upgrade row's `to` (`<version>(<source>)`) names a build other
-/// than `from`, both known (a version unknown, `-`, is no evidence of a move).
 fn moved_build(from: &str, to: &str) -> bool {
     let to = to
         .strip_suffix(')')
@@ -1477,18 +1339,12 @@ fn moved_build(from: &str, to: &str) -> bool {
     known(from) && known(to) && from != to
 }
 
-/// `line` as a JSON object and its time under `key` (an integer); `None` for
-/// a line that is no row.
 fn row_and_time(line: &str, key: &str) -> Option<(Value, i64)> {
     let v = aterm_json::from_str::<Value>(line).ok()?;
     let t = v.get(key).and_then(Value::as_i64)?;
     Some((v, t))
 }
 
-/// Whether a file of `rows` rows (read through a ring of at most
-/// [`READ_MAX_ROWS`]) whose cut keeps `keep`, its oldest row read at
-/// `oldest_ms`, may be missing the start of the window at `since_ms`: it is
-/// long enough to have been cut, and begins after the window does.
 fn window_cut(rows: usize, keep: usize, oldest_ms: Option<i64>, since_ms: i64) -> bool {
     rows >= keep.min(READ_MAX_ROWS) && oldest_ms.is_some_and(|t| t > since_ms)
 }
@@ -1503,7 +1359,6 @@ enum DriveFile {
 }
 
 impl DriveFile {
-    /// The name's ending past the session's id.
     const fn suffix(self) -> &'static str {
         match self {
             Self::Ledger => ".jsonl",
@@ -1523,8 +1378,6 @@ struct Listed {
     modified_ms: Option<i64>,
 }
 
-/// The ledgers and journals under `drive` (`<state>/drive`), in name order;
-/// none for a directory that is missing or cannot be read.
 fn drive_files(drive: &Path, since_ms: i64) -> Vec<Listed> {
     let Ok(entries) = std::fs::read_dir(drive) else {
         return Vec::new();
@@ -1558,7 +1411,6 @@ fn drive_files(drive: &Path, since_ms: i64) -> Vec<Listed> {
     out
 }
 
-/// When `path` was last written, unix ms; `None` where that cannot be read.
 fn modified_ms(path: &Path) -> Option<i64> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
@@ -1567,21 +1419,14 @@ fn modified_ms(path: &Path) -> Option<i64> {
         .and_then(|d| i64::try_from(d.as_millis()).ok())
 }
 
-/// Whether a file last written at `modified_ms` was written before the
-/// window at `since_ms` opened (less [`MTIME_SLACK_MS`]): none of its rows
-/// can fall in the window.
 fn untouched(modified_ms: Option<i64>, since_ms: i64) -> bool {
     modified_ms.is_some_and(|ms| ms.saturating_add(MTIME_SLACK_MS) < since_ms)
 }
 
-/// [`untouched`], `path`'s time read now.
 fn untouched_since(path: &Path, since_ms: i64) -> bool {
     untouched(modified_ms(path), since_ms)
 }
 
-/// The live upgrade's ledger under the harness state directory:
-/// `<harness state>/upgrade/ledger.jsonl`, where `upgrade_drive::ledger_path`
-/// keeps it for a sweep whose state is `harness_state`.
 fn upgrade_ledger(harness_state: &Path) -> PathBuf {
     harness_state.join("upgrade").join("ledger.jsonl")
 }
@@ -1633,8 +1478,7 @@ pub fn stats_under(state_dir: &Path, harness_state: &Path, since_ms: i64) -> Har
     acc
 }
 
-/// ONE READING, TWO WINDOWS: what the harness did since `today_ms` (each session's share kept)
-/// and since `week_ms`, reading each file at most once.
+/// ONE READING, TWO WINDOWS.
 #[must_use]
 pub fn stats_windows(
     state_dir: &Path,
@@ -1647,8 +1491,6 @@ pub fn stats_windows(
     })
 }
 
-/// [`stats_windows`], each file's lines read by `read` (the ring
-/// [`tail_lines`] keeps; a test counts the reads).
 fn stats_windows_with(
     state_dir: &Path,
     harness_state: &Path,

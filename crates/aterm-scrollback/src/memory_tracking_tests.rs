@@ -5,7 +5,7 @@
 use super::*;
 
 /// Both incrementally kept counters — the diagnostic total and the budgeted
-/// bytes (#5881) — equal a from-scratch recount after every kind of mutation.
+/// bytes — equal a from-scratch recount after every kind of mutation.
 #[test]
 fn scrollback_incremental_counters_match_recomputed() {
     let mut sb = Scrollback::with_block_size(10, 30, 20_000, 10);
@@ -35,25 +35,19 @@ fn scrollback_incremental_counters_match_recomputed() {
     check(&sb, "budget eviction");
 }
 
-// Budget/diagnostic split tests
-
 /// Proves that read-only warm-cache fills do not perturb the budget counter.
 #[test]
 fn scrollback_budget_ignores_warm_cache_population() {
-    // Small tiers to force warm promotion quickly.
     let mut sb = Scrollback::with_block_size(10, 100, 1_000_000, 10);
 
-    // Push enough lines to create warm-tier blocks.
     for i in 0..30 {
         sb.push_str(&format!("Warm-budget-{i:03}-{}", "x".repeat(40)));
     }
     assert!(sb.warm_line_count() > 0, "fixture must have warm data");
 
     let budget_before = sb.budgeted_bytes;
-    // memory_used() reads live from tiers (warm uses Cell for cache tracking).
     let hw_mem_before = sb.memory_used();
 
-    // Read a warm-tier line — this populates the block cache.
     let _line = sb
         .get_line(0)
         .expect("no error")

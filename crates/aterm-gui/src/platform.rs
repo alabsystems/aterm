@@ -15,7 +15,7 @@ use crate::app_config::WindowTheme;
 use crate::notify::NotifyMsg;
 use crate::{Wake, WindowId, menu, toolbar};
 
-/// One complete toolbar tab-strip model, borrowed for a single [`AppRt::set_toolbar_tabs`] push: parallel per-tab slices paired by index (title, id, strip metadata, hover tooltip, chrome extension), plus the active index.
+/// One complete toolbar tab-strip model, borrowed for a single [`AppRt::set_toolbar_tabs`] push.
 #[derive(Clone, Copy)]
 pub(crate) struct ToolbarTabsModel<'a> {
     pub(crate) titles: &'a [String],
@@ -43,14 +43,14 @@ pub(crate) trait AppRt {
     /// Paint the OS window background the terminal's theme background colour (`bg`, as `0x00RRGGBB`) so the transparent titlebar / bare compact bar reads as a seamless extension of the terminal body (Windows: the class brush the client area erases to; X11: the background the server paints until a frame covers it).
     fn window_set_background_color(&self, window: &Window, bg: u32);
 
-    /// Apply the window-chrome appearance: match the NSWindow colour space to softbuffer's device-RGB content (dropping a per-frame CoreAnimation gamut conversion) and set the titlebar light/dark appearance from `theme`.
+    /// Apply the window-chrome appearance.
     fn window_set_appearance(&self, window: &Window, theme: WindowTheme);
 
     /// Synchronously paint the window's themed backdrop, without waiting for the event loop to pump a paint message.
     #[cfg(windows)]
     fn window_flush_backdrop(&self, _window: &Window) {}
 
-    /// Tag the window's GPU swapchain layer (the CAMetalLayer wgpu attaches at surface creation) with an explicit colour space, so ColorSync interprets the sRGB-encoded bytes instead of stretching them to the panel's P3 primaries; bytes and readback are untouched.
+    /// Tag the window's GPU swapchain layer (the CAMetalLayer wgpu attaches at surface creation) with an explicit colour space, so ColorSync interprets the sRGB-encoded bytes instead of stretching them to the panel's P3 primaries.
     fn window_set_surface_colorspace(
         &self,
         window: &Window,
@@ -60,7 +60,7 @@ pub(crate) trait AppRt {
     /// Stop the compositor rescaling the last presented frame during a live drag.
     fn window_anchor_surface_top_left(&self, window: &Window);
 
-    /// Read back the live presentation state of the window's GPU swapchain layer: `(contents_gravity, contents_scale, contents_are_flipped)`.
+    /// Read back the live presentation state of the window's GPU swapchain layer.
     fn window_surface_presentation(&self, window: &Window) -> Option<(String, f64, bool)>;
 
     /// A frame of `window` was just presented (its swap or its image put returned).
@@ -81,27 +81,27 @@ pub(crate) trait AppRt {
     /// Extend the window's content view under the titlebar (`NSWindowStyleMaskFullSizeContentView`) so the GPU surface spans the full frame, giving the effects layer a band above the grid.
     fn window_set_fullsize_content(&self, _window: &Window) {}
 
-    /// The titlebar band height in logical points, the chrome headroom the effects layer may draw into: content-view height minus `contentLayoutRect` height, so `0` before the full-size-content mask, in fullscreen, off macOS and for chromeless windows.
+    /// The titlebar band height in logical points, the chrome headroom the effects layer may draw into.
     fn titlebar_band_pts(&self, _window: &Window) -> f64 {
         0.0
     }
 
-    /// The usable placement area of `window`'s screen: the display minus permanent system chrome (on macOS the menu bar and Dock, `NSScreen.visibleFrame`), in logical points with a top-left origin and y growing down, the space `Window::outer_position().to_logical()` reports.
+    /// The usable placement area of `window`'s screen.
     fn window_work_area_pts(&self, _window: &Window) -> Option<crate::app_window::WorkAreaPts> {
         None
     }
 
-    /// The EDR POTENTIAL of the screen `window` occupies: the most the panel can show above SDR white, whatever its brightness now (macOS `NSScreen.maximumPotentialExtendedDynamicRangeColorComponentValue`; Windows with HDR on, its headroom).
+    /// The EDR POTENTIAL of the screen `window` occupies.
     fn screen_edr_potential(&self, _window: &Window) -> f32 {
         1.0
     }
 
-    /// Windows scRGB: the display's reference-white scale (`SDR-white / 80`) for the EDR present, so the grid is not dim (scRGB `1.0` is 80 nits).
+    /// Windows scRGB: the display's reference-white scale (`SDR-white / 80`) for the EDR present.
     fn screen_sdr_white_scale(&self, _window: &Window) -> f32 {
         1.0
     }
 
-    /// Spawn the process-wide notification delivery thread and return the bounded `SyncSender` each tab clones into its engine callbacks. macOS, Windows and Linux deliver; elsewhere this is the channel-draining stub (senders never block; nothing is delivered).
+    /// Spawn the process-wide notification delivery thread and return the bounded `SyncSender` each tab clones into its engine callbacks. macOS, Windows and Linux deliver.
     fn send_notification_init(
         &self,
         suppress: Arc<Mutex<HashSet<u64>>>,
@@ -128,7 +128,7 @@ pub(crate) trait AppRt {
         false
     }
 
-    /// Open `url` with the system's handler — the status item's Screen Sharing (`vnc://<host>`) and the Local Network privacy pane (`x-apple.systempreferences:`).
+    /// Open `url` with the system's handler.
     #[cfg_attr(
         not(target_os = "macos"),
         expect(dead_code, reason = "the menu-bar status item is macOS's")
@@ -146,7 +146,7 @@ pub(crate) trait AppRt {
         crate::control::pbcopy(text)
     }
 
-    /// Un-minimize and raise our own `window`: the receiving half of a `windowing_behavior = "attach"` forward, where `aterm new-tab` spawns a tab in an instance the user may not see.
+    /// Un-minimize and raise our own `window`.
     fn window_bring_to_front(&self, _window: &Window) -> bool {
         false
     }
@@ -205,7 +205,7 @@ pub(crate) trait AppRt {
         None
     }
 
-    /// Forward one editing command to the live rename field's field editor instead of to the terminal: macOS resolves a menu key equivalent before the first responder sees the key, so without this ⌘V would paste into the PTY behind an open editor.
+    /// Forward one editing command to the live rename field's field editor instead of to the terminal.
     fn rename_editor_edit(
         &self,
         handle: &toolbar::ToolbarHandle,
@@ -215,7 +215,7 @@ pub(crate) trait AppRt {
         false
     }
 
-    /// Read native title chrome as one introspection line (titles, selection, independent status, full tooltips), or `None` only for an empty tab set. macOS reads the retained native tab views; elsewhere it is the in-memory model `set_toolbar_tabs` maintains (`toolbar.rs`), in the same line shape.
+    /// Read native title chrome as one introspection line (titles, selection, independent status, full tooltips), or `None` only for an empty tab set. macOS reads the retained native tab views.
     fn read_toolbar_chrome(&self, handle: &toolbar::ToolbarHandle) -> Option<String>;
 
     /// The strip's per-tab context-menu models as `chrome` introspection lines (`tab-menu tab=<i> items=[...]`, one per chip, none at ≤1 tab), read off the same stored models a right-click pops and serialised by `session_chrome::tab_menu_chrome_line`.
@@ -226,15 +226,15 @@ pub(crate) trait AppRt {
     /// Show a native modal confirmation for a destructive quit/close gesture and block until the user answers.
     fn confirm(&self, title: &str, body: &str, proceed_label: &str) -> Option<bool>;
 
-    /// [`Self::confirm`] for an owner gesture that ends something, FAIL CLOSED (Stop Worker's sheet): its default button is Cancel and the destructive button takes only a click, so a Return the person was typing elsewhere never says yes; `None` when no alert could be shown (no native dialog, headless, off the main thread) — nobody was asked, which the caller never reads as a yes.
+    /// [`Self::confirm`] for an owner gesture that ends something, FAIL CLOSED (Stop Worker's sheet): its default button is Cancel and the destructive button takes only a click, so a Return the person was typing elsewhere never says yes.
     fn confirm_owner(&self, _title: &str, _body: &str, _proceed_label: &str) -> Option<bool> {
         None
     }
 
-    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to a typed event-loop deferral, where `App` runs the same dialog and document-durability barrier as ⌘Q; a no-op off macOS.
+    /// Register the whole-app quit confirmation for AppKit `terminate:` gestures that bypass the application menu's Quit item: the Dock-icon "Quit", AppleScript `quit`, and logout/restart/shutdown. macOS wires winit's synchronous `applicationShouldTerminate:` to a typed event-loop deferral, where `App` runs the same dialog and document-durability barrier as ⌘Q.
     fn install_quit_confirm(&self);
 
-    /// Query the OS motion preference. macOS reads `NSWorkspace.accessibilityDisplayShouldReduceMotion`; Windows reads `SPI_GETCLIENTAREAANIMATION`; Linux reads GNOME's `enable-animations` from the Settings portal in a bounded read, answering `false` wherever that key cannot be read.
+    /// Query the OS motion preference. macOS reads `NSWorkspace.accessibilityDisplayShouldReduceMotion`.
     fn reduce_motion(&self) -> bool;
 
     /// Snapshot the OS-native display accessibility preferences consumed by the semantic native-app appearance system.
@@ -245,7 +245,7 @@ pub(crate) trait AppRt {
     /// Subscribe to the OS reduce-motion change notification (macOS: `NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification` on the workspace centre), posting [`Wake::ReduceMotionChanged`] so the main thread re-queries [`Self::reduce_motion`] and repaints.
     fn observe_reduce_motion(&self, proxy: &EventLoopProxy<Wake>) -> Option<ReduceMotionObserver>;
 
-    /// Hold App Nap off for the rest of the process's life; the activity ends when the returned token is released.
+    /// Hold App Nap off for the rest of the process's life.
     fn hold_off_app_nap(&self) -> Option<AppNapActivity> {
         None
     }
@@ -292,7 +292,7 @@ pub(crate) fn capture_space_after_surface_tag(
     effective.map_or(previous, SurfaceColorspace::gpu_capture_space)
 }
 
-/// The layer tag for a just-attached (or re-tagged) GPU window: an HDR (`Rgba16Float`) swapchain must be read as extended-linear-sRGB (its pixels are linear light with EDR headroom), while an SDR swapchain takes the user's `window_colorspace` verbatim.
+/// The layer tag for a just-attached (or re-tagged) GPU window.
 #[must_use]
 pub(crate) fn resolve_surface_colorspace(
     cfg: crate::app_config::WindowColorspace,
@@ -351,11 +351,7 @@ impl AppRt for AppRtMacOS {
         let r = f64::from((bg >> 16) & 0xff) / 255.0;
         let g = f64::from((bg >> 8) & 0xff) / 255.0;
         let b = f64::from(bg & 0xff) / 255.0;
-        // SAFETY: `+colorWithSRGBRed:green:blue:alpha:` is
-        // `-(id)(CGFloat, CGFloat, CGFloat, CGFloat)` and returns an
-        // AUTORELEASED colour — borrowed for the length of `-setBackgroundColor:`,
-        // which is `-(void)(NSColor *)` and RETAINS it. The pool is the caller's
-        // (the winit event loop's), which is why the borrow is sound.
+        // SAFETY: `+colorWithSRGBRed:green:blue:alpha:` is `-(id)(CGFloat, CGFloat, CGFloat, CGFloat)` and returns an AUTORELEASED colour — borrowed for the length of `-setBackgroundColor:`, which is `-(void)(NSColor *)` and RETAINS it. The pool is the caller's (the winit event loop's), which is why the borrow is sound.
         unsafe {
             let make: unsafe extern "C-unwind" fn(
                 aterm_objc::Id,
@@ -420,8 +416,6 @@ impl AppRt for AppRtMacOS {
                     }
                 }
             } else {
-                // Auto: clear any forced appearance so the window tracks the OS
-                // `effectiveAppearance` again after a live Dark/Light → Auto change.
                 appkit::send_v_id(ns_window, sel!(setAppearance:), aterm_objc::Id::NIL);
             }
             appkit::send_v_bool(ns_window, sel!(setTitlebarAppearsTransparent:), true);
@@ -514,9 +508,7 @@ impl AppRt for AppRtMacOS {
         if ns_window.is_null() {
             return 0.0;
         }
-        // SAFETY: every message below is a side-effect-free geometry read. `-bounds` and
-        // `-contentLayoutRect` return `NSRect`, a 32-byte struct, which `msg` sends through
-        // `objc_msgSend_stret` on the x86_64 slice.
+        // SAFETY: every message below is a side-effect-free geometry read. `-bounds` and `-contentLayoutRect` return `NSRect`, a 32-byte struct, which `msg` sends through `objc_msgSend_stret` on the x86_64 slice.
         unsafe {
             let content_view = crate::appkit::send_id(ns_window, aterm_objc::sel!(contentView));
             if content_view.is_null() {
@@ -742,19 +734,7 @@ impl AppRt for AppRtMacOS {
     }
 }
 
-/// Map aterm's config [`WindowTheme`] onto the winit window-theme override
-/// [`aterm_window::window::Theme`] applied via [`Window::set_theme`]:
-/// * `Auto`  → `None` — clear the override. On X11 winit defaults the
-///   `_GTK_THEME_VARIANT` hint to dark; on Wayland the fork only stores the value
-///   (it draws no frame since LW.5: a window the compositor leaves undecorated
-///   has aterm's own header, `crate::client_frame`).
-///   Neither backend reports the desktop preference back (`Window::theme()` is
-///   the override or `None`, and no `ThemeChanged` arrives), which is why
-///   `App::chrome_theme_for_apprt` resolves Linux `Auto` from the terminal theme
-///   instead.
-/// * `Light` → `Some(Theme::Light)` — force the light variant of the window
-///   system's frame (X11's `_GTK_THEME_VARIANT`, a Windows title bar).
-/// * `Dark`  → `Some(Theme::Dark)` — force the dark variant.
+/// Map aterm's config [`WindowTheme`] onto the winit window-theme override [`aterm_window::window::Theme`] applied via [`Window::set_theme`].
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<aterm_window::window::Theme> {
@@ -765,7 +745,7 @@ pub(crate) fn window_theme_to_winit(theme: WindowTheme) -> Option<aterm_window::
     }
 }
 
-/// Proof that this process launched WINDOWED: its event loop is AppKit's, whose `+[NSApplication sharedApplication]` exists once the loop is built, so sending it from the loop creates nothing.
+/// Proof that this process launched WINDOWED.
 #[cfg(target_os = "macos")]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Windowed(());
@@ -781,7 +761,7 @@ impl Windowed {
         Self(())
     }
 
-    /// The proof, if this process launched windowed; `None` in a headless process and in a unit-test build.
+    /// The proof, if this process launched windowed.
     pub(crate) fn get() -> Option<Self> {
         WINDOWED_LAUNCH
             .load(std::sync::atomic::Ordering::Acquire)
@@ -789,7 +769,7 @@ impl Windowed {
     }
 }
 
-/// The modifier state winit last DERIVED FROM AN EVENT for `window` — its own cache, which `update_modifiers` writes before it queues `ModifiersChanged`.
+/// The modifier state winit last DERIVED FROM AN EVENT for `window`.
 #[cfg(target_os = "macos")]
 pub(crate) fn cached_modifiers(
     window: &aterm_window::window::Window,
@@ -798,7 +778,7 @@ pub(crate) fn cached_modifiers(
     window.cached_modifiers()
 }
 
-/// The window setting for an Option that is an Alt (`alt`, [`crate::App::option_is_alt`]): both keys, so AppKit is handed each Option key event without its Option characters and neither composes a glyph (Option+a, "å") nor starts a dead key (Option+e), and the key event's text is the layout's character at the Shift level, which the encoder sends after ESC; neither key otherwise, so Option types what the layout composes.
+/// The window setting for an Option that is an Alt (`alt`, [`crate::App::option_is_alt`]).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) const fn option_as_alt_for(alt: bool) -> aterm_window::platform::macos::OptionAsAlt {
@@ -810,7 +790,7 @@ pub(crate) const fn option_as_alt_for(alt: bool) -> aterm_window::platform::maco
     }
 }
 
-/// Make `window`'s Option keys an Alt (`alt`) or let them compose: [`option_as_alt_for`], written by `App::sync_option_as_alt` and at the window's creation.
+/// Make `window`'s Option keys an Alt (`alt`) or let them compose.
 pub(crate) fn set_option_as_alt(window: &aterm_window::window::Window, alt: bool) {
     #[cfg(target_os = "macos")]
     {
@@ -821,13 +801,10 @@ pub(crate) fn set_option_as_alt(window: &aterm_window::window::Window, alt: bool
     let _ = (window, alt);
 }
 
-/// Where an Option chord that Meta mode would send as ESC and the key types a character
-/// instead: the one its layout reaches only with Option (`App::on_key`; German Option+L is
-/// `@`, Option+7 `|`, Option+N `~`, French `Option+(` `{`, British Option+3 `#`), as
-/// [`aterm_window::platform::macos::option_only_character`] reads the selected layout.
+/// Where an Option chord that Meta mode would send as ESC and the key types a character instead.
 pub(crate) type OptionOnly = fn(aterm_window::keyboard::PhysicalKey, bool) -> Option<char>;
 
-/// The [`OptionOnly`] source an `App` holds: the selected layout's windowed on macOS, [`no_option_only`] headless, in unit tests and off macOS (no other backend reads Alt chords as Meta past a layout's level-3 characters: X11 and Wayland report AltGr as a level, and Windows encodes the composed key).
+/// The [`OptionOnly`] source an `App` holds.
 pub(crate) fn option_only_source(headless: bool) -> OptionOnly {
     #[cfg(target_os = "macos")]
     if !headless {
@@ -846,7 +823,7 @@ pub(crate) const fn no_option_only(
     None
 }
 
-/// Whether an Option chord's key-event text is what Option composed rather than the layout's character at the Shift level: on macOS, whenever the window's Option is not an Alt (`option_is_alt`, what `App::sync_option_as_alt` last set), so the keymap must not hand that text to the encoder as the layout's character (`keymap::layout_text`).
+/// Whether an Option chord's key-event text is what Option composed rather than the layout's character at the Shift level.
 #[must_use]
 pub(crate) const fn option_composes(option_is_alt: bool) -> bool {
     cfg!(target_os = "macos") && !option_is_alt
@@ -869,7 +846,7 @@ mod option_as_alt_tests {
     }
 }
 
-/// How long the NSEvent currently being dispatched sat in the NSApp queue before this code ran, in nanoseconds — the touch-to-glass slice NO post-dequeue stamp can see.
+/// How long the NSEvent currently being dispatched sat in the NSApp queue before this code ran, in nanoseconds.
 #[cfg(target_os = "macos")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     use std::ffi::c_void;
@@ -906,11 +883,7 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
 
     let _windowed = Windowed::get()?;
     let _main_thread = MainThread::new()?;
-    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton
-    // (`_main_thread` is the witness); `-currentEvent` is `-(id)` and nil
-    // outside a dispatch, which is the fail-closed case; `-timestamp` and
-    // `-systemUptime` are `-(NSTimeInterval)`, i.e. `double`, side-effect-free
-    // scalar reads; `+processInfo` is `-(id)`, another immortal singleton.
+    // SAFETY: `+sharedApplication` is `-(id)`, the main-thread AppKit singleton (`_main_thread` is the witness); `-currentEvent` is `-(id)` and nil outside a dispatch, which is the fail-closed case; `-timestamp` and `-systemUptime` are `-(NSTimeInterval)`, i.e. `double`, side-effect-free scalar reads; `+processInfo` is `-(id)`, another immortal singleton.
     let (ts, uptime) = unsafe {
         let app = appkit::send_id(ns_application_class(), sel!(sharedApplication));
         if app.is_null() {
@@ -930,7 +903,6 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
         )
     };
     if ts <= 0.0 {
-        // Distinct branch.
         return None;
     }
     let age_s = uptime - ts;
@@ -952,14 +924,14 @@ pub(crate) fn appkit_window_number(window: &Window) -> i64 {
     unsafe { crate::appkit::send_isize(ns_window, aterm_objc::sel!(windowNumber)) as i64 }
 }
 
-/// Non-macOS peer of the macOS reader: there is no AppKit window number, and the `hwkey` injector refuses on these platforms anyway.
+/// Non-macOS peer of the macOS reader.
 #[cfg(not(target_os = "macos"))]
 #[must_use]
 pub(crate) fn appkit_window_number(_window: &Window) -> i64 {
     0
 }
 
-/// Whether this window is the key window of the active application: where a key press goes, and the only window whose keys the input method composes (an Option dead key starts no composition in an inactive app, measured on macOS 27, `docs/measured/desk-appkit-2026-10-19.md`).
+/// Whether this window is the key window of the active application.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn appkit_window_is_key_in_active_app(window: &Window) -> bool {
@@ -970,9 +942,7 @@ pub(crate) fn appkit_window_is_key_in_active_app(window: &Window) -> bool {
     if ns_window.is_null() {
         return false;
     }
-    // SAFETY: `+sharedApplication` is `@16#0:8` (the windowed launch created it
-    // before any window existed); `-isActive` and `-isKeyWindow` are `B16@0:8`
-    // plain getters on live receivers. Main thread, as the caller's wake runs.
+    // SAFETY: `+sharedApplication` is `@16#0:8` (the windowed launch created it before any window existed); `-isActive` and `-isKeyWindow` are `B16@0:8` plain getters on live receivers. Main thread, as the caller's wake runs.
     unsafe {
         let app = crate::appkit::send_id(
             aterm_objc::class(c"NSApplication").as_id(),
@@ -1004,7 +974,7 @@ fn recent_user_input_event(_within: std::time::Duration) -> bool {
     false
 }
 
-/// The input-activity source an `App` holds: the platform read ([`recent_user_input_event`]) windowed, [`no_recent_user_input_event`] headless.
+/// The input-activity source an `App` holds.
 pub(crate) fn user_input_source(headless: bool) -> fn(std::time::Duration) -> bool {
     if headless {
         no_recent_user_input_event
@@ -1078,10 +1048,7 @@ mod hid_idle {
         static HANDLES: OnceLock<Option<Handles>> = OnceLock::new();
         HANDLES
             .get_or_init(|| {
-                // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and returns a
-                // dictionary `IOServiceGetMatchingService` consumes. The service and the
-                // `CFStringCreateWithCString` key (a NUL-terminated UTF-8 literal) are the cache,
-                // kept for the process; the service is released only if the key cannot be made.
+                // SAFETY: `IOServiceMatching` takes a NUL-terminated class name and returns a dictionary `IOServiceGetMatchingService` consumes. The service and the `CFStringCreateWithCString` key (a NUL-terminated UTF-8 literal) are the cache, kept for the process; the service is released only if the key cannot be made.
                 unsafe {
                     let matching = IOServiceMatching(IOHID_SYSTEM_CLASS.as_ptr().cast::<c_char>());
                     if matching.is_null() {
@@ -1110,10 +1077,7 @@ mod hid_idle {
     #[must_use]
     pub(super) fn seconds_since_last_input() -> Option<f64> {
         let h = handles()?;
-        // SAFETY: `h.service` is a live registry entry and `h.key` a live
-        // CFString (both process-cached); the Create rule gives us +1 on the
-        // returned object, which we release on every path after use. The type
-        // is checked before `CFNumberGetValue` writes into the `i64`.
+        // SAFETY: `h.service` is a live registry entry and `h.key` a live CFString (both process-cached); the Create rule gives us +1 on the returned object, which we release on every path after use. The type is checked before `CFNumberGetValue` writes into the `i64`.
         unsafe {
             let value = IORegistryEntryCreateCFProperty(h.service, h.key, std::ptr::null(), 0);
             if value.is_null() {
@@ -1169,7 +1133,7 @@ mod user_input_probe_tests {
     }
 }
 
-/// The X11 twin of the macOS queue age: how long the key event being dispatched took from the X server stamping it to this code running, in nanoseconds.
+/// The X11 twin of the macOS queue age.
 #[cfg(target_os = "linux")]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     static MAX_AGE_MS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -1379,11 +1343,10 @@ mod x11_key_stamp_seam_tests {
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "linux")))]
 pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
-    // winit exposes no event timestamp on this platform; the post-dequeue stamp stands.
     None
 }
 
-/// Whether the `RedrawRequested` being handled is one the X server asked for with an `Expose` (`aterm_window::platform::x11::redraw_is_exposure`): the server lost what the window showed, and the whole frame is owed (`App::note_owed_repaint`).
+/// Whether the `RedrawRequested` being handled is one the X server asked for with an `Expose` (`aterm_window::platform::x11::redraw_is_exposure`).
 #[cfg(target_os = "linux")]
 pub(crate) fn redraw_is_exposure() -> bool {
     aterm_window::platform::x11::redraw_is_exposure()
@@ -1394,7 +1357,7 @@ pub(crate) const fn redraw_is_exposure() -> bool {
     false
 }
 
-/// Linux/BSD application-runtime using the **pure-winit** surface (NO new system libraries — see [`AppRt::window_set_background_color`] and `toolbar.rs` for the deferred GTK4 work): the appearance method drives `aterm_window::Window::set_theme` so the client-side-decoration light/dark variant honours config `window_theme`; the toolbar seam maintains a REAL in-memory tab-chrome model (`toolbar.rs`) and seeds the window title from it; the menu install delegates to the menu stub; and notification delivery forwards to `notify::spawn_delivery` (freedesktop `Notify` on Linux, a channel-draining stub on the BSDs).
+/// Linux/BSD application-runtime using the **pure-winit** surface (NO new system libraries — see [`AppRt::window_set_background_color`] and `toolbar.rs` for the deferred GTK4 work): the appearance method drives `aterm_window::Window::set_theme` so the client-side-decoration light/dark variant honours config `window_theme`.
 #[cfg(all(not(target_os = "macos"), not(windows)))]
 pub(crate) struct AppRtLinux {
     pub(crate) probe_preferences: bool,
@@ -1509,7 +1472,7 @@ impl AppRt for AppRtLinux {
     }
 }
 
-/// The concrete application-runtime the `App` stores, selected at compile time: [`AppRtMacOS`] on macOS, `AppRtWindows` on Windows, [`AppRtLinux`] elsewhere.
+/// The concrete application-runtime the `App` stores, selected at compile time.
 #[cfg(target_os = "macos")]
 pub(crate) type PlatformAppRt = AppRtMacOS;
 
@@ -1561,7 +1524,7 @@ pub(crate) fn take_opened_urls() -> Vec<String> {
     OPENED_URLS.with(|urls| std::mem::take(&mut *urls.borrow_mut()))
 }
 
-/// Note `url` as opened on this thread ([`take_opened_urls`]): what `app_mouse::open_url_external` does in a test build, which opens none.
+/// Note `url` as opened on this thread ([`take_opened_urls`]).
 #[cfg(test)]
 pub(crate) fn record_opened_url(url: &str) {
     OPENED_URLS.with(|urls| urls.borrow_mut().push(url.to_string()));
@@ -1606,7 +1569,7 @@ mod headless_fixture_tests {
     }
 }
 
-/// The three display-accessibility reads [`AppRtMacOS`] answers [`AppRt::reduce_motion`] and [`AppRt::native_appearance_preferences`] with, asked once and dropped: the boot's off-thread warm (`warm_accessibility_reads` in `lib.rs`), so AppKit's first, slow answer is made before the UI thread asks.
+/// The three display-accessibility reads [`AppRtMacOS`] answers [`AppRt::reduce_motion`] and [`AppRt::native_appearance_preferences`] with, asked once and dropped.
 #[cfg(target_os = "macos")]
 pub(crate) fn warm_accessibility_reads() {
     aterm_objc::autoreleasepool(|_| {
@@ -1616,7 +1579,7 @@ pub(crate) fn warm_accessibility_reads() {
     });
 }
 
-/// The retained reduce-motion notification observer [`AppRt::observe_reduce_motion`] returns: the objc target on macOS, `()` elsewhere (so the `App` field type is the same name on every platform, like `menu::MenuHandle`).
+/// The retained reduce-motion notification observer [`AppRt::observe_reduce_motion`] returns.
 #[cfg(target_os = "macos")]
 pub(crate) type ReduceMotionObserver = aterm_objc::Retained<reduce_motion::ReduceMotionTarget>;
 
@@ -1624,7 +1587,7 @@ pub(crate) type ReduceMotionObserver = aterm_objc::Retained<reduce_motion::Reduc
 #[cfg(not(target_os = "macos"))]
 pub(crate) type ReduceMotionObserver = ();
 
-/// The App Nap opt-out's activity token [`AppRt::hold_off_app_nap`] returns: the retained `NSProcessInfo` activity on macOS, `()` elsewhere (so the `App` field type is the same name on every platform, like [`ReduceMotionObserver`]).
+/// The App Nap opt-out's activity token [`AppRt::hold_off_app_nap`] returns.
 #[cfg(target_os = "macos")]
 pub(crate) type AppNapActivity = aterm_objc::Obj;
 
@@ -1643,12 +1606,7 @@ fn begin_app_nap_opt_out() -> Option<AppNapActivity> {
 
     let token = autoreleasepool(|_| {
         let reason = appkit::nsstring(REASON)?;
-        // SAFETY: `+processInfo` is `-(id)`, the immortal process singleton, and
-        // `-beginActivityWithOptions:reason:` is `-(id<NSObject>)(NSActivityOptions, NSString *)`
-        // (`@@:Q@`; the `uint64_t` options word is `NSUInteger`-wide on every Apple target, so
-        // `send_id_usize_id` is its exact shape). `reason` is a live +1 NSString this frame owns.
-        // The token comes back autoreleased (+0), so it is retained before the pool pops. This
-        // runs on the main thread (`App::resumed`).
+        // SAFETY: `+processInfo` is `-(id)`, the immortal process singleton, and `-beginActivityWithOptions:reason:` is `-(id<NSObject>)(NSActivityOptions, NSString *)` (`@@:Q@`; the `uint64_t` options word is `NSUInteger`-wide on every Apple target, so `send_id_usize_id` is its exact shape). `reason` is a live +1 NSString this frame owns. The token comes back autoreleased (+0), so it is retained before the pool pops. This runs on the main thread (`App::resumed`).
         unsafe {
             let info = appkit::send_id(class(c"NSProcessInfo").as_id(), sel!(processInfo));
             if info.is_null() {
@@ -1695,7 +1653,7 @@ fn gnome_reduce_motion() -> bool {
     false
 }
 
-/// Run `program args…` and return its stdout if it exits successfully within `bound`; otherwise kill it and answer `None`.
+/// Run `program args…` and return its stdout if it exits successfully within `bound`.
 #[cfg(any(all(not(target_os = "macos"), not(windows)), test))]
 pub(crate) fn read_bounded_stdout(
     program: &str,
@@ -1811,7 +1769,7 @@ mod reduce_motion {
     }
 
     aterm_objc::declare_class! {
-        /// The notification-observer target: one `reduceMotionDidChange:` selector that posts [`Wake::ReduceMotionChanged`].
+        /// The notification-observer target.
         pub(crate) struct ReduceMotionTarget: NSObject {
             const NAME: &str = "ATermReduceMotionTarget";
             type Ivars = ReduceMotionIvars;
@@ -1900,11 +1858,7 @@ mod reduce_motion {
                 let Some(name) = aterm_objc::ns_string(notification) else {
                     return false;
                 };
-                // SAFETY: `-addObserver:selector:name:object:` is
-                // `-(void)(id, SEL, id, id)`, exactly the prototype cast below. The
-                // observer is `target`, which the caller keeps alive; the selector
-                // is one this class declares; `name` is a live +1 NSString the pool
-                // outlives; nil `object` means "from any sender".
+                // SAFETY: `-addObserver:selector:name:object:` is `-(void)(id, SEL, id, id)`, exactly the prototype cast below. The observer is `target`, which the caller keeps alive; the selector is one this class declares; `name` is a live +1 NSString the pool outlives; nil `object` means "from any sender".
                 unsafe {
                     let add: unsafe extern "C-unwind" fn(
                         aterm_objc::Id,
@@ -1953,7 +1907,7 @@ mod reduce_motion {
         })
     }
 
-    /// Query `NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion` — the live OS "Reduce Motion" accessibility preference.
+    /// Query `NSWorkspace.sharedWorkspace.accessibilityDisplayShouldReduceMotion`.
     pub(crate) fn query() -> bool {
         workspace_flag(sel!(accessibilityDisplayShouldReduceMotion))
     }
@@ -1992,7 +1946,6 @@ mod reduce_motion {
         let target = new_target(
             main_thread,
             Box::new(move || {
-                // Fire-and-forget: a closed loop (app shutting down) drops the event.
                 let _ = proxy.send_event(Wake::ReduceMotionChanged);
             }),
             Box::new(aterm_update::note_system_woke),
@@ -2223,9 +2176,7 @@ mod layer_colorspace {
         if obj.is_null() || metal.is_null() {
             return false;
         }
-        // SAFETY: `-isKindOfClass:` is `-(BOOL)(Class)` and side-effect free. The argument is a
-        // Class (`@encode` `"#"`, not `"@"`), which `ClassPtr` keeps distinct; hence not
-        // `send_bool_id`.
+        // SAFETY: `-isKindOfClass:` is `-(BOOL)(Class)` and side-effect free. The argument is a Class (`@encode` `"#"`, not `"@"`), which `ClassPtr` keeps distinct; hence not `send_bool_id`.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel, aterm_objc::ClassPtr) -> aterm_objc::Bool =
                 aterm_objc::checked_msg();
@@ -2233,18 +2184,14 @@ mod layer_colorspace {
         }
     }
 
-    /// Find the CAMetalLayer wgpu attached to `view` and set its `colorspace` to the named CG colour space; returns whether it did.
+    /// Find the CAMetalLayer wgpu attached to `view` and set its `colorspace` to the named CG colour space.
     #[must_use]
     pub(crate) fn set(window: &Window, cg_name: &str) -> bool {
         let view = ns_view_of(window);
         let Some(name) = appkit::nsstring(cg_name) else {
             return false;
         };
-        // SAFETY: `view` is this window's live NSView, borrowed on the main thread (only the
-        // winit event loop reaches this); the layer walk reads CALayers that view retains.
-        // `CGColorSpaceCreateWithName` takes a `CFStringRef`, which the toll-free-bridged
-        // NSString is, and returns +1; `-setColorspace:` is `-(void)(CGColorSpaceRef)` (a bare
-        // pointer) and retains, so releasing our reference right after is balanced.
+        // SAFETY: `view` is this window's live NSView, borrowed on the main thread (only the winit event loop reaches this); the layer walk reads CALayers that view retains. `CGColorSpaceCreateWithName` takes a `CFStringRef`, which the toll-free-bridged NSString is, and returns +1; `-setColorspace:` is `-(void)(CGColorSpaceRef)` (a bare pointer) and retains, so releasing our reference right after is balanced.
         unsafe {
             let Some(layer) = find_metal_layer(view) else {
                 return false;
@@ -2261,7 +2208,7 @@ mod layer_colorspace {
         }
     }
 
-    /// Set the window's CAMetalLayer `contentsGravity` to the visual top-left, so a bounds change not yet repainted leaves the previous drawable at 1:1 instead of stretching it (see [`super::AppRt::window_anchor_surface_top_left`]).
+    /// Set the window's CAMetalLayer `contentsGravity` to the visual top-left.
     pub(crate) fn anchor_contents_top_left(window: &Window) {
         // SAFETY: the `CALayerContentsGravity` constants are stable exported QuartzCore symbols; these are reads of immutable `CFStringRef` globals, never freed or mutated here.
         #[link(name = "QuartzCore", kind = "framework")]
@@ -2295,10 +2242,7 @@ mod layer_colorspace {
     /// Read back the CAMetalLayer's live `contentsGravity`, `contentsScale` and `contentsAreFlipped`, the state [`anchor_contents_top_left`] establishes (see [`super::AppRt::window_surface_presentation`]).
     pub(crate) fn read_contents_presentation(window: &Window) -> Option<(String, f64, bool)> {
         let view = ns_view_of(window);
-        // SAFETY: `view` is this window's live NSView (winit owns it for the window's lifetime),
-        // borrowed on the main thread as AppKit requires. Every message below is a side-effect-free
-        // property read; the returned `contentsGravity` is a borrowed NSString copied out
-        // immediately.
+        // SAFETY: `view` is this window's live NSView (winit owns it for the window's lifetime), borrowed on the main thread as AppKit requires. Every message below is a side-effect-free property read; the returned `contentsGravity` is a borrowed NSString copied out immediately.
         unsafe {
             let layer = find_metal_layer(view)?;
             let gravity = appkit::send_id(layer, sel!(contentsGravity));
@@ -2388,12 +2332,7 @@ mod vibrancy {
         if ns_window.is_null() {
             return;
         }
-        // SAFETY: every message below is a standard AppKit call on the main
-        // thread. `-contentView` is `-(id)`; `-setOpaque:` is `-(void)(BOOL)`;
-        // `+clearColor` is `-(id)` returning a shared immortal colour and
-        // `+colorWithSRGBRed:green:blue:alpha:` an AUTORELEASED one, both
-        // borrowed only for the length of `-setBackgroundColor:`, which is
-        // `-(void)(NSColor *)` and RETAINS.
+        // SAFETY: every message below is a standard AppKit call on the main thread. `-contentView` is `-(id)`; `-setOpaque:` is `-(void)(BOOL)`; `+clearColor` is `-(id)` returning a shared immortal colour and `+colorWithSRGBRed:green:blue:alpha:` an AUTORELEASED one, both borrowed only for the length of `-setBackgroundColor:`, which is `-(void)(NSColor *)` and RETAINS.
         unsafe {
             let content = appkit::send_id(ns_window, sel!(contentView));
             if content.is_null() {
@@ -2481,7 +2420,6 @@ mod vibrancy {
             let effect =
                 appkit::send_id_rect(appkit::alloc(effect_cls), sel!(initWithFrame:), bounds);
             if effect.is_null() {
-                // Distinct branch.
                 return;
             }
             appkit::send_v_isize(effect, sel!(setMaterial:), material);
@@ -2592,17 +2530,14 @@ mod surface_colorspace_tests {
     }
 }
 
-/// Opt this application out of macOS diacritic press-and-hold, so a held key repeats instead of opening the accent palette.
+/// Opt this application out of macOS diacritic press-and-hold.
 #[cfg(target_os = "macos")]
 pub(crate) fn disable_press_and_hold() {
     use aterm_objc::{Bool, Id, Sel, autoreleasepool, class, sel};
 
     use crate::appkit;
 
-    // SAFETY: standard NSUserDefaults registration. `+numberWithBool:` (`-(id)(BOOL)`) and
-    // `+dictionaryWithObject:forKey:` (`-(id)(id, id)`) return autoreleased objects borrowed
-    // inside this pool; `+standardUserDefaults` is the process singleton, and
-    // `-registerDefaults:` copies the dictionary, so nothing has to outlive the pool.
+    // SAFETY: standard NSUserDefaults registration. `+numberWithBool:` (`-(id)(BOOL)`) and `+dictionaryWithObject:forKey:` (`-(id)(id, id)`) return autoreleased objects borrowed inside this pool; `+standardUserDefaults` is the process singleton, and `-registerDefaults:` copies the dictionary, so nothing has to outlive the pool.
     autoreleasepool(|_| unsafe {
         let Some(key) = appkit::nsstring("ApplePressAndHoldEnabled") else {
             return;

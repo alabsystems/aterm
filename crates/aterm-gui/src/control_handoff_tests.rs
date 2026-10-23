@@ -112,6 +112,14 @@ impl Captures {
         self.guards.lock().unwrap_or_else(PoisonError::into_inner)[index].load(Ordering::SeqCst)
     }
 
+    /// How many latches were handed out.
+    fn wires_handed(&self) -> usize {
+        self.wires
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
     /// The `index`th latch handed out.
     fn wire(&self, index: usize) -> ReplyWire {
         self.wires.lock().unwrap_or_else(PoisonError::into_inner)[index].clone()
@@ -430,8 +438,10 @@ fn a_latch_is_released_once_its_last_byte_is_taken() {
     let lanes = parked_lanes(&stub);
     let client = dial(&lanes).expect("admitted");
     (&client).write_all(b"AUTH ok\nlatched\n").expect("request");
+    // A connection whose handshake has not arrived parks too, so the census
+    // alone does not say the request was served; the latch handed out does.
     settle(&lanes, "the unread answer parked", |census| {
-        census.parked == 1 && census.rpc == 0
+        census.parked == 1 && census.rpc == 0 && stub.wires_handed() == 1
     });
     let wire = stub.wire(0);
     assert!(

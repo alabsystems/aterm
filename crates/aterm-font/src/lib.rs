@@ -10,7 +10,7 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
-//! aterm's font reader, the sfnt half of the text-fonts carve (TF.3 and TF.5 of docs/AUDIT-third-party-2026-10-15.md): every table aterm-render reads.
+//! aterm's font reader: every sfnt table `aterm-render` reads.
 
 #![forbid(unsafe_code)]
 #![allow(clippy::identity_op)]
@@ -55,10 +55,7 @@ use head::IndexToLocationFormat;
 pub use work::{Spent, take_spent};
 
 pub mod opentype_layout {
-    //! The [OpenType Layout](
-    //! https://docs.microsoft.com/en-us/typography/opentype/spec/chapter2#overview)
-    //! common tables: script, feature and lookup lists, coverage and class
-    //! definitions, (chained) context lookups and feature variations.
+    //! OpenType Layout common tables.
     pub use crate::ggg::*;
 }
 
@@ -500,8 +497,6 @@ impl FromData for TableRecord {
     }
 }
 
-/// The most variation axes a [`Face`] keeps coordinates for; a face with
-/// more is read at its default instance only.
 const MAX_VAR_COORDS: usize = 64;
 
 #[derive(Clone)]
@@ -576,7 +571,7 @@ pub struct RawFace<'a> {
 }
 
 impl<'a> RawFace<'a> {
-    /// Reads the table directory of face `index` (0 for a single-face file; [`fonts_in_collection`] gives a collection's count).
+    /// Reads the table directory of face `index`.
     pub fn parse(data: &'a [u8], index: u32) -> Result<Self, FaceParsingError> {
         let mut s = Stream::new(data);
 
@@ -603,8 +598,6 @@ impl<'a> RawFace<'a> {
                 return Err(FaceParsingError::UnknownMagic);
             }
         } else {
-            // When reading from a regular font (not a collection) disallow index to be non-zero
-            // Basically treat the font as a one-element collection
             if index != 0 {
                 return Err(FaceParsingError::FaceIndexOutOfBounds);
             }
@@ -724,7 +717,7 @@ pub struct FaceTables<'a> {
     pub vvar: Option<vvar::Table<'a>>,
 }
 
-/// A font face: the tables of one face of a font file, and the variation instance its varied answers are read at.
+/// A font face and its active variation coordinates.
 #[derive(Clone)]
 pub struct Face<'a> {
     raw_face: RawFace<'a>,
@@ -935,7 +928,6 @@ impl<'a> Face<'a> {
     #[inline]
     #[must_use]
     pub const fn is_variable(&self) -> bool {
-        // `fvar::Table::parse` already checked that `axisCount` is non-zero.
         self.tables.fvar.is_some()
     }
 
@@ -963,11 +955,10 @@ impl<'a> Face<'a> {
     /// Checks that face is marked as *Italic*.
     #[inline]
     pub fn is_italic(&self) -> bool {
-        // A face can have a Normal style and a non-zero italic angle, which also makes it italic.
         self.style() == Style::Italic || self.italic_angle() != 0.0
     }
 
-    /// Checks that face is marked as *Bold*: `OS/2` `fsSelection`, or the `head` table's `macStyle` when the face has no `OS/2` table.
+    /// Checks that face is marked as *Bold*.
     #[inline]
     pub fn is_bold(&self) -> bool {
         self.tables
@@ -981,7 +972,7 @@ impl<'a> Face<'a> {
         self.style() == Style::Oblique
     }
 
-    /// Returns face style: `OS/2`'s, or Italic from the `head` table's `macStyle` when the face has no `OS/2` table.
+    /// Returns face style.
     #[inline]
     pub fn style(&self) -> Style {
         match self.tables.os2 {
@@ -991,7 +982,7 @@ impl<'a> Face<'a> {
         }
     }
 
-    /// Returns face's weight: `OS/2`'s, or Bold from the `head` table's `macStyle` when the face has no `OS/2` table (else `Weight::Normal`).
+    /// Returns face weight.
     #[inline]
     pub fn weight(&self) -> Weight {
         match self.tables.os2 {
@@ -1007,7 +998,7 @@ impl<'a> Face<'a> {
         self.tables.os2.map(|os2| os2.width()).unwrap_or_default()
     }
 
-    /// Returns a horizontal face ascender: OS/2's typographic ascender when `USE_TYPO_METRICS` is set, else `hhea`'s (OS/2's when that is 0), with the `MVAR` delta at the current instance.
+    /// Returns the horizontal face ascender at the current instance.
     #[inline]
     pub fn ascender(&self) -> i16 {
         if let Some(os_2) = self.tables.os2 {
@@ -1290,7 +1281,7 @@ impl<'a> Face<'a> {
         None
     }
 
-    /// Resolves a variation of a glyph ID from two code points through the first format 14 subtable ([Unicode Variation Sequences]( https://docs.microsoft.com/en-us/typography/opentype/spec/cmap#format-14-unicode-variation-sequences)).
+    /// Resolves a glyph variation ID from two code points through the first format 14 subtable.
     #[inline]
     pub fn glyph_variation_index(&self, code_point: char, variation: char) -> Option<GlyphId> {
         for subtable in self.tables.cmap?.subtables {
@@ -1305,7 +1296,7 @@ impl<'a> Face<'a> {
         None
     }
 
-    /// Returns glyph's horizontal advance at the current instance: `hmtx` plus the `HVAR` delta (else the `gvar` phantom point), rounded.
+    /// Returns the glyph's horizontal advance at the current instance.
     #[inline]
     pub fn glyph_hor_advance(&self, glyph_id: GlyphId) -> Option<u16> {
         let mut advance = self.tables.hmtx?.advance(glyph_id)? as f32;
@@ -1314,7 +1305,6 @@ impl<'a> Face<'a> {
             // Ignore variation offset when `hvar` is not set.
             if let Some(hvar) = self.tables.hvar {
                 if let Some(offset) = hvar.advance_offset(glyph_id, self.coords()) {
-                    // Upstream rounds as `+ 0.5` and a truncating cast.
                     advance += offset + 0.5;
                 }
             } else if let Some(points) = self.glyph_phantom_points(glyph_id) {
@@ -1325,7 +1315,7 @@ impl<'a> Face<'a> {
         u16::try_num_from(advance)
     }
 
-    /// Returns glyph's vertical advance at the current instance: `vmtx` plus the `VVAR` delta (else the `gvar` phantom point), rounded.
+    /// Returns the glyph's vertical advance at the current instance.
     #[inline]
     pub fn glyph_ver_advance(&self, glyph_id: GlyphId) -> Option<u16> {
         let mut advance = self.tables.vmtx?.advance(glyph_id)? as f32;
@@ -1378,7 +1368,7 @@ impl<'a> Face<'a> {
         i16::try_num_from(bearing)
     }
 
-    /// Returns glyph's vertical origin according to the [Vertical Origin Table](https://docs.microsoft.com/en-us/typography/opentype/spec/vorg), at the current instance.
+    /// Returns the glyph's vertical origin at the current instance.
     #[inline]
     pub fn glyph_y_origin(&self, glyph_id: GlyphId) -> Option<i16> {
         let mut origin = self.tables.vorg.map(|vorg| vorg.glyph_y_origin(glyph_id))? as f32;
@@ -1417,7 +1407,7 @@ impl<'a> Face<'a> {
         None
     }
 
-    /// Outlines a glyph at the current instance into `sink` as points: the on- and off-curve points of each contour as the font stores them (`glyf`: TrueType's quadratic points, composite components transformed; CFF: each segment's control and end points), and returns the bounding box [`Face::outline_glyph`] would.
+    /// Outlines a glyph at the current instance into `sink` as contour points and returns its bounding box.
     #[inline]
     pub fn outline_glyph_points(
         &self,
@@ -1438,7 +1428,7 @@ impl<'a> Face<'a> {
         bbox
     }
 
-    /// Returns a tight glyph bounding box at the current instance, computed from the outline (the `glyf` header boxes are ignored: they can be malformed, and a variation moves them).
+    /// Returns the tight glyph bounding box at the current instance.
     #[inline]
     pub fn glyph_bounding_box(&self, glyph_id: GlyphId) -> Option<Rect> {
         self.outline_glyph(glyph_id, &mut sink::NullSink)
@@ -1451,7 +1441,7 @@ impl<'a> Face<'a> {
         self.tables.head.global_bbox
     }
 
-    /// Returns a glyph's raster image: the strike closest to `pixels_per_em` from below, else the next larger one (`u16::MAX` picks the largest).
+    /// Returns the glyph's raster image closest to `pixels_per_em`.
     #[inline]
     pub fn glyph_raster_image(
         &self,
@@ -1493,7 +1483,7 @@ impl<'a> Face<'a> {
         Some(self.tables().colr?.palettes.palettes())
     }
 
-    /// Paints a color glyph from the `COLR` table at the current instance, with `palette` (0 is the default) and `foreground_color` for the foreground palette index.
+    /// Paints a color glyph from the `COLR` table at the current instance.
     #[inline]
     pub fn paint_color_glyph(
         &self,

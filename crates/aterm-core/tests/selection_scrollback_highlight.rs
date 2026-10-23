@@ -1,9 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-//! A selection made while scrolled back copies the scrollback text and highlights the
-//! matching display rows. Anchor rows are terminal-relative (0 = live top, negative =
-//! scrollback); the renderer maps display row `r` to `r - display_offset`.
+
+//! Selection text and highlight mapping across scrollback.
 
 use aterm_core::selection::{SelectionSide, SelectionType};
 use aterm_core::terminal::Terminal;
@@ -15,13 +13,11 @@ fn selection_over_scrollback_highlights_correct_display_rows() {
         term.process(format!("line{i}\r\n").as_bytes());
     }
 
-    // Scroll up 4 lines: the viewport top now shows a scrollback line.
     term.scroll_display(4);
     let display_offset = term.grid().display_offset() as i32;
     assert_eq!(display_offset, 4, "scrolled 4 lines into history");
 
-    // Select display rows 0..=1 (scrollback); callers pass terminal-relative
-    // rows, `d - display_offset`.
+    // Select display rows 0..=1 via terminal-relative coordinates (`d - display_offset`).
     let term_start = 0 - display_offset; // display row 0 -> terminal row -4
     let term_end = 1 - display_offset; // display row 1 -> terminal row -3
     {
@@ -31,15 +27,11 @@ fn selection_over_scrollback_highlights_correct_display_rows() {
         sel.complete_selection();
     }
 
-    // (a) The copied text is the scrollback lines at display rows 0..=1, not
-    // live grid rows 0..=1.
     let copied = term.selection_to_string().expect("selection has text");
     let want_row0 = term.display_row_text(0).expect("display row 0 text");
     let want_row1 = term.display_row_text(1).expect("display row 1 text");
     assert_eq!(copied, format!("{want_row0}\n{want_row1}"));
 
-    // (b) Display rows 0 and 1 report contained under
-    // `contains_cell(r - display_offset, ...)`; rows below do not.
     let sel = term.text_selection();
     let contained = |display_row: i32, col: u16| {
         sel.contains_cell(display_row - display_offset, col, false, false)
@@ -50,9 +42,7 @@ fn selection_over_scrollback_highlights_correct_display_rows() {
     assert!(!contained(4, 0), "bottom display row is NOT highlighted");
 }
 
-/// An out-of-range selection (the control socket's `select` verb takes
-/// unclamped i32 rows) must not make `selection_to_string` walk ~2^31 rows
-/// under the terminal lock; the walk is bounded to the grid's coordinate range.
+/// Out-of-range selection coordinates clamp to the grid's row range.
 #[test]
 fn selection_to_string_bounds_pathological_out_of_range_span() {
     let mut term = Terminal::new(5, 20);
@@ -65,7 +55,6 @@ fn selection_to_string_bounds_pathological_out_of_range_span() {
         sel.complete_selection();
     }
 
-    // Bounded to the 5 visible rows.
     let copied = term.selection_to_string().expect("selection has text");
     let line_count = copied.split('\n').count();
     assert!(

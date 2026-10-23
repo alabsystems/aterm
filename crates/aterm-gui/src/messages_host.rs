@@ -418,7 +418,6 @@ impl App {
             };
             let row = msg.hold != Hold::LogOnly;
             if row && let Some(key) = msg.key.as_deref() {
-                // Said on the glass again: its next repeat is a record.
                 self.config_cleared.remove(key);
             }
             self.post_unsynced(msg, stamp);
@@ -626,7 +625,6 @@ impl App {
         self.append_message_lines(&lines);
         let changed = step.glass_changed || committed || wire || strip;
         if changed {
-            // The chips moved under a still pointer.
             self.refresh_band_hover();
         }
         changed
@@ -1078,7 +1076,6 @@ impl App {
             _ => false,
         };
         let performed = self.perform_intent(wid, id, intent.clone());
-        // A System State press says whether the review it opened shows the vault sync's rows.
         let applies = applies
             || (performed
                 && intent == Intent::ReviewVaultSync
@@ -1524,7 +1521,6 @@ impl App {
                 self.toolchain_person_waiting = false;
                 self.toolchain_holder_pid = None;
                 if self.toolchain_person.take().is_none() || self.toolchain_row_latched {
-                    // A latched lane row (a first run) is the lane's to fold.
                     return;
                 }
                 self.retire_live_toolchain(Some(echo));

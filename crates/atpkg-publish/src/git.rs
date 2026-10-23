@@ -11,7 +11,7 @@ use crate::error::{Error, Result};
 /// # Errors
 /// A could-not-run when git cannot be started, or a refusal when git fails.
 pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = aterm_uds::spawnfd::command("git")
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
         .arg("-C")
         .arg(dir)
         .args(args)

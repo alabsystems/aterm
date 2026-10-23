@@ -102,8 +102,7 @@ fn open_regular_shared(path: &Path, share: u32) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// Portable fallback. Targets without a non-blocking filesystem-open flag use
-/// a no-link precheck and still verify the opened handle before reading.
+/// Portable fallback for targets without a non-blocking filesystem-open flag.
 #[cfg(not(any(unix, windows)))]
 fn open_regular(path: &Path) -> io::Result<(std::fs::File, Cow<'_, Path>)> {
     if !std::fs::symlink_metadata(path)?.file_type().is_file() {
@@ -671,8 +670,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A reused buffer reads what a fresh one does, including after a larger file (the stale
-    /// tail a missing `clear()` would leave).
+    /// A reused buffer reads what a fresh one does, including after a larger file.
     #[test]
     fn a_reused_buffer_reads_the_same_bytes_a_fresh_one_does() {
         let root = fixture_dir("reuse");
@@ -696,8 +694,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A refused path must not leave the previous font in a reused buffer. One case per
-    /// fallible admission step, in source order.
+    /// A refused path must not leave the previous font in a reused buffer.
     #[test]
     fn a_refused_path_leaves_no_stale_font_in_a_reused_buffer() {
         let root = fixture_dir("stale");
@@ -728,8 +725,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A one-shot read allocates no slack: the blob is interned for the process's life, so
-    /// over-reserved capacity would stay resident.
+    /// A one-shot read allocates no slack.
     #[test]
     fn a_fresh_read_allocates_no_slack() {
         let root = fixture_dir("exact-capacity");
@@ -761,9 +757,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("remove font-file fixtures");
     }
 
-    /// A file under the system font directory maps; one under any user-writable directory (the
-    /// per-user `$HOME` dirs, `/Library/Fonts`) copies, as does a `..` traversal that begins in
-    /// the system directory.
+    /// A file under the system font directory maps; one under any user-writable directory copies.
     #[test]
     fn maps_in_place_admits_the_system_font_volume_and_nothing_user_writable() {
         #[cfg(target_os = "macos")]

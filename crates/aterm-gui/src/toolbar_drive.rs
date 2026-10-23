@@ -20,9 +20,6 @@ pub(crate) const HUNG: i32 = 3;
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn run_toolbar_drive() -> i32 {
-    // The drive is a windowed process of its own: it builds AppKit windows and
-    // reads NSApp, so it mints the proof a windowed launch carries and hands it
-    // to the body that sends `+sharedApplication`.
     macos::run(crate::platform::Windowed::launch())
 }
 
@@ -47,19 +44,13 @@ mod macos {
     use crate::tab_model::{TabConnRole, TabIconKind, TabId};
     use crate::{Wake, WindowId, toolbar};
 
-    /// `+[NSMenu popUpContextMenu:withEvent:forView:]`, the strip's one pop site
-    /// (toolbar.rs), as the class method it is: `(cls, _cmd, menu, event,
-    /// view)`, void.
     type PopUpContextMenu = unsafe extern "C-unwind" fn(Id, Sel, Id, Id, Id);
 
-    /// The site that replaces it for the life of the drive process.
     static POP_UP_CONTEXT_MENU: aterm_objc::swizzle::SwizzleSite<PopUpContextMenu> =
         aterm_objc::swizzle::SwizzleSite::new();
-    /// Pops the stub swallowed, and the item count of the last one.
     static MENUS_SWALLOWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     static LAST_MENU_ITEMS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// The stub, entered by the runtime as the class method it replaces.
     unsafe extern "C-unwind" fn swallow_pop_up(
         _cls: Id,
         _cmd: Sel,
@@ -68,8 +59,7 @@ mod macos {
         _view: Id,
     ) {
         use std::sync::atomic::Ordering::Relaxed;
-        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for this call);
-        // `-numberOfItems` is `-(NSInteger)`, sent as that.
+        // SAFETY: `menu` is the live NSMenu the strip just built (+0 for this call); `-numberOfItems` is `-(NSInteger)`, sent as that.
         let items = if menu.is_null() {
             0
         } else {
@@ -79,7 +69,6 @@ mod macos {
         MENUS_SWALLOWED.fetch_add(1, Relaxed);
     }
 
-    /// How many menus the stub has swallowed so far.
     fn pops() -> usize {
         MENUS_SWALLOWED.load(std::sync::atomic::Ordering::Relaxed)
     }
@@ -148,8 +137,7 @@ mod macos {
         }
     }
     unsafe fn s_rect(r: Id, s: Sel) -> CGRect {
-        // SAFETY: as above, for `NSRect (id, SEL)`. 32 bytes, returned in
-        // registers on both Apple ABIs for this shape.
+        // SAFETY: as above, for `NSRect (id, SEL)`. 32 bytes, returned in registers on both Apple ABIs for this shape.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> CGRect = checked_msg();
             f(r, s)
@@ -184,9 +172,7 @@ mod macos {
         }
     }
     unsafe fn s_bytes(r: Id, s: Sel) -> *const u8 {
-        // SAFETY: as above, for `unsigned char * (id, SEL)`
-        // (`-[NSBitmapImageRep bitmapData]`). Taken as `Id` and re-cast
-        // because both are one pointer-sized return in the same register.
+        // SAFETY: as above, for `unsigned char * (id, SEL)` (`-[NSBitmapImageRep bitmapData]`). Taken as `Id` and re-cast because both are one pointer-sized return in the same register.
         unsafe {
             let f: unsafe extern "C-unwind" fn(Id, Sel) -> Id = checked_msg();
             f(r, s).as_ptr().cast_const().cast::<u8>()
@@ -200,9 +186,6 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:]`,
-    /// encoded `@92@0:8Q16{CGPoint=dd}24Q40d48q56@64q72q80f88`: `pressure` is
-    /// `f32` and the two counters are `NSInteger`.
     unsafe fn mouse_event(
         kind: usize,
         loc: CGPoint,
@@ -210,8 +193,7 @@ mod macos {
         win: isize,
         clicks: isize,
     ) -> Id {
-        // SAFETY: a class method on `NSEvent` (linked), cast to the exact
-        // prototype above; every argument is a plain scalar or nil.
+        // SAFETY: a class method on `NSEvent` (linked), cast to the exact prototype above; every argument is a plain scalar or nil.
         unsafe {
             let f: unsafe extern "C-unwind" fn(
                 Id,
@@ -242,8 +224,6 @@ mod macos {
         }
     }
 
-    /// `+[NSEvent keyEventWithType:…]`, encoded
-    /// `@96@0:8Q16{CGPoint=dd}24Q40d48q56@64@72@80B88S92`.
     unsafe fn key_event(kind: usize, win: isize, chars: Id, code: u16) -> Id {
         // SAFETY: as [`mouse_event`], against the signature above.
         unsafe {
@@ -286,14 +266,10 @@ mod macos {
     const MOUSE_MOVED: usize = 5;
     const KEY_DOWN: usize = 10;
     const KEY_UP: usize = 11;
-    /// `NSEventModifierFlagControl`.
     const CTRL: usize = 1 << 18;
 
-    /// How long a stage waits for macOS to make the drive the active app with
-    /// its window key before it clicks anyway.
     const FOCUS_WAIT: Duration = Duration::from_secs(10);
 
-    /// An autoreleased `NSString`, for an event's `-characters`.
     fn nsstr(s: &str) -> Id {
         ns_string(s).map_or(Id::NIL, aterm_objc::Obj::autorelease)
     }
@@ -302,14 +278,12 @@ mod macos {
         if id.is_null() {
             return "nil".to_owned();
         }
-        // SAFETY: `id` is non-null here; `class_of` and `class_name` are
-        // read-only runtime queries and the name is immortal.
+        // SAFETY: `id` is non-null here; `class_of` and `class_name` are read-only runtime queries and the name is immortal.
         unsafe { class_name(class_of(id)) }
             .to_string_lossy()
             .into_owned()
     }
 
-    /// Intern a class or protocol name known only as a `&str`.
     fn cstr_named(name: &str) -> &'static CStr {
         Box::leak(
             std::ffi::CString::new(name)
@@ -318,8 +292,6 @@ mod macos {
         )
     }
 
-    /// Round to a sixteenth of a point, so a layout figure is printable without
-    /// a float's last bit deciding whether two transcripts differ.
     fn r4(v: f64) -> f64 {
         (v * 16.0).round() / 16.0
     }
@@ -406,14 +378,10 @@ mod macos {
         m
     }
 
-    /// The presence line the model's hover for tab `i` ends in, which the
-    /// extension's bare tooltip lacks.
     fn presence_line(i: usize) -> String {
         format!("last typed into by worker-{i} at 14:02")
     }
 
-    /// Whether every chip's hover, as `chrome` reads it, is the strip's tooltip
-    /// with its presence line, not the extension's bare one.
     fn hovers_keep_presence(handle: &toolbar::ToolbarHandle, n: usize) -> (bool, String) {
         let chrome = toolbar::read_tab_chrome(handle).unwrap_or_default();
         ((0..n).all(|i| chrome.contains(&presence_line(i))), chrome)
@@ -487,8 +455,6 @@ mod macos {
         }
     }
 
-    /// The findings ledger. `check` prints every question it asked, passing or
-    /// failing: the transcript is what an A/B between two commits diffs.
     struct Ctx {
         findings: Vec<String>,
         /// Clicks that failed while another app held activation: they measured
@@ -503,8 +469,6 @@ mod macos {
             }
         }
 
-        /// A click that reaches the strip only while the drive is the active app
-        /// with its window key.
         fn check_focused(&mut self, focused: bool, ok: bool, msg: String) {
             if ok || focused {
                 self.check(ok, msg);
@@ -515,11 +479,8 @@ mod macos {
         }
     }
 
-    /// The strip container, reached the way AppKit reaches it: window ->
-    /// toolbar -> items -> item 0 -> view.
     unsafe fn strip_of(ns_window: Id) -> Id {
-        // SAFETY: `ns_window` is a live `NSWindow`; every send is a read-only
-        // accessor at the prototype its helper declares.
+        // SAFETY: `ns_window` is a live `NSWindow`; every send is a read-only accessor at the prototype its helper declares.
         unsafe {
             let tb = s_id(ns_window, sel!(toolbar));
             if tb.is_null() {
@@ -548,7 +509,6 @@ mod macos {
         }
     }
 
-    /// Every tab chip, in x order. The `+` button is excluded by class name.
     unsafe fn chips(strip: Id) -> Vec<Id> {
         // SAFETY: `strip` is a live `NSView`; `-frame` is read-only.
         unsafe {
@@ -569,14 +529,8 @@ mod macos {
             .find(|v| name_of(*v).contains("ChromeButton"))
     }
 
-    /// Capture `view` through AppKit's `-cacheDisplayInRect:` pair and return
-    /// `(w, h, bytes)`: what `drawRect:` actually put down, so a class that
-    /// registers every encoding correctly yet draws the wrong thing is caught.
     unsafe fn capture(view: Id) -> Option<(usize, usize, Vec<u8>)> {
-        // SAFETY: `view` is a live `NSView` on the main thread; the two sends
-        // are the documented caching pair and the rep's accessors are
-        // read-only. `bitmapData` is valid while `rep` is, which is for the
-        // rest of this autorelease scope.
+        // SAFETY: `view` is a live `NSView` on the main thread; the two sends are the documented caching pair and the rep's accessors are read-only. `bitmapData` is valid while `rep` is, which is for the rest of this autorelease scope.
         unsafe {
             let b = s_rect(view, sel!(bounds));
             if !(b.size.width > 1.0 && b.size.height > 1.0) {
@@ -604,8 +558,6 @@ mod macos {
         }
     }
 
-    /// Per-column ink profile: how many non-transparent samples each x column
-    /// holds.
     fn ink_columns(w: usize, h: usize, px: &[u8]) -> Vec<u32> {
         let spp = px.len().checked_div(w * h).unwrap_or(4).max(1);
         let mut cols = vec![0u32; w];
@@ -651,9 +603,6 @@ mod macos {
             .join(",")
     }
 
-    /// Every protocol reachable from `seed`, following protocol inheritance
-    /// (`NSTextFieldDelegate` inherits `NSControlTextEditingDelegate`, where two
-    /// of the three rename rows are declared).
     fn expand_protocols(into: &mut Vec<String>, seed: impl IntoIterator<Item = String>) {
         for name in seed {
             let mut stack = vec![name];
@@ -667,9 +616,6 @@ mod macos {
         }
     }
 
-    /// The protocols a protocol itself inherits. `protocol_copyProtocolList` has
-    /// no `aterm-objc` wrapper (no shipping call site needs one), so the
-    /// prototype is declared here.
     fn protocol_parents(proto: aterm_objc::ProtocolPtr) -> Vec<String> {
         unsafe extern "C" {
             fn protocol_copyProtocolList(
@@ -683,8 +629,7 @@ mod macos {
             return Vec::new();
         }
         let mut count: std::ffi::c_uint = 0;
-        // SAFETY: `proto` is live; the runtime writes the count through the pointer and hands back
-        // a malloc'd array this function owns.
+        // SAFETY: `proto` is live; the runtime writes the count through the pointer and hands back a malloc'd array this function owns.
         let list = unsafe { protocol_copyProtocolList(proto, &raw mut count) };
         if list.is_null() {
             return Vec::new();
@@ -695,14 +640,11 @@ mod macos {
             let name = unsafe { CStr::from_ptr(protocol_getName(*list.add(i))) };
             names.push(name.to_string_lossy().into_owned());
         }
-        // SAFETY: the array is this function's to free; the immortal protocol
-        // objects it held are not touched.
+        // SAFETY: the array is this function's to free; the immortal protocol objects it held are not touched.
         unsafe { free(list.cast()) };
         names
     }
 
-    /// Where a row's shape is written down outside this tree, and what that
-    /// authority says.
     unsafe fn authority_for(cls: ClassPtr, s: Sel) -> Option<(String, String)> {
         // SAFETY: `cls` is a live class object.
         let mut protos: Vec<String> = Vec::new();
@@ -728,7 +670,6 @@ mod macos {
         None
     }
 
-    /// One declared class, audited off a live instance.
     struct Declared {
         /// The instance this class was read from, and how it was found.
         found_by: &'static str,
@@ -741,8 +682,6 @@ mod macos {
         conforms: Option<&'static CStr>,
     }
 
-    /// Read every registered row of `d`'s class and check it against whatever
-    /// the runtime says it should be.
     fn audit_declared(cx: &mut Ctx, d: &Declared) {
         println!("  --  {} found by {}", d.name.to_string_lossy(), d.found_by);
         if d.cls.is_null() {
@@ -876,8 +815,7 @@ mod macos {
             crate::logging::stderr_line!("objc-toolbar-drive: NOT RUN — no content view");
             return NOT_RUN;
         }
-        // SAFETY: `ns_view` is winit's live content view; both accessors are
-        // read-only.
+        // SAFETY: `ns_view` is winit's live content view; both accessors are read-only.
         let ns_window = unsafe { s_id(ns_view, sel!(window)) };
         // SAFETY: as above.
         let win_no = unsafe { s_isize(ns_window, sel!(windowNumber)) };
@@ -975,8 +913,7 @@ mod macos {
         println!("\n-- stage 3: a left click on each hit-tested chip view");
         // SAFETY: `+sharedApplication` on a linked class.
         let app = unsafe { s_id(class(c"NSApplication").as_id(), sel!(sharedApplication)) };
-        // SAFETY: the live NSApp and the drive's own window; `-isActive` and
-        // `-isKeyWindow` are read-only `B16@0:8` getters.
+        // SAFETY: the live NSApp and the drive's own window; `-isActive` and `-isKeyWindow` are read-only `B16@0:8` getters.
         let focused =
             || unsafe { s_bool(app, sel!(isActive)) && s_bool(ns_window, sel!(isKeyWindow)) };
         let take_focus = |d: &mut Driver, el: &mut EventLoop<Wake>| {
@@ -1000,8 +937,7 @@ mod macos {
         for (i, c) in cs.iter().enumerate() {
             d.wakes.clear();
             let before = focused();
-            // SAFETY: `c` and `strip` are live views, `ns_window` is live;
-            // the synthesized events are +0 autoreleased `NSEvent`s.
+            // SAFETY: `c` and `strip` are live views, `ns_window` is live; the synthesized events are +0 autoreleased `NSEvent`s.
             unsafe {
                 let b = s_rect(*c, sel!(bounds));
                 let mid = CGPoint {
@@ -1083,11 +1019,9 @@ mod macos {
         );
 
         println!("\n-- stage 5: the context menu, two ways in");
-        // SAFETY: `NSMenu` is a live, immortal class object; `class_of` on it
-        // answers its metaclass.
+        // SAFETY: `NSMenu` is a live, immortal class object; `class_of` on it answers its metaclass.
         let meta = unsafe { aterm_objc::class_of(class(c"NSMenu").as_id()) };
-        // SAFETY: the stub has exactly the row's prototype and cannot unwind;
-        // NSMenu's metaclass is live and the selector is interned.
+        // SAFETY: the stub has exactly the row's prototype and cannot unwind; NSMenu's metaclass is live and the selector is interned.
         let pop_site_replaced = match unsafe {
             POP_UP_CONTEXT_MENU.install(
                 meta,
@@ -1152,8 +1086,7 @@ mod macos {
             );
         }
         if pop_site_replaced {
-            // SAFETY: live views, NSApp and NSWindow throughout this block; every
-            // synthesized event is +0 autoreleased.
+            // SAFETY: live views, NSApp and NSWindow throughout this block; every synthesized event is +0 autoreleased.
             unsafe {
                 let b = s_rect(cs[1], sel!(bounds));
                 let mid = CGPoint {
@@ -1456,8 +1389,7 @@ mod macos {
                 toolbar::rename_editor_text(&handle)
             ),
         );
-        // SAFETY: `fr` is a live responder while the editor is up; both
-        // `-delegate` sends are read-only accessors.
+        // SAFETY: `fr` is a live responder while the editor is up; both `-delegate` sends are read-only accessors.
         unsafe {
             let ctl = s_id(fr, sel!(delegate));
             let tgt = if ctl.is_null() {
@@ -1878,8 +1810,7 @@ mod macos {
         }
 
         println!("\n-- stage 10: the four declared classes, off the live objects");
-        // SAFETY: `ns_window` is live; the toolbar's delegate is the declared
-        // `ATermToolbarDelegate` while the toolbar exists.
+        // SAFETY: `ns_window` is live; the toolbar's delegate is the declared `ATermToolbarDelegate` while the toolbar exists.
         let tb_delegate = unsafe {
             let tb = s_id(ns_window, sel!(toolbar));
             if tb.is_null() {

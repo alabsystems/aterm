@@ -14,6 +14,8 @@ description = "aterm — `aterm machines`: configure and manage a lab of Macs fr
 aterm-tempfile = { workspace = true }
 # Child processes (spawnfd::command), bounded runs (deadline), this process's euid (peer).
 aterm-uds = { workspace = true }
+# A process's start second, any uid's (`kproc`): the run lock's holder check.
+aterm-sysprobe = { workspace = true }
 # The baseline, fleet and envelope documents; comment-preserving edits of fleet.toml.
 aterm-toml = { workspace = true }
 # Reports on the wire and in state/.

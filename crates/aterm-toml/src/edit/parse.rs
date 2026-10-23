@@ -117,8 +117,7 @@ impl<'a> Parser<'a> {
         Err(Error::at(self.src, span, message))
     }
 
-    /// A one-character span at the current position. Not `pos + 1`: that can
-    /// split a multi-byte character, and the diagnostic printer panics slicing it.
+    /// A one-character span at the current position.
     fn here<T>(&self, message: impl Into<String>) -> Result<T> {
         self.err(self.pos..self.next_boundary(self.pos), message)
     }
@@ -132,9 +131,7 @@ impl<'a> Parser<'a> {
         end.max(at)
     }
 
-    /// Refuse a tree deeper than the limit. The bound is on the tree, not the
-    /// recursion: a long dotted key parses in a loop, but dropping, printing and
-    /// deserializing what it builds all recurse.
+    /// Refuse a tree deeper than the limit.
     fn check_depth(&self, depth: usize, at: usize) -> Result<()> {
         if depth > self.limits.max_depth {
             return self.err(
@@ -553,15 +550,11 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// After a bare scalar the next byte has to end it. Without this check
-    /// `truex` would parse as `true` and leave `x` to blow up somewhere less
-    /// informative.
+    /// After a bare scalar the next byte has to end it.
     fn end_of_scalar(&mut self, start: usize) -> Result<()> {
         match self.peek() {
             None | Some(b' ' | b'\t' | b'\n' | b'\r' | b',' | b']' | b'}' | b'#') => Ok(()),
             Some(_) => {
-                // The whole offending character: callers slice the source with the
-                // public `Error::span()` (see `here()`).
                 let end = self.next_boundary(self.pos);
                 self.err(start..end, "unexpected characters after a value")
             }
@@ -612,9 +605,6 @@ impl<'a> Parser<'a> {
                 return Ok(array);
             }
             if self.eof() {
-                // An empty span at end of input, not `[`..EOF: the config editor's
-                // `parser_diagnostic_range` turns that into a caret on the last authored
-                // byte, where a whole-array span would underline the opening bracket.
                 return self.err(self.b.len()..self.b.len(), "unterminated array");
             }
             let prefix = self.src[trivia_start..self.pos].to_owned();
@@ -710,8 +700,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// A `"…"` or `"""…"""` string. `multiline_ok` is false for keys, where the
-    /// spec allows only the single-line form.
+    /// A `"…"` or `"""…"""` string.
     fn basic_string(&mut self, multiline_ok: bool) -> Result<String> {
         let start = self.pos;
         if multiline_ok && self.at(1) == Some(b'"') && self.at(2) == Some(b'"') {
@@ -762,9 +751,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// The `"""`/`'''` forms. They share every rule except escaping, and both
-    /// allow one or two of their own delimiter immediately before the close —
-    /// `"""a""""` is `a"`.
+    /// The `"""`/`'''` forms.
     fn multiline_string(&mut self, start: usize, quote: u8) -> Result<String> {
         self.pos += 3;
         if self.peek() == Some(b'\r') && self.at(1) == Some(b'\n') {
@@ -877,7 +864,6 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
-                // The offending character, not byte: `c` may lead a multi-byte one.
                 let ch = self.src[start + 1..]
                     .chars()
                     .next()

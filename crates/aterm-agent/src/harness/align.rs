@@ -3,12 +3,6 @@
 
 //! The bounded child runner, [`capture_bounded`]: a child read to a deadline
 //! (the `claude auth` probes of [`super::cli`]).
-//!
-//! [`capture_bounded`] parks on stdout until its deadline, then checks a child
-//! that closed stdout but has not exited at a bounded 20 ms cadence, so the
-//! caller can kill it at the same deadline; there is no resident timer. The
-//! worker lifecycle is Tier-1 bound to `harness_capture_worker_lifecycle_model`
-//! in `aterm-spec` (`align_tests.rs`).
 
 use aterm_uds::spawnfd::{Child, Command, Stdio};
 use std::io::Read;
@@ -19,17 +13,15 @@ use std::sync::mpsc;
 use std::sync::{Arc, atomic::AtomicBool, atomic::Ordering};
 use std::time::{Duration, Instant};
 
-/// On non-Unix hosts the reader still uses a blocking pipe. Do not join it
-/// indefinitely if a descendant kept the write end open after the child died.
+/// On non-Unix hosts the reader still uses a blocking pipe.
 #[cfg(not(unix))]
 const READER_CLOSE_GRACE: Duration = Duration::from_millis(500);
-/// The process may close stdout before it exits. Check its exit without
-/// spinning, and never wait beyond the caller's absolute deadline.
+/// The process may close stdout before it exits.
 const REAP_CHECK: Duration = Duration::from_millis(20);
 
 /// Per-invocation witness for the Tier-1 lifecycle bind: it records the real
 /// worker exit and child reap rather than inferring them from a successful
-/// return. Unix tests only; elsewhere the observer is a zero-sized marker.
+/// return.
 #[cfg(all(test, unix))]
 #[derive(Default)]
 struct CaptureLifecycleObservation {
@@ -101,19 +93,6 @@ impl Captured {
 /// why there is none: a deadline-free `wait_with_output` would hang on a stale
 /// mount or a looping command.
 ///
-/// The environment is cleared and rebuilt from `PATH`, `HOME`, `TMPDIR` plus
-/// what the caller set on `cmd`, and stdin is null. `budget` starts before the
-/// spawn, so the time a slow spawn takes (a loaded machine, a binary the
-/// system assesses first) is charged to it, not added to it. A spawn that
-/// does not return at all still holds the caller: nothing interrupts a spawn
-/// on its own thread, and one moved to another would outlive this call with
-/// its child, which this runner never leaves behind. One thread reads stdout
-/// while this one blocks in `recv_timeout`, then checks `try_wait` until the
-/// same absolute deadline. On Unix the reader polls a nonblocking descriptor
-/// against the deadline, so a descendant that escapes the process group with
-/// the inherited pipe leaves no thread behind. The child gets a private
-/// process group, killed together at timeout.
-///
 /// # Errors
 ///
 /// The child will not spawn, its stdout cannot be captured, it ran past
@@ -152,7 +131,6 @@ fn capture_bounded_impl(
     }
     #[cfg(unix)]
     cmd.process_group(0);
-    // Before the spawn: the budget bounds the spawn too.
     let deadline = Instant::now() + budget;
     #[cfg(all(test, unix))]
     observed_step(&observer, |o| &o.before_spawn);
@@ -208,8 +186,6 @@ fn capture_bounded_impl(
             let _ = reader.join();
             #[cfg(not(unix))]
             {
-                // A non-Unix blocking read cannot be interrupted if an
-                // escaped descendant still owns the pipe.
                 let _ = rx.recv_timeout(READER_CLOSE_GRACE);
                 if reader.is_finished() {
                     let _ = reader.join();
@@ -274,7 +250,6 @@ fn capture_pipe_ready(fd: std::os::fd::RawFd, deadline: Instant) -> std::io::Res
         if remaining.is_zero() {
             return Err(capture_pipe_deadline());
         }
-        // A positive sub-millisecond wait still needs one kernel sleep.
         let millis = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
         let mut ready = libc::pollfd {
             fd,
@@ -327,8 +302,7 @@ pub(super) fn read_capture_pipe(
 }
 
 /// Stop the child and descendants that inherited its stdout, then reap the
-/// direct child. Killing only the direct child leaves a reader thread parked
-/// when a shell has already spawned a background process holding the pipe.
+/// direct child.
 fn kill_capture_child(child: &mut Child, observer: &CaptureObserver) {
     #[cfg(unix)]
     if let Ok(pgid) = libc::pid_t::try_from(child.id())

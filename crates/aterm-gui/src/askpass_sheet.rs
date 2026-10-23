@@ -108,8 +108,7 @@ impl App {
         self.build_askpass_sheet(wid, session, &command, &invoker, ticket, reply);
     }
 
-    /// Build and attach the sheet. On any AppKit failure it replies a refusal;
-    /// on success it stores the sheet and raises the open count.
+    /// Build and attach the askpass sheet, or reply with a refusal on failure.
     fn build_askpass_sheet(
         &mut self,
         wid: crate::WindowId,

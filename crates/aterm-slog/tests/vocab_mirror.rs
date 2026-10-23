@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The box and wall words mirror the screen reader's own: every
-//! `PromptKind::name()` and `WallKind::name()` is a word here, so a verdict
-//! detail the server publishes never reads `other` or `unknown` in the log.
-//! The matches are exhaustive: a kind added to aterm-phase does not compile
-//! here until its word is.
+//! Vocabulary mirror tests between `aterm-slog`, `aterm-phase`, and fabric grammar.
 
 use aterm_phase::{ApiCause, PromptKind, WallKind as PhaseWall};
 use aterm_slog::vocab::{BOX_WORDS, WALL_WORDS};
@@ -42,7 +38,6 @@ fn prompt_kinds() -> Vec<PromptKind> {
         P::Other,
     ];
     for k in all {
-        // Exhaustive: a new variant fails to compile here.
         match k {
             P::Bash
             | P::Edit
@@ -124,9 +119,6 @@ fn vocab_mirrors_the_screen_reader() {
         assert_eq!(BoxWord::from_detail(v).kind(), "bash");
         assert_eq!(BoxWord::from_detail(v).need(), "approval:bash");
     }
-    // The kinds the screen reader no longer names stay words, so a log
-    // written before their reader's retirement still decodes: Codex's boxes
-    // (aterm's Codex screen lane, retired 2026-10-16).
     let retired = ["rate-nudge", "model-pick", "goal-resume"];
     for w in retired {
         assert!(BOX_WORDS.contains(&w), "{w}");
@@ -154,10 +146,6 @@ fn vocab_mirrors_the_screen_reader() {
     );
 }
 
-/// The mail and inbox words hold every word the fabric speaks:
-/// each kind `deliver` accepts is a `mail kind=` word, each
-/// receipt verdict a `word=` word, and each story verb `aterm ctl story`
-/// tells a `word=` word, so a mark of any of them never reads `unknown`.
 #[test]
 fn mail_story_and_verdict_words_mirror_the_fabric_and_the_story() {
     use aterm_slog::vocab::{MAIL_KIND_WORDS, WORD_WORDS};
@@ -170,7 +158,6 @@ fn mail_story_and_verdict_words_mirror_the_fabric_and_the_story() {
     for w in aterm_messages::presence::StoryVerb::TOLD_WORDS {
         assert!(WORD_WORDS.contains(&w), "story verb {w:?}");
     }
-    // Negative control: a kind the fabric does not speak is no mail word.
     assert!(!aterm_types::fabric_grammar::is_kind("teleport"));
     assert!(!MAIL_KIND_WORDS.contains(&"teleport"));
 }

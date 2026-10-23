@@ -3,17 +3,6 @@
 
 //! The Themes page's demo terminal: a scripted shell session played through a
 //! real [`aterm_core::terminal::Terminal`] and drawn by the shipping renderer.
-//! The session is the platform's shell ([`DemoSession::PLATFORM`]: PowerShell
-//! on Windows, zsh elsewhere), and its colours are held to the same theme-pair
-//! contrast floor a terminal tab applies ([`DemoColors::new`]).
-//!
-//! Everything here is a pure function of the demo phase. The tape is a
-//! compile-time table ([`DEMO_TAPE`]) built from a short step list, and the
-//! frame for a phase is the terminal after every event at or before it.
-//! Playback feeds a thread-local terminal incrementally ([`demo_frame`]), so a
-//! frame costs at most one event's bytes, one `cell_frame` and one raster; a
-//! theme change rebases the colours of the cells already on the grid instead
-//! of replaying the tape, so the typing carries on under the new theme.
 
 use std::sync::Arc;
 
@@ -54,9 +43,7 @@ const ZSH_PROMPT: &[u8] = "\u{1b}[1;34m~/src/aterm\u{1b}[0m\u{1b}[90m on \u{1b}[
 const PWSH_PROMPT: &[u8] = b"PS C:\\src\\aterm> ";
 
 /// The shell session the demo plays: the one a terminal on this platform
-/// opens. On Windows it was the zsh session, a starship prompt under a
-/// PowerShell tab (the 2026-10-18 Fluent judge's
-/// `J4F-7-settings-samples-unix-and-light-badges`).
+/// opens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DemoSession {
     /// pwsh with PSReadLine's colours: `PS C:\src\aterm>` prompts, git, a
@@ -118,9 +105,7 @@ enum Step {
     /// The prompt, `BETWEEN_MS` after the previous write (at once when it is
     /// the first write of the loop).
     Prompt,
-    /// Characters typed one per event. A style switch (`ESC [ … m`) rides
-    /// with the character after it, so a shell's colouring of the typed
-    /// command (PSReadLine's) costs no time of its own.
+    /// Characters typed one per event.
     Type(&'static [u8]),
     /// Bytes written with the next event and no delay of their own (a style
     /// switch before typing).
@@ -136,8 +121,7 @@ enum Step {
 }
 
 /// The zsh session: git, a test run, a source listing, a directory listing, a
-/// comment that wraps, and a resting prompt. Every line but the comment fits
-/// 44 columns, and between them they ink every palette slot.
+/// comment that wraps, and a resting prompt.
 const ZSH_STEPS: &[Step] = &[
     Step::Prompt,
     Step::Type(b"git status -sb"),
@@ -187,9 +171,7 @@ const ZSH_STEPS: &[Step] = &[
 
 /// The PowerShell session: git, a cargo test run (rustc's Windows paths, its
 /// bright cyan `help`), a source listing, a comment that wraps, and a resting
-/// prompt. The typed commands wear PSReadLine's default colours: the command
-/// bright yellow, a parameter bright black, a comment green. Every line but
-/// the comment fits 44 columns, and between them they ink every palette slot.
+/// prompt.
 const PWSH_STEPS: &[Step] = &[
     Step::Prompt,
     Step::Type(b"\x1b[93mgit\x1b[0m status \x1b[90m-sb"),
@@ -250,7 +232,6 @@ const fn typed_head(text: &[u8]) -> usize {
         while at < text.len() && !text[at].is_ascii_alphabetic() {
             at += 1;
         }
-        // The final letter.
         at += 1;
     }
     if at < text.len() { at + 1 } else { text.len() }
@@ -270,7 +251,6 @@ const fn typed_events(text: &[u8]) -> usize {
 
 /// The number of events `steps` makes.
 const fn event_count(steps: &[Step]) -> usize {
-    // The clear that opens the loop.
     let mut count = 1;
     let mut index = 0;
     while index < steps.len() {
@@ -294,7 +274,6 @@ const fn build_tape<const N: usize>(
         bytes: CLEAR,
     }; N];
     let mut next = 1;
-    // The time of the last write, and the gap the next one keeps after it.
     let mut at = 0_u32;
     let mut gap = 0_u32;
     let mut index = 0;
@@ -302,7 +281,6 @@ const fn build_tape<const N: usize>(
     while index < steps.len() {
         match steps[index] {
             Step::Prompt => {
-                // The first prompt follows the clear at once.
                 at += if next == 1 { 0 } else { BETWEEN_MS };
                 events[next] = DemoEvent {
                     at_ms: at,
@@ -378,7 +356,6 @@ pub(crate) const DEMO_LOOP_MS: u64 = DemoSession::PLATFORM.loop_ms();
 pub(crate) const DEMO_SETTLED_EVENT: usize = DemoSession::PLATFORM.settled_event();
 
 const fn settled_event(steps: &[Step]) -> usize {
-    // The third prompt: the one after the second command's output.
     let mut events = 1;
     let mut prompts = 0;
     let mut index = 0;
@@ -415,8 +392,7 @@ pub(crate) fn event_index(phase: u64) -> usize {
 }
 
 /// What a frame at `phase` shows: the last event fed, whether the caret is
-/// lit, and how many cells of the closing selection are swept. A resting
-/// demo shows the settled event with a steady caret and no selection.
+/// lit, and how many cells of the closing selection are swept.
 pub(crate) fn frame_key(phase: u64, playing: bool) -> (usize, bool, u16) {
     if !playing {
         return (DEMO_SETTLED_EVENT, true, 0);
@@ -436,7 +412,7 @@ pub(crate) fn frame_key(phase: u64, playing: bool) -> (usize, bool, u16) {
 }
 
 /// The cadence a playing demo needs at `phase`: one wake at the next write,
-/// caret edge or sweep step, whichever comes first. Never a frame cadence.
+/// caret edge or sweep step, whichever comes first.
 pub(crate) fn demo_animation(phase: u64, playing: bool) -> PreviewAnimation {
     if !playing {
         return PreviewAnimation::None;
@@ -475,10 +451,7 @@ pub(crate) struct DemoColors {
     pub(crate) bold_is_bright: bool,
     /// `TerminalConfig::indexed_minimum_contrast` as its bits: the floor the
     /// live terminal applies to text in the theme's own colours
-    /// (`Config::indexed_minimum_contrast_or_default`). The demo skipped it,
-    /// so in Default Light its FAIL badge read 1.49:1 where a tab draws the
-    /// same pair at 4.5:1 (the 2026-10-18 type judge's
-    /// `j4t-themes-demo-light-badges-unfloored`).
+    /// (`Config::indexed_minimum_contrast_or_default`).
     floor_bits: u32,
 }
 
@@ -596,12 +569,6 @@ fn memo_key(colors: &DemoColors, rows: usize, cols: usize, key: (usize, bool, u1
 }
 
 /// The demo frame at `phase` on a `rows × cols` grid, and its fingerprint.
-///
-/// A pure function of its arguments: the thread-local tape only saves work.
-/// It feeds the events past the ones already written, starts again when the
-/// phase went back (the loop wrapped, or the demo came to rest), and moves a
-/// theme change onto the cells already written with
-/// [`aterm_core::terminal::Terminal::rebase_colors`].
 pub(crate) fn demo_frame(
     colors: &DemoColors,
     phase: u64,

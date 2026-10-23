@@ -2379,3 +2379,93 @@ fn the_bare_switch_reads_on_every_ground() {
         reads(dracula, light)
     );
 }
+
+/// THE THEMED SWITCH READS ON EVERY GROUND IT IS LAID ON (design §8): the
+/// switch a harness theme wears walks its arc ([`SwitchInk::Arc`]) — on, off
+/// under either switch, turning — and each letter reads 4.5:1 on the pane's
+/// ground, not only on the near-black and paper grounds the built-ins ship:
+/// a grey every few steps from black to white under the ink a theme would
+/// give it, and the mid grounds imported themes bring (Silver Aerogel
+/// `#929292` under `#000000`, Unikitty `#ff8cd9` under `#0b0b0b`), which
+/// [`aterm_effects::harness_card::dark_ground`] calls dark though a letter
+/// lifted for the dark law can sit on their own luminance.
+#[test]
+fn the_themed_switch_reads_on_every_ground() {
+    use aterm_effects::color_math::contrast_ratio;
+    use aterm_types::scheme::{builtin, builtin_names};
+    let pack = |c: [u8; 3]| u32::from_be_bytes([0, c[0], c[1], c[2]]);
+    let reads = |a: [u8; 3], b: [u8; 3]| contrast_ratio(pack(a), pack(b));
+    let rgb = |c: aterm_types::Rgb| [c.r, c.g, c.b];
+    let mut grounds: Vec<(String, [u8; 3], [u8; 3])> = builtin_names()
+        .into_iter()
+        .filter_map(|n| Some((n.to_owned(), builtin(n)?)))
+        .map(|(n, s)| (n, rgb(s.background), rgb(s.foreground)))
+        .collect();
+    assert!(grounds.len() >= 17, "{} built-ins", grounds.len());
+    for v in (0..=255u8).step_by(5) {
+        let (black, white) = ([0; 3], [0xff; 3]);
+        let ink = if reads(black, [v; 3]) > reads(white, [v; 3]) {
+            black
+        } else {
+            white
+        };
+        grounds.push((format!("grey {v}"), [v; 3], ink));
+    }
+    grounds.push(("Silver Aerogel".into(), [0x92; 3], [0; 3]));
+    grounds.push(("Unikitty".into(), [0xff, 0x8c, 0xd9], [0x0b; 3]));
+    let floor = aterm_effects::cli_marks::NAME_CONTRAST;
+    let accent = [0x3b, 0x8e, 0xea];
+    let (mut checked, mut lows) = (0usize, Vec::new());
+    for (name, bg, fg) in &grounds {
+        let blank = RenderCell {
+            ch: ' ',
+            fg: *fg,
+            bg: *bg,
+            ..RenderCell::default()
+        };
+        let mut least = (f32::MAX, String::new());
+        for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
+            for paint in [LIT, OFF, MASTER_OFF, TURNING] {
+                for stop in (0..=255u8).step_by(3) {
+                    let c = switch_cell(
+                        'a',
+                        SwitchInk::Arc(stop),
+                        paint,
+                        Some(palette),
+                        blank,
+                        accent,
+                    );
+                    let k = reads(c.fg, blank.bg);
+                    if k < least.0 {
+                        least = (
+                            k,
+                            format!("{palette:?} {:?} at stop {stop}: {:?}", paint.face, c.fg),
+                        );
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        if least.0 < floor {
+            lows.push(format!("{name} {bg:?}: {} at {:.2}:1", least.1, least.0));
+        }
+    }
+    assert!(checked >= 70 * 3 * 4 * 86, "{checked}");
+    assert!(
+        lows.is_empty(),
+        "{} grounds under {floor}:1: {lows:#?}",
+        lows.len()
+    );
+    let aerogel = [0x92; 3];
+    let lifted = (0..=255u8)
+        .map(|k| {
+            let letter = CardPalette::Land.letter(f32::from(k) / 255.0, true);
+            let letter = [(letter >> 16) as u8, (letter >> 8) as u8, letter as u8];
+            reads(mix(letter, [0; 3], 0.25), aerogel)
+        })
+        .fold(f32::MAX, f32::min);
+    assert!(
+        lifted < 1.5,
+        "CONTROL: the lifted letter alone on Silver Aerogel, {lifted:.2}:1"
+    );
+}

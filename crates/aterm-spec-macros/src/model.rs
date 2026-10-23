@@ -1,17 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `ty_model!`: the bounded state machine it reads and the
-//! `::aterm_spec::derive::Model` literal it writes (see the crate root).
-//!
-//! An expression is the five shapes the `derive::Expr` builders take: an
-//! integer literal, an identifier, parentheses, a binary `+ - > <= == && ||`,
-//! and `if`/`else`. The reader is a precedence climber over Rust's own
-//! operator table, so a supported expression groups exactly as the compiler
-//! (and syn 2, which read these models before SP.8) groups it: `a - b + c` is
-//! `(a - b) + c`, `||` binds looser than `&&`, comparisons do not chain, and
-//! an `if` condition ends at the first `{`. Every other expression Rust has is
-//! read far enough to name it in the error, never translated.
+//! `ty_model!`: parses a bounded state machine and expands it to an `::aterm_spec::derive::Model` literal.
 
 use std::collections::HashSet;
 
@@ -24,7 +14,6 @@ pub(crate) fn expand(input: TokenStream) -> Result<TokenStream, Error> {
     def.expand()
 }
 
-/// The words syn's `Ident` refused as a name, so a model may not use one.
 const RESERVED: &[&str] = &[
     "_", "abstract", "as", "async", "await", "become", "box", "break", "const", "continue",
     "crate", "do", "dyn", "else", "enum", "extern", "false", "final", "fn", "for", "if", "impl",
@@ -33,7 +22,6 @@ const RESERVED: &[&str] = &[
     "typeof", "unsafe", "unsized", "use", "virtual", "where", "while", "yield",
 ];
 
-/// The reserved words an expression still reads as a one-segment path.
 const PATH_WORDS: &[&str] = &["self", "Self", "super", "crate"];
 
 fn is_reserved(ident: &Ident) -> bool {
@@ -48,7 +36,6 @@ pub(crate) fn expect_name(c: &mut Cursor, what: &str) -> Result<Ident, Error> {
     }
 }
 
-/// Takes an integer literal, a `-` before it allowed, as an `i64`.
 fn expect_int(c: &mut Cursor) -> Result<i64, Error> {
     let start = c.span();
     let minus = c.eat_punct('-').is_some();
@@ -63,8 +50,6 @@ fn expect_int(c: &mut Cursor) -> Result<i64, Error> {
         return Err(Error::new(start, "expected integer literal"));
     };
     if minus {
-        // Sign the decimal digits before the bounded conversion: the
-        // positive magnitude of i64::MIN does not itself fit an i64.
         int.digits.insert(0, '-');
     }
     int.to_i64().map_err(|e| Error::spanned(start, span, e))
@@ -211,8 +196,6 @@ impl ModelDef {
             .iter()
             .map(|(id, v)| q!("(#s, #v)", s = str_lit(id), v = Literal::i64_suffixed(*v)))
             .collect();
-        // A scenario overrides declared constants only, and never `Buggy`: a
-        // configuration the real code runs under, not a mutant.
         let mut scenarios = Vec::new();
         for overrides in &self.scenarios {
             let mut pairs = Vec::new();
@@ -276,7 +259,6 @@ impl ModelDef {
             .invariants
             .iter()
             .map(|(id, e, kind)| {
-                // `:: #kind` for the reason `to_builder` writes `:: #f`.
                 q!(
                     "::aterm_spec::derive::Invariant {
                         name: #s,
@@ -290,9 +272,6 @@ impl ModelDef {
             })
             .collect();
 
-        // Writing a model registers it: the literal is built by a fn of its own,
-        // and that fn is submitted to `xref::model_registry`, so no model can be
-        // left out of the sweeps by forgetting a list.
         let body = q!(
             "fn __aterm_spec_model() -> ::aterm_spec::derive::Model {
                 ::aterm_spec::derive::Model {
@@ -323,7 +302,6 @@ impl ModelDef {
     }
 }
 
-/// `ident`'s text as a string literal, as `quote!` wrote a `String`.
 fn str_lit(ident: &Ident) -> Literal {
     Literal::string(&ident.to_string())
 }
@@ -335,9 +313,6 @@ fn ensure_empty(c: &mut Cursor, message: &str) -> Result<(), Error> {
     }
 }
 
-// Expressions.
-
-/// A parsed expression of the supported shapes, and the source it covers.
 struct Node {
     expr: Expr,
     first: Span,
@@ -381,7 +356,6 @@ impl Builder {
 }
 
 impl Node {
-    /// The `::aterm_spec::derive` builder calls that construct this expression.
     fn to_builder(&self, consts: &HashSet<String>) -> TokenStream {
         match &self.expr {
             Expr::Int(v) => q!(
@@ -397,8 +371,6 @@ impl Node {
                 }
             }
             Expr::Paren(inner) => inner.to_builder(consts),
-            // `:: #f`, not `::#f`: a `:` written against the `#` lexes joint to it,
-            // and the path is spelled as `quote!` spelled it before SP.8.
             Expr::Binary(f, l, r) => q!(
                 "::aterm_spec::derive:: #f(#l, #r)",
                 f = Ident::new(f.path(), Span::call_site()),
@@ -496,7 +468,6 @@ impl Op {
     }
 }
 
-/// Spellings, longest first where one is a prefix of another.
 const OPS: &[(&str, Op)] = &[
     ("<<=", Op::Compound),
     (">>=", Op::Compound),
@@ -528,8 +499,6 @@ const OPS: &[(&str, Op)] = &[
     (">", Op::Gt),
 ];
 
-/// Whether the next tokens spell `op`, each joined to the one after it.
-/// Expressions are read raw, so a None-delimited group is not looked into.
 fn peek_spelled(c: &Cursor, op: &str) -> bool {
     let len = op.chars().count();
     op.chars().enumerate().all(|(i, ch)| {
@@ -555,7 +524,6 @@ fn peek_raw_group(c: &Cursor, delimiter: Delimiter) -> Option<&Group> {
     }
 }
 
-/// What the next token would start, as an operator after an operand.
 fn peek_prec(c: &Cursor) -> Prec {
     if let Some((op, _)) = peek_binop(c) {
         op.prec()
@@ -570,14 +538,11 @@ fn peek_prec(c: &Cursor) -> Prec {
     }
 }
 
-/// An expression; `allow_struct` is false only in an `if` condition, where a
-/// name before `{` is the condition's end, not a struct literal.
 fn expr(c: &mut Cursor, allow_struct: bool) -> Result<Node, Error> {
     let lhs = unary(c, allow_struct)?;
     climb(c, lhs, allow_struct, Prec::Min)
 }
 
-/// Folds operators of at least `base`'s strength onto `lhs`.
 fn climb(c: &mut Cursor, mut lhs: Node, allow_struct: bool, base: Prec) -> Result<Node, Error> {
     loop {
         if let Some((op, len)) = peek_binop(c) {
@@ -612,7 +577,6 @@ fn climb(c: &mut Cursor, mut lhs: Node, allow_struct: bool, base: Prec) -> Resul
             || (base <= Prec::Range && peek_spelled(c, ".."))
             || (base <= Prec::Cast && peek_raw_ident(c, "as"))
         {
-            // An assignment, a range or a cast.
             let at = c.peek_raw().map_or(lhs.last, TokenTree::span);
             return Err(Error::spanned(lhs.first, at, UNSUPPORTED));
         } else {
@@ -622,8 +586,6 @@ fn climb(c: &mut Cursor, mut lhs: Node, allow_struct: bool, base: Prec) -> Resul
     Ok(lhs)
 }
 
-/// The right operand of an operator of strength `prec`, with every stronger
-/// operator after it folded in (assignment folds right).
 fn rhs(c: &mut Cursor, allow_struct: bool, prec: Prec) -> Result<Node, Error> {
     let mut node = unary(c, allow_struct)?;
     loop {
@@ -637,8 +599,6 @@ fn rhs(c: &mut Cursor, allow_struct: bool, prec: Prec) -> Result<Node, Error> {
     Ok(node)
 }
 
-/// An operand: a prefix operator is not supported, so this is an atom and
-/// whatever postfix follows it.
 fn unary(c: &mut Cursor, allow_struct: bool) -> Result<Node, Error> {
     if let Some(TokenTree::Punct(p)) = c.peek_raw()
         && matches!(p.as_char(), '&' | '*' | '!' | '-')
@@ -649,8 +609,6 @@ fn unary(c: &mut Cursor, allow_struct: bool) -> Result<Node, Error> {
     postfix(c, node)
 }
 
-/// A call, an index, a field, a method or `?` after an operand is not
-/// supported.
 fn postfix(c: &mut Cursor, node: Node) -> Result<Node, Error> {
     let call_or_index = peek_raw_group(c, Delimiter::Parenthesis).is_some()
         || peek_raw_group(c, Delimiter::Bracket).is_some();
@@ -701,7 +659,6 @@ fn atom(c: &mut Cursor, allow_struct: bool) -> Result<Node, Error> {
         TokenTree::Group(g) if g.delimiter() == Delimiter::Parenthesis => {
             let mut inner = Cursor::of_group(&g);
             if inner.peek_raw().is_none() {
-                // `()`.
                 return Err(Error::new(span, UNSUPPORTED));
             }
             let e = expr(&mut inner, true)?;
@@ -711,19 +668,14 @@ fn atom(c: &mut Cursor, allow_struct: bool) -> Result<Node, Error> {
                     first: g.span_open(),
                     last: g.span_close(),
                 }),
-                // A tuple.
                 Some(t) if is_punct(t, ',') => Err(Error::new(span, UNSUPPORTED)),
                 Some(t) => Err(Error::new(t.span(), "expected `,`")),
             }
         }
-        // A block, an array, a macro fragment, or punctuation no operand
-        // starts with that is supported (`|x|`, `..`, `<T>::C`, `::a`).
         _ => Err(Error::new(span, UNSUPPORTED)),
     }
 }
 
-/// `if <cond> { <expr> } else { <expr> }`, the `else` arm also an `if`; the
-/// `if` itself has been taken and was at `if_span`.
 fn if_expr(c: &mut Cursor, if_span: Span) -> Result<Node, Error> {
     let cond = expr(c, false)?;
     let Some(then_group) = peek_raw_group(c, Delimiter::Brace).cloned() else {
@@ -762,10 +714,6 @@ fn if_expr(c: &mut Cursor, if_span: Span) -> Result<Node, Error> {
     })
 }
 
-/// The one expression an `if`/`else` arm's block holds.
-///
-/// The block is read as a statement: an `if` at its start ends where its last
-/// arm does, as the compiler reads it.
 fn block_tail(group: &Group) -> Result<Node, Error> {
     let single = || {
         Error::spanned(

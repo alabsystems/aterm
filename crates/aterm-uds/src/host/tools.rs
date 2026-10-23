@@ -228,8 +228,9 @@ pub const TOOLS: &[Tool] = &[
     ),
     os(
         "ps",
-        &["/bin/ps"],
-        "askpass's and the machines agent's process reads, until S12's libproc reader (row 8)",
+        &["/bin/ps", "/usr/bin/ps"],
+        "the process table off macOS, the release's and verify's process reads, and the oracle the \
+         in-process readers are held to (row 8)",
     ),
     os(
         "pgrep",
@@ -249,7 +250,7 @@ pub const TOOLS: &[Tool] = &[
     os(
         "lsof",
         &["/usr/sbin/lsof"],
-        "the harness's and the lab's open-file reads, until S12's libproc reader (row 8)",
+        "the lab's open-file reads, and the oracle the harness's libproc reader is held to (row 8)",
     ),
     os(
         "ls",
@@ -329,7 +330,7 @@ pub const TOOLS: &[Tool] = &[
     os(
         "date",
         &["/bin/date"],
-        "`date +%z` for the local offset, until S12 reads `tm_gmtoff` (row 9)",
+        "the oracle the zone reader (`aterm_uds::zone`) is held to (row 9)",
     ),
     os(
         "df",
@@ -395,7 +396,7 @@ pub const TOOLS: &[Tool] = &[
     os(
         "script",
         &["/usr/bin/script"],
-        "a real pty for the interactive-shell tests, until S12 uses aterm-pty (row 7)",
+        "the harness tests' pty another process opened (macOS; the shell tests use aterm-pty, row 7)",
     ),
     os(
         "perl",
@@ -890,35 +891,21 @@ pub const TOOLS: &[Tool] = &[
         "the site repo's deploy script, which `ship site` runs (row 34)",
     ),
     missing(
-        unprovided(
+        guest(
             "python3",
-            &[
-                "/opt/homebrew/bin/python3.14",
-                "/opt/homebrew/bin/python3.13",
-                "/opt/homebrew/bin/python3.12",
-                "/opt/homebrew/bin/python3.11",
-                "/usr/local/bin/python3.14",
-                "/usr/local/bin/python3.13",
-                "/usr/local/bin/python3.12",
-                "/usr/local/bin/python3.11",
-            ],
-            "S11's Rust bootstrap verifier removes the need (row 14)",
-            "the Linux installer's embedded verifier, which 12 install_sh tests run, needs 3.11+ \
-             (tomllib, hashlib.file_digest); macOS ships 3.9.6. S11 replaces it with a Rust verifier \
-             (row 14)",
+            &["/usr/bin/python3"],
+            "the Linux installer's embedded verifier, until a release pins the Rust one: the \
+             install_sh tests that run it need 3.11+ (tomllib, hashlib.file_digest), so they run \
+             in the Linux guest (row 14)",
         ),
         "Python 3.11+",
     ),
     missing(
-        unprovided(
+        guest(
             "openssl3",
-            &[
-                "/opt/homebrew/opt/openssl@3/bin/openssl",
-                "/usr/local/opt/openssl@3/bin/openssl",
-            ],
-            "S11's Rust bootstrap verifier removes the need (row 14)",
-            "the Linux installer's verifier checks Ed25519 with `pkeyutl -rawin`, which macOS's \
-             LibreSSL lacks; S11 replaces it (row 14)",
+            &["/usr/bin/openssl"],
+            "the Linux installer's embedded verifier checks Ed25519 with `pkeyutl -rawin`, which \
+             macOS's LibreSSL lacks, so its tests run in the Linux guest (row 14)",
         ),
         "OpenSSL 3",
     ),

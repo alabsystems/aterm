@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The fabric endpoint, `crates/aterm-gui-fabric`, under its old
-//! module name, and what binds it to this crate: a session is a
-//! [`crate::SessionCtx`] ([`FabricSession`]), the registry is the
-//! [`crate::session_store::SessionStore`] ([`Registry`]), a timeline is a
-//! [`crate::session_timeline::SessionTimeline`] ([`Timeline`]). Every item of
-//! the endpoint is reachable as `crate::fabric::…`, as before the split.
+//! Fabric endpoint bindings ([`FabricSession`], [`Registry`], [`Timeline`]).
 
 use std::sync::Arc;
 
@@ -66,7 +61,6 @@ impl Registry for crate::session_store::SessionStore {
     }
 
     fn bridge_lost_advised(&self, sessions: usize) {
-        // Only a unix instance supervises a bridge it can lose.
         #[cfg(any(unix, test))]
         crate::message_inbox::queue_message(crate::message_reporters::fabric_lost_advisory(
             sessions,
@@ -76,8 +70,6 @@ impl Registry for crate::session_store::SessionStore {
     }
 
     fn torn_state_set_aside(&self, files: u64, told_when_empty: bool) {
-        // A fact for the owner's later look: an exceptions entry, raised at
-        // the next park ([`crate::message_inbox::queue_exception`]).
         #[cfg(any(unix, test))]
         crate::message_inbox::queue_exception(
             crate::message_reporters::torn_state_set_aside_entry(files, told_when_empty),
@@ -87,10 +79,6 @@ impl Registry for crate::session_store::SessionStore {
     }
 
     fn torn_state_held(&self, files: u64) {
-        // At 0 the owner took the torn bytes away: the entry's cause has
-        // ended, and it ends at the next park
-        // ([`crate::message_inbox::queue_exception_clear`]). A count above 0
-        // leaves the entry as the owner left it, open or filed.
         #[cfg(any(unix, test))]
         if files == 0 {
             crate::message_inbox::queue_exception_clear(crate::message_reporters::torn_state_key());
@@ -105,14 +93,7 @@ impl Timeline for crate::session_timeline::SessionTimeline {
         crate::session_timeline::SessionTimeline::record(self, kind, payload);
     }
 
-    /// THE ONE FABRIC HOOK: the session
-    /// log's typed mark and the timeline row in this one hold, then whether
-    /// the log's readers were owed a wake, which
-    /// [`crate::session_timeline::SessionTimeline::slog_take_wake`] has rung
-    /// on the session's watchers in this hold. The mark first (the review
-    /// of 6F-8): its entry reconciles the person, and a key it
-    /// marks there owes its `human` row, which the fact's row pays before
-    /// its own, so the ring's order is the log's.
+    /// THE ONE FABRIC HOOK ([`crate::session_timeline::SessionTimeline::slog_take_wake`]).
     fn record_fact(&mut self, kind: &'static str, payload: String, fact: FabricFact<'_>) -> bool {
         let at = self.slog().now();
         self.slog_mut().observe_fabric(fact, at);
@@ -125,8 +106,7 @@ impl Timeline for crate::session_timeline::SessionTimeline {
     }
 }
 
-/// [`aterm_gui_fabric::with_link_reset`], resetting the launcher's supervisor
-/// record with the link (`fabric_launch::arm` sets both under its own lock).
+/// [`aterm_gui_fabric::with_link_reset`].
 #[cfg(test)]
 pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     #[cfg(unix)]
@@ -134,15 +114,7 @@ pub(crate) fn with_link_reset<T>(f: impl FnOnce() -> T) -> T {
     aterm_gui_fabric::with_link_reset(f)
 }
 
-/// THE NEGATIVE CONTROL OF A FENCED WAIT, WITHOUT A CLOCK: a waiter
-/// another thread started on `fabric` under a raised fence is PARKED — it
-/// blocked on the fence ([`SessionFabric::fence_waits`] moved past `before`,
-/// awaited under the hang detector) — and, woken while the fence still stands,
-/// blocks AGAIN rather than answering. `finished` reads the waiter's thread.
-///
-/// A copy of aterm-gui-fabric's own: there it is `cfg(test)`, because the hang
-/// detector it waits under (`aterm_spec::wait`) is only that crate's
-/// dev-dependency, so it cannot be exported to these tests.
+/// THE NEGATIVE CONTROL OF A FENCED WAIT ([`SessionFabric::fence_waits`]).
 #[cfg(all(test, unix))]
 pub(crate) fn assert_parked_on_the_fence(
     fabric: &SessionFabric,

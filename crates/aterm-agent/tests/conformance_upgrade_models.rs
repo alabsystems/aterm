@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 binding for `harness::upgrade_models` against the derived specs
-//! `HarnessModelPriority` (the list), `HarnessModelLadder` (the ladder) and
-//! `HarnessModelSwitch` (the switch). Each submodule drives the real code over every
-//! reachable model state and validates each observed transition on every installed
-//! tier; forged successors the model must refuse keep a green bind from being vacuous.
+//! Tier-1 binding for `harness::upgrade_models` against the derived specs `HarnessModelPriority`, `HarnessModelLadder`, and `HarnessModelSwitch`.
 
 use std::collections::BTreeMap;
 
@@ -21,8 +17,6 @@ mod switch;
 
 type Vars = BTreeMap<&'static str, i64>;
 
-/// Check one observed transition against the model's named action, on every
-/// tier that is installed.
 fn assert_transition(model: &Model, before: &Vars, after: &Vars, action: &str, label: &str) {
     let (accepted, diagnostics) = verify::validate_transition_tiered(
         model,
@@ -38,9 +32,6 @@ fn assert_transition(model: &Model, before: &Vars, after: &Vars, action: &str, l
     );
 }
 
-/// A successor the real code did not produce must be refused as `action`:
-/// `base` is what the real code did produce, the forgery is `base` with
-/// `changes` applied, offered as a successor of `before`.
 fn assert_forged_rejected(
     model: &Model,
     before: &Vars,

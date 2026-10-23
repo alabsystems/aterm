@@ -546,11 +546,21 @@ pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     }
 }
 
+/// Nothing to arm off unix: Windows sends no SIGTERM or SIGHUP to pass on.
+pub struct Forwarding;
+
+/// [`Forwarding`]'s stand-in.
+#[must_use]
+pub fn arm_forwarding() -> Forwarding {
+    Forwarding
+}
+
 /// [`exec_or_run`]'s Ctrl-C rule for a holder that waits on its child (`aterm pkg lease`): [`swallow_ctrl_c`], installed after the spawn, leaves the console's Ctrl-C to the child.
 /// # Errors
 /// The wait's.
 pub fn wait_standing_aside(
     child: &mut aterm_uds::spawnfd::TransparentChild,
+    _forwarding: Forwarding,
 ) -> io::Result<std::process::ExitStatus> {
     let _ = add_ctrl_handler(swallow_ctrl_c);
     child.wait()

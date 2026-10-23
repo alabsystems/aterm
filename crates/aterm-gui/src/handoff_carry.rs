@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The self-update handoff's CONTROL CARRY: what a session's drivers rely on that lived only in the outgoing process — its TURN LEDGER and the TAIL of its alt-screen archive — handed to the process that adopts the session, in one JSON sidecar per session beside the manifest.
+//! Per-session JSON sidecar carrying the turn ledger, alt-screen archive tail, and session log across a self-update handoff.
 
 use std::sync::Arc;
 #[cfg(any(unix, test))]
@@ -20,16 +20,14 @@ use crate::turn_ledger::{ArchMark, TurnBy, TurnLedger, TurnRecord};
 /// The most archived rows one session carries, charged as the live archive charges them (text plus 32 bytes a row).
 #[cfg(any(unix, test))]
 pub(crate) const CARRY_ARCHIVE_BYTES: usize = 1024 * 1024;
-/// The largest sidecar a receiver reads: the rows above, the ledger (512 records of at most 512 bytes of text) and the differ's state, with JSON's escaping on top.
+/// Maximum byte size of one session's handoff sidecar.
 pub(crate) const MAX_SIDECAR_BYTES: u64 = 4 * 1024 * 1024;
-/// The most sidecar bytes one handoff writes, and one receiver reads, across every session — the receiver decodes them in early `main`, inside the freeze the user sees.
+/// Maximum aggregate sidecar bytes across all sessions in one handoff.
 pub(crate) const MAX_AGGREGATE_BYTES: u64 = 16 * 1024 * 1024;
-/// How many of the newest SUBMITTED turns' marks the carried tail reaches back to: a reader of `history 8` that reads on from the newest submitted turn's `arch=` mark (`offscreen since=`) finds its rows.
+/// Count of newest submitted turns whose archive marks bound the carried tail.
 #[cfg(any(unix, test))]
 pub(crate) const TAIL_TURNS: usize = 8;
-/// The sidecar's layout version. Unknown fields are skipped and missing ones
-/// default, so it moves only when a field changes meaning; a receiver drops a
-/// version it does not know.
+/// Wire format version for the handoff control sidecar.
 const WIRE_VERSION: u64 = 1;
 /// The highest turn id a handoff carries: what the manifest can hold (a TOML integer is an `i64`).
 pub(crate) const MAX_TURN_ID: u64 = i64::MAX as u64;
@@ -64,7 +62,7 @@ pub(crate) struct CarrySource {
 
 #[cfg(any(unix, test))]
 impl CarrySource {
-    /// The session this capture belongs to, which the park's capture matches against its carried screens: a session whose screen it lowered below the exact rungs goes without its differ's state too ([`Self::without_differ`]).
+    /// Session local id for this capture.
     #[cfg(unix)]
     pub(crate) const fn local_id(&self) -> u64 {
         self.local_id
@@ -76,7 +74,7 @@ impl CarrySource {
         self.keep_differ
     }
 
-    /// Carry this session without the differ's state: its screen was not carried as the program drew it (`CarryRung::keeps_differ_state`), so that state describes nothing the successor shows.
+    /// Drop the differ's state when the session's screen was lowered below an exact rung.
     #[cfg(unix)]
     pub(crate) fn without_differ(&mut self) {
         self.head.differ = None;
@@ -84,7 +82,7 @@ impl CarrySource {
     }
 }
 
-/// The freeze's share: the archive's fence and counters and, with `differ`, the differ's screen-sized state, under the terminal lock the caller already holds for this session's checkpoint (so both describe the same screen).
+/// Capture the archive's fence, counters, and optional differ state during the freeze.
 #[cfg(any(unix, test))]
 pub(crate) fn capture_head(
     local_id: u64,
@@ -106,30 +104,30 @@ pub(crate) fn capture_head(
     }
 }
 
-/// Whether a successor of `target_build` reads the session log a handoff carries (the sidecar's `log`): one at least as new as this build, as for the mailbox (`app_update_handoff::successor_reads_fabric_carry`).
+/// Whether a successor of `target_build` reads the sidecar's session log.
 #[cfg(any(unix, test))]
 #[must_use]
 pub(crate) const fn successor_reads_session_log(target_build: u64, running_build: u64) -> bool {
     target_build >= running_build
 }
 
-/// Which turn-status words the receiving build reads, so [`export_for`] spells every record in its vocabulary; a receiver leaves out a record whose word it does not know.
+/// Turn-status vocabulary understood by the receiving build.
 #[cfg(any(unix, test))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StatusWords {
-    /// This build's `settled`, `timeout` and `hangup`, read by every build from [`READS_HANGUP_FROM_BUILD`] on.
+    /// Vocabulary including `settled`, `timeout`, and `hangup` ([`READS_HANGUP_FROM_BUILD`]).
     Current,
-    /// A build from before `hangup` (a rollback, an older bundle, a channel switch): v0.98.0 and earlier read `settled` and `timeout` alone, and leave a `hangup` record out while still vouching for its id.
+    /// Pre-`hangup` vocabulary (`settled` and `timeout` only).
     PreHangup,
 }
 
-/// The first build whose turn ledger reads `hangup`: v0.100.0's in `RELEASES.ledger` (no v0.99.0 was cut).
+/// First build number whose turn ledger reads `hangup`.
 #[cfg(any(unix, test))]
 pub(crate) const READS_HANGUP_FROM_BUILD: u64 = 1_790_807_622;
 
 #[cfg(any(unix, test))]
 impl StatusWords {
-    /// The words of the successor at `target_build`, keyed on the first build that reads `hangup` and not on whether the target is older than this build, as the screen carry's ceilings (`seamless::WireCaps::for_hop`) and the history carry (`handoff_history::exports_for_target`) are keyed on theirs: a rollback to v0.100.0 or later reads `hangup`, carried it as it is before this export respelled any word, and still does.
+    /// Select the status-word vocabulary for `target_build`.
     #[must_use]
     pub(crate) const fn for_target(target_build: u64) -> Self {
         if target_build < READS_HANGUP_FROM_BUILD {
@@ -139,9 +137,7 @@ impl StatusWords {
         }
     }
 
-    /// `status` in these words. A build from before `hangup` has no word for a
-    /// turn whose caller hung up during its settle (that build never recorded
-    /// one); its nearest is `timeout`, a settle nobody saw end.
+    /// Translate `status` into this vocabulary.
     fn spell(self, status: &'static str) -> &'static str {
         match (self, status) {
             (Self::PreHangup, "hangup") => "timeout",
@@ -236,10 +232,7 @@ pub(crate) fn export_for_target(
     )
 }
 
-/// What the log pass took of a session: its carry's source, prepared (the
-/// records that always cross encoded once), its skeleton cut, and what its
-/// whole carry would take, sized from what the ring already knows of its
-/// records without encoding them.
+/// Prepared session-log carry state and size estimates for one session.
 #[cfg(any(unix, test))]
 struct LogTake {
     source: crate::session_log::PreparedSlogCarry,
@@ -247,18 +240,13 @@ struct LogTake {
     skeleton: aterm_slog::CarryOut,
     /// `skeleton`'s lines as the member's JSON, its key included.
     skeleton_json: u64,
-    /// The whole carry's member JSON, at most (the node lines its detail
-    /// needs aside): the skeleton's, its detail's line bytes, and two JSON
-    /// bytes a line.
+    /// Estimated upper bound on the full carry's member JSON size.
     full_json: u64,
     /// The JSON's bytes per carry-line byte (its quotes, commas, escapes).
     json_ratio: f64,
 }
 
-/// The bytes the JSON string literal of `text` takes, quotes included:
-/// `aterm_json`'s writer's escapes (`"` and `\` two, `\b \f \n \r \t`
-/// two, any other C0 control six, every other byte itself), counted rather
-/// than written.
+/// Byte length of `text` when serialized as a JSON string literal, quotes included.
 #[cfg(any(unix, test))]
 fn json_string_len(text: &str) -> u64 {
     let escaped: u64 = text
@@ -280,9 +268,7 @@ fn log_json_len(lines: &[String]) -> u64 {
     items + commas + 2 + 7
 }
 
-/// `sidecar` (a [`Wire`] as [`encode`] writes it, compact, its `log` member
-/// absent) with `log` as its `log` member, spliced in before the object's
-/// closing brace: the ledger and archive are not serialized again.
+/// Splice `log` as the `"log"` member into a compact `sidecar` JSON object.
 #[cfg(any(unix, test))]
 fn with_log_member(sidecar: &[u8], log: &[String]) -> Option<Vec<u8>> {
     let (last, body) = sidecar.split_last()?;
@@ -619,9 +605,7 @@ fn with_log(
     sidecar(&take.skeleton.lines).filter(fits)
 }
 
-/// Each session's share of `budget` for its core ([`core_len`], `cores` in pool order): the
-/// whole core while every core fits; past that, max-min fair (a core under the common share
-/// keeps all of it, the longer ones are cut alike).
+/// Allocate `budget` across `cores` using max-min fair sharing.
 #[cfg(any(unix, test))]
 fn core_shares(cores: &[u64], budget: u64) -> Vec<u64> {
     if cores.iter().fold(0_u64, |sum, c| sum.saturating_add(*c)) <= budget {
@@ -656,7 +640,7 @@ pub(crate) fn manifest_turn_id(minted: u64) -> Option<u64> {
     (minted > 0 && minted <= MAX_TURN_ID).then_some(minted)
 }
 
-/// The turn ledger an adopted session starts with: the one its carry brought ([`ControlCarry::ledger`]), or, when the handoff could not carry it, an empty one that no longer vouches for any turn id up to the count this process continued from, so a resumed `subscribe … since-turn=` below it is told (`GAP … events-resync=`).
+/// Build the initial [`TurnLedger`] for an adopted session from `control`.
 pub(crate) fn adopted_ledger(control: Option<&mut ControlCarry>) -> TurnLedger {
     match control {
         Some(control) => control.ledger(),
@@ -667,7 +651,7 @@ pub(crate) fn adopted_ledger(control: Option<&mut ControlCarry>) -> TurnLedger {
     }
 }
 
-/// A SESSION'S CRASH CARRY (the crash-restore plan's increment 7): the turn-ledger half of this module's sidecar, for the control slot of the session's crash-restore region (`crash_restore`: the window's journal worker writes it at most every two seconds while the ledger moves).
+/// Turn-ledger snapshot for a session's crash-restore control slot.
 #[cfg(any(unix, test))]
 pub(crate) struct CrashLedger {
     turns: Vec<TurnRecord>,
@@ -677,7 +661,7 @@ pub(crate) struct CrashLedger {
 
 #[cfg(any(unix, test))]
 impl CrashLedger {
-    /// `ledger` as it stands, with `turn_ids`, this process's turn-id count now (`control::turn_ids_minted`): the floor carried is the export's own ([`TurnLedger::carry_floor`]), raised past every turn still open.
+    /// Snapshot `ledger` at process turn-id count `turn_ids`.
     pub(crate) fn of(ledger: &TurnLedger, turn_ids: u64) -> Self {
         Self {
             turns: ledger.records().cloned().collect(),
@@ -745,7 +729,7 @@ fn encode_ledger(turns: &[TurnRecord], floors: Floors, turn_ids: u64) -> Option<
     aterm_json::to_vec(&wire).ok()
 }
 
-/// Decode a CRASH CARRY ([`CrashLedger`], read out of a dead window's region) exactly as an update's sidecar is decoded ([`decode_why`]: its version, every record's status word and id, the floors), with what no crash carry holds left out: an archive or a session log in one is no writing of this build's, and an archive would describe a screen other than the restored one.
+/// Decode a [`CrashLedger`] payload, discarding any archive or session-log fields.
 /// # Errors
 /// [`decode_why`]'s.
 #[cfg(any(unix, test))]
@@ -801,10 +785,7 @@ fn rows_after_marks(
     from
 }
 
-/// The bytes a carry's rows add to its sidecar (each row's JSON string and a
-/// comma), in two tiers: the rows after the newest turn's mark, and the rows
-/// the screen shows again ([`rows_after_marks`] over one turn: what `drive
-/// report` reads back), then the older ones.
+/// JSON byte sizes of `archive`'s rows split into newest-turn and older tiers.
 #[cfg(any(unix, test))]
 fn row_tiers(turns: &[TurnRecord], archive: &AltArchiveCarry) -> (u64, u64) {
     let from = rows_after_marks(
@@ -821,9 +802,7 @@ fn row_tiers(turns: &[TurnRecord], archive: &AltArchiveCarry) -> (u64, u64) {
     (len(&archive.rows[older..]), len(&archive.rows[..older]))
 }
 
-/// A `try_lock` (`attempt`, which names the lock so the lock-order census
-/// sees whose it is) retried until `until`: `None` when another thread keeps
-/// the lock past then.
+/// Retry `attempt` until `until`, returning `None` if it remains contended.
 #[cfg(any(unix, test))]
 fn patiently<G>(
     until: Instant,
@@ -852,10 +831,7 @@ struct Chosen {
     bytes: Vec<u8>,
 }
 
-/// Encode, shedding what does not fit `room`: the archive's OLDEST rows
-/// first, no more of them than the room needs, then the differ's state, then
-/// the ledger's OLDEST records, likewise (the ids shed are ones the carried
-/// ledger no longer vouches for).
+/// Encode within `room` bytes, shedding oldest archive rows, differ state, and oldest turns as needed.
 #[cfg(any(unix, test))]
 fn encode_within(
     turns: &[TurnRecord],
@@ -967,32 +943,24 @@ fn newest_rows(mut c: AltArchiveCarry, keep: usize) -> AltArchiveCarry {
 pub(crate) struct Wire {
     version: u64,
     turns: Vec<TurnWire>,
-    /// Turn ids below this may have named records `turns` does not hold (a
-    /// ledger that could not be carried whole); 0: none.
+    /// Turn id floor below which records may have been omitted.
     unheld_below: u64,
-    /// Turn ids below this may have named a harness record the sender's
-    /// ring evicted from inside (`TurnLedger::shed_below`); 0: none, and
-    /// then absent, so a ledger that shed nothing carries the bytes it did
-    /// before the field.
+    /// Turn id floor below which harness records were evicted (`TurnLedger::shed_below`).
     #[serde(skip_serializing_if = "is_zero")]
     shed_below: u64,
-    /// The turn-id count of the process that wrote it
-    /// (`control::turn_ids_minted`), as of the write; 0: none, and then
-    /// absent.
+    /// Process turn-id count at the time of writing (`control::turn_ids_minted`).
     #[serde(skip_serializing_if = "is_zero")]
     turn_ids: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     archive: Option<ArchiveWire>,
-    /// THE SESSION LOG (phase 2A): its carry lines, oldest part first
-    /// (`aterm_slog::Log::carry`).
+    /// Carried session-log lines, oldest first (`aterm_slog::Log::carry`).
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
         deserialize_with = "lenient_log"
     )]
     log: Vec<String>,
-    /// THE BUS MIRROR's cursor and head in the old seq space, for a mirrored
-    /// log that did not cross: `<ep>:<seq>:<ms>:<head>`.
+    /// Bus mirror cursor and head in the old sequence space (`<ep>:<seq>:<ms>:<head>`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     log_mirror: Option<String>,
 }
@@ -1040,21 +1008,16 @@ struct TurnWire {
     started_ms: u64,
     dur_ms: u64,
     submitted: bool,
-    /// `settled`, `timeout` or `hangup` — a word, never a code. A
-    /// [`crate::turn_ledger::STATUS_PRESSED`] record says `timeout` here, a
-    /// word every build reads, and [`Self::pressed`].
+    /// Turn status word (`settled`, `timeout`, or `hangup`).
     status: String,
     text: String,
     screen_hash: u64,
     seq: u64,
     arch_origin: u64,
     arch_last: u64,
-    /// Who typed it (`history`'s `by=` word); an older sender's record has
-    /// none and reads as `-` ([`TurnBy::from_wire`]).
+    /// Origin actor token ([`TurnBy::from_wire`]).
     by: String,
-    /// The window harness's `send` and `key enter`, or a `turn
-    /// settle=submitted` ([`crate::turn_ledger::STATUS_PRESSED`]), whose `status` says
-    /// `timeout`.
+    /// Whether the turn's status was [`crate::turn_ledger::STATUS_PRESSED`].
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pressed: bool,
 }

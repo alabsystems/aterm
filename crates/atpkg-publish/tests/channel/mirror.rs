@@ -1,11 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The mirror over a fake channel: a complete public pack is skipped with no staging read; an
-//! absent one is checked and created with exactly its signed set (extras refused, lookalike
-//! names read as data); only what is missing is uploaded, never replacing; a published pack is
-//! immutable; a one-shot HTTP 500 is retried; the work list is the union of `pin` and every
-//! overlay; an unreachable download host is never read as "absent".
+//! Channel mirror tests over a fake release host.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,7 +31,6 @@ fn opts(dry_run: bool) -> MirrorOptions {
     MirrorOptions { dry_run }
 }
 
-/// Index 7 pinning ay 8256 (with `doc`'s overlays), the pack signed on staging.
 fn setup(label: &str, doc: Doc) -> (Rig, VerifiedQuad) {
     let rig = Rig::new(label);
     rig.lay_pack("alabsystems", "ay", 8256, &[MAC]);
@@ -114,8 +109,6 @@ fn a_one_shot_http_500_on_a_staging_asset_is_retried_to_completion() {
     assert_eq!(downloads, 2, "the 500 fired once and the retry finished");
 }
 
-/// Anything the signed manifest does not account for is refused by its exact name —
-/// lookalike names included, read as data, never as a pattern.
 #[test]
 fn every_extra_staging_file_is_refused_by_name() {
     for extra in [
@@ -172,7 +165,6 @@ fn a_publish_creates_the_signed_set_and_confirms_it_then_a_rerun_skips() {
         rel.assets.keys().map(String::as_str).collect::<Vec<_>>(),
         [TARBALL, "pkg-ay-8256.toml", "pkg-ay-8256.toml.sig"]
     );
-    // A program ALab does not build names no upstream base: the paragraph alone.
     assert_eq!(
         rig.host.notes_of(&public(), "atpkg-ay-8256").as_deref(),
         Some(mirror::PUBLIC_NOTES)
@@ -183,7 +175,6 @@ fn a_publish_creates_the_signed_set_and_confirms_it_then_a_rerun_skips() {
             .contains(&format!("probe alabsystems/ay atpkg-ay-8256 {TARBALL}"))
     );
 
-    // Public and complete: skipped — no staging read, no write, no payload download.
     let before = rig.host.calls().len();
     let (report, _) = ok(&rig, &q, false);
     assert_eq!(report.skipped, ["atpkg-ay-8256"]);
@@ -250,7 +241,6 @@ fn a_published_pack_is_immutable_and_must_verify() {
         "a manifest its signature does not cover: {e}"
     );
 
-    // Signed, but not the staging copy: DIFFERS.
     let (rig, q) = setup("mirror-differs", index());
     let stranger = rig.pack("ay", 8256, &[MAC, LINUX]);
     for (name, bytes) in &stranger.files {
@@ -280,7 +270,6 @@ fn a_public_release_serving_no_manifest_is_refused_with_its_remedy() {
     assert!(writes(&rig.host).is_empty());
 }
 
-/// A host that publishes but whose download host answers nothing, or 404 for everything.
 struct Dark {
     inner: Arc<FakeHost>,
     probe: Probe,
@@ -389,12 +378,10 @@ fn every_build_any_target_resolves_is_mirrored_once() {
         ]
     );
 
-    // A re-stated overlay is one unit of work.
     let (rig, q) = setup("mirror-once", index().overlay(LINUX, &[("ay", 8256)]));
     let (report, _) = ok(&rig, &q, true);
     assert_eq!(report.planned.len(), 1);
 
-    // An overlay build staging does not carry stops the mirror.
     let (rig, q) = setup("mirror-missing", index().overlay(LINUX, &[("ay", 9003)]));
     let e = err(&rig, &q, true);
     assert!(

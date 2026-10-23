@@ -16,16 +16,13 @@ fn eligible() -> HandoffLaneFacts {
     }
 }
 
-/// One field of [`HandoffLaneFacts`] flipped per row against an eligible attempt,
-/// each with whether it must refuse the lane.
+/// One field of [`HandoffLaneFacts`] flipped per row against an eligible attempt, each with whether it must refuse the lane.
 #[test]
 fn each_fact_alone_decides_the_out_of_band_lane() {
     let limit = crate::handoff_rendezvous::MAX_RENDEZVOUS_SESSIONS;
     let chunked = crate::handoff_rendezvous::MAX_CHUNKED_SESSIONS;
     let rows: [(&str, HandoffLaneFacts, bool); 13] = [
-        // An attempt with nothing wrong with it takes the lane.
         ("eligible", eligible(), false),
-        // A platform with no LaunchServices launcher has nothing to start.
         (
             "no launcher",
             HandoffLaneFacts {
@@ -34,8 +31,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // A dev build, `targo run` and the test harness reach the seamless lane
-        // without a bundle, so LaunchServices has nothing to start.
         (
             "unbundled",
             HandoffLaneFacts {
@@ -44,9 +39,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // `$HOME` decides whether the rendezvous path fits `sun_path`; when it
-        // does not, the fallback must be silent and total, not a bind failing
-        // after the park.
         (
             "rendezvous path too long",
             HandoffLaneFacts {
@@ -55,9 +47,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // The downgrade guard: an older authorized target must fork, or a
-        // successor without rendezvous code is handed descriptors it cannot
-        // receive and every session is lost.
         (
             "older target",
             HandoffLaneFacts {
@@ -66,8 +55,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // The transport bounds the pool: one `SCM_RIGHTS` message carries 64
-        // descriptors, two of them the pipes. Exactly the limit fits…
         (
             "sessions == limit",
             HandoffLaneFacts {
@@ -76,7 +63,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             false,
         ),
-        // …one more does not, and must fall back rather than fail at sendmsg…
         (
             "sessions == limit + 1",
             HandoffLaneFacts {
@@ -85,8 +71,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // The chunked grant: a candidate whose verified `Info.plist` declares it
-        // takes 100 sessions over several messages…
         (
             "100 sessions, chunked grant declared",
             HandoffLaneFacts {
@@ -96,7 +80,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             false,
         ),
-        // …and a candidate that did not declare it still forks them.
         (
             "100 sessions, no chunked grant",
             HandoffLaneFacts {
@@ -105,7 +88,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // The protocol's own ceiling still binds a chunked grant.
         (
             "chunked grant at the protocol ceiling",
             HandoffLaneFacts {
@@ -124,7 +106,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // …and an overlap with no sessions is not an overlap.
         (
             "no sessions",
             HandoffLaneFacts {
@@ -133,9 +114,6 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
             },
             true,
         ),
-        // A LaunchServices launch merges its environment and cannot remove a
-        // variable; `bind_expected_update_artifact` removes three, so a removal
-        // that would remove something disqualifies the lane.
         (
             "environment needs a removal",
             HandoffLaneFacts {
@@ -154,12 +132,9 @@ fn each_fact_alone_decides_the_out_of_band_lane() {
     }
 }
 
-/// The predicate behind that fact, against a real `Command`: removing something
-/// the launcher lacks is a no-op (the common case), and removing something it
-/// has cannot be expressed.
+/// The predicate behind that fact, against a real `Command`: removing something the launcher lacks is a no-op (the common case), and removing something it has cannot be expressed.
 #[test]
 fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
-    // std on purpose: never spawned; the shipped `launch_environment` reads a std one.
     let mut command = std::process::Command::new("/bin/echo");
     command.env("ATERM_LANE_TEST_KEY", "value");
     command.env_remove("ATERM_LANE_TEST_ABSENT_KEY");
@@ -184,10 +159,7 @@ fn only_a_removal_that_would_remove_something_disqualifies_the_launch() {
     );
 }
 
-/// the successor's control directory is the launcher's
-/// by construction. The variables it is computed from travel explicitly from the
-/// launcher's own environment, whatever LaunchServices merges them over; one the
-/// `Command` sets wins, and one the launcher lacks is not invented.
+/// the successor's control directory is the launcher's by construction.
 #[test]
 fn a_launched_successor_is_handed_the_launchers_control_directory() {
     let launcher = |key: &std::ffi::OsStr| match key.to_str() {
@@ -223,8 +195,7 @@ fn a_launched_successor_is_handed_the_launchers_control_directory() {
     );
 }
 
-/// The bundle root is `<bundle>.app/Contents/MacOS/<bin>`, and the `.app` suffix is checked:
-/// a dev binary also sits three levels below something.
+/// The bundle root is `<bundle>.app/Contents/MacOS/<bin>`, and the `.app` suffix is checked: a dev binary also sits three levels below something.
 #[test]
 fn only_a_dot_app_three_levels_up_is_a_bundle_root() {
     let temp = std::env::temp_dir().join(format!("aterm-lane-{}", std::process::id()));

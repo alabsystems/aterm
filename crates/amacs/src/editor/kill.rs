@@ -3,9 +3,7 @@
 
 //! The kill ring: the kills (kill-region, kill-line, kill-word and
 //! backward-kill-word) push to it once their deletion commits, kill-ring-save
-//! copies to it, and yank and yank-pop insert from it. A kill straight after
-//! a kill joins the entry the first one made, as Emacs's kill-append does, so
-//! `C-k C-k C-k` yanks back as one piece.
+//! copies to it, and yank and yank-pop insert from it.
 
 use std::ops::Range;
 
@@ -72,8 +70,6 @@ impl EditorWorkspace {
         if edits.is_empty() {
             return Ok(vec![EditorEffect::Status("No region selected".to_string())]);
         }
-        // The kill ring takes the text only once the deletion has
-        // committed, so a refused edit (overlapping ranges) kills nothing.
         self.apply_recorded(store, view, normalize_edits(edits)?)?;
         self.record_kill(killed, previous, false);
         self.last_yank = None;
@@ -95,9 +91,6 @@ impl EditorWorkspace {
         let mut edits = Vec::new();
         for selection in &view.selections {
             let start = selection.range().start;
-            // With an argument, C-k kills that many whole lines,
-            // newlines included (C-u 2 C-k); without one, to the end
-            // of the line, or the newline itself at the end.
             let end = if argument.is_some() {
                 line_kill_end(&snapshot.text, selection.range().end, count)
             } else {
@@ -117,8 +110,6 @@ impl EditorWorkspace {
                 insert: String::new(),
             });
         }
-        // As for kill-region: no kill without the deletion. With a
-        // count, carets on neighbouring lines overlap and are refused.
         self.apply_recorded(store, view, normalize_edits(edits)?)?;
         self.record_kill(killed, previous, false);
         self.last_yank = None;
@@ -175,8 +166,7 @@ impl EditorWorkspace {
     }
 
     /// `kill-ring-save` (M-w): copy every non-empty selection to the kill
-    /// ring, joined by newlines, leaving the text as it is. The region is
-    /// done with: each selection becomes a caret at its head.
+    /// ring, joined by newlines, leaving the text as it is.
     pub(super) fn kill_ring_save(
         &mut self,
         store: &DocumentStore,
@@ -211,9 +201,6 @@ impl EditorWorkspace {
         argument: Option<PrefixArgument>,
         count: usize,
     ) -> Result<(), EditorError> {
-        // As in Emacs: C-u 2 C-y yanks the second most recent kill (and
-        // M-y goes on from there), while a bare C-u yanks the latest
-        // and leaves point before it.
         let ring_index = match argument {
             Some(PrefixArgument::Numeric { .. }) => {
                 count.saturating_sub(1) % self.kill_ring.len().max(1)
@@ -288,8 +275,7 @@ impl EditorWorkspace {
     /// Take `text` into the kill ring: joined to the newest entry when the
     /// command before was a kill (`backward` puts it in front, as a
     /// backward kill reads), else as a new entry, the oldest falling off
-    /// past [`KILL_RING_LIMIT`]. Either way the newest entry is the face's
-    /// to put on the clipboard ([`EditorEffect::KillToClipboard`]).
+    /// past [`KILL_RING_LIMIT`].
     fn record_kill(&mut self, text: String, previous: Option<EditorCommand>, backward: bool) {
         if text.is_empty() {
             return;
@@ -437,8 +423,6 @@ mod tests {
     /// A kill straight after a kill joins its kill-ring entry, as Emacs's
     /// kill-append does: `C-k C-k` yanks back the line and its newline as one,
     /// a backward kill goes in front, and `C-u` between kills keeps the run.
-    /// Anything else between them (a motion, typing, C-g, a copy, a
-    /// selection the host sets, a kill in another view) starts a new entry.
     #[test]
     fn kill_append_joins_consecutive_kills() {
         let (mut store, mut workspace, mut view, document) = editor("one\ntwo\nthree\n");
@@ -480,21 +464,17 @@ mod tests {
         press(&mut store, &mut workspace, &mut view, "C-k");
         assert_eq!(workspace.kill_ring, ["\n", "ab"], "typing ends the run");
 
-        // A kill after a copy starts anew.
         let (mut store, mut workspace, mut view, _) = editor("one two three");
         view.selections = vec![Selection { anchor: 0, head: 3 }];
         press(&mut store, &mut workspace, &mut view, "M-w C-k");
         assert_eq!(workspace.kill_ring, [" two three", "one"]);
 
-        // A selection the host sets between kills (here ⌘A's) ends the run.
         let (mut store, mut workspace, mut view, _) = editor("one\ntwo\n");
         press(&mut store, &mut workspace, &mut view, "C-k");
         workspace.select_whole_document(&store, &mut view).unwrap();
         press(&mut store, &mut workspace, &mut view, "C-w");
         assert_eq!(workspace.kill_ring, ["\ntwo\n", "one"]);
 
-        // So does a kill in another view: the ring is the workspace's, and
-        // its newest entry is that view's.
         let mut store = DocumentStore::for_test();
         let mut workspace = EditorWorkspace::new();
         let one = store.open("mem://one".into(), "one\n".into());
@@ -519,7 +499,6 @@ mod tests {
             .collect::<String>();
         let (mut store, mut workspace, mut view, _) = editor(&text);
         for _ in 0..70 {
-            // C-g between kills keeps each its own entry; C-d drops the newline.
             press(&mut store, &mut workspace, &mut view, "C-k C-g C-d");
         }
         assert_eq!(workspace.kill_ring.len(), KILL_RING_LIMIT);

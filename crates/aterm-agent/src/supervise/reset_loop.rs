@@ -28,35 +28,20 @@ pub(super) const RESET_STALE: Duration = Duration::from_secs(RESET_CLAIM_S.unsig
 /// From which failed Escape on the host is told the dialog is stuck ([`IdleHost::inform`], once).
 pub(super) const RESET_STUCK_AT: u32 = 2;
 
-/// What a `declined` row of the reset's rule names where no confirmation's
-/// title (`Use a <kind>?`) is on the screen and the step holds no go whose
-/// kind would name one: a successor's Escape on a box read by its parts.
 const RESET_UNTITLED: &str = "the reset confirmation";
 
-/// The one record a dialog that will not close leaves with the host: a title
-/// and what a person does about it.
 const RESET_STUCK: &str = "The limit-reset confirmation did not close\nPress Esc in this tab.";
 
-/// The one record a step leaves that ended on a screen its readers could
-/// not read: whatever stands there is a person's to look at.
 const RESET_UNREAD: &str = "A limit-reset dialog could not be read\nLook at this tab.";
 
-/// How long a screen that moved must hold still before the step's next read
-/// of it, in the server's `await idle` milliseconds: as the probe's.
 const RESET_STILL_MS: &str = "50";
 
-/// What a `HELD` line names as the act a person's hand holds.
 const RESET_KEY_ACT: &str = "the reset confirmation's key";
 
-/// What the step's `waiting` row names: the step, not a text of the vendor's.
 const RESET_SUBJECT: &str = "limit reset";
 
-/// What the `waiting` row says of a step ended under `[harness] limit_reset
-/// = false` ([`Session::reset_end`]): nobody was told how it ended.
 const RESET_UNTOLD: &str = "ended: untold (key off)";
 
-/// What the `waiting` row says of a step whose open row was older than a
-/// step can be ([`RESET_STALE`]): ended with nobody told, at either key.
 const RESET_STALE_END: &str = "ended: stale";
 
 /// The bounds of one reset step ([`RESET_WAITS`]; a test shortens them).
@@ -104,7 +89,6 @@ pub(super) enum ResetAsked {
     Pass,
 }
 
-/// What a read shows of a step that is owed ([`Session::reset_run`]).
 enum Shows {
     /// A pending line under its dialog's title, and its row.
     Pending(ResetPending, usize),
@@ -135,7 +119,6 @@ enum Flow {
     Leave,
 }
 
-/// What is done at a confirmation ([`Session::reset_verdict`]).
 enum Judged {
     /// Enter, on the yes row as read.
     Enter,
@@ -145,8 +128,6 @@ enum Judged {
     Again,
 }
 
-/// The year a day of the vendor's names (`Jan 2, 2027 at 9am`: the formatter
-/// adds it whenever it is not this year's): its third word, four digits.
 fn named_year(when: &str) -> Option<i64> {
     when.split(|c: char| c.is_whitespace() || c == ',')
         .filter(|word| !word.is_empty())
@@ -156,7 +137,6 @@ fn named_year(when: &str) -> Option<i64> {
         .ok()
 }
 
-/// The outcome as the journal's `RESET` line words it.
 fn outcome_words(outcome: &ResetOutcome, kept: Option<KeepWhy>) -> String {
     match outcome {
         ResetOutcome::Spent {
@@ -177,7 +157,6 @@ fn outcome_words(outcome: &ResetOutcome, kept: Option<KeepWhy>) -> String {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// The step owed, if one is.
     fn reset_owed(&self) -> Option<&ResetOwed> {
         match &self.reset {
             ResetStep::Idle => None,
@@ -192,8 +171,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// A step owed from now, with `go` what its confirmation is held to
-    /// (`None`: never entered) and the claim asked for at `since`.
     fn reset_step_owed(&mut self, go: Option<ResetGo>, since: Instant, entered: bool) {
         let now = self.fx.mono();
         self.reset = ResetStep::Owed(Box::new(ResetOwed {
@@ -257,8 +234,6 @@ impl<C: Ctl> Session<'_, C> {
         ));
     }
 
-    /// Whether the step owed ends untold, and the words its `waiting` row and journal carry: its
-    /// open row was stale ([`Self::reset_take_up`]), or `[harness] limit_reset` is off.
     fn reset_untold(&self, opts: &SuperviseOpts) -> Option<(&'static str, &'static str)> {
         let owed = self.reset_owed()?;
         if owed.stale {
@@ -323,8 +298,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The zone the wall's notice named, where the loop holds one: the open limit episode's
-    /// reset text, else the remembered wall's.
     fn reset_zone(&self) -> Option<String> {
         let named = |text: &str| match limit::parse_reset(text) {
             Some(ResetSpec::At { zone, .. }) => zone,
@@ -365,14 +338,10 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// The first second of a grant's last day as the row draws it (`Oct 5`):
-    /// a day, not a deadline — what the host's pre-filter reads.
     fn reset_day_start(&mut self, day: &str) -> Option<i64> {
         self.reset_place(&format!("{day} at 12am"))
     }
 
-    /// The loop's own gates on the grant row, in order: `None` with every
-    /// one open, else the word of the first that shut.
     fn reset_gate(
         &mut self,
         turn: &Turn,
@@ -464,8 +433,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Classify `screen` for an active reset step (`Pending`, `Wall`, `Confirm`,
-    /// `Other`, `Gone`, or `Unread`).
     fn reset_shows(&self, screen: &Screen, before: Option<ResetShown>) -> Shows {
         let rows = &screen.rows;
         if let Some((line, row)) = aterm_phase::reset_pending(rows) {
@@ -507,8 +474,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// One wait of the step's, to `until` at most: a step of the loop's and
-    /// the budget bound it.
     fn reset_wait(&self, until: Option<Instant>, deadline: Instant) -> Duration {
         let now = self.fx.mono();
         until
@@ -679,10 +644,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether the step's next key must wait (`true`, after one wait on the row `guard` names
-    /// leaving): a failed Escape's pause is not over, or by a `status` read now the worker is
-    /// not reading its input or a hand is on the session within its grace (`HELD`, said once a
-    /// hold).
     fn reset_not_ready(
         &mut self,
         seq: u64,
@@ -725,8 +686,6 @@ impl<C: Ctl> Session<'_, C> {
         Ok(true)
     }
 
-    /// Handle a reset confirmation screen: wait for box settle and input readiness,
-    /// evaluate [`Self::reset_verdict`], and send a fenced `Enter` or guarded `Esc`.
     fn reset_confirmation(
         &mut self,
         screen: &Screen,
@@ -876,9 +835,6 @@ impl<C: Ctl> Session<'_, C> {
         self.reset_escape(screen, &guard, why, title, opts, review)
     }
 
-    /// Record that confirmation `Enter` was sent (or lost in flight): advance the
-    /// enter counter, reset the phase timer, and write the `approved` ledger row
-    /// and `confirmed` journal line once per step.
     fn reset_yes_written(
         &mut self,
         kind: aterm_phase::ResetKind,
@@ -906,10 +862,6 @@ impl<C: Ctl> Session<'_, C> {
         ));
     }
 
-    /// Decide whether to `Enter`, `Keep(KeepWhy)` (`Esc`), or `Again` on a
-    /// confirmation: requires no prior `Esc`, a live `ResetGo` from this loop,
-    /// `< RESET_ENTERS` prior tries, [`confirm_verdict`] approval, and a fresh
-    /// [`IdleHost::reset_take`] re-confirming the claim within `enter_by`.
     fn reset_verdict(
         &mut self,
         read: &ConfirmRead,
@@ -954,8 +906,6 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether `screen` still shows a dialog an Escape of the step's is
-    /// for: the confirmation, or `Checking…`.
     fn reset_stands(&self, screen: &Screen) -> bool {
         let before = self.reset_owed().and_then(|owed| owed.shown);
         matches!(
@@ -964,10 +914,6 @@ impl<C: Ctl> Session<'_, C> {
         )
     }
 
-    /// Send one guarded `Esc` (`if-human=`, `if=<guard>`), record the `declined`
-    /// ledger row on the first attempt, wait up to `ResetWaits::close`, and back
-    /// off via `SURVEY_RETRY` (informing the host at `RESET_STUCK_AT`) if the
-    /// dialog remains.
     fn reset_escape(
         &mut self,
         screen: &Screen,

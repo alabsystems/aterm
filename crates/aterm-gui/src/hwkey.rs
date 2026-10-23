@@ -7,14 +7,14 @@
 //! postEvent:atStart:]` is one of the few `NSApplication` methods Apple documents as safe from
 //! any thread.
 
-/// A parsed hardware-key injection request: everything needed to build the `NSEvent` pair, with no AppKit types, so the grammar is unit-testable.
+/// A parsed hardware-key injection request.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HwKeySpec {
-    /// macOS virtual keycode (`kVK_*`). winit's `create_key_event` derives the logical key from this through `UCKeyTranslate`, so it, not `chars`, decides which key the app sees.
+    /// macOS virtual keycode (`kVK_*`).
     pub keycode: u16,
     /// `-[NSEvent characters]`: the text the layout produces with modifiers applied.
     pub chars: String,
-    /// `-[NSEvent charactersIgnoringModifiers]`: winit dereferences this unconditionally (`.expect("expected characters to be non-null")`), so it is never empty here.
+    /// `-[NSEvent charactersIgnoringModifiers]`.
     pub chars_ignoring: String,
     /// Raw `NSEventModifierFlags` bits.
     pub flags: u64,
@@ -22,32 +22,20 @@ pub(crate) struct HwKeySpec {
     pub count: u32,
     /// Milliseconds between successive presses.
     pub interval_ms: u64,
-    /// `shape=press`: build each event as a key press is, from a CoreGraphics keyboard event wrapped by `+[NSEvent eventWithCGEvent:]`, so AppKit reads its characters off the CURRENT layout (Option+b is `∫` on the U.S. layout, Option+e the acute dead key with empty characters) and the input method may compose it.
+    /// `shape=press`: build each event from a CoreGraphics keyboard event wrapped by `+[NSEvent eventWithCGEvent:]`.
     pub press: bool,
 }
 
-/// `NSEventModifierFlags` bits, spelled out so the pure parser needs no AppKit.
 const FLAG_SHIFT: u64 = 1 << 17;
 const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_OPTION: u64 = 1 << 19;
 const FLAG_COMMAND: u64 = 1 << 20;
-/// `NSEventModifierFlagFunction` — AppKit sets it on arrows and F-keys, and some
-/// responders read it, so a synthetic arrow must carry it too.
 const FLAG_FUNCTION: u64 = 1 << 23;
 
-/// Upper bound on one `hwkey` invocation: the verb blocks while it paces the stream, so an
-/// unbounded count would pin a control worker.
 const MAX_COUNT: u32 = 5000;
-/// Upper bound on the pacing interval, for the same reason.
 const MAX_INTERVAL_MS: u64 = 1000;
-/// Default pacing: 40 ms ≈ 25 keys/s, brisk typing. Not zero: a zero-interval burst measures
-/// queue drain, not typing.
 const DEFAULT_INTERVAL_MS: u64 = 40;
 
-/// A named key: `(name, keycode, characters)`. `characters` uses the private-use
-/// function-key code points AppKit puts in `-[NSEvent characters]` for the
-/// non-printing keys, and the C0/DEL control characters for the rest — the same
-/// bytes a physical press produces.
 const NAMED: &[(&str, u16, &str)] = &[
     ("enter", 36, "\r"),
     ("return", 36, "\r"),
@@ -79,7 +67,6 @@ const NAMED: &[(&str, u16, &str)] = &[
     ("f12", 111, "\u{f70f}"),
 ];
 
-/// The keys that AppKit marks with `NSEventModifierFlagFunction` on a real press.
 const FUNCTION_FLAGGED: &[u16] = &[
     123, 124, 125, 126, 115, 116, 117, 119, 121, 96, 97, 98, 99, 100, 101, 103, 109, 111, 118, 120,
     122,
@@ -167,8 +154,6 @@ const fn ansi_keycode(c: char) -> Option<(u16, bool)> {
     Some((code, shift))
 }
 
-/// Strip leading inline modifier prefixes (`ctrl+`, `alt+`, …), mirroring
-/// [`crate::control_input::parse_key`]'s grammar so the two verbs read the same.
 fn take_inline_mods(body: &str) -> (u64, &str) {
     let mut m = 0u64;
     let mut rest = body;
@@ -186,8 +171,6 @@ fn take_inline_mods(body: &str) -> (u64, &str) {
     (m, rest)
 }
 
-/// Parse `mods=<list>` / `count=<n>` / `interval=<ms>` trailing tokens, returning them plus the
-/// residual body.
 fn take_tokens(rest: &str) -> Result<(u64, u32, u64, bool, String), String> {
     let mut mods = 0u64;
     let mut count = 1u32;
@@ -314,7 +297,6 @@ pub(crate) fn post(spec: &HwKeySpec, window_number: i64) -> Result<u32, String> 
 
     use crate::appkit;
 
-    /// `NSEvent.h` — `NSEventTypeKeyDown = 10`, `NSEventTypeKeyUp = 11`.
     const NS_EVENT_TYPE_KEY_DOWN: usize = 10;
     const NS_EVENT_TYPE_KEY_UP: usize = 11;
 
@@ -475,8 +457,6 @@ pub(crate) fn post(_spec: &HwKeySpec, _window_number: i64) -> Result<u32, String
 mod tests {
     use super::{FLAG_CONTROL, FLAG_FUNCTION, FLAG_SHIFT, MAX_COUNT, parse_hwkey};
 
-    /// A bare letter is the unshifted US-QWERTY key for it, with no modifiers and
-    /// both character strings equal — the shape AppKit reports for a plain press.
     #[test]
     fn a_plain_letter_is_its_unshifted_physical_key() {
         let s = parse_hwkey("x").expect("x parses");
@@ -487,9 +467,6 @@ mod tests {
         assert_eq!(s.count, 1);
     }
 
-    /// SHIFT is DERIVED from the character, not demanded from the caller: `hwkey X`
-    /// must be the same physical key as `hwkey x` plus the shift flag, because that
-    /// is what the keyboard does.
     #[test]
     fn an_uppercase_letter_shifts_the_same_physical_key() {
         for (plain, shifted) in [("x", "X"), ("1", "!")] {
@@ -501,9 +478,6 @@ mod tests {
         }
     }
 
-    /// Control chords carry the C0 byte in `characters` (what AppKit delivers) and
-    /// the bare letter in `charactersIgnoringModifiers` (what winit reads for the
-    /// logical key).
     #[test]
     fn a_control_chord_carries_the_c0_byte_and_the_bare_letter() {
         let a = parse_hwkey("ctrl+u").unwrap();
@@ -514,8 +488,6 @@ mod tests {
         assert_eq!(a.chars_ignoring, "u");
     }
 
-    /// Named keys resolve to their AppKit keycode and private-use character, and the ones AppKit
-    /// marks as function keys carry that flag.
     #[test]
     fn named_keys_match_appkit_codes_and_function_flag() {
         let enter = parse_hwkey("enter").unwrap();
@@ -539,8 +511,6 @@ mod tests {
         );
     }
 
-    /// winit unwraps `charactersIgnoringModifiers` with `.expect(...)`, so an empty string there
-    /// would panic on dispatch: no accepted spelling produces one.
     #[test]
     fn no_accepted_key_yields_empty_character_strings() {
         for spelling in [
@@ -577,8 +547,6 @@ mod tests {
         }
     }
 
-    /// Pacing tokens are additive and bounded; out-of-range or malformed values are refused,
-    /// never clamped or defaulted.
     #[test]
     fn pacing_tokens_are_additive_and_bounded() {
         let s = parse_hwkey("x count=200 interval=25").unwrap();
@@ -593,8 +561,6 @@ mod tests {
         assert!(parse_hwkey("x mods=bogus").is_err());
     }
 
-    /// `shape=press` asks for the key-press shape and changes nothing else about the
-    /// key; the default is the built shape, and an unknown shape is refused.
     #[test]
     fn the_press_shape_is_asked_for_by_name_and_keeps_the_key() {
         let built = parse_hwkey("b mods=alt").unwrap();
@@ -607,7 +573,6 @@ mod tests {
         assert!(parse_hwkey("b shape=cg").is_err());
     }
 
-    /// Unknown / multi-character bodies are refused rather than guessed at.
     #[test]
     fn a_malformed_body_is_refused() {
         assert!(parse_hwkey("").is_err());

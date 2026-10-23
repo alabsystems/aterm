@@ -234,8 +234,6 @@ impl TrustedIndex {
     #[inline]
     #[must_use]
     pub fn authorizing_seq(&self) -> u64 {
-        // An index that declares no generation cannot waive a generation floor: 0 is never
-        // strictly greater than a recorded floor.
         self.index.roster_seq.unwrap_or(0)
     }
 
@@ -373,7 +371,7 @@ impl BuildFloor {
     }
 }
 
-/// Freshness gate (gate 2, §8): an index is fresh iff `now_unix < valid_until_unix`.
+/// Freshness gate: an index is fresh iff `now_unix < valid_until_unix`.
 #[inline]
 pub const fn check_freshness(now_unix: i64, valid_until_unix: i64) -> Result<(), Reject> {
     if now_unix >= valid_until_unix {
@@ -383,7 +381,7 @@ pub const fn check_freshness(now_unix: i64, valid_until_unix: i64) -> Result<(),
     }
 }
 
-/// A durable, anti-rollback high-water mark over the index's monotonic `index_build` (gate 3, §8).
+/// A durable, anti-rollback high-water mark over the index's monotonic `index_build`.
 pub struct Floor {
     path: PathBuf,
 }
@@ -396,7 +394,7 @@ impl Floor {
         Self { path }
     }
 
-    /// The recorded high-water floor (`0` if none or unreadable), for a caller that filters on it (§5) before advancing it with [`Self::check_and_record`].
+    /// The recorded high-water floor (`0` if none or unreadable), for a caller that filters on it before advancing it with [`Self::check_and_record`].
     #[inline]
     #[must_use]
     pub fn current(&self) -> u64 {
@@ -464,8 +462,7 @@ impl Floor {
         FileLock::acquire(&lockpath).ok()
     }
 
-    /// The recorded floor, or `0` if the file is missing or unparseable (fail-open only for
-    /// first contact, per §8).
+    /// The recorded floor, or `0` if the file is missing or unparseable (fail-open only for first contact).
     fn read_floor(&self) -> u64 {
         self.read_floor_reported().0
     }

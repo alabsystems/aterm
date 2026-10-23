@@ -95,7 +95,6 @@ pub fn coverage_phased(
         _ => unreachable!("covers() gates the ranges"),
     }
     if antialiased(ch) {
-        // The seam-tiling law: AA families still tile bit-exactly across cells.
         c.harden_edges();
     }
     Some(c.buf)
@@ -206,23 +205,21 @@ fn paw(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     cov
 }
 
-/// The Singularity nova's per-cell Over darkening mask (Sparkle Words v2 §6.1): a soft
+/// The Singularity nova's per-cell Over darkening mask: a soft
 /// radial shadow, coverage `1` at the cell centre falling quadratically to `0` at `r`.
 fn ring_arc(px: f32, py: f32, cx: f32, cy: f32, r: f32) -> f32 {
     let d2 = ((px - cx).powi(2) + (py - cy).powi(2)) / (r * r).max(1e-6);
     (1.0 - d2).clamp(0.0, 1.0)
 }
 
-/// The super nova's light-background eclipse veil (Sparkle Words v3 §3.3): a full-cell
+/// The super nova's light-background eclipse veil: a full-cell
 /// square whose coverage is the pixel centre's distance to the nearest cell border,
 /// clamped to `0..=1`, so it fills the cell with a ~1 px fringe like [`disc`]'s.
 fn soft_square(px: f32, py: f32, fw: f32, fh: f32) -> f32 {
     px.min(fw - px).min(py.min(fh - py)).clamp(0.0, 1.0)
 }
 
-/// A coverage canvas: `w * h` bytes. The hard painters ([`Canvas::set`],
-/// [`Canvas::rect`]) write 0/255 only; [`Canvas::paint_aa`] writes box-filtered
-/// 8-bit coverage for the anti-aliased families.
+/// A coverage canvas: `w * h` bytes.
 struct Canvas {
     w: usize,
     h: usize,
@@ -581,10 +578,7 @@ fn dash_v(c: &mut Canvas, m: &Metrics, n: usize, t: usize) {
     }
 }
 
-/// Double-line glyphs U+2550–256C. Rails sit at the outer thirds of the heavy
-/// envelope (`Metrics` docs); junction shapes follow the Unicode charts: outer
-/// rails meet at the outer corner, inner rails at the inner corner, and a
-/// branch breaks only the rail it attaches to.
+/// Double-line glyphs U+2550–256C.
 fn draw_double(c: &mut Canvas, m: &Metrics, cp: u32) {
     let t = m.light;
     let (w, h) = (m.w, m.h);
@@ -798,11 +792,7 @@ fn draw_arc(c: &mut Canvas, m: &Metrics, cp: u32) {
     }
 }
 
-/// Light diagonals U+2571–2573, corner to corner. A subsample is lit when it
-/// lies within half a light stroke of the ideal line, measured PERPENDICULAR
-/// to it (floored at 0.6 so the line stays visually connected — and meets the
-/// cell corners, so diagonals in adjacent cells chain without a break; the
-/// corner texels are edge-hardened back to 255).
+/// Light diagonals U+2571–2573, corner to corner.
 fn draw_diag(c: &mut Canvas, m: &Metrics, fwd: bool, back: bool) {
     let (wf, hf) = (m.w as f32, m.h as f32);
     let half = (m.light as f32 / 2.0).max(0.6);
@@ -886,9 +876,7 @@ fn quadrants(c: &mut Canvas, cp: u32) {
     }
 }
 
-/// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`. The Powerline chevron
-/// stroke: a band `dist <= t/2` is `t` thick perpendicular to the edge at every slope,
-/// where a per-row fill of width `t` thins to `t / sqrt(1 + slope²)` (beads at 45°).
+/// Distance from `(px, py)` to the segment `(ax, ay)..(bx, by)`.
 fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
     let (dx, dy) = (bx - ax, by - ay);
     let len2 = dx * dx + dy * dy;
@@ -939,26 +927,19 @@ fn draw_powerline(c: &mut Canvas, cp: u32) {
             let (nx, ny) = (px / wf, (py - mid) / mid);
             let e = (nx * nx + ny * ny).sqrt();
             if outline {
-                // Radial distance scaled by the smaller radius — the
-                // perpendicular stroke width bound, as in `ellipse`.
                 ((e - 1.0) * wf.min(mid)).abs() <= half
             } else {
                 e <= 1.0
             }
         } else if outline {
-            // Chevron `>`: stroke the two hypotenuse segments
-            // (0,0)->(w,mid) and (w,mid)->(0,h) at perpendicular width t.
             seg_dist(px, py, 0.0, 0.0, wf, mid).min(seg_dist(px, py, wf, mid, 0.0, hf)) <= half
         } else {
-            // Solid triangle: inside the linear taper from both edges.
             px <= wf * (1.0 - ((py - mid).abs() / mid))
         }
     });
 }
 
-/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells. The 60 code points map
-/// to the 6-bit masks 1..=62 except 21 (left column) and 42 (right column), which, like 0
-/// (space) and 63 (full block), have their own characters.
+/// Block sextants U+1FB00–1FB3B: a 2×3 grid of filled sub-cells.
 fn draw_sextant(c: &mut Canvas, cp: u32) {
     let k = cp - 0x1FB00;
     let mask = k + 1 + u32::from(k >= 20) + u32::from(k >= 40);
@@ -1007,9 +988,7 @@ const OCTANT_MASKS: [u8; 230] = [
     0xF7, 0xF8, 0xF9, 0xFB, 0xFD, 0xFE,
 ];
 
-/// Draw one octant mask. The column split is `eighth(4, w)`, the sextants'
-/// and ▌'s; the row splits are `eighth(2|4|6, h)`, the upper quarter /
-/// half / three-quarter blocks' (U+1FB82, ▀, U+1FB85).
+/// Draw one octant mask.
 fn draw_octant(c: &mut Canvas, mask: u8) {
     let (w, h) = (c.w, c.h);
     let xs = [0, eighth(4, w), w];
@@ -1133,17 +1112,13 @@ fn draw_legacy_block(c: &mut Canvas, cp: u32) {
         0x1FB7C..=0x1FB7F => {
             let (ew, eh) = (eighth(1, w), eighth(1, h));
             if matches!(cp, 0x1FB7C | 0x1FB7D) {
-                // left eighth
                 c.rect(0, 0, ew, h);
             } else {
-                // right eighth
                 c.rect(w - ew, 0, w, h);
             }
             if matches!(cp, 0x1FB7C | 0x1FB7F) {
-                // lower eighth
                 c.rect(0, h - eh, w, h);
             } else {
-                // upper eighth
                 c.rect(0, 0, w, eh);
             }
         }
@@ -1194,7 +1169,6 @@ fn draw_braille(c: &mut Canvas, cp: u32) {
         let (y0, y1) = (yb(row), yb(row + 1));
         let (bw, bh) = (x1 - x0, y1 - y0);
         if bw == 0 || bh == 0 {
-            // cell too small for this dot's compartment
             continue;
         }
         let dw = bw.div_ceil(2);

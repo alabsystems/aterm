@@ -45,7 +45,6 @@ mod test_support;
 #[cfg(test)]
 mod write_test_helpers;
 
-// Crate types re-exported so grid submodules can use `super::X`.
 pub(in crate::grid) use crate::Cursor;
 #[cfg(test)]
 pub(in crate::grid) use crate::PackedColor;
@@ -55,7 +54,6 @@ pub(in crate::grid) use crate::{CellCoord, CellExtra, CellExtras};
 pub(in crate::grid) use crate::{HorizontalMargins, PAGE_SIZE, PageStore, ScrollRegion};
 pub(in crate::grid) use crate::{LineSize, Row};
 
-// Test counter re-exports so grid submodules can use `super::count_*`.
 #[cfg(any(test, debug_assertions))]
 pub(in crate::grid) use crate::test_counters::{
     count_reflow_passthrough_lines, count_reflow_row_op, count_ring_fast_materialize,
@@ -63,13 +61,11 @@ pub(in crate::grid) use crate::test_counters::{
     count_viewport_row_materialize,
 };
 
-// Scrollback re-exports for the grid tests.
 #[cfg(test)]
 pub(in crate::grid) use aterm_scrollback::Scrollback;
 #[cfg(test)]
 pub(in crate::grid) use aterm_scrollback::{CellAttrs, HyperlinkSpan, Line, Rle};
 
-// Test counter take_* re-exports for performance/complexity tests.
 #[cfg(test)]
 pub(in crate::grid) use crate::test_counters::{
     take_extras_clear_ops, take_extras_shift_ops, take_reflow_cell_ops, take_reflow_row_ops,
@@ -108,8 +104,7 @@ const fn clamp_u16(val: i32) -> u16 {
 use state::GridStorage;
 pub(in crate::grid) use viewport_row_cache::{HistoryEpoch, ViewportRowCache};
 
-/// Terminal grid. A ring buffer gives O(1) scrolling; `display_offset` selects
-/// the part of history shown.
+/// Terminal grid with ring-buffered display scrolling.
 #[derive(Debug)]
 pub struct Grid {
     /// All grid state: rows, cursor, damage, extras, scrollback.
@@ -148,9 +143,7 @@ impl Grid {
         self.row_mut(row).and_then(|r| r.get_mut(col))
     }
 
-    /// Whether the cell at (row, col) is a wide-character continuation spacer,
-    /// checked against its left `WIDE` neighbour (unlike
-    /// `Cell::is_wide_continuation()`, which misreads DECSCA-protected cells).
+    /// Whether the cell at (row, col) is a wide-character continuation spacer.
     #[must_use]
     #[inline]
     pub fn is_wide_continuation_at(&self, row: u16, col: u16) -> bool {
@@ -158,12 +151,7 @@ impl Grid {
             .is_some_and(|r| r.is_cell_wide_continuation(col))
     }
 
-    /// Set the BCE (background colour erase) template cell, which ED, EL, ECH,
-    /// IL, DL and scroll use to fill erased cells. Call whenever the SGR
-    /// background changes.
-    ///
-    /// `bg_rgb` is `Some([r, g, b])` for a truecolor background; erases write
-    /// it into the `RgbColorRing` for every filled cell.
+    /// Set the BCE (background colour erase) template cell.
     #[inline]
     pub const fn set_cursor_template(&mut self, template: Cell, bg_rgb: Option<[u8; 3]>) {
         self.storage.cursor_state.cursor_template = template;

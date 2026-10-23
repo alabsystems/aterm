@@ -8,19 +8,7 @@
 //! Owner-side Ed25519 signing for atpkg manifests: the producer half of the signature
 //! contract whose verifier is `atpkg::sig`.
 //!
-//! The atpkg client is verify-only (`ring` without default features, so no RNG). Generating
-//! the paper master and machine keys and signing `index.toml` / `pkg-*.toml` needs the full
-//! `ring` crate, so it lives in this owner-only tool, never shipped to clients. The signed
-//! unit is the exact asset bytes (no canonicalization), checked by `aterm_update_core::roster`,
-//! the same verifier the app updater runs.
-//!
-//! [`master`] handles the paper master: 52 base32 characters, read back from a no-echo
-//! `/dev/tty` and never written anywhere. [`roster_ops`] holds the roster edits as pure
-//! functions over the shared `Roster` type the updater parses, so producer and client cannot
-//! disagree on a valid roster. [`provision`] is the engine behind `setup` (first machine) and
-//! `join` (each later one): through [`pins_edit`] it writes the public keys into
-//! `aterm_update_core::pins` itself, and stops short of `git commit`, since arming a trust
-//! anchor is a reviewed act. See `docs/RELEASE-KEYS.md`.
+//! See `docs/RELEASE-KEYS.md`.
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
@@ -132,7 +120,6 @@ mod tests {
         (bytes, sig)
     }
 
-    // Each negative control breaks one link of the chain.
     #[test]
     fn verify_signed_accepts_a_rostered_signature_and_nothing_else() {
         use aterm_update_core::roster::RosterReject;
@@ -154,14 +141,12 @@ mod tests {
             }
         );
 
-        // A tampered file (one byte) is refused.
         let mut bad = file.to_vec();
         bad[2] ^= 0x01;
         assert_eq!(
             verify_signed(&[&master_pub], roster.clone(), &roster_sig, &bad, &sig, now),
             Err(RosterReject::Verify)
         );
-        // A signature by a key the roster does not list is refused.
         let (stranger, _) = generate().unwrap();
         let stranger_sig = sign(&stranger, file).unwrap();
         assert_eq!(
@@ -175,18 +160,15 @@ mod tests {
             ),
             Err(RosterReject::Verify)
         );
-        // A roster the pinned master did not sign is refused before any file crypto.
         let (other_master, _) = generate().unwrap();
         let forged_sig = sign(&other_master, &roster).unwrap();
         assert_eq!(
             verify_signed(&[&master_pub], roster.clone(), &forged_sig, file, &sig, now),
             Err(RosterReject::Verify)
         );
-        // A machine revoked on the roster authorizes nothing.
         let (revoked, revoked_sig) =
             signed_roster(&master, &machine_pub, &["m2"], "2099-01-01T00:00:00Z");
         assert!(verify_signed(&[&master_pub], revoked, &revoked_sig, file, &sig, now).is_err());
-        // A lapsed roster authorizes nothing.
         let (stale, stale_sig) = signed_roster(&master, &machine_pub, &[], "2026-01-01T00:00:00Z");
         assert_eq!(
             verify_signed(&[&master_pub], stale, &stale_sig, file, &sig, now),
@@ -194,9 +176,6 @@ mod tests {
         );
     }
 
-    // The contract: the client verifier (`aterm_update_core::roster`) accepts this tool's
-    // signature over the exact bytes and rejects a 1-byte tamper. The full owner→client chain
-    // through `atpkg::flow::install` is `tests/owner_to_client.rs`.
     #[test]
     fn produces_signatures_the_client_verifier_accepts() {
         use aterm_update_core::roster::{Machine, Roster, RosterReject};
@@ -204,8 +183,6 @@ mod tests {
         let (key, pub_b64) = generate().unwrap();
         let manifest = b"schema = 2\nindex_build = 7\nvalid_until = \"2099-01-01T00:00:00Z\"\n";
         let sig = sign(&key, manifest).unwrap();
-        // An in-memory roster keeps this a test of the signature; the master-signature half
-        // is `verify_signed_accepts_a_rostered_signature_and_nothing_else`.
         let roster = Roster {
             schema: 1,
             roster_seq: 1,
@@ -220,20 +197,17 @@ mod tests {
         };
         let now = 1_785_801_600i64;
 
-        // The real client verifier accepts it, and attributes it to the minting machine.
         let who = roster
             .authorize_appcast(manifest, &sig, now)
             .expect("the client must accept a signature this tool produced");
         assert_eq!(who.machine_id, "m3");
         assert_eq!(who.pubkey_b64, pub_b64);
-        // A single-byte tamper is rejected.
         let mut bad = manifest.to_vec();
         bad[0] ^= 0x01;
         assert_eq!(
             roster.authorize_appcast(&bad, &sig, now).err(),
             Some(RosterReject::Verify)
         );
-        // Another key's signature is rejected.
         let (other, _) = generate().unwrap();
         let other_sig = sign(&other, manifest).unwrap();
         assert_eq!(
@@ -246,7 +220,6 @@ mod tests {
     fn pubkey_b64_recovers_the_published_key() {
         let (key, pub_b64) = generate().unwrap();
         assert_eq!(pubkey_b64(&key).unwrap(), pub_b64);
-        // The client's BadKey gate: the pubkey decodes to exactly 32 bytes.
         assert_eq!(
             aterm_codec::base64::decode_strict(pub_b64.as_bytes())
                 .unwrap()

@@ -42,9 +42,6 @@ impl<'de> Deserializer<'de> for Enum {
     }
 }
 
-// The variant's payload is replayed from tokens: upstream builds it from
-// `i32::into_deserializer`, `SeqDeserializer` and `MapDeserializer`, which
-// this crate dropped (nothing in aterm called them).
 fn replay<'de, T: DeserializeSeed<'de>>(seed: T, tokens: &'de [Token]) -> Result<T::Value, Error> {
     seed.deserialize(&mut crate::support::Deserializer::new(tokens))
 }
@@ -109,7 +106,6 @@ impl<'de> VariantAccess<'de> for Enum {
 
 #[test]
 fn test_deserialize_enum() {
-    // First just make sure the Deserializer impl works
     assert_eq!(Target::Unit, Target::deserialize(Enum("Unit")).unwrap());
     assert_eq!(
         Target::Newtype(10),
@@ -124,7 +120,6 @@ fn test_deserialize_enum() {
         Target::deserialize(Enum("Struct")).unwrap()
     );
 
-    // Now try IgnoredAny
     IgnoredAny::deserialize(Enum("Unit")).unwrap();
     IgnoredAny::deserialize(Enum("Newtype")).unwrap();
     IgnoredAny::deserialize(Enum("Tuple")).unwrap();

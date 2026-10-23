@@ -27,7 +27,7 @@ pub const PLACEHOLDER: &str = "/tmp/.com.apple.dt.CommandLineTools.installondema
 pub const SOFTWAREUPDATE: &str = "/usr/sbin/softwareupdate";
 
 /// `xcode-select`.
-pub const XCODE_SELECT: &str = "/usr/bin/xcode-select";
+pub const XCODE_SELECT: &str = aterm_uds::os_path!("xcode-select");
 
 /// The catalog host whose reachability the probe checks before it plans an install.
 pub const CATALOG: &str = "https://swscan.apple.com/";

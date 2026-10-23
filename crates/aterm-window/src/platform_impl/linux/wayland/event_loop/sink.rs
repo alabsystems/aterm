@@ -5,9 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! An event loop's sink to deliver events from the Wayland event callbacks.
-//!
-//! Modified by the aterm project in 2026; see the repository NOTICE. (`push_device_event`
-//! left with the relative pointer, its one caller: docs/AUDIT-third-party-2026-10-15.md, LW.7.)
 
 use std::vec::Drain;
 

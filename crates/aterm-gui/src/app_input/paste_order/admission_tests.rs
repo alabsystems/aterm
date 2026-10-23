@@ -92,8 +92,6 @@ fn admission_bounds_and_reserved_key_room_follow_the_model() {
             assert!(model.check_invariant("PasteLeavesInputRoom", &state));
         }
     }
-    // Negative control: an unbounded admission would accept a third paste; the
-    // real guard declines it while the model's mutant violates both claims.
     let budget = Budget::new(limits);
     assert!(budget.claim(2, true));
     assert!(budget.claim(2, true));
@@ -295,8 +293,6 @@ fn stalled_sink_case(hidden: bool) {
     expected.extend_from_slice(b"\x1b[200~");
     expected.resize(expected.len() + body, b'p');
     expected.extend_from_slice(b"\x1b[201~\x1b[200~second\x1b[201~K");
-    // A hang detector: the watchdog releases the owned socket should a paste
-    // ever fall back to a synchronous write. Not a latency benchmark.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();
     let drain = std::thread::spawn(move || {
         let returned_without_drain = ready_rx.recv_timeout(aterm_spec::wait::MUST_HAPPEN).is_ok();
@@ -355,9 +351,6 @@ fn stalled_sink_case(hidden: bool) {
     };
     let busy = rows(&app);
     assert_eq!(busy.len(), 1, "one row for the refusals");
-    // A paste whose len equals the paste cap still cannot fit an empty
-    // queue once its Job is charged: too large, not busy, and the one
-    // row's line follows the new cause.
     assert_eq!(
         submit(&mut app, paste("p".repeat(7 * 1024 * 1024))),
         InputOutcome::WriteFailed

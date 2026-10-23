@@ -4,28 +4,7 @@
 //! One ES module run in a headless Chromium over the DevTools protocol
 //! ([`super::cdp`]): the wasm lanes' drivers (`perf/wasm/*.mjs`, the toy's
 //! `drive.mjs`) and the glue tests' checks run in V8 inside the browser the
-//! site ships to, not in node (docs/DESIGN-init-system-2026-10-20.md, S10).
-//!
-//! A loopback server ([`super::serve`]) serves a directory the caller laid,
-//! into which [`Chrome::start`] writes one blank page, [`PAGE`]. Each run
-//! opens a fresh tab at that page, imports one module of the directory and
-//! awaits its exported `run(args)`. What the page printed to its console is
-//! the run's log, one line each; what `run` answered comes back as JSON. An
-//! exception the page throws outside that promise (a timer's, a finalizer's,
-//! a rejection nobody handles) fails the run, as it failed node's process.
-//!
-//! The browser is the caller's ([`crate::wasm_page::browser`]:
-//! `ATERM_BROWSER`, else the pinned chrome-headless-shell exactly as `verify
-//! provision` placed it). It runs on a private profile with WebGL2 on
-//! SwiftShader (nothing here presents, so no GPU is needed) and with
-//! `--expose-gc`, so a driver that waits on a finalizer can collect. Only
-//! [`Chrome::start`] answers [`Refused::Unavailable`]: once the browser has
-//! answered, a tab it cannot open or a pipe it closes is a finding.
-//!
-//! No budget bounds a run: the wait for its answer is a hang detector that
-//! starts again at each line the page prints. A driver that runs for minutes
-//! prints between its sections and yields there (a page's console lines are
-//! sent between its tasks), and one silent for a minute is hung.
+//! site ships to, not in node.
 
 use std::path::Path;
 use std::time::Instant;
@@ -120,7 +99,6 @@ impl Chrome {
             .and_then(Value::as_str)
             .unwrap_or("?")
             .to_string();
-        // Isolated: `performance.now()` at 5 µs, not 100 µs, for the bench.
         let server = serve::Server::start_isolated(root).map_err(unavailable)?;
         Ok(Self {
             cdp,
@@ -144,9 +122,7 @@ impl Chrome {
 
     /// Open a fresh tab at [`PAGE`], import the module at `module` (a path
     /// under the served directory) and await its `run(args)`: its answer and
-    /// the page's console, or why there is none. A browser that answered
-    /// [`Chrome::start`] and cannot open the tab now is a finding: it died or
-    /// hung under an earlier run.
+    /// the page's console, or why there is none.
     pub(crate) fn run(&mut self, module: &str, args: &Value) -> Result<Ran, Refused> {
         let target = self
             .cdp
@@ -274,8 +250,6 @@ impl Drop for Chrome {
         while waited.elapsed() < cdp::HANG_DETECTOR && self.running.ended().is_none() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // `running` kills and reaps a browser that did not close; `dir`
-        // goes after it.
     }
 }
 
@@ -369,9 +343,6 @@ mod tests {
             "export async function run() { console.log('before'); throw new Error('planted') }\n",
         )
         .unwrap();
-        // The timer that throws was set first, so it runs before the one run
-        // waits on; the rejection is reported as its event is dispatched,
-        // which run waits for.
         std::fs::write(
             dir.path().join("timer.mjs"),
             "export async function run() { setTimeout(() => { throw new Error('a timer threw') }, 0); \
@@ -425,8 +396,6 @@ mod tests {
             .run("ok.mjs", &json!({"a": 0, "who": "again"}))
             .unwrap();
         assert_eq!(again.console, ["from again"]);
-        // A browser that died after it answered: the next run is a finding,
-        // never the machine's answer (which a lane reads as COULD NOT RUN).
         chrome.running.0.kill().expect("the test's own browser");
         let _ = chrome.running.0.wait();
         let dead = chrome

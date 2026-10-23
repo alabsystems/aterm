@@ -12,8 +12,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE-CHROMIUM file.
 
-//! Walks over a node's children and siblings as a filter sees them: a node the filter excludes is
-//! looked through to its children, a subtree it excludes is skipped.
+//! Walks over a node's children and siblings as a filter sees them.
 
 use std::iter::FusedIterator;
 
@@ -100,7 +99,6 @@ fn previous_filtered_sibling<'a>(
     None
 }
 
-/// Whether a double-ended walk has met itself.
 fn met(front: Option<&Node>, back: Option<&Node>) -> bool {
     front
         .zip(back)

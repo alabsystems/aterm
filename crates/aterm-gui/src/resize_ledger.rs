@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Resize ledger: records every grid resize a session takes, who asked for it, the runs they form, and whether the application has drawn over content a resize displaced (`resizes`, `status render=`, `EVENT <local> resize`, `EVENT <local> render desync-risk|healed`).
+//! Resize ledger tracking session grid resizes, their caller sites, and desync-risk state.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -12,17 +12,13 @@ use aterm_core::terminal::{ResizeReport, Terminal};
 
 use crate::resize_epoch::{EpochBook, EpochVerdict};
 
-/// How many resize rows the ledger keeps (drop-oldest; a subscriber's gap is said as `dropped=<n>` on its next `EVENT <local> resize`).
+/// How many resize rows the ledger keeps.
 pub(crate) const LEDGER_ROWS_CAP: usize = 128;
 /// How many runs the ledger keeps (drop-oldest).
 pub(crate) const LEDGER_RUNS_CAP: usize = 64;
 /// The widest gap between two resizes of one run.
 pub(crate) const RUN_GAP_MS: u64 = 250;
 
-/// The run gap in force: [`RUN_GAP_MS`], or the development seam
-/// `ATERM_RESIZE_RUN_GAP_MS` (debug and dev-seams builds only), with which a
-/// live test joins a flap whose halves a stand-in's draw separates without
-/// racing the clock.
 fn run_gap_ms() -> u64 {
     static GAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| {
@@ -31,31 +27,28 @@ fn run_gap_ms() -> u64 {
             .unwrap_or(RUN_GAP_MS)
     })
 }
-/// How long after a run's last resize a draw is judged: time for a changed-size repaint that starts with a diff to finish (Claude Code's healthy repaint lands 5-30 ms after the flap).
+/// How long after a run's last resize a draw is judged.
 pub(crate) const RISK_AFTER_MS: u64 = 1_000;
-/// Geometries a run keeps for its `geom=` chain; past it the newest replaces
-/// the last and the chain says `...`.
 const GEOMS_KEPT: usize = 8;
 
-/// Which kind of entry point asked for a window pass (`site=`): the outermost one on the main thread's stack when the pass ran.
+/// Which kind of entry point asked for a window pass (`site=`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Cause {
-    /// The input dispatch (`App::input_to_session`): an `InputEvent::Resize`, which is how the control `resize` verb reaches a window.
+    /// The input dispatch (`App::input_to_session`): an `InputEvent::Resize`.
     Input,
     /// The OS window changed size (`App::on_resize`).
     Window,
-    /// The window's chrome rows changed — the tab strip or the message band appeared or folded: their every-window re-grid (`regrid_for_chrome_rows`).
+    /// The window's chrome rows changed — the tab strip or the message band appeared or folded.
     Chrome,
-    /// One window's sessions re-gridded directly (`App::apply_term_resize` under no other entry point).
+    /// One window's sessions re-gridded directly.
     Term,
-    /// A pane pass under no other entry point: a split, a zoom, a tab switch, a font or scale change, a drag's settle (`App::resize_panes`).
+    /// A pane pass under no other entry point.
     Pass,
     /// A tab a drag deferred, sized as it is drawn (`redraw_window`).
     Redraw,
 }
 
 impl Cause {
-    /// The wire word.
     const fn word(self) -> &'static str {
         match self {
             Self::Input => "input",
@@ -71,7 +64,7 @@ impl Cause {
 /// Who asked for a resize.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Site {
-    /// A window pass: its entry point's kind and the source line that called that entry point (`site=<cause> at=<file:line>`).
+    /// A window pass: its entry point's kind and the source line that called that entry point.
     Caller {
         cause: Cause,
         at: &'static Location<'static>,
@@ -90,7 +83,6 @@ impl Site {
 }
 
 thread_local! {
-    /// The resize entry point this thread is inside, outermost first.
     static SCOPE: Cell<Option<Site>> = const { Cell::new(None) };
 }
 
@@ -123,9 +115,6 @@ impl SiteScope {
 
 #[cfg(test)]
 thread_local! {
-    /// The site each every-window chrome re-grid ran under on this thread
-    /// (`App::regrid_for_chrome_rows`), for the tests: a headless window has
-    /// no OS size, so its `on_resize` — which books the row — never runs.
     static CHROME_REGRID_SITES: std::cell::RefCell<Vec<Option<Site>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -177,10 +166,10 @@ impl Attribution {
     };
 }
 
-/// The engine facts a verdict needs, read under a `term_lock` hold the caller already takes: a handful of integer loads.
+/// The engine facts a verdict needs, read under a `term_lock` hold the caller already takes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EngineProbe {
-    /// The engine's lifetime token (`Terminal::resize_lifetime`): ordinals and counters compare only within one.
+    /// The engine's lifetime token (`Terminal::resize_lifetime`).
     pub(crate) lifetime: u64,
     /// The engine's newest resize ordinal (`Terminal::resize_ordinal`).
     pub(crate) ordinal: u64,
@@ -190,7 +179,7 @@ pub(crate) struct EngineProbe {
     pub(crate) full_clears: u64,
     /// `Terminal::screen_replaced_count`.
     pub(crate) screen_replaced: u64,
-    /// `Terminal::render_debt`: what the alternate screen owes its program (rows moved, drawn columns cut).
+    /// `Terminal::render_debt`: what the alternate screen owes its program.
     pub(crate) debt: aterm_core::terminal::RenderDebt,
     /// The grid's `(rows, cols)` now.
     pub(crate) geom: (u16, u16),
@@ -211,7 +200,7 @@ impl EngineProbe {
     }
 }
 
-/// The engine's journal as a resize path copied it, inside the same `term_lock` hold as the resize: at most `RESIZE_JOURNAL_CAP` reports and the probe taken with them.
+/// The engine's journal as a resize path copied it, inside the same `term_lock` hold as the resize.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct JournalCopy {
     reports: Vec<ResizeReport>,
@@ -242,7 +231,7 @@ pub(crate) enum Verdict {
     DesyncRisk,
     /// A full clear or screen switch repainted the displaced screen.
     Healed,
-    /// A run whose geometry stayed changed, drawn over since with no heal: the app's changed-size repaint or a diff on moved rows, which no counter here tells apart (`cast drift` does).
+    /// A run whose geometry stayed changed, drawn over since with no heal.
     Unverified,
 }
 
@@ -259,18 +248,14 @@ impl Verdict {
         }
     }
 
-    /// Still waiting on the app: a heal or a draw moves it.
     const fn open(self) -> bool {
         matches!(self, Self::Silent | Self::DesyncRisk)
     }
 
-    /// Still owed a verdict the engine can give: an open run, or an
-    /// unverified one a later heal (a full clear, a screen switch) settles.
     const fn watched(self) -> bool {
         matches!(self, Self::Silent | Self::DesyncRisk | Self::Unverified)
     }
 
-    /// A run with this verdict may still take resizes.
     const fn joinable(self) -> bool {
         matches!(self, Self::None | Self::Reflow | Self::Silent)
     }
@@ -286,9 +271,9 @@ pub(crate) enum Render {
     Displaced,
     /// The app drew over displaced content without clearing it.
     DesyncRisk,
-    /// The app drew over content a net-changed run displaced, and nothing cleared it: repainted or not, no counter here can say (`cast drift`).
+    /// The app drew over content a net-changed run displaced, and nothing cleared it.
     Unverified,
-    /// The engine owes rows, the geometry is back and the risk wait is over, but the program has not shown it clears its screen when resized, so aterm cannot tell a miss from a repaint that does not clear ([`crate::resize_epoch`]).
+    /// The engine owes rows, the geometry is back and the risk wait is over, but the program has not shown it clears its screen when resized.
     Unjudged,
 }
 
@@ -375,9 +360,6 @@ pub(crate) struct Run {
 }
 
 impl Run {
-    /// A run of one resize. `credited` is `(top, bottom)`: the rows `report`
-    /// handed back to OTHER runs ([`ResizeLedger::credit`]), which are theirs,
-    /// not this run's shift.
     fn start(id: u64, report: &ResizeReport, now_ms: u64, credited: (u32, u32)) -> Self {
         let mut run = Self {
             id,
@@ -411,7 +393,6 @@ impl Run {
         run
     }
 
-    /// Fold one more adjoining resize in (`credited` as for [`Run::start`]).
     fn extend(&mut self, report: &ResizeReport, now_ms: u64, credited: (u32, u32)) {
         self.n = self.n.saturating_add(1);
         self.t_end_ms = now_ms;
@@ -440,8 +421,6 @@ impl Run {
         self.classify();
     }
 
-    /// The verdict before any read: only a run that is still taking resizes
-    /// is re-classified (an outcome, once read, stands).
     fn classify(&mut self) {
         if !self.verdict.joinable() {
             return;
@@ -455,8 +434,6 @@ impl Run {
         };
     }
 
-    /// Alternate screen, no rewrap, and content moved (either direction) or
-    /// pushed off the bottom.
     const fn judged(&self) -> bool {
         self.alt && !self.reflowed && (self.displaced != 0 || self.pushed > 0)
     }
@@ -465,18 +442,14 @@ impl Run {
         self.start == self.end
     }
 
-    /// A judged run that can turn `desync-risk`: its geometry ended where it
-    /// began, so the app's handler read no change whenever it ran.
     fn eligible(&self) -> bool {
         self.judged() && self.net_zero()
     }
 
-    /// A geometry change and back, in one run.
     fn is_flap(&self) -> bool {
         self.n >= 2 && self.changed && self.net_zero()
     }
 
-    /// Either heal counter advanced past the run's.
     const fn healed_by(&self, full_clears: u64, screen_replaced: u64) -> bool {
         full_clears > self.full_clears || screen_replaced > self.screen_replaced
     }
@@ -485,7 +458,6 @@ impl Run {
         if self.net_zero() { "zero" } else { "changed" }
     }
 
-    /// `geom=<CxR>><CxR>>...`, `...` standing for the elided middle.
     fn geom_chain(&self) -> String {
         let mut out = String::new();
         let last = self.geoms.len().saturating_sub(1);
@@ -516,10 +488,10 @@ struct Reading {
     screen_replaced: u64,
 }
 
-/// A verdict transition the timeline records as `kind=render` (and the `events` digest pushes as `EVENT <local> render …`).
+/// A verdict transition the timeline records as `kind=render`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Transition {
-    /// `desync-risk run=<r> displaced=<+-k> net=<zero|changed> at=<ms>` (`at=` is the run's first resize, the `t=` its `resizes` row carries; only a net-zero run is judged, so `net=zero` today).
+    /// `desync-risk run=<r> displaced=<+-k> net=<zero|changed> at=<ms>`.
     Risk {
         run: u64,
         displaced: i32,
@@ -528,7 +500,7 @@ pub(crate) enum Transition {
     },
     /// `healed run=<r> after_ms=<ms>` (after the run's last resize).
     Healed { run: u64, after_ms: u64 },
-    /// `desync-risk epoch=<e> displaced=<+-k> pushed=<k> cut=<k> drew=<0|1> class=<c> at=<ms>`: the engine's debt says rows or drawn columns are owed with the geometry back, for a program the ledger judges (see [`crate::resize_epoch`]).
+    /// `desync-risk epoch=<e> displaced=<+-k> pushed=<k> cut=<k> drew=<0|1> class=<c> at=<ms>`.
     EpochRisk {
         epoch: u64,
         shift: i32,
@@ -547,7 +519,7 @@ pub(crate) enum Transition {
 }
 
 impl Transition {
-    /// The verdict it moved to, as the session log's `render state=` word (phase 3B): `desync-risk` or `healed`.
+    /// The verdict it moved to, as the session log's `render state=` word (phase 3B).
     pub(crate) const fn state_word(&self) -> &'static str {
         match self {
             Self::Risk { .. } | Self::EpochRisk { .. } => "desync-risk",
@@ -659,10 +631,6 @@ impl ResizeLedger {
         out
     }
 
-    /// Follow `probe`'s engine. The same lifetime changes nothing; another one
-    /// (a restored engine: ordinals, content and counters restart) rebases the
-    /// open runs onto its readings, so the displacement a checkpoint carried
-    /// over is still judged, against counters it can be compared with.
     fn enter_lifetime(&mut self, probe: &EngineProbe) {
         if self.lifetime == Some(probe.lifetime) {
             return;
@@ -685,7 +653,6 @@ impl ResizeLedger {
         self.last_ordinal = 0;
     }
 
-    /// Give a backfilled row the attribution its own path brought late.
     fn attribute(&mut self, ordinal: u64, attribution: Attribution) {
         if let Some(row) = self
             .rows
@@ -813,10 +780,6 @@ impl ResizeLedger {
         credited
     }
 
-    /// Settle the watched runs against one reading of the engine: a heal
-    /// first (the screen was repainted from scratch), then a draw, then — once
-    /// [`RISK_AFTER_MS`] passed — the risk (a net-zero run) or `unverified` (a
-    /// run whose geometry stayed changed; only a later heal moves it).
     fn observe(&mut self, reading: Reading, now_ms: u64, out: &mut Vec<Transition>) {
         let mut risks = 0u64;
         for run in self.runs.iter_mut().filter(|run| run.verdict.watched()) {
@@ -919,7 +882,7 @@ impl ResizeLedger {
         out
     }
 
-    /// The presence classifier's reading of this session's program: whether it is Claude Code, the class the epoch judge accuses.
+    /// The presence classifier's reading of this session's program.
     pub(crate) fn set_agent(&mut self, agent: bool) {
         self.epochs.set_agent(agent);
     }
@@ -934,7 +897,7 @@ impl ResizeLedger {
         self.epochs.still_at_risk(id)
     }
 
-    /// The open epoch when the repaint nudge may act on it (`desync-risk`, the agent class, untried).
+    /// The open epoch when the repaint nudge may act on it.
     pub(crate) fn nudge_view(&self) -> Option<crate::resize_epoch::NudgeView> {
         self.epochs.nudge_view()
     }
@@ -985,7 +948,7 @@ impl ResizeLedger {
         &self.epochs
     }
 
-    /// The run judge's word alone, as of now: the model's `verdict`, which the epoch judge's `unjudged` and its own `desync-risk` are kept apart from.
+    /// The run judge's word alone, as of now: the model's `verdict`.
     #[cfg(test)]
     pub(crate) fn run_render(&self) -> Render {
         let any = |verdict: Verdict| self.runs.iter().any(|r| r.verdict == verdict);
@@ -1016,7 +979,7 @@ impl ResizeLedger {
         self.rows.front().map(|row| row.id)
     }
 
-    /// The engine `probe` read has a resize this ledger has not booked (or is another engine): a reader that can take the terminal lock should copy the journal and backfill.
+    /// The engine `probe` read has a resize this ledger has not booked (or is another engine).
     pub(crate) fn behind(&self, probe: &EngineProbe) -> bool {
         self.lifetime
             .is_some_and(|lifetime| lifetime != probe.lifetime)
@@ -1029,7 +992,7 @@ impl ResizeLedger {
         self.rows.range(start..)
     }
 
-    /// `render=<ok|displaced|desync-risk|unverified|unjudged|-> resizes=<n> flaps=<n>`, the `status` fields; `probe` is `None` when the terminal lock was contended, and the render then reads `-`.
+    /// `render=<ok|displaced|desync-risk|unverified|unjudged|-> resizes=<n> flaps=<n>`, the `status` fields.
     pub(crate) fn status_fields(
         &mut self,
         probe: Option<EngineProbe>,
@@ -1051,7 +1014,7 @@ impl ResizeLedger {
         )
     }
 
-    /// The `resizes` reply: the header, then the selected `resize` rows oldest first, then the `run` rows they belong to — and every retained run still `silent`, `desync-risk` or `unverified`, whatever the selection, so a narrow read never hides the run behind `render=` — oldest first.
+    /// The `resizes` reply: the header, then the selected `resize` rows oldest first, then the `run` rows they belong to — and every retained run still `silent`, `desync-risk` or `unverified`, whatever the selection.
     pub(crate) fn reply(&self, n: usize, since: Option<u64>) -> String {
         let rows: Vec<&LedgerRow> = self.rows_since(since.unwrap_or(0)).collect();
         let skip = if n == 0 {
@@ -1123,24 +1086,18 @@ fn joins_run(prev: &LedgerRow, report: &ResizeReport, now_ms: u64, run: &Run) ->
     (in_gap && (adjoins || takes_back)) || (silent && !run.drew && adjoins)
 }
 
-/// `report`'s row shift less the top rows it handed back to other runs
-/// (`credited.0`), which move THEIR content back, not this run's.
 fn own_shift(report: &ResizeReport, credited: (u32, u32)) -> i32 {
     report
         .shift()
         .saturating_sub(i32::try_from(credited.0).unwrap_or(i32::MAX))
 }
 
-/// `report`'s net push less the bottom rows it put back for other runs
-/// (`credited.1`): those were pushed off by another run's shrink.
 fn own_pushed(report: &ResizeReport, credited: (u32, u32)) -> i32 {
     report
         .net_pushed()
         .saturating_add(i32::try_from(credited.1).unwrap_or(i32::MAX))
 }
 
-/// `(top, bottom)`: the demoted and pushed rows `report` left in the engine's
-/// resize undo (all of them or none: `ResizeReport::stashed`).
 fn stash_of(report: &ResizeReport) -> (u32, u32) {
     if report.stashed == 0 {
         (0, 0)
@@ -1149,12 +1106,10 @@ fn stash_of(report: &ResizeReport) -> (u32, u32) {
     }
 }
 
-/// `(rows, cols)` as the cast's `<cols>x<rows>`.
 fn cxr((rows, cols): (u16, u16)) -> String {
     format!("{cols}x{rows}")
 }
 
-/// `site=<word> at=<pct file:line|->`.
 fn wire_site(site: Site) -> String {
     match site {
         Site::Caller { cause, at } => format!(
@@ -1167,9 +1122,6 @@ fn wire_site(site: Site) -> String {
     }
 }
 
-/// `resize <id> t=<ms> run=<r> ord=<n> from=<CxR> to=<CxR> alt=<0|1>
-/// sync=<0|1> trimmed= demoted= pushed= revealed= appended= restored= shift=<+-k>
-/// cut=<k> site=<word> at=<file:line|-> win= chrome=`
 fn wire_row(out: &mut String, row: &LedgerRow) {
     let r = &row.report;
     let win = row
@@ -1205,8 +1157,6 @@ fn wire_row(out: &mut String, row: &LedgerRow) {
     );
 }
 
-/// `run <r> t=<ms> n=<k> alt=<0|1> geom=<chain> net=<zero|changed>
-/// displaced=<+-k> verdict=<v> first_out_ms=<ms|-> healed_ms=<ms|->`
 fn wire_run(out: &mut String, run: &Run) {
     let opt = |v: Option<u64>| v.map_or_else(|| "-".to_string(), |v| v.to_string());
     let _ = writeln!(
@@ -1262,10 +1212,8 @@ mod tests {
 
     use super::*;
 
-    /// The engine lifetime the pure tests book from.
     const LIFE: u64 = 7;
 
-    /// A report as the engine writes one, for the pure ledger tests.
     fn report(ordinal: u64, from: u16, to: u16, alt: bool, seq: (u64, u64)) -> ResizeReport {
         ResizeReport {
             ordinal,
@@ -1294,8 +1242,6 @@ mod tests {
         }
     }
 
-    /// The incident's flap on the alternate screen: a demote then a grow, the
-    /// second adjoining the first.
     fn alt_flap(first_ordinal: u64, seq: u64) -> [ResizeReport; 2] {
         let mut shrink = report(first_ordinal, 24, 23, true, (seq, seq + 1));
         shrink.demoted = 1;
@@ -1468,9 +1414,6 @@ mod tests {
         assert_eq!((quiet.high_run, quiet.flaps), (1, 1));
     }
 
-    /// Rows restored from the engine's resize undo are credited LIFO to the run
-    /// whose shrink stashed them, both when the grow joins that run and when it
-    /// credits an earlier closed run without joining it.
     #[test]
     fn a_grow_hands_rows_back_to_the_run_that_stashed_them() {
         let shrink = |ordinal, from, to, seq: u64| {
@@ -1555,9 +1498,6 @@ mod tests {
         );
     }
 
-    /// When a journal overrun (`lost=`) drops a shrink report, [`Run::held`] is
-    /// cleared on existing runs so a subsequent undo restore cannot credit an
-    /// older run whose own stashed row was already dropped.
     #[test]
     fn a_lost_report_credits_no_older_run() {
         let mut ledger = ResizeLedger::default();
@@ -1727,9 +1667,6 @@ mod tests {
         assert_eq!(run_verdict(&ledger, 1), Verdict::Silent);
     }
 
-    /// Forty booked resizes, then the interleaving two threads produce: one
-    /// copies the journal at ordinal 40, another resizes, copies at 41 and
-    /// books first, then the first books its OLDER copy.
     #[test]
     fn a_late_stale_copy_books_nothing_and_keeps_the_counts() {
         let mut ledger = ResizeLedger::default();
@@ -1774,9 +1711,6 @@ mod tests {
         assert_eq!(ledger.rows.back().expect("row").attribution, site);
     }
 
-    /// A probe sampled BEFORE a run was booked (another thread's read, settled
-    /// after the resize) says nothing about that run: its older content
-    /// sequence is not a draw, and its lower counters are not a heal.
     #[test]
     fn a_stale_probe_neither_draws_nor_heals() {
         let mut ledger = ResizeLedger::default();
@@ -1815,10 +1749,6 @@ mod tests {
         assert_eq!(run_verdict(&ledger, 1), Verdict::Healed);
     }
 
-    /// A restored engine (another lifetime token, ordinals from 0) rebases the
-    /// ledger: its first resizes are booked, the old engine's open run is
-    /// judged against the new engine's counters, and a probe of the OLD engine
-    /// settles nothing.
     #[test]
     fn a_restored_engine_rebases_the_open_runs() {
         let mut ledger = ResizeLedger::default();
@@ -1979,8 +1909,6 @@ mod tests {
         );
     }
 
-    /// The OUTERMOST entry point names a pass, from the line that called it;
-    /// leaving the scope — a panic's unwind included — clears it.
     #[test]
     fn the_outermost_entry_point_names_the_site() {
         assert_eq!(SiteScope::current(), None);
@@ -2005,9 +1933,6 @@ mod tests {
         assert_eq!(SiteScope::current(), None, "an unwind leaves the scope");
     }
 
-    /// Every-window chrome re-grids (`App::regrid_for_chrome_rows`) enter their
-    /// own [`Cause::Chrome`] scope, attributed to the caller's line, rather than
-    /// booking under the inner `on_resize`'s `site=window`.
     #[test]
     fn the_bands_and_the_strips_regrid_is_booked_as_chrome_from_the_line_that_asked() {
         let mut app = crate::App::headless_for_test();
@@ -2098,10 +2023,6 @@ mod tests {
         assert!(cmd_resizes(ctx, term, "since=2").starts_with("OK 0 "));
     }
 
-    /// The window pass books each resize it makes, with its entry point and
-    /// the line that called it (`site=term at=<this file>:<line>`), the
-    /// window's grid and its chrome rows; a pass that changes nothing books
-    /// nothing.
     #[test]
     fn the_window_pass_books_its_caller_the_grid_and_the_chrome() {
         let mut app = crate::App::headless_for_test();
@@ -2143,10 +2064,6 @@ mod tests {
         );
     }
 
-    /// A chrome-driven re-grid is booked `site=chrome`, not as the OS window:
-    /// `regrid_for_chrome_rows` (the message band, the tab strip) enters the
-    /// scope, and the scope keeps the OUTERMOST entry point, so the
-    /// `on_resize` it runs books under it.
     #[test]
     fn the_band_regrid_books_site_chrome() {
         let sites = |app: &crate::App| -> Vec<String> {
@@ -2183,9 +2100,6 @@ mod tests {
         );
     }
 
-    /// The reviewer's false alarm, on the real engine: a real 8 -> 6 shrink
-    /// (the geometry stays changed), after which the app repaints every row
-    /// with CUP + text + EL and no ED 2.
     #[test]
     fn a_changed_size_repaint_without_a_clear_is_unverified_not_a_risk() {
         let mut term = claude_shaped_alt(8);
@@ -2211,15 +2125,10 @@ mod tests {
         assert_eq!(ledger.render(), Render::Unverified);
     }
 
-    /// The Claude-shaped frame's full height; one row fewer is `geom = 1`.
     const ROWS: u16 = 8;
     const COLS: u16 = 20;
-    /// The model's displacement box.
     const CAP: i64 = 2;
 
-    /// `L<r>` on each row but the last, `F<tick>` (the footer) on the last,
-    /// with absolute cursor moves only, and the cursor parked on the composer
-    /// three rows from the bottom, as Claude Code parks it.
     fn frame(rows: u16, tick: u32) -> Vec<String> {
         (0..rows)
             .map(|r| {
@@ -2244,8 +2153,6 @@ mod tests {
         t
     }
 
-    /// The application stand-in: the rows it laid its frame out for and what
-    /// it believes each row shows.
     struct App {
         rows: u16,
         believed: Vec<String>,
@@ -2253,8 +2160,6 @@ mod tests {
     }
 
     impl App {
-        /// A full repaint at `rows` (its SIGWINCH handler read a changed size):
-        /// ED 2, then every row.
         fn repaint(&mut self, t: &mut Terminal, rows: u16) {
             self.rows = rows;
             self.believed = frame(rows, self.tick);
@@ -2266,8 +2171,6 @@ mod tests {
             t.process(bytes.as_bytes());
         }
 
-        /// A diff frame: the footer's spinner advances, drawn at the row the
-        /// app believes is its last, with absolute moves and EL, no clear.
         fn diff(&mut self, t: &mut Terminal) {
             self.tick += 1;
             let last = usize::from(self.rows) - 1;
@@ -2284,10 +2187,6 @@ mod tests {
         }
     }
 
-    /// The real terminal, the stand-in, the real ledger and what the model
-    /// cannot read off them: whether the app drew onto displaced content
-    /// (ground truth, from the screen at the moment it drew) and the last
-    /// verdict.
     struct Rig {
         term: Terminal,
         app: App,
@@ -2350,8 +2249,6 @@ mod tests {
             }
         }
 
-        /// How many rows up the screen's content sits from where the app
-        /// painted it: the witness is row 0, which no diff frame touches.
         fn displacement(&self) -> i64 {
             let top = self.term.row_text(0).unwrap_or_default();
             let top = top.trim_end();
@@ -2365,13 +2262,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("row 0 {top:?} is no shift of {:?}", self.app.believed))
         }
 
-        /// The ledger's OPEN run: the newest one, when the next resize would
-        /// join it (`push`'s own test, [`joins_run`], read off the engine as
-        /// it stands: the same run, still joinable, no heal since its last
-        /// resize — `push`'s settling of it first — and within the gap with
-        /// nothing drawn since or the run `silent` — the next resize here, with
-        /// two geometries, always takes the last one back — or `silent`,
-        /// undrawn and nothing drawn since).
         fn open_run(&self, probe: &EngineProbe) -> Option<&Run> {
             let (prev, run) = (self.ledger.rows.back()?, self.ledger.runs.back()?);
             let unhealed = probe.full_clears == prev.report.full_clears
@@ -2386,12 +2276,6 @@ mod tests {
                 .then_some(run)
         }
 
-        /// The projection onto `ResizeRender`'s variables: the screen, the
-        /// engine's resize undo (`st`), the stand-in and the ledger's runs
-        /// (`ro`/`rs`/`rd`/`rw` the open one; `led` and `lr` the closed,
-        /// unhealed, judged net-zero ones; `lb` and `br` the closed, unhealed,
-        /// judged net-changed ones that displaced rows, and whether the app drew
-        /// on one; `blind` is ground truth).
         fn project(&self) -> BTreeMap<&'static str, i64> {
             let probe = EngineProbe::sample(&self.term);
             let open = self.open_run(&probe);
@@ -2482,8 +2366,6 @@ mod tests {
             ])
         }
 
-        /// Resize the real engine to `rows` and ingest its journal the way the
-        /// window pass does (copied under the resize's hold, booked after).
         fn resize(&mut self, rows: u16) -> ResizeReport {
             if self.open_run(&EngineProbe::sample(&self.term)).is_none() {
                 self.d0 = self.displacement();
@@ -2497,8 +2379,6 @@ mod tests {
             *copy.reports.last().expect("the resize was journalled")
         }
 
-        /// A diff frame; ground truth marks it drawn onto displaced content
-        /// when the screen, at that moment, is displaced.
         fn diff(&mut self) {
             if self.displacement() >= 1 {
                 self.drew = true;
@@ -2511,8 +2391,6 @@ mod tests {
             self.now_ms += 1;
         }
 
-        /// Drive one step and name the model action it is. A shrink is a
-        /// `Demote` or a `Trim` by what the engine journalled it did.
         fn drive(&mut self, step: Step) -> &'static str {
             self.evaluated = false;
             match step {
@@ -2629,9 +2507,6 @@ mod tests {
         Step::Evaluate,
     ];
 
-    /// Replay `schedule` on a fresh rig, checking every real transition
-    /// against the model: the action is enabled in the projected state, the
-    /// projected successor is the model's, and every invariant holds.
     fn conform(
         model: &aterm_spec::derive::Model,
         schedule: &[Step],
@@ -2640,15 +2515,12 @@ mod tests {
         conform_answered(&mut Answers::new(model), schedule, seen)
     }
 
-    /// Caches pure model transition and invariant answers across prefix-sharing
-    /// schedules in [`resize_render_conformance`].
     struct Answers<'m> {
         model: &'m aterm_spec::derive::Model,
         fired: BTreeMap<Projected, BTreeMap<&'static str, Projected>>,
         holds: std::collections::BTreeSet<Projected>,
     }
 
-    /// A rig state projected onto the model's variables.
     type Projected = BTreeMap<&'static str, i64>;
 
     impl<'m> Answers<'m> {
@@ -2661,7 +2533,6 @@ mod tests {
         }
     }
 
-    /// [`conform`], asking `answers` before its model.
     fn conform_answered(
         answers: &mut Answers<'_>,
         schedule: &[Step],
@@ -2773,9 +2644,6 @@ mod tests {
         }
     }
 
-    /// Replay every schedule one step longer than `prefix` (a step never
-    /// repeated back to back), tally each, and return the ones that stayed
-    /// inside the box, to be extended in turn.
     fn extend(answers: &mut Answers<'_>, prefix: &[Step], t: &mut Tally) -> Vec<Vec<Step>> {
         let mut inside = Vec::new();
         for step in STEPS {
@@ -2804,9 +2672,6 @@ mod tests {
         inside
     }
 
-    /// Replays every schedule of rig steps up to depth 6 (without back-to-back
-    /// duplicate steps) on a real alternate-screen `Terminal` and `ResizeLedger`,
-    /// walking independent length-2 subtrees in parallel.
     #[test]
     fn resize_render_conformance() {
         let model = resize_render_model();
@@ -2891,9 +2756,6 @@ mod tests {
         assert!(schedules > 1_000, "{schedules} schedules");
     }
 
-    /// When a run's net displacement returns to zero (`rd == 0`, `Verdict::None`)
-    /// after a draw inside the run gap, `rw` retains the draw (`rw == 1`) to match
-    /// the model.
     #[test]
     fn a_run_brought_back_to_zero_keeps_the_draw_it_saw() {
         let model = resize_render_model();
@@ -2913,7 +2775,6 @@ mod tests {
         assert_eq!((end["ro"], end["rd"], end["rw"]), (1, 0, 1), "{end:?}");
     }
 
-    /// Shrinks and grows alternate from the full height.
     fn valid_geometry(schedule: &[Step]) -> bool {
         let mut shrunk = false;
         for step in schedule {
@@ -2927,12 +2788,6 @@ mod tests {
         true
     }
 
-    /// A flap split by a diff frame within [`RUN_GAP_MS`] stays one net-zero run
-    /// and is flagged as `desync-risk` (negative control: `Buggy = 5` splits on
-    /// any draw and breaks `RiskIsFlagged`); a quiet flap restored by the resize
-    /// undo after [`RUN_GAP_MS`] joins as one net-zero run with `render=ok`
-    /// (negative control: `Buggy = 3` closes on time alone and breaks
-    /// `NoFalseDisplaced`).
     #[test]
     fn a_flap_split_by_a_frame_or_by_time_is_judged_on_the_real_engine() {
         let model = resize_render_model();
@@ -3035,10 +2890,6 @@ mod tests {
         assert!(!old.check_invariant("RiskIsFlagged", &missed), "{missed:?}");
     }
 
-    /// Quiet net-zero flap on the current engine (restored by the resize undo,
-    /// `verdict=none`) versus the negative control without resize undo
-    /// (`historical = true` / `Buggy = 1`, breaking `QuietFlapIsIdentity` and
-    /// `RiskIsFlagged`).
     #[test]
     fn the_t2649_flap_is_undone_and_the_historical_engine_is_caught() {
         let model = resize_render_model();
@@ -3109,9 +2960,6 @@ mod tests {
         );
     }
 
-    /// Negative control for `Buggy = 2`: a diff tick on moved rows after a
-    /// net-changed shrink reads `unverified` on the real ledger, whereas an
-    /// assumed-repaint judge answers `ok` and breaks `NoSilentPass`.
     #[test]
     fn the_assumed_repaint_answers_ok_on_a_tick_at_a_changed_size() {
         let model = resize_render_model();
@@ -3146,9 +2994,6 @@ mod tests {
         );
     }
 
-    /// A quiet flap separated only by time (`> RUN_GAP_MS`) joins into one run
-    /// credited back by the resize undo (`render=ok`), whereas `Buggy = 3` closes
-    /// on time alone and breaks `NoFalseVerdict`.
     #[test]
     fn a_quiet_flap_only_time_split_is_one_run_credited_back() {
         let model = resize_render_model();
@@ -3220,7 +3065,6 @@ mod tests {
         );
     }
 
-    /// A probe with the engine owing `shift` rows, the grid at `geom`.
     fn owing(ordinal: u64, content_seq: u64, shift: i32, geom: (u16, u16)) -> EngineProbe {
         EngineProbe {
             debt: aterm_core::terminal::RenderDebt::of_rows(shift, 0),
@@ -3229,13 +3073,8 @@ mod tests {
         }
     }
 
-    /// How long after the shrink the grow of [`split_flap`] lands: past the run
-    /// gap, so the run judge's grouping cannot join the halves (an app frame drew
-    /// on the moved rows between them) and only the engine's debt sees the flap.
     const LATE_GROW: u64 = RUN_GAP_MS + 50;
 
-    /// Flap with an app frame between its halves and separated by more than
-    /// [`RUN_GAP_MS`]: forms two net-changed runs while the engine owes one row.
     fn split_flap(ledger: &mut ResizeLedger, at: u64) {
         let mut shrink = report(1, 24, 23, true, (10, 11));
         (shrink.demoted, shrink.stashed) = (1, 1);
@@ -3262,9 +3101,6 @@ mod tests {
             .collect()
     }
 
-    /// THE BLIND SPOT, CLOSED: a flap an app frame splits was two net-changed
-    /// runs and neither was judged (`render=` read `unverified` at best, `ok` on
-    /// the first landing of the ledger).
     #[test]
     fn a_flap_an_app_frame_splits_is_judged_as_one_epoch() {
         let mut ledger = ResizeLedger::default();
@@ -3322,8 +3158,6 @@ mod tests {
         assert!(ledger.take_logs().is_empty());
     }
 
-    /// An UNDRAWN residual (a mode set between the halves, then silence) is as
-    /// displaced as a drawn one: judged at the risk wait with no further output.
     #[test]
     fn an_undrawn_residual_is_judged_after_the_risk_wait() {
         let mut ledger = ResizeLedger::default();
@@ -3345,8 +3179,6 @@ mod tests {
         assert_eq!(ledger.look_at_ms(), None, "judged: nothing more is owed");
     }
 
-    /// The geometry not being back keeps the epoch open: the program's handler is
-    /// still to read a CHANGE and repaints.
     #[test]
     fn an_epoch_whose_geometry_is_not_back_is_only_displaced() {
         let mut ledger = ResizeLedger::default();
@@ -3363,8 +3195,6 @@ mod tests {
         assert_eq!(ledger.look_at_ms(), None, "the next resize re-registers it");
     }
 
-    /// The debt returning to zero with no heal (an undo) closes the epoch as
-    /// `restored, by=undo`; a quiet flap owes nothing and leaves no line.
     #[test]
     fn an_epoch_closes_when_the_engine_debt_returns_to_zero() {
         let mut ledger = ResizeLedger::default();
@@ -3396,9 +3226,6 @@ mod tests {
         assert_eq!(quiet.look_at_ms(), None, "an idle machine arms no deadline");
     }
 
-    /// The engine's counter is exact however far the journal was overrun: the
-    /// ledger, which saw only the tail of the journal (`lost=`), still judges the
-    /// displacement the counter reports.
     #[test]
     fn a_journal_overrun_cannot_hide_a_displacement() {
         let mut ledger = ResizeLedger::default();
@@ -3418,9 +3245,6 @@ mod tests {
         assert!(epoch_lines(&ledger)[0].contains("shift=-20"));
     }
 
-    /// Who healed it: a full clear that repaints the screen ends an at-risk epoch
-    /// as `healed by=app` and pushes the matching event; the engine had already
-    /// reset the debt.
     #[test]
     fn the_transition_names_who_healed_it() {
         let mut ledger = ResizeLedger::default();
@@ -3449,9 +3273,6 @@ mod tests {
         assert!(epoch_lines(&ledger)[0].contains("verdict=healed by=app"));
     }
 
-    /// What the repaint nudge may act on: an UNTRIED epoch at `desync-risk` of the
-    /// AGENT class, and nothing else (`unjudged`, a learned program, an epoch
-    /// still inside its risk wait, or one a repair was already tried for).
     #[test]
     fn the_nudge_acts_only_on_an_untried_agent_epoch_at_desync_risk() {
         let mut ledger = ResizeLedger::default();
@@ -3490,8 +3311,6 @@ mod tests {
         assert!(!other.agent_class());
     }
 
-    /// A screen the nudge repainted closes the epoch `by=nudge`, and the matching
-    /// event says so; a heal the program made on its own stays `by=app`.
     #[test]
     fn an_epoch_the_nudge_repainted_closes_by_nudge() {
         let mut ledger = ResizeLedger::default();
@@ -3519,9 +3338,6 @@ mod tests {
         assert_eq!(ledger.render(), Render::Ok);
     }
 
-    /// A program the ledger has not learned is never accused: `unjudged` on
-    /// `status` and `resizes`, no event, and one `aterm.log` line for the field
-    /// rate.
     #[test]
     fn an_unknown_program_reads_unjudged_and_pushes_no_event() {
         let mut ledger = ResizeLedger::default();
@@ -3544,8 +3360,6 @@ mod tests {
         assert!(logs[0].contains("unjudged"), "{logs:?}");
     }
 
-    /// A session whose run was healed by a full clear inside the risk window has
-    /// shown it repaints when resized: its next at-risk epoch is judged.
     #[test]
     fn a_program_that_cleared_on_resize_is_learned() {
         let mut ledger = ResizeLedger::default();
@@ -3587,8 +3401,6 @@ mod tests {
         );
     }
 
-    /// The look an owed epoch registers is its risk wait; a terminal the reader
-    /// held is asked again after 100 ms, 20 times, then at the next risk wait.
     #[test]
     fn a_contended_terminal_is_asked_again_after_100ms() {
         let mut ledger = ResizeLedger::default();
@@ -3619,8 +3431,6 @@ mod tests {
         );
     }
 
-    /// A restored engine seeded with its predecessor's debt (the handoff) opens
-    /// the epoch that debt owes, with the geometry it finds as its start.
     #[test]
     fn a_restored_engine_seeded_with_debt_owes_an_epoch() {
         let mut ledger = ResizeLedger::default();
@@ -3631,9 +3441,6 @@ mod tests {
         assert_eq!(ledger.render(), Render::DesyncRisk);
     }
 
-    /// A net-zero column flap on the alternate screen that cuts drawn cells and
-    /// draws before growing back accrues column debt (`cut=1`) and is judged as
-    /// `desync-risk` until repainted.
     #[test]
     fn a_column_flap_that_cut_cells_is_judged_until_a_repaint() {
         let mut term = Terminal::new(ROWS, COLS);
@@ -3682,8 +3489,6 @@ mod tests {
         assert!(ledger.nudge_view().is_none());
     }
 
-    /// A ConPTY session never accrues engine debt, so its epoch never opens a
-    /// line and `render=` stays per run as before.
     #[test]
     fn a_session_that_owes_nothing_has_no_epoch() {
         let mut ledger = ResizeLedger::default();

@@ -3,38 +3,6 @@
 // Author: Andrew Yates
 
 //! The shared verification helpers for aterm's derived models and their conformance tests, in two tiers with one switch between them.
-//!
-//! ## Caller idioms
-//!
-//! ```no_run
-//! use std::collections::BTreeMap;
-//! use aterm_spec::{derive::Model, verify::{self, Covered, NotRun}};
-//!
-//! // SCALAR derived model — the common case. The interpreter always runs, so
-//! // coverage is unconditional and the returned Covered is a log line.
-//! fn check_scalar(m: &Model) -> Covered {
-//!     verify::prove_and_catch_scalar(m, "Thing non-vacuity")
-//! }
-//!
-//! // FUNCTION-VALUED derived model — only `ty` can walk it, so outside a
-//! // checker run the obligation does NOT run, and the `_tiered` forms return
-//! // `Result<Covered, NotRun>` so the caller must state a policy (a registered
-//! // one is `spec-check models`'s). Propagate NotRun; it is not coverage.
-//! fn check_function_valued(m: &Model) -> Result<Covered, NotRun> {
-//!     verify::prove_and_catch_tiered(m, "Thing Tier-0")
-//! }
-//!
-//! fn check_transition(
-//!     m: &Model,
-//!     overrides: &[(&'static str, i64)],
-//!     prev: &BTreeMap<&'static str, i64>,
-//!     next: &BTreeMap<&'static str, i64>,
-//! ) -> (bool, String) {
-//!     verify::validate_transition_tiered(
-//!         m, overrides, prev, next, Some("Push"), "Thing conformance",
-//!     )
-//! }
-//! ```
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -45,13 +13,13 @@ use std::sync::Mutex;
 use crate::derive::{Liveness, Model};
 use crate::interp;
 
-/// Discover the Trust `ty` model checker: the atpkg store's shim, then `ty` on `PATH` ([`locate_ty`] says which answered).
+/// Discover the Trust `ty` model checker: the atpkg store's shim, then `ty` on `PATH`.
 #[must_use]
 pub fn find_ty() -> Option<PathBuf> {
     checker("ty", locate_ty)
 }
 
-/// Discover `ty` and where it came from, whatever [`checkers_required`] says: what `spec-check` asks before it turns the checkers on.
+/// Discover `ty` and where it came from, whatever [`checkers_required`] says.
 #[must_use]
 pub fn locate_ty() -> Option<Located> {
     discover("ty")
@@ -65,7 +33,7 @@ pub fn locate_ay() -> Option<Located> {
 
 static CHECKERS_REQUIRED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// Turn the external checkers on for this process: from here every `ty` and `ay` obligation runs, and a missing checker fails it.
+/// Turn the external checkers on for this process.
 pub fn require_checkers() {
     let _ = CHECKERS_REQUIRED.set(true);
     assert!(
@@ -268,9 +236,7 @@ fn lookup_account_home() -> Option<PathBuf> {
     let mut pw: libc::passwd = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 4096];
     let mut out: *mut libc::passwd = std::ptr::null_mut();
-    // SAFETY: `pw`, `buf` (of the stated length) and `out` are valid writable out-params, and
-    // getpwuid_r writes nothing past buflen. `pw_dir` is read only on success (`out` non-null),
-    // when it is a NUL-terminated string inside `buf`, copied out while `buf` lives.
+    // SAFETY: `pw`, `buf` (of the stated length) and `out` are valid writable out-params, and getpwuid_r writes nothing past buflen. `pw_dir` is read only on success (`out` non-null), when it is a NUL-terminated string inside `buf`, copied out while `buf` lives.
     unsafe {
         let rc = libc::getpwuid_r(
             libc::getuid(),
@@ -1038,7 +1004,7 @@ pub struct NotRun {
     pub model: &'static str,
 }
 
-/// Run `ty check` on a derived model's generated spec and `cfg` (overrides pre-rendered); panics if `ty` cannot run.
+/// Run `ty check` on a derived model's generated spec and `cfg` (overrides pre-rendered).
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn ty_check_derived(ty: &Path, m: &Model, cfg: &str, label: &str) -> (bool, String) {
     let dir = scratch_dir("aterm-tier", m.name);
@@ -1103,7 +1069,7 @@ impl TyCommand {
         Self(cmd)
     }
 
-    /// `ty trace validate <trace> --spec <spec> --config <cfg>`: a two-state trace, not a state space, so it takes no arming.
+    /// `ty trace validate <trace> --spec <spec> --config <cfg>`.
     #[must_use]
     pub fn trace_validate(ty: &Path, trace: &Path, spec: &Path, cfg: &Path) -> Self {
         let mut cmd = Command::new(ty);
@@ -1180,7 +1146,7 @@ fn scratch_ty_env() -> Vec<(&'static str, std::path::PathBuf)> {
     env
 }
 
-/// The identity of the checker a transcript came from, path and build stamp, so a gate panic names the binary to act on (`--version` does not tell builds of one version apart; the mtime does).
+/// The identity of the checker a transcript came from, path and build stamp.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn ty_evidence_header(ty: &Path) -> String {
@@ -1562,9 +1528,6 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
                 .map(|dial| interp::with_buggy(config, dial))
         })
         .collect();
-    // The mutants are walked at once. A verdict on one action does not depend on which others a
-    // walk watches, so `stepped` is the same set in any order; `fires_lawfully` is read only
-    // for actions no mutant steps, which every walk watched.
     let verdicts: Mutex<(BTreeSet<&'static str>, BTreeSet<&'static str>)> = Mutex::default();
     let open = || -> Vec<&'static str> {
         let held = verdicts
@@ -1598,8 +1561,6 @@ pub fn audit_dead_negative_controls(configs: &[Model]) -> Result<usize, String> 
     let baseline_of: Vec<std::sync::OnceLock<Result<usize, (interp::State, &'static str)>>> =
         mutants.iter().map(|_| std::sync::OnceLock::new()).collect();
     let unstepped: Vec<&'static str> = dead.difference(&stepped).copied().collect();
-    // Each action's isolation is its own; the first failing action, in name order, is the
-    // error.
     let isolations = crate::check::each(&unstepped, |&d| -> Result<(), String> {
         if !fires_lawfully.contains(d)
             && !mutants.iter().zip(&fired_under).any(|(mutant, fired)| {
@@ -1737,7 +1698,7 @@ pub fn deadlock_free_and_catches_tiered(
     }
 }
 
-/// The interpreter's full discharge of a [`Liveness`] obligation, returned rather than panicked so the registry sweep can name every failure at once.
+/// The interpreter's full discharge of a [`Liveness`] obligation.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn audit_liveness(m: &Model, live: &Liveness) -> Result<usize, String> {
     liveness_preflight(m, live)?;
@@ -1864,14 +1825,14 @@ fn audit_liveness_on(
     Ok(live.mutants.len())
 }
 
-/// The `Buggy = 1` copy of `m` with every committed-dead action removed except `mutant`: the healthy lane plus that one defect.
+/// The `Buggy = 1` copy of `m` with every committed-dead action removed except `mutant`.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn buggy_baseline_with(m: &Model, mutant: &str) -> Model {
     isolate_mutant(m, &interp::fired_actions(&interp::with_buggy(m, 0)), mutant)
 }
 
-/// [`buggy_baseline_with`] for a caller that already holds the actions firing at the committed config, so the space is not walked again to learn them.
+/// [`buggy_baseline_with`] for a caller that already holds the actions firing at the committed config.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn isolate_mutant(m: &Model, fired: &BTreeSet<&'static str>, mutant: &str) -> Model {
     let mut isolated = interp::with_buggy(m, 1);
@@ -1881,7 +1842,7 @@ pub(crate) fn isolate_mutant(m: &Model, fired: &BTreeSet<&'static str>, mutant: 
     isolated
 }
 
-/// Run `ty check` on a liveness module (`Liveness::to_tla`) with its cfg, in a directory of its own per call ([`scratch_dir`]).
+/// Run `ty check` on a liveness module (`Liveness::to_tla`) with its cfg, in a directory of its own per call.
 #[cfg_attr(trust_verify, trust::skip)]
 pub(crate) fn ty_check_liveness(
     ty: &Path,
@@ -1911,7 +1872,7 @@ pub(crate) fn ty_check_liveness(
     (out.status.success(), evidence)
 }
 
-/// Tiered liveness: [`audit_liveness`] on the interpreter, plus `ty` checking `PROPERTY <name>` under [`Liveness::to_tla`] when checkers run.
+/// Tiered liveness: [`audit_liveness`] on the interpreter.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn liveness_proves_and_catches_tiered(m: &Model, live: &Liveness, label: &str) -> Covered {
     assert_scalar(m, label, "liveness_proves_and_catches_tiered");
@@ -2140,8 +2101,6 @@ const CASES_TRIES: u8 = 2;
 
 type CasesSlot = std::sync::Arc<Mutex<Option<CasesChild>>>;
 
-/// The `--cases` co-processes, one per (checker, spec, cfg), oldest first. A static is never
-/// dropped, so each child still here at `exit(3)` is ended by [`end_the_pool_at_exit`]'s handler.
 static POOL: Mutex<Vec<(TyChecker, String, String, CasesSlot)>> = Mutex::new(Vec::new());
 
 /// Arm, once, the `exit(3)` handler that kills and reaps every pooled co-process. Without it a
@@ -2156,12 +2115,10 @@ fn end_the_pool_at_exit() {
             end_the_pool();
         }
         unsafe extern "C" {
-            /// `stdlib.h`, declared inline as `aterm-uds`'s test-binary scratch declares it.
             fn atexit(cb: extern "C" fn()) -> std::ffi::c_int;
         }
         ARMED.call_once(|| {
-            // SAFETY: registers a plain `extern "C"` function with no captured state; a failed
-            // registration leaves each child to end on its stdin's EOF after this process.
+            // SAFETY: registers a plain `extern "C"` function with no captured state; a failed registration leaves each child to end on its stdin's EOF after this process.
             unsafe { atexit(at_exit) };
         });
     }
@@ -2222,7 +2179,6 @@ fn cases_verdict(
             Some(at) => pool.remove(at),
             None => {
                 if pool.len() >= CASES_POOL_CAP {
-                    // Its child is killed once no case holds it any more.
                     pool.remove(0);
                 }
                 (
@@ -2525,7 +2481,7 @@ pub(crate) fn transition_trace_json(
     )
 }
 
-/// Per-invariant non-vacuity: the invariants of `m` that no `Buggy = 1` member falsifies when each is checked alone, in model order.
+/// Per-invariant non-vacuity.
 #[must_use]
 pub fn uncaught_invariants(m: &Model) -> Vec<&'static str> {
     let violated = interp::violated_invariants(&interp::with_buggy(m, 1));
@@ -2536,7 +2492,7 @@ pub fn uncaught_invariants(m: &Model) -> Vec<&'static str> {
         .collect()
 }
 
-/// What the non-vacuity sweep finds wrong with one model, one line per fault, over every configuration it declares (`configs[0]` the committed one, then each `scenario`).
+/// What the non-vacuity sweep finds wrong with one model, one line per fault, over every configuration it declares.
 #[cfg_attr(trust_verify, trust::skip)]
 #[must_use]
 pub fn sweep_faults(configs: &[Model]) -> Vec<String> {

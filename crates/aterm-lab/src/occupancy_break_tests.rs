@@ -380,6 +380,22 @@ fn each_way_the_run_falls_short_fails_it_alone() {
         case("two episodes", |p| {
             p.ledger[2] = p.ledger[2].replace(EPISODE, "00000000000000cd");
         }),
+        case("no episode identity", |p| {
+            let token = format!("episode={EPISODE} ");
+            for row in p.ledger.iter_mut().chain(&mut p.journal) {
+                *row = row.replace(&token, "");
+            }
+        }),
+        case("empty episode identity", |p| {
+            for row in p.ledger.iter_mut().chain(&mut p.journal) {
+                *row = row.replace(EPISODE, "");
+            }
+        }),
+        case("malformed episode identity", |p| {
+            for row in p.ledger.iter_mut().chain(&mut p.journal) {
+                *row = row.replace(EPISODE, "00000000000000gg");
+            }
+        }),
         case("another line typed", |p| {
             p.ledger[3] = p.ledger[3].replace("1 min", "2 min");
         }),

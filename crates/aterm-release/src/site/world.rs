@@ -260,7 +260,7 @@ impl World for Real {
     }
 
     fn live(&mut self, url: &str) -> Result<Vec<u8>, String> {
-        let mut curl = command("curl");
+        let mut curl = command(aterm_uds::os_path!("curl"));
         curl.args([
             "-fsSL",
             "--max-time",

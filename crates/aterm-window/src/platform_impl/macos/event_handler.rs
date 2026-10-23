@@ -26,8 +26,6 @@ impl fmt::Debug for EventHandlerData {
 pub(crate) struct EventHandler {
     /// This can be in the following states:
     /// - Not registered by the event loop (None).
-    /// - Present (Some(handler)).
-    /// - Currently executing the handler / in use (RefCell borrowed).
     inner: RefCell<Option<EventHandlerData>>,
 }
 
@@ -42,12 +40,10 @@ impl EventHandler {
         handler: impl FnMut(Event<HandlePendingUserEvents>, &RootActiveEventLoop) + 'handler,
         closure: impl FnOnce() -> R,
     ) -> R {
-        // SAFETY: We extend the lifetime of the handler here so that we can
-        // store it in `EventHandler`'s `RefCell`.
-        //
-        // This is sound, since we make sure to unset the handler again at the
-        // end of this function, and as such the lifetime isn't actually
-        // extended beyond `'handler`.
+        // SAFETY: We extend the lifetime of the handler here so that we can store it in
+        // `EventHandler`'s `RefCell`.  This is sound, since we make sure to unset the handler again
+        // at the end of this function, and as such the lifetime isn't actually extended beyond
+        // `'handler`.
         let handler = unsafe {
             mem::transmute::<
                 Box<dyn FnMut(Event<HandlePendingUserEvents>, &RootActiveEventLoop) + 'handler>,

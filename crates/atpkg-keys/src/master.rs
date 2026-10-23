@@ -8,13 +8,8 @@ use ring::signature::{Ed25519KeyPair, KeyPair};
 /// Number of base32 characters in the written master phrase.
 pub const MASTER_PHRASE_LEN: usize = 52;
 
-/// The phrase alphabet: lowercase Crockford base32, `0-9a-z` minus the easily confused
-/// `i l o u`.
 const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
-/// Overwrite `buf` with zeroes the optimizer may not delete. A zeroing loop on a buffer never
-/// read again is dead-store elimination's textbook case; `write_volatile` cannot be removed
-/// and the fence stops the writes sinking past the buffer's death.
 fn scrub(buf: &mut [u8]) {
     for b in buf.iter_mut() {
         // SAFETY: `b` is a live, uniquely borrowed, aligned `u8` from a mutable slice, so a
@@ -24,31 +19,24 @@ fn scrub(buf: &mut [u8]) {
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-/// [`scrub`] for the one-word bit accumulators the base32 codec threads master bits
-/// through.
 fn scrub_u32(v: &mut u32) {
     // SAFETY: `v` is a live, uniquely borrowed, aligned `u32`.
     unsafe { std::ptr::write_volatile(v, 0) };
     std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 }
 
-/// Ask the kernel to keep `buf` out of swap. Best-effort: `mlock` is bounded by
-/// `RLIMIT_MEMLOCK` and its failure is ignored, so a machine with a tight limit can still
-/// mint.
 fn try_lock(buf: &[u8]) {
-    // SAFETY: `buf` points to `buf.len()` live bytes for the duration of the `mlock` call.
-    // `mlock` neither reads nor writes the contents.
+    // SAFETY: `buf` points to `buf.len()` live bytes for the duration of the `mlock` call. `mlock`
+    // neither reads nor writes the contents.
     unsafe {
         let _ = libc::mlock(buf.as_ptr().cast::<libc::c_void>(), buf.len());
     }
 }
 
-/// Undo [`try_lock`] before the memory is freed, so a long-running process does not leak
-/// locked pages.
 fn try_unlock(buf: &[u8]) {
     // SAFETY: `buf` points to `buf.len()` live bytes for the duration of the `munlock` call.
-    // `munlock` neither reads nor writes the contents, and it is harmless on a range
-    // `try_lock` never managed to lock.
+    // `munlock` neither reads nor writes the contents, and it is harmless on a range `try_lock`
+    // never managed to lock.
     unsafe {
         let _ = libc::munlock(buf.as_ptr().cast::<libc::c_void>(), buf.len());
     }
@@ -60,8 +48,8 @@ pub fn forbid_core_dumps() {
         rlim_cur: 0,
         rlim_max: 0,
     };
-    // SAFETY: `zero` is a fully initialized `rlimit` living for the call, and
-    // `RLIMIT_CORE` is a valid resource. `setrlimit` writes nothing through the pointer.
+    // SAFETY: `zero` is a fully initialized `rlimit` living for the call, and `RLIMIT_CORE` is a
+    // valid resource. `setrlimit` writes nothing through the pointer.
     unsafe {
         let _ = libc::setrlimit(libc::RLIMIT_CORE, &raw const zero);
     }
@@ -73,8 +61,6 @@ pub struct MasterSeed {
 }
 
 impl std::fmt::Debug for MasterSeed {
-    /// Hand-written so a derive can never print the master (as `ReleaseCredentials` in
-    /// `aterm-release/src/sign.rs`).
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("MasterSeed(<redacted>)")
     }
@@ -88,7 +74,6 @@ impl Drop for MasterSeed {
 }
 
 impl MasterSeed {
-    /// Wrap 32 raw bytes, locking them out of swap immediately.
     fn new(bytes: [u8; 32]) -> Self {
         let seed = Self { bytes };
         try_lock(&seed.bytes);
@@ -166,8 +151,6 @@ impl MasterPhrase {
     }
 }
 
-/// The 5-bit value of one phrase character. Called only on alphabet bytes; the unreachable
-/// fallback returns 0 rather than panicking with the master live in memory.
 const fn b32_val(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',
@@ -231,7 +214,6 @@ pub fn parse_master(input: &str) -> Result<MasterPhrase, PhraseError> {
             return Err(PhraseError::BadChar { position: n + 1 });
         }
         if n < MASTER_PHRASE_LEN {
-            // Count past the end so the length error reports the true count.
             chars[n] = c;
         }
         n += 1;
@@ -256,8 +238,6 @@ pub fn generate_master() -> Result<MasterPhrase, String> {
     Ok(phrase)
 }
 
-/// Spell 32 seed bytes as the 52-character phrase [`MasterPhrase::seed`] decodes back to
-/// exactly those bytes.
 fn encode_phrase(raw: &[u8; 32]) -> MasterPhrase {
     let mut chars = [0u8; MASTER_PHRASE_LEN];
     let mut acc: u32 = 0;
@@ -302,7 +282,6 @@ pub struct TtyEcho {
 }
 
 impl TtyEcho {
-    /// Disable ECHO on `fd`, remembering the previous state.
     fn disable(fd: std::os::unix::io::RawFd) -> Result<Self, String> {
         // SAFETY: `termios` is a plain-old-data struct initialized by `tcgetattr` before read.
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
@@ -322,17 +301,15 @@ impl TtyEcho {
 
 impl Drop for TtyEcho {
     fn drop(&mut self) {
-        // SAFETY: `self.fd` is still open: the caller declares this guard after the `File`
-        // that owns the descriptor, so the guard drops first. `self.saved` is the initialized
-        // snapshot taken in `disable`.
+        // SAFETY: `self.fd` is still open: the caller declares this guard after the `File` that
+        // owns the descriptor, so the guard drops first. `self.saved` is the initialized snapshot
+        // taken in `disable`.
         unsafe {
             let _ = libc::tcsetattr(self.fd, libc::TCSAFLUSH, &raw const self.saved);
         }
     }
 }
 
-/// The longest line the phrase prompt reads: 52 characters plus room for separators and the
-/// newline.
 const PROMPT_CAP: usize = 256;
 
 /// Controlling terminal (`/dev/tty`) used to read and display the master phrase.
@@ -342,7 +319,6 @@ pub struct Tty {
 }
 
 impl std::fmt::Debug for Tty {
-    /// Content-free, like every other `Debug` in this module.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Tty(/dev/tty)")
     }
@@ -475,11 +451,7 @@ mod tests {
 
     const SYNTHETIC: &str = "0123456789abcdefghjkmnpqrstvwxyz0123456789abcdefghj0";
 
-    /// The refusal for an input that must not parse. [`MasterPhrase`] has no `PartialEq` on
-    /// purpose: equality on secret material invites comparison and timing side channels.
     fn refused(input: &str) -> PhraseError {
-        // `expect_err` needs `Debug` on the Ok type, which prints `<redacted>`, so a failure
-        // cannot spill phrase bytes into the panic message.
         parse_master(input).expect_err("this input must be refused")
     }
 
@@ -575,7 +547,6 @@ mod tests {
         assert_eq!(refused(&bad), PhraseError::BadChar { position: 5 });
     }
 
-    /// Two generations differ, so the CSPRNG is consulted.
     #[test]
     fn generate_produces_a_fresh_fifty_two_character_phrase() {
         let a = generate_master().unwrap();
@@ -590,10 +561,6 @@ mod tests {
         assert_eq!(parse_master(a.as_str()).unwrap().as_str(), a.as_str());
     }
 
-    /// THE PAPER IS THE SEED. A phrase decodes to exactly the 32 bytes it was spelled
-    /// from, its last character carries zero padding bits (one canonical spelling), and
-    /// the derivation is a cross-version contract: paper written under an earlier build
-    /// names the same master in this one.
     #[test]
     fn a_phrase_decodes_to_exactly_the_seed_it_spells() {
         for raw in [
@@ -623,8 +590,6 @@ mod tests {
         );
     }
 
-    /// Spellings that differ only in the last character's low four bits name the same
-    /// master; its top bit is significant.
     #[test]
     fn the_padding_bits_of_the_last_character_are_masked() {
         let base = parse_master(SYNTHETIC)
@@ -668,7 +633,6 @@ mod tests {
         );
     }
 
-    /// Pins the input: the fingerprint is taken over the public key, never the secret.
     #[test]
     fn the_fingerprint_is_taken_over_the_public_key() {
         let seed = parse_master(SYNTHETIC).unwrap().seed();
@@ -693,8 +657,6 @@ mod tests {
         assert!(!s.contains("0123"), "{s}");
     }
 
-    /// Tests the primitive, the only testable part of vector 9: whether the optimizer honours
-    /// `write_volatile` is the compiler's contract.
     #[test]
     fn scrub_zeroes_the_buffer() {
         let mut buf = *b"0123456789abcdef";

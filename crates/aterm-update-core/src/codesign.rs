@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use aterm_uds::deadline::{RunError, output_until};
 
 /// Absolute path to Apple's `codesign` tool.
-pub const CODESIGN: &str = "/usr/bin/codesign";
+pub const CODESIGN: &str = aterm_uds::os_path!("codesign");
 
 /// Base verification timeout and floor for [`verify_timeout_for`].
 pub const VERIFY_TIMEOUT: Duration = Duration::from_secs(30);

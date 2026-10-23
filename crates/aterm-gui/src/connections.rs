@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Process-local connection records, connect/disconnect acts, and close-time source sweep
-//! ([`EdgeTable`], [`ConnectionRecord`], [`crate::proxy`]).
+//! Process-local connection records, connect/disconnect acts, and close-time source sweep ([`EdgeTable`], [`ConnectionRecord`], [`crate::proxy`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,9 +107,7 @@ pub(crate) fn new_connection_store() -> ConnectionStore {
     Arc::new(ConnectionTable::default())
 }
 
-/// The process-wide connection store, one per process (the `PROXIES` idiom in `proxy.rs`): a
-/// singleton saves threading a handle through every UI/control caller, and a process has one
-/// connection fabric.
+/// The process-wide connection store, one per process (the `PROXIES` idiom in `proxy.rs`): a singleton saves threading a handle through every UI/control caller, and a process has one connection fabric.
 static CONNECTIONS: OnceLock<ConnectionStore> = OnceLock::new();
 
 /// The process-wide [`ConnectionStore`] (lazily initialized, cloned Arc).
@@ -130,14 +127,11 @@ pub(crate) fn connect_in(
     origin: &str,
 ) -> bool {
     if src == dst {
-        // Refused before any state is touched — `grant_connection` would also
-        // refuse, but a self-loop must not even churn the record store.
         return false;
     }
     let key = (src.clone(), dst.clone());
     let mut records = conn.records();
     if records.get(&key).is_some_and(|r| r.kind() == Some(kind)) {
-        // Set semantics: nothing changed, so the freshness epoch holds too.
         return true;
     }
     let old = records.remove(&key);
@@ -280,8 +274,7 @@ pub(crate) fn roles<'a>(
     out
 }
 
-/// Fold one table's rows into the role map: the role predicate per row, shared by every entry
-/// point so they cannot drift.
+/// Fold one table's rows into the role map: the role predicate per row, shared by every entry point so they cannot drift.
 fn fold_roles(out: &mut HashMap<SessionId, SessionRoles>, rows: Vec<aterm_session::Edge>) {
     for edge in rows {
         if edge.src == edge.dst {
@@ -339,8 +332,6 @@ pub(crate) fn sweep_session_closed_in(
         .collect();
     for (sid, ctx) in survivors {
         if sid == *closing {
-            // A caller that swept before deregistering (or a duplicate-close
-            // race) must not "sweep" the dying session's own table.
             continue;
         }
         let removed = {
@@ -348,8 +339,6 @@ pub(crate) fn sweep_session_closed_in(
             edges.revoke_src(closing)
         };
         if removed > 0 {
-            // Audit off the table lock; `op=*`, since the sweep removes every op
-            // the source held (the `revoke src=` wire-form convention).
             session_edge_audit::emit(EdgeAction::RevokeSrc, "close", closing, &sid, "*");
         }
     }
@@ -385,8 +374,7 @@ mod tests {
         )
     }
 
-    /// A minimal registrable handle (the `session_store` test idiom): dead fds,
-    /// fresh identity, empty edge table.
+    /// A minimal registrable handle (the `session_store` test idiom): dead fds, fresh identity, empty edge table.
     fn handle(local_id: u64) -> SessionHandle {
         let sid = SessionId::generate();
         let nonce = LaunchNonce::generate();
@@ -416,6 +404,7 @@ mod tests {
             crash_journal: Default::default(),
             typed: Default::default(),
             bells: Default::default(),
+            screen_moves: Default::default(),
             update_parked: Default::default(),
             watchers: observed.watchers,
             frame: Default::default(),
@@ -435,8 +424,7 @@ mod tests {
         }
     }
 
-    /// Fail-soft grouping: a carried op set re-mints the largest kind it fully proves and drops
-    /// the rest, never widening.
+    /// Fail-soft grouping: a carried op set re-mints the largest kind it fully proves and drops the rest, never widening.
     #[test]
     fn carried_kind_never_widens_and_drops_the_rest() {
         let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();

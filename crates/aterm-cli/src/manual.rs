@@ -1861,8 +1861,9 @@ WHAT IT CANNOT MEASURE HERE
 const SYS_PAGE_COVERAGE: &str = r#"
 WHAT THIS OS MEASURES (Linux)
   CPU per core (/proc/stat), grouped by performance level where the kernel
-  names one (cpu_core/cpu_atom PMUs, cpu_capacity); memory classes, swap and the
-  commit charge (/proc/meminfo); pressure from PSI where it is enabled; the GPU's
+  names one (cpu_core/cpu_atom PMUs, or cpu_capacity with one level per core
+  design and top clock); memory classes, swap and the commit charge
+  (/proc/meminfo); pressure from PSI where it is enabled; the GPU's
   busy percent where its driver says (amdgpu's sysfs file, NVIDIA's NVML; a
   sleeping card reads idle without being woken, and a laptop's runtime-managed
   dGPU is not read); thermal throttling from trip points and throttle

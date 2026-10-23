@@ -4,19 +4,7 @@
 //! Master-signed machine [`Roster`] ([`ROSTER_ASSET`], [`ROSTER_SIG_ASSET`]) verification
 //! ([`verify_roster`], [`VerifiedRoster`], [`Roster::authorize_appcast`], [`Attribution::bind`])
 //! and rejection ([`RosterReject::Disabled`], [`RosterReject::Malformed`],
-//! [`RosterReject::Rollback`], [`RosterReject::Stale`]):
-//!
-//! ```toml
-//! schema      = 1
-//! roster_seq  = 3                       # monotonic; the replay counter
-//! valid_until = "9999-12-31T00:00:00Z"  # checked; minted as "forever"
-//! revoked     = ["m11"]                 # ABOVE the first [[machine]], always
-//!
-//! [[machine]]
-//! id       = "m3"
-//! pubkey   = "<base64 Ed25519>"
-//! added_at = "2026-08-04T00:00:00Z"
-//! ```
+//! [`RosterReject::Rollback`], [`RosterReject::Stale`]).
 
 use serde::{Deserialize, Serialize};
 
@@ -104,7 +92,7 @@ fn verify_under(pubkey_b64: &str, msg: &[u8], sig: &[u8]) -> Result<(), RosterRe
         .map_err(|_| RosterReject::Verify)
 }
 
-/// **Step 1–3.** Verify the roster's exact bytes under the pinned master keyset.
+/// Verify the roster's exact bytes under the pinned master keyset.
 pub fn verify_roster(
     master_pubkeys: &[&str],
     raw: Vec<u8>,
@@ -190,7 +178,7 @@ impl std::fmt::Display for Attribution {
 }
 
 impl Roster {
-    /// **Step 4–5.** Parse a roster from bytes that passed master verification.
+    /// Parse a roster from bytes that passed master verification.
     pub fn parse(verified: &VerifiedRoster) -> Result<Self, RosterReject> {
         /// The schema alone, every other key ignored, so a newer schema is refused for its
         /// version before the closed key set can call its new keys malformed.
@@ -230,7 +218,7 @@ impl Roster {
         Ok(())
     }
 
-    /// **Step 6–7.** Admit the roster itself.
+    /// Admit the roster itself.
     pub fn admit(&self, floor_seq: u64, now_unix: i64) -> Result<(), RosterReject> {
         // Step 6, the ratchet: strong for a client that has seen a newer roster, nothing for
         // a fresh install.
@@ -278,7 +266,7 @@ impl Roster {
             .collect()
     }
 
-    /// **Step 8–9.** Verify the appcast's exact bytes under the roster's live machines.
+    /// Verify the appcast's exact bytes under the roster's live machines.
     pub fn authorize_appcast(
         &self,
         appcast: &[u8],
@@ -291,7 +279,6 @@ impl Roster {
         }
         let live = self.live(now_unix);
         if live.is_empty() {
-            // Every machine is revoked or expired: an empty set authorizes nothing.
             return Err(RosterReject::UnknownMachine);
         }
         let mut usable = 0usize;
@@ -317,7 +304,7 @@ impl Roster {
 }
 
 impl Attribution {
-    /// **Step 10.** Bind the manifest's self-declared identity to what verified.
+    /// Bind the manifest's self-declared identity to what verified.
     pub fn bind(
         &self,
         manifest_machine_id: Option<&str>,
@@ -382,7 +369,7 @@ mod tests {
         kp.sign(msg).as_ref().to_vec()
     }
 
-    /// A two-machine roster: m3 live, m11 live. `revoked` is empty.
+    /// A two-machine roster: m3 live, m11 live.
     fn roster() -> Roster {
         Roster {
             schema: 1,

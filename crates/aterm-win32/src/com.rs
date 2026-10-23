@@ -2,12 +2,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0 AND (MIT OR Apache-2.0)
 //
-// HAND-WRITTEN, not generated: `aterm-win32-oracle gen` neither emits nor
-// deletes this file, and harvests the generated declarations it names like a
-// consumer's. `IUnknown_Vtbl` is derived from windows-core 0.62.2
-// src/unknown.rs (MIT OR Apache-2.0, see ../LICENSE-MIT and
-// ../LICENSE-APACHE); the rest moved here from aterm-gui's src/win_ffi.rs
-// (WB.2 of docs/AUDIT-third-party-2026-10-15.md).
+// `IUnknown_Vtbl` is derived from windows-core 0.62.2 src/unknown.rs
+// (MIT OR Apache-2.0, see ../LICENSE-MIT and ../LICENSE-APACHE).
 
 //! COM's vocabulary.
 

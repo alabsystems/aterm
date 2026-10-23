@@ -35,7 +35,13 @@ pub(crate) fn trim_tty(text: &str) -> Result<(String, bool), String> {
 /// Copy the pinned benchmarks and trim their tty lookup.
 fn trimmed_benchmarks(stock: &Path, copy: &Path) -> Result<usize, String> {
     let _ = std::fs::remove_dir_all(copy);
-    run_ok(command("cp").arg("-R").arg(stock).arg(copy), "cp")?;
+    run_ok(
+        command(aterm_uds::os_path!("cp"))
+            .arg("-R")
+            .arg(stock)
+            .arg(copy),
+        "cp",
+    )?;
     let mut trimmed = 0;
     for bench in benchmark_dirs(copy)? {
         for name in ["benchmark", "setup"] {
@@ -145,7 +151,7 @@ fn clone_pin(repo: &str, dir: &Path) -> Result<(), Halt> {
     if dir.is_dir() {
         return Ok(());
     }
-    let out = command("git")
+    let out = command(aterm_uds::os_path!("git"))
         .args(["clone", "-q", repo])
         .arg(dir)
         .output()
@@ -179,14 +185,14 @@ fn run_inner(args: &Args) -> Result<String, Halt> {
     let vte_dir = arena.join(format!("vtebench-{}", pin.commit));
     clone_pin(&pin.repo, &vte_dir)?;
     run_ok(
-        command("git")
+        command(aterm_uds::os_path!("git"))
             .arg("-C")
             .arg(&vte_dir)
             .args(["checkout", "-q", "--detach", &pin.commit]),
         "git checkout",
     )?;
     let dirty = super::stdout_of(
-        command("git")
+        command(aterm_uds::os_path!("git"))
             .arg("-C")
             .arg(&vte_dir)
             .args(["status", "--porcelain"]),

@@ -7318,23 +7318,25 @@ impl App {
         }
     }
 
-    /// The program cat's raw claim.
-    pub(crate) fn app_kitty_claim(
-        &mut self,
-        wid: WindowId,
-        session: u64,
-    ) -> Option<aterm_effects::companion_look::AppIdentity> {
-        let s = self.pool.get(session)?;
+    /// Refresh the focused pane's cached raw program claim on `wid`'s [`aterm_effects::companion_look::LookPolicy`].
+    pub(crate) fn resolve_app_kitty_claim(&mut self, wid: WindowId, session: u64) {
+        let Some(s) = self.pool.get(session) else {
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                ws.fx.look_mut().resolve_claim(session, None);
+            }
+            return;
+        };
         let term = crate::term_lock_ui(
             &s.term,
             &s.ctx.ui_waiting,
             crate::metrics::TermWaitSite::Redraw,
         );
-        let ws = self.windows.get_mut(&wid)?;
-        ws.fx.look_mut().claim(
-            session,
-            term.current_block().or_else(|| term.all_blocks().last()),
-        )
+        if let Some(ws) = self.windows.get_mut(&wid) {
+            ws.fx.look_mut().resolve_claim(
+                session,
+                term.current_block().or_else(|| term.all_blocks().last()),
+            );
+        }
     }
 
     /// The one companion verdict.
@@ -7344,15 +7346,14 @@ impl App {
         focus_session: u64,
         now: std::time::Instant,
     ) -> aterm_effects::kitty_registry::KittyLook {
-        let raw = self.app_kitty_claim(wid, focus_session);
-        self.companion_verdict_with_claim(wid, raw, now)
+        self.resolve_app_kitty_claim(wid, focus_session);
+        self.companion_verdict_for_resolved_claim(wid, now)
     }
 
-    /// [`Self::companion_verdict`] with the focused pane's raw program claim already read.
-    pub(crate) fn companion_verdict_with_claim(
+    /// [`Self::companion_verdict`] with the focused pane's raw program claim already resolved on `wid`'s [`aterm_effects::companion_look::LookPolicy`].
+    pub(crate) fn companion_verdict_for_resolved_claim(
         &mut self,
         wid: WindowId,
-        raw: Option<aterm_effects::companion_look::AppIdentity>,
         now: std::time::Instant,
     ) -> aterm_effects::kitty_registry::KittyLook {
         let favourite = self.kitty_log.favourite_look();
@@ -7361,7 +7362,7 @@ impl App {
             Some(ws) => ws
                 .fx
                 .look_mut()
-                .verdict(raw.as_ref(), favourite, launch, now),
+                .verdict_from_resolved_claim(favourite, launch, now),
             None => aterm_effects::companion_look::companion_precedence(favourite, None, launch).0,
         }
     }
@@ -11315,7 +11316,7 @@ impl App {
             let pet_world_facts = pet_console_owned.then(|| {
                 aterm_effects::pet_world::PetWorldFacts::read(&term, front_terminal.session)
             });
-            let app_kitty_raw = ws.fx.look_mut().claim(
+            ws.fx.look_mut().resolve_claim(
                 front_terminal.session,
                 term.current_block().or_else(|| term.all_blocks().last()),
             );
@@ -11391,8 +11392,7 @@ impl App {
             } = glow_geom;
             self.install_window_config_assets(id);
             let front_session = self.focused_session_id(id).unwrap_or(0);
-            let companion_verdict =
-                self.companion_verdict_with_claim(id, app_kitty_raw, frame_started);
+            let companion_verdict = self.companion_verdict_for_resolved_claim(id, frame_started);
             let trail_presentation = self.trail_presentation();
             let pet_mode = trail_presentation.pet_species.is_some();
             let pet_species = trail_presentation
@@ -14829,6 +14829,10 @@ impl App {
                     focus_snapshot_valid = true;
                     focus_world_facts = pet_console_owned
                         .then(|| aterm_effects::pet_world::PetWorldFacts::read(&term, focus));
+                    ws.fx.look_mut().resolve_claim(
+                        focus,
+                        term.current_block().or_else(|| term.all_blocks().last()),
+                    );
                     let d_off = term.grid().display_offset();
                     focus_scrolled = d_off != 0;
                     focus_no_echo =
@@ -15097,7 +15101,7 @@ impl App {
             cursor_companions_allowed && decoration_presentable,
             !focus_scrolled,
         );
-        let companion_verdict = self.companion_verdict(wid, focus, now);
+        let companion_verdict = self.companion_verdict_for_resolved_claim(wid, now);
         let sing_style = cursor_companions_allowed
             && matches!(glow_cfg.style, crate::cursor_glow::GlowStyle::RainbowKitty);
         let sound_on = self.config.trail_sounds_or_default();

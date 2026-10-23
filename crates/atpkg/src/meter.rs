@@ -2,21 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The one-line progress meter a person sees under a typed `aterm pkg` verb.
-//!
-//! One line on stderr, redrawn about eight times a second: from the live pass
-//! ([`crate::progress::live_snapshot`]) — which program, what it is doing, the bytes, the rate
-//! and a rough time left — or, with no pass live, a spinner and a sentence ([`Show::Busy`]).
-//! [`render_line`] builds the line and is pure; [`TtyMeter`] owns the thread that draws it.
-//!
-//! It draws only for a person ([`wanted`]): stderr a terminal, `TERM` not `dumb`, on Unix. A
-//! process the window spawns has piped stdout and stderr, so nothing here reaches it, and the
-//! meter never writes to stdout.
-//!
-//! Output and meter never share a line: atpkg's `println!` and `eprintln!` (the macros in
-//! `lib.rs`) are this module's [`println`] and [`eprintln`] — the standard macro when no meter
-//! is live, else the meter's line is cleared first and the next tick redraws it. The line is
-//! also cleared when the meter stops, on every return and on Ctrl-C, whose default action is
-//! kept (clear, then re-raise).
 
 use std::collections::VecDeque;
 use std::io::Write as _;
@@ -141,8 +126,6 @@ fn bar(done: u64, total: u64, width: usize, utf8: bool) -> String {
 /// "about 3 min left" / "40 s left" for `secs` remaining.
 fn time_left(secs: u64) -> String {
     if secs < 60 {
-        // Rounded up to the next 5 s: a countdown that ticks every second reads as a
-        // promise, and this is an estimate.
         format!("{} s left", secs.div_ceil(5).max(1) * 5)
     } else if secs < 100 * 60 {
         format!("about {} min left", secs.div_ceil(60))
@@ -151,10 +134,7 @@ fn time_left(secs: u64) -> String {
     }
 }
 
-/// The meter's line for `show`, pure so every shape is pinned by a test. `rate` is the
-/// download rate in bytes per second, `None` until it has settled ([`Rate`]). The line is cut
-/// to one short of `look.cols`, so it never wraps (a wrapped line is not redrawn in place).
-/// Empty for [`Show::Nothing`].
+/// The meter's line for `show`, pure so every shape is pinned by a test.
 pub(crate) fn render_line(show: &Show, rate: Option<f64>, look: &Look) -> String {
     let body = match show {
         Show::Nothing => return String::new(),
@@ -171,10 +151,7 @@ pub(crate) fn render_line(show: &Show, rate: Option<f64>, look: &Look) -> String
     fit(line, look.cols)
 }
 
-/// The words after the spinner for one program of a pass. `whole_pass` when the line
-/// follows the pass rather than one program in it ([`Show::Pass`]'s `focus`): only then
-/// are the pass's position (`3 of 12`) and its whole download's time left about the
-/// program shown — a pending stub's program may still be queued behind the others.
+/// The words after the spinner for one program of a pass.
 fn pass_body(
     file: &ProgressFile,
     name: &str,
@@ -224,8 +201,6 @@ fn pass_body(
         );
         match rate.filter(|r| r.is_finite() && *r >= 1.0) {
             Some(rate) => {
-                // The time left for the whole pass's downloads when the line follows a pass
-                // that planned them, else for this one program.
                 let remaining = if whole_pass && file.overall.bytes_total > 0 {
                     file.overall
                         .bytes_total
@@ -250,8 +225,6 @@ fn pass_body(
             None => (amount, String::new(), String::new()),
         }
     };
-    // The time left survives a narrow terminal: the rate is dropped first, then the pass
-    // position, and the bar takes the room the words leave (up to 16 cells, none under 4).
     let room = look.cols.max(20) - 1 - 2;
     let words = |position: &str, per_second: &str| {
         [
@@ -305,8 +278,7 @@ pub(crate) struct Rate {
 
 impl Rate {
     /// Record `bytes` (the pass's overall download count) at `now`; the rate in bytes per
-    /// second once bytes have moved for [`RATE_SETTLE`], else `None`. A count that went down is
-    /// a new pass: the window starts again.
+    /// second once bytes have moved for [`RATE_SETTLE`], else `None`.
     pub(crate) fn note(&mut self, now: Instant, bytes: u64) -> Option<f64> {
         if self.samples.back().is_some_and(|(_, b)| bytes < *b) {
             self.reset();
@@ -339,8 +311,7 @@ impl Rate {
     }
 }
 
-/// Whether this process may draw a meter: stderr is a person's terminal. Never in a test
-/// binary, whose stderr is often the terminal that ran it.
+/// Whether this process may draw a meter: stderr is a person's terminal.
 #[must_use]
 pub(crate) fn wanted() -> bool {
     use std::io::IsTerminal as _;
@@ -438,12 +409,6 @@ pub(crate) fn around<R>(write: impl FnOnce() -> R) -> R {
 }
 
 /// `println!`, the meter's line out of the way (the crate's `println!` is this).
-///
-/// A line that cannot be written is dropped, as the doctor's report drops it
-/// ([`aterm_uds::stdout::println`]): std's `println!` PANICKED on the EPIPE a closed reader
-/// leaves (Rust ignores SIGPIPE), so `aterm pkg --help | head -1` exited 101, and a
-/// window-spawned pass whose window had just quit died on its next line inside the orphan
-/// watch's poll interval ([`crate::progress::watch_for_orphaning`]) instead of running on.
 pub(crate) fn println(args: std::fmt::Arguments<'_>) {
     around(|| aterm_uds::stdout::println(args));
 }
@@ -461,8 +426,7 @@ pub(crate) struct TtyMeter {
 }
 
 impl TtyMeter {
-    /// Start drawing what `source` shows. `None` when this process may not draw
-    /// ([`wanted`]), or a meter is already running in it.
+    /// Start drawing what `source` shows.
     pub(crate) fn start(mut source: impl FnMut() -> Show + Send + 'static) -> Option<Self> {
         if !wanted() || LIVE.swap(true, Ordering::AcqRel) {
             return None;
@@ -521,8 +485,6 @@ impl Drop for TtyMeter {
 }
 
 /// Ctrl-C while the meter is drawn: clear its line, then die of the signal as before.
-/// atpkg installs no handler of its own anywhere else, so this one exists only while a
-/// meter runs, and a SIGINT this process was started ignoring (`nohup`) stays ignored.
 #[cfg(unix)]
 mod sigint {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -797,7 +759,6 @@ mod tests {
         assert_eq!(rate.note(at(3), 300), None, "two seconds of movement");
         let r = rate.note(at(4), 400).expect("settled");
         assert!((r - 100.0).abs() < 1e-9, "{r}");
-        // Older samples leave the window: 10 s later at 1000 B/s.
         for s in 5..=14 {
             rate.note(at(s), 400 + (s - 4) * 1000);
         }

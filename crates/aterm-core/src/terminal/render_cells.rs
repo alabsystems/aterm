@@ -115,9 +115,7 @@ pub enum UnderlineStyle {
 }
 
 impl UnderlineStyle {
-    /// Resolve the packed underline bits to a single variant. The composite styles
-    /// share bits with the singletons (DOTTED = UNDERLINE|CURLY, DASHED =
-    /// DOUBLE|CURLY), so they are tested before the singletons.
+    /// Resolve the packed underline bits to a single variant.
     #[inline]
     const fn from_flags(cflags: CellFlags) -> Self {
         if cflags.contains(CellFlags::DOTTED_UNDERLINE) {
@@ -569,8 +567,6 @@ impl Terminal {
             } else if has_kitty
                 && let Some(iref) = self.placeholder_image_ref(screen_row, col, extra)
             {
-                // Kitty Unicode placeholder cell: synthesize an ImageRef so it rides
-                // the same (pixel-tested) render path as a direct placement.
                 out.push((col as usize, iref));
             }
         }
@@ -669,8 +665,6 @@ impl Terminal {
             } else if has_kitty
                 && let Some(iref) = self.placeholder_image_ref(coord.row, coord.col, extra)
             {
-                // Kitty Unicode placeholder cell: synthesize an ImageRef so it
-                // rides the same (pixel-tested) render path as a direct placement.
                 images[r].push((usize::from(coord.col), iref));
             }
         }
@@ -1134,9 +1128,6 @@ impl Terminal {
             let [r, g, b] = implicit_blank.bg;
             scratch.default_bg = u32::from_be_bytes([0, r, g, b]);
         } else {
-            // A pristine, unconfigured `Terminal::new`'s VT black is not a host
-            // theme decision; any host/OSC background or DECSCNM makes the
-            // terminal authoritative.
             scratch.default_bg = crate::render::COLOR_UNSET;
         }
         if self.color.frame_foreground_authoritative || reverse_video {
@@ -2047,9 +2038,7 @@ mod tests {
         assert!(text.starts_with("line "), "apron text: {text:?}");
     }
 
-    /// Cursor-only updates do not bump the row-content generation. The apron
-    /// keeps its materialized row, but its caret must follow the current DEC
-    /// cursor so the incoming strip cannot show a stale position or visibility.
+    /// Cursor-only updates do not bump the row-content generation.
     #[test]
     fn apron_memo_refreshes_cursor_without_rematerializing_the_row() {
         let (rows, cols) = (6usize, 10usize);
@@ -2292,8 +2281,6 @@ mod tests {
 
             term.process(b"\r\nnew one\r\nnew two\r\nnew three\r\nnew four");
             if tiered {
-                // The first row is older than the one-row ring; flush the
-                // deferred buffer so this arm genuinely reads the tier store.
                 let _ = term.grid_mut().scrollback_mut();
             }
             term.grid_mut().scroll_to_top();

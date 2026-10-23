@@ -4,10 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/macos/cursor.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
-// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
-// and its framework bindings Custom cursors are gone on macOS: this answers the system cursors
-// aterm sets.
 use aterm_objc::send::{send_bool_id, send_id};
 use aterm_objc::{autoreleasepool, class, sel, Obj};
 
@@ -46,8 +42,6 @@ pub(crate) fn cursor_from_icon(icon: CursorIcon) -> Obj {
         CursorIcon::Grabbing => class_cursor(sel!(closedHandCursor)),
         CursorIcon::ColResize => class_cursor(sel!(resizeLeftRightCursor)),
         CursorIcon::RowResize => class_cursor(sel!(resizeUpDownCursor)),
-        // LOCAL PATCH (aterm): the edges map as upstream's did; the corners are the arrow, because
-        // upstream's corner cursors were undocumented `+_windowResize…Cursor` accessors.
         CursorIcon::NResize => class_cursor(sel!(resizeUpCursor)),
         CursorIcon::SResize => class_cursor(sel!(resizeDownCursor)),
         CursorIcon::EResize => class_cursor(sel!(resizeRightCursor)),

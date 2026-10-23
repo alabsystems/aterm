@@ -3,12 +3,6 @@
 
 //! The shim's cell module, `crates/aterm-libc/src/<cell>.rs`, written from a
 //! cell's declarations ([`super::decls`]) and measurements ([`super::probe`]).
-//!
-//! Every value is derived: constants and signatures from the reference's
-//! rustdoc, sizes, offsets and the bytes of the struct-valued initialisers from
-//! the probes. Where libc keeps private fields, byte padding reproduces their
-//! measured extent, placed by the layout engine ([`super::layout`]). The only
-//! hand-written code comes from [`super::handwritten`].
 
 use std::fmt::Write as _;
 
@@ -233,7 +227,6 @@ fn struct_lines(os: Os, record: &Record, measured: &Measured) -> Result<Vec<Stri
             .map(|f| (f.name.clone(), f.ty.clone(), true))
             .collect()
     } else if record.fields.is_empty() {
-        // Fully opaque in libc: size and alignment ARE the whole public contract.
         let unit = match align {
             8 => "u64",
             4 => "u32",
@@ -265,8 +258,6 @@ fn struct_lines(os: Os, record: &Record, measured: &Measured) -> Result<Vec<Stri
         .collect();
     let (_, mut computed_size, mut computed_align) = layout(&fields, &types, packed, forced)?;
     if record.stripped && !record.fields.is_empty() && computed_align < align {
-        // libc reaches this alignment through a private field of a wider type;
-        // state it directly instead of inventing one.
         forced = Some(align);
         (_, computed_size, computed_align) = layout(&fields, &types, packed, forced)?;
         notes.push(
@@ -293,9 +284,6 @@ fn struct_lines(os: Os, record: &Record, measured: &Measured) -> Result<Vec<Stri
     reprs.extend(forced.map(|a| format!("align({a})")));
     out.push(format!("#[repr({})]", reprs.join(", ")));
     out.extend(trait_lines(&record.traits));
-    // A derived `PartialEq` compares function pointers by address, which rustc
-    // warns about; upstream allows the lint on the same structs, and matching it
-    // keeps the comparison semantics of the crate this replaces.
     if record.traits.contains(&"PartialEq") && slots.iter().any(|(_, ty, _)| ty.contains("fn(")) {
         out.push("#[allow(unpredictable_function_pointer_comparisons)]".into());
     }
@@ -688,7 +676,6 @@ mod tests {
                 "}",
             ]
         );
-        // A public field measured before where it could start is unplaceable.
         m.offset.insert(("s".into(), "b".into()), 6);
         assert!(
             struct_lines(
@@ -901,9 +888,8 @@ pub const extern \"C\" fn WSTOPSIG(status: c_int) -> c_int {
     }
 
     /// The sibling gate finds a cell's hand-written section by a line of code
-    /// this generator writes, so a comment prune of the cell sources (every
-    /// `//` line gone, as 3410d4c0e1, 8bcda75523 and 6e1ffead74 did to them)
-    /// leaves each section defined and the gate's verdict the code's.
+    /// this generator writes, so a comment prune of the cell sources leaves
+    /// each section defined and the gate's verdict unchanged.
     #[test]
     fn a_comment_prune_leaves_each_sibling_section_and_the_verdict() {
         use crate::siblings::{SiblingFinding, compare};
@@ -928,7 +914,6 @@ pub const extern \"C\" fn WSTOPSIG(status: c_int) -> c_int {
         assert_ne!(emitted, pruned, "the generator writes comments to prune");
         assert_eq!(compare(&emitted), []);
         assert_eq!(compare(&pruned), [], "a comment prune changed the verdict");
-        // Negative control: the pruned sections are still compared.
         let mut planted = pruned;
         let x86 = planted.get_mut("darwin_x86_64.rs").expect("the cell");
         x86.push_str("const fn planted() {}\n");

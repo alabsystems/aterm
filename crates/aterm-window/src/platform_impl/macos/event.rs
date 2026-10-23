@@ -10,9 +10,6 @@ use aterm_objc::send::{
     send_id, send_id_usize_point_usize_f64_isize_id_i16_isize_isize, send_u16, send_usize,
 };
 
-// LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
-// `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
-// and its framework bindings.
 use crate::keyboard::SmolStr;
 use aterm_objc::cf::{CFDataGetBytePtr, CFDataRef, CFRelease};
 use aterm_objc::{autoreleasepool, class, run_on_main, sel, CGPoint, Id, Obj};
@@ -80,15 +77,12 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
         return Key::Unidentified(NativeKey::MacOS(scancode));
     }
     if result_len == 0 {
-        // For instance, users that have mapped the `Fn` key to toggle
-        // keyboard layouts will hit this code path.
         return Key::Unidentified(NativeKey::MacOS(scancode));
     }
     let chars = String::from_utf16_lossy(&string[0..result_len as usize]);
     Key::Character(SmolStr::new(chars))
 }
 
-/// LOCAL PATCH (aterm), 2026-10-20.
 pub(crate) trait LayoutKeys {
     /// The character `scancode` types with `mods`, Carbon's `UCKeyTranslate` modifier byte.
     fn typed(&self, scancode: u16, mods: u32) -> Option<char>;
@@ -218,7 +212,6 @@ pub(crate) fn create_key_event(ns_event: Id, is_press: bool, is_repeat: bool) ->
         None
     } else {
         if matches!(physical_key, PhysicalKey::Unidentified(_)) {
-            // The key may be one of the funky function keys
             physical_key = extra_function_key_to_code(scancode, &characters);
         }
         Some(SmolStr::new(characters))
@@ -390,7 +383,7 @@ const NX_DEVICELALTKEYMASK: usize = 0x0000_0020;
 const NX_DEVICERALTKEYMASK: usize = 0x0000_0040;
 const NX_DEVICERCTLKEYMASK: usize = 0x0000_2000;
 
-/// LOCAL PATCH (aterm): `NSEventModifierFlags::contains`, spelled out.
+/// `NSEventModifierFlags::contains`, spelled out.
 #[inline]
 const fn has_flag(flags: usize, mask: usize) -> bool {
     flags & mask == mask

@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1: the shipping `MessageCenter` follows the derived `ExceptionsDigest`
-//! model in lock step. Every real transition is one the model enables, and
-//! after each the real center's `(open, glass)` equals the model's, so the
-//! digest never wants a band row (`LaterNeverWantsARow`), a dismissal holds
-//! inside its span (`DismissalHolds`), and the cap files rather than drops
-//! (`NothingIsLost`). The negative control plants an exception posted as a
-//! plain warning and shows the same projection catches it.
+//! Tier-1 conformance of `MessageCenter` against the derived `ExceptionsDigest` model.
 
 use aterm_messages::need::{Ask, Fingerprint, LaterAsk, Mover, Reason, Resurface, Span, Then, Why};
 use aterm_messages::{
@@ -86,8 +80,6 @@ fn the_real_center_follows_the_model_in_lock_step() {
         let stamp = |w: u64| WallStamp { unix_ms: w };
         let mut rows: Vec<MessageId> = Vec::new();
         let (mut next_row, mut next_fact) = (0usize, 0usize);
-        // facts whose quiet span is still running (filed since the last
-        // Resurface) and facts whose span is over
         let mut recent: Vec<usize> = Vec::new();
         let mut filed_facts: Vec<usize> = Vec::new();
         for step in 0..400 {
@@ -97,7 +89,6 @@ fn the_real_center_follows_the_model_in_lock_step() {
                 .copied()
                 .filter(|a| model.action_enabled(a, &st))
                 .collect();
-            // Lean on posting exceptions so the run reaches the cap.
             let posting: Vec<&str> = enabled
                 .iter()
                 .copied()
@@ -118,7 +109,6 @@ fn the_real_center_follows_the_model_in_lock_step() {
                     assert!(c.resolve(id, Outcome::Ok, now), "seed {seed} step {step}");
                 }
                 "PostLater" => {
-                    // a fresh fact, or (once its quiet span is over) one filed before
                     let n = if !filed_facts.is_empty() && rng.below(2) == 0 {
                         filed_facts.remove(0)
                     } else {
@@ -144,7 +134,6 @@ fn the_real_center_follows_the_model_in_lock_step() {
                 }
                 "FileAll" => {
                     let open = c.digest().len();
-                    // the facts the digest holds are the quiet ones now
                     recent.extend(c.digest().entries.iter().filter_map(|e| {
                         e.key
                             .split('.')
@@ -156,8 +145,6 @@ fn the_real_center_follows_the_model_in_lock_step() {
                     assert_eq!(c.file_digest(stamp(wall), now), open);
                 }
                 "Resurface" => {
-                    // 91 days clear every resurface span, the backed-off ones (at most 90
-                    // days) included
                     wall += 91 * DAY_MS;
                     filed_facts.append(&mut recent);
                 }
@@ -191,8 +178,6 @@ fn the_real_center_follows_the_model_in_lock_step() {
         );
     }
 
-    // Negative control: an exception posted as a plain warning moves the
-    // band's rows without the model moving, and the same projection sees it.
     #[expect(
         clippy::disallowed_methods,
         reason = "test code: the one instant a test mints and feeds in"

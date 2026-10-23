@@ -24,8 +24,7 @@ fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
     Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// A run of `count` big-endian u16 (or i16) values, empty when it runs
-/// past the data.
+/// A run of `count` big-endian u16 (or i16) values, empty when it runs past the data.
 fn u16_array(data: &[u8], start: usize, count: usize) -> &[u8] {
     data.get(start..)
         .and_then(|d| d.get(..count * 2))
@@ -66,8 +65,7 @@ impl<'a> Cmap4<'a> {
         })
     }
 
-    /// The glyph for `codepoint`, binary searching the header's
-    /// `seg_count` segments (each array read is checked).
+    /// The glyph for `codepoint`, binary searching the header's `seg_count` segments (each array read is checked).
     fn map_codepoint(&self, codepoint: u32, seg_count: usize) -> Option<u32> {
         if codepoint > 0xFFFF {
             return None;
@@ -170,8 +168,7 @@ impl<'a> Cmap1213<'a> {
         None
     }
 
-    /// Group `index` as an iteration range, cut to the valid characters and
-    /// (for format 12) to the glyphs the font has.
+    /// Group `index` as an iteration range, cut to the valid characters and (for format 12) to the glyphs the font has.
     fn iter_group(&self, index: usize, glyph_count: u32) -> Option<IterGroup> {
         let (start_code, end, start_glyph_id) = self.group(index)?;
         let max_char = char::MAX as u64;
@@ -380,7 +377,6 @@ impl Iterator for Mappings<'_> {
                     let Some(next_range) = subtable.code_range(*cur_range_ix) else {
                         break None;
                     };
-                    // Clamp overlapping/out-of-order segments while keeping `start_code` for lookup (fontations#1100).
                     let start_code = next_range.start as u16;
                     *cur_range =
                         next_range.start.max(cur_range.end)..next_range.end.max(cur_range.end);
@@ -460,8 +456,7 @@ mod tests {
         t
     }
 
-    /// A format 4 subtable of `(start, end, delta)` segments plus the
-    /// 0xFFFF terminator.
+    /// A format 4 subtable of `(start, end, delta)` segments plus the 0xFFFF terminator.
     fn format4(segments: &[(u16, u16, i16)]) -> Vec<u8> {
         let mut segs: Vec<(u16, u16, i16)> = segments.to_vec();
         segs.push((0xFFFF, 0xFFFF, 1));
@@ -488,8 +483,7 @@ mod tests {
         t
     }
 
-    /// The UCS-4 subtable wins over the BMP one, whatever their order, and
-    /// only it answers.
+    /// The UCS-4 subtable wins over the BMP one, whatever their order, and only it answers.
     #[test]
     fn picks_the_full_unicode_subtable() {
         let bmp = format4(&[(0x41, 0x42, 1)]);
@@ -517,8 +511,7 @@ mod tests {
         assert_eq!(map.map('A'), Some(GlyphId::new(5)));
     }
 
-    /// Enumeration skips `.notdef`, cuts format 12 groups to the glyph
-    /// count, and never steps a backwards group back.
+    /// Enumeration skips `.notdef`, cuts format 12 groups to the glyph count, and never steps a backwards group back.
     #[test]
     fn mappings_follow_read_fonts() {
         let full = format12(&[(0x20, 0x22, 0), (0x30, 0x39, 95), (0x31, 0x36, 1)]);

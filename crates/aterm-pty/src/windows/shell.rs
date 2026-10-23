@@ -33,7 +33,6 @@ pub(crate) fn resolve_program_windows(name: &str) -> OsString {
     }
     for ext in pathext() {
         if ext.eq_ignore_ascii_case(".exe") {
-            // already probed above
             continue;
         }
         if let Some(hit) = search_path_with_ext(name, &ext) {
@@ -91,7 +90,6 @@ fn search_path_with_ext(name: &str, ext: &str) -> Option<OsString> {
             )
         };
         if n == 0 {
-            // not found
             return None;
         }
         let n = n as usize;
@@ -147,9 +145,7 @@ pub(crate) fn discover_shell(name: &str) -> Option<OsString> {
     }
 }
 
-/// Locate Git for Windows' `bash.exe`. First beside a PATH-resolved `git.exe`
-/// (`<gitroot>\bin\bash.exe`, where `git.exe` sits in `<gitroot>\cmd`), then the
-/// standard machine + per-user install roots.
+/// Locate Git for Windows' `bash.exe`.
 fn discover_git_bash() -> Option<OsString> {
     // Beside git.exe: cmd\git.exe → ..\bin\bash.exe.
     if let Some(git) = search_path("git") {
@@ -306,10 +302,7 @@ mod tests {
         }
     }
 
-    /// MEASURED, not assumed: what `lpApplicationName` accepts is the entire
-    /// justification for what `--validate-config` accepts and rejects, and a
-    /// validator that models it from POSIX habit is how a Windows user came to
-    /// be told to write `/bin/zsh`.
+    /// Verify what `CreateProcessW` accepts and rejects as `lpApplicationName`.
     #[test]
     fn create_process_application_name_contract() {
         /// `ERROR_FILE_NOT_FOUND`.
@@ -574,11 +567,7 @@ mod tests {
         assert!(!is_wsl_shell(OsStr::new("bash.exe")));
     }
 
-    /// The verdict config validation reads. A bare name that RESOLVES is the
-    /// normal Windows spelling — the whole reason `--validate-config` must not
-    /// warn about `pwsh` — and `resolve_shell_name` must be exactly this
-    /// classification with the verdict collapsed, so the spawn and the
-    /// validator cannot disagree about the same string.
+    /// Verify that `classify_shell_name` matches the resolution performed by `resolve_shell_name`.
     #[test]
     fn classify_shell_name_is_the_resolution_the_spawn_performs() {
         let cmd = classify_shell_name(OsStr::new("cmd"));
@@ -635,10 +624,7 @@ mod tests {
         }
     }
 
-    /// `select_shell_with_origin` IS `select_shell` with the deciding arm named:
-    /// the program never differs, an override is always `Override`, and with
-    /// nothing named the origin is one of the platform-default arms — `Pwsh`
-    /// whenever pwsh is on PATH, as it is on the owner's box.
+    /// Verify that `select_shell_with_origin` agrees with `select_shell` and reports the deciding arm.
     #[test]
     fn select_shell_with_origin_names_the_arm_select_shell_took() {
         let (program, origin) = select_shell_with_origin(Some(OsStr::new("cmd")));

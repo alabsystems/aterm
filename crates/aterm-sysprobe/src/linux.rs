@@ -522,6 +522,41 @@ pub fn layout_from(
     }
 }
 
+/// One kind of core: its design (`midr_el1`'s implementer and part number,
+/// [`MIDR_DESIGN`]) and its top clock (`cpuinfo_max_freq`, kHz, where cpufreq
+/// says).
+pub type Design = (u64, Option<u64>);
+
+/// `midr_el1`'s implementer (bits 31..24) and part number (bits 15..4): the
+/// design, without its variant, architecture and revision.
+pub const MIDR_DESIGN: u64 = 0xff00_fff0;
+
+/// `capacities` with each core raised to the highest capacity among the
+/// cores of its [`Design`], so one design at one clock is one level however
+/// firmware spreads its `cpu_capacity`.
+#[must_use]
+pub fn capacities_by_design(
+    capacities: &[(u16, u32)],
+    designs: &[(u16, Design)],
+) -> Vec<(u16, u32)> {
+    let design = |id: u16| designs.iter().find(|(d, _)| *d == id).map(|(_, k)| *k);
+    if capacities.iter().any(|(id, _)| design(*id).is_none()) {
+        return capacities.to_vec();
+    }
+    capacities
+        .iter()
+        .map(|&(id, own)| {
+            let kind = design(id);
+            let top = capacities
+                .iter()
+                .filter(|(other, _)| design(*other) == kind)
+                .map(|(_, c)| *c)
+                .fold(own, u32::max);
+            (id, top)
+        })
+        .collect()
+}
+
 /// [`layout_from`]'s first rule: `None` unless at least two PMUs partition
 /// the online cores among `present` exactly; each offline present core then
 /// joins its nearest online neighbour's cluster.
@@ -922,7 +957,28 @@ impl Root {
             .collect()
     }
 
-    /// The cores grouped by performance level, fastest first ([`layout_from`] over [`Self::present_or_parallelism`], [`Self::hybrid_pmus`] and [`Self::capacities`]).
+    /// Each of `ids`' [`Design`]: its `regs/identification/midr_el1` and `cpufreq/cpuinfo_max_freq` (`/sys/devices/system/cpu/cpuN/`), for the cores that publish a MIDR (ARM).
+    #[must_use]
+    pub fn designs(&self, ids: &[u16]) -> Vec<(u16, Design)> {
+        ids.iter()
+            .filter_map(|id| {
+                let cpu = format!("sys/devices/system/cpu/cpu{id}");
+                let midr = self
+                    .read(&format!("{cpu}/regs/identification/midr_el1"), |t| {
+                        u64::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok()
+                    })
+                    .flatten()?;
+                let top = self
+                    .read(&format!("{cpu}/cpufreq/cpuinfo_max_freq"), |t| {
+                        t.trim().parse::<u64>().ok()
+                    })
+                    .flatten();
+                Some((*id, (midr & MIDR_DESIGN, top)))
+            })
+            .collect()
+    }
+
+    /// The cores grouped by performance level, fastest first ([`layout_from`] over [`Self::present_or_parallelism`], [`Self::hybrid_pmus`] and [`Self::capacities`], one level per [`Design`]).
     #[must_use]
     pub fn cpu_layout(&self) -> CpuLayout {
         let present = self.present_or_parallelism();
@@ -930,7 +986,7 @@ impl Root {
         let capacities = if pmus.len() >= 2 {
             Vec::new()
         } else {
-            self.capacities(&present)
+            capacities_by_design(&self.capacities(&present), &self.designs(&present))
         };
         layout_from(&present, self.online().as_deref(), &pmus, &capacities)
     }
@@ -1172,9 +1228,6 @@ impl Root {
             let read_at = Some(std::time::Instant::now());
             let ticks = stat.utime.saturating_add(stat.stime);
             let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
-            // A kernel thread maps no user memory: nothing in `status` or `statm` for it,
-            // and no read after its `stat` to confirm. Most of a sweep's rows are kernel
-            // threads (341 of 519 on the GB10 desk, 2026-10-23).
             let footprint = if stat.kernel_thread() {
                 Some(0)
             } else {
@@ -1224,8 +1277,6 @@ impl Root {
         let others = if readable("proc/1/stat") {
             Cap::Yes
         } else {
-            // `hidepid`: other users' processes are hidden, so sums over
-            // them are lower bounds.
             Cap::Estimate
         };
         let has_zones = self.zones().iter().any(|z| !z.trips.is_empty());

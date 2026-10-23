@@ -1,26 +1,9 @@
 // Copyright 2021 The AccessKit Authors.
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//
-// Derived from accesskit_consumer 0.37.0 (MIT OR Apache-2.0, used under
-// Apache-2.0) src/tree.rs and src/lib.rs, and cut by the aterm project in
-// 2026 to what aterm's publisher reads: one tree per window (no grafted
-// subtrees), and an update's changes reported in node order, not hash order.
+// Derived from accesskit_consumer 0.37.0 src/tree.rs and src/lib.rs.
 
-//! A window's accessibility tree as a publisher reads it: the nodes of the
-//! model's updates joined into a tree with parents and indices, and what
-//! each update changed (docs/AUDIT-third-party-2026-10-15.md, unit a11y,
-//! A11Y.5).
-//!
-//! [`Tree`] holds the published state and applies a [`TreeUpdate`] to a
-//! copy, then tells a [`ChangeHandler`] which nodes were added, updated and
-//! removed and where the focus moved, old and new node side by side, before
-//! it adopts the copy. [`Node`] reads a node in its tree, and [`text`]
-//! (crate::text) walks a text document's runs.
-//!
-//! An update that breaks the model's rules (a node that is nobody's child, a
-//! child twice, a focus or root that is not in the tree) panics, as the
-//! upstream crate's does: the window that builds the tree is aterm itself.
+//! Window accessibility tree ([`Tree`], [`TreeUpdate`], [`ChangeHandler`], [`Node`], [`text`]).
 
 mod filters;
 mod iterators;
@@ -45,8 +28,7 @@ pub(crate) struct State {
     next_incarnation: u64,
 }
 
-/// The nodes an update touched, in node order so the events they cause come
-/// out the same way every time.
+/// The nodes an update touched.
 #[derive(Default)]
 struct Changes {
     added: BTreeSet<NodeId>,
@@ -212,8 +194,6 @@ impl State {
         self.focus = NodeId(update.focus);
         self.is_host_focused = is_host_focused;
 
-        // What no node holds any more goes, with everything under it that
-        // the update did not give a new parent.
         for id in unreachable {
             let mut stack = vec![id];
             while let Some(id) = stack.pop() {
@@ -307,8 +287,7 @@ impl State {
         self.data.toolkit_version.as_deref()
     }
 
-    /// The model's id of `node_id`, if it is in the tree: what an action
-    /// request names.
+    /// The model's id of `node_id`, if it is in the tree.
     #[inline]
     pub(crate) fn locate_node(&self, node_id: NodeId) -> Option<LocalNodeId> {
         self.nodes.contains_key(&node_id).then_some(node_id.0)
@@ -323,7 +302,7 @@ pub(crate) trait ChangeHandler {
     fn node_removed(&mut self, node: &Node);
 }
 
-/// A window's tree: the published state, and the next one an update builds.
+/// A window's tree.
 #[derive(Debug)]
 pub(crate) struct Tree {
     state: State,

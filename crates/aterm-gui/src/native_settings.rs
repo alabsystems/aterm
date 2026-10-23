@@ -377,7 +377,7 @@ const THEME_MODE_KEY: &str = "theme-mode";
 const THEME_PREVIEW_SIDE_ACTION: &str = "settings/theme-preview-side";
 const THEME_SLOT_ACTION_PREFIX: &str = "settings/theme-slot/";
 
-/// The config key the compiled Settings control `key` edits, one binding the Settings builder owns.
+/// The config key the compiled Settings control `key` edits.
 pub(crate) fn edited_setting_key(key: &UiKey) -> Option<&str> {
     let key = key.as_str();
     if let Some(setting) = key.strip_prefix("settings/control/") {
@@ -390,7 +390,8 @@ pub(crate) fn edited_setting_key(key: &UiKey) -> Option<&str> {
     (slot || key == THEME_MODE_ACTION).then_some(prefs::EDIT_THEME)
 }
 
-/// What a setting is, in the words its controls together say, where its control is not one `settings/control/<key>` row.
+/// What a setting is, in the words its controls together say, where its control is not one
+/// `settings/control/<key>` row.
 pub(crate) fn setting_effective_words(state: &SettingsViewState, key: &str) -> Option<String> {
     (key == prefs::EDIT_THEME).then(|| {
         theme_value_words(
@@ -1414,7 +1415,7 @@ impl UndoOffer {
     }
 }
 
-/// Facts sampled by the host from existing writer/registration state. No I/O.
+/// Facts sampled by the host from existing writer/registration state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SessionRuntime {
     pub(crate) desk: crate::desk::Desk,
@@ -1518,11 +1519,8 @@ pub(crate) struct SettingsViewState {
     pinned_place: Cell<Option<PinnedPlace>>,
     measuring_calm: Cell<bool>,
     status_extra: Cell<f32>,
-    /// What a plain status's bar under a reload warning could give back,
-    /// while [`page`] builds it ([`plain_status_slack`]): there the page is
-    /// laid out again under the bar, which takes nothing from the list's
-    /// screens ([`plain_status_extra`]), and shortens by up to this for the
-    /// control the person is on ([`SettingsViewState::note_status_room`]).
+    /// What a plain status's bar under a reload warning could give back ([`page`],
+    /// [`plain_status_slack`], [`plain_status_extra`], [`SettingsViewState::note_status_room`]).
     status_slack: Cell<f32>,
     status_bar_most: Cell<Option<f32>>,
     status_overrun: Cell<f32>,
@@ -2295,8 +2293,7 @@ impl SettingsViewState {
             && (!font_picker_key(field.key) || self.font_row_takes_text(field.key))
     }
 
-    /// Take the MACOS ACCESS block off this view (its posture source publishes
-    /// nothing now); whether it carried one.
+    /// Take the MACOS ACCESS block off this view (its posture source publishes nothing now).
     pub(crate) fn clear_macos_access(&mut self) -> bool {
         self.macos_access.take().is_some()
     }
@@ -2441,7 +2438,7 @@ impl SettingsViewState {
         true
     }
 
-    /// Drain the *Move to Trash* press: the copies it was pressed for.
+    /// Drain the *Move to Trash* press.
     pub(crate) const fn take_claimant_retire_request(&mut self) -> Option<Vec<std::path::PathBuf>> {
         self.claimant_retire_request.take()
     }
@@ -2453,7 +2450,7 @@ impl SettingsViewState {
         self.debugger_change_request.take()
     }
 
-    /// Drain a pending `sudo` off-switch press, `Some` carrying its direction, for the park to persist via `crate::askpass::set_relay_off`.
+    /// Drain a pending `sudo` off-switch press.
     pub(crate) const fn take_askpass_off_request(&mut self) -> Option<(bool, OwnerYes)> {
         self.askpass_off_request.take()
     }
@@ -2477,7 +2474,7 @@ impl SettingsViewState {
         true
     }
 
-    /// Record a confirmed debugger-access press, as the reducer arm does, for the host's drain tests.
+    /// Record a confirmed debugger-access press.
     #[cfg(test)]
     pub(crate) fn record_debugger_change_for_test(
         &mut self,
@@ -2969,7 +2966,6 @@ impl SettingsViewState {
             } else if from_desktop_navigation {
                 Some(UiKey::new(format!("settings/nav{}", route.path())))
             } else {
-                // Leave focus unset until its first real tree establishes one.
                 None
             }
         });
@@ -3720,9 +3716,6 @@ impl SettingsApp {
                     if Self::submit_config(view, cx, patch).is_some() {
                         view.feedback = Some("Applying…".to_string());
                     } else {
-                        // Return on what the file already holds (an empty
-                        // field while the key is unset): the draft closes on
-                        // the saved value and no status claims a change.
                         view.field_inputs.remove(&key);
                     }
                 }
@@ -3773,8 +3766,7 @@ impl SettingsApp {
             return false;
         };
         let Some(index) = view.field_index_of(key) else {
-            // An action from a prior compiled Settings revision is consumed but
-            // cannot create arbitrary field state or mutate configuration.
+            // Distinct branch.
             return true;
         };
         let field = &view.legacy.fields[index];
@@ -4956,7 +4948,6 @@ impl SettingsApp {
         {
             let Some(entry) = manual_reset_schema_entry(index) else {
                 // Stale/forged actions cannot promote unknown structures into
-                // destructive dotted-key edits.
                 return EventResult::Handled;
             };
             if !view.raw_values.contains_key(entry.key) {
@@ -5069,7 +5060,6 @@ impl SettingsApp {
             }
             "settings/reset-all-confirm" => {
                 if !view.reset_all_confirmation {
-                    // A stale semantic action cannot bypass the disclosure step.
                     return EventResult::Handled;
                 }
                 let patch = ConfigPatch {
@@ -5332,8 +5322,6 @@ impl SettingsApp {
                 let said = if confirmed {
                     "aterm is already starting a debugger-access change.".to_string()
                 } else if view.macos_access.is_none() {
-                    // A headless instance, a unit test, a non-macOS build:
-                    // no row, so nothing a press could have been aimed at.
                     "Nothing was changed: this page does not show debugger access.".to_string()
                 } else if let Some(why) = debugger_press_refusal(&facts, change) {
                     format!("Nothing was changed: {why}.")
@@ -5475,14 +5463,10 @@ impl SettingsApp {
                     view.feedback =
                         Some("Update checks are unavailable for this installation.".to_string());
                 } else if update.installable.cannot_install() && !update.linux_host {
-                    // No check thread ever starts in a copy that can't replace
-                    // itself: say why instead of sending a check nothing answers.
                     view.feedback = Some(UPDATE_CANT_INSTALL.to_string());
                 } else if update.installable == UpdateInstallability::Unobserved
                     && !update.linux_host
                 {
-                    // Nothing has read this copy yet: a check it may not be able
-                    // to run is not sent on a guess.
                     view.feedback = Some(UPDATE_UNOBSERVED_FEEDBACK.to_string());
                 } else if update.checking {
                     view.feedback = Some("An update check is already in progress.".to_string());
@@ -5829,11 +5813,8 @@ impl SettingsApp {
         view.relay_in_flight(&finished, landed);
         if view.reset_all_confirmation {
             if failed {
-                // Why the change did not land, rather than a question about
-                // values that just went back.
                 view.reset_all_confirmation = false;
             } else {
-                // The question stays, and says what Reset All would reset now.
                 view.feedback = Some(reset_all_scope(view));
             }
         }
@@ -5917,9 +5898,6 @@ impl SettingsApp {
         if add_failed {
             view.showcase.error = view.feedback.clone();
         } else if !selecting && !keeping && view.feedback.is_some() && !theme_outcome_failed {
-            // A finished save, trash, add or import is a completion; one that
-            // goes on to select or keep a theme stands until that lands, and a
-            // failure stands.
             view.mark_transient_status();
         }
         view.common.presentation_revision = view.common.presentation_revision.saturating_add(1);
@@ -6087,8 +6065,6 @@ impl SettingsApp {
             "copy-all" => {
                 let shown = messages_visible(&self.messages, &view.messages_filter);
                 if shown.is_empty() {
-                    // Nothing shown, nothing to copy: the button is greyed,
-                    // and the palette's command with it.
                     return EventResult::Handled;
                 }
                 let text = aterm_messages::page::copy_all_text(
@@ -6669,7 +6645,6 @@ fn settings_field_result_count(view: &SettingsViewState) -> usize {
         + usize::from(global_search && manual_search_has_match(view, query))
         + search_page_hits(view, query).len()
         + if modified_only {
-            // One row per selected key; labels and previews are decoration.
             authored_manual_override_keys(view).len()
         } else {
             0
@@ -6773,7 +6748,6 @@ fn authored_manual_overrides(view: &SettingsViewState) -> Vec<ManualOverride> {
                         } else if schema.is_none() {
                             unknown_key_preview(key)
                         } else if key == prefs::EDIT_CURSOR_TRAIL_STYLE_BEFORE_OFF {
-                            // A style by the name its row goes by.
                             cursor_style_name(raw)
                         } else {
                             manual_override_preview(raw, schema)
@@ -7156,11 +7130,8 @@ fn change_words(
         } else if switch {
             format!("{name} turned {}", now.to_lowercase())
         } else if row == prefs::EDIT_WALLPAPER && after(row).is_none() {
-            // The Remove button's own words, kept once the change saves.
             "Wallpaper removed".to_string()
         } else if row == prefs::EDIT_PALETTE_OVERRIDES && after(row).is_none() {
-            // Every tuned slot came off (Save as theme carries them into the
-            // file): say where the colours come from now.
             palette_colours_source_words(view, &after)
         } else if after(row).is_none() && row != prefs::EDIT_CURSOR_TRAIL_STYLE {
             format!("{name} reset to {now}")
@@ -7168,9 +7139,6 @@ fn change_words(
             && prefs::theme_mode(before(row).as_deref()) == prefs::ThemeMode::FollowSystem
             && prefs::theme_mode(after(row).as_deref()) == prefs::ThemeMode::Always
         {
-            // A theme that followed the system is now one theme for both
-            // appearances (Follow system off, or a Keep that pinned it): the
-            // status says so, since no row of its own names the switch.
             format!("{name} set to {now} for light and dark mode")
         } else {
             format!("{name} set to {now}")
@@ -7298,7 +7266,6 @@ fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<S
         && prefs::trail_color_setting(raw(key).as_deref())
             == aterm_effects::cursor_fx::TrailColor::Cursor
     {
-        // The cursor's colour by its word reads as the picker names it.
         return prefs::TRAIL_COLOR_CURSOR_LABEL.to_string();
     }
     if key == prefs::EDIT_DISPLAY_FONT {
@@ -7339,8 +7306,6 @@ fn row_words(view: &SettingsViewState, key: &str, raw: &dyn Fn(&str) -> Option<S
         && let Some(value) = raw(key)
         && let Some(meta) = view.assets.themes.meta(value.trim())
     {
-        // One theme reads as the name its card shows (a themes-folder file
-        // goes by its `name`, never its file id).
         return meta.display_name;
     }
     if raw(key).is_none()
@@ -7694,10 +7659,6 @@ fn settings_field_is_visible(
         return true;
     }
     if top_setting {
-        // Color theme and Window appearance also lead their own page, the
-        // Appearance page's Theme group, and the font family and size lead
-        // Text & Fonts: the same row, key and picker as Top Settings, so the
-        // page can change what its preview shows.
         return TOP_KEYS_ON_THEIR_PAGE.contains(&key);
     }
     special_page_of(key).is_none()
@@ -7917,9 +7878,7 @@ fn settings_page_scroll_limit(view: &SettingsViewState) -> usize {
     view.result_page_limit.get().unwrap_or(usize::MAX)
 }
 
-/// Whether `event` is a projection's reply, not something the person sent:
-/// a shared snapshot that advanced, or the outcome of an effect a view asked
-/// the host for.
+/// Whether `event` is a projection's reply, not something the person sent.
 const fn projection_reply(event: &AppEvent) -> bool {
     matches!(
         event,
@@ -7951,14 +7910,6 @@ impl SettingsApp {
         cx: &mut UpdateCx<'_>,
     ) -> EventResult {
         let view_id = cx.view_id();
-        // ONLY WHAT THE PERSON SENDS LETS THE LIST'S PLACE GO
-        // ([`SettingsViewState::settle_page_scroll`]): a projection's reply
-        // (the Messages tick every view gets each minute, a refresh, a
-        // write's outcome) is nothing they did, so it lets no landing, no
-        // wheel's place and no kept control go
-        // ([`SettingsViewState::seat_scroll`]'s keeping rules). Settled by
-        // the tick, Themes opened on Nord at 1144x700 and made 1144x462 lost
-        // Nord's row.
         if !projection_reply(&event) {
             view.settle_page_scroll();
         }
@@ -9444,9 +9395,7 @@ fn choices_for_field(
 ) -> Option<Vec<String>> {
     match field.kind {
         EditKind::Enum { .. } if field.key == prefs::EDIT_PREDICTIVE_ECHO => {
-            // `always` may expose password keystrokes. Manual accepts it for
-            // experts who deliberately author the unsafe mode; the ordinary
-            // native picker offers only the safe Off and Adaptive policies.
+            // Distinct branch.
             Some(vec!["off".to_string(), "adaptive".to_string()])
         }
         EditKind::Enum { options } => {
@@ -9919,9 +9868,6 @@ fn field_text(state: &SettingsViewState, key: &str, fallback: &str) -> String {
                 return fallback.trim().to_string();
             };
             if field.seed.is_some() {
-                // An explicit value may legally end in the same characters as
-                // the placeholder annotation. `display_value` preserves that
-                // data while canonicalizing only recognized Enum aliases.
                 return SettingsState::display_value(field).trim().to_string();
             }
             let display = SettingsState::display_value(field).trim();
@@ -9960,7 +9906,6 @@ fn preview_field_text(state: &SettingsViewState, key: &str, fallback: &str) -> S
 
 fn preview_font_px(state: &SettingsViewState, applied: f32) -> f32 {
     if state.environment_override(prefs::EDIT_FONT_PX).is_some() {
-        // A launch-pinned size stays fixed, just as it does in the terminal.
         return preview_unscaled_font_px(state, applied).0;
     }
     let scale_of = |text: &str| {
@@ -9998,7 +9943,6 @@ fn preview_unscaled_font_px(state: &SettingsViewState, applied: f32) -> (f32, bo
             })
     };
     if let Some(active) = state.environment_override(key) {
-        // A launch size is never scaled.
         return (admitted(&active.effective).unwrap_or(applied), true);
     }
     if let Some(input) = state.field_inputs.get(key) {
@@ -10870,21 +10814,16 @@ fn renderer_preview_spec_for_key_with_font(
                 .is_some_and(|field| field.seed.is_none())
             && !state.field_has_unsaved_draft(focused_key)
         {
-            // An unset font row reads as its control does: "Automatic
-            // (SF Mono)".
             font_automatic_label(state, focused_key)
         } else if value.is_empty() {
             effective_default_for_field(focused_key)
         } else if focused_key == prefs::EDIT_THEME
             && prefs::theme_mode(Some(&value)) == prefs::ThemeMode::FollowSystem
         {
-            // A Follow system pair is named by the side the preview draws,
-            // never as its raw `dark:…,light:…` text.
             resolved.id.clone()
         } else if focused_key == prefs::EDIT_CURSOR_TRAIL_COLOR
             && value.trim().eq_ignore_ascii_case(prefs::TRAIL_COLOR_CURSOR)
         {
-            // The cursor's colour by its word, named as the row names it.
             prefs::TRAIL_COLOR_CURSOR_LABEL.to_string()
         } else if state
             .field_by_key(focused_key)
@@ -11608,10 +11547,6 @@ fn compact_toolbar_leading(
     }
     let spec = ButtonSpec::new(ALL_SETTINGS);
     if status_docked {
-        // A transient status dock replaces Search and keeps the button
-        // icon-only. This leaves enough horizontal measure for a complete
-        // recovery/confirmation action pair at 2x Dynamic Type while its
-        // name remains "All Settings".
         return (spec.visual_icon(ButtonIcon::Back), 56.0);
     }
     if let Some(titled) = compact_titled_leading(viewport) {
@@ -12524,7 +12459,6 @@ fn plain_bar_layout(
         .clamp(1, most_lines) as f32
         * status_line_height();
     let height = if undo_under {
-        // The bar's 5pt padding, the words, a gap and Undo's row.
         words + 4.0 + scaled_control_height()
     } else {
         scaled_control_height().max(words + 10.0)
@@ -12569,7 +12503,6 @@ fn status_words_node_at(
     let mut lines = status_word_lines(feedback, width);
     let scrolls = lines.len() > most;
     if scrolls {
-        // The thumb's room at the lines' end.
         lines = status_word_lines(feedback, (width - STATUS_THUMB_GUTTER).max(1.0));
     }
     let words_key = format!("{key}/words");
@@ -13303,9 +13236,6 @@ fn bar_undo_width() -> f32 {
     if need <= WIDTH {
         WIDTH
     } else {
-        // A point past the exact measure: the painter takes its edges off the
-        // button's placed origin, so a width of exactly the word's lands a
-        // hair under it (`top_regular_choice_control_width` says the same).
         need.ceil() + 1.0
     }
 }
@@ -13804,7 +13734,6 @@ fn navigation(
         if text_scale > 1.25 {
             "Search…"
         } else {
-            // Its semantic label still names everything search finds.
             "Search settings…"
         },
         Length::Fixed(search_height),
@@ -14020,11 +13949,6 @@ fn page(
     let (mut children, layout) = match built {
         Some(built) if !bars => built,
         _ => {
-            // seated again under a bar that much shorter — and again, until
-            // the bar leaves the control its room or is at its least: under
-            // a reload warning the page is laid out again under the shorter
-            // bar, and a pinned head or footer the list's room gave way to
-            // can take part of what the bar gave.
             state.status_overrun.set(0.0);
             let mut seated = seat(chrome, false).0;
             loop {
@@ -14328,8 +14252,6 @@ fn settings_page_gap(
         && state.choice_picker.is_some()
         && compact_header_height(state, viewport) > compact_toolbar_height() + 0.01
     {
-        // A dock whose actions go under its words owns two toolbar rows. Six
-        // points keeps the complete picker inside the same body budget.
         6.0
     } else {
         responsive_page_gap(width, viewport.height)
@@ -14483,10 +14405,8 @@ fn lists_its_preview_when_starved(route: SettingsRoute) -> bool {
 thread_local! {
     /// How many renders took the chrome remembered for their inputs, on this thread.
     pub(crate) static CHROME_REMEMBERED: Cell<usize> = const { Cell::new(0) };
-    /// Whether this thread's renders draw a plain status's bar at its
-    /// least, its words on one line ([`SettingsViewState::status_bar_most`]):
-    /// the most room any bar leaves the page, which a test measures to tell
-    /// geometry from the bar's height the page chose.
+    /// Whether this thread's renders draw a plain status's bar at its least
+    /// ([`SettingsViewState::status_bar_most`]).
     pub(crate) static STATUS_BAR_LEAST: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -14637,16 +14557,7 @@ fn plain_status_extra(
 }
 
 /// THE BAR UNDER A RELOAD WARNING SHORTENS FOR WHAT THE PERSON IS ON TOO
-/// (R2 of [`SettingsViewState::seat_scroll`]'s keeping rules): there a
-/// plain status's bar takes nothing from the list's screens
-/// ([`plain_status_extra`]) — the page is laid out again under it — and
-/// this is how much shorter it can be, down to its words' one line, which
-/// scroll in it ([`status_words_node`]). Shortened only without the warning,
-/// a status that came at 178x348 at 2× text over Settings ▸ Themes under
-/// the warning drew a 224pt bar for all its words, and the Customize
-/// sheet's Done, or the chooser's filter, the keyboard on it, was on no
-/// screen of the list, where the bar's one line (64pt) left the list room
-/// to show it.
+/// ([`SettingsViewState::seat_scroll`], [`plain_status_extra`], [`status_words_node`]).
 fn plain_status_slack(
     state: &SettingsViewState,
     width: SettingsWidth,
@@ -15560,7 +15471,6 @@ fn compact_landscape_choice_page(
 fn choice_option_button(option: &ChoiceOption, text_width: f32, fonts: bool) -> ButtonSpec {
     let visual = if option.value.is_none() && option.theme.is_none() && !option.free_text && !fonts
     {
-        // The reset row says what the default is, as the closed control does.
         reset_row_visual(&option.label, text_width.max(0.0))
     } else {
         crate::native_ui::fit_native_button_label(&option.label, text_width.max(0.0))
@@ -15997,8 +15907,6 @@ fn settings_location(key: &str) -> &'static str {
     } else if key == prefs::EDIT_TRAIL_SOUNDS {
         Some(SettingsRoute::Sound)
     } else if TOP_SETTING_KEYS.contains(&key) && !TOP_KEYS_ON_THEIR_PAGE.contains(&key) {
-        // A Top key that leads its own page is placed there, by its section,
-        // below.
         Some(SettingsRoute::Home)
     } else if key.starts_with("update.") {
         Some(SettingsRoute::SoftwareUpdate)
@@ -16026,7 +15934,6 @@ fn search_group_caption(key: &str, group: &str) -> String {
     {
         PLAYFUL_EFFECTS_TITLE
     } else if key == prefs::EDIT_ACTIVE_TAB_COLOR {
-        // The Tab Color page is the whole of its place.
         location
     } else {
         group
@@ -16928,7 +16835,6 @@ fn theme_slot_row(
     let control_width = if width == SettingsWidth::Compact {
         Length::Fill
     } else if matches!(host, ThemeRowsHost::List { .. }) {
-        // A list's choice column, so the slot lines up with the rows under it.
         Length::Fixed(270.0 * settings_text_scale().min(1.25))
     } else {
         Length::Fixed(
@@ -17202,9 +17108,6 @@ fn top_preview(
 }
 
 fn top_serious_mode_disclosure_height() -> f32 {
-    // The visual child is a Caption status, not body copy. Keep enough line
-    // height for Dynamic Type without charging the 40pt body-subtitle band at
-    // 2×; this lets short landscape retain both disclosure and a full picker.
     28.0_f32.max(16.0 * settings_text_scale())
 }
 
@@ -17312,8 +17215,6 @@ fn top_cards(
             if cfg!(target_os = "macos") {
                 "Choose colors; the window can match macOS, Light, or Dark."
             } else {
-                // The Linux and Windows truth: Automatic tracks the terminal
-                // theme, not a live OS appearance feed.
                 "Choose colors; the window can match the terminal, Light, or Dark."
             },
             None,
@@ -20583,8 +20484,6 @@ fn group_footnote_lines(note: &str, available_width: f32) -> Vec<String> {
 }
 
 fn group_footnote_text_px() -> f32 {
-    // Footnote children are quiet Status copy, painted at Caption size. Measure
-    // at that exact size or wrapping can choose a line the painter must elide.
     11.0 * crate::native_appearance::text_scale()
 }
 
@@ -21149,8 +21048,6 @@ fn settings_fields_page(
         let head = if shows_caption {
             28.0 + group_caption_height(&caption, group_text_width)
         } else {
-            // The card keeps its padding and semantic label without the
-            // painted caption.
             24.0
         } + reason.as_ref().map_or(0.0, |(_, _, height)| height + 4.0);
         let id = plan.group(head, head - 10.0);
@@ -22077,9 +21974,6 @@ fn candidate_profanity_style(
     } else if authored.eq_ignore_ascii_case("nova") {
         crate::word_decorations::ProfanityStyle::Nova
     } else {
-        // The owning resolver deliberately treats absent and unknown values
-        // as Rainbow; Settings must not manufacture a fourth style from raw
-        // text when disclosing dependent controls.
         crate::word_decorations::ProfanityStyle::Rainbow
     }
 }
@@ -22095,8 +21989,6 @@ fn candidate_feline_style(
     if authored.trim().eq_ignore_ascii_case("paw") {
         crate::word_decorations::FelineStyle::Paw
     } else {
-        // The owning resolver treats every other spelling as the modern Cat
-        // graphic. Keep dependent disclosures on that same two-state result.
         crate::word_decorations::FelineStyle::Cat
     }
 }
@@ -22476,9 +22368,6 @@ fn registered_value_unavailability(
     key: &str,
 ) -> Option<EffectDisclosure> {
     if key == prefs::EDIT_CURSOR_TRAIL_STYLE {
-        // Dynamic pack existence and the built-in Off state are semantic, not
-        // merely registry syntax; the owning trail resolver below supplies
-        // the precise cause without a duplicate generic error.
         return None;
     }
     let candidate_is_authored = if let Some(patch) = patch {
@@ -24000,7 +23889,7 @@ fn config_application_projection(
     projection
 }
 
-/// One folder's published row: the folder, and what the warm-up observed.
+/// One folder's published row.
 pub(crate) type MacosAccessRow = (Folder, crate::consent_warmup::WarmupRow);
 
 /// What one *Ask again* gesture did, folded by `aterm_containment::consent::reset_outcome`.
@@ -24131,8 +24020,7 @@ impl MacosAccess {
             .collect()
     }
 
-    /// `prompt_possible` — through the consent module's own join, never a
-    /// second copy of the rule.
+    /// `prompt_possible`.
     pub(crate) fn prompt_possible(&self) -> bool {
         aterm_containment::ConsentPosture::join(aterm_containment::PostureInputs {
             adoption: if self.sessions_adopted > 0 {
@@ -24224,7 +24112,7 @@ impl ConsentGestures {
         (self.open_settings)(pane)
     }
 
-    /// The headless / unit-test arms: no `NSWorkspace`, no spawn.
+    /// The headless / unit-test arms.
     pub(crate) const fn inert() -> Self {
         Self {
             open_settings: inert_open_settings,
@@ -24254,7 +24142,7 @@ impl ConsentGestures {
         (self.run_devtools)(job)
     }
 
-    /// The inert arms with a stand-in alert and a stand-in worker start, for the App's tests of the debugger-access launch ask.
+    /// The inert arms with a stand-in alert and a stand-in worker start.
     #[cfg(all(test, target_os = "macos"))]
     pub(crate) const fn for_test_with(
         confirm: fn(&str, &str, &str) -> Option<bool>,
@@ -24282,7 +24170,7 @@ impl ConsentGestures {
         }
     }
 
-    /// Whether these are the live arms, for the tests that prove an unarmed view cannot reach the OS.
+    /// Whether these are the live arms.
     #[cfg(test)]
     pub(crate) const fn is_live(self) -> bool {
         self.live
@@ -24730,8 +24618,6 @@ pub(crate) fn macos_access_copy(access: &MacosAccess) -> MacosAccessCopy {
                   dialog for this.";
     let lasts = "Lasts: While this aterm keeps its signature. Applies to programs run in aterm.";
     let prompt = if access.prompt_possible() && access.fda == FdaState::Granted {
-        // The coverage line above already says what was measured and what
-        // was not; this line says what that leaves, pointing at the rows.
         "Granted. A row below marked not measured, or one Full Disk Access does not apply to, can still interrupt a program."
     } else if access.prompt_possible() {
         "A program running in aterm can still be interrupted by a macOS file-access request."
@@ -25562,7 +25448,7 @@ pub(crate) const MACOS_ACCESS_DEBUGGER_ON: &str = "settings/macos-access/debugge
 pub(crate) const MACOS_ACCESS_DEBUGGER_OFF: &str = "settings/macos-access/debugger-off";
 /// The owner's `sudo` askpass relay off switch.
 pub(crate) const MACOS_ACCESS_ASKPASS_OFF: &str = "settings/macos-access/askpass-off";
-/// *Allow sudo Password Prompts* — the other direction of the off switch.
+/// *Allow sudo Password Prompts*.
 pub(crate) const MACOS_ACCESS_ASKPASS_ON: &str = "settings/macos-access/askpass-on";
 /// *Open Developer Tools…*, the Developer Tools card's one button.
 pub(crate) const MACOS_ACCESS_OPEN_DEVTOOLS: &str = "settings/macos-access/developer-tools";
@@ -25685,7 +25571,7 @@ impl OwnerQuiet {
         self.askpass_confirmed = true;
     }
 
-    /// Whether a press right now would be quieted, for the host's tests of what counts as a decline.
+    /// Whether a press right now would be quieted.
     #[cfg(test)]
     pub(crate) fn is_quiet_now_for_test(&self) -> bool {
         self.quiet_at(QuietStamp::now())
@@ -25712,7 +25598,7 @@ impl OwnerYes {
     }
 }
 
-/// Ask the owner in aterm's alert, through `gestures`' confirm arm, unless a recent decline quiets every Security gesture (`quiet`).
+/// Ask the owner in aterm's alert.
 pub(crate) fn owner_confirms_with(
     quiet: &SharedOwnerQuiet,
     gestures: &ConsentGestures,
@@ -27615,10 +27501,6 @@ fn with_tags<'a>(base: &str, tags: impl IntoIterator<Item = &'a String>) -> Stri
 }
 
 fn row_label_fits(text: &str, label_width: f32) -> bool {
-    // As the painter elides (`elide_text_label`: whole where its width is at
-    // most the box's), with no slack of its own: a line a hair over its box
-    // painted "Mark t…" where this said it fit (108.004pt of Noto Sans in
-    // 108).
     row_label_width(text) <= label_width
 }
 
@@ -28605,7 +28487,7 @@ fn row_shown_value(state: &SettingsViewState, field: &EditField, modified_only: 
     }
 }
 
-/// WHAT A SETTING READS AS NOW, in the words its Settings row's control says and where it comes from.
+/// WHAT A SETTING READS AS NOW.
 pub(crate) fn effective_value_words(
     snapshot: &crate::native_config_service::ConfigSnapshot,
     key: &str,
@@ -29157,8 +29039,6 @@ fn setting_row_parts_in(
             setting_reset_button_to(field, theme_fallback.as_ref())
         })
     } else if reserve_reset_slot {
-        // The Reset's place, kept while the row has none, so the control
-        // stays where it is when a change brings Reset up.
         Some(reset_slot(field.key))
     } else {
         None
@@ -29634,8 +29514,6 @@ fn numeric_slider_value(field: &EditField) -> Option<(f64, String)> {
         return Some((effective, compact_f64(effective)));
     }
     if (range.min..=range.max).contains(&configured) {
-        // The number as aterm spells one (`prefs::written_number`): a
-        // placeholder's "1.0" and a saved "1" read the same.
         return Some((configured, compact_f64(configured)));
     }
 
@@ -30443,7 +30321,7 @@ fn line_pieces(text: &str) -> Vec<(&str, &str)> {
     pieces
 }
 
-/// `text`'s lines in a box `width` wide, each as full as the box holds, measured by `measure` (the face and size the lines paint in).
+/// `text`'s lines in a box `width` wide.
 pub(crate) fn wrap_to_box(text: &str, width: f32, measure: &dyn Fn(&str) -> f32) -> Vec<String> {
     wrap_to_box_marked(text, width, measure, "-")
 }
@@ -30839,7 +30717,6 @@ fn update_release_notes_padding() -> f32 {
 }
 
 fn update_release_notes_line_height() -> f32 {
-    // Keep the page capacity derived from that exact painter contract.
     (13.0 * crate::native_appearance::text_scale() * 1.45).max(16.0)
 }
 
@@ -30933,7 +30810,6 @@ const fn not_applying(update: &UpdateProjection) -> bool {
 
 pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
     if update.checking || update.installable == UpdateInstallability::Unobserved {
-        // Unobserved: the full headline's "Checking this copy…".
         "Checking".to_string()
     } else if update.linux_host {
         if update.installable.cannot_install() {
@@ -30961,16 +30837,12 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
         {
             "Installed"
         } else if !update.automatic_checks {
-            // The full ladder's idle arm (`UpdateState::headline`): below every disk,
-            // enrollment and trouble fact, above "None staged".
             "Checks off"
         } else {
             "None staged"
         }
         .to_string()
     } else if update.staged_on_hold {
-        // The full headline's "Update on hold" (`UpdateState::headline`),
-        // failed tries or not: never "Ready".
         "On hold".to_string()
     } else if not_applying(update) {
         "Not installing".to_string()
@@ -30979,21 +30851,14 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
     } else if update.failing_persistent {
         "Failing".to_string()
     } else if update.dev_build {
-        // Left alone on purpose: the headline says where it stands.
         "Dev build".to_string()
     } else if update.installable.cannot_install() {
-        // Not "Current": nothing was compared, and this copy could not take a newer
-        // build if one existed.
         "Can\u{2019}t update".to_string()
     } else if update.channel_unreadable {
-        // Not "Current": the channel cannot be read, so no comparison ran and none
-        // will until an operator acts.
         "Can\u{2019}t check".to_string()
     } else if !update.enabled {
         "No updater".to_string()
     } else if !update.automatic_checks {
-        // Not "Current": nothing in this process checks by itself (the full
-        // headline's "Automatic checks are off."). Every trouble arm above outranks it.
         "Checks off".to_string()
     } else {
         "Current".to_string()
@@ -31011,8 +30876,6 @@ pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
             .clone()
             .unwrap_or_else(|| "Run `aterm update status`.".to_string())
     } else if let Some(trouble) = update.apply_trouble.as_ref() {
-        // The count and the cause survive the squeeze to a phone column; the whole
-        // sentence stays the card's semantic value for assistive tech.
         trouble.compact()
     } else if update.staged_on_hold {
         format!(
@@ -31020,8 +30883,6 @@ pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
             crate::update_words::NEWER_RELEASE_REPLACES
         )
     } else if not_applying(update) {
-        // Escalated, but the ledger cannot pin the streak to this artifact (see
-        // `UpdateState::apply_failure_build`): no count or cause, yet not "Ready".
         "Downloaded, but it keeps failing to install.".to_string()
     } else if update.staged.is_some() && update.failing_persistent {
         "Ready to install; update checks are failing.".to_string()
@@ -31057,8 +30918,6 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
         .to_string();
     }
     if let Some(trouble) = update.apply_trouble.as_ref().filter(|_| !update.checking) {
-        // The tersest rung keeps the count ("2 tries failed"): the one fact that
-        // separates this from a stage waiting its turn.
         return trouble.micro();
     }
     if update.checking {
@@ -31084,7 +30943,6 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
     } else if !update.enabled {
         "Unavailable."
     } else if !update.automatic_checks {
-        // Beside "Checks off": what still checks (the button, the terminal verb).
         "Manual checks."
     } else {
         "Up to date."
@@ -31127,20 +30985,16 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
     } else if update.staged.is_some() {
         "Ready"
     } else if update.failing_persistent {
-        // Beside the Danger "Failing" headline; "None staged" would contradict it.
         "Checks failing"
     } else if update.dev_build {
-        // Beside the "Dev build" headline: why nothing moves it, not the same words.
         "Not auto-updated"
     } else if update.installable.cannot_install() {
         "Needs an installed copy"
     } else if update.channel_unreadable {
-        // Beside "Can't check"; "Up to date" would claim a comparison that never ran.
         "Channel unreadable"
     } else if !update.enabled {
         "Unavailable"
     } else if !update.automatic_checks {
-        // Beside "Checks off".
         "Manual checks"
     } else {
         "Up to date"
@@ -31728,9 +31582,7 @@ fn update_notes_lines(update: &UpdateProjection) -> Vec<String> {
         format!("Version {version} {state}; its release notes aren\u{2019}t available here.")
     } else if update.failing_persistent || update.dev_build || !update.installable.is_installable()
     {
-        // Never "is the latest build" where the headline says this Mac cannot update,
-        // is a dev build left alone, or is a copy that can never replace itself; the
-        // status card names the cause.
+        // Distinct branch.
         "Release notes appear here when an update is ready.".to_string()
     } else if update.enabled && (update.channel_unreadable || update.checked_at.is_none()) {
         // Channel unreadable or first check still pending.
@@ -32131,8 +31983,6 @@ fn update_automatic_caption(
     let compact = width == SettingsWidth::Compact;
     let install = prefs::UPDATE_INSTALL_LABEL;
     if macos_updater && installable.cannot_install() {
-        // A copy that can't replace itself checks and installs nothing; the
-        // switches are saved for an installed copy, and say only that.
         "These switches take effect in an installed copy of aterm.".to_string()
     } else if linux_updater {
         if compact {
@@ -34900,7 +34750,6 @@ impl MessagesPlan {
 
     fn indent(&self) -> f32 {
         if self.lead.stacked {
-            // Under a stacked head the body has the row, as its title does.
             self.lead.gap
         } else if self.compact {
             self.lead.mark + self.lead.gap
@@ -36539,7 +36388,6 @@ fn field_own_match_score(
 
 const fn update_page_subtitle(native_updater: bool) -> &'static str {
     if !native_updater {
-        // The headline ("No in-app updater here.") and the detail line name the rest.
         "Updates arrive by reinstalling."
     } else {
         "Your version of aterm and how it updates."

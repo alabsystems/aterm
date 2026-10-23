@@ -2,9 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The `.tar.zst` writer: a deterministic ustar/PAX archive of a staged tree, compressed
-//! through the [`Compressor`] port: the `zstd` CLI ([`ZstdCli`]) for every real pack,
-//! aterm-zstd's raw-block writer (`RawFrames`, a debug-build seam) in the producer's tests,
-//! which then need no zstd CLI (init design §6.1 row 18).
+//! through the [`Compressor`] port.
 
 use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
@@ -85,9 +83,7 @@ enum Member {
     },
 }
 
-/// What compresses a pack's tar stream into its asset. Every real pack is [`ZstdCli`];
-/// the producer's tests pack through `RawFrames`, so they need no zstd CLI. Whatever
-/// it writes is decoded back and held to the stream before the asset is hashed.
+/// What compresses a pack's tar stream into its asset.
 pub trait Compressor {
     /// Write the zstd frames of the stream `tar` writes into `asset` (an empty file open
     /// for writing).
@@ -122,8 +118,7 @@ impl Default for ZstdCli {
 /// Raw zstd frames, uncompressed and each with its content checksum, of at most
 /// `frame_max` stream bytes each: what aterm-zstd's raw-block writer
 /// (`aterm_zstd::frame::write_raw`) writes, which every client's decoder reads like the
-/// CLI's frames. The producer's tests compress with it, so they need no zstd CLI; a debug
-/// build's seam only, since a shipped pack is always [`ZstdCli`]'s.
+/// CLI's frames.
 #[cfg(any(test, debug_assertions))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RawFrames {
@@ -446,7 +441,6 @@ fn encode(members: &[Member], asset: &Path, compressor: &dyn Compressor) -> io::
         (n, sum) = (out.n, out.hash.digest());
         streamed
     })?;
-    // Durable: the asset is uploaded and signed for every client after this.
     aterm_durable::durable(&file)?;
     decodes_back(asset, n, sum)?;
     Ok(n)
@@ -474,7 +468,6 @@ impl Compressor for ZstdCli {
             })?;
         let child = CompressorChild::new(child);
         let (streamed, said, status) = std::thread::scope(move |scope| {
-            // Moved in so it drops before the scope's implicit joins on an error or unwind.
             let mut child = child;
             let stdin = child
                 .child
@@ -487,9 +480,6 @@ impl Compressor for ZstdCli {
                 .stderr
                 .take()
                 .ok_or_else(|| io::Error::other("the compressor's stderr was not piped"))?;
-            // Drained while the stream is written: a compressor that fills its stderr pipe
-            // would otherwise block while this thread blocks writing its stdin. If the
-            // drain cannot start, dropping `child` kills and reaps the compressor.
             let drain = std::thread::Builder::new()
                 .name("pack-zstd-stderr".to_string())
                 .spawn_scoped(scope, move || {
@@ -499,8 +489,6 @@ impl Compressor for ZstdCli {
                     said
                 })?;
             let streamed = tar(child.input.as_mut().expect("the input was installed"));
-            // `wait` closes stdin, which ends the stream; the drain reads on until zstd
-            // exits.
             let status = child.wait()?;
             let said = drain
                 .join()

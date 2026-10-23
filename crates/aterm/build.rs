@@ -8,17 +8,13 @@
     reason = "never linked into the shipped binary: a build script"
 )]
 
-/// Ordinal of both the icon and the manifest; resources are keyed by (type, id), so they do not
-/// collide.
+/// Ordinal of both the icon and the manifest; resources are keyed by (type, id).
 const RESOURCE_ID: u16 = 1;
 
-/// `RT_MANIFEST` as its raw type number: the macro needs `#include <winuser.h>`, and a box with
-/// `rc.exe` but no SDK headers on its include path would then fail to compile the resource.
+/// `RT_MANIFEST` as its raw type number (`24`) so `rc.exe` needs no `<winuser.h>`.
 const RT_MANIFEST: u16 = 24;
 
-/// `VS_VERSION_INFO` as its raw id. Without `#include <winver.h>` rc.exe takes the bare macro
-/// as a resource name string: the build succeeds, but `GetFileVersionInfo` looks up only
-/// `MAKEINTRESOURCE(1)`, finds nothing, and every property reads back empty.
+/// `VS_VERSION_INFO` as its raw id (`1`) so `rc.exe` needs no `<winver.h>`.
 const VS_VERSION_INFO_ID: u16 = 1;
 
 fn main() {
@@ -63,10 +59,7 @@ fn main() {
     report(&outcome.to_string());
 }
 
-/// Apple-silicon macOS bins link with chained fixups (`ld -fixup_chains`), which the linker
-/// emits only from a macOS 12 deployment target on its own; Rust's for `aarch64-apple-darwin`
-/// is 11.0, so without this the shipped executable carries the older rebase/bind opcodes and
-/// dyld rebases every pointer in `__DATA_CONST` (about 46,800 of them) before `main`.
+/// Emit `-Wl,-fixup_chains` on `aarch64-apple-darwin` so dyld uses chained fixups.
 fn chained_fixups() {
     let target = |key: &str| std::env::var(key).unwrap_or_default();
     if target("CARGO_CFG_TARGET_OS") == "macos" && target("CARGO_CFG_TARGET_ARCH") == "aarch64" {
@@ -102,8 +95,7 @@ fn report(why: &str) {
     }
 }
 
-/// Build the resource script text. Generated, not checked in: `VS_VERSION_INFO` carries the
-/// version four times, all from `CARGO_PKG_VERSION_*`, so it cannot drift from the crate's.
+/// Build the `.rc` script text from `CARGO_PKG_VERSION_*`.
 fn resource_script(icon: &std::path::Path, app_manifest: &std::path::Path) -> String {
     let major = env_num("CARGO_PKG_VERSION_MAJOR");
     let minor = env_num("CARGO_PKG_VERSION_MINOR");
@@ -180,21 +172,45 @@ END
     )
 }
 
-/// A path as it may appear inside an `.rc` string literal. Backslash is the .rc escape
-/// character, so separators become `/`: every resource compiler in play (`rc.exe`, `llvm-rc`,
-/// `windres`) hands the path to a Win32 file open, which accepts it.
+/// Format a path for an `.rc` string literal with `/` separators.
 fn rc_path_literal(p: &std::path::Path) -> String {
     p.display().to_string().replace('\\', "/")
 }
 
-/// A `CARGO_PKG_VERSION_*` component, clamped into the u16 a version-quad field
-/// actually is.
+/// A `CARGO_PKG_VERSION_*` component clamped to `u16`.
 fn env_num(key: &str) -> u16 {
     std::env::var(key)
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .map(|v| v.min(u32::from(u16::MAX)) as u16)
         .unwrap_or(0)
+}
+
+/// The system's git, by the path `aterm_uds::host::TOOLS`'s `git` row names (a build script links
+/// no workspace crate): never whichever git a `PATH` finds first. Off Unix the bare name, as
+/// there.
+const GIT: &str = if cfg!(unix) { "/usr/bin/git" } else { "git" };
+
+/// `unix` seconds as RFC 3339 UTC (`2026-10-22T00:00:00Z`): what `date -u +%Y-%m-%dT%H:%M:%SZ`
+/// printed, computed here (the civil calendar of Hinnant's `civil_from_days`, as
+/// `aterm_types::rfc3339` has it), so no `date` runs.
+fn rfc3339_utc(unix: i64) -> String {
+    let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+        secs / 3600,
+        secs % 3600 / 60,
+        secs % 60
+    )
 }
 
 /// Run `cmd args…`, its trimmed stdout when it succeeded with some, else `None`.
@@ -208,7 +224,7 @@ fn run(cmd: &str, args: &[&str]) -> Option<String> {
 }
 
 mod build_stamp {
-    use super::run;
+    use super::{GIT, rfc3339_utc, run};
     use std::path::PathBuf;
 
     /// A build fact supplied by the caller instead of probed from git. Empty is
@@ -229,9 +245,9 @@ mod build_stamp {
         let commit = match &pinned_commit {
             Some(commit) => commit.clone(),
             None => {
-                let commit = run("git", &["rev-parse", "--short=12", "HEAD"])
+                let commit = run(GIT, &["rev-parse", "--short=12", "HEAD"])
                     .unwrap_or_else(|| "unknown".into());
-                let dirty = run("git", &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+                let dirty = run(GIT, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
                 if commit != "unknown" && dirty {
                     format!("{commit}-dirty")
                 } else {
@@ -241,7 +257,7 @@ mod build_stamp {
         };
         println!("cargo:rustc-env=ATERM_GIT_COMMIT={commit}");
         let full_commit = pinned_full_commit.unwrap_or_else(|| {
-            run("git", &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
+            run(GIT, &["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into())
         });
         let dirty = commit.ends_with("-dirty");
         println!("cargo:rustc-env=ATERM_GIT_COMMIT_FULL={full_commit}");
@@ -249,12 +265,12 @@ mod build_stamp {
 
         let dev_commits = pinned_dev_commits.unwrap_or_else(|| {
             run(
-                "git",
+                GIT,
                 &["describe", "--tags", "--match", "v*.*.0", "--abbrev=0"],
             )
             .and_then(|tag| {
                 run(
-                    "git",
+                    GIT,
                     &["rev-list", &format!("{}..HEAD", tag.trim()), "--count"],
                 )
             })
@@ -267,20 +283,17 @@ mod build_stamp {
         let build_number = std::env::var("SOURCE_DATE_EPOCH")
             .ok()
             .filter(is_epoch)
-            .or_else(|| run("git", &["show", "-s", "--format=%ct", "HEAD"]).filter(is_epoch))
+            .or_else(|| run(GIT, &["show", "-s", "--format=%ct", "HEAD"]).filter(is_epoch))
             .unwrap_or_else(|| "0".into());
         println!("cargo:rustc-env=ATERM_BUILD_NUMBER={build_number}");
 
         let build_time = match std::env::var("SOURCE_DATE_EPOCH") {
-            Ok(epoch) if !epoch.is_empty() => {
-                run("date", &["-u", "-r", &epoch, "+%Y-%m-%dT%H:%M:%SZ"]).or_else(|| {
-                    run(
-                        "date",
-                        &["-u", "-d", &format!("@{epoch}"), "+%Y-%m-%dT%H:%M:%SZ"],
-                    )
-                })
-            }
-            _ => run("date", &["-u", "+%Y-%m-%dT%H:%M:%SZ"]),
+            Ok(epoch) if !epoch.is_empty() => epoch.parse::<i64>().ok().map(rfc3339_utc),
+            _ => std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .and_then(|d| i64::try_from(d.as_secs()).ok())
+                .map(rfc3339_utc),
         }
         .unwrap_or_else(|| "unknown".into());
         println!("cargo:rustc-env=ATERM_BUILD_TIME={build_time}");
@@ -293,16 +306,14 @@ mod build_stamp {
         println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     }
 
-    /// A path git prints, made absolute. `--path-format=absolute` arrived after
-    /// `--git-common-dir`/`--git-path`, so an older git's relative answer is joined
-    /// to this script's working directory (the package root, where git ran).
+    /// Resolve a `git rev-parse` path to an absolute [`PathBuf`].
     fn git_abs_path(args: &[&str]) -> Option<PathBuf> {
         let mut with_format = vec!["rev-parse", "--path-format=absolute"];
         with_format.extend_from_slice(args);
-        let value = run("git", &with_format).or_else(|| {
+        let value = run(GIT, &with_format).or_else(|| {
             let mut plain = vec!["rev-parse"];
             plain.extend_from_slice(args);
-            run("git", &plain)
+            run(GIT, &plain)
         })?;
         let path = PathBuf::from(value);
         if path.is_absolute() {
@@ -312,11 +323,10 @@ mod build_stamp {
         }
     }
 
-    /// The git files whose change may stale the commit stamp, resolved through git so a linked
-    /// worktree (whose `.git` is a file) and the main checkout both work.
+    /// Git files whose modification may invalidate the commit stamp.
     fn git_watch_paths() -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        let Some(git_dir) = run("git", &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from)
+        let Some(git_dir) = run(GIT, &["rev-parse", "--absolute-git-dir"]).map(PathBuf::from)
         else {
             return paths;
         };
@@ -324,7 +334,7 @@ mod build_stamp {
 
         paths.push(git_dir.join("HEAD"));
 
-        if let Some(reference) = run("git", &["symbolic-ref", "--quiet", "HEAD"])
+        if let Some(reference) = run(GIT, &["symbolic-ref", "--quiet", "HEAD"])
             && let (Some(ref_path), Some(refs_root)) = (
                 git_abs_path(&["--git-path", &reference]),
                 git_abs_path(&["--git-path", "refs"]),

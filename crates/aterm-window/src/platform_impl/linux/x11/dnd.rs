@@ -4,11 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/linux/x11/dnd.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// LOCAL PATCH (aterm): percent-decoding is `common/percent.rs`, not the `percent-encoding` crate,
-// and the requests are aterm-x11's encoders, where upstream used x11rb's. A path is the one the
-// source named, not canonicalized; an entry naming no local file is skipped, a list naming none is
-// refused, and a list too large for one property is read through ICCCM INCR.
-
 use std::os::raw::*;
 use std::path::PathBuf;
 use std::str::Utf8Error;
@@ -29,8 +24,6 @@ pub enum DndState {
     Rejected,
 }
 
-/// The most an INCR transfer may bring: a list of a million paths fits, a source that never
-/// stops does not.
 const MAX_INCR_BYTES: usize = 64 * 1024 * 1024;
 
 /// What the source put in the drag's property (an aterm addition).
@@ -77,8 +70,6 @@ pub struct Dnd {
     pub result: Option<Vec<PathBuf>>,
 }
 
-/// An unmapped child of the target, used for exactly one conversion. A cancelled source may
-/// still write to this id; a later conversion never admits it again, even if destroy failed.
 struct Requestor {
     xconn: Arc<XConnection>,
     window: xproto::Window,
@@ -312,7 +303,6 @@ impl Dnd {
         }
     }
 
-    /// The whole value of `window`'s `XdndSelection` property, which the read deletes.
     fn take_property(&self, window: xproto::Window) -> Option<xproto::GetPropertyReply> {
         let property = self.xconn.atoms()[XdndSelection];
         self.xconn
@@ -334,8 +324,6 @@ pub fn local_paths(data: &[u8]) -> Vec<PathBuf> {
     uri_list_entries(data).filter_map(|uri| file_uri_path(uri).ok()).collect()
 }
 
-/// Decode only the path of a local file URI; escaped bytes cannot change its
-/// scheme or authority, and URI-looking text within the path stays intact.
 fn file_uri_path(uri: &[u8]) -> Result<PathBuf, DndDataParseError> {
     let uri = std::str::from_utf8(uri)?;
     let Some(path) = uri.strip_prefix("file://") else {
@@ -379,7 +367,6 @@ mod tests {
         assert!(matches!(file_uri_path(b"file:///tmp/a%00b"), Err(DndDataParseError::NulInPath)));
     }
 
-    /// An entry that names no local file is skipped; the others still count.
     #[test]
     fn a_list_keeps_its_local_files_and_skips_the_rest() {
         let list = b"https://example.com/cat.png\r\nfile:///tmp/Screenshot%20from%202026.png\r\n\

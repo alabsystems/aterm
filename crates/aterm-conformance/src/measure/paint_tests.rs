@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The verdict's terms on synthetic scans: each arm passes its healthy take
-//! and goes red on the shape it exists to catch.
+//! Paint verdict tests over synthetic scan reports.
 
 use super::*;
 use crate::measure::scan::{Cell, DrivenWindow, Shape};
@@ -21,7 +20,6 @@ fn row(expect: Expect, capture: Capture, style: Style) -> PaintRow {
     }
 }
 
-/// A healthy typed image burst: 67 frames, every floor cleared with margin.
 fn lit_burst() -> ScanReport {
     ScanReport {
         frames: 67,
@@ -59,7 +57,6 @@ fn lit_burst() -> ScanReport {
     }
 }
 
-/// A healthy recorded take: no paired rows, a bounded driven window.
 fn lit_video() -> ScanReport {
     ScanReport {
         status_frames: 0,
@@ -83,7 +80,6 @@ fn status(style: &str, extra: &str) -> StatusRow {
     ))
 }
 
-/// One flying-style row per frame.
 fn flying_rows(frames: usize, extra: &str) -> Ledger {
     Ledger {
         rows: Some(vec![status("rainbow kitty flying", extra); frames]),
@@ -118,8 +114,6 @@ fn a_healthy_burst_is_ink_and_quiet_is_its_exact_negation() {
 
 #[test]
 fn the_coverage_floor_binds_ink_but_never_buys_the_quiet_control() {
-    // A lit take whose ledger booked no driven mature claim: the ink arm
-    // refuses it for asking nothing, and the control still goes red on it.
     let uncovered = ScanReport {
         ribbon_bound: 0,
         ..lit_burst()
@@ -178,7 +172,6 @@ fn recorded_continuity_tolerates_one_dark_frame_and_refuses_two() {
         scan.driven.dark_us = dark_us;
         assert_eq!(verdict(&ink, &ledger, &scan), want, "{dark_us}");
     }
-    // The excused lead is bounded: a band that took 3 s to reach glass is red.
     let mut dead_start = lit_video();
     dead_start.driven.mature_lead_us = 3_000_000;
     assert_eq!(verdict(&ink, &ledger, &dead_start), ShapeVerdict::Fail);
@@ -191,7 +184,6 @@ fn a_recorded_take_that_lost_its_bracket_decides_nothing() {
     let mut lost = lit_video();
     lost.driven = DrivenWindow::NOT_MEASURED;
     assert!(judge(&ink, &ledger, &lost).is_err());
-    // An image burst has no bracket to lose: it keeps the frame-count gap.
     let burst = row(Expect::Ink, Capture::UnpinnedFocused, Style::Flying);
     let gapped = ScanReport {
         rainbow_gap: 2,
@@ -314,7 +306,6 @@ fn a_spelling_that_resolved_elsewhere_is_red() {
         verdict(&tall, &resolved("lumen"), &lit_burst()),
         ShapeVerdict::Fail
     );
-    // A row missing for some frame is not a bound style.
     assert_eq!(
         verdict(
             &tall,

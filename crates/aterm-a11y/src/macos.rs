@@ -346,8 +346,8 @@ aterm_objc::declare_class! {
                     let live = self.read(|cx, handle| handle.is_none() ||
                         handle.and_then(|handle| cx.publication.node(handle)).is_some()).unwrap_or(false);
                     if !live { return Bool::NO; }
-                    // SAFETY: ask the inherited NSAccessibilityElement policy for
-                    // remaining read selectors. The exact prototype is -(BOOL)(SEL).
+                    // SAFETY: ask the inherited NSAccessibilityElement policy for remaining read
+                    // selectors. The exact prototype is -(BOOL)(SEL).
                     unsafe {
                         let send: unsafe extern "C-unwind" fn(*mut aterm_objc::ObjcSuper, Sel, Sel) -> Bool = aterm_objc::msg_super();
                         send(&mut self.super_receiver(), sel!(isAccessibilitySelectorAllowed:), selector)
@@ -714,8 +714,8 @@ fn string(value: &str) -> Id {
 }
 
 fn array(items: impl IntoIterator<Item = Id>) -> Id {
-    // SAFETY: NSMutableArray's +new returns +1; addObject: retains live, non-null
-    // objects. The array is returned autoreleased, as an ObjC getter requires.
+    // SAFETY: NSMutableArray's +new returns +1; addObject: retains live, non-null objects. The
+    // array is returned autoreleased, as an ObjC getter requires.
     unsafe {
         let new: unsafe extern "C-unwind" fn(aterm_objc::ClassPtr, Sel) -> Id = checked_msg();
         let Some(array) = Obj::from_owned(new(class(c"NSMutableArray"), sel!(new))) else {

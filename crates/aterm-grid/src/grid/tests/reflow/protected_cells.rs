@@ -1,5 +1,4 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
 //! The PROTECTED flag survives reflow and narrow resize.
@@ -9,7 +8,6 @@ use crate::{Cell, CellFlags, Grid};
 
 #[test]
 fn resize_to_one_column_preserves_protected_cells() {
-    // PROTECTED shares bit 10 with the wide spacer; it survives a narrow resize.
     let mut grid = Grid::new(2, 4);
 
     let mut protected_cell = Cell::new('P');
@@ -71,8 +69,6 @@ fn resize_to_one_column_preserves_protected_cells_with_reflow() {
 
 #[test]
 fn resize_to_one_column_preserves_protected_cell_after_wide_char() {
-    // PROTECTED shares bit 10 with WIDE_CONTINUATION: only the cell after a
-    // replaced wide char is skipped, not every cell with bit 10 set.
     let mut grid = Grid::new(2, 4);
 
     grid.write_wide_char_wrap_styled(
@@ -91,10 +87,6 @@ fn resize_to_one_column_preserves_protected_cell_after_wide_char() {
     grid.resize(2, 1);
     grid.assert_invariants();
 
-    // The wide char cannot fit one column and is blanked; 'P' reflows to the
-    // next row. The line takes three rows at one column: the rewrap keeps its
-    // end on the screen, the cursor's row ('P') on top, and its blanked head
-    // goes to history.
     let head = grid
         .get_history_line(grid.scrollback_lines() - 1)
         .expect("the line's head is the newest history line");

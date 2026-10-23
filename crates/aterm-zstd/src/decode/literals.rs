@@ -5,17 +5,13 @@
 // src/decoding/literals_section_decoder.rs, modified by the aterm project in
 // 2026. See ../../LICENSE-MIT for the upstream MIT license.
 
-//! The literals section, the first half of a compressed block (RFC 8878
-//! §3.1.1.3.1): the bytes the sequences copy from, stored raw, as one
-//! repeated byte, or Huffman-coded in one or four streams.
+//! The literals section, the first half of a compressed block (RFC 8878 §3.1.1.3.1).
 
 use super::error::DecodeError;
 use super::huffman::HuffmanTable;
 use super::window::SLACK;
 
-/// Fewest literals a four-stream section may hold (libzstd's
-/// `MIN_LITERALS_FOR_4_STREAMS`): below it the fourth stream's share of the
-/// split would be negative.
+/// Fewest literals a four-stream section may hold (`MIN_LITERALS_FOR_4_STREAMS`).
 const MIN_LITERALS_FOR_4_STREAMS: usize = 6;
 
 /// `Literals_Block_Type`.
@@ -35,17 +31,12 @@ struct Header {
     /// Header bytes (1 to 5).
     len: usize,
     regenerated_size: usize,
-    /// Bytes after the header: the Huffman streams (and tree), or the raw
-    /// literals, or the one RLE byte.
+    /// Bytes after the header.
     compressed_size: usize,
     four_streams: bool,
 }
 
 /// Parses the header at the front of `raw` (RFC 8878 §3.1.1.3.1.1).
-///
-/// Each size format reads its fixed count of header bytes as one
-/// little-endian word and takes the size fields out with constant shifts and
-/// masks, so every field is bounded by its width.
 fn parse_header(raw: &[u8]) -> Result<Header, DecodeError> {
     let Some(&b0) = raw.first() else {
         return Err(short_header());
@@ -60,14 +51,11 @@ fn parse_header(raw: &[u8]) -> Result<Header, DecodeError> {
     let header = match kind {
         Kind::Raw | Kind::Rle => {
             let (len, regenerated) = match size_format {
-                // One bit of size format, five bits of size.
                 0 | 2 => (1, u32::from(b0 >> 3)),
-                // 12 bits.
                 1 => {
                     let [h0, h1] = head::<2>(raw)?;
                     (2, u32::from(u16::from_le_bytes([h0, h1]) >> 4))
                 }
-                // 20 bits.
                 _ => {
                     let [h0, h1, h2] = head::<3>(raw)?;
                     (3, u32::from_le_bytes([h0, h1, h2, 0]) >> 4)
@@ -84,18 +72,15 @@ fn parse_header(raw: &[u8]) -> Result<Header, DecodeError> {
         }
         Kind::Compressed | Kind::Treeless => {
             let (len, regenerated, compressed) = match size_format {
-                // Both sizes 10 bits; format 0 is one stream, 1 is four.
                 0 | 1 => {
                     let [h0, h1, h2] = head::<3>(raw)?;
                     let word = u32::from_le_bytes([h0, h1, h2, 0]);
                     (3, (word >> 4) & 0x3FF, (word >> 14) & 0x3FF)
                 }
-                // Both 14 bits.
                 2 => {
                     let word = u32::from_le_bytes(head::<4>(raw)?);
                     (4, (word >> 4) & 0x3FFF, (word >> 18) & 0x3FFF)
                 }
-                // Both 18 bits.
                 _ => {
                     let [h0, h1, h2, h3, h4] = head::<5>(raw)?;
                     let word = u64::from_le_bytes([h0, h1, h2, h3, h4, 0, 0, 0]);
@@ -130,11 +115,7 @@ const fn short_header() -> DecodeError {
     DecodeError::Corrupt("literals section header runs past the block")
 }
 
-/// Decodes the literals section at the front of `block[..size]`, where
-/// `block` runs [`SLACK`] bytes past `size`. Returns the literals, the count
-/// of them, and the bytes of the block the section took; the literals slice
-/// holds [`SLACK`] bytes past the last literal for chunked copies (borrowed
-/// from `block` when stored raw, else decoded into `buf`).
+/// Decodes the literals section at the front of `block[..size]`, where `block` runs [`SLACK`] bytes past `size`.
 pub(crate) fn decode<'a>(
     block: &'a [u8],
     size: usize,
@@ -154,7 +135,6 @@ pub(crate) fn decode<'a>(
     let count = header.regenerated_size;
     match header.kind {
         Kind::Raw => {
-            // The block's own slack follows its last byte.
             let lits = block.get(header.len..).unwrap_or_default();
             Ok((lits, count, end))
         }
@@ -174,8 +154,7 @@ pub(crate) fn decode<'a>(
     }
 }
 
-/// Huffman-coded literals: the tree (Compressed only), then one stream, or a
-/// 6-byte jump table and four.
+/// Huffman-coded literals: the tree (Compressed only), then one or four streams.
 fn decode_huffman(
     header: &Header,
     body: &[u8],
@@ -183,7 +162,6 @@ fn decode_huffman(
     out: &mut Vec<u8>,
 ) -> Result<(), DecodeError> {
     let regenerated = header.regenerated_size;
-    // Treeless reuses the last table; with none, decoding refuses.
     let streams = if header.kind == Kind::Compressed {
         let tree = huf.build_decoder(body)?;
         body.get(tree..)
@@ -215,8 +193,6 @@ fn decode_huffman(
             "four-stream jump table runs past the literals",
         ));
     }
-    // The first three streams each decode a quarter (rounded up); the
-    // fourth, the rest (at least 6 literals keep it non-negative).
     let quarter = regenerated.div_ceil(4);
     let Some((d0, rest)) = dst.split_at_mut_checked(quarter) else {
         return Err(DecodeError::Corrupt("too few literals for four streams"));
@@ -242,19 +218,15 @@ mod tests {
 
     #[test]
     fn header_sizes_at_each_format() {
-        // Raw, 1-byte header, 5-bit size 31.
         let h = parse_header(&[31 << 3]).unwrap();
         assert_eq!((h.kind, h.len, h.regenerated_size), (Kind::Raw, 1, 31));
-        // RLE, 2-byte header: 12-bit size 0xABC.
         let h = parse_header(&[0b1100_0101, 0xAB]).unwrap();
         assert_eq!(
             (h.kind, h.len, h.regenerated_size, h.compressed_size),
             (Kind::Rle, 2, 0xABC, 1)
         );
-        // Raw, 3-byte header: 20-bit size.
         let h = parse_header(&[0x0C | 0x10, 0x23, 0x01]).unwrap();
         assert_eq!((h.len, h.regenerated_size), (3, 0x1231));
-        // Compressed, one stream, 10-bit sizes 1023 and 1023.
         let h = parse_header(&[0xF2, 0xFF, 0xFF]).unwrap();
         assert_eq!(
             (
@@ -266,7 +238,6 @@ mod tests {
             ),
             (Kind::Compressed, 3, 1023, 1023, false)
         );
-        // Treeless, 18-bit sizes.
         let h = parse_header(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
         assert_eq!(
             (
@@ -278,7 +249,6 @@ mod tests {
             ),
             (Kind::Treeless, 5, (1 << 18) - 1, (1 << 18) - 1, true)
         );
-        // Compressed, four streams, 14-bit sizes 0x2ABC and 0x1234.
         let h = parse_header(&[0xCA, 0xAB, 0xD2, 0x48]).unwrap();
         assert_eq!(
             (
@@ -290,13 +260,11 @@ mod tests {
             ),
             (Kind::Compressed, 4, 0x2ABC, 0x1234, true)
         );
-        // RLE, 3-byte header: 20-bit size 0xFEDCB.
         let h = parse_header(&[0xBD, 0xDC, 0xFE]).unwrap();
         assert_eq!(
             (h.kind, h.len, h.regenerated_size, h.compressed_size),
             (Kind::Rle, 3, 0xF_EDCB, 1)
         );
-        // Each format one byte short of its header.
         assert!(parse_header(&[]).is_err());
         assert!(parse_header(&[0b0100]).is_err());
         assert!(parse_header(&[0x0E, 0, 0]).is_err());

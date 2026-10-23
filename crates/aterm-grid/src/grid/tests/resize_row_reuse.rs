@@ -51,12 +51,6 @@ fn repeated_resize_shapes_and_intervening_output_keep_the_allocation_highwater()
     }
 }
 
-/// Retaining history can make a grow reveal a row rather than consume a freed
-/// blank. The pool must conserve those bodies until later output grows the
-/// ring again, even when it holds more rows than the visible viewport. A grow
-/// hands a trimmed blank back before it reveals (`grid::resize_handback`), so the
-/// trim is forgotten between the halves, as a replay of a recording made
-/// before that law forgets it.
 #[test]
 fn resize_reveal_then_output_reuses_the_retained_ring_highwater() {
     let mut grid = Grid::with_scrollback(4, 80, 64);
@@ -86,9 +80,6 @@ fn resize_reveal_then_output_reuses_the_retained_ring_highwater() {
     }
 }
 
-/// Tier-1: all six-step schedules over real resize, width rebuild and output
-/// transitions agree with the derived ownership machine. The counters come
-/// from the shipping arena, rather than a second allocator in the test.
 #[test]
 fn resize_row_reuse_conforms() {
     use aterm_models_core::resize_row_reuse_model;
@@ -143,8 +134,6 @@ fn resize_row_reuse_conforms() {
     }
     assert_eq!(seen.len(), actions.len());
 
-    // A shrink that discards its unique allocation token breaks ownership in
-    // the same allocation census.
     let mutant = interp::with_buggy(&model, 1);
     let mut state = mutant.init_state();
     assert!(mutant.fire("Shrink", &mut state));

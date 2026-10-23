@@ -30,18 +30,10 @@ pub const RIBBON_QUAD_BUDGET: usize = 10_240;
 /// Cells the hot edge reaches back from the head (§4.1).
 pub const HOT_EDGE_CELLS: f32 = 3.0;
 
-/// How far back from its head end a run the hand has left feathers in, in
-/// cells ([`Ribbon::head_feather`]): the body, its rail and its hot edge thin
-/// to nothing at the end the caret jumped off instead of standing square-cut
-/// there, at the end and along the top edge beside it. Wide enough that its
-/// pixel-fine boundaries step by no more than a fifth of the body a column
-/// (0.9 stepped by 0.23), narrow enough that the band an Enter leaves goes
-/// dark with a submit's (1.5 dimmed its newest end a frame early).
+/// How far back from its head end a run the hand has left feathers in, in cells ([`Ribbon::head_feather`]): the body, its rail and its hot edge thin to nothing at the end the caret jumped off instead of standing square-cut there, at the end and along the top edge beside it. Wide enough that its pixel-fine boundaries step by no more than a fifth of the body a column (0.9 stepped by 0.23), narrow enough that the band an Enter leaves goes dark with a submit's (1.5 dimmed its newest end a frame early).
 pub const HEAD_FEATHER_CELLS: f32 = 1.2;
 
-/// The furthest back, in cells, the crisp edge may reach when a key is born on a change of
-/// speed or under an open theme ([`edge_cells`]): the same alpha law over a longer `d`, so a
-/// longer streak, never a brighter one.
+/// The furthest back, in cells, the crisp edge may reach when a key is born on a change of speed or under an open theme ([`edge_cells`]): the same alpha law over a longer `d`, so a longer streak, never a brighter one.
 pub const HOT_EDGE_CELLS_MAX: f32 = 5.0;
 
 /// The hot edge's falloff shape, normalised at the head cell.
@@ -706,8 +698,7 @@ impl Phase {
         let reach_end = retract_start_s(grace);
         let retract_end = reach_end + RETRACT_DUR_S;
         if idle_s.is_nan() || idle_s <= 0.0 {
-            // NaN-refusing spelling: a non-finite idle takes the laying arm,
-            // which draws the mark rather than dropping it.
+            // NaN-refusing spelling: a non-finite idle takes the laying arm, which draws the mark rather than dropping it.
             return Some(Self::Laying);
         }
         if idle_s < grace {
@@ -990,12 +981,12 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
         ),
         InkRole::Leading => (PAPER_WEIGHT_LEADING, None),
     };
-    let worst = |ink: u32| {
+    let worst_lum = |ink: u32| {
         let ch = |sh: u32| {
             let (i, b) = (((ink >> sh) & 0xff) as f32, ((bg >> sh) & 0xff) as f32);
-            (b + (i - b) * cap - 1.0).max(0.0) as u32
+            (b + (i - b) * cap - 1.0).max(0.0) as usize
         };
-        (ch(16) << 16) | (ch(8) << 8) | ch(0)
+        crate::color_math::relative_luminance_rgb(table, ch(16), ch(8), ch(0))
     };
     let bg_lab = oklab(bg);
     let holds = |share: f32| {
@@ -1003,12 +994,7 @@ pub(crate) fn paper_ink(rgb: u32, fg: u32, bg: u32, role: InkRole) -> u32 {
         let lab = oklab(on_glass);
         let (dl, da, db) = (lab[0] - bg_lab[0], lab[1] - bg_lab[1], lab[2] - bg_lab[2]);
         (dl * dl + da * da + db * db).sqrt() <= weight
-            && bar.is_none_or(|bar| {
-                ratio(crate::color_math::relative_luminance_with(
-                    table,
-                    worst(lerp_rgb(bg, full, share)),
-                )) >= bar
-            })
+            && bar.is_none_or(|bar| ratio(worst_lum(lerp_rgb(bg, full, share))) >= bar)
     };
     let share = if holds(1.0) {
         1.0
@@ -1096,13 +1082,22 @@ fn channel_contrast(linear: &[f32; 256], a: u8, b: u8) -> f32 {
 #[inline]
 #[must_use]
 pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
+    seen_with(
+        &crate::color_math::relative_luminance_table().linear,
+        rgb,
+        bg,
+    )
+}
+
+#[inline]
+#[must_use]
+pub(crate) fn seen_with(linear: &[f32; 256], rgb: u32, bg: u32) -> bool {
     let ch = |c: u32, sh: u32| ((c >> sh) & 0xff) as u8;
     let (r, g, b) = (ch(rgb, 16), ch(rgb, 8), ch(rgb, 0));
     let spread = f32::from(r.max(g).max(b) - r.min(g).min(b));
     if spread < SEEN_SPREAD {
         return false;
     }
-    let linear = &crate::color_math::relative_luminance_table().linear;
     let stand = channel_contrast(linear, r, ch(bg, 16))
         .max(channel_contrast(linear, g, ch(bg, 8)))
         .max(channel_contrast(linear, b, ch(bg, 0)));
@@ -1112,10 +1107,11 @@ pub(crate) fn seen(rgb: u32, bg: u32) -> bool {
 #[inline]
 #[must_use]
 fn seen_floor(ink: u32, bg: u32) -> f32 {
+    let linear = &crate::color_math::relative_luminance_table().linear;
     (1..=255u16)
         .rev()
         .map(|a| u8::try_from(a).unwrap_or(255))
-        .find(|&a| !seen(over_premul(bg, premul_rgb(ink, a), a), bg))
+        .find(|&a| !seen_with(linear, over_premul(bg, premul_rgb(ink, a), a), bg))
         .map_or(1.0, |a| f32::from(a) + 1.0)
 }
 
@@ -1461,8 +1457,7 @@ struct Run {
     stream_dir: i8,
 }
 
-/// The feather a run the hand has left wears at its head end
-/// ([`Ribbon::head_feather`]): `1` everywhere for a run at the caret.
+/// The feather a run the hand has left wears at its head end ([`Ribbon::head_feather`]): `1` everywhere for a run at the caret.
 #[derive(Clone, Copy, Debug)]
 struct HeadFeather {
     /// The head boundary's window x.
@@ -1472,8 +1467,7 @@ struct HeadFeather {
 }
 
 impl HeadFeather {
-    /// The share of its light a boundary at window x `x` keeps: nothing at
-    /// the head end, easing to all of it [`HEAD_FEATHER_CELLS`] back.
+    /// The share of its light a boundary at window x `x` keeps: nothing at the head end, easing to all of it [`HEAD_FEATHER_CELLS`] back.
     #[inline]
     fn at(self, x: f32) -> f32 {
         if self.width <= 0.0 {
@@ -1483,8 +1477,7 @@ impl HeadFeather {
     }
 }
 
-/// A boundary as the emit lays it: a planned [`Segment`]'s fields with its
-/// coverage in `f32`, or one laid between two of them.
+/// A boundary as the emit lays it: a planned [`Segment`]'s fields with its coverage in `f32`, or one laid between two of them.
 #[derive(Clone, Copy, Debug)]
 struct LaidSegment {
     x: f32,
@@ -1495,24 +1488,11 @@ struct LaidSegment {
     cov: f32,
 }
 
-/// How far apart, px, the boundaries inside a head feather's reach are laid
-/// ([`for_each_feathered`]).
 const FEATHER_FINE_PX: f32 = 1.0;
 
-/// The rows, in cells, a planned boundary's body and rail are reckoned to
-/// spend quads on when the emit weighs whether the frame has room for a
-/// smooth feather ([`Ribbon::emit`]).
 const FEATHER_ROOM_ROWS: f32 = 1.6;
-/// The share of [`RIBBON_QUAD_BUDGET`] the reckoned plan must stay under for
-/// a smooth feather.
 const FEATHER_ROOM_SHARE: f32 = 0.6;
 
-/// Hand `each` the boundaries of `segs` last first (the emit's head-first
-/// order), each with its index in `segs`; between two boundaries either of
-/// which lies inside `feather`'s reach, boundaries [`FEATHER_FINE_PX`] apart
-/// interpolated from them (index `None`), so the slabs `ribbon_beam` tiles
-/// there are narrow and the feather thins smoothly, not in the stride's
-/// steps (a 3 px stair read at the end the caret left).
 fn for_each_feathered(
     segs: &[Segment],
     feather: HeadFeather,
@@ -1558,16 +1538,7 @@ fn for_each_feathered(
     }
 }
 
-/// The attach's level this frame, set by [`Ribbon::plan_run`] at the head
-/// boundary of the run under the caret: the head boundary's coverage (`base`),
-/// the head cell's uniform attack (`uniform`, [`BIRTH_EDGE_FLOOR`] to 1 over
-/// the edge-in) and the wipe's probe ([`Ribbon::wipe_of`]).
-/// [`AttachFloor::level`] at `dist` across the caret cell is the light the
-/// attach puts there: the caret cell's own segments when nothing is laid
-/// under the caret, and the floor under a leaving cell's light when one is (a
-/// Backspaced cell draining, or a neighbour retiring by content), so the
-/// block stands on the band while the cell spends and its retirement changes
-/// no byte.
+/// The attach's level this frame, set by [`Ribbon::plan_run`] at the head boundary of the run under the caret: the head boundary's coverage (`base`), the head cell's uniform attack (`uniform`, [`BIRTH_EDGE_FLOOR`] to 1 over the edge-in) and the wipe's probe ([`Ribbon::wipe_of`]).
 #[derive(Clone, Copy, Debug)]
 struct AttachFloor {
     row: u16,
@@ -1603,18 +1574,13 @@ struct RewrapStart {
 /// The ribbon producer.
 #[derive(Clone, Debug, Default)]
 pub struct Ribbon {
-    /// Test-only: leave a run the hand has left square-cut at its head end
-    /// (no [`Ribbon::head_feather`]), the negative control of the feather's
-    /// test.
+    /// Test-only: leave a run the hand has left square-cut at its head end (no [`Ribbon::head_feather`]), the negative control of the feather's test.
     #[cfg(test)]
     head_square: bool,
-    /// Test-only: keep the hot edge on a run the hand has left, as it was,
-    /// the negative control of the hot edge's hand test.
+    /// Test-only: keep the hot edge on a run the hand has left, as it was, the negative control of the hot edge's hand test.
     #[cfg(test)]
     hot_edge_left_lit: bool,
-    /// Test-only: lay the boundaries inside a head feather's reach at the
-    /// stride, as they were ([`for_each_feathered`]), the negative control of
-    /// the smooth feather's test.
+    /// Test-only: lay the boundaries inside a head feather's reach at the stride, as they were ([`for_each_feathered`]), the negative control of the smooth feather's test.
     #[cfg(test)]
     feather_coarse: bool,
     /// The live cells, resident and reused (§18: no allocation per frame).
@@ -1918,8 +1884,7 @@ impl Ribbon {
 
     /// Ingest one engine event at its own edge, before this frame's plan.
     pub fn on_event(&mut self, ev: &super::Event, at: Instant, ctx: &Ctx<'_>) {
-        // Under a curtain nothing is laid (§2.8): the cells on glass belong to
-        // an ended coordinate space. Only the caret mirror is kept.
+        // Under a curtain nothing is laid (§2.8): the cells on glass belong to an ended coordinate space.
         if self.curtain.is_some() {
             if let Event::Move { to, .. } = *ev {
                 self.caret = Some(to);
@@ -1961,10 +1926,7 @@ impl Ribbon {
         }
         match *ev {
             Event::Typed { cells, class, .. } => {
-                // A key typed while the focus ember burns (e.g. an agent typing
-                // into an unfocused window) clears the ember and comes back up
-                // from the current level through `edge-in`, as a focus regain
-                // does; otherwise cells laid under it would be born dark.
+                // Distinct branch.
                 if self.ember_at.is_some() {
                     self.regain_focus(at);
                 }
@@ -2022,12 +1984,9 @@ impl Ribbon {
                     }
                 }
                 if licence.is_echo() {
-                    // An echo's motion is inert (its key or sweep laid the cells) except
-                    // the hand leaving the row, an erase's retreat, and a re-anchor.
+                    // An echo's motion is inert (its key or sweep laid the cells) except the hand leaving the row, an erase's retreat, and a re-anchor.
                     if !same_row {
-                        // A repaint's home is not a gesture: only a row change the hand
-                        // could have made ([`Ribbon::hand_changed_row`]) leaves the row;
-                        // anything else under an echo licence moves only the caret mirror.
+                        // A repaint's home is not a gesture: only a row change the hand could have made ([`Ribbon::hand_changed_row`]) leaves the row; anything else under an echo licence moves only the caret mirror.
                         if Self::hand_changed_row(from, to) {
                             self.leave_row(from, to, at, licence);
                         }
@@ -2035,8 +1994,6 @@ impl Ribbon {
                         if let Some(lift) =
                             self.lift.filter(|l| l.origin == from && l.landing == to)
                         {
-                            // The word went up with its text
-                            // ([`Ribbon::lift_word`]).
                             self.lift_word(lift, at);
                         } else if self.pending_erase > 0 {
                             let erased = from.1 - to.1;
@@ -2194,8 +2151,7 @@ impl Ribbon {
         }
         let hand = self.curtain_hand();
         for i in 0..self.cohorts.len() {
-            // A cohort already retracting froze its target when the hand let
-            // go of it; that is the same fact, measured earlier, and it stays.
+            // A cohort already retracting froze its target when the hand let go of it; that is the same fact, measured earlier, and it stays.
             if self.cohorts[i].retract_col.is_some() {
                 continue;
             }
@@ -2562,7 +2518,6 @@ impl Ribbon {
                 return caret;
             }
         } else if Self::hand_changed_row(pen, caret) {
-            // Upward only a Backspace back through the fold ([`Ribbon::hand_changed_row`]).
             return caret;
         }
         if !self.cells.iter().any(|c| c.row == pen.0) {
@@ -2629,7 +2584,6 @@ impl Ribbon {
             None
         };
         if re_wrapped {
-            // One relay per split: a later one reads its own.
             self.split_off = None;
         }
         if Self::folded_down(from, to, licence) {
@@ -2640,13 +2594,7 @@ impl Ribbon {
             }
             self.flow_row(from.0, at);
         } else {
-            // A line the hand left downward by anything but a navigation (a
-            // Return, the line feed after it) is printed text now: its light
-            // dims to [`RETURN_PRINTED_SHARE`] over [`RETURN_DIM_S`], clear of
-            // its letters by the time the output lands, and goes on out
-            // through the swoosh's retract (at full light the band under the
-            // line's last word took it under 4.5:1 on paper for longer than
-            // a sixth of a second).
+            // A line the hand left downward by anything but a navigation (a Return, the line feed after it) is printed text now: its light dims to [`RETURN_PRINTED_SHARE`] over [`RETURN_DIM_S`], clear of its letters by the time the output lands, and goes on out through the swoosh's retract (at full light the band under the line's last word took it under 4.5:1 on paper for longer than a sixth of a second).
             if to.0 > from.0 && licence != Licence::Nav {
                 self.print_row(from.0, at);
             }
@@ -2777,8 +2725,7 @@ impl Ribbon {
         width: Option<u16>,
         space: Option<u16>,
     ) {
-        // The follow pass may also sample an earlier buffered move. A legacy
-        // sample must not replace a queued exact-key width/Space proof.
+        // The follow pass may also sample an earlier buffered move.
         if width.is_none()
             && self
                 .rewrap_start
@@ -3392,10 +3339,6 @@ impl Ribbon {
                 }
                 None => {
                     if k >= WAKE_MAX_CELLS && k > reach && !Self::reads_as_glass_light(base_cov) {
-                        // Beyond the cap, new light is not laid past `reach`;
-                        // light the band shows there is covered and the
-                        // drained columns up to it are laid, so the corridor
-                        // stays whole. The same glass bar as the reach.
                         continue;
                     }
                     if base_cov > 0.0 {
@@ -3644,8 +3587,7 @@ impl Ribbon {
                 }
             })
             .or_else(|| {
-                // A finished swoosh's walk continues too, inside the chain window (`retire`
-                // drops the cohort with its cells).
+                // A finished swoosh's walk continues too, inside the chain window (`retire` drops the cohort with its cells).
                 self.last_walk.filter(|w| fresh(w.alive_at)).map(|w| w.end)
             })
             .unwrap_or(WalkPos::COLD);
@@ -3842,9 +3784,7 @@ impl Ribbon {
                 continue;
             }
             if cell.leaving() {
-                // Replaced content cannot restore a prior partial release,
-                // even when its visual retract has already finished. Keep
-                // that clock and count, but revoke its redraw custody.
+                // Replaced content cannot restore a prior partial release, even when its visual retract has already finished.
                 if cell.released_at.take().is_some()
                     && let Some(coh) = self.cohorts.iter_mut().find(|c| c.id == cell.cohort)
                 {
@@ -4297,8 +4237,6 @@ impl Ribbon {
                 },
             );
             if lo > hi {
-                // A wholly leaving cohort keeps its existing fade until its
-                // last resident cell retires.
                 return resident;
             }
             if let Some(edge) = &mut coh.retract_col {
@@ -4342,8 +4280,7 @@ impl Ribbon {
         sorted.clear();
         sorted.reserve(self.cells.len());
         for (i, c) in self.cells.iter().enumerate() {
-            // Expired partial releases may remain in content custody, but
-            // own neither field nor geometry until their glyphs return.
+            // Expired partial releases may remain in content custody, but own neither field nor geometry until their glyphs return.
             if c.retract_at.is_some_and(|at| {
                 ctx.now.saturating_duration_since(at).as_secs_f32() >= RETRACT_FADE_S
             }) {
@@ -4573,8 +4510,7 @@ impl Ribbon {
             if reduced {
                 env *= reduced_fade(coh.swoosh_total() - idle);
             } else {
-                // Farthest from the hand first ([`Cohort::drain_rank`]), each cell
-                // taking `RETRACT_FADE_S`, so the mark is drawn back into the hand.
+                // Farthest from the hand first ([`Cohort::drain_rank`]), each cell taking `RETRACT_FADE_S`, so the mark is drawn back into the hand.
                 if coh.flow.is_some() {
                     env *= ember_level(
                         self.ember_floor(ctx, cell, env),
@@ -4629,10 +4565,7 @@ impl Ribbon {
 
     #[inline]
     fn wipe_of(&self, ctx: &Ctx<'_>, cell: &Cell, dist: f32) -> f32 {
-        // Typed cells only: a wake's cells share one birth instant, so
-        // wiping each from its own edge would print a comb; its lay sweep is
-        // its attack. The wipe runs on the cell's visual clock (`attack_at`),
-        // not its identity (`born`), so a re-wet cell keeps its wipe.
+        // Typed cells only: a wake's cells share one birth instant, so wiping each from its own edge would print a comb; its lay sweep is its attack.
         if !cell.typing
             || !Self::comet(ctx.cfg)
             || ctx.cfg.reduced_motion
@@ -5009,12 +4942,6 @@ impl Ribbon {
         let head_feather = |run: &Run| self.head_feather(ctx, run);
         #[cfg(test)]
         let coarse = self.feather_coarse;
-        // The fine boundaries cost quads: laid only while the whole plan's
-        // light (a row of a device pixel per slab and pixel row, body and
-        // rail, [`FEATHER_ROOM_ROWS`] cells tall) fits in
-        // [`FEATHER_ROOM_SHARE`] of the budget, so a saturated frame keeps
-        // every run's body before any feather's finish, and every run lays
-        // the same light whatever runs it shares the frame with.
         let roomy = (self.plan.len() as f32) * FEATHER_ROOM_ROWS * chf
             < RIBBON_QUAD_BUDGET as f32 * FEATHER_ROOM_SHARE;
         {
@@ -5037,20 +4964,12 @@ impl Ribbon {
                 };
                 verts.clear();
                 verts.reserve(run.hi - run.lo);
-                // The head boundary's place in `verts` once they are put back
-                // in plan order, for a capped repaint.
                 let mut head_rev = 0usize;
-                // Laid head-first, so a capped run is repainted outward from its head and never
-                // drops the light beside the hand. Inside the head feather's reach the boundaries
-                // are laid a pixel or so apart ([`for_each_feathered`]), so the feather thins
-                // smoothly instead of in the stride's steps.
                 if rail_layer {
                     for_each_feathered(&plan[run.lo..run.hi], fine_feather, |i, seg| {
                         if i == Some(run.head - run.lo) {
                             head_rev = verts.len();
                         }
-                        // The vivid rail lies below the row's bottom and uses
-                        // the body's own lower reach, capped at the leading.
                         let top = row_bottom.max(seg.spine);
                         let dn = (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max);
                         verts.push(RibbonVertex {
@@ -5071,7 +4990,6 @@ impl Ribbon {
                         if i == Some(run.head - run.lo) {
                             head_rev = verts.len();
                         }
-                        // The spine's strip is inside the body's one ceiling.
                         let cov = seg.cov * feather(seg.x);
                         let strip = (cov * STRIP_LIFT_GAIN).min(ceiling - cov).max(0.0);
                         verts.push(RibbonVertex {
@@ -5150,14 +5068,6 @@ impl Ribbon {
             .count();
     }
 
-    /// The feather `run` wears at its head end: a run the hand has left (the
-    /// caret jumped off it, or moved to another row) whose head boundary is
-    /// one of its ends thins to nothing over [`HEAD_FEATHER_CELLS`] there, so
-    /// its body, rail and hot edge never stand square-cut where the caret
-    /// was. The run under the caret keeps its head whole (the caret stands on
-    /// it), and so does a run whose head lies inside it or meets other light
-    /// in the cell past it (two runs sharing a boundary carry one light
-    /// across it), and every run under a falling curtain.
     fn head_feather(&self, ctx: &Ctx<'_>, run: &Run) -> HeadFeather {
         let head_x = self.plan.get(run.head).map_or(0.0, |seg| seg.x);
         let past = if run.stream_dir < 0 {
@@ -5167,7 +5077,6 @@ impl Ribbon {
         };
         let meets = past.is_some_and(|col| self.index.at(run.row, col).is_some());
         let at_end = (run.head == run.lo || run.head + 1 == run.hi) && !meets;
-        // A falling curtain spends the band by its own law (its cliff bound).
         let at_end = at_end && self.curtain.is_none();
         #[cfg(test)]
         if self.head_square {
@@ -5181,8 +5090,6 @@ impl Ribbon {
         HeadFeather { head_x, width }
     }
 
-    /// Retry only a run that the quad budget actually cut, starting at its
-    /// head and walking both sides without a synthetic segment between them.
     fn repaint_capped_run_from_head(
         out: &mut Vec<GlowQuad>,
         clip: BeamClip,
@@ -5239,12 +5146,6 @@ impl Ribbon {
         let Some(run) = self.runs.first() else {
             return;
         };
-        // Still wet at the hand: the head cell itself, only while it is live
-        // light, and only while the hand is on it: a run the caret jumped off
-        // (a clear, a Return) sheds its hairline with the hand, or it stood
-        // detached a gap above the band's feathered end. The gain is priced
-        // from that cell's birth, not the run's newest-born cell (after a
-        // backspace, the erased one).
         #[cfg(not(test))]
         let left_lit = false;
         #[cfg(test)]
@@ -5561,8 +5462,7 @@ impl Ribbon {
             }
         }
         for coh in &self.cohorts {
-            // Edges: the grace's end, the two beats after it, the retract's first frame and
-            // the swoosh's end; the retract's end is a tail. A flowing cohort has no grace.
+            // Edges: the grace's end, the two beats after it, the retract's first frame and the swoosh's end; the retract's end is a tail.
             if coh.flow.is_some() {
                 cad.edge(coh.clock() + dur(coh.swoosh_total()));
                 if !self.reduced {
@@ -7159,17 +7059,8 @@ mod tests {
         );
     }
 
-    /// A RUN THE HAND LEAVES IS FEATHERED AT ITS HEAD END: on the frame a
-    /// program's jump takes the caret off a typed run to another row, the
-    /// run's body, its rail and its hot edge thin to nothing at the end the
-    /// caret left, so neither the end nor the top edge beside it stands
-    /// square-cut, in every ribbon spelling on both grounds. Negative control:
-    /// the same frame with the feather off keeps that end at the body's
-    /// level and the hot edge at its peak there.
     #[test]
     fn a_run_the_hand_leaves_is_feathered_at_its_head_end() {
-        // The quad's level: its coverage, or an additive quad's brightest
-        // channel.
         let level = |q: &GlowQuad| {
             if q.alpha > 0 {
                 f32::from(q.alpha)
@@ -7239,16 +7130,6 @@ mod tests {
         }
     }
 
-    /// THE FEATHER THINS SMOOTHLY AND THE HAIRLINE GOES WITH THE HAND (round
-    /// 1: the end the caret jumped off thinned in steps a slab wide, 154,
-    /// 147, 117, 67, 18, 0 three pixels apart, and the hot edge's hairline
-    /// stood detached over it). Twenty keys on row 2, then a jump to row 10:
-    /// on the jump frame the band's light per pixel column across its
-    /// feathered end never steps by more than a fifth of the body's level,
-    /// and no hot edge lies over the run the hand left. Negative controls:
-    /// the feather laid at the stride ([`Ribbon::feather_coarse`]) steps by
-    /// more than that; the hairline kept on the left run
-    /// ([`Ribbon::hot_edge_left_lit`]) lights it.
     #[test]
     fn the_left_run_s_feather_is_smooth_and_sheds_the_hot_edge() {
         let c = cfg(true, true);
@@ -7270,7 +7151,6 @@ mod tests {
                 let mut f = sink.frame();
                 rib.emit(&cx, &mut f);
             }
-            // The body's coverage per pixel column on row 2 (source-over).
             let mut col = vec![0.0f32; usize::from(g.win_w)];
             for q in sink.under.iter().filter(|q| q.row == 2 && q.alpha > 0) {
                 for x in q.x..q.x + q.w {
@@ -7313,9 +7193,6 @@ mod tests {
         );
     }
 
-    // -- R5: the wake ------------------------------------------------------
-
-    /// Cells on `row` as `(col, typing, life_s, born)`, column-sorted.
     fn row_cells(rib: &Ribbon, row: u16) -> Vec<(u16, bool, f32, Instant)> {
         let mut v: Vec<_> = rib
             .cells()

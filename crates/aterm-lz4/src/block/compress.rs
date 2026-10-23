@@ -22,7 +22,7 @@ use super::hashtable::HashTable4K;
 use super::hashtable::HashTable4KU16;
 use super::{CompressError, WINDOW_SIZE};
 
-/// Increase step size after 1<<INCREASE_STEPSIZE_BITSHIFT non matches
+/// Increase step size after 1<<INCREASE_STEPSIZE_BITSHIFT non matches.
 const INCREASE_STEPSIZE_BITSHIFT: usize = 5;
 /// `1 << INCREASE_STEPSIZE_BITSHIFT`, so the search loop divides by a
 /// constant (linear arithmetic for the verifier) instead of shifting.
@@ -64,11 +64,8 @@ pub(super) fn get_batch_arch(input: &[u8], n: usize) -> usize {
 #[inline]
 const fn token_from_literal(lit_len: usize) -> u8 {
     if lit_len < 0xF {
-        // Since we can fit the literals length into it, there is no need for saturation.
         (lit_len as u8) << 4
     } else {
-        // We were unable to fit the literals into it, so we saturate to 0xF. We will later
-        // write the extensional value.
         0xF0
     }
 }
@@ -76,19 +73,14 @@ const fn token_from_literal(lit_len: usize) -> u8 {
 #[inline]
 const fn token_from_literal_and_match_length(lit_len: usize, duplicate_length: usize) -> u8 {
     let mut token = if lit_len < 0xF {
-        // Since we can fit the literals length into it, there is no need for saturation.
         (lit_len as u8) << 4
     } else {
-        // We were unable to fit the literals into it, so we saturate to 0xF. We will later
-        // write the extensional value.
         0xF0
     };
 
     token |= if duplicate_length < 0xF {
-        // We could fit it in.
         duplicate_length as u8
     } else {
-        // We were unable to fit it in, so we default to 0xF, which will later be extended.
         0xF
     };
 
@@ -111,9 +103,6 @@ fn count_same_bytes(input: &[u8], cur: &mut usize, source: &[u8], candidate: usi
         let match_block = usize::from_ne_bytes(*block2);
 
         if input_block == match_block {
-            // `num` counts matched bytes inside `cur_slice`, so it is bounded
-            // by a slice length and never actually saturates; saturating just
-            // makes the no-overflow obligations provable.
             num = num.saturating_add(USIZE_SIZE);
         } else {
             let diff = input_block ^ match_block;
@@ -155,7 +144,7 @@ fn push_slice(output: &mut impl Sink, s: &[u8]) {
     output.extend_from_slice(s);
 }
 
-/// Handle the last bytes from the input as literals
+/// Handle the last bytes from the input as literals.
 #[cold]
 fn handle_last_literals(output: &mut impl Sink, input: &[u8], start: usize) {
     let tail = input.get(start..).unwrap_or(&[]);
@@ -169,7 +158,7 @@ fn handle_last_literals(output: &mut impl Sink, input: &[u8], start: usize) {
     push_slice(output, tail);
 }
 
-/// Moves the cursors back as long as the bytes match, to find additional bytes in a duplicate
+/// Moves the cursors back as long as the bytes match, to find additional bytes in a duplicate.
 #[inline]
 fn backtrack_match(
     input: &[u8],
@@ -277,8 +266,6 @@ pub(crate) fn compress_internal<T: HashTable, const USE_DICT: bool, S: Sink>(
                 candidate = candidate.saturating_sub(ext_dict_stream_offset);
                 candidate_source = ext_dict;
             } else {
-                // Match no longer reachable, e.g. tables kept across
-                // independent blocks with only `input_stream_offset` growing.
                 continue;
             }
             let cand_bytes: u32 = get_batch(candidate_source, candidate);
@@ -366,8 +353,6 @@ pub(crate) fn compress_into_sink_with_dict<const USE_DICT: bool>(
 fn init_dict<T: HashTable>(dict: &mut T, dict_data: &mut &[u8]) {
     let data = *dict_data;
     if data.len() > WINDOW_SIZE {
-        // Plain `-` on purpose: the guard discharges underflow, and its value
-        // proves the slice bound (`saturating_sub` would hide that relation).
         *dict_data = &data[data.len() - WINDOW_SIZE..];
     }
     let mut i = 0usize;
@@ -381,7 +366,6 @@ fn init_dict<T: HashTable>(dict: &mut T, dict_data: &mut &[u8]) {
 /// Returns the maximum output size of the compressed data.
 #[inline]
 pub const fn get_maximum_output_size(input_len: usize) -> usize {
-    // Never saturates for a real buffer length; saturating is for the verifier.
     (input_len.saturating_mul(110) / 100).saturating_add(20)
 }
 
@@ -403,8 +387,6 @@ fn compress_into_vec_with_dict<const USE_DICT: bool>(
         let out = if prepend_size {
             // `max_compressed_size >= 24`; `get_mut` states it for the verifier.
             if let Some(header) = compressed.get_mut(..4) {
-                // The wire header is a `u32`; the mask makes the truncation
-                // `as u32` already does explicit for the verifier.
                 header.copy_from_slice(&((input.len() & u32::MAX as usize) as u32).to_le_bytes());
             }
             compressed.get_mut(4..).unwrap_or_default()

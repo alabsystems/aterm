@@ -40,12 +40,6 @@ use super::{
     VoidCookie, WindowId, XConnection,
 };
 
-// LOCAL PATCH (aterm): the requests are aterm-x11's encoders and ICCCM properties, where upstream
-// used x11rb's; there is no input shape (`set_cursor_hittest` is Windows-only). A failed request is
-// reported (`XConnection::report`), never a panic, so the event loop can end the run on a lost
-// display. Where the server has SYNC the window offers EWMH's resize sync counter
-// (`sync_request.rs`).
-
 #[derive(Debug)]
 pub struct SharedState {
     pub cursor_pos: Option<(f64, f64)>,
@@ -69,10 +63,9 @@ pub struct SharedState {
     pub occlusion: Occlusion,
     /// Whether the server asked for the window to be drawn again since its last `RedrawRequested` (`Expose`).
     pub exposed: bool,
-    /// What `_NET_WM_STATE` held at its last read, until the window manager changes it
-    /// (`UnownedWindow::wm_state_changed`).
+    /// Cached `_NET_WM_STATE` until invalidated by `UnownedWindow::wm_state_changed`.
     shown: Option<ShownState>,
-    /// How many changes of `_NET_WM_STATE` the window has seen: a read that one overtook is not kept.
+    /// Monotonic counter of `_NET_WM_STATE` invalidations.
     shown_changes: u64,
 }
 
@@ -196,7 +189,6 @@ pub(super) fn background_pixel(
     visual: xproto::Visualid,
     rgb: u32,
 ) -> Option<u32> {
-    /// `TrueColor` and `DirectColor` (X11 protocol).
     const DECOMPOSED: [u8; 2] = [4, 5];
     let visual = screen
         .allowed_depths
@@ -615,8 +607,6 @@ impl UnownedWindow {
         )
     }
 
-    /// Removes `_NET_WM_STATE_ABOVE` and then `_NET_WM_STATE_BELOW`, the two messages winit's
-    /// creation-time `set_window_level(WindowLevel::Normal)` sent for every window.
     fn clear_window_level(&self) -> Result<VoidCookie<'_>, X11Error> {
         let atoms = self.xconn.atoms();
         self.set_netwm(util::StateOperation::Remove, (atoms[_NET_WM_STATE_ABOVE], 0, 0, 0))?
@@ -857,10 +847,7 @@ impl UnownedWindow {
         self.fullscreen().is_some() || self.shown_state().fullscreen
     }
 
-    /// What `_NET_WM_STATE` holds of the states the window manager shows the window in, read
-    /// once per change of it ([`Self::wm_state_changed`]) rather than per query: a resize asks
-    /// several times while the X server is busy with it, each read a round trip; none where it
-    /// cannot be read.
+    /// Cached `_NET_WM_STATE` properties, re-read after [`Self::wm_state_changed`].
     fn shown_state(&self) -> ShownState {
         let changes = {
             let state = self.shared_state_lock();
@@ -940,8 +927,6 @@ impl UnownedWindow {
         self.xconn.flush_requests().or_report(&self.xconn, what);
     }
 
-    /// Ask the window manager for decorations (Motif hints), as upstream did for every window
-    /// created with them (WC.8: no window turns them off).
     fn set_decorations_inner(&self) -> Result<VoidCookie<'_>, X11Error> {
         let mut hints = self.xconn.get_motif_hints(self.xwindow);
 
@@ -968,9 +953,6 @@ impl UnownedWindow {
         )
     }
 
-    /// End the launch's startup sequence at the window's first map (the spec's
-    /// `remove` comes once the launchee shows its window, so a launcher's busy cursor
-    /// or spinner lasts until then).
     fn end_startup_sequence(&self) {
         let Some(startup_id) = self.startup_id.lock().unwrap().take() else {
             return;
@@ -1010,8 +992,6 @@ impl UnownedWindow {
         }
     }
 
-    /// The window's frame extents: the cached ones, else the heuristic's
-    /// (`get_frame_extents_heuristic`, round trips), which are cached.
     fn frame_extents(&self) -> Result<util::FrameExtentsHeuristic, X11Error> {
         let cached = self.shared_state_lock().frame_extents.clone();
         if let Some(extents) = cached {
@@ -1342,8 +1322,6 @@ impl UnownedWindow {
         }
     }
 
-    /// Ask the window manager to raise and focus the window (`_NET_ACTIVE_WINDOW`, as an
-    /// application) for the user action at `time` (`CURRENT_TIME` when none is known).
     fn focus_window_at(&self, time: u32) {
         let atoms = self.xconn.atoms();
         let state_atom = atoms[WM_STATE];
@@ -1444,18 +1422,15 @@ impl UnownedWindow {
     }
 }
 
-/// Cast a dimension value into a hinted dimension for `WmSizeHints`, clamping if too large.
 fn cast_dimension_to_hint(val: u32) -> i32 {
     val.try_into().unwrap_or(i32::MAX)
 }
 
-/// Use the above strategy to cast a physical size into a hinted size.
 fn cast_physical_size_to_hint(size: PhysicalSize<u32>) -> (i32, i32) {
     let PhysicalSize { width, height } = size;
     (cast_dimension_to_hint(width), cast_dimension_to_hint(height))
 }
 
-/// Use the above strategy to cast a size into a hinted size.
 fn cast_size_to_hint(size: Size, scale_factor: f64) -> (i32, i32) {
     match size {
         Size::Physical(size) => cast_physical_size_to_hint(size),
@@ -1469,14 +1444,11 @@ pub(super) fn xim_spot(position: PhysicalPosition<i32>, size: PhysicalSize<u32>)
     (clamp(position.x.into()), clamp(i64::from(position.y) + i64::from(size.height)))
 }
 
-/// ConfigureWindow's values that raise a window to the top of the stack.
 fn stack_above() -> ValueList {
-    // `Above`, the first of ConfigureWindow's stack modes.
     ValueList::new().set(xproto::config::STACK_MODE, 0)
 }
 
 impl XConnection {
-    /// The window's `WM_NORMAL_HINTS`, `None` when it has none.
     fn get_normal_hints(&self, window: xproto::Window) -> Result<Option<WmSizeHints>, X11Error> {
         let reply = self.request(xproto::get_property(
             false,
@@ -1489,7 +1461,6 @@ impl XConnection {
         Ok(WmSizeHints::from_reply(&reply).map_err(aterm_x11::Error::from)?)
     }
 
-    /// The window's `WM_HINTS`, `None` when it has none.
     fn get_wm_hints(&self, window: xproto::Window) -> Result<Option<WmHints>, X11Error> {
         let reply = self.request(xproto::get_property(
             false,

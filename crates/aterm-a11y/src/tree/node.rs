@@ -3,11 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Derived from accesskit_consumer 0.37.0 (MIT OR Apache-2.0, used under
-// Apache-2.0) src/node.rs, and cut by the aterm project in 2026 to the
-// properties aterm's model carries: no grafts, explicit label or control
-// relations, active descendants, hidden or clipping nodes, and only the
-// roles aterm-gui publishes. An off-screen node (a scrolled list's row) is
-// in the tree but owns no point.
+// Apache-2.0) src/node.rs, modified by the aterm project in 2026.
 //
 // Derived from Chromium's accessibility abstraction.
 // Copyright 2021 The Chromium Authors. All rights reserved.
@@ -32,7 +28,6 @@ use super::iterators::{FilteredChildren, FollowingFilteredSiblings, PrecedingFil
 pub(crate) struct NodeId(pub(crate) LocalNodeId);
 
 impl From<NodeId> for u128 {
-    /// The model's id in the high 64 bits of the AT-SPI object path number.
     fn from(id: NodeId) -> Self {
         u128::from(id.0.0) << 64
     }

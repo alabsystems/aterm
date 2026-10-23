@@ -1,8 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Control reads of a program's unfinished DEC 2026 frame ([`crate::term_lock_whole`]). A test
-//! sees a read waiting by its registration on the session's watcher list.
+//! Control reads of an unfinished DEC 2026 frame ([`crate::term_lock_whole`]).
 
 use super::*;
 #[cfg(unix)]
@@ -13,14 +12,10 @@ use crate::session_store::SessionHandle;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-/// A frame the program finished: the transcript row, then the composer row.
 const WHOLE: &str = "\x1b[?2026h\x1b[H\x1b[2J⏺ Done\r\n❯ ready\x1b[?2026l";
-/// The next frame's first half: the screen cleared, the transcript row written, the composer not yet.
 const HALF: &str = "\x1b[?2026h\x1b[H\x1b[2J⏺ On it.";
-/// The rest of that frame: the composer row, and the close.
 const REST: &str = "\r\n❯ ready\x1b[?2026l";
 
-/// A registered session with its watcher list bound to its terminal, and `bound` its sync timeout.
 fn session(h: SessionHandle, bound: Duration) -> SessionHandle {
     h.ctx.watchers.bind_frame(&h.term);
     term_lock(&h.term).apply_config(&aterm_core::config::TerminalConfig {
@@ -30,22 +25,18 @@ fn session(h: SessionHandle, bound: Duration) -> SessionHandle {
     h
 }
 
-/// Write `bytes` as one of the program's bursts and ring the session's list, as the PTY reader does.
 fn burst(h: &SessionHandle, bytes: &str) {
     term_lock(&h.term).process(bytes.as_bytes());
     h.ctx.watchers.ring_watchers();
 }
 
-/// The screen's row 1 as `line` addresses it (an absolute row).
 fn abs_row_1(h: &SessionHandle) -> String {
     let t = term_lock(&h.term);
     (t.grid().oldest_absolute_row() + t.grid().scrollback_lines() as u64 + 1).to_string()
 }
 
-/// A named control-thread screen read.
 type Reader<'a> = (&'static str, Box<dyn Fn() -> String + Send + Sync + 'a>);
 
-/// Every control-thread screen read the rule covers, `select line 1` + `selection` standing for the `GuiHost` verbs.
 fn readers(h: &SessionHandle) -> Vec<Reader<'_>> {
     let term = &h.term;
     let line = abs_row_1(h);
@@ -92,7 +83,6 @@ fn readers(h: &SessionHandle) -> Vec<Reader<'_>> {
     ]
 }
 
-/// Every control read waits, holding no lock, for the frame to close and reads it whole.
 #[test]
 fn every_control_read_waits_for_the_frame_and_reads_it_whole() {
     let h = session(registered_session(0, -1, b""), EVENTUALLY);
@@ -119,7 +109,6 @@ fn every_control_read_waits_for_the_frame_and_reads_it_whole() {
             .map(|(name, r)| (name, r.join().expect("a reader")))
             .collect()
     });
-    // `screen` read either side of the host reader's `select`.
     let host = super::super::control_host::GuiHost::new(0, &h.term, None, &h.ctx.watchers);
     let _ = control_selection::cmd_select(&host, 0, "clear");
     let unselected = cmd_screen_styled_json(&h.term, &crate::frame_memo::FrameSlot::default(), "");
@@ -140,8 +129,6 @@ fn every_control_read_waits_for_the_frame_and_reads_it_whole() {
     );
 }
 
-/// Frame after frame never starves a reader: it answers `frame=open` at the bound fixed at its call.
-/// The run is dated after any call this test makes, so its bound counts from the call however late the reader starts.
 #[test]
 fn a_reader_is_never_starved_by_frame_after_frame() {
     use aterm_core::terminal::ClockReading;
@@ -195,7 +182,6 @@ fn a_reader_is_never_starved_by_frame_after_frame() {
     );
 }
 
-/// A read still facing an unfinished frame at its bound says so wherever its format has room.
 #[test]
 fn a_read_facing_an_unfinished_frame_at_its_bound_says_frame_open() {
     let h = session(registered_session(0, -1, b""), Duration::from_millis(1));
@@ -277,14 +263,12 @@ fn a_read_facing_an_unfinished_frame_at_its_bound_says_frame_open() {
     }
 }
 
-/// A row fence never vouches for half a frame: the event loop declines at once, a control thread waits.
 #[test]
 #[cfg(unix)]
 fn a_row_fence_declines_an_unfinished_frame_and_the_event_loop_never_waits() {
     use std::os::fd::FromRawFd as _;
     let (h, rx) = guarded_pipe_session(1);
-    // SAFETY: guarded_pipe_session returned this new write descriptor; the session
-    // and sink borrow it, and no other owner closes it.
+    // SAFETY: guarded_pipe_session returned this new write descriptor.
     let _write_end = unsafe { std::os::fd::OwnedFd::from_raw_fd(h.master) };
     let h = session(h, EVENTUALLY);
     burst(&h, WHOLE);
@@ -342,7 +326,6 @@ fn a_row_fence_declines_an_unfinished_frame_and_the_event_loop_never_waits() {
     assert_eq!(drain_pipe(&rx), b"1", "pressed on the whole frame");
 }
 
-/// A turn's `if-rows=` and settled screen take the whole-frame rule; `if-gen=` alone is decided as the screen stands.
 #[test]
 fn a_turns_row_fence_and_settled_screen_take_the_whole_frame_rule() {
     use aterm_types::control_verbs::RowsFence;
@@ -376,7 +359,6 @@ fn a_turns_row_fence_and_settled_screen_take_the_whole_frame_rule() {
         last: 1,
         hash,
     };
-    // The next frame redraws row 0 and has not reached the composer.
     burst(&h, "\x1b[?2026h\x1b[1;1Htick 2\x1b[2;3H");
     let turn = |args: &str| cmd_turn(term, &store, 0, args, &h.ctx, &io);
     let out = turn(&format!("if-rows={fence} idle=20 timeout=60000 hello"));
@@ -433,7 +415,6 @@ fn a_turns_row_fence_and_settled_screen_take_the_whole_frame_rule() {
     assert!(!verdict.contains("frame=open"), "{verdict}");
 }
 
-/// Whether `read` registered on `h`'s list before it answered, and its answer; a waiting read is let go by `REST`.
 fn waited_for(h: &SessionHandle, read: impl FnOnce() -> String + Send) -> (bool, String) {
     std::thread::scope(|s| {
         let reading = s.spawn(read);
@@ -452,7 +433,6 @@ fn waited_for(h: &SessionHandle, read: impl FnOnce() -> String + Send) -> (bool,
     })
 }
 
-/// A frame past its sync timeout from the run's start is read at once, `frame=open`.
 #[test]
 fn a_frame_the_glass_gave_up_is_read_at_once() {
     use aterm_core::terminal::ClockReading;
@@ -477,7 +457,6 @@ fn a_frame_the_glass_gave_up_is_read_at_once() {
     assert_eq!(reply.lines().next(), Some("OK 24 frame=open"), "{reply}");
 }
 
-/// `line` of a history row never waits for the screen's frame.
 #[test]
 fn a_history_line_is_read_without_waiting_for_the_frame() {
     let h = session(registered_session(0, -1, b""), EVENTUALLY);
@@ -498,7 +477,6 @@ fn a_history_line_is_read_without_waiting_for_the_frame() {
     assert_eq!(reply, "OK old 0\n");
 }
 
-/// `cell abs=` of a history row never waits for the screen's frame, nor says it is open.
 #[test]
 fn a_history_cell_is_read_without_waiting_for_the_frame() {
     let h = session(registered_session(0, -1, b""), EVENTUALLY);
@@ -519,7 +497,6 @@ fn a_history_cell_is_read_without_waiting_for_the_frame() {
     assert_eq!(reply, "OK o e5e5e5 000000 none\n");
 }
 
-/// `text --json`'s person stamps and first `inputs` count are taken after its wait, beside the rows.
 #[test]
 fn text_json_stamps_the_person_after_its_wait() {
     let h = session(registered_session(0, -1, b""), EVENTUALLY);
@@ -548,7 +525,6 @@ fn text_json_stamps_the_person_after_its_wait() {
     assert!(reply.contains(",\"inputs\":[1,1],"), "{reply}");
 }
 
-/// `blocktext`, `selection`, `copy` and `select` on a frame still unfinished at their bound say `frame=open`.
 #[test]
 fn the_host_verbs_say_frame_open_on_a_frame_unfinished_at_their_bound() {
     let h = session(registered_session(0, -1, b""), Duration::from_millis(1));
@@ -588,7 +564,6 @@ fn the_host_verbs_say_frame_open_on_a_frame_unfinished_at_their_bound() {
     assert_eq!(headers(), ["OK 1", "OK 1 trimmed=0", "OK 1", "OK 6", "OK"]);
 }
 
-/// A typed turn with no input frame to hold waits for the whole frame, as a pasted one does.
 #[test]
 fn a_typed_turn_off_an_input_frame_waits_for_the_whole_frame() {
     use aterm_types::control_verbs::RowsFence;
@@ -606,7 +581,6 @@ fn a_typed_turn_off_an_input_frame_waits_for_the_whole_frame() {
         last: 1,
         hash,
     };
-    // The next frame redraws row 0 and has not reached the composer.
     burst(&h, "\x1b[?2026h\x1b[1;1Htick 2\x1b[2;3H");
     let keys = std::cell::Cell::new(0usize);
     let key = |_: crate::input::InputEvent| {
@@ -656,12 +630,10 @@ fn a_typed_turn_off_an_input_frame_waits_for_the_whole_frame() {
     assert_eq!(keys.get(), 5, "every key typed into the whole frame");
 }
 
-/// A typed turn on an input frame judges its `if-rows=` fence on the whole frame its first key waited for.
 #[test]
 fn a_typed_turns_fence_is_judged_on_the_whole_frame_its_first_key_waits_for() {
     use aterm_types::control_verbs::RowsFence;
     use control_session::set_hold_wait_for_test;
-    /// The thread's holds wait on the clock again however the test ends.
     struct Clock;
     impl Drop for Clock {
         fn drop(&mut self) {
@@ -703,7 +675,6 @@ fn a_typed_turns_fence_is_judged_on_the_whole_frame_its_first_key_waits_for() {
             last: 3,
             hash,
         };
-        // The next frame redraws row 0, and closes on `composer` while the first key waits.
         burst(&h, "\x1b[?2026h\x1b[1;1Htick 2\x1b[3;3H");
         let (program, close) = (h.clone(), format!("\x1b[3;1H\x1b[2K{composer}\x1b[?2026l"));
         set_hold_wait_for_test(Some(Box::new(move || {
@@ -735,14 +706,12 @@ fn a_typed_turns_fence_is_judged_on_the_whole_frame_its_first_key_waits_for() {
     }
 }
 
-/// A typed turn defers its fence to its hold only for an input frame its first look found within the read's bound.
 #[test]
 fn a_typed_turns_fence_is_deferred_only_to_an_input_frame_its_first_look_found() {
     use aterm_core::terminal::ClockReading;
     use aterm_types::control_verbs::RowsFence;
     use control_session::set_hold_wait_for_test;
     use std::sync::Arc;
-    /// The thread's holds wait on the clock again however the test ends.
     struct Clock;
     impl Drop for Clock {
         fn drop(&mut self) {
@@ -798,7 +767,6 @@ fn a_typed_turns_fence_is_deferred_only_to_an_input_frame_its_first_look_found()
             &io,
         )
     };
-    // The window gave the next frame up already, its input frame still drawn.
     let given_up = fence();
     term_lock(term).process_at(
         b"\x1b[?2026h\x1b[1;1Htick 2\x1b[3;3H",
@@ -810,7 +778,6 @@ fn a_typed_turns_fence_is_deferred_only_to_an_input_frame_its_first_look_found()
         },
     );
     let at_once = turn(given_up);
-    // The next frame clears the screen, and draws the input frame again while the look waits.
     let drawn = fence();
     burst(&h, "\x1b[?2026h\x1b[H\x1b[2Jtick 2");
     let at_bound = std::thread::scope(|s| {
@@ -832,7 +799,6 @@ fn a_typed_turns_fence_is_deferred_only_to_an_input_frame_its_first_look_found()
     assert!(!held.load(Ordering::Acquire), "a hold waited on the frame");
 }
 
-/// A Claude Code session at its composer in `store`, and the halves of the frame echoing `carry on`.
 fn claude_echoing(store: &session_store::Store) -> (SessionHandle, &'static str, String) {
     let h = session(
         registered_session(0, -1, &claude_composer_screen()),
@@ -860,7 +826,6 @@ fn claude_echoing(store: &session_store::Store) -> (SessionHandle, &'static str,
     (h, echo_head, echo_rest)
 }
 
-/// A turn's composer verify reads the composer in a whole frame, so an ignored Enter is not verified.
 #[test]
 fn a_turns_composer_verify_reads_the_composer_in_a_whole_frame() {
     use std::cell::Cell;
@@ -871,7 +836,6 @@ fn a_turns_composer_verify_reads_the_composer_in_a_whole_frame() {
         burst(&h, echo_head);
         true
     };
-    // The program ignores the Enter.
     let presses = Cell::new(0u32);
     let press = |_: &str| {
         presses.set(presses.get() + 1);
@@ -928,7 +892,6 @@ fn a_turns_composer_verify_reads_the_composer_in_a_whole_frame() {
     assert!(waited, "the look waited for the frame: {verdict}");
 }
 
-/// A turn's settled screen is read in a whole frame.
 #[test]
 fn a_turns_settled_screen_is_read_in_a_whole_frame() {
     let store = session_store::new_store();
@@ -979,7 +942,6 @@ fn a_turns_settled_screen_is_read_in_a_whole_frame() {
     assert!(waited, "the read waited for the frame: {verdict}");
 }
 
-/// A `GuiHost` select takes its span from a whole frame.
 #[test]
 fn a_guihost_select_is_made_on_a_whole_frame() {
     let h = session(registered_session(0, -1, b""), EVENTUALLY);
@@ -1000,7 +962,6 @@ fn a_guihost_select_is_made_on_a_whole_frame() {
     assert!(waited, "the select waited for the frame");
 }
 
-/// A `GuiHost` verb whose caller hung up while it waited for a frame does nothing on the half frame.
 #[test]
 #[cfg(unix)]
 fn a_guihost_verb_whose_caller_hung_up_does_nothing_on_half_a_frame() {
@@ -1038,7 +999,6 @@ fn a_guihost_verb_whose_caller_hung_up_does_nothing_on_half_a_frame() {
     assert!(read.is_none(), "a read ran for a caller that hung up");
 }
 
-/// A read's bound never passes the frame's hang detector, whatever the sync timeout.
 #[test]
 fn a_reads_bound_never_passes_the_hang_detector() {
     use aterm_core::terminal::{ClockReading, FRAME_HANG};
@@ -1062,7 +1022,6 @@ fn a_reads_bound_never_passes_the_hang_detector() {
     assert_eq!(crate::whole_frame_bound(&t, now), Some(hang));
 }
 
-/// A read waiting for a frame gives its lane back when its caller hangs up, long before its bound.
 #[test]
 #[cfg(unix)]
 fn a_read_waiting_for_a_frame_gives_its_lane_back_when_its_caller_hangs_up() {
@@ -1115,7 +1074,6 @@ fn hang_up(client: &std::cell::Cell<Option<aterm_uds::CtlStream>>) {
     });
 }
 
-/// A turn whose caller hung up after its Enter still books its settled screen off a whole frame.
 #[test]
 #[cfg(unix)]
 fn a_turn_whose_caller_hung_up_books_a_whole_frame() {
@@ -1158,7 +1116,6 @@ fn a_turn_whose_caller_hung_up_books_a_whole_frame() {
     );
 }
 
-/// A turn whose caller hung up while it pasted still verifies its submit off a whole frame.
 #[test]
 #[cfg(unix)]
 fn a_turn_whose_caller_hung_up_verifies_its_submit_off_a_whole_frame() {
@@ -1173,7 +1130,6 @@ fn a_turn_whose_caller_hung_up_verifies_its_submit_off_a_whole_frame() {
         hang_up(&client);
         true
     };
-    // The program ignores the Enter.
     let presses = Cell::new(0u32);
     let press = |_: &str| {
         presses.set(presses.get() + 1);
@@ -1216,7 +1172,6 @@ fn a_turn_whose_caller_hung_up_verifies_its_submit_off_a_whole_frame() {
     );
 }
 
-/// A turn whose caller hung up after its paste still presses its guarded Enter off a whole frame.
 #[test]
 #[cfg(unix)]
 fn a_turn_whose_caller_hung_up_presses_its_guarded_enter_off_a_whole_frame() {
@@ -1261,7 +1216,6 @@ fn a_turn_whose_caller_hung_up_presses_its_guarded_enter_off_a_whole_frame() {
     );
 }
 
-/// `blocks`, `blocks --json` and `wait` never wait for a frame; `blocktext`, the control, does.
 #[test]
 fn a_verb_that_reads_no_row_never_waits_for_a_frame() {
     let h = session(registered_session(0, -1, b""), EVENTUALLY);
@@ -1311,7 +1265,6 @@ fn a_verb_that_reads_no_row_never_waits_for_a_frame() {
     assert!(waited, "CONTROL: blocktext waits for the frame");
 }
 
-/// A parked `wait` re-checks the marks as they stand when a frame opens.
 #[test]
 fn a_parked_wait_never_waits_for_a_frame() {
     let h = session(registered_session(0, -1, b""), EVENTUALLY);
@@ -1345,7 +1298,6 @@ fn a_parked_wait_never_waits_for_a_frame() {
     assert!(reply.starts_with("OK complete "), "{reply}");
 }
 
-/// The harness's `key enter` books its turn's `hash=` on a whole frame.
 #[test]
 fn a_harness_enter_is_booked_on_a_whole_frame() {
     use aterm_agent::harness::upgrade_drive::hand_take_here_request;
@@ -1391,7 +1343,6 @@ fn a_harness_enter_is_booked_on_a_whole_frame() {
     CONNECTION_CLAIMED.with(|c| c.set(false));
 }
 
-/// A harness `key enter` with no typed turn to book reads no frame, so its reply never waits for one.
 #[test]
 fn a_harness_enter_with_nothing_to_book_never_waits_for_a_frame() {
     use aterm_agent::harness::upgrade_drive::hand_take_here_request;
@@ -1422,7 +1373,6 @@ fn a_harness_enter_with_nothing_to_book_never_waits_for_a_frame() {
     CONNECTION_CLAIMED.with(|c| c.set(false));
 }
 
-/// The harness's `key enter` whose caller hung up still books its turn's `hash=` on a whole frame.
 #[test]
 #[cfg(unix)]
 fn a_harness_enter_whose_caller_hung_up_is_booked_on_a_whole_frame() {

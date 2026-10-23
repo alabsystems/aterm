@@ -92,8 +92,8 @@ pub(crate) const GL_SRGB8_ALPHA8: GLenum = 0x8C43;
 pub(crate) const GL_RGBA16F: GLenum = 0x881A;
 pub(crate) const GL_RED: GLenum = 0x1903;
 pub(crate) const GL_RGBA: GLenum = 0x1908;
-/// `EXT_read_format_bgra`: a readback in the byte order of an X11 window's
-/// `0x00RRGGBB` words on a little-endian client.
+/// `EXT_read_format_bgra`: a readback in the byte order of an X11 window's `0x00RRGGBB` words on a
+/// little-endian client.
 #[cfg(all(not(wgpu_arm), not(target_arch = "wasm32")))]
 pub(crate) const GL_BGRA_EXT: GLenum = 0x80E1;
 pub(crate) const GL_UNSIGNED_BYTE: GLenum = 0x1401;
@@ -152,9 +152,10 @@ macro_rules! fn_table {
         #[cfg(not(target_arch = "wasm32"))]
         impl $name {
             /// Fill the table from `lookup` (a symbol name to its address, null when absent).
+            ///
             /// # Safety
-            /// `lookup` must return either null or the address of the named
-            /// function with exactly the signature declared here.
+            /// `lookup` must return either null or the address of the named function with
+            /// exactly the signature declared here.
             pub(crate) unsafe fn load(
                 lookup: &mut dyn FnMut(&CStr) -> *const c_void,
             ) -> Result<Self, String> {
@@ -174,9 +175,9 @@ macro_rules! fn_table {
                                 $sym
                             ));
                         }
-                        // SAFETY: a non-null address of this symbol, whose
-                        // signature the caller vouches for; a data pointer and
-                        // a fn pointer have the same size on every target.
+                        // SAFETY: a non-null address of this symbol, whose signature the caller
+                        // vouches for; a data pointer and a fn pointer have the same size on every
+                        // target.
                         unsafe {
                             std::mem::transmute::<
                                 *const c_void,
@@ -323,6 +324,7 @@ pub(crate) fn gl_reset_name(code: GLenum) -> String {
 }
 
 /// A NUL-terminated C string at `p` as an owned `String` (empty for null).
+///
 /// # Safety
 /// `p` is null or points at a NUL-terminated string that outlives the call.
 pub(crate) unsafe fn c_string(p: *const c_char) -> String {
@@ -338,9 +340,9 @@ pub(crate) unsafe fn c_string(p: *const c_char) -> String {
 pub(crate) mod webgl {
     #[link(wasm_import_module = "aterm_gl")]
     unsafe extern "C" {
-        /// A WebGL2 context on the canvas in object-table slot `canvas`
-        /// (`getContext('webgl2', { antialias: false })`): its id, or 0 when the canvas
-        /// gives none (no WebGL2, another context already on it, not a canvas).
+        /// A WebGL2 context on the canvas in object-table slot `canvas` (`getContext('webgl2', {
+        /// antialias: false })`): its id, or 0 when the canvas gives none (no WebGL2, another
+        /// context already on it, not a canvas).
         pub(crate) safe fn context_create(canvas: u32) -> u32;
         /// Forget context `ctx` (unbinding it if current).
         pub(crate) safe fn context_drop(ctx: u32);
@@ -476,8 +478,8 @@ mod egl {
         fn open() -> Result<Egl, String> {
             let mut handle = std::ptr::null_mut();
             for name in [c"libEGL.so.1", c"libEGL.so"] {
-                // SAFETY: a NUL-terminated library name; RTLD_LAZY binds on first
-                // call. The handle is never closed (see the type's note).
+                // SAFETY: a NUL-terminated library name; RTLD_LAZY binds on first call. The handle
+                // is never closed (see the type's note).
                 handle = unsafe { libc::dlopen(name.as_ptr(), libc::RTLD_LAZY) };
                 if !handle.is_null() {
                     break;
@@ -486,8 +488,8 @@ mod egl {
             if handle.is_null() {
                 return Err("no EGL library (libEGL.so.1) on this machine".to_owned());
             }
-            // SAFETY: `dlsym` on a live handle returns the symbol's address or
-            // null; the table declares each EGL 1.5 function's registry signature.
+            // SAFETY: `dlsym` on a live handle returns the symbol's address or null; the table
+            // declares each EGL 1.5 function's registry signature.
             let fns = unsafe {
                 EglFns::load(&mut |sym: &CStr| libc::dlsym(handle, sym.as_ptr()).cast_const())
             }?;
@@ -653,8 +655,8 @@ mod glx {
             let gl = open_first(&[c"libGLX.so.0", c"libGL.so.1"])
                 .ok_or("no GLX library (libGLX.so.0, libGL.so.1) on this machine")?;
             let x = open_first(&[c"libX11.so.6"]).ok_or("no libX11.so.6 on this machine")?;
-            // SAFETY: `dlsym` on live handles returns the symbol's address or
-            // null; the tables declare each function's registry signature.
+            // SAFETY: `dlsym` on live handles returns the symbol's address or null; the tables
+            // declare each function's registry signature.
             let fns = unsafe {
                 GlxFns::load(&mut |sym: &CStr| libc::dlsym(gl, sym.as_ptr()).cast_const())
             }?;
@@ -666,7 +668,6 @@ mod glx {
         }
     }
 
-    /// The first of `names` `dlopen` opens (never closed; see `Glx`).
     fn open_first(names: &[&CStr]) -> Option<*mut c_void> {
         names.iter().find_map(|name| {
             // SAFETY: a NUL-terminated library name; RTLD_LAZY binds on first call.

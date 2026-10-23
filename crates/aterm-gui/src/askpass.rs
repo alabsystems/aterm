@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The server side of the `sudo` askpass relay: the request the window raises a
-//! password sheet for, the answer that comes back, the decline backoff, and the
-//! pure helpers (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.4). The AppKit
-//! sheet itself lives in `lib.rs` (modelled on the pastejacking sheet); the
-//! control-socket handler is `control_askpass.rs`. Everything OS-touching is
-//! passed in, so the park loop and the shaping are tested headless.
+//! The server side of the `sudo` askpass relay: the request the window raises a password sheet for, the answer that comes back, the decline backoff, and the pure helpers (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.4).
 
 #[cfg(target_os = "macos")]
 use std::sync::mpsc::Sender;
@@ -15,8 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::control_askpass::public_reply;
 
-/// The process-wide boundary between synthetic key posting and a password
-/// sheet. The native presenter and the control input path share this state.
+/// The process-wide boundary between synthetic key posting and a password sheet.
 pub(crate) struct PromptInputGate {
     sheets: std::sync::atomic::AtomicUsize,
     posting: std::sync::Mutex<()>,
@@ -93,12 +87,10 @@ impl PasswordInput {
     }
 }
 
-/// The sheet's wait for the owner, matched to `await consent`'s ceiling. The
-/// helper waits longer still (360 s), so the server's answer always wins.
+/// The sheet's wait for the owner, matched to `await consent`'s ceiling.
 #[cfg(target_os = "macos")]
 pub(crate) const ASKPASS_DEADLINE: Duration = Duration::from_secs(300);
-/// One park between hang-up checks, so a killed `sudo`/helper frees the lane
-/// promptly.
+/// One park between hang-up checks, so a killed `sudo`/helper frees the lane promptly.
 pub(crate) const ASKPASS_TICK: Duration = Duration::from_millis(200);
 
 /// One request's identity and lifetime, shared by its wait lane and sheet.
@@ -140,15 +132,7 @@ impl Drop for RetireTicket<'_> {
     }
 }
 
-/// What the owner is asked about. Built only from kernel reads, never from the
-/// agent's words. The lane attests and reads these; the App (which holds the
-/// session pool and windows) attributes `attribute_from` to a local session,
-/// applies the backoff, finds the tab, and presents or refuses.
-///
-/// * `attribute_from` — the pid to start the session walk from: `sudo`'s parent
-///   (the invoking shell), because `sudo`'s own `PROC_PIDTBSDINFO` is refused.
-/// * `command` — the command line `sudo` was given (from `ps`, escaped).
-/// * `invoker` — the command that invoked `sudo` (from `ps`, escaped).
+/// What the owner is asked about.
 #[derive(Debug)]
 #[cfg(target_os = "macos")]
 pub(crate) struct AskpassRequest {
@@ -172,7 +156,6 @@ pub(crate) enum AskpassAnswer {
 impl std::fmt::Debug for AskpassAnswer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            // Never prints the bytes.
             Self::Secret(_) => f.write_str("Secret(<redacted>)"),
             Self::Cancel => f.write_str("Cancel"),
             Self::Refused(why) => write!(f, "Refused({why})"),
@@ -180,9 +163,7 @@ impl std::fmt::Debug for AskpassAnswer {
     }
 }
 
-/// The verb's reply line for an answer. The secret is hex so the
-/// one line carries no control byte; it is the only place the bytes cross the
-/// socket, point to point, never logged.
+/// The verb's reply line for an answer.
 pub(crate) fn reply_line(answer: &AskpassAnswer) -> aterm_uds::sudo::WireBuffer {
     match answer {
         AskpassAnswer::Secret(secret) => aterm_uds::sudo::WireBuffer::secret_reply(secret),
@@ -191,17 +172,11 @@ pub(crate) fn reply_line(answer: &AskpassAnswer) -> aterm_uds::sudo::WireBuffer 
     }
 }
 
-/// Escape a command line for a trusted display: any control char, newline, or
-/// Unicode bidi/isolate/override is shown as `\u{XXXX}`, so a crafted argument
-/// can neither inject rows into the sheet nor reorder what the owner reads
-/// (design §3.4 step 4, §4). `sudo`'s own argv is unreadable per-argument by an
-/// unprivileged process, so this is applied to the `ps` line — the command line
-/// `sudo` was given — which the sheet labels as such.
+/// Escape a command line for a trusted display: any control char, newline, or Unicode bidi/isolate/override is shown as `\u{XXXX}`, so a crafted argument can neither inject rows into the sheet nor reorder what the owner reads (design §3.4 step 4, §4).
 pub(crate) fn escape_display(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
-            // C0/C1 controls, DEL, and the bidi/isolate/override ranges.
             c if c.is_control()
                 || ('\u{200e}'..='\u{200f}').contains(&c)
                 || ('\u{202a}'..='\u{202e}').contains(&c)
@@ -215,12 +190,7 @@ pub(crate) fn escape_display(s: &str) -> String {
     out
 }
 
-/// The decline backoff, kept per instance and keyed per WINDOW (design §3.4
-/// step 5, O5): after a cancel, the next request for that window inside the
-/// quiet window is refused at once; it starts at 10 s and doubles to 5 min on
-/// each consecutive cancel, and an answer resets it. Keying per window (not per
-/// session) is why opening a new tab does not escape the quiet window — the
-/// caller passes the hosting window's id.
+/// The decline backoff, kept per instance and keyed per WINDOW (design §3.4 step 5, O5): after a cancel, the next request for that window inside the quiet window is refused at once; it starts at 10 s and doubles to 5 min on each consecutive cancel, and an answer resets it.
 #[derive(Default)]
 pub(crate) struct Backoff {
     per_window: std::collections::HashMap<u64, Quiet>,
@@ -269,10 +239,7 @@ impl Backoff {
     }
 }
 
-/// Park on the sheet's answer until it comes, the deadline passes, or the
-/// caller hangs up. `recv` is the request's receiver; `hung_up` reports the
-/// socket peer gone; `now` the clock. Pure over those, so it is tested with a
-/// fake clock and channel. Returns the reply line.
+/// Park on the sheet's answer until it comes, the deadline passes, or the caller hangs up.
 pub(crate) fn await_answer(
     recv: &Receiver<AskpassAnswer>,
     ticket: &AskpassTicket,
@@ -301,8 +268,6 @@ pub(crate) fn await_answer(
                 return reply_line(&answer);
             }
             Err(RecvTimeoutError::Timeout) => {}
-            // The App dropped the sender without answering (a window closed,
-            // the sheet withdrawn): not a decline, a transient refusal.
             Err(RecvTimeoutError::Disconnected) => {
                 return public_reply("ERR askpass busy the window withdrew the prompt\n");
             }
@@ -310,33 +275,21 @@ pub(crate) fn await_answer(
     }
 }
 
-// The owner-only OFF switch (design §3.1)
-
-/// The marker file whose presence means the owner has turned the sudo relay
-/// OFF. Under the aterm state dir (`aterm_types::dirs::state_dir`), NOT in
-/// agent-writable `aterm.toml`. Absent is the default (relay on).
+/// The marker file whose presence means the owner has turned the sudo relay OFF.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn relay_off_marker() -> Option<std::path::PathBuf> {
     aterm_types::dirs::state_dir().map(|d| d.join("askpass-off"))
 }
 
-/// Whether the relay is off. Only a confirmed absent marker permits the
-/// default-on state; an unknown state path or metadata error keeps it off.
-/// A dangling marker symlink is still an off entry, without following its target.
-///
-/// Only the owner's confirmed Settings request writes the marker; no control verb or
-/// config edit does. A same-uid program can still change the file directly, so the
-/// switch is not a filesystem privilege boundary.
+/// Whether the relay is off.
 #[cfg(target_os = "macos")]
 #[must_use]
 pub(crate) fn relay_off() -> bool {
     relay_off_from_metadata(relay_off_marker().as_deref(), marker_metadata_at)
 }
 
-/// The same presence decision with an explicit marker and metadata probe, so
-/// unknown-path and I/O outcomes can be tested without process-global env or
-/// permission changes. The native lane uses `marker_metadata_at` below.
+/// The same presence decision with an explicit marker and metadata probe, so unknown-path and I/O outcomes can be tested without process-global env or permission changes.
 fn relay_off_from_metadata(
     marker: Option<&std::path::Path>,
     metadata: impl FnOnce(&std::path::Path) -> std::io::Result<std::fs::Metadata>,
@@ -351,8 +304,7 @@ fn marker_metadata_at(path: &std::path::Path) -> std::io::Result<std::fs::Metada
     std::fs::symlink_metadata(path)
 }
 
-/// Persist the owner's confirmed preference, consuming its one-use answer. An unknown
-/// state directory or failed filesystem operation is reported to the requesting view.
+/// Persist the owner's confirmed preference, consuming its one-use answer.
 #[cfg(target_os = "macos")]
 pub(crate) fn set_relay_off(
     off: bool,
@@ -367,8 +319,7 @@ pub(crate) fn set_relay_off(
     set_marker_at(&path, off)
 }
 
-/// Change the marker entry itself. An existing entry already means off, including a
-/// symlink or FIFO; never open it or follow its target. Only absence means on.
+/// Change the marker entry itself.
 #[cfg(any(target_os = "macos", test))]
 fn set_marker_at(path: &std::path::Path, off: bool) -> std::io::Result<()> {
     if off {

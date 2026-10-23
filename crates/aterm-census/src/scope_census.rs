@@ -2,34 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! Scope-cardinality census (OB-13..OB-16): "one enforcer, N instances" as a
-//! fail-closed obligation.
-//!
-//! A model can verify a property of one instance of an enforcing structure
-//! while the property that matters is global across all live instances. The
-//! `FlashLimiter` model proves at most 2 ignitions per rolling second for one
-//! limiter; if every split pane had its own `WordDecorations`, the viewer would
-//! see 2N flashes per second. WCAG 2.3.1 is window-wide.
-//!
-//! A [`ScopeClaim`] declares the ownership chain from the scope root down to the
-//! enforcing state, plus every other place that state may live. The census
-//! re-derives both from the tree on every run, so multiplying an enforcer
-//! either re-types a pinned link (OB-13) or opens the closure (OB-14).
-//!
-//! Obligations (`[OB-n]` tags in the diagnostics):
-//!
-//! * OB-13 chain pinned: each link's field declaration occurs exactly once,
-//!   verbatim, in the declared owner's struct body.
-//! * OB-14 closure: every non-test struct field and construction site of a
-//!   claim's `closed_tokens` type is accounted for by its `chain` or
-//!   `replicas`.
-//! * OB-15 aggregation: a claim with shard replicas names an `aggregator` whose
-//!   body reads every declared access path.
-//! * OB-16 liveness: files exist, owners resolve, the `machine` (if declared)
-//!   resolves in the derived-model catalog (`aterm-models-*`), prose fields are non-empty,
-//!   `chain[0].owner == root`, and every closed token is mentioned by the chain.
-//!
-//! None has a waiver channel: a violation is fixed, or the claim is re-argued.
+//! Scope-cardinality census (OB-13 through OB-16).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -37,8 +10,6 @@ use std::path::Path;
 
 use crate::lock_order::{mask_gated_items, mask_literals};
 use crate::{CensusOutcome, collect_rs_files, is_test_file, strip_line_comment};
-
-// The claim vocabulary.
 
 /// The physical thing the safety budget belongs to. Declared, not derived; see
 /// [`SCOPE_PRECISION_NOTE`].
@@ -48,11 +19,6 @@ enum Scope {
     Window,
 }
 
-/// One link of the ownership chain from the scope root down to the enforcing
-/// state.
-///
-/// `decl` is the field declaration verbatim (trimmed). Pinning the spelling
-/// means a map, `Vec`, alias or newtype all read as a change.
 struct Link {
     file: &'static str,
     owner: &'static str,
@@ -70,8 +36,6 @@ enum ReplicaKind {
     Shard,
 }
 
-/// A place the enforcing state legitimately lives outside the primary chain,
-/// with the argument for why a second one is sound.
 struct Replica {
     file: &'static str,
     /// `struct` name for a field replica, or the enclosing `fn` for a
@@ -82,8 +46,6 @@ struct Replica {
     justification: &'static str,
 }
 
-/// The fn that must re-establish the aggregate across every shard. Required
-/// whenever a claim has [`ReplicaKind::Shard`] replicas.
 struct Aggregator {
     symbol: &'static str,
     file: &'static str,
@@ -91,8 +53,6 @@ struct Aggregator {
     reads: &'static [&'static str],
 }
 
-/// A global-scope safety claim: a doc-comment assertion turned into an
-/// obligation the census re-derives from the tree on every run.
 struct ScopeClaim {
     /// Stable id; appears in diagnostics.
     id: &'static str,
@@ -114,9 +74,6 @@ struct ScopeClaim {
     rationale: &'static str,
 }
 
-// The registry (the census's fail-closed ground truth).
-
-/// Why a web host's pipeline is its own scope, not a second enforcer.
 const WEB_PIPELINE_SCOPE: &str = "The web page's pipeline runs in a DIFFERENT PROCESS \
     driving its own browser surface — its window, its budget (the same limiter is \
     documented at aterm-wasm/src/effects_api.rs). It never shares a retina with a \
@@ -129,9 +86,6 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
         unmodelled_because: "",
         scope: Scope::Window,
         root: "WindowState",
-        // The window owns one `EffectsPipeline`, which owns the one
-        // `WordDecorations`. Both types are closed: a second pipeline anywhere
-        // is a second limiter.
         chain: &[
             Link {
                 file: "crates/aterm-gui/src/lib.rs",
@@ -178,8 +132,6 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                     holds no flash budget and cannot put a luminance transition on the glass.",
             },
         ],
-        // Every replica is a separate scope, not a shard, so OB-15 requires
-        // (and permits) no aggregator.
         aggregator: None,
         rationale: "WCAG 2.3.1 charges 2 flash pairs per ignition against a \
             more-than-3-flashes-per-second threshold measured on ONE retina. The budget \
@@ -212,8 +164,6 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
                 decl: "persist: FxHashMap<u64, Episode>,",
             },
         ],
-        // The leaf type `FxHashMap<u64, Episode>` is too common to close over;
-        // this claim relies on OB-13 (the chain) and OB-15 (the aggregator).
         closed_tokens: &[],
         replicas: &[Replica {
             file: "crates/aterm-effects/src/word_decorations.rs",
@@ -256,13 +206,9 @@ const SCOPE_CLAIMS: &[ScopeClaim] = &[
     },
 ];
 
-/// Sources this census never reads: its own registry and fixtures name every
-/// closed token.
 const SELF_EXCLUDED_DIR: &str = "crates/aterm-census/src";
 
 /// The honest limits of this census, printed in every red diagnostic.
-// A plain multi-line literal: `\` continuations would strip the leading
-// indentation the diagnostic relies on.
 pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits of this census):
       - LEXICAL, declaration-text based. A chain link is pinned by the VERBATIM
         field declaration inside a `struct <owner> {` body, comments and string
@@ -288,11 +234,6 @@ pub const SCOPE_PRECISION_NOTE: &str = "    PRECISION / SCOPE (the honest limits
         registry itself names every token).
 ";
 
-// Source primitives.
-
-/// Every file OB-16 resolves a claim's `machine` against: aterm-spec's
-/// `derive.rs` plus every model file of each `aterm-models-<domain>` crate,
-/// enumerated so a split, a merge or a move cannot take a machine out of reach.
 fn derive_model_sources(root: &Path) -> Vec<std::path::PathBuf> {
     let rs_files = |dir: std::path::PathBuf| -> Vec<std::path::PathBuf> {
         crate::tree::read_dir(&dir)
@@ -325,8 +266,6 @@ fn derive_model_sources(root: &Path) -> Vec<std::path::PathBuf> {
     paths
 }
 
-/// Blank comments and string literals, preserving line count and offsets, so
-/// a token in a doc comment or string is never read as a declaration.
 fn mask_comments(source: &str) -> String {
     let mut out = String::with_capacity(source.len());
     for line in source.lines() {
@@ -337,15 +276,12 @@ fn mask_comments(source: &str) -> String {
     out
 }
 
-/// The body of `struct <owner> {` … matching `}` in masked `source`. `None`
-/// when the struct is absent (OB-16's stale-claim signal).
 fn struct_body<'a>(source: &'a str, owner: &str) -> Option<&'a str> {
     let head = format!("struct {owner} {{");
     let start = source.find(&head)? + head.len();
     brace_body(source, start)
 }
 
-/// From `start` (just past an opening `{`), the slice up to its matching `}`.
 fn brace_body(source: &str, start: usize) -> Option<&str> {
     let mut depth = 1i32;
     for (i, b) in source.as_bytes()[start..].iter().enumerate() {
@@ -363,8 +299,6 @@ fn brace_body(source: &str, start: usize) -> Option<&str> {
     None
 }
 
-/// Every `struct <Name> { … }` in a masked source, as `(name, body)`. Tuple
-/// structs (`struct X(..)`) have no named fields and are skipped.
 fn all_struct_bodies(source: &str) -> Vec<(String, &str)> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
@@ -372,7 +306,6 @@ fn all_struct_bodies(source: &str) -> Vec<(String, &str)> {
     while let Some(rel) = source[from..].find("struct ") {
         let at = from + rel;
         from = at + "struct ".len();
-        // `struct` must be a whole word: reject `_struct`, `mystruct`.
         if at > 0 && (bytes[at - 1].is_ascii_alphanumeric() || bytes[at - 1] == b'_') {
             continue;
         }
@@ -396,9 +329,6 @@ fn all_struct_bodies(source: &str) -> Vec<(String, &str)> {
     out
 }
 
-/// The body of `fn <symbol>(` … matching `}` in a masked source. The first `{`
-/// at paren-depth 0 after the signature opens the body, so `-> Option<Instant>`
-/// and multi-line parameter lists are handled without parsing types.
 fn fn_body<'a>(source: &'a str, symbol: &str) -> Option<&'a str> {
     let head = format!("fn {symbol}(");
     let at = source.find(&head)?;
@@ -418,9 +348,6 @@ fn fn_body<'a>(source: &'a str, symbol: &str) -> Option<&'a str> {
     None
 }
 
-/// The name of the `fn` a byte offset sits inside (the nearest preceding
-/// `fn <ident>(`). A constructor inside a closure attributes to its enclosing
-/// function.
 fn enclosing_fn(source: &str, at: usize) -> Option<String> {
     let head = &source[..at];
     let mut best: Option<String> = None;
@@ -444,7 +371,6 @@ fn enclosing_fn(source: &str, at: usize) -> Option<String> {
     best
 }
 
-/// Is `hay[at..at + needle.len()]` a whole-word occurrence of `needle`?
 const fn word_at(hay: &str, at: usize, needle: &str) -> bool {
     let b = hay.as_bytes();
     let before_ok = at == 0 || !(b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_');
@@ -453,20 +379,16 @@ const fn word_at(hay: &str, at: usize, needle: &str) -> bool {
     before_ok && after_ok
 }
 
-/// The field name of a declaration like `word_decos: crate::…::T,`.
 fn field_name(decl: &str) -> Option<&str> {
     let (lhs, _) = decl.split_once(':')?;
     let name = lhs.rsplit(' ').next()?.trim();
     (!name.is_empty()).then_some(name)
 }
 
-/// The 1-based line number containing byte offset `at`.
 fn line_of(source: &str, at: usize) -> usize {
     source[..at].bytes().filter(|b| *b == b'\n').count() + 1
 }
 
-/// Every non-test source under `root/crates` (examples included), minus this
-/// census's own sources.
 fn sweep_files(root: &Path) -> Vec<std::path::PathBuf> {
     let mut files = Vec::new();
     let _ = collect_rs_files(&root.join("crates"), &mut files);
@@ -475,11 +397,8 @@ fn sweep_files(root: &Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-/// Item gates whose code never ships: masked before every sweep, so test-only
-/// engines can construct as many enforcers as they like.
 const UNSHIPPED_GATES: &[&str] = &["#[cfg(test)]"];
 
-/// Repo-relative, forward-slashed path for diagnostics and registry matching.
 fn rel(root: &Path, path: &Path) -> String {
     path.strip_prefix(root)
         .unwrap_or(path)
@@ -487,19 +406,14 @@ fn rel(root: &Path, path: &Path) -> String {
         .replace('\\', "/")
 }
 
-// The census.
-
 /// The scope-cardinality census over the live registry.
 #[must_use]
 pub fn run_scope_census(root: &Path) -> CensusOutcome {
     run_scope_census_over(root, SCOPE_CLAIMS)
 }
 
-/// The scope census's verdict title.
 const SCOPE: &str = "scope-cardinality census";
 
-/// The census body, parameterised by registry so tests can drive one claim over
-/// a copied-and-mutated real tree.
 fn run_scope_census_over(root: &Path, claims: &[ScopeClaim]) -> CensusOutcome {
     let mut log = String::new();
     let _ = writeln!(
@@ -550,8 +464,6 @@ fn run_scope_census_over(root: &Path, claims: &[ScopeClaim]) -> CensusOutcome {
     CensusOutcome::green(SCOPE, log, summary)
 }
 
-/// The why + repair block every cardinality diagnostic ends with, printed in
-/// full so the diagnostic explains the class on its own.
 fn why_and_repair(claim: &ScopeClaim) -> String {
     format!(
         "\x20   WHY THIS IS AN OBLIGATION: {}\n\
@@ -564,8 +476,6 @@ fn why_and_repair(claim: &ScopeClaim) -> String {
     )
 }
 
-/// OB-16: anti-vacuity. A claim that no longer resolves against the tree is
-/// red.
 fn check_liveness(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
     if claim.rationale.trim().is_empty() {
         v.push(format!(
@@ -646,7 +556,6 @@ fn check_liveness(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
     }
 }
 
-/// OB-13: the pinned declaration occurs exactly once in its declared owner.
 fn check_link(root: &Path, claim: &ScopeClaim, link: &Link, v: &mut Vec<String>) {
     let Ok(source) = crate::tree::read_to_string(&root.join(link.file)) else {
         v.push(format!(
@@ -684,8 +593,6 @@ fn check_link(root: &Path, claim: &ScopeClaim, link: &Link, v: &mut Vec<String>)
     ));
 }
 
-/// OB-14 over the whole tree: every field and construction of a closed token
-/// is accounted for by its claim.
 fn check_closure(root: &Path, claims: &[ScopeClaim], v: &mut Vec<String>) {
     if claims.iter().all(|c| c.closed_tokens.is_empty()) {
         return;
@@ -710,9 +617,6 @@ fn check_closure(root: &Path, claims: &[ScopeClaim], v: &mut Vec<String>) {
     }
 }
 
-/// The field half of OB-14. Enumerating struct bodies keeps enum variants
-/// (`DeadlineOwner::WordDecorations`) and fn parameters
-/// (`decos: &mut WordDecorations`) out of the closure.
 fn check_closure_fields(
     claim: &ScopeClaim,
     file: &str,
@@ -752,9 +656,6 @@ fn check_closure_fields(
     }
 }
 
-/// Whether the text before a type token ends in a fn signature's return
-/// arrow, optionally through a reference (`-> T`, `-> &T`, `-> &mut T`,
-/// `-> &'a mut T`).
 fn returns_token(before: &str) -> bool {
     let mut rest = before.trim_end();
     if let Some(r) = rest.strip_suffix("mut")
@@ -776,9 +677,6 @@ fn returns_token(before: &str) -> bool {
     rest.ends_with("->")
 }
 
-/// Every closed token's named constructors: associated fns of its `impl`
-/// blocks whose return type is the token (`-> Self`, `-> Option<Self>`, …),
-/// e.g. `EffectsPipeline::for_window`.
 fn closed_token_ctors(
     files: &[std::path::PathBuf],
     claims: &[ScopeClaim],
@@ -807,9 +705,6 @@ fn closed_token_ctors(
     out
 }
 
-/// The bodies of every `impl … <token> {` (inherent or trait) in a masked
-/// source: the self type is what follows `for`, else what follows `impl` and
-/// its generics, with any path and generic arguments stripped.
 fn impl_bodies<'a>(masked: &'a str, token: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut from = 0usize;
@@ -845,7 +740,6 @@ fn impl_bodies<'a>(masked: &'a str, token: &str) -> Vec<&'a str> {
     out
 }
 
-/// `<'a, T: X<Y>> Rest` → `Rest`.
 fn skip_generics(header: &str) -> &str {
     let mut depth = 0i32;
     for (i, c) in header.char_indices() {
@@ -863,8 +757,6 @@ fn skip_generics(header: &str) -> &str {
     ""
 }
 
-/// The names of the fns in an impl body whose return type names `Self` or
-/// the token by value (a `&Self` return lends, it builds nothing).
 fn self_returning_fns(body: &str, token: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut from = 0usize;
@@ -906,8 +798,6 @@ fn self_returning_fns(body: &str, token: &str) -> Vec<String> {
     out
 }
 
-/// The construction half of OB-14: a per-pane engine needs no field at all if
-/// something builds one inside a loop.
 fn check_closure_ctors(
     claim: &ScopeClaim,
     file: &str,
@@ -925,9 +815,6 @@ fn check_closure_ctors(
         }
         let tail = &masked[at + token.len()..];
         let trimmed = tail.trim_start();
-        // `T::default()` / `T::new(` / `T::<named ctor>(` / `T {`. `default`
-        // and `new` count even for derives or out-of-tree definitions. The
-        // single space before the brace excludes `T| {` and `T) {`.
         let assoc = tail.strip_prefix("::").and_then(|t| {
             let len = t.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
             t[len..].starts_with('(').then_some(&t[..len])
@@ -938,8 +825,6 @@ fn check_closure_ctors(
         if !is_ctor {
             continue;
         }
-        // `struct X {`, `impl X {`, `impl Default for X {`, `enum`, `trait`,
-        // `union` are definitions, not constructions.
         let prev_word = masked[..at]
             .split_whitespace()
             .next_back()
@@ -950,8 +835,6 @@ fn check_closure_ctors(
         ) {
             continue;
         }
-        // `fn decos(&self) -> &X {` is a signature whose body brace follows
-        // its return type: an accessor lends the one instance, it builds none.
         if returns_token(&masked[..at]) {
             continue;
         }
@@ -989,7 +872,6 @@ fn check_closure_ctors(
     }
 }
 
-/// OB-15: shards require an aggregator that reads every one of them.
 fn check_aggregation(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
     let shards = claim
         .replicas
@@ -1054,8 +936,7 @@ fn check_aggregation(root: &Path, claim: &ScopeClaim, v: &mut Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // The real checkout: the main tests mutate copies of the real claim files
-    // rather than synthetic lookalikes.
+
     use crate::scan_set::test_fixtures::{Tree, repo_root, synth_tree};
 
     fn claim_by_id(id: &str) -> &'static ScopeClaim {
@@ -1065,8 +946,6 @@ mod tests {
             .unwrap_or_else(|| panic!("no claim `{id}` in SCOPE_CLAIMS"))
     }
 
-    /// Every repo-relative file a claim names, plus the whole derived-model
-    /// catalog OB-16 resolves `machine` against.
     fn claim_files(claim: &ScopeClaim) -> Vec<String> {
         let repo = repo_root();
         let mut files: Vec<String> = derive_model_sources(&repo)
@@ -1082,8 +961,6 @@ mod tests {
         files
     }
 
-    /// Copy `files` out of the live checkout into a tree held in memory,
-    /// preserving repo-relative paths. The caller mutates it.
     fn copy_root(name: &str, files: &[String]) -> Tree {
         let src = repo_root();
         let copied: Vec<(String, String)> = files
@@ -1102,8 +979,6 @@ mod tests {
         root.write(rel, contents);
     }
 
-    /// Apply a mutation to a copied file, asserting it applied (a stale `from`
-    /// would make the test vacuous).
     fn mutate(root: &Tree, rel: &str, from: &str, to: &str) {
         let before = crate::tree::read_to_string(&root.join(rel)).expect("read for mutation");
         let after = before.replace(from, to);
@@ -1119,7 +994,6 @@ mod tests {
         run_scope_census_over(root, std::slice::from_ref(claim))
     }
 
-    /// The union of every claim's files, for runs over the whole registry.
     fn all_claim_files() -> Vec<String> {
         let mut files: Vec<String> = SCOPE_CLAIMS.iter().flat_map(claim_files).collect();
         files.sort();
@@ -1127,9 +1001,6 @@ mod tests {
         files
     }
 
-    /// Giving every split pane its own effects pipeline (and so its own
-    /// limiter), applied to a copy of the real `crates/aterm-gui/src/lib.rs`:
-    /// green before, red after.
     #[test]
     fn a_per_pane_word_decorations_map_fails_the_flash_limiter_chain() {
         let claim = claim_by_id("flash-limiter");
@@ -1168,8 +1039,6 @@ mod tests {
         );
     }
 
-    /// With the chain untouched, a new per-pane owner of the engine or of a
-    /// pipeline around it is caught by OB-14.
     #[test]
     fn a_new_per_pane_owner_fails_the_closure() {
         let claim = claim_by_id("flash-limiter");
@@ -1213,8 +1082,6 @@ mod tests {
         );
     }
 
-    /// No field at all: a per-pane engine built inside a loop. OB-13 and the
-    /// field half of OB-14 both see nothing.
     #[test]
     fn a_per_pane_constructor_fails_the_closure() {
         let claim = claim_by_id("flash-limiter");
@@ -1247,9 +1114,6 @@ mod tests {
         );
     }
 
-    /// Every associated fn returning the closed token by value is a
-    /// constructor, inherent or trait; a lending method and a test-only
-    /// impl are not.
     #[test]
     fn named_constructors_are_discovered_from_impl_blocks() {
         let src = "pub struct EffectsPipeline;\n\
@@ -1285,9 +1149,6 @@ mod tests {
         assert_eq!(impl_bodies(src, "T").len(), 2);
     }
 
-    /// The same loop through a named constructor
-    /// (`EffectsPipeline::for_window()`): any associated fn of a closed token
-    /// returning `Self` builds one.
     #[test]
     fn a_per_pane_named_constructor_fails_the_closure() {
         let claim = claim_by_id("flash-limiter");
@@ -1325,7 +1186,6 @@ mod tests {
         );
     }
 
-    /// Anti-vacuity: a claim that stops matching the tree goes red.
     #[test]
     fn a_renamed_field_or_owner_fails_stale_rather_than_silently_passing() {
         let claim = claim_by_id("flash-limiter");
@@ -1377,9 +1237,6 @@ mod tests {
         }
     }
 
-    /// False-positive calibration: an enum variant named after the type, a
-    /// `Self::`-qualified variant, an `impl` block and a `&mut` fn parameter are
-    /// not owners of the enforcing state.
     #[test]
     fn enum_variants_and_fn_parameters_are_not_owners() {
         let claim = claim_by_id("flash-limiter");
@@ -1402,8 +1259,6 @@ mod tests {
         );
     }
 
-    /// OB-15 both ways: the aggregator passes on the real tree, and dropping
-    /// the parked-shard fold goes red.
     #[test]
     fn the_supernova_aggregator_regression_goes_red() {
         let root = copy_root("supernova", &all_claim_files());
@@ -1411,9 +1266,6 @@ mod tests {
         let out = run_scope_census_over(&root, SCOPE_CLAIMS);
         assert!(out.ok, "the aggregator must pass as written:\n{}", out.log);
 
-        // Drop the parked-shard fold: each shard carries an O(1) burst-mutex
-        // summary that the aggregator must fold in, so removing it means the
-        // scan sees one pane only.
         mutate(
             &root,
             "crates/aterm-effects/src/word_decorations.rs",

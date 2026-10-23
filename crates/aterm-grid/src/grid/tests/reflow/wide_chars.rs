@@ -19,7 +19,6 @@ fn reflow_narrow_terminal_with_wide_chars_terminates() {
     );
     grid.write_char('A');
 
-    // The wide char cannot fit one column: it is skipped, not retried forever.
     grid.resize(5, 1);
     grid.assert_invariants();
     let row0 = grid.row(0).unwrap();
@@ -139,8 +138,6 @@ fn reflow_narrow_terminal_replaces_multiple_wide_chars() {
     }
 }
 
-/// Write `中A` into a 2×4 grid, park the cursor at `col`, shrink to one column, and check the
-/// cursor lands at (`row`, 0) on a narrow `ch` (`what`) with row 1 continuing row 0.
 fn shrink_wide_pair_with_cursor_at(col: u16, row: u16, ch: char, what: &str) -> Grid {
     let mut grid = Grid::new(2, 4);
     grid.write_wide_char_wrap_styled(
@@ -187,7 +184,6 @@ fn shrink_wide_pair_with_cursor_at(col: u16, row: u16, ch: char, what: &str) -> 
 
 #[test]
 fn reflow_narrow_terminal_with_wide_chars_clamps_cursor() {
-    // Cursor on the spacer cell: it stays on row 0, on the wide char's blank.
     let grid = shrink_wide_pair_with_cursor_at(1, 0, ' ', "cleared wide cell replacement");
     assert_eq!(
         grid.row(1).unwrap().get(0).unwrap().char_data(),
@@ -195,7 +191,6 @@ fn reflow_narrow_terminal_with_wide_chars_clamps_cursor() {
         "ASCII cell should reflow to the next row after shrink"
     );
 
-    // Cursor on the ASCII cell: it follows 'A' to the next row.
     let grid = shrink_wide_pair_with_cursor_at(2, 1, 'A', "the reflowed ASCII cell");
     let row0_cell = grid.row(0).unwrap().get(0).unwrap();
     assert_eq!(
@@ -215,7 +210,6 @@ fn reflow_narrow_terminal_with_wide_chars_clamps_cursor() {
 
 #[test]
 fn resize_no_reflow_clears_wide_char_at_boundary() {
-    // `Row::resize` blanks a wide char whose spacer is cut off (WideCharNotAtEnd).
     let mut grid = Grid::new(2, 4);
 
     grid.row_mut(0).unwrap().set(0, Cell::new('A'));
@@ -242,13 +236,10 @@ fn resize_no_reflow_clears_wide_char_at_boundary() {
     assert_eq!(grid.row(0).unwrap().get(1).unwrap().char_data(), 'B' as u16);
 }
 
-/// Reflow shrink: a wide char starting at `chunk_end - 1` moves to the next chunk with its spacer
-/// (`adjust_chunk_boundary` backs the boundary up by one).
 #[test]
 fn reflow_shrink_wide_char_at_chunk_boundary() {
     let mut grid = Grid::new(5, 6);
 
-    // [A][中][spacer][B][C]
     grid.write_char('A');
     grid.write_wide_char_wrap_styled(
         '中',
@@ -261,8 +252,6 @@ fn reflow_shrink_wide_char_at_chunk_boundary() {
 
     grid.set_cursor(0, 3);
 
-    // At 2 columns: row 0 = [A] (cells[1] is WIDE, so the chunk ends at 1), row 1 = [中][spacer],
-    // row 2 = [B][C].
     grid.resize(5, 2);
     grid.assert_invariants();
 
@@ -293,13 +282,10 @@ fn reflow_shrink_wide_char_at_chunk_boundary() {
     assert_eq!(grid.cursor_col(), 0, "cursor should be at col 0 on row 2");
 }
 
-/// Reflow grow: when the merged line ends with a wide char, a cursor at the last content position
-/// lands on the last row (`cursor_in_chunk`'s `<=` for the last chunk).
 #[test]
 fn reflow_grow_cursor_at_end_of_wide_char_content() {
     let mut grid = Grid::new(4, 4);
 
-    // Row 0: [中][spacer][A][B], full.
     grid.write_wide_char_wrap_styled(
         '中',
         crate::PackedColor::DEFAULT_FG,
@@ -316,7 +302,6 @@ fn reflow_grow_cursor_at_end_of_wide_char_content() {
         row.write_char(0, 'C');
     }
 
-    // The cursor at the end of the continuation's content.
     grid.set_cursor(1, 1);
 
     grid.resize(4, 10);

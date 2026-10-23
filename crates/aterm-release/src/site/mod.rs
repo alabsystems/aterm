@@ -578,7 +578,7 @@ struct Git<'e> {
 
 impl Git<'_> {
     fn run(&self, dir: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-        let mut git = aterm_uds::spawnfd::command("git");
+        let mut git = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
         git.arg("-C")
             .arg(dir)
             .args(args)

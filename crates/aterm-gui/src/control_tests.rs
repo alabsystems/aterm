@@ -1,23 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-/// How long a test waits for something that must happen.
 const EVENTUALLY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// A pid alive on every host and never this process.
 const LIVE_FOREIGN_PID: u32 = if cfg!(windows) { 4 } else { 1 };
 
-/// A discovery entry a live foreign instance would have written.
 fn live_foreign_entry() -> String {
     format!("sock /nonexistent/aterm.sock\nnonce ab\npid {LIVE_FOREIGN_PID}\n")
 }
 
-/// [`proxy_forward_plan`] for a request line, read as a lane reads it.
 fn plan_for(line: &str, scope: Scope, store: &Store, dir: &std::path::Path) -> Option<String> {
     proxy_forward_plan(&Request::parse(line.to_string()), scope, store, dir)
 }
 
-/// [`is_wait_request`] for a request line, read as a lane reads it.
 fn request_waits(line: &str, scope: Scope, store: &Store) -> bool {
     is_wait_request(&Request::parse(line.to_string()), scope, store)
 }
@@ -39,7 +34,6 @@ where
     run_feed_bin_routed(&request, frame, reader, route, dispatch_front_input, writer)
 }
 
-/// [`deliver`] by the background route, as a `verb`'s arm calls it for a session not on screen.
 fn background(
     verb: &str,
     term: &Arc<Mutex<Terminal>>,
@@ -309,14 +303,12 @@ impl Drop for WireProbe {
     }
 }
 
-/// A verb's answer queued as a connection queues it ([`control_lanes::Outbox::attach`]).
 fn outbox_of(reply: ControlReply) -> control_lanes::Outbox {
     let mut outbox = control_lanes::Outbox::default();
     outbox.attach(reply);
     outbox
 }
 
-/// Deliver `outbox` into `writer` waiting.
 fn deliver_waiting(
     outbox: &mut control_lanes::Outbox,
     writer: &mut impl Write,
@@ -324,7 +316,6 @@ fn deliver_waiting(
     outbox.deliver_to(writer, false, |_| Ok(()))
 }
 
-/// The acknowledgement a delivered guarded answer awaits, read waiting from `server` and judged.
 fn await_ack(outbox: &mut control_lanes::Outbox, server: &CtlStream) -> ArtifactAckOutcome {
     let mut reader = BufReader::new(server);
     outbox
@@ -678,13 +669,10 @@ fn video_retention_is_reserved_apart_from_path_artifacts() {
     );
 }
 
-/// How long a test waits for the quarantine reaper to drop a guard whose quarantine has run out.
 const REAPER_PATIENCE: std::time::Duration = EVENTUALLY;
 
-/// A quarantine a test holds while it looks at it.
 const HELD_QUARANTINE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
-/// The ticket of the guard this thread put in quarantine last.
 fn last_quarantine_ticket() -> u64 {
     let ticket = super::LAST_QUARANTINE_TICKET
         .with(std::cell::Cell::take)
@@ -702,7 +690,6 @@ fn last_quarantine_ticket() -> u64 {
     ticket
 }
 
-/// End quarantine `ticket`'s grace now and ring the reaper.
 fn end_quarantine(ticket: u64) {
     let quarantine = artifact_reply_quarantine();
     let mut entries = quarantine
@@ -837,7 +824,6 @@ fn a_quarantined_path_capture_does_not_block_bytes() {
     }
 }
 
-/// A peer that takes `limit` bytes and then breaks.
 struct FailPast {
     limit: usize,
     bytes: Vec<u8>,
@@ -1100,7 +1086,6 @@ fn a_reply_wire_releases_when_its_reply_is_written() {
     assert!(!wire.wait_released(std::time::Instant::now() + std::time::Duration::from_millis(20)));
 }
 
-/// A fresh automatic capture target and the name lease the encode worker takes before writing.
 fn capture_reply_target(
     label: &str,
 ) -> (
@@ -1124,7 +1109,6 @@ fn capture_reply_target(
     (sock, target, lease)
 }
 
-/// The writer's output as the model reads it.
 fn reply_wire(wire: &[u8], body: &str) -> (bool, bool, bool) {
     let text = String::from_utf8_lossy(wire);
     let prefix = aterm_types::control_verbs::ARTIFACT_REPLY_CHALLENGE_PREFIX;
@@ -1720,7 +1704,6 @@ fn capture_reply_identity_failures_conform_to_artifact_reply_publication() {
     }
 }
 
-/// Copy a projected reply state and change some of its observations.
 fn project_artifact_reply_with(
     model: &aterm_spec::derive::Model,
     state: &aterm_spec::interp::State,
@@ -1825,7 +1808,6 @@ fn dribbling_ack_cannot_refresh_the_handoff_deadline() {
     dribbler.join().unwrap();
 }
 
-/// Read the guarded frame, acknowledge it and close.
 fn acknowledge_then_exit(
     client: CtlStream,
     server: &CtlStream,
@@ -2709,7 +2691,6 @@ fn authenticated_binary_payload_preserves_delayed_chunks() {
     sender.join().expect("delayed binary sender exits");
 }
 
-/// The server end of a control socket, read through, saying what its reads have met.
 struct TickingReads<'a> {
     stream: &'a CtlStream,
     seen: Arc<Mutex<(usize, bool)>>,
@@ -2915,7 +2896,6 @@ fn take_mods_grammar() {
 #[test]
 fn screen_styled_frame_is_lossless() {
     use aterm_core::terminal::Terminal;
-    /// (label, rows, cols, seed, needles).
     type Row<'a> = (&'a str, u16, u16, &'a [u8], &'a [&'a str]);
     let rows: &[Row] = &[
         (
@@ -3362,7 +3342,6 @@ fn never_listening_socket(path: &std::path::Path) {
 #[cfg(unix)]
 fn a_stale_graph_entry_answers_no_such_session_without_a_probe() {
     use std::io::{BufRead, BufReader, Write};
-    /// The read timeout a lane serves a connection under.
     const LANE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
     let scratch = crate::test_scratch::short_dir("the control dir");
     let dir = scratch.path();
@@ -3655,7 +3634,6 @@ fn an_invalid_sid_is_never_joined_into_a_path() {
 
 #[test]
 fn head_tokenizes_once_for_every_stage() {
-    /// The dispatcher's request head before the one grammar (frozen copy).
     fn legacy_head_verb(line: &str) -> &str {
         let tail = match line.split_once(' ') {
             Some((first, tail)) if first.starts_with('@') => tail,
@@ -3663,7 +3641,6 @@ fn head_tokenizes_once_for_every_stage() {
         };
         tail.split_once(' ').map_or(tail, |(verb, _)| verb)
     }
-    /// The frame detector's verb before the one grammar (frozen copy).
     fn legacy_frame_verb(line: &str) -> Option<&str> {
         let mut words = line.split_whitespace();
         match words.next() {
@@ -3836,14 +3813,12 @@ fn proxy_forward_plan_conforms_to_dispatch_model() {
     );
 }
 
-/// The line a planned forward to `sock` presents for `line`, `TOKEN <token> <line>`.
 fn presented(sock: &str, line: &str) -> String {
     let token = crate::proxy::read_sibling_token(sock)
         .unwrap_or_else(|| panic!("{sock}: no token to present"));
     crate::proxy::forward_first_line(&token, line)
 }
 
-/// An instance hosting the session `sid`, as this process finds it.
 fn hosting_instance(
     dir: &std::path::Path,
     pid: u32,
@@ -5347,24 +5322,18 @@ fn cross_session_scroll_moves_target_viewport() {
     );
 }
 
-/// A fresh `SessionCtx` for the auth/gate tests.
 fn test_ctx() -> Arc<crate::SessionCtx> {
     registered_session(0, -1, b"").ctx
 }
 
-/// The decision the op-scope gate at the top of `serve_session_verb` makes.
 fn gate_allows(scope: Scope, verb: &str, active: &SessionCtx) -> bool {
-    // An Edge passes only if its token holds the verb's op on the now-active session, so it
-    // cannot drive a session it was never granted on after the active handle moves.
     scope.is_owner_class() || cross_session_authorized(scope, verb, active)
 }
 
-/// An `Edge` scope with a throwaway, ungranted token.
 fn edge() -> Scope {
     Scope::Edge(EdgeToken::generate())
 }
 
-/// An `Edge` scope whose token is granted on `ctx`.
 fn edge_granted(op: Op, ctx: &SessionCtx) -> Scope {
     let tok = {
         let mut tbl = ctx.edges.lock().unwrap_or_else(|p| p.into_inner());
@@ -5460,18 +5429,15 @@ fn owner_verbs_need_no_terminal_except_the_session_authority_ones() {
     }
 }
 
-/// [`dispatch_authorized`] for `verb rest` over its table form, as the router hands it to the gate.
 fn line_authorized(scope: Scope, verb: &str, rest: &str, ctx: &SessionCtx) -> bool {
     let form = aterm_types::control_verbs::spec_for(verb, rest).expect("a table verb");
     dispatch_authorized(scope, &form, verb, rest, ctx)
 }
 
-/// What `verb rest` needs at the dispatch gate.
 fn request_need(verb: &str, rest: &str) -> Option<Need> {
     aterm_types::control_verbs::spec_for(verb, rest).and_then(|form| need_of(&form, verb, rest))
 }
 
-/// What `verb rest` needs at the dispatch gate beyond its verb's base op ([`required_op`]).
 fn escalation(verb: &str, rest: &str) -> Option<Need> {
     let need = request_need(verb, rest);
     need.filter(|_| need != required_op(verb).map(Need::Op))
@@ -6376,7 +6342,6 @@ fn tab_parses_each_form() {
     assert_eq!(parse_tab("next y"), None);
 }
 
-/// The grapheme content of one cell via the selection path.
 fn selection_of_cell(term: &Arc<Mutex<Terminal>>, row: i32, col: u16) -> String {
     let mut t = term_lock(term);
     let sel = t.text_selection_mut();
@@ -6510,7 +6475,6 @@ fn search_reaches_scrollback_and_parses_its_flags_off_the_tail() {
 use crate::session_store::{self, SessionHandle, SessionState};
 use aterm_session::{EdgeTable, LaunchNonce, decide_edge};
 
-/// Build a registered session.
 fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle {
     let sid = SessionId::generate();
     let nonce = LaunchNonce::generate();
@@ -6548,6 +6512,7 @@ fn registered_session(local_id: u64, master: i32, seed: &[u8]) -> SessionHandle 
         crash_journal: Default::default(),
         typed: Default::default(),
         bells: Default::default(),
+        screen_moves: Default::default(),
         update_parked: Default::default(),
         watchers: observed.watchers,
         frame: Default::default(),
@@ -7150,7 +7115,6 @@ fn timeline_records_lifecycle_in_order() {
     );
 }
 
-/// How many of `store`'s sessions a subscription is registered.
 fn watched_sessions(store: &Store) -> usize {
     let g = store.read().unwrap();
     let sessions = g
@@ -7161,7 +7125,6 @@ fn watched_sessions(store: &Store) -> usize {
     sessions + usize::from(g.instance_watchers().count() > 0)
 }
 
-/// Build an [`ActiveHandle`] over a registered session's tuple.
 fn active_for(h: &SessionHandle) -> ActiveHandle {
     Arc::new(Mutex::new(Some(ActiveSession {
         term: h.term.clone(),
@@ -7208,7 +7171,6 @@ fn a_refused_handshake_is_recorded_by_kind_through_the_denials_it_is_given() {
     assert_eq!(totals, [1, 2, 1], "blind, wrong, no-context");
 }
 
-/// Accumulate pushed bytes from a `CtlStream` until `pred` matches the accumulated text.
 fn read_until(s: &CtlStream, mut acc: String, pred: impl Fn(&str) -> bool) -> String {
     use std::io::Read;
     let mut s = s.try_clone().expect("clone client end");
@@ -7226,7 +7188,6 @@ fn read_until(s: &CtlStream, mut acc: String, pred: impl Fn(&str) -> bool) -> St
     acc
 }
 
-/// Whether `text` holds a whole `screen` frame.
 fn screen_frame_read_whole(text: &str) -> bool {
     text.split_once(" screen ")
         .and_then(|(_, rest)| rest.split_once('\n'))
@@ -7826,7 +7787,6 @@ fn subscribe_refusals_register_nothing() {
         /// Starts with `ERR ` and names this.
         Names(&'static str),
     }
-    /// (label, sessions (local id, seed) with the first active, line, owner?, want).
     type Row<'a> = (&'a str, &'a [(u64, &'a [u8])], &'a str, bool, Want);
     let rows: [Row; 4] = [
         (
@@ -8069,7 +8029,6 @@ fn subscribe_reads_its_line_by_the_request_grammar() {
     }
 }
 
-/// A `--json` body is one well-formed JSON value, as the workspace's JSON reader parses it.
 fn assert_well_formed_json(s: &str) {
     if let Err(e) = aterm_json::from_str::<aterm_json::Value>(s) {
         panic!("malformed JSON ({e}) in {s:?}");
@@ -8322,7 +8281,6 @@ fn family_verb_emits_parent_and_children() {
     );
 }
 
-/// Register two sessions and return `(store, private conn store, src, dst)`.
 fn connection_fixture() -> (
     crate::session_store::Store,
     crate::connections::ConnectionStore,
@@ -8337,7 +8295,6 @@ fn connection_fixture() -> (
     (store, crate::connections::new_connection_store(), a, b)
 }
 
-/// The token hex bound to `op=` on a `connect` reply line.
 fn reply_token(reply: &str, op: &str) -> Option<EdgeToken> {
     reply
         .split_whitespace()
@@ -9710,7 +9667,6 @@ impl ConptyTab {
         }
     }
 
-    /// The text conhost drew so far, its CSI and OSC framing left out.
     fn text(&self) -> String {
         let (mut text, mut i, s) = (Vec::new(), 0, &self.seen);
         while i < s.len() {
@@ -9737,7 +9693,6 @@ impl ConptyTab {
         String::from_utf8_lossy(&text).into_owned()
     }
 
-    /// Read until the drawn text holds `marker` (a hang detector, never a budget).
     fn await_text(&mut self, marker: &str) {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while !self.text().contains(marker) {
@@ -9749,7 +9704,6 @@ impl ConptyTab {
         }
     }
 
-    /// Read to the end of the program's output.
     fn await_end(&mut self) {
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         loop {
@@ -10889,7 +10843,6 @@ fn cap_gives_a_typed_turn_room_to_press_a_long_text() {
     }
 }
 
-/// One typed `turn` of "hello world" (11 keys) into a fresh session.
 fn typed_turn_with(
     opts: &str,
     fence: bool,
@@ -10993,12 +10946,10 @@ fn a_fenced_typed_turn_stops_at_a_persons_key_and_presses_nothing() {
     assert_eq!((keys, enters), (11, 1));
 }
 
-/// The composer's all-`─` rule, the test grid's full width.
 fn composer_rule() -> String {
     "─".repeat(80)
 }
 
-/// A model of Claude Code's composer for the caret-anchor tests.
 struct Composer {
     top: String,
     wrap: usize,
@@ -11034,7 +10985,6 @@ impl Composer {
         }
     }
 
-    /// The frame's bytes as the model stands, `extra` drawn first inside the same bracket.
     fn frame(&self, extra: &str) -> String {
         let draft = self.draft.borrow();
         let mut rows: Vec<String> = draft.chunks(self.wrap).map(<[String]>::concat).collect();
@@ -11064,7 +11014,6 @@ impl Composer {
         f
     }
 
-    /// One grapheme into the draft.
     fn push(&self, g: &str) {
         let rows = |n: usize| n.div_ceil(self.wrap).max(1);
         let before = rows(self.draft.borrow().len());
@@ -11074,13 +11023,11 @@ impl Composer {
         }
     }
 
-    /// Repaint now, `extra` first inside the same bracket.
     fn draw(&self, h: &SessionHandle, extra: &str) {
         h.term.lock().unwrap().process(self.frame(extra).as_bytes());
     }
 }
 
-/// What a typed turn into a [`Composer`].
 struct Typing {
     verdict: String,
     keys: Vec<String>,
@@ -11089,7 +11036,6 @@ struct Typing {
     enters: u32,
 }
 
-/// One `typed=1 cadence=1` turn of `text` into a fresh session showing `tick 1`.
 fn composer_turn_with(
     top: &str,
     wrap: usize,
@@ -11100,7 +11046,6 @@ fn composer_turn_with(
     composer_turn_on(-1, top, wrap, opts, text, during)
 }
 
-/// [`composer_turn_with`] over a session whose sink is `master`.
 fn composer_turn_on(
     master: i32,
     top: &str,
@@ -11315,10 +11260,6 @@ fn the_caret_anchor_rides_the_screen_around_a_growing_composer() {
     assert_eq!((t.keys.concat().as_str(), t.enters), (text, 1));
 }
 
-/// A stall that is no wait for a frame (the typing thread descheduled under load, here a
-/// key's own delivery taking 100 ms) keeps every later key a cadence behind the one before
-/// it. Negative control: keys due on a fixed schedule from the first go out in a burst to
-/// catch up, seven in about 60 ms.
 #[test]
 fn a_stall_is_never_caught_up_in_a_burst() {
     let stall = |k: usize, _: &Composer, _: &SessionHandle| {
@@ -11441,7 +11382,6 @@ fn a_digit_waits_for_the_program_to_read_every_key_before_it() {
     use super::control_session::set_hold_wait_for_test;
     use aterm_session::sink::Discard;
     use std::time::Instant;
-    /// The thread's holds wait on the clock again however the test ends.
     struct Clock;
     impl Drop for Clock {
         fn drop(&mut self) {
@@ -11982,7 +11922,6 @@ fn turn_settle_submitted_answers_at_the_verified_submit_on_a_screen_that_never_r
     );
 }
 
-/// A Claude Code screen at 24x80.
 fn claude_composer_screen() -> Vec<u8> {
     let rule = "\u{2500}".repeat(80);
     format!(
@@ -12332,7 +12271,6 @@ fn turn_submit_verification_rows() {
         started_blocks: usize,
         content_seq: u64,
     }
-    /// The probe before and after the first press, and why the signal it reads misjudges the press.
     type Control = (fn(Probe, Probe) -> bool, &'static str);
     struct Row {
         label: &'static str,
@@ -13391,8 +13329,6 @@ fn fabric_attach_body() {
 
 #[test]
 fn the_bridge_verbs_refuse_every_scope_but_the_bridge_inbox_hold() {
-    // `deliver` marks the session bridge-governed in the process-wide link, so
-    // this takes the shared reset guard (`fabric::with_link_reset`).
     crate::fabric::with_link_reset(the_bridge_verbs_refuse_every_scope_but_the_bridge_body);
 }
 
@@ -14376,9 +14312,6 @@ fn only_the_bridge_may_claim_the_fabric_lease_namespace() {
 
 #[test]
 fn dropping_the_bridge_guard_halts_the_governed_sessions_inbox_hold() {
-    // Dropping the guard moves the instance link to `disconnected`, which
-    // `status`'s `fabric=` and `post --wait` read; the reset guard serializes
-    // tests that read it.
     crate::fabric::with_link_reset(dropping_the_bridge_guard_halts_the_governed_sessions_body);
 }
 
@@ -14782,7 +14715,6 @@ fn feed_idempotent_a_producer_is_namespaced_by_the_callers_authority() {
     let attack = format!("{hex}:{bridge_producer}:{}", u64::MAX);
     assert_eq!(
         crate::pty_idem::guarded(&h.ctx, Scope::Owner, "send", Some(attack.as_str()), || {
-            // `send` with an empty tail: OK, and nothing typed.
             "OK\n".to_string()
         }),
         "OK\n"
@@ -16029,7 +15961,6 @@ fn active_for_handle(h: &crate::session_store::SessionHandle) -> ActiveHandle {
     })))
 }
 
-/// A headless app with a second session (a stub tab) that wrote a few records.
 fn closed_session_fixture(
     grants: &[aterm_session::Op],
 ) -> (
@@ -16062,7 +15993,6 @@ fn closed_session_fixture(
     (app, ctx, tokens)
 }
 
-/// The session's local id in `app`'s registry, before it closes.
 fn local_of(app: &crate::App, ctx: &crate::SessionCtx) -> u64 {
     app.store
         .read()
@@ -17623,12 +17553,10 @@ fn mark_is_status_framed() {
     );
 }
 
-/// `await log <args>` on `h`, in process.
 fn await_log(h: &SessionHandle, store: &Store, args: &str) -> String {
     control_session::cmd_await(&h.term, store, h.local_id, &h.ctx, &format!("log {args}"))
 }
 
-/// A session continued from its own log's carry, as a seamless update's successor continues it.
 fn carried_across_an_update(h: &SessionHandle) {
     let mut g = h.ctx.timeline.lock().unwrap();
     let log = g.slog().log();
@@ -18505,7 +18433,6 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
         "procs scope=pane",
         "disk scope=window",
         "since=7f3a.12 fresh=0",
-        // `why` is Scoped: its rows outside the caller's tab are withheld.
         "why",
         "why cpu",
         "why mem",
@@ -18525,9 +18452,6 @@ fn sys_escalates_its_owner_only_forms_by_its_own_parser() {
         "name job=a40977",
         "bogus",
         "procs top=0",
-        // A form `why` refuses fails closed for an edge (the owner gets
-        // `WHY_USAGE`, or the built `USAGE` for `scope=` and
-        // `instances=all`, `query.rs`'s own tests).
         "why pid=1",
         "why scope=tab",
         "why instances=all",

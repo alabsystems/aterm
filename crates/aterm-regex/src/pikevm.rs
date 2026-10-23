@@ -95,8 +95,6 @@ pub(crate) fn search(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Exhausted;
 
-/// [`search`]'s simulation, charging every unit of work to `steps` and giving up once more
-/// than `step_limit` are charged.
 fn simulate(
     prog: &Program,
     cache: &mut Cache,
@@ -311,7 +309,6 @@ mod tests {
     use crate::compile::compile;
     use crate::parse::{Flags, parse};
 
-    /// Every assertion, at every position of a haystack that exercises it.
     #[test]
     fn assertions_read_the_surrounding_code_points() {
         let text = "ab cd";
@@ -344,8 +341,6 @@ mod tests {
         assert_eq!(bounds, vec![0, 4, 5, 6]);
     }
 
-    /// One cache, reused across programs of different sizes, must not carry
-    /// stale marks between runs.
     #[test]
     fn a_cache_survives_being_resized_between_programs() {
         let small =
@@ -373,7 +368,6 @@ mod tests {
         }
     }
 
-    /// The budget is enforced, and an exhausted search returns no span.
     #[test]
     fn the_step_budget_stops_the_simulation() {
         let ast = parse("a+b", Flags::default()).expect("parses");
@@ -402,8 +396,6 @@ mod tests {
         );
     }
 
-    /// Bytes the prefilter skips are charged, so a haystack no position can start a match
-    /// on still costs its length.
     #[test]
     fn the_prefilter_skip_is_charged_by_the_byte() {
         let ast = parse("needle", Flags::default()).expect("parses");
@@ -422,8 +414,6 @@ mod tests {
         );
     }
 
-    /// The generation stamp wraps rather than growing without bound, and a wrap
-    /// must not make every state look visited.
     #[test]
     fn the_visited_generation_wraps_cleanly() {
         let mut list = ThreadList::default();

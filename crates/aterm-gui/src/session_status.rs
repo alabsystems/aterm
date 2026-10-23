@@ -1758,9 +1758,7 @@ impl StatusObserver {
             .sessions
             .values()
             .filter_map(|slot| {
-                // Clamp to `next_due`: `due()` refuses the slot until then, so an earlier
-                // deadline could only fire, be refused and re-arm. This bounds any such bug to
-                // the observation rate rather than an event-loop-rate spin.
+                // Clamp to `next_due`.
                 slot.fsm.owed_wake().map(|owed| owed.max(slot.next_due))
             })
             .min();
@@ -2095,8 +2093,6 @@ impl StatusObserver {
             w.deferred_name_recheck_at = None;
             w.name_confirmed = false;
         } else if w.deferred_name_recheck_at.take().is_some() {
-            // A confirmation was requested; another waits for screen movement and the
-            // named-program floor.
             w.name_confirmed = true;
         }
         w.resolved_at = Some(now);
@@ -2204,7 +2200,6 @@ impl StatusObserver {
         crate::codex_rollout_tap::retire_session(session);
         self.rollout_asked.remove(&session);
         if self.sessions.remove(&session).is_some() {
-            // The removed slot may have been the minimum; retirement is rare, so recompute.
             self.next_due_any = self.sessions.values().map(|slot| slot.next_due).min();
         }
     }
@@ -3021,7 +3016,6 @@ impl crate::App {
             }
         };
         let detail = term.as_deref().and_then(executing_detail);
-        // `-` on a contended lock or an unfinished DEC 2026 frame: the event loop never waits on a program.
         let stamp = term
             .as_deref()
             .filter(|t| !crate::frame_unfinished_now(t))

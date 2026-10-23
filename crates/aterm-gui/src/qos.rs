@@ -278,7 +278,7 @@ pub(crate) fn slice_of_self() -> Option<(u64, u64)> {
 }
 
 /// macOS's QoS launcher — the one `aterm-verify` wraps compile-only children in.
-const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+const TASKPOLICY: &str = aterm_uds::os_path!("taskpolicy");
 
 /// The `taskpolicy -c` clamp for a child spawned on behalf of `role`, or `None`
 /// when the child keeps the tier it inherits.

@@ -2,8 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! UIA semantic deltas from the shared consumer's changed-node callbacks.
-//! Both nodes refer to complete snapshots; ancestors can inherit labels,
-//! values and document text from a changed child without appearing in its update.
 
 use std::collections::HashSet;
 
@@ -77,10 +75,6 @@ impl ChangeHandler for Events {
             return;
         }
         self.observe(*old, *new);
-        // A surviving parent's child-list update covers inserted/removed text.
-        // A changed run can also affect an unchanged document or label ancestor.
-        // The consumer completes next_state before invoking any callback, so
-        // observing an ancestor once sees every changed descendant in the batch.
         for node in [old, new] {
             let mut parent = node.parent();
             while let Some(node) = parent {

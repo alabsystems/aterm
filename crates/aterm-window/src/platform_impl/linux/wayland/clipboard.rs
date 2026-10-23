@@ -4,8 +4,6 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-//! Added by the aterm project in 2026; see the repository NOTICE.
-//!
 //! Wayland `CLIPBOARD` and `PRIMARY` selections ([`WaylandClipboard`], [`SelectionPort::copy`],
 //! [`CLAIM_ORDER`], [`CopyOutcome`]).
 
@@ -49,9 +47,7 @@ const MAX_PASTE_BYTES: usize = 16 << 20;
 /// read all fit inside it on a healthy compositor; a hung owner is refused).
 const PASTE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long a copy made OFF the loop thread waits for the loop's verdict. The
-/// loop answers from a channel callback, so this is only ever spent when the loop
-/// is wedged — and a caller that waited in vain is told `false`, never `true`.
+/// How long a copy made off the loop thread waits for the loop's verdict.
 const COPY_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// The two protocol steps a copy takes at the compositor.
@@ -256,10 +252,7 @@ impl WaylandClipboard {
     }
 }
 
-/// The loop's answer to one copy, as the caller's `bool`. A verdict that never
-/// arrives — the loop died holding the request, or is wedged past [`COPY_TIMEOUT`]
-/// — is NOT success: the one thing this must never do is answer `true` for a copy
-/// nobody can say reached the compositor.
+/// The loop's answer to one copy, as the caller's `bool`.
 fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
     match verdict.recv_timeout(COPY_TIMEOUT) {
         Ok(outcome) => outcome.placed(),
@@ -267,8 +260,7 @@ fn copy_verdict(verdict: &mpsc::Receiver<CopyOutcome>) -> bool {
     }
 }
 
-/// Write `bytes` to a requester's pipe on a helper thread. Refuse a pipe we
-/// cannot make non-blocking, so a stalled reader cannot park the worker in a write.
+/// Write `bytes` to a requester's pipe on a helper thread.
 fn write_on_thread(pipe: OwnedFd, bytes: Vec<u8>) {
     if set_nonblocking(&pipe).is_err() {
         return;
@@ -348,8 +340,7 @@ pub(crate) trait SelectionPort {
     /// Offer a fresh source for `selection` and hand it to the seat with `serial`.
     fn claim(&mut self, selection: WaylandSelection, serial: u32) -> bool;
 
-    /// THE COPY. One body, for production and for the test, so the order and the
-    /// gate below are not things a call site can get wrong twice.
+    /// Place the selection at the seat, releasing any existing source first.
     fn copy(&mut self, selection: WaylandSelection, serial: u32) -> CopyOutcome {
         if !self.focused() {
             return if self.offers(selection) {
@@ -391,9 +382,7 @@ impl SelectionPort for WinitSelectionPort<'_> {
         self.state.clipboard.offered(selection).is_some()
     }
 
-    /// Dropping the source IS the release: aterm-wayland's `Source` destroys its
-    /// proxy in `Drop` (as smithay-client-toolkit 0.19.2's `CopyPasteSource` and
-    /// `PrimarySelectionSource` did before LW.7).
+    /// Dropping the source destroys its proxy in `Drop`.
     fn release(&mut self, selection: WaylandSelection) {
         drop(self.state.clipboard.offered_mut(selection).take());
     }
@@ -454,13 +443,12 @@ impl WinitState {
         }
     }
 
-    /// One copy, at the seat that holds this client's newest input serial. The
-    /// sequence and the gate are [`SelectionPort::copy`]; what is left here is the
-    /// seat pick and what a refusal costs — the own slot, which must not keep
-    /// answering with text the compositor never took.
+    /// One copy, at the seat that holds this client's newest input serial.
     fn clipboard_copy(&mut self, selection: WaylandSelection) -> CopyOutcome {
         let Some((seat, serial)) = self.clipboard_seat() else {
-            warn!("wayland clipboard: no seat has given this client an input serial yet — {selection:?} copy not offered");
+            warn!(
+                "wayland clipboard: no seat has given this client an input serial yet — {selection:?} copy not offered"
+            );
             self.clipboard_disown(selection);
             return CopyOutcome::Refused(CopyRefusal::NoSerial);
         };
@@ -468,12 +456,14 @@ impl WinitState {
         if let CopyOutcome::Refused(refusal) = outcome {
             match refusal {
                 CopyRefusal::NoDevice => {
-                    warn!("wayland clipboard: the compositor binds no device for {selection:?} — copy refused");
+                    warn!(
+                        "wayland clipboard: the compositor binds no device for {selection:?} — copy refused"
+                    );
                 },
                 CopyRefusal::Unfocused => {
-                    // A compositor hands a selection only to the client its keyboard
-                    // is on, and we hold no source for this one to keep instead.
-                    warn!("wayland clipboard: no keyboard focus and no {selection:?} of ours — copy refused");
+                    warn!(
+                        "wayland clipboard: no keyboard focus and no {selection:?} of ours — copy refused"
+                    );
                 },
                 CopyRefusal::NoSerial => {},
             }
@@ -606,9 +596,7 @@ mod tests {
             self.copy(WaylandSelection::Clipboard, serial)
         }
 
-        /// What another client on the system reads. A selection held by a source of
-        /// ours is served LIVE out of the slot — `clipboard_send_request` reads the
-        /// slot when the paste asks, not when the claim was made.
+        /// What another client on the system reads.
         fn read(&self) -> String {
             match self.selection {
                 Some(_) => self.slot.clone(),

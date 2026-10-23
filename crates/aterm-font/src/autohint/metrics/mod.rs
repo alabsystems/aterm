@@ -2,9 +2,7 @@
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //
-// Derived from skrifa 0.46.2 src/outline/autohint/metrics/mod.rs and modified by the
-// aterm project in 2026: metrics computed lazily only, the advance-only digit width dropped.
-// See ../../../LICENSE-FONTATIONS for the upstream license.
+// Derived from skrifa 0.46.2 src/outline/autohint/metrics/mod.rs (see ../../../LICENSE-FONTATIONS).
 
 //! Autohinting specific metrics.
 

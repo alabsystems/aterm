@@ -1,16 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The one back-off ladder: the `n`-th retry pauses the table's `n`-th step, and every retry
-//! past the table its last step, never a give-up. Every schedule the supervisor and its host
-//! wait on reads through it (host restarts, relaunch attempts, upgrade looks, survey tries, the
-//! turn-end policy's API-error and usage-limit ladders); [`doubling`] is every back-off that
-//! doubles to a cap (press retries, a re-asked question's pause, the short-turn streak).
+//! Step-table and doubling retry back-off schedules.
 
 use std::time::Duration;
 
-/// The one doubling back-off: `base` at step 0, doubling each step, at most `max`, for every
-/// `n` without overflow.
+/// Returns `base` doubled `n` times and clamped to `max` without overflow.
 #[must_use]
 pub fn doubling(base: Duration, n: u32, max: Duration) -> Duration {
     base.checked_mul(1u32.checked_shl(n).unwrap_or(u32::MAX))
@@ -18,13 +13,12 @@ pub fn doubling(base: Duration, n: u32, max: Duration) -> Duration {
         .min(max)
 }
 
-/// A schedule of pauses ([module header](self)).
+/// A table-driven schedule of retry pauses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ladder<'a>(pub &'a [Duration]);
 
 impl Ladder<'_> {
-    /// The pause at step `n` (0-based: the first retry's is step 0), the
-    /// last step for every `n` past the table; `None` for an empty one.
+    /// Returns the pause at 0-based step `n`, clamping to the last entry, or `None` if empty.
     #[must_use]
     pub fn at(self, n: usize) -> Option<Duration> {
         self.0.get(n.min(self.0.len().checked_sub(1)?)).copied()
@@ -41,7 +35,6 @@ impl Ladder<'_> {
 mod tests {
     use super::*;
 
-    /// Each step in turn, then the last for ever; nothing from an empty table.
     #[test]
     fn a_ladder_clamps_to_its_last_step() {
         let s = |n| Duration::from_secs(n);
@@ -55,8 +48,6 @@ mod tests {
         assert_eq!(Ladder(&[]).at(0), None);
     }
 
-    /// Doubling from the base, then the cap for ever, overflow included. Control: a cap under
-    /// the base is the cap.
     #[test]
     fn a_doubling_back_off_doubles_to_its_cap() {
         let ms = Duration::from_millis;

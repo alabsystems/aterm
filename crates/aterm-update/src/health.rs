@@ -7,7 +7,6 @@ use aterm_update_core::FileLock;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// How long a ledger write waits for `health.toml.lock` before proceeding unlocked.
 const HEALTH_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Failure-count and duration thresholds for persistent updater errors.
@@ -129,13 +128,8 @@ pub struct Health {
     pub handoff_park_at: String,
 }
 
-/// The longest error text the ledger stores, in characters.
 const MAX_STORED_ERROR_CHARS: usize = 400;
 
-/// `error` cut to [`MAX_STORED_ERROR_CHARS`] — WITHOUT CUTTING OFF WHAT IT IS. A
-/// passing refusal carries its key ([`crate::PASSING_REFUSAL_KEY`]) at the END of its
-/// text, and readers ([`crate::is_passing_refusal`]) tell a moment from a verdict by
-/// it.
 fn capped_error(error: &str) -> String {
     if error.chars().count() <= MAX_STORED_ERROR_CHARS {
         return error.to_string();
@@ -161,7 +155,6 @@ impl Health {
         h
     }
 
-    /// The newest failure of the standing diagnosis class ([`Self::last_diagnosis_at`]).
     fn diagnosis_at(&self) -> &str {
         &self.last_diagnosis_at
     }
@@ -176,7 +169,8 @@ impl Health {
             .saturating_add(self.apply_failures)
     }
 
-    /// Consecutive failed checks across acquisition classes (`network`, `pipeline`, `manifest`, `stage`).
+    /// Consecutive failed checks across acquisition classes (`network`, `pipeline`, `manifest`,
+    /// `stage`).
     #[must_use]
     pub fn acquisition_failures(&self) -> u32 {
         match self.standing_acquisition_class() {
@@ -188,8 +182,6 @@ impl Health {
         }
     }
 
-    /// The `(streak, start-of-streak)` pair a failure class owns, or `None` for an
-    /// unrecognised kind.
     fn class_streak_mut(&mut self, kind: &str) -> Option<(&mut u32, &mut String)> {
         match kind {
             "network" => Some((&mut self.network_failures, &mut self.network_since)),
@@ -219,7 +211,8 @@ impl Health {
         }
     }
 
-    /// Highest-priority failure class whose streak has crossed both persistence gates, with its count.
+    /// Highest-priority failure class whose streak has crossed both persistence gates, with its
+    /// count.
     #[must_use]
     pub fn persistent_class(&self) -> Option<(&'static str, u32)> {
         [
@@ -232,8 +225,6 @@ impl Health {
         .find(|&(class, n)| n >= PERSISTENT_AFTER && self.spans_persistently(class))
     }
 
-    /// Whether `class`'s streak has lasted [`PERSISTENT_SPAN`] (see
-    /// [`Self::persistent_class`]).
     fn spans_persistently(&self, class: &str) -> bool {
         if class == "apply" {
             return true;
@@ -257,9 +248,6 @@ impl Health {
         h
     }
 
-    /// The streak arithmetic shared by [`Self::record_failure`] and
-    /// [`Self::record_apply_failure`], applied to an ALREADY-LOCKED, already-read
-    /// record so a caller that must do more under the same lock can.
     fn advance_failure_streak(h: &mut Self, kind: &str, error: &str) {
         let now = crate::install::now_rfc3339();
         if let Some((count, since)) = h.class_streak_mut(kind) {
@@ -293,10 +281,6 @@ impl Health {
         }
     }
 
-    /// Re-describe the ledger by the class that still stands, with THAT
-    /// class's own reason: the apply lane's for `apply`, the diagnosis lane's
-    /// for `pipeline`/`manifest`/`stage`, nothing for a bare network blip
-    /// (weather has no diagnosis).
     fn relabel_by_standing(h: &mut Self) {
         if h.total_failures() == 0 {
             h.kind = String::new();
@@ -315,7 +299,6 @@ impl Health {
                 }
             }
             Some(standing) => {
-                // `network` alone: weather, described by whatever it said.
                 h.kind = standing.to_string();
             }
             None => {
@@ -357,7 +340,8 @@ impl Health {
         h
     }
 
-    /// Highest-priority standing acquisition failure class (`pipeline`, `manifest`, `stage`, `network`).
+    /// Highest-priority standing acquisition failure class (`pipeline`, `manifest`, `stage`,
+    /// `network`).
     #[must_use]
     pub(crate) fn standing_acquisition_class(&self) -> Option<&'static str> {
         [
@@ -412,7 +396,8 @@ impl Health {
         h
     }
 
-    /// Clear the apply failure streak if `current_build` has moved past [`Self::last_apply_failure_build`].
+    /// Clear the apply failure streak if `current_build` has moved past
+    /// [`Self::last_apply_failure_build`].
     pub fn expire_stale_apply_streak(path: &Path, current_build: u64) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
@@ -430,8 +415,6 @@ impl Health {
         h.apply_failures_for_target = 0;
         h.last_apply_failure_target_build = 0;
         if h.total_failures() == 0 || h.kind == "apply" {
-            // Some acquisition streak may still stand; let it own the headline
-            // WITH ITS OWN REASON (`kind == ""` means healthy).
             Self::relabel_by_standing(&mut h);
         }
         h.write(path);
@@ -512,10 +495,6 @@ impl Health {
             h.last_apply_failure_at = String::new();
             h.last_apply_failure_build = 0;
             if h.total_failures() == 0 || h.kind == "apply" {
-                // Acquisition failures may still stand; stop describing the ledger
-                // by the apply failure that just resolved — and NAME the one that
-                // is still standing, with its own reason, because `kind == ""`
-                // means healthy.
                 Self::relabel_by_standing(&mut h);
             }
         }
@@ -607,13 +586,10 @@ impl Health {
         h
     }
 
-    /// Best-effort sibling lock (`…/health.toml.lock`) guarding a whole read→mutate→
-    /// write of the ledger.
     fn lock(path: &Path) -> Option<FileLock> {
         FileLock::acquire_within(&path.with_extension("toml.lock"), HEALTH_LOCK_WAIT).ok()
     }
 
-    /// Best-effort atomic write (temp + rename), mirroring `status::record`.
     fn write(&self, path: &Path) {
         use std::sync::atomic::{AtomicU64, Ordering};
         let Ok(text) = aterm_toml::to_string(self) else {
@@ -659,8 +635,6 @@ pub(crate) fn backdate_streaks(path: &Path, by: std::time::Duration) {
 mod tests {
     use super::*;
 
-    /// `health.toml` in a per-TEST scratch dir (tests share one process, so a
-    /// pid-keyed dir would race across the parallel test threads).
     struct Scratch {
         file: std::path::PathBuf,
         _dir: aterm_tempfile::TempDir,
@@ -690,9 +664,6 @@ mod tests {
         }
     }
 
-    /// A TIMED HANDOFF CAPTURE IS A PRIOR: it survives a re-read, the newest
-    /// measurement replaces the last outright, a zero reading
-    /// records nothing, and no streak or standing slot moves for it.
     #[test]
     fn a_timed_handoff_capture_is_kept_as_a_prior_and_moves_no_streak() {
         let p = tmp("handoff-capture");
@@ -762,8 +733,6 @@ mod tests {
         );
     }
 
-    /// The stage-backoff check proves ACQUISITION works while deliberately declining to
-    /// download, so it must not vouch for the lane it just refused to exercise.
     #[test]
     fn an_acquisition_only_success_preserves_the_stage_and_apply_streaks() {
         let p = tmp("acquisition-success");
@@ -788,10 +757,6 @@ mod tests {
         assert_eq!(h.kind, "stage", "the standing streak owns the headline");
     }
 
-    /// `kind == ""` is the documented HEALTHY sentinel, so the apply-lane clears must
-    /// never blank it while an acquisition streak is still standing — that reported a
-    /// healthy class on an unhealthy machine, and `update status` printed a non-zero
-    /// `failing=` beside no class at all.
     #[test]
     fn clearing_the_apply_lane_names_the_streak_that_is_still_standing() {
         let p = tmp("apply-clear-names-standing");
@@ -813,8 +778,6 @@ mod tests {
         assert_eq!(h.kind, "pipeline", "named, not blanked");
     }
 
-    /// `failing_since` is any-class: it stamps when the ledger stopped being
-    /// clean and does not move again until it is clean.
     #[test]
     fn each_failure_class_carries_its_own_clock() {
         let p = tmp("per-class-clock");
@@ -858,7 +821,6 @@ mod tests {
         assert!(h.apply_since.is_empty());
     }
 
-    /// A ledger written BEFORE per-class clocks existed carries no class stamp.
     #[test]
     fn a_pre_upgrade_ledger_falls_back_to_the_any_class_clock() {
         let h = Health {
@@ -878,8 +840,6 @@ mod tests {
         );
     }
 
-    /// Apply failures are recorded in `apply_failures`, and a healthy download
-    /// check clears only the acquisition streaks without erasing the apply streak.
     #[test]
     fn a_healthy_check_never_clears_the_apply_streak() {
         let p = tmp("apply-survives-check");
@@ -914,10 +874,6 @@ mod tests {
         assert!(h.kind.is_empty(), "fully healthy ledger reports no class");
     }
 
-    /// A refusal is the answer to "the build is staged, so why is it not
-    /// running?" — it must be durable, must NOT manufacture a failure streak (or
-    /// ordinary terminal use would escalate to the persistent-failure
-    /// notification), and must not outlive the apply that finally succeeds.
     #[test]
     fn a_refusal_is_recorded_without_inventing_a_failure_streak() {
         let p = tmp("apply-refusal");
@@ -960,7 +916,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// TWO COUNTS, BECAUSE THERE ARE TWO QUESTIONS.
     #[test]
     fn the_artifact_scoped_count_restarts_with_the_artifact_and_the_escalation_does_not() {
         let p = tmp("apply-target-scope");
@@ -994,8 +949,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// An apply streak recorded by a different running build is proven stale
-    /// and expires; the same build's streak stands.
     #[test]
     fn an_apply_streak_expires_once_a_different_build_is_running() {
         let p = tmp("apply-expiry");
@@ -1034,9 +987,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// Every class that strands the machine (`manifest`, `stage`, `pipeline`)
-    /// escalates and names its own count; `network` is transient and never
-    /// escalates.
     #[test]
     fn each_stranding_class_escalates_under_its_own_name_and_network_never_does() {
         for (class, escalates) in [
@@ -1060,10 +1010,6 @@ mod tests {
         }
     }
 
-    /// THREE FAILED CHECKS ARE PERSISTENT ONLY ONCE THEY SPAN HALF AN HOUR. At the
-    /// two-minute cadence three failures of a check class come 0, 2 and 6 minutes
-    /// apart — a GitHub incident or a slow asset upload, not the broken lane the
-    /// status, the update screen's headline and the loud notice promise.
     #[test]
     fn a_check_class_streak_is_persistent_only_once_it_spans_half_an_hour() {
         let streak = |class: &str, count: u32, newest: &str| {
@@ -1130,7 +1076,6 @@ mod tests {
         );
     }
 
-    /// A standing class label does not identify the last failure's timestamp.
     #[test]
     fn a_relabelled_legacy_diagnosis_has_no_proven_end_stamp() {
         let captured = format!(
@@ -1260,7 +1205,6 @@ apply_failures = {PERSISTENT_AFTER}
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// A PASSING REFUSAL LONGER THAN THE CAP IS STILL A PASSING REFUSAL WHEN STORED.
     #[test]
     fn a_long_passing_refusal_keeps_its_key_in_the_ledger() {
         let p = tmp("long-passing");
@@ -1294,8 +1238,6 @@ apply_failures = {PERSISTENT_AFTER}
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// NO SPLICED COUNT: a ledger carrying a dead, clock-less `manifest` streak of 999
-    /// meets this build's `pipeline` failures.
     #[test]
     fn a_pipeline_failure_clears_its_sibling_diagnoses_and_the_count_is_its_own() {
         let p = tmp("sibling-clear");
@@ -1357,8 +1299,6 @@ apply_failures = {PERSISTENT_AFTER}
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// NO SPLICED REASON. Counts and clocks are per class, but there is ONE
-    /// `last_error`, and it belongs to whichever failure landed LAST.
     #[test]
     fn a_standing_diagnosis_keeps_its_own_reason_across_a_blip() {
         let p = tmp("diagnosis-reason");
@@ -1383,9 +1323,6 @@ apply_failures = {PERSISTENT_AFTER}
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// The same splice from the apply-expiry side: `expire_stale_apply_streak` blanks
-    /// `last_error` while NAMING a standing acquisition class, so the status line
-    /// would read `failing=1:stage` with no reason at all.
     #[test]
     fn expiring_a_stale_apply_streak_leaves_the_standing_diagnosis_its_reason() {
         let p = tmp("expire-keeps-reason");
@@ -1404,7 +1341,6 @@ apply_failures = {PERSISTENT_AFTER}
         let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
-    /// THE PENDING CLOCK SURVIVES RE-STAGES (`ready.toml`'s `staged_at` does not).
     #[test]
     fn the_pending_clock_is_the_first_sighting_and_survives_a_restage() {
         let p = tmp("pending-clock");

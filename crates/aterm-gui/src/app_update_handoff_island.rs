@@ -1,17 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-// The seamlessness invariant: no update handoff step leaves a live session without an owner.
-// The Clean kernel checks it during the build, even under -Ztrust-verify=off (the
-// `targo --unverified` lane), because an island carries its own authority.
-//
-// This is a theorem about the model below, not about the Rust. The code-bound half is the
-// derived twin `aterm_models_update::native_update_seamless_handoff_ownership_model`, whose
-// bind (`ownership_conformance` in app_update_handoff.rs) drives the real Commit admission
-// over its bounded input space and checks the model admits exactly what the code decides.
-//
-// `lost` is representable on purpose: without it the theorem would hold by construction.
-// Routing any pre-Commit failure to `lost` instead of `rolledBack` stops this file compiling.
+// Seamlessness invariant: no update handoff step leaves a live session without an owner.
 clean {
     -- WHO holds the live PTY masters. nobody is a lost session: the state the
     -- overlap protocol exists to make unreachable.

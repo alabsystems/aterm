@@ -4,7 +4,7 @@
 //
 // Derived from skrifa 0.46.2 src/outline/autohint/topo/segments.rs and modified by the
 // aterm project in 2026: its tests need fontations' test fonts and are not
-// carried (the TF.1 hinting corpus replays the whole hinter).
+// carried.
 // See ../../../LICENSE-FONTATIONS for the upstream license.
 
 //! Segment computation and linking.
@@ -140,7 +140,6 @@ fn link_segments_cjk(outline: &Outline, axis: &mut Axis, scale: i32) {
             let len = max - min;
             if len >= len_threshold {
                 let check_seg = |seg: &Segment| {
-                    // See <https://gitlab.freedesktop.org/freetype/freetype/-/blob/57617782464411201ce7bbc93b086c1b4d7d84a5/src/autofit/afcjk.c#L896>
                     (dist * 8 < seg.score * 9) && (dist * 8 < seg.score * 7 || seg.len < len)
                 };
                 if check_seg(&seg1) {
@@ -308,8 +307,6 @@ fn build_segments(outline: &mut Outline, axis: &mut Axis) -> bool {
                             prev_segment.last_ix = point_ix as u16;
                             state.apply_to_segment(prev_segment, flat_threshold);
                         } else {
-                            // We have different directions; use the
-                            // properties of the longer segment
                             if (prev_state.max_coord - prev_state.min_coord).abs()
                                 > (state.max_coord - state.min_coord).abs()
                             {
@@ -434,7 +431,6 @@ fn _detect_round_segments_cjk(outline: &mut Outline, axis: &mut Axis) {
             let point = &points[point_ix];
             let is_on_curve = point.is_on_curve();
             if is_prev_on_curve && is_on_curve {
-                // Two on-curves in a row means we're not a round segment
                 break;
             }
             is_prev_on_curve = is_on_curve;

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE `sys` HOST: `aterm ctl sys` and the machine terms of `await sys`, answered on the control worker from the workers' copy of the vitals snapshot (`docs/DESIGN-system-awareness-2026-10-16.md` §13, §6.4, §3.2).
+//! `aterm ctl sys` and the machine terms of `await sys`.
 
 use std::collections::VecDeque;
 use std::sync::mpsc::{SyncSender, TrySendError};
@@ -143,7 +143,7 @@ pub(crate) struct Shared {
 /// The process's one copy.
 pub(crate) static SYS: LazyLock<Shared> = LazyLock::new(Shared::new);
 
-/// This instance's epoch, the `<ep>` of every cursor: new at every start (a live upgrade's successor included), from the start's wall clock and pid.
+/// This instance's epoch, the `<ep>` of every cursor.
 pub(crate) static EPOCH: LazyLock<u64> = LazyLock::new(|| {
     let ms = aterm_time::unix_millis().unwrap_or(0);
     let mixed = (ms ^ (u64::from(std::process::id()) << 40)) & 0xffff_ffff_ffff;
@@ -162,23 +162,22 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// The probe thread hands over its sender, so workers can pull.
+    /// Install the probe thread's sender so workers can pull.
     pub(crate) fn install(&self, tx: SyncSender<Msg>) {
         self.lock().tx = Some(tx);
     }
 
-    /// The quit takes the sender back, so the probe thread hears the hang-up and ends (`VitalsHost::stop_at_exit`).
+    /// Take the sender back so the probe thread hears the hang-up and ends.
     pub(crate) fn uninstall(&self) {
         self.lock().tx = None;
     }
 
-    /// The probe thread's newest layout.
+    /// Record the probe thread's newest layout.
     pub(crate) fn set_facts(&self, panes: Vec<PaneFact>) {
         self.lock().panes = panes;
     }
 
-    /// The probe thread's newest snapshot: its events rung, the head moved, held unless it is
-    /// machine-only and one is held already, every waiting worker woken.
+    /// Publish the probe thread's newest snapshot and wake waiting workers.
     pub(crate) fn publish(&self, snap: Arc<Snapshot>, machine: &Machine) {
         let mut g = self.lock();
         if g.machine != *machine {
@@ -204,37 +203,26 @@ impl Shared {
         self.landed.notify_all();
     }
 
-    /// The newest whole snapshot as held, without pulling: the occupancy board's ([`crate::occupancy_host::look`]), which reads the reading the disk look asked for at its next look.
+    /// The newest whole snapshot as held, without pulling.
     pub(crate) fn held_now(&self) -> Option<Held> {
         self.lock().held.clone()
     }
 
-    /// The cursor's head seq.
     fn head_seq(&self) -> u64 {
         self.lock().head_seq
     }
 
-    /// A whole snapshot at most `fresh` old (`force`: one taken after this call), pulling one when needed and waiting a bounded time for it.
+    /// A whole snapshot at most `fresh` old, pulling one when needed.
     pub(crate) fn fresh(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
         self.fresh_by(fresh, force, false)
     }
 
-    /// [`Self::fresh`] for a `sys why` (`docs/DESIGN-resource-details-2026-10-20.md`
-    /// §2.1), judged by its split set's age while the coalition lane
-    /// reads: one whose split is missing, has no window or is older than
-    /// `fresh` pulls (the caller holds `vitals_host::SPLIT_ARMED`, so the
-    /// pull reads a split, twice when it is cold), whatever another view
-    /// pulled within the gap, and waits for a new split, at most `PULL_WAIT`
-    /// (`PULL_WAIT_COLD` cold), past which the held one answers stale. With
-    /// the lane off it is [`Self::fresh`].
+    /// [`Self::fresh`] for a `sys why`, judged by its split set's age while the coalition lane reads.
     pub(crate) fn fresh_why(&self, fresh: Duration, force: bool) -> (Option<Held>, Freshness) {
         self.fresh_by(fresh, force, true)
     }
 
-    /// The snapshot `q` reads, as fresh as it asks: a `why`'s by its split
-    /// ([`Self::fresh_why`]), `split` armed while it waits so the pull reads
-    /// one (`cmd_sys` passes `vitals_host::SPLIT_ARMED`); any other view's
-    /// by [`Self::fresh`].
+    /// The snapshot `q` reads, as fresh as it asks.
     pub(crate) fn fresh_for(&self, q: &SysQuery, split: &Arming) -> (Option<Held>, Freshness) {
         let fresh_ms = q.fresh_ms.unwrap_or_else(|| q.freshness_default_ms());
         let fresh = Duration::from_millis(fresh_ms);
@@ -250,7 +238,6 @@ impl Shared {
         let now = Instant::now();
         let mut g = self.lock();
         let have = g.held.clone();
-        // When what the reply reads landed: the snapshot, or its split.
         let landed = |h: &Held| if split { split_landed(h) } else { Some(h.at) };
         if let Some(h) = have.as_ref()
             && !force
@@ -267,7 +254,6 @@ impl Shared {
                 || (split && split_cold(h))
         });
         let pacing = g.pacing;
-        // Only a pull the split was armed for reads one.
         let armed = split && have.as_ref().is_none_or(|h| h.snap.coal_lane.on());
         let last_pull = if armed {
             g.last_split_pull
@@ -302,7 +288,6 @@ impl Shared {
             }
         }
         if g.tx.is_none() {
-            // No probe thread (none started yet, or it ended): what is held.
             return stale(have);
         }
         let deadline = now + if cold { pacing.wait_cold } else { pacing.wait };
@@ -329,8 +314,6 @@ impl Shared {
         stale(g.held.clone())
     }
 
-    /// Park until a snapshot other than `seq` lands or `until`, at most one
-    /// hang-up poll at a time.
     fn wait_newer(&self, seq: Option<u64>, until: Instant) {
         let mut g = self.lock();
         loop {
@@ -349,34 +332,28 @@ impl Shared {
         }
     }
 
-    /// The newest snapshot's jobs view and when that snapshot landed, without pulling (`brief`'s jobs line), and whether its reader runs (the probe thread's sender is installed: the quit takes it back).
+    /// The newest snapshot's jobs view, when it landed, and whether its reader runs.
     pub(crate) fn jobs_view(&self) -> Option<(Arc<aterm_vitals::jobs::JobsView>, Instant, bool)> {
         let g = self.lock();
         let h = g.held.as_ref()?;
         Some((Arc::clone(h.snap.jobs.as_ref()?), h.at, g.tx.is_some()))
     }
 
-    /// The layout and the machine's words.
     fn facts(&self) -> (Vec<PaneFact>, Machine) {
         let g = self.lock();
         (g.panes.clone(), g.machine.clone())
     }
 
-    /// The jobs the ring remembers exiting, oldest first: a wait on one that
-    /// already left the engine's view reads its end from here.
     fn ended_jobs(&self) -> Vec<EndedJob> {
         self.lock().events.iter().filter_map(EndedJob::of).collect()
     }
 
-    /// The events after snapshot `seq`, and whether the ring still holds all
-    /// of them.
     fn events_since(&self, seq: u64) -> (Vec<Event>, bool) {
         let g = self.lock();
         let events = g.events.iter().filter(|e| e.seq > seq).cloned().collect();
         (events, g.evicted_through <= seq)
     }
 
-    /// The fingerprints of the newest kept reply with `key`.
     fn recall(&self, key: &ReplyKey) -> Option<Fingerprints> {
         self.lock()
             .replies
@@ -386,7 +363,6 @@ impl Shared {
             .map(|k| k.prints.clone())
     }
 
-    /// Keep a reply's fingerprints, dropping the oldest past the ring's rule.
     fn remember(&self, key: ReplyKey, prints: Fingerprints) {
         let mut g = self.lock();
         g.replies.push_back(Kept {
@@ -424,7 +400,7 @@ impl Shared {
     }
 }
 
-/// Whether `snap` measured what a reply prints (§6.4 step 1): a whole reading (not a hidden Deck's machine counters), with CPU, aterm and process rates, over a window of at most [`WINDOW_MAX`].
+/// Whether `snap` is a whole reading with CPU, aterm, and process rates within [`WINDOW_MAX`].
 pub(crate) fn whole(snap: &Snapshot) -> bool {
     !snap.machine_only
         && snap.cpu.is_some()
@@ -434,9 +410,6 @@ pub(crate) fn whole(snap: &Snapshot) -> bool {
             .is_some_and(|w| u128::from(w) <= WINDOW_MAX.as_nanos())
 }
 
-/// When a `why` reply's split set landed: its last split tick, the
-/// snapshot's own landing while the lane does not read; `None` with the lane
-/// on and no split with a window held.
 fn split_landed(h: &Held) -> Option<Instant> {
     if !h.snap.coal_lane.on() {
         return Some(h.at);
@@ -445,7 +418,6 @@ fn split_landed(h: &Held) -> Option<Instant> {
     h.at.checked_sub(Duration::from_nanos(h.snap.at_ns.saturating_sub(ns)))
 }
 
-/// The monotonic stamp of `snap`'s split set, where it has one with a window.
 fn split_ns(snap: &Snapshot) -> Option<u64> {
     snap.why
         .as_deref()
@@ -453,16 +425,12 @@ fn split_ns(snap: &Snapshot) -> Option<u64> {
         .map(|f| f.at_ns)
 }
 
-/// Whether a pull for `h`'s `why` must read the split twice for a window:
-/// the lane reads and its split is missing or, within the probe's margin,
-/// too old for one (`vitals_host::SplitReader::cold`).
 fn split_cold(h: &Held) -> bool {
     use crate::vitals_host::{SPLIT_COLD_MARGIN, SPLIT_WINDOW_MAX};
     h.snap.coal_lane.on()
         && split_landed(h).is_none_or(|t| t.elapsed() + SPLIT_COLD_MARGIN > SPLIT_WINDOW_MAX)
 }
 
-/// `otherwise`, unless the snapshot is a first sample without rates.
 fn freshness(h: &Held, otherwise: Freshness) -> Freshness {
     if h.snap.cpu.is_none() || h.snap.aterm.is_none() {
         Freshness::Warming
@@ -471,7 +439,6 @@ fn freshness(h: &Held, otherwise: Freshness) -> Freshness {
     }
 }
 
-/// What a pull that did not land answers: the last snapshot, labelled.
 fn stale(held: Option<Held>) -> (Option<Held>, Freshness) {
     match held {
         Some(h) => {
@@ -482,8 +449,6 @@ fn stale(held: Option<Held>) -> (Option<Held>, Freshness) {
     }
 }
 
-/// A session's working directory as its shell reported it; `None` when the
-/// engine is busy (never park behind a PTY reader for a path).
 fn cwd_of(term: &Arc<Mutex<Terminal>>) -> Option<String> {
     use crate::cwd_native::ReportedCwd as _;
     let read = |t: &Terminal| {
@@ -498,7 +463,6 @@ fn cwd_of(term: &Arc<Mutex<Terminal>>) -> Option<String> {
     }
 }
 
-/// The terminal's foreground process group.
 fn fg_pgid(master: i32) -> Option<u32> {
     #[cfg(unix)]
     {
@@ -516,7 +480,6 @@ fn fg_pgid(master: i32) -> Option<u32> {
     }
 }
 
-/// What one request reads besides the snapshot.
 struct Gathered {
     target: Target,
     tabs: Vec<TabFact>,
@@ -529,11 +492,8 @@ struct Gathered {
     home: Option<String>,
 }
 
-/// A pane's session key and its terminal.
 type PaneTerm = (u64, Arc<Mutex<Terminal>>);
 
-/// The target, every session's place, and (for `disk`) the scope's folders
-/// and the target's volume.
 fn gather(
     store: &Store,
     session: u64,
@@ -694,7 +654,7 @@ pub(crate) struct PaneCwd {
     pub(crate) path: String,
 }
 
-/// THE WALKER SEAM (design §10.4, §10.5, §13.2): the asked scope's roots and what the disk walker (`crate::diskwalk_host`) knows of them, read from a control worker without waiting for any walk.
+/// The asked scope's roots and what the disk walker knows of them.
 pub(crate) fn disk_roots(
     scope: ScopeArg,
     keys: &[u64],
@@ -717,8 +677,6 @@ pub(crate) fn disk_roots(
     walker_roots(&reports, cwds, tab_of, now)
 }
 
-/// Each pane's working directory as one `cwd` root of `size` (two panes in
-/// one folder are one root).
 fn cwd_roots(cwds: &[PaneCwd], size: RootSize) -> Vec<Root> {
     let mut roots: Vec<Root> = Vec::new();
     for c in cwds {
@@ -903,7 +861,6 @@ pub(crate) fn walker_roots(
     (roots, Some(totals))
 }
 
-/// A walk's growth over its span, bytes per second; `None` over no span.
 fn growth_bps(g: crate::diskwalk_host::Growth) -> Option<i64> {
     let ms = i64::try_from(g.over.as_millis())
         .ok()
@@ -911,7 +868,6 @@ fn growth_bps(g: crate::diskwalk_host::Growth) -> Option<i64> {
     Some(g.bytes.saturating_mul(1000) / ms)
 }
 
-/// One root's record as the seam's [`RootSize`].
 fn root_size(r: &crate::diskwalk_host::RootRecord, now: Instant) -> RootSize {
     use crate::diskwalk_host::RootState;
     let sizes = |c: &crate::diskwalk_host::Complete| aterm_vitals::sys::RootSizes {
@@ -937,7 +893,6 @@ fn root_size(r: &crate::diskwalk_host::RootRecord, now: Instant) -> RootSize {
     }
 }
 
-/// A walker refusal as one of `sys`'s disk unavailable words (§13.4).
 const fn refusal_word(why: aterm_diskwalk::Refusal) -> &'static str {
     use aterm_diskwalk::Refusal;
     match why {
@@ -957,9 +912,6 @@ const fn refusal_word(why: aterm_diskwalk::Refusal) -> &'static str {
     }
 }
 
-/// The volume holding `path`, read only where the bars would read it
-/// (`vitals_host::tab_volume`: a complete mount table calls it local; on
-/// Windows a fixed or RAM drive), with the disk watch's level for it.
 fn volume_facts(path: &std::path::Path) -> Option<VolumeFacts> {
     if !path.is_absolute() {
         return None;
@@ -979,7 +931,6 @@ fn volume_facts(path: &std::path::Path) -> Option<VolumeFacts> {
     })
 }
 
-/// How a `since=` is answered.
 struct Since {
     base: Option<Fingerprints>,
     events: Vec<Event>,
@@ -1033,9 +984,6 @@ pub(crate) fn cmd_sys(
         Err(usage) => return usage.to_owned(),
     };
     if q.name.is_some() {
-        // Tier B (§11.8) names a job's wait with one sample(1) on request;
-        // this build's host hands the engine no namings yet, so the rows'
-        // `named=` stays not_sampled and so does the request.
         return "ERR unavailable name why=not_sampled\n".to_owned();
     }
     let (held, state) = SYS.fresh_for(&q, &crate::vitals_host::SPLIT_ARMED);
@@ -1052,7 +1000,6 @@ pub(crate) fn cmd_sys(
     answer(&SYS, &q, held.as_ref(), state, &machine, &g, owner_class)
 }
 
-/// The reply, from what was gathered.
 fn answer(
     shared: &Shared,
     q: &SysQuery,
@@ -1072,7 +1019,6 @@ fn answer(
         scope: q.effective_scope(),
         target: g.target.key,
         top: q.top,
-        // Only a `why`'s rows depend on whether `top=` was given.
         top_set: q.top_set && q.view == View::Why,
         depth: q.depth,
         subject: q.subject,
@@ -1152,7 +1098,7 @@ fn answer(
     out
 }
 
-/// `await sys …` on the control socket: the machine terms park here; `free` and `disk=` alone go to the volume wait.
+/// `await sys …` on the control socket.
 pub(crate) fn cmd_await_sys(
     term: &Arc<Mutex<Terminal>>,
     store: &Store,
@@ -1184,10 +1130,6 @@ pub(crate) fn cmd_await_sys(
     }
 }
 
-/// How many engine passes after the one the wait armed on may go by with a
-/// named job in neither the view nor the ring before the wait says it is
-/// gone: a job still starting (an agent's task id the engine has not bound
-/// yet) gets a pass to show up in.
 const GONE_AFTER_PASSES: u32 = 2;
 
 /// One machine wait's reading of the snapshots it is handed.
@@ -1201,9 +1143,6 @@ struct MachineWait {
 }
 
 impl MachineWait {
-    /// Read one new snapshot, the wait's sessions being `keys` and the jobs
-    /// that left the view `ended`: the reply once the wait is answered (met,
-    /// refused, or a named job gone).
     fn step(
         &mut self,
         wait: &AwaitSys,
@@ -1236,8 +1175,6 @@ impl MachineWait {
     }
 }
 
-/// The sessions a machine wait from `session` reads: its tab's panes, or
-/// every pane with `scope=aterm` (Owner-only, the access arm's).
 fn wait_keys(panes: &[PaneFact], session: u64, every_tab: bool) -> Vec<u64> {
     if every_tab {
         return panes.iter().map(|p| p.key).collect();
@@ -1254,14 +1191,11 @@ fn wait_keys(panes: &[PaneFact], session: u64, every_tab: bool) -> Vec<u64> {
     )
 }
 
-/// Whether `await <rest>` is a machine wait that reads every tab's jobs (`scope=aterm`): Owner-only (`control::argument_escalation`).
+/// Whether `await <rest>` is a machine wait that reads every tab's jobs (`scope=aterm`).
 pub(crate) fn await_reads_every_tab(rest: &str) -> bool {
     matches!(AwaitSys::parse(rest), Ok(Parsed::Machine(w)) if w.scope_aterm)
 }
 
-/// THE MACHINE WAIT: each new snapshot re-evaluates the predicate; a pull
-/// keeps them coming once a second while armed; `for=` holds over their
-/// stamps.
 fn names_slots(wait: &AwaitSys) -> bool {
     wait.terms
         .iter()
@@ -1281,8 +1215,6 @@ fn await_machine(
     loop {
         let (held, freshness) = shared.fresh(AWAIT_PERIOD, false);
         if freshness != Freshness::Fresh {
-            // A failed refresh says nothing of the condition now, and a
-            // hold cannot bridge the interval no fresh sample measured.
             state.latch = Latch::default();
         }
         if let Some(h) = held.as_ref()
@@ -1320,7 +1252,7 @@ fn await_machine(
 /// The timeline row a job's moved verdict is recorded as; `subscribe … events` pushes it as `EVENT <local> job …` (`subscribe::timeline_wire_kind`).
 pub(crate) const JOB_CHANGE: &str = "job-change";
 
-/// The `job-change` row's payload, the push's words after `EVENT <local> job`: `<verdict> job=<id> class=<class> rev=<n>`, then `task=<id>` for an agent's call and `code=<n>` once it exited.
+/// Format the `job-change` timeline event payload.
 pub(crate) fn job_event_payload(
     verdict: aterm_vitals::jobs::Verdict,
     id: &str,
@@ -1344,10 +1276,6 @@ pub(crate) fn job_event_payload(
     out
 }
 
-/// The jobs view that may speak for now, from when it was read and whether
-/// its reader runs (`reader`): one at most [`crate::vitals_jobs::JOBS_FRESH`]
-/// old, or a parked one while its reader runs
-/// ([`crate::vitals_jobs::speaks_for_now`]).
 fn fresh_jobs(
     view: Option<(Arc<aterm_vitals::jobs::JobsView>, Instant)>,
     now: Instant,
@@ -1359,14 +1287,14 @@ fn fresh_jobs(
     .map(|(v, _)| v)
 }
 
-/// `brief`'s jobs line for `session` (`jobs 2 jobs · 1 running · 1 stuck · worst: …`), from the workers' copy without pulling; `None` when no fresh view says the session has a live job.
+/// `brief`'s jobs line for `session` from the workers' copy without pulling.
 pub(crate) fn brief_jobs_line(session: u64) -> Option<String> {
     let (view, at, reader) = SYS.jobs_view()?;
     let view = fresh_jobs(Some((view, at)), Instant::now(), reader)?;
     aterm_vitals::sys::jobs_view::brief_line(&view, &[session])
 }
 
-/// Put `line` into the brief reply `text` as its last line before the trailer's `gap why=…` and `more=` lines, its header saying the new line count, the budget asked (`budget`) and the whole reply's token estimate (`aterm_slog::tokens`, header included, as the brief's own assembly counts it).
+/// Splice `line` into the brief reply `text` before the trailer lines.
 pub(crate) fn splice_brief_line(text: &str, line: &str, budget: usize) -> String {
     let mut lines: Vec<&str> = text.lines().collect();
     let Some(more) = lines.iter().rposition(|l| l.starts_with("more=")) else {
@@ -1401,7 +1329,7 @@ pub(crate) fn splice_brief_line(text: &str, line: &str, budget: usize) -> String
 }
 
 impl crate::App {
-    /// `status`'s `job=<verdict|none|-> job_quiet_ms=<ms|->` for `session`: its worst live job in the snapshot the loop adopted, when that is at most [`crate::vitals_jobs::JOBS_FRESH`] old, or parked while the probe thread runs (`-` otherwise: nothing read lately speaks for now).
+    /// `status`'s `job=` and `job_quiet_ms=` fields for `session`.
     pub(crate) fn status_job_fields(&self, session: u64) -> String {
         let now = Instant::now();
         let view = self

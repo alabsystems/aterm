@@ -1,12 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
 //! Conformance: the real `snapshot()` obeys the derived isolation discipline.
-//!
-//! `aterm_models_session::snapshot_model()`'s `SnapshotIsolated` (`leaked = 0`):
-//! a write after `Surface::snapshot` does not reach `Snapshot::read_text`. The
-//! observed state is checked against the model's own invariant. Pure Rust, so
-//! it always runs.
 
 use crate::support::{read_cap, write_cap};
 use aterm_buffer::{Edit, LineId, Range, Surface};
@@ -31,14 +25,11 @@ fn real_snapshot_isolated_from_later_writes() {
     let snap_at = snap.at.0;
     let captured = snap.read_text(&read_cap(), full_range()).text;
 
-    // A later write advances the surface and changes its content.
     s.apply(&write_cap(), Edit::AppendLine("c".into()));
 
     let snap_after = snap.read_text(&read_cap(), full_range()).text;
     let surface_now = s.read_text(&read_cap(), full_range()).text;
 
-    // The snapshot's view is unchanged and differs from the surface's new view
-    // (`leaked = 0`).
     assert_eq!(
         snap_after, captured,
         "snapshot view must be isolated from later writes (no leak)"
@@ -53,7 +44,6 @@ fn real_snapshot_isolated_from_later_writes() {
     );
     assert_eq!(s.seq().0, 3, "the surface advanced past the snapshot");
 
-    // Tie the observed no-leak outcome to the model's actual invariant.
     let observed: BTreeMap<&'static str, i64> =
         [("seq", s.seq().0 as i64), ("snapped", 1), ("leaked", 0)]
             .into_iter()

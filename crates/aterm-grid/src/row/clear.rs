@@ -101,8 +101,6 @@ impl Row {
         } else if start < old_len
             && (end >= old_len || (cleared_right_orphan && old_len == end + 1))
         {
-            // A blank `fill` implies a blank `orphan` (see the debug_assert), so
-            // there is no visible-orphan case here.
             self.recalculate_len_up_to(start);
         }
         super::u16_from_usize(written_start)..super::u16_from_usize(written_end)
@@ -164,7 +162,6 @@ impl Row {
         }
 
         if col > 0 && self.cells[col - 1].flags().contains(CellFlags::WIDE) {
-            // This is a continuation cell. It is protected iff the WIDE cell is.
             return self.cells[col - 1].flags().contains(CellFlags::PROTECTED);
         }
 
@@ -258,10 +255,6 @@ impl Row {
                         self.recalculate_len_up_to(old_len);
                     }
                 } else {
-                    // A BCE blank is content, possibly past the old end and
-                    // possibly not through the span's end (a protected cell
-                    // there survives as whatever it was): rescan for the tight
-                    // len. DECSEL/DECSED are rare; the O(cols) scan is not.
                     self.recompute_len();
                 }
             }
@@ -352,7 +345,6 @@ impl Row {
                     self.recalculate_len_up_to(old_len);
                 }
             } else {
-                // As in `selective_clear_range`: a BCE blank is content.
                 self.recompute_len();
             }
         }

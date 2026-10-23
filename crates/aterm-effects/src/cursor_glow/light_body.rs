@@ -123,8 +123,13 @@ pub(crate) fn ink_over_floor_from(ink: u32, theme_bg: u32, a_max: u8, floor: f32
     } else {
         1.0
     };
+    let linear = &table.linear;
     let seen_at = |w: f32| {
-        crate::rainbow_kitty::ribbon::seen(over_at(theme_bg, toward_white(ink, w), a_max), theme_bg)
+        crate::rainbow_kitty::ribbon::seen_with(
+            linear,
+            over_at(theme_bg, toward_white(ink, w), a_max),
+            theme_bg,
+        )
     };
     let w_seen = if !seen_at(0.0) {
         0.0

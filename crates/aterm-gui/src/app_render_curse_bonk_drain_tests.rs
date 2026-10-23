@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-
 //! The sound policy's laws are pinned in `aterm_effects::sound_policy`;
 //! these drive them through this host's config and window.
+
 use std::time::Instant;
 
 use aterm_core::terminal::Terminal;
@@ -12,8 +12,6 @@ use aterm_lexicon::Lexicon;
 
 use super::drain_curse_bonk_cues;
 
-/// A window inside [`crate::RESIZE_SOUND_QUIET`] of its last reflow mutes the sound seams (a
-/// TUI's resize repaint storm is not typing); a never-resized window is never quiet.
 #[test]
 fn resize_quiets_the_sound_seams_and_expires() {
     let mut app = crate::App::headless_for_test();
@@ -37,8 +35,6 @@ fn resize_quiets_the_sound_seams_and_expires() {
     );
 }
 
-/// Over a real typed-curse tick, an enabled drain emits one `Words(Bonk)` at the user volume; a
-/// muted drain drops the same cue and still empties the engine's queue, so nothing backlogs.
 #[test]
 fn drain_maps_typed_cues_to_namespaced_bonk_and_never_backlogs() {
     let cfg = crate::app_config::Config::default()
@@ -62,14 +58,11 @@ fn drain_maps_typed_cues_to_namespaced_bonk_and_never_backlogs() {
     let typed_curse = |wd: &mut WordDecorations, now: Instant| {
         let mut term = Terminal::new(4, 32);
         term.process(b"fuck");
-        // Typed means a committed key, not just a caret one past the token (a scrolling build
-        // log leaves it there too); the engine's typed witness demands both.
         wd.note_typed_edit(now, None);
         wd.rescan(&term, 4, 32, &lex, &cfg, 1, now);
         tick(wd, now);
     };
 
-    // Enabled: one cue ⇒ one namespaced bonk at the user volume.
     let mut wd = WordDecorations::default();
     typed_curse(&mut wd, t0);
     let mut events = Vec::new();
@@ -96,7 +89,6 @@ fn drain_maps_typed_cues_to_namespaced_bonk_and_never_backlogs() {
         "the clash register keys off the trail style"
     );
 
-    // Muted (gain None): the same cue is dropped and the queue emptied, so nothing replays.
     let mut wd2 = WordDecorations::default();
     typed_curse(&mut wd2, t0);
     let drained = drain_curse_bonk_cues(

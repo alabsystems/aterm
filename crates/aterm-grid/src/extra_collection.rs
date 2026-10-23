@@ -159,7 +159,6 @@ impl RingSpans for ComplexCharRing {
         self.ring_offset = offset;
     }
 
-    /// Clear all entries.
     fn clear(&mut self) {
         self.entries.fill('\0');
         self.ring_offset = 0;
@@ -341,7 +340,6 @@ impl RgbColorRing {
     ) {
         let end = col_end.min(self.stride);
         if col_start >= end {
-            // empty / wholly out-of-range run — no allocation (like set_fg)
             return;
         }
         let base = (self.ring_row(row) as usize) * (self.stride as usize);
@@ -438,7 +436,6 @@ impl RingSpans for RgbColorRing {
         self.ring_offset = offset;
     }
 
-    /// Clear all entries.
     fn clear(&mut self) {
         if let Some(fg) = self.fg.as_deref_mut() {
             fg.fill(0);
@@ -506,23 +503,15 @@ impl RingSpans for RgbColorRing {
     }
 }
 
-/// Row-span primitives both dense rings provide, so the rectangular shifts built
-/// on them — and the full-width region shifts, which are the rect shift over
-/// `[0, stride - 1]` — are written once.
 trait RingSpans {
-    /// Number of visible rows (ring capacity).
     fn visible_rows(&self) -> u16;
 
-    /// Ring offset: external row 0 maps to `ring_row = ring_offset`.
     fn ring_offset(&self) -> u16;
 
-    /// Move the ring offset (full-screen scroll recycles the top rows).
     fn set_ring_offset(&mut self, offset: u16);
 
-    /// Clear all entries and reset the offset.
     fn clear(&mut self);
 
-    /// Clear a single external row's entries.
     fn clear_row(&mut self, row: u16);
 
     /// Map an external row to its ring index.
@@ -536,7 +525,6 @@ trait RingSpans {
         }
     }
 
-    /// Scroll up by `n` rows: recycle the top `n` rows by clearing them.
     fn scroll_up(&mut self, n: u16) {
         // Over-scroll: when the whole visible area (or more) scrolls off, the
         // ring is fully recycled and the offset resets to 0. `ring_row` only
@@ -553,14 +541,10 @@ trait RingSpans {
         self.set_ring_offset(offset);
     }
 
-    /// Copy a `[left, right]` column span from `src_row` to `dst_row`.
     fn copy_row_span(&mut self, src_row: u16, dst_row: u16, left: u16, right: u16);
 
-    /// Clear the `[left, right_excl)` column span of one external row.
     fn clear_range(&mut self, row: u16, left: u16, right_excl: u16);
 
-    /// Rect shift up by `n` within rows `[top, bottom]` × cols `[left, right]`
-    /// (DECLRMM).
     fn shift_rect_up(&mut self, top: u16, bottom: u16, left: u16, right: u16, n: u16) {
         if n == 0 || top > bottom || left > right {
             return;
@@ -580,8 +564,6 @@ trait RingSpans {
         }
     }
 
-    /// Rect shift down by `n` within rows `[top, bottom]` × cols `[left, right]`
-    /// (DECLRMM).
     fn shift_rect_down(&mut self, top: u16, bottom: u16, left: u16, right: u16, n: u16) {
         if n == 0 || top > bottom || left > right {
             return;
@@ -650,15 +632,12 @@ fn shift_left_in<T: Copy>(plane: &mut [T], base: usize, start: u16, count: u16, 
     plane[keep_end..h].fill(blank);
 }
 
-/// Compact after this many accumulated scroll rows: rare enough to amortize to
-/// O(1) per scroll, small enough to bound stale-entry memory and keep
-/// `row_offset` plus the screen height clear of u16 overflow.
 const COMPACT_THRESHOLD: u16 = 256;
 
 /// Maximum number of hyperlink-bearing entries allowed in `CellExtras`.
 pub(crate) const MAX_HYPERLINK_ENTRIES: usize = 10_000;
 
-/// Per-cell extras snapshot for render/FFI hot paths: one accessor over the rings and the map, so callers do not re-probe each layer.
+/// Per-cell extras snapshot for render and FFI hot paths.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CellRenderData<'a> {
     extra: Option<&'a CellExtra>,
@@ -668,7 +647,7 @@ pub struct CellRenderData<'a> {
 }
 
 impl<'a> CellRenderData<'a> {
-    /// Get the cell's `CellExtra` entry when the HAS_EXTRAS flag requested it.
+    /// Get the cell's `CellExtra` entry when requested by `HAS_EXTRAS`.
     #[must_use]
     #[inline]
     pub const fn cell_extra(&self) -> Option<&'a CellExtra> {
@@ -758,7 +737,7 @@ impl CellExtras {
         }
     }
 
-    /// Store a complex char codepoint in the dense ring buffer, allocating the ring on first use; no `Arc<str>` allocation or refcounting.
+    /// Store a complex char codepoint in the dense ring buffer.
     #[inline]
     pub fn set_complex_char_ring(
         &mut self,
@@ -791,7 +770,7 @@ impl CellExtras {
         ring.set_wide_run(row, start_col, chars);
     }
 
-    /// Store the non-BMP chars (> U+FFFF) of a mixed BMP/non-BMP wide-char run.
+    /// Store the non-BMP chars of a mixed BMP/non-BMP wide-char run.
     #[inline]
     pub fn set_mixed_wide_ring(
         &mut self,
@@ -817,7 +796,7 @@ impl CellExtras {
         }
     }
 
-    /// Look up a complex char codepoint: ring first, then the map (cells whose complex char shares an entry with other extras).
+    /// Look up a complex char codepoint in the ring first, then the map.
     #[inline]
     pub fn complex_codepoint_for(&self, row: u16, col: u16) -> Option<char> {
         if let Some(ring) = &self.complex_ring
@@ -831,7 +810,7 @@ impl CellExtras {
             .and_then(|s| s.chars().next())
     }
 
-    /// Look up a complex char as `Arc<str>`: map only (the ring stores codepoints).
+    /// Look up a complex char as `Arc<str>` in the map.
     #[inline]
     pub fn complex_char_arc_for(&self, row: u16, col: u16) -> Option<&Arc<str>> {
         self.data
@@ -839,7 +818,7 @@ impl CellExtras {
             .and_then(|e| e.complex_char())
     }
 
-    /// Append a complex char's full text to `out`: the ring's codepoint, else the HashMap's string (a multi-scalar cluster).
+    /// Append a complex char's full text to `out` from the ring or map.
     pub fn push_complex_char(&self, row: u16, col: u16, out: &mut String) -> bool {
         if let Some(ring) = &self.complex_ring
             && let Some(c) = ring.get(row, col)
@@ -889,7 +868,7 @@ impl CellExtras {
         }
     }
 
-    /// Look up fg RGB: ring buffer first (O(1)), then HashMap.
+    /// Look up foreground RGB in the ring buffer first, then the map.
     #[inline]
     pub fn fg_rgb_for(&self, row: u16, col: u16) -> Option<[u8; 3]> {
         if let Some(ring) = &self.rgb_ring
@@ -902,7 +881,7 @@ impl CellExtras {
             .and_then(|e| e.fg_rgb())
     }
 
-    /// Look up bg RGB: ring buffer first (O(1)), then HashMap.
+    /// Look up background RGB in the ring buffer first, then the map.
     #[inline]
     pub fn bg_rgb_for(&self, row: u16, col: u16) -> Option<[u8; 3]> {
         if let Some(ring) = &self.rgb_ring
@@ -984,21 +963,21 @@ impl CellExtras {
         CellCoord::new(self.internal_row(coord.row), coord.col)
     }
 
-    /// Returns `true` when the map holds no entry, so the FFI render path can skip per-cell probes.
+    /// Returns `true` when the map holds no entry.
     #[must_use]
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
 
-    /// Returns `true` when any storage layer (map, complex ring or RGB ring) holds data, unlike [`Self::is_empty`], which sees only the map.
+    /// Returns `true` when any storage layer holds data.
     #[must_use]
     #[inline]
     pub fn has_any_data(&self) -> bool {
         !self.data.is_empty() || self.complex_ring.is_some() || self.rgb_ring.is_some()
     }
 
-    /// Iterate over all valid (non-stale) (coord, extra) pairs, in external coordinates.
+    /// Iterate over all non-stale `(coord, extra)` pairs in external coordinates.
     pub fn iter(&self) -> impl Iterator<Item = (CellCoord, &CellExtra)> + '_ {
         let offset = self.row_offset;
         self.data.iter().filter_map(move |(coord, extra)| {
@@ -1028,7 +1007,7 @@ impl CellExtras {
         self.data.get(&self.internal_coord(coord))
     }
 
-    /// Get mutable extras for a cell, creating if needed.
+    /// Get mutable extras for a cell, creating an entry if needed.
     #[inline]
     pub fn get_or_create(&mut self, coord: CellCoord) -> &mut CellExtra {
         let key = self.internal_coord(coord);
@@ -1040,7 +1019,7 @@ impl CellExtras {
         extra
     }
 
-    /// A fresh entry for a cell a writer has just written, replacing whatever entry is keyed to the coordinate.
+    /// Return a fresh entry for `coord`, replacing any existing entry.
     #[inline]
     pub fn fresh(&mut self, coord: CellCoord) -> &mut CellExtra {
         let key = self.internal_coord(coord);
@@ -1053,28 +1032,28 @@ impl CellExtras {
         extra
     }
 
-    /// Whether an inline image has ever been placed here (see the [`any_image`](Self::any_image) field).
+    /// Whether an inline image has ever been placed here.
     #[must_use]
     #[inline]
     pub const fn any_image(&self) -> bool {
         self.any_image
     }
 
-    /// Attach an inline-image ref to a cell, arming the scroll-off scan gate.
+    /// Attach an inline-image reference to a cell.
     #[inline]
     pub fn set_image(&mut self, coord: CellCoord, image: crate::extra::ImageRef) {
         self.any_image = true;
         self.get_or_create(coord).set_image(Some(image));
     }
 
-    /// [`set_image`](Self::set_image)'s layering twin: add `image` to the cell's layers ([`CellExtra::stack_image`]) instead of replacing them.
+    /// Add `image` to the cell's image layers.
     #[inline]
     pub fn stack_image(&mut self, coord: CellCoord, image: crate::extra::ImageRef) {
         self.any_image = true;
         self.get_or_create(coord).stack_image(image);
     }
 
-    /// Set extras for a cell; an extra with no data removes the entry.
+    /// Set extras for a cell, removing the entry when `extra` has no data.
     #[inline]
     pub fn set(&mut self, coord: CellCoord, extra: CellExtra) {
         let internal = self.internal_coord(coord);
@@ -1120,7 +1099,6 @@ impl CellExtras {
                 return;
             }
         } else if extra.has_data() {
-            // Truecolor bytes alone: a BCE blank's, kept.
             return;
         }
         self.data.remove(&key);
@@ -1216,7 +1194,7 @@ impl CellExtras {
         self.maybe_shrink();
     }
 
-    /// Shift rows up by `n` (multi-line scroll): rows `start_row, start_row + n)` drop, rows below move up by `n`, rows above stay.
+    /// Shift rows up by `n` starting at `start_row`.
     pub fn shift_rows_up_by(&mut self, start_row: u16, n: u16) {
         if let Some(ring) = &mut self.complex_ring {
             if start_row == 0 {
@@ -1340,7 +1318,7 @@ impl CellExtras {
         }
     }
 
-    /// Clear all extras, releasing capacity: a new map (unlike `HashMap::clear`) reclaims the memory of a hyperlink-heavy peak.
+    /// Clear all extras and release map capacity.
     #[inline]
     pub fn clear(&mut self) {
         self.data = FxHashMap::default();
@@ -1529,7 +1507,7 @@ impl CellExtras {
         base.saturating_add(extras_mem).saturating_add(rgb_mem)
     }
 
-    /// Number of valid extras entries (excluding those scrolled off under the row offset).
+    /// Number of valid extras entries excluding scrolled-off rows.
     #[must_use]
     pub fn len(&self) -> usize {
         if self.row_offset == 0 {
@@ -1581,7 +1559,7 @@ impl CellExtras {
         self.maybe_shrink();
     }
 
-    /// Check if any cell in a row has a hyperlink (O(E) scan).
+    /// Check if any cell in `row` has a hyperlink.
     #[must_use]
     #[cfg(test)]
     pub fn row_has_hyperlinks(&self, row: u16) -> bool {
@@ -1591,7 +1569,7 @@ impl CellExtras {
             .any(|(coord, extra)| coord.row == internal_row && extra.hyperlink().is_some())
     }
 
-    /// Enforce the hyperlink entry limit (bounding memory under OSC 8 spam): when the population may exceed [`MAX_HYPERLINK_ENTRIES`], drop the links of the oldest entries (lowest internal rows).
+    /// Enforce the hyperlink entry limit by dropping links from the oldest entries.
     #[inline]
     pub fn enforce_hyperlink_limit(&mut self) {
         // Two sound upper bounds on the hyperlink population; either proving
@@ -1686,9 +1664,6 @@ impl CellExtras {
 mod tests {
     use super::*;
 
-    /// Both rings ignore a column at or past their stride: a read is `None`
-    /// and a write a no-op, never an alias into the next ring row's slots
-    /// (row 0, col 10 of a 10-wide ring is row 1, col 0's slot).
     #[test]
     fn ring_columns_past_the_stride_never_alias_the_next_row() {
         let mut complex = ComplexCharRing::new(4, 10);
@@ -1714,9 +1689,6 @@ mod tests {
         assert_eq!(rgb.fg(1, 0), Some([0, 0, 255]));
     }
 
-    /// Scrolling a ring by at least its visible rows (e.g. `CSI 65535 S`)
-    /// recycles it whole and resets `ring_offset`, so later writes stay
-    /// readable.
     #[test]
     fn ring_overscroll_recycles_and_resets_the_offset() {
         for n in [4, 5, 65535] {
@@ -1743,10 +1715,6 @@ mod tests {
         }
     }
 
-    /// EVERY CLEAR REACHES BOTH STORES (#7697): `clear_row`, `clear_range`,
-    /// `clear_rows` and `clear_rect` remove exactly their cells from the
-    /// HashMap and from the RGB ring (where RGB-only writes live), keep every
-    /// other cell, and an empty range clears nothing.
     #[test]
     fn every_clear_removes_exactly_its_cells_from_map_and_rgb_ring() {
         type Clear = fn(&mut CellExtras);
@@ -1821,9 +1789,6 @@ mod tests {
         }
     }
 
-    /// `fill_runs` leaves the ring exactly as per-cell `set_fg`/`set_bg` does,
-    /// including empty, overhanging and fully out-of-range runs (which must not
-    /// allocate the plane).
     #[test]
     fn fill_run_matches_per_cell_set() {
         let rgb_f = [17u8, 34, 51];
@@ -1870,9 +1835,6 @@ mod tests {
         }
     }
 
-    /// `RgbColorRing::clear_range` leaves the planes exactly as a per-column loop
-    /// does, including a stale `row >= visible_rows` and non-zero ring offsets,
-    /// and never allocates an absent plane.
     #[test]
     fn clear_range_matches_per_cell_clear() {
         fn clear_range_per_cell(ring: &mut RgbColorRing, row: u16, start_col: u16, end_col: u16) {
@@ -1939,8 +1901,6 @@ mod tests {
         }
     }
 
-    /// `ComplexCharRing::clear_range`'s one `fill('\0')` equals a per-column
-    /// store, across the same kinds of ranges.
     #[test]
     fn complex_clear_range_matches_per_cell_clear() {
         fn clear_range_per_cell(ring: &mut ComplexCharRing, row: u16, left: u16, right_excl: u16) {
@@ -2048,9 +2008,6 @@ mod tests {
         assert_eq!(extra.combining(), &['\u{0308}']);
     }
 
-    /// Sharing is unobservable: `set_range_uniform` gives every cell of an OSC 8
-    /// run the same `Arc<HyperlinkData>`, so a later single-cell edit must
-    /// copy-on-write and leave its neighbours' link alone.
     #[test]
     fn per_cell_hyperlink_edit_does_not_leak_across_the_run() {
         const RUN_URL: &str = "https://example.com/run";

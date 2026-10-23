@@ -2,35 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 // The supervisor policy has one writer, proved by the compiler.
-//
-// config_watcher.rs makes the watcher thread the only writer of the `[harness]` policy the window
-// runs (`observed_harness`, `post_harness`, `Wake::HarnessPolicyObserved`,
-// `App::adopt_harness_policy`): it reads the file in disk order, readable or refused, and posts
-// each read's policy once per change; the config lane admits generations under the running
-// policy and never writes one; a seamless successor drops every wake it handles before Commit,
-// and the Commit handler has the watcher forget what it posted (`REPOST_AFTER_COMMIT`).
-//
-// This island states the protocol (the watcher's post, its flight through the event loop queue
-// and its delivery, the Commit and the watcher's later forget as separate steps, lane admissions
-// at any moment), and the Clean CIC kernel checks it in every Trust-lane build, even under
-// -Ztrust-verify=off, because an island carries its own authority:
-//   * the invariant holds along any run, every interleaving of those events;
-//   * with the window live and the watcher settled, one read and its delivery run the file on
-//     disk;
-//   * the two failure shapes (a second writer; a Commit that raises no forget) are
-//     kernel-evaluated counterexamples, so the proof is not vacuous: putting the second writer
-//     into `step` stops this crate compiling.
-//
-// It is a theorem about the model below, not about the Rust; the queue holds one post at a time
-// here. The code-bound half is the derived twin,
-// `aterm_spec::derive::harness_policy_one_writer_model` (Tier-0 in aterm-spec's
-// `derived_harness_policy_one_writer.rs`, with the second writer as its `Buggy` member), and its
-// Tier-1 binds: `config_watcher::tests::the_watcher_is_the_policys_one_writer` drives the real
-// read, post, dedupe, delivery, admission and Commit reset; `app_native`'s
-// `a_late_admission_never_moves_the_watchers_harness_policy` drives the real admission path.
-//
-// A sibling file, like `app_update_handoff_island.rs`: a compiler without the Clean surface fails
-// to lex an island, so it sits behind `mod island;` under `cfg(clean_islands)`.
 clean {
     namespace HarnessWriter
 

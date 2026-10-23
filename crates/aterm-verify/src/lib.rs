@@ -25,9 +25,7 @@ pub mod plan;
 #[cfg(unix)]
 pub mod provision;
 pub mod report;
-/// Nothing outlives its run: the run record, the stage-end survivor check and the next run's
-/// start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md`
-/// §3.3, §5.4, §8.1).
+/// Nothing outlives its run: the run record, the stage-end survivor check and the next run's start ending a dead run's proven members (`docs/DESIGN-leftover-processes-2026-10-16.md` §3.3, §5.4, §8.1).
 pub mod runs;
 pub mod rustup;
 pub mod sched;
@@ -57,7 +55,7 @@ pub use ladder::{Outcome, Report, Severity};
 pub use scope::Scope;
 pub use toolchain::{Toolchain, is_executable_file};
 
-/// Exit codes. Failed and could-not-run stay apart.
+/// Exit codes.
 pub mod exit {
     /// Every check that ran passed.
     pub const PASS: i32 = 0;
@@ -69,7 +67,7 @@ pub mod exit {
     pub const COULD_NOT_RUN: i32 = 3;
 }
 
-/// The environment, read once at startup on the main thread, so every concurrent stage decides from a value a test can construct.
+/// The environment, read once at startup on the main thread.
 #[derive(Clone, Debug, Default)]
 pub struct EnvSnapshot {
     pub path: OsString,
@@ -275,9 +273,7 @@ pub struct Ctx {
     pub test_recorder: Option<PathBuf>,
     /// The machine-wide lock the timing stages hold while they run ([`plan::TIMED`]).
     pub timing_lock: Option<PathBuf>,
-    /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one: every stage
-    /// child's group is told to it, and a stage's normal end sweeps its survivors. `None` off
-    /// the shipped run and wherever the rendezvous or the boot id cannot be read.
+    /// This run's record of its stage groups ([`runs::Runs`]), when it keeps one.
     pub runs: Option<runs::Runs>,
 }
 
@@ -381,18 +377,13 @@ impl Ctx {
             measure_artifact: None,
             test_jobs: testrun::DEFAULT_JOBS,
             test_threads: pinned_threads,
-            // Named now: a stage that rebuilds this binary (the test stage, for aterm-verify's
-            // own tests) leaves Linux's `current_exe` reading `… (deleted)`, which no later
-            // stage can run.
             test_recorder: std::env::current_exe().ok(),
             timing_lock: None,
             runs: None,
         }
     }
 
-    /// Keep this run's leftover record ([`runs::Runs`]) and set `ATERM_VERIFY_RUN` on every
-    /// stage child (W-run), so a descendant that leaves its group still names which run made
-    /// it.
+    /// Keep this run's leftover record ([`runs::Runs`]) and set `ATERM_VERIFY_RUN` on every stage child (W-run).
     #[must_use]
     pub fn with_runs(mut self, runs: runs::Runs) -> Self {
         self.child_env_add
@@ -580,12 +571,9 @@ impl Ctx {
     }
 }
 
-/// The machine-wide timing lock, held: released by `LOCK_UN` before its file
-/// closes.
 struct TimingLock(std::fs::File);
 
 impl TimingLock {
-    /// Take the lock at `path`, waiting for a holder, said once on stderr.
     fn take(path: &Path) -> Option<Self> {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -623,8 +611,6 @@ impl Drop for TimingLock {
     }
 }
 
-/// Run `f` holding the run's timing lock, when it has one: two runs' timing
-/// stages never overlap.
 fn with_timing_lock<T>(ctx: &Ctx, f: impl FnOnce() -> T) -> T {
     let _held = ctx.timing_lock.as_deref().and_then(TimingLock::take);
     f()
@@ -678,11 +664,8 @@ pub fn selection(ctx: &Ctx, cone: Option<&str>) -> String {
     }
 }
 
-/// When a stage started (from the run's start) and how long it ran: its `time`
-/// line in the log.
 type Clock = (Duration, Duration);
 
-/// One check's progress while the stages run.
 struct Progress {
     /// Stages still to finish, and the first start and last end seen.
     left: usize,
@@ -814,9 +797,6 @@ pub fn run(
         .into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     results.sort_by_key(|r| r.check);
-    // What the run's stages and its own end left behind, ended or named
-    // (`docs/DESIGN-leftover-processes-2026-10-16.md` §8.1.2, §8.1.4), goes into the receipt
-    // and the log above the verdict, which it does not change yet (§11 Q4).
     if let Some(runs) = &ctx.runs {
         for line in runs.end_of_run(&runs::LiveKernel) {
             let _ = writeln!(log, "verify: {line}");
@@ -837,7 +817,6 @@ pub fn run(
     Ok(code)
 }
 
-/// The toolchain the run resolved, for the log.
 fn toolchain_lines(ctx: &Ctx) -> String {
     let mut s = format!(
         "toolchain: {} (channel {})\n",
@@ -917,9 +896,6 @@ pub fn hold_toolchain(
     (held, said)
 }
 
-/// The directories a run executes tools from: the toolchain directory, then the
-/// directory of each tool it took from the managed build ([`Toolchain::borrowed`]),
-/// each once, in that order.
 fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
     let mut dirs = vec![tools.stage2_dir.clone()];
     for (_, file) in &tools.borrowed {
@@ -932,12 +908,8 @@ fn held_dirs(tools: &Toolchain) -> Vec<PathBuf> {
     dirs
 }
 
-/// How many of the run logs are kept.
 const LOGS_KEPT: usize = 20;
 
-/// Open this run's log: `--log <path>` (read from `cwd`), else
-/// `<target>/verify/logs.noindex/<epoch>-<pid>.log`, keeping the newest
-/// [`LOGS_KEPT`].
 fn open_log(chosen: Option<&Path>, cwd: &Path, ctx: &Ctx) -> Option<(PathBuf, std::fs::File)> {
     let path = match chosen {
         Some(p) => cwd.join(p),
@@ -962,7 +934,6 @@ fn open_log(chosen: Option<&Path>, cwd: &Path, ctx: &Ctx) -> Option<(PathBuf, st
     }
 }
 
-/// Keep the newest [`LOGS_KEPT`] logs in `dir`; best effort.
 fn prune_logs(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -1088,10 +1059,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     let (_leases, lease_said) = hold_toolchain(&env, &tools, &root);
     #[cfg(unix)]
     exec::group::kill_on_interrupt();
-    // The run records' directory, verify's own rendezvous, resolved here and nowhere else.
     let runs_dir = aterm_uds::control_socket_dir().map(|d| d.join("verify-runs"));
-    // The start pass: delete other boots' records, and end a dead run's proven members
-    // (§8.1.3), skipping this run's own pid.
     if let (Some(dir), Some(boot)) = (&runs_dir, aterm_uds::process::boot_id()) {
         let me = i32::try_from(std::process::id()).unwrap_or(0);
         runs::end_dead_runs(dir, &boot, me, &runs::LiveKernel, &mut |line| {
@@ -1126,9 +1094,6 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
         .with_test_threads(parsed.test_threads)
         .with_timing_lock(Some(default_timing_lock()))
         .with_toolchain_lease(lease_said);
-    // Keep this run's record (and set ATERM_VERIFY_RUN on every child) when the rendezvous and
-    // boot id can be read; a run that cannot keeps none, and the next run's start pass simply
-    // has nothing of it to act on.
     let ctx = match runs_dir
         .as_deref()
         .and_then(|dir| runs::Runs::open(&ctx, dir, exec::run))
@@ -1158,7 +1123,6 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
             exit::COULD_NOT_RUN
         }
     };
-    // The run's orderly end, after its run-end sweep (`run`): its record's removal.
     if let Some(record) = &ctx.runs {
         record.finish(&runs::LiveKernel);
     }
@@ -1171,7 +1135,7 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
 /// # Errors
 /// Fails when `mktemp` is absent or refuses to create the directory.
 pub fn mktemp_dir(tag: &str) -> std::io::Result<PathBuf> {
-    let out = Command::new("mktemp")
+    let out = Command::new(aterm_uds::os_path!("mktemp"))
         .arg("-d")
         .arg(format!("/tmp/{tag}.XXXXXX"))
         .output()?;
@@ -1276,8 +1240,6 @@ pub use aterm_uds::host::{host_user_cache, user_cache};
 mod tests {
     use super::*;
 
-    /// A tool the run took from the managed build runs out of THAT build, so the run
-    /// holds it for as long as it runs, once however many tools came from it.
     #[test]
     fn a_borrowed_tools_build_is_held_for_the_run() {
         use aterm_toolchain::lease::{self, Holders, Subject};
@@ -1382,8 +1344,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// Every child builds in the caller's `CARGO_TARGET_DIR`, and
-    /// `--test-threads` reaches every child only when asked.
     #[test]
     fn every_child_builds_in_the_callers_target_dir_and_gets_the_threads_asked_for() {
         let theirs = Ctx::new(
@@ -1417,10 +1377,6 @@ mod tests {
         assert!(has(&threaded, "RUST_TEST_THREADS", "3"));
     }
 
-    /// THE MAIN LANE SHARES PLAIN TARGO'S CACHE exactly where atpkg's shim would
-    /// hand plain `targo` its build-cache `--config` (macOS, a root under a
-    /// writable `$HOME`, no layout chosen): then no child is pinned to a
-    /// CARGO_TARGET_DIR, and the target dir is still `<root>/target`.
     #[test]
     fn the_main_lane_shares_plain_targos_cache_exactly_where_the_shim_would() {
         let tmp = std::fs::canonicalize(mktemp_dir("atv-cache").expect("mktemp")).expect("real");
@@ -1469,10 +1425,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// WHERE THE SHIM STEPS ASIDE the main lane is pinned to the run's target dir
-    /// and its intermediates still go where Spotlight never looks:
-    /// `<target>/build.noindex`, so only the uplifted artifacts land in the plain
-    /// folder.
     #[test]
     fn a_pinned_main_lane_keeps_its_intermediates_out_of_spotlight() {
         let pinned = |c: &Ctx| {
@@ -1535,7 +1487,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// A caller's own RUST_TEST_THREADS is a pin, as --test-threads is.
     #[test]
     fn a_callers_rust_test_threads_pins_every_binary() {
         let c = Ctx::new(
@@ -1558,9 +1509,6 @@ mod tests {
         assert_eq!(unpinned.test_threads, None);
     }
 
-    /// A rerun keeps `--no-windows` for a check it changes: a windowed stage's
-    /// (appkit) and one that skips its windowed rows (browser, whose WebKit
-    /// session opens windows).
     #[test]
     fn a_rerun_keeps_no_windows_where_the_flag_changes_the_check() {
         let c = |no_windows| {
@@ -1597,7 +1545,7 @@ mod tests {
             exit::COULD_NOT_RUN,
             "no checkout"
         );
-        let git = std::process::Command::new("git")
+        let git = std::process::Command::new(aterm_uds::os_path!("git"))
             .args(["init", "-q"])
             .current_dir(&tmp)
             .status()
@@ -1613,8 +1561,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    /// The header says what the selection pulled into `dev`, and the package
-    /// that pulled each.
     #[test]
     fn the_header_names_what_the_selection_pulled_and_why() {
         let head = |crates: &[&str]| {

@@ -29,9 +29,7 @@ fn boot(tag: &str) -> Instance {
     boot_with(tag, COLUMNS)
 }
 
-/// Boot one headless instance, 40 rows, `columns` wide ([`headless_boot::boot`]:
-/// an environment refusal is COULD NOT RUN; a product that cannot start fails
-/// the test).
+/// Boot one headless instance, 40 rows, `columns` wide ([`headless_boot::boot`]).
 fn boot_with(tag: &str, columns: &str) -> Instance {
     static BOOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let n = BOOTS.fetch_add(1, Ordering::Relaxed);
@@ -41,9 +39,7 @@ fn boot_with(tag: &str, columns: &str) -> Instance {
     )
 }
 
-/// How long a wait for something that MUST happen — a screen, a worker's
-/// record, a submitted line — may take before it is read as a hang (AGENTS.md:
-/// a hang detector is a minute, never a latency budget).
+/// One-minute hang detector for a wait that must happen.
 const HANG: Duration = aterm_spec::wait::MUST_HAPPEN;
 /// [`HANG`] as a server-side `await`'s bound.
 const HANG_MS: &str = "timeout=60000";
@@ -74,8 +70,7 @@ fn boot_session(inst: &Instance) -> String {
     row.split_whitespace().nth(1).unwrap().to_string()
 }
 
-/// Submit `line` to the worker as an orchestrator's write does: the text and
-/// its Enter in ONE `feed-bin` frame, so it never stands in the composer.
+/// Submit `line` and its Enter in one `feed-bin` frame.
 fn submit(inst: &Instance, sid: &str, line: &str) {
     let mut c = aterm_agent::RelayClient::connect_local_beside(&inst.sock)
         .unwrap_or_else(|e| panic!("connect to {}: {e}", inst.sock));
@@ -88,19 +83,14 @@ fn submit(inst: &Instance, sid: &str, line: &str) {
     );
 }
 
-/// `await match <re>` on the session: the server's latched watcher. `<re>`
-/// is one wire token (`.` for a space).
+/// `await match <re>` on the session (`<re>` is one wire token, `.` for a space).
 fn await_match(inst: &Instance, sid: &str, re: &str) {
     if let Err(reply) = awaited(inst, sid, re) {
         panic!("`{re}` never reached the screen: {reply}");
     }
 }
 
-/// [`await_match`] handing the reply back (`aterm ctl` exits non-zero on
-/// failure). The screen it waits for comes at the end of a chain of steps
-/// that must happen (the worker's turn, the loop's act, the worker's redraw),
-/// so its hang detector is [`HANG`] with no step of the chain taken
-/// ([`progress`]), however long the whole chain takes on a loaded machine.
+/// [`await_match`] handing the reply back, bounded by [`HANG`] with no step of [`progress`] taken.
 fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
     let mut taken = progress(inst);
     loop {
@@ -126,8 +116,7 @@ fn awaited(inst: &Instance, sid: &str, re: &str) -> Result<(), String> {
     }
 }
 
-/// The steps a live chain has taken: the worker's events and the loop's
-/// steps in its journal ([`steps`]).
+/// The steps a live chain has taken: worker events and loop journal steps ([`steps`]).
 fn progress(inst: &Instance) -> (usize, usize) {
     (
         worker_events(&inst.tmp.join("events")).len(),
@@ -135,15 +124,10 @@ fn progress(inst: &Instance) -> (usize, usize) {
     )
 }
 
-/// Journal kinds the hosted loop writes again on its own with no step of a
-/// chain taken: a decision skipped and re-armed (`SKIPPED`), a read waited
-/// on and tried again (`WAITING`), a reconnect, a timeout. A loop stuck
-/// writing them is hung, not moving.
+/// Journal kinds the hosted loop writes again on its own with no step of a chain taken.
 const LOOP_OWN: [&str; 4] = ["skipped", "waiting", "reconnect", "timeout"];
 
-/// The loop's steps in `journal`: its distinct lines of any other kind (an
-/// event read, an act, an escalation), each counted once however often it
-/// is written again.
+/// Distinct non-[`LOOP_OWN`] lines in `journal`.
 fn steps(journal: &str) -> usize {
     let mut seen = std::collections::HashSet::new();
     journal
@@ -154,11 +138,7 @@ fn steps(journal: &str) -> usize {
         .count()
 }
 
-/// A LOOP THAT ONLY REPEATS ITSELF TAKES NO STEP ([`steps`]): its `SKIPPED`,
-/// `WAITING`, `RECONNECT` and `TIMEOUT` lines, and a line written again word
-/// for word, leave the count where it was, so a livelock that keeps
-/// journaling still runs out [`moving`]'s hang detector. NEGATIVE CONTROL: a
-/// new event and an act each count.
+/// A loop that only repeats itself takes no step ([`steps`]).
 #[test]
 fn a_loop_that_only_repeats_itself_takes_no_step() {
     let line = |kind: &str, text: &str| {
@@ -193,7 +173,6 @@ fn a_loop_that_only_repeats_itself_takes_no_step() {
         base,
         "the loop repeating itself: {looping}"
     );
-    // NEGATIVE CONTROL: a new event, an act.
     for (kind, text) in [
         ("event", "EVENT idle seq=8 done"),
         ("continued", "CONTINUED seq=8 rule=continue@v1 keep going"),
@@ -203,10 +182,7 @@ fn a_loop_that_only_repeats_itself_takes_no_step() {
     }
 }
 
-/// `done`'s answer, waited for while the chain moves: the hang detector is
-/// [`HANG`] in which no step of the chain is taken ([`progress`]), however
-/// long the whole chain takes on a loaded machine: one step alone took up to
-/// 32.5 s at load 476 (`docs/measured/typing-under-load-2026-10-22.md`).
+/// Wait for `done` while the chain moves, failing after [`HANG`] with no step of [`progress`] taken.
 fn moving<T>(inst: &Instance, mut done: impl FnMut() -> Option<T>) -> Result<T, String> {
     let mut taken = progress(inst);
     let mut since = Instant::now();
@@ -225,8 +201,7 @@ fn moving<T>(inst: &Instance, mut done: impl FnMut() -> Option<T>) -> Result<T, 
     }
 }
 
-/// The lines of `path` once it holds `n` of them, or the ones it holds when
-/// the chain hangs ([`moving`]).
+/// The lines of `path` once it holds `n` of them, or when the chain hangs ([`moving`]).
 fn submits_when(inst: &Instance, path: &Path, n: usize) -> Vec<String> {
     let read = || -> Vec<String> {
         std::fs::read_to_string(path)
@@ -242,9 +217,7 @@ fn submits_when(inst: &Instance, path: &Path, n: usize) -> Vec<String> {
     .unwrap_or_else(|_| read())
 }
 
-/// The fake worker's events of `kind` (`draw-<screen>`, `submit`, `press`),
-/// their stamps in order, once there are `n` of them, or the ones there are
-/// when the chain hangs ([`moving`]).
+/// The fake worker's events of `kind` (`draw-<screen>`, `submit`, `press`), their stamps in order, once `n` exist ([`moving`]).
 fn stamps_when(inst: &Instance, kind: &str, n: usize) -> Vec<SystemTime> {
     let events = inst.tmp.join("events");
     let seen = || -> Vec<SystemTime> {
@@ -261,8 +234,7 @@ fn stamps_when(inst: &Instance, kind: &str, n: usize) -> Vec<SystemTime> {
     .unwrap_or_else(|_| seen())
 }
 
-/// When the worker first drew `screen` (its event record, [`stamps_when`]),
-/// waited for while the chain moves; panics naming what it did draw.
+/// When the worker first drew `screen` ([`stamps_when`]), or panic naming what it did draw.
 fn drawn(inst: &Instance, screen: &str) -> SystemTime {
     if let Some(&at) = stamps_when(inst, &format!("draw-{screen}"), 1).first() {
         return at;
@@ -273,9 +245,7 @@ fn drawn(inst: &Instance, screen: &str) -> SystemTime {
     );
 }
 
-/// The worker's whole event record, in order, each event with its stamp in
-/// ms since the epoch — the clock of the loop's journal (`"t"`), so the two
-/// read side by side.
+/// The worker's whole event record in order, each event stamped in unix ms.
 fn record(events: &Path) -> Vec<String> {
     let mut seen: Vec<(u64, String)> = std::fs::read_dir(events)
         .map(|d| d.flatten().collect::<Vec<_>>())
@@ -299,8 +269,7 @@ fn record(events: &Path) -> Vec<String> {
     seen.into_iter().map(|(_, e)| e).collect()
 }
 
-/// Every event in the worker's record ([`stamps_when`]) — its order, its
-/// kind, its stamp — in order.
+/// Every event in the worker's record ([`stamps_when`]) — sequence, kind, stamp — in order.
 fn worker_events(events: &Path) -> Vec<(u64, String, SystemTime)> {
     let mut seen: Vec<(u64, String, SystemTime)> = std::fs::read_dir(events)
         .map(|d| d.flatten().collect::<Vec<_>>())
@@ -317,8 +286,7 @@ fn worker_events(events: &Path) -> Vec<(u64, String, SystemTime)> {
     seen
 }
 
-/// The lines of `path` once it holds `n` of them, or panic after `within`
-/// (the worker's own log: nothing on the socket announces it).
+/// The lines of `path` once it holds `n` of them, or after `within`.
 fn lines_when(path: &Path, n: usize, within: Duration) -> Vec<String> {
     let deadline = Instant::now() + within;
     loop {
@@ -334,8 +302,7 @@ fn lines_when(path: &Path, n: usize, within: Duration) -> Vec<String> {
     }
 }
 
-/// Rows as the fake worker draws them: each row at its own line, `\r\n`
-/// between, then the cursor placed at (`row`, `col`), both 0-based.
+/// Rows joined by `\r\n`, with the cursor placed at 0-based (`row`, `col`).
 fn render(rows: &[String], cursor: (usize, usize)) -> String {
     let mut s = rows.join("\r\n");
     s.push_str(&format!("\x1b[{};{}H", cursor.0 + 1, cursor.1 + 1));
@@ -374,10 +341,7 @@ fn busy() -> Vec<String> {
     r
 }
 
-/// The measured `/goal` screen (2026-09-21) at the END of its turn: the
-/// running workflow's status row, its monitor and its agent rows gone, a
-/// done row in their place, `◎ /goal active` and the dim `❯ keep going`
-/// kept as measured, a `⏺` head over the message's last rows.
+/// The measured `/goal` screen at the end of its turn (`◎ /goal active` and dim `❯ keep going` kept).
 fn goal_end() -> Vec<String> {
     let measured = screen(GOAL_ACTIVE_SUGGESTION);
     let mut r = vec!["⏺ Stage 2 of the harness is in.".to_string()];
@@ -395,11 +359,7 @@ fn goal_end() -> Vec<String> {
     r
 }
 
-/// The measured weekly wall of 2026-09-28 (tab 1: the wall's
-/// gutter block, the `/goal` echo, a done row counting `1 shell still
-/// running`, the bypass footer's `· 1 shell ·`, Claude's dim suggestion in the
-/// composer), its reset a few SECONDS off (`resets in 5s`, the span
-/// grammar the loop reads) so a live test can wait it out.
+/// The measured weekly wall behind a background shell, with its reset 5 seconds off.
 fn wall_behind_a_shell() -> Vec<String> {
     wall_behind_a_shell_in(5)
 }
@@ -419,8 +379,7 @@ fn wall_behind_a_shell_in(secs: u64) -> Vec<String> {
 /// The text a person left in the composer at the wall ([`wall_with_a_draft`]).
 const DRAFT: &str = "and then merge when it is green";
 
-/// [`wall_behind_a_shell`] with a person's DRAFT standing in the composer: the
-/// caret row holds `DRAFT`, drawn plain, not as Claude's dim suggestion.
+/// [`wall_behind_a_shell`] with a person's [`DRAFT`] standing in the composer.
 fn wall_with_a_draft() -> Vec<String> {
     let mut rows = wall_behind_a_shell();
     let c = caret(&rows);
@@ -428,11 +387,7 @@ fn wall_with_a_draft() -> Vec<String> {
     rows
 }
 
-/// [`wall_behind_a_shell`] with the wall's rows scrolled out of view (the owner
-/// reading back up the transcript: Claude Code's fullscreen view keeps the
-/// status row, the composer and the footer where they are): the workflow
-/// notice, the gutter block and the echo are gone, the done row and the
-/// footer still count `1 shell`.
+/// [`wall_behind_a_shell`] with the wall's rows scrolled out of view while the done row and footer still count `1 shell`.
 fn wall_scrolled_out_of_view() -> Vec<String> {
     let mut rows = wall_behind_a_shell();
     let from = rows
@@ -447,8 +402,7 @@ fn wall_scrolled_out_of_view() -> Vec<String> {
     rows
 }
 
-/// The decision the second turn ends on: answered under full power,
-/// escalated (never typed into) where the owner switched answers off.
+/// The decision the second turn ends on.
 const STOP: &str = "I need your decision on the schema before I go on.";
 
 /// A turn a person stopped with Esc, as Claude Code 2.1.280 draws it.
@@ -467,16 +421,7 @@ fn interrupted() -> Vec<String> {
 /// A plain end of turn after real work: continued.
 const DONE: &str = "Fixed the parser; the suite is green.";
 
-/// The fake worker: `$1` the screens' directory (`<name>.scr`
-/// drawn whole, `<name>.row` its caret row, 1-based, `<name>.below` the rows
-/// under it), `$2` the key log, `$3` the submit log, `$4` the screen the
-/// first line ([`submit`]) ends on, `$5` the columns, `$6` `mangle` to show a
-/// composer text over 40 characters as a pasted-text placeholder, `$7`
-/// `loop` to end EVERY turn on `$4` (else the turns after the first end on
-/// the decision), `$8` the event directory ([`drawn`]), `$9` the directory
-/// the loop's connection marks its busy reads in ([`Tap`]), `$10` the loop's
-/// approvals ledger (the `wallscroll` end scrolls once the loop has written
-/// its wait on the wall there).
+/// Fake worker shell script driven by [`start_worker_in`].
 const FAKE_WORKER: &str = r#"#!/bin/sh
 dir="$1"; keys="$2"; subs="$3"; after="$4"; cols="$5"; mangle="$6"; mode="$7"
 events="$8"; seen="$9"; ledger="${10}"
@@ -588,12 +533,10 @@ while :; do
 done
 "#;
 
-/// The fake worker's three logs: the keys it read, the lines it took, and
-/// its event directory ([`stamps_when`]).
+/// The fake worker's three logs: keys read, lines submitted, and event directory ([`stamps_when`]).
 type WorkerLogs = (PathBuf, PathBuf, PathBuf);
 
-/// Write the screens and the script, start the worker as `claude` in the
-/// boot session, and wait for its ready screen.
+/// Write the screens and script, start the worker as `claude` in the boot session, and wait for its ready screen.
 fn start_worker(inst: &Instance, sid: &str, after: &str) -> WorkerLogs {
     start_worker_with(inst, sid, after, COLUMNS, false)
 }
@@ -603,8 +546,7 @@ fn start_looping_worker(inst: &Instance, sid: &str, after: &str) -> WorkerLogs {
     start_worker_in(inst, sid, after, COLUMNS, false, true)
 }
 
-/// [`start_worker`] for an instance `columns` wide (every rule drawn that
-/// wide), the composer mangled past 40 characters when `mangle`.
+/// [`start_worker`] for an instance `columns` wide, mangling the composer past 40 characters when `mangle`.
 fn start_worker_with(
     inst: &Instance,
     sid: &str,
@@ -714,26 +656,21 @@ fn start_worker_in(
     (keys, subs, events)
 }
 
-/// The hosted loop on its own thread, over its own persistent connection,
-/// under a policy with `timing`; stopped by [`Supervisor::stop`], which
-/// returns what the loop printed.
+/// The hosted loop on its own thread, over its own persistent connection, stopped by [`Supervisor::stop`].
 struct Supervisor {
     stop: Arc<AtomicBool>,
     cut: Option<Interrupter>,
     handle: std::thread::JoinHandle<String>,
 }
 
-/// The loop's connection: every request carried to the instance as it is,
-/// and the worker told when the loop has read its busy screen
-/// ([`FAKE_WORKER`]'s `work`).
+/// The loop's connection, notifying the worker when the loop has read its busy screen ([`FAKE_WORKER`]).
 struct Tap {
     ctl: RelayCtl,
     events: PathBuf,
     seen: PathBuf,
     /// The last screen read showed the busy spell.
     read_busy: bool,
-    /// Raw reads for diagnosing a torn fixture frame versus a real person
-    /// stamp.
+    /// Raw reads log for diagnosing fixture frames.
     reads: PathBuf,
 }
 
@@ -781,15 +718,12 @@ impl Ctl for Tap {
 }
 
 impl Supervisor {
-    /// The owner's policy with the answers off: these scripts end on a
-    /// decision, which is then escalated (the answer is
-    /// [`a_decision_is_answered_with_the_answer_text`]'s).
+    /// Start under [`no_answers`].
     fn start(inst: &Instance, sid: &str, timing: TurnEndTiming) -> Self {
         Self::start_with(inst, sid, timing, no_answers())
     }
 
-    /// [`Self::start`] under `policy`. Returns once the loop has LOOKED — its
-    /// journal holds the first point it read ([`Self::looked`]).
+    /// [`Self::start`] under `policy`, returning once the loop has journaled its first read ([`Self::looked`]).
     fn start_with(
         inst: &Instance,
         sid: &str,
@@ -830,9 +764,7 @@ impl Supervisor {
         Self { stop, cut, handle }.looked(inst, before)
     }
 
-    /// Wait until the loop has read the screen and journaled the point it
-    /// shows (more `EVENT`s than the `before` there were), or panic with
-    /// what it said.
+    /// Wait until the loop has read the screen and journaled the point it shows, or panic with [`evidence`].
     fn looked(self, inst: &Instance, before: usize) -> Self {
         let looked = moving(inst, || {
             if looks(&journal(inst)) > before {
@@ -851,9 +783,7 @@ impl Supervisor {
         );
     }
 
-    /// [`await_match`] for a screen that STAYS once drawn, with the loop
-    /// running: on `OK timeout` the loop is stopped, and the panic says
-    /// everything that names the side that stalled ([`evidence`]).
+    /// [`await_match`] for a screen that stays once drawn, stopping the loop and panicking with [`evidence`] on timeout.
     fn saw(self, inst: &Instance, sid: &str, re: &str) -> Self {
         match awaited(inst, sid, re) {
             Ok(()) => self,
@@ -884,8 +814,7 @@ fn no_answers() -> SupervisorConfig {
     }
 }
 
-/// The session's `meta` once it satisfies `ok`, or as it is when the chain
-/// hangs ([`moving`]).
+/// The session's `meta` once it satisfies `ok`, or when the chain hangs ([`moving`]).
 fn meta_when(inst: &Instance, sid: &str, ok: impl Fn(&str) -> bool) -> String {
     let meta = || ctl_ok(inst, &[&format!("@{sid}"), "meta"]);
     moving(inst, || {
@@ -895,14 +824,12 @@ fn meta_when(inst: &Instance, sid: &str, ok: impl Fn(&str) -> bool) -> String {
     .unwrap_or_else(|_| meta())
 }
 
-/// The loop's journal (the `WAITING` lines are there, not on its stdout).
+/// The loop's journal.
 fn journal(inst: &Instance) -> String {
     std::fs::read_to_string(inst.tmp.join("state/journal.jsonl")).unwrap_or_default()
 }
 
-/// The loop's journal once it satisfies `ok`, or after a minute as it is: a
-/// hang detector for a line the loop says once its act is done, which comes
-/// after the worker has logged what the act brought it.
+/// The loop's journal once it satisfies `ok`, or when the chain hangs ([`moving`]).
 fn journal_when(inst: &Instance, ok: impl Fn(&str) -> bool) -> String {
     moving(inst, || {
         let j = journal(inst);
@@ -919,9 +846,7 @@ fn looks(journal: &str) -> usize {
         .count()
 }
 
-/// Whether the loop said it typed `text` under `rule`: a `CONTINUED` line
-/// naming the rule, the words after it the head of `text` (the line clips a
-/// long text to its first characters).
+/// Whether the loop said it typed `text` under `rule` (`CONTINUED … rule=<rule> <head>`).
 fn continued_with(out: &str, rule: &str, text: &str) -> bool {
     let named = format!(" rule={rule} ");
     out.lines().any(|l| {
@@ -931,16 +856,12 @@ fn continued_with(out: &str, rule: &str, text: &str) -> bool {
     })
 }
 
-/// The worker's submit-log line for Cruise's continuation, typed whole
-/// ([`CONTINUE_TEXT`], the default `continue_text`).
+/// The worker's submit-log line for Cruise's continuation ([`CONTINUE_TEXT`]).
 fn cruise_submit() -> String {
     format!("SUBMIT:{CONTINUE_TEXT}")
 }
 
-/// What a failed wait says: the loop's output and journal (`"t"` its
-/// stamps), the lines and keys the worker took, and the worker's event
-/// record on the journal's clock ([`record`]) — enough to name which side
-/// stalled, and where.
+/// Diagnostic summary of the loop's output, journal, submits, keys, events, and raw reads.
 fn evidence(inst: &Instance, out: &str) -> String {
     let reads = std::fs::read_to_string(inst.tmp.join("reads.log")).unwrap_or_default();
     let mut start = reads.len().saturating_sub(32 * 1024);
@@ -958,9 +879,7 @@ fn evidence(inst: &Instance, out: &str) -> String {
     )
 }
 
-/// THE SUGGESTION, live: exactly one continuation reaches the worker, by
-/// the accept key and a fenced Enter; the decision the next turn ends on is
-/// escalated and nothing more is typed.
+/// The suggestion is accepted once via the accept key and fenced Enter, and the decision after it is escalated.
 #[test]
 fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
     let inst = boot("s");
@@ -993,9 +912,7 @@ fn the_suggestion_is_accepted_once_and_the_decision_after_it_is_escalated() {
     );
 }
 
-/// THE 529, live: after the backoff (1 s here), ONE retry naming the wall —
-/// never the rote `keep going` (the outage of 2026-09-27) — through the
-/// fenced write, echoed into the worker's composer and submitted whole.
+/// A 529 end is continued once after its backoff with a retry naming the wall.
 #[test]
 fn a_529_end_is_continued_once_after_its_backoff() {
     let inst = boot("r");
@@ -1026,17 +943,11 @@ fn a_529_end_is_continued_once_after_its_backoff() {
     assert!(out.contains("rule=api-retry@v1 "), "{ev}");
 }
 
-/// The standing rules the narrow case rides: with them Cruise's
-/// continuation is 401 characters — `❯ ` and it fill six 64-column rows and
-/// 19 cells of a seventh, fewer than the 40-character tail the old guard
-/// named.
+/// Standing rules for the narrow-composer test (401 characters with Cruise's continuation).
 const RULES: &str = "stay on the lane branch, never push to main,\nand run the lane's tests \
                      before every commit";
 
-/// A LONG CONTINUATION IN A NARROW COMPOSER, live: Cruise's
-/// continuation with its standing rules wraps over seven composer rows, is
-/// read back whole, and is submitted ONCE; the decision after it is
-/// escalated.
+/// A long continuation in a narrow composer wraps across seven rows, is read back whole, and is submitted once.
 #[test]
 fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
     let want = format!(
@@ -1062,9 +973,7 @@ fn a_long_continuation_in_a_narrow_composer_is_submitted_once() {
     });
 }
 
-/// One run of [`a_long_continuation_in_a_narrow_composer_is_submitted_once`]:
-/// `want` submitted whole, or — `mangle`, the control — left typed and
-/// escalated.
+/// One run of [`a_long_continuation_in_a_narrow_composer_is_submitted_once`].
 fn narrow_composer(want: &str, mangle: bool) {
     let tag = if mangle { "m" } else { "n" };
     let inst = boot_with(tag, "64");
@@ -1110,9 +1019,7 @@ fn narrow_composer(want: &str, mangle: bool) {
     assert!(!out.contains("CONTINUED"), "{ev}");
 }
 
-/// FULL POWER, a WRITE box (the measured 2.1.280 `touch x` box): its
-/// one-shot allow, `1`, reaches the worker once — fenced on the judged read
-/// and guarded on the command's row — and the loop says `APPROVED`.
+/// A write box gets its one-shot allow (`1`) under `approve = "all"`, and is escalated under `"safe"`.
 #[test]
 fn a_write_box_gets_its_one_shot_allow_under_full_power() {
     std::thread::scope(|scope| {
@@ -1126,8 +1033,7 @@ fn a_write_box_gets_its_one_shot_allow_under_full_power() {
     });
 }
 
-/// One run of [`a_write_box_gets_its_one_shot_allow_under_full_power`] under
-/// `approve`.
+/// One run of [`a_write_box_gets_its_one_shot_allow_under_full_power`] under `approve`.
 fn write_box(approve: &str) {
     let inst = boot(if approve == "all" { "w" } else { "v" });
     let sid = boot_session(&inst);
@@ -1139,10 +1045,6 @@ fn write_box(approve: &str) {
     drawn(&inst, "box");
     if approve == "all" {
         let submitted = submits_when(&inst, &subs, 2);
-        // The loop says `APPROVED` once its press is in, after the worker has
-        // logged the press. Stopped at the worker's log, a loop on a loaded
-        // machine had not said it yet (load 448: the stop 78 ms after the
-        // worker read the `1`, the journal ending `EXIT stopped`).
         let said = journal_when(&inst, |j| j.contains("APPROVED seq="));
         let out = sup.stop();
         let ev = evidence(&inst, &out);
@@ -1168,9 +1070,7 @@ fn write_box(approve: &str) {
     assert_eq!(submitted, ["SUBMIT:go"], "nothing pressed; {ev}");
 }
 
-/// FULL POWER, a request for a decision: ANSWERED — `answer_text`, aterm's
-/// [`NEEDS_HINT`] after it, typed through the fenced write and submitted
-/// once — and nothing escalated.
+/// Under full power, a decision request is answered with `answer_text` plus [`NEEDS_HINT`] and not escalated.
 #[test]
 fn a_decision_is_answered_with_the_answer_text() {
     let inst = boot("a");
@@ -1204,8 +1104,7 @@ fn a_decision_is_answered_with_the_answer_text() {
     assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
-/// FULL POWER, a worker whose every turn is short (`min_work` an hour, the
-/// injected clock): continued for ever, never escalated as done.
+/// Under full power, a worker whose every turn is short (`min_work` an hour) is continued forever without escalating.
 #[test]
 fn a_short_turn_loop_is_continued_and_never_escalates() {
     let inst = boot("b");
@@ -1233,10 +1132,7 @@ fn a_short_turn_loop_is_continued_and_never_escalates() {
     assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
-/// A PERSON'S KEYSTROKE, live: a turn a person stopped with Esc (the
-/// vendor's `Interrupted · What should Claude do instead?`) is held for
-/// `human_grace_s` (3 s here) — nothing escalated — and then, nobody having
-/// come back, continued with Cruise's continuation.
+/// A turn interrupted with Esc is held for `human_grace_s` without escalating, then continued with Cruise's continuation.
 #[test]
 fn an_esc_interrupt_is_held_then_continued() {
     let inst = boot("i");
@@ -1268,8 +1164,7 @@ fn an_esc_interrupt_is_held_then_continued() {
     assert!(!meta.contains("attention_owner=supervisor"), "{meta}\n{ev}");
 }
 
-/// THE WEEKLY WALL BEHIND A BACKGROUND SHELL
-/// of 2026-09-28, live.
+/// A weekly wall behind a background shell is published, waited out, and continued once.
 #[test]
 fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
     let inst = boot("c");
@@ -1313,11 +1208,7 @@ fn a_weekly_wall_behind_a_shell_is_published_waited_out_and_continued_once() {
     );
 }
 
-/// The same wall on a grid
-/// drawn one row high — the cursor on the row BELOW the prompt — is continued
-/// with the continuation typed (Cruise's: `… keep going. …`), never with a
-/// bare Enter on Claude's ghost text (which the fake worker logs as an empty
-/// `SUBMIT:`).
+/// A weekly wall on a displaced grid (cursor on the row below the prompt) is continued with Cruise's continuation, never a bare Enter.
 #[test]
 fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_enter() {
     let inst = boot("g");
@@ -1351,10 +1242,7 @@ fn a_weekly_wall_on_a_displaced_grid_is_continued_with_keep_going_not_a_bare_ent
     );
 }
 
-/// A DRAFT LEFT AT THE WALL, LIVE. A person typed into the composer before the
-/// limit hit and went away: at the reset and its grace the loop SUBMITS what
-/// stands there under the wall's rule (a bare Enter), and never types `keep
-/// going` over it.
+/// A draft left in the composer at the wall is submitted with a bare Enter after the reset, never overwritten with `keep going`.
 #[test]
 fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
     let inst = boot("j");
@@ -1388,8 +1276,7 @@ fn a_draft_left_at_the_wall_is_submitted_after_the_reset_not_keep_going() {
     );
 }
 
-/// THE WALL SCROLLED
-/// OUT OF VIEW.
+/// A weekly wall scrolled out of view is still continued at its reset.
 #[test]
 fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
     let inst = boot("k");
@@ -1420,12 +1307,7 @@ fn a_weekly_wall_scrolled_out_of_view_is_still_continued_at_its_reset() {
     );
 }
 
-/// THE UPDATE THAT APPLIES WHILE THE WALL IS SCROLLED OUT OF VIEW, live. A loop
-/// reads the wall behind the shell and waits for its reset (6 s here), the wall scrolls away, and
-/// a new loop replaces it on the same ledger and tab: ONE continuation is typed, by the successor,
-/// at the written-down reset and its own grace. The first loop waits the shipped grace (150 s), so
-/// its own continuation never comes while it runs however late the scroll and the stop come under
-/// load; with the first on 1 s, a starved worker's late read let both loops type.
+/// A loop that replaces another at a scrolled wall continues waiting for the recorded reset and submits once.
 #[test]
 fn a_loop_that_replaces_another_at_a_scrolled_wall_goes_on_waiting_for_its_reset() {
     let inst = boot("o");

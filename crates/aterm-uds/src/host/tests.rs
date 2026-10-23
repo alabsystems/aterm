@@ -235,7 +235,7 @@ fn the_refusal_names_its_provider() {
     assert!(ty.contains("aterm pkg install --default-set"), "{ty}");
     let python = tool("python3").refusal();
     assert!(
-        python.starts_with("no Python 3.11+ here: aterm provides none: S11's")
+        python.starts_with("no Python 3.11+ here: the Linux guest provides it")
             && python.contains("ATERM_TEST_PYTHON3=<path>"),
         "{python}"
     );
@@ -430,6 +430,40 @@ fn the_user_cache_follows_each_platform_convention() {
         Some(PathBuf::from("/h/.cache/aterm/browser"))
     );
     assert_eq!(user_cache("linux", None, None, "browser"), None);
+}
+
+/// A SITE SPAWNS THE OS'S OWN PROGRAM BY THE ONE PATH ITS ROW LISTS (§9 A41): the first of
+/// the row's places, evaluated at compile time, so a site names a program and never a path
+/// of its own. NEGATIVE CONTROLS: a row the OS does not provide (fish, pinned by the tree),
+/// a root tool whose row lists no path on purpose (pmset, which only aterm-machines may
+/// spell), and a name no row carries are refused, where a compile-time use would not build.
+#[test]
+fn an_os_program_is_spawned_by_its_rows_one_path() {
+    const CURL: &str = crate::os_path!("curl");
+    const GIT: &str = crate::os_path!("git");
+    if cfg!(unix) {
+        assert_eq!(CURL, "/usr/bin/curl");
+        assert_eq!(GIT, "/usr/bin/git");
+        for name in [
+            "lsof",
+            "osascript",
+            "ps",
+            "perl",
+            "nc",
+            "sysctl",
+            "launchctl",
+        ] {
+            let path = os_path(name);
+            assert_eq!(path, tool(name).at[0], "{name}");
+            assert!(Path::new(path).is_absolute(), "{name}: {path}");
+        }
+    } else {
+        assert_eq!((CURL, GIT), ("curl", "git"));
+    }
+    for refused in ["fish", "pmset", "no-such-program"] {
+        let caught = std::panic::catch_unwind(|| os_path(refused));
+        assert!(caught.is_err(), "{refused} has no OS path");
+    }
 }
 
 /// node is a release host's alone (`ship site`'s firebase-tools, until S17): no dev lane

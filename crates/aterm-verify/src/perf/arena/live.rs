@@ -182,7 +182,7 @@ pub(crate) fn opening(app: &Path) {
 
 /// Stop every ghostty the arena opened from `app`.
 pub(crate) fn stop_app(app: &Path) {
-    let _ = command("pkill")
+    let _ = command(aterm_uds::os_path!("pkill"))
         .arg("-f")
         .arg(app.join("Contents/MacOS"))
         .stderr(Stdio::null())
@@ -244,7 +244,7 @@ fn interrupted(sig: i32) -> ! {
     });
     let _ = rx.recv_timeout(KILL_CEILING);
     for app in &live.apps {
-        let _ = command("pkill")
+        let _ = command(aterm_uds::os_path!("pkill"))
             .arg("-f")
             .arg(app.join("Contents/MacOS"))
             .stderr(Stdio::null())

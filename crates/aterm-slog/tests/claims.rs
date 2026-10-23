@@ -1,12 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Claims (design §3.7, §7.4): a claim is an
-//! attributed opinion that never overrides an observation, the trusted
-//! authors' newest claims are kept beside the newest of any author, a label
-//! reaches `brief` and the clause only from the harness or the owner, and no
-//! name someone chose ever reads back as one of the actors a connection's
-//! class names.
+//! Claim attribution, trust slot, and need-lifting tests.
 
 use aterm_slog::{
     Actor, BoxWord, Close, Conf, Fields, Fold, Key, Kind, Log, Mark, Node, Open, Out, RunOut,
@@ -19,7 +14,6 @@ fn sid(s: &str) -> Actor {
     Actor::Sid(ShortId::new(s).expect("a sid"))
 }
 
-/// A claim mark: `kind` from `by`, its word or text, `as=` when given.
 fn claim(log: &mut Log, kind: Kind, by: Actor, value: &str, as_name: Option<&str>, ms: u64) -> u64 {
     let f = if kind == Kind::Label {
         Fields::new()
@@ -40,10 +34,6 @@ fn claim(log: &mut Log, kind: Kind, by: Actor, value: &str, as_name: Option<&str
     .expect("the mark")
 }
 
-/// R13: an edge's newer verdict and label never displace the harness's. The
-/// fold stores every claim as made (the newest of any author), and keeps the
-/// newest trusted one beside it; the clause and `brief` show the label only
-/// from a trusted author, and `brief` names both verdicts, the trusted first.
 #[test]
 fn an_edges_claims_never_displace_the_harnesss() {
     let mut log = Log::new(2);
@@ -122,7 +112,6 @@ fn an_edges_claims_never_displace_the_harnesss() {
         !b.text.contains("all%20is%20lost"),
         "an edge's label is never briefed"
     );
-    // NEGATIVE: the edge's label is in the ring, as `log` shows it.
     assert!(
         log.window()
             .filter_map(|r| encode(r, Tier::Host).ok())
@@ -131,9 +120,6 @@ fn an_edges_claims_never_displace_the_harnesss() {
     );
 }
 
-/// The trusted slot is what a later trusted claim replaces: an owner's
-/// verdict after the edge's is both the newest and the trusted one, and
-/// `brief` names it once.
 #[test]
 fn a_trusted_claim_is_both_slots_when_newest() {
     let mut log = Log::new(2);
@@ -158,10 +144,6 @@ fn a_trusted_claim_is_both_slots_when_newest() {
     assert_eq!(verdicts, 1, "{}", b.text);
 }
 
-/// Correction 5 (§3.7): a claim's `clear` (src=mark) lifts only needs a claim
-/// raised; an observed need closes by observation alone. NEGATIVE CONTROL: a
-/// clear from another source (the owner's meta flag) keeps the 2A rule and
-/// lifts the observed failure.
 #[test]
 fn a_mark_clear_never_lifts_an_observed_need() {
     let words = |log: &Log| -> Vec<&'static str> {
@@ -207,9 +189,6 @@ fn a_mark_clear_never_lifts_an_observed_need() {
     );
 }
 
-/// `need_raised` IS the fold's rule: every record kind driven through both,
-/// a need raised by the fold exactly when the predicate names one, with the
-/// predicate's word and the record's seq.
 #[test]
 fn need_raised_is_the_folds_rule() {
     let mut log = Log::new(0);
@@ -229,9 +208,6 @@ fn need_raised_is_the_folds_rule() {
                 .flatten()
                 .find(|n| n.since_seq == r.seq)
                 .map(|n| n.word);
-            // A need a record raised may be lifted later in the same batch
-            // (a step closes): judge only what still stands, and only that
-            // a predicate's silence leaves no need behind.
             match need_raised(&r) {
                 Some(w) => {
                     if let Some(h) = held {
@@ -324,7 +300,6 @@ fn need_raised_is_the_folds_rule() {
     .into_iter()
     .collect();
     assert_eq!(raised, want, "every need kind was driven");
-    // A claim never raises an observed need's word, or escalates.
     let mark = |src: Src, w: &str| aterm_slog::Rec {
         seq: 1,
         t: 0,
@@ -346,11 +321,6 @@ fn need_raised_is_the_folds_rule() {
     );
 }
 
-/// R1 (the decoders): a session whose name is a reserved actor word is no
-/// session ([`Actor::sid`]), and one built anyway prints `-`, so neither a
-/// record, a fold snapshot nor a tracker's carry line ever reads it back as
-/// the harness, the owner or the bridge. The trusted actors decode only from
-/// their own words.
 #[test]
 fn a_reserved_word_never_reads_back_as_its_actor() {
     for w in aterm_slog::RESERVED_ACTOR_WORDS {
@@ -360,7 +330,6 @@ fn a_reserved_word_never_reads_back_as_its_actor() {
     }
     assert_eq!(Actor::from_word("harness"), Actor::Harness);
     assert_eq!(Actor::sid(ShortId::new("s-1").expect("id")), sid("s-1"));
-    // A record, a snapshot and a carry line, each made with the forged sid.
     let forged = Actor::Sid(ShortId::new("harness").expect("id"));
     let mut log = Log::new(2);
     let run = agent_session(&mut log, 0);
@@ -391,9 +360,6 @@ fn a_reserved_word_never_reads_back_as_its_actor() {
     assert!(carried.contains("input_by=-"), "{carried}");
 }
 
-/// The snapshot carries both claim slots and their `as=`/`re=`, and a 2A
-/// snapshot (one claim per line, no `t…` tokens) still reads, its claim the
-/// trusted one when its author is.
 #[test]
 fn the_claim_slots_cross_a_snapshot_and_a_2a_one_still_reads() {
     let mut log = Log::new(2);
@@ -431,7 +397,6 @@ fn the_claim_slots_cross_a_snapshot_and_a_2a_one_still_reads() {
         ),
         (Some("lead"), Some("@88231".to_string()))
     );
-    // A 2A snapshot: the claim lines as 2A wrote them.
     let two_a: Vec<String> = snap
         .iter()
         .map(|l| {
@@ -456,7 +421,6 @@ fn the_claim_slots_cross_a_snapshot_and_a_2a_one_still_reads() {
     );
     assert_eq!(old.state().label_trusted, None, "s-1's is not");
     assert_eq!(old.state().label.as_ref().map(|c| c.by), Some(sid("s-1")));
-    // A malformed trusted token refuses the whole snapshot, as any line does.
     let bad: Vec<String> = snap
         .iter()
         .map(|l| {
@@ -471,14 +435,6 @@ fn the_claim_slots_cross_a_snapshot_and_a_2a_one_still_reads() {
     assert_eq!(Fold::from_snapshot(&refs).err(), Some(SnapError::Line));
 }
 
-/// `ctl` IS ANY IN-SESSION CLIENT (the supervised agent among them), so it
-/// never displaces the harness: the harness marks `off-track`, the worker
-/// inside its session marks `done` as `ctl`, and `brief` still names the
-/// harness's verdict first, the clause and `brief` still show the harness's
-/// label, and a `ctl` claim's `clear` lifts no need the harness raised (the
-/// harness's own does). The proven slot crosses a fold snapshot. NEGATIVE
-/// CONTROL: with no harness claim, the `ctl` verdict and label are the ones
-/// shown.
 #[test]
 fn a_ctl_claim_never_displaces_the_harnesss() {
     let mut log = Log::new(2);
@@ -527,7 +483,6 @@ fn a_ctl_claim_never_displaces_the_harnesss() {
     let c = log.fold().clause(now).expect("a clause");
     assert_eq!(c.by, Actor::Harness, "{c:?}");
 
-    // A `ctl` claim's clear, every word: the harness's need stands.
     log.mark(
         Mark::new(Kind::Clear, Src::Mark, Conf::Claim).by(Actor::Ctl),
         at(10),
@@ -549,7 +504,6 @@ fn a_ctl_claim_never_displaces_the_harnesss() {
         b.text
     );
 
-    // The proven slot crosses a snapshot, as `p…` tokens.
     let snap = log.fold().snapshot();
     assert!(
         snap.iter()
@@ -560,7 +514,6 @@ fn a_ctl_claim_never_displaces_the_harnesss() {
     let back = Fold::from_snapshot(&refs).expect("reads");
     assert_eq!(back.state(), log.state(), "{snap:#?}");
 
-    // The harness's own clear lifts it.
     log.mark(
         Mark::new(Kind::Clear, Src::Mark, Conf::Claim).by(Actor::Harness),
         at(11),
@@ -568,7 +521,6 @@ fn a_ctl_claim_never_displaces_the_harnesss() {
     .expect("clear");
     assert!(needs(&log).is_empty());
 
-    // NEGATIVE CONTROL: no harness claim, and `ctl`'s are what is shown.
     let mut solo = Log::new(2);
     let _ = agent_session(&mut solo, 0);
     claim(&mut solo, Kind::Verdict, Actor::Ctl, "done", None, 7);
@@ -582,12 +534,6 @@ fn a_ctl_claim_never_displaces_the_harnesss() {
     );
 }
 
-/// A NEED IS ITS RAISER'S: the same word raised again by another author is
-/// that author's own need beside it, never a takeover, so its `clear` lifts
-/// only its own — an edge cannot take the owner's or the harness's
-/// escalation over and lift it. A flood of other authors' needs gives way
-/// before the harness's. NEGATIVE CONTROL: the raiser's own clear lifts its
-/// need, and `ctl`'s lifts an edge's.
 #[test]
 fn a_need_stays_its_raisers() {
     let needs = |log: &Log| -> Vec<(&'static str, Actor)> {
@@ -630,13 +576,11 @@ fn a_need_stays_its_raisers() {
     clear(&mut log, Actor::Harness, 5);
     assert!(needs(&log).is_empty(), "NEGATIVE CONTROL: the raiser's own");
 
-    // `ctl` lifts an edge's.
     let mut log = Log::new(0);
     claim(&mut log, Kind::Need, edge, "help", None, 1);
     clear(&mut log, Actor::Ctl, 2);
     assert!(needs(&log).is_empty(), "NEGATIVE CONTROL: ctl over an edge");
 
-    // A flood: twelve edges, each its three words, then the harness's.
     let mut log = Log::new(0);
     for i in 0..12u32 {
         let e = sid(&format!("s-{i:020}"));
@@ -655,10 +599,6 @@ fn a_need_stays_its_raisers() {
     );
 }
 
-/// No CHOSEN NAME is an actor word (class): an `as=` naming one,
-/// in any case, is no field at all — refused by the fields a mark is built
-/// from, skipped by the line decoder, refused by the fold snapshot — so
-/// nothing reads `by=- as=harness`. NEGATIVE CONTROL: any other name holds.
 #[test]
 fn a_chosen_name_is_never_an_actor_word() {
     for w in ["harness", "HARNESS", "Ctl", "human", "bridge", "-", "aterm"] {

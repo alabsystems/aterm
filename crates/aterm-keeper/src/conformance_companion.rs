@@ -17,7 +17,6 @@ use aterm_spec::interp::{self, State};
 const R: Rdev = 0x0f00_0077;
 const LEN: u64 = 8 << 20;
 
-/// Every shell lives, nobody else holds the master, and the live windows are the runner's.
 struct World<'a> {
     live: &'a BTreeSet<u32>,
 }
@@ -64,8 +63,6 @@ struct Rig {
 }
 
 impl Rig {
-    /// Window 1 journals, has registered the master and sent its region: the model's initial
-    /// state.
     fn new(model: &Model) -> Self {
         let mut rig = Rig {
             core: KeeperCore::new(true),
@@ -88,7 +85,6 @@ impl Rig {
         self.now
     }
 
-    /// Window `n` connects and says HELLO (stating `CAP_JOURNAL` when `journal`); the outs.
     fn hello(&mut self, n: i64, journal: bool) -> Vec<Out> {
         let now = self.tick();
         assert!(self.core.accept(conn_of(n), pid_of(n), None), "accepted");
@@ -99,7 +95,6 @@ impl Rig {
             .hello(conn_of(n), PeerClass::App, caps, now, &mut world)
     }
 
-    /// Window `n` sends its region.
     fn companion(&mut self, n: i64) -> Vec<Out> {
         let id = self.next_id;
         self.next_id += 1;
@@ -108,7 +103,6 @@ impl Rig {
             .companion(conn_of(n), R, COMPANION_JOURNAL, LEN, id)
     }
 
-    /// Window `n`'s process dies by a signal: the EOF, then the kernel's status.
     fn die(&mut self, n: i64) -> Vec<Out> {
         let now = self.tick();
         self.live.remove(&pid_of(n));
@@ -118,14 +112,9 @@ impl Rig {
         out
     }
 
-    /// The keeper's variables of `st`, read from the core; the runner's own stay as `st` has
-    /// them. `done` and `attempts` keep their value once the record is gone, as the model's do.
     fn keeper_vars(&self, mut st: State) -> State {
         match self.core.companion_view(R) {
             None => {
-                // The record is gone: any companion the core still holds anywhere (there is no
-                // other record) is one its master's close left behind. That the server closes
-                // the descriptors the core lets go is `server.rs`'s test.
                 st.insert("state", 3);
                 st.insert(
                     "comp",
@@ -162,8 +151,6 @@ impl Rig {
         st
     }
 
-    /// The model's `bad_*` flags after the real OFFER in `outs` to a window that did (or did
-    /// not) state `CAP_JOURNAL`.
     fn judge_offer(&self, st: &mut State, outs: &[Out], journal: bool) {
         let offered: Option<Option<OfferJournal>> = outs.iter().find_map(|o| match o {
             Out::Offer { rdev, journal, .. } if *rdev == R => Some(*journal),
@@ -188,7 +175,6 @@ impl Rig {
     }
 }
 
-/// One real step for the model action `action`, from the rig's state: `(before, after)`.
 fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
     let before = rig.st.clone();
     let mut env = before.clone();
@@ -196,8 +182,6 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
     let next = before["next"];
     match action {
         "Release" => {
-            // The last claim closes the tab: the reader's, or the outgoing window's once its
-            // successor's claim ended.
             let last = if before["live"] == 1 {
                 reader
             } else {
@@ -206,8 +190,6 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
             rig.core.release(conn_of(last), R);
         }
         "SuccessorCommits" => {
-            // The reader names window `next` as its successor; the successor says HELLO as a
-            // window that journals, and registers the master at its Commit.
             let now = rig.tick();
             rig.live.insert(pid_of(next));
             rig.core.pending(conn_of(reader), pid_of(next), now, None);
@@ -220,8 +202,6 @@ fn step(rig: &mut Rig, action: &'static str) -> (State, State) {
             env.insert("jcap", 1);
         }
         "OutgoingEnds" => {
-            // The outgoing window's process ends by a signal (its Commit's own `exit(0)` inside
-            // the death grace is a hold, which the model leaves to `PtyKeeperCustody`).
             rig.die(before["outgoing"]);
             env.insert("outgoing", 0);
         }
@@ -268,9 +248,6 @@ struct Explored {
     fired: BTreeSet<&'static str>,
 }
 
-/// Breadth-first over the model's states, each reached by real steps: from every state first
-/// reached, every action the model enables there is taken on a copy of the real core. With
-/// `strict`, each step must be a transition of `model` with every invariant holding after it.
 fn explore(model: &Model, strict: bool) -> Explored {
     let mut out = Explored::default();
     let first = Rig::new(model);
@@ -307,7 +284,6 @@ fn explore(model: &Model, strict: bool) -> Explored {
     out
 }
 
-/// Every state the model reaches.
 fn model_states(model: &Model) -> BTreeSet<State> {
     let mut all = BTreeSet::from([model.init_state()]);
     let mut queue = vec![model.init_state()];
@@ -323,9 +299,6 @@ fn model_states(model: &Model) -> BTreeSet<State> {
     all
 }
 
-/// The real keeper refines the model: every real step is a model transition, every model state
-/// is reached by real steps, every action fires. Negative control: each defect of the model
-/// rejects real steps at its own site.
 #[test]
 fn the_real_keeper_conforms_to_the_companion_model() {
     let model = keeper_companion_custody_model();
@@ -392,10 +365,6 @@ fn the_real_keeper_conforms_to_the_companion_model() {
     }
 }
 
-/// THE PLAN'S NEGATIVE CONTROL: with the poison brake's attempt count removed from the real core
-/// (its `fault` point, armed on this thread only), the committed model rejects real steps where
-/// a restorer dies, and those same steps are exactly what the model's `Buggy = 1` admits: the
-/// conformance sees the defect, and sees it as that defect.
 #[test]
 fn a_keeper_that_counts_no_attempt_is_rejected() {
     let model = keeper_companion_custody_model();
@@ -420,7 +389,6 @@ fn a_keeper_that_counts_no_attempt_is_rejected() {
     assert!(explore(&model, true).fired.contains("RecipientDrops"));
 }
 
-/// The anchors the conformance exercises are compiled in and were entered.
 #[test]
 fn the_companion_anchors_are_live() {
     assert!(

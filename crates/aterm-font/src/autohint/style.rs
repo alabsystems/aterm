@@ -1,13 +1,7 @@
 // Copyright (c) 2019 Fontations Developers
 // Modifications Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//
-// Derived from skrifa 0.46.2 src/outline/autohint/style.rs and modified by the
-// aterm project in 2026: the generated script data included from
-// styles_generated.rs; the digit bit (it fed only the fitted advance) and the
-// precomputed-metrics style iterator dropped. Its tests need fontations' test
-// fonts and are not carried.
-// See ../../LICENSE-FONTATIONS for the upstream license.
+// Derived from skrifa 0.46.2 src/outline/autohint/style.rs (see ../../LICENSE-FONTATIONS).
 
 //! Styles, scripts and glyph style mapping.
 
@@ -92,8 +86,7 @@ const UNMAPPED_STYLE: u8 = 0xFF;
 pub(crate) struct GlyphStyleMap {
     /// List of styles, indexed by glyph id.
     styles: Vec<GlyphStyle>,
-    /// Maps an actual style class index into a compacted index for the
-    /// metrics table.
+    /// Maps an actual style class index into a compacted index for the metrics table.
     metrics_map: [u8; MAX_STYLES],
     /// Number of metrics styles in use.
     metrics_count: u8,

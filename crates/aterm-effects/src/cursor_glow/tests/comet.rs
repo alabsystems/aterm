@@ -19,9 +19,6 @@ fn comet_parses_apart_from_beam_and_lumen() {
     assert!(style_has_beam("comet"), "the comet keeps its beam");
 }
 
-/// A real-window geometry with the grid interior at origin (56, 56). The other
-/// test geoms use origin 0, where grid-relative and window-absolute coincide,
-/// so only this one exposes a producer mixing the two coordinate spaces.
 fn chrome_geom() -> Geom {
     Geom {
         cw: 8,
@@ -36,9 +33,7 @@ fn chrome_geom() -> Geom {
     }
 }
 
-/// The live-cursor bridge vertex is window-absolute like every other comet
-/// sample: with real chrome it attaches at `origin_x + (col + head_dx)·cw`. A
-/// grid-relative x fails the ±1.5-cell adjacency gate and detaches the beam.
+/// The live-cursor bridge vertex is window-absolute like every other comet sample: with real chrome it attaches at `origin_x + (col + head_dx)·cw`.
 #[test]
 fn comet_bridge_attaches_window_absolute() {
     let g = chrome_geom();
@@ -53,7 +48,6 @@ fn comet_bridge_attaches_window_absolute() {
         glow.note_synthetic_typed(t, 1);
         glow.tick(Some((2, col)), t, &c, g, &mut out);
     }
-    // Re-emit the beam stream alone (no crown/ring/particle quads).
     let mut beam = Vec::new();
     let mut halos = Vec::new();
     let mut under = Vec::new();
@@ -64,9 +58,6 @@ fn comet_bridge_attaches_window_absolute() {
         .map(|q| i32::from(q.x) + i32::from(q.w))
         .max()
         .unwrap();
-    // Window-absolute attach: 56 + (14 + 0.9)·8 = 175.2 px. The head sample
-    // (cell 13's centre) reaches only 56 + 13.5·8 = 164, so a reach ≥ 172
-    // proves the bridge segment exists and lands at head_dx.
     assert!(
         reach >= 172,
         "bridge reaches the window-absolute head_dx attach point: {reach}"
@@ -77,14 +68,11 @@ fn comet_bridge_attaches_window_absolute() {
     );
 }
 
-/// Comet debris is born window-absolute: jump grains sit on the true leap
-/// vector, and typing debris drifts behind the one-cell motion with
-/// jitter-only vy (not toward the window's top-left).
+/// Comet debris is born window-absolute: jump grains sit on the true leap vector, and typing debris drifts behind the one-cell motion with jitter-only vy (not toward the window's top-left).
 #[test]
 fn comet_debris_born_window_absolute_with_chrome_origin() {
     let g = chrome_geom();
     let c = cfg(GlowStyle::Comet, true);
-    // A leap: grains strewn along the window-absolute vector.
     let mut glow = CursorGlow::default();
     let t = Instant::now();
     let mut out = Vec::new();
@@ -109,8 +97,6 @@ fn comet_debris_born_window_absolute_with_chrome_origin() {
             p.y0
         );
     }
-    // Typing: the drift vector is the true one-cell motion, leftward along
-    // the row, vy pure dispersion jitter (±0.175·cell).
     let mut glow = CursorGlow::default();
     let mut t = Instant::now();
     glow.tick(Some((2, 10)), t, &c, g, &mut out);
@@ -131,9 +117,7 @@ fn comet_debris_born_window_absolute_with_chrome_origin() {
     }
 }
 
-/// A leap's dust is born window-absolute: every mote lies inside the
-/// ±0.4-cell sleeve of the true leap vector. The comet's (a leap's dust is
-/// the comet's; the beam's leap sheds none).
+/// A leap's dust is born window-absolute: every mote lies inside the ±0.4-cell sleeve of the true leap vector.
 #[test]
 fn leap_dust_strewn_along_window_absolute_leap() {
     let g = chrome_geom();
@@ -176,8 +160,7 @@ fn leap_dust_strewn_along_window_absolute_leap() {
     }
 }
 
-/// The comet's emitted light (beam + coma crown + twinkling glitter) honours
-/// the shared quad invariants and decays to exactly empty.
+/// The comet's emitted light (beam + coma crown + twinkling glitter) honours the shared quad invariants and decays to exactly empty.
 #[test]
 fn comet_light_respects_invariants_and_decays() {
     let g = geom();
@@ -205,12 +188,6 @@ fn comet_light_respects_invariants_and_decays() {
     assert!(!glow.is_active());
 }
 
-/// The comet's whole frame over a typed run on the dark default page, through
-/// the host's frame step (the cell bed under the letters, the streak, crown,
-/// bodies and the typing-momentum glow over them, as the renderer lays them):
-/// the worst contrast the letter just left of the caret keeps, from the
-/// tenth key of a 24-key burst at `gap_ms` a key. `unbudgeted` draws the
-/// glow's streak as light over the letters with no over-ink account.
 fn comet_newest_letter(gap_ms: u64, unbudgeted: bool) -> f32 {
     let g = tall_geom();
     let page = 0x0011_1318u32;
@@ -313,15 +290,7 @@ fn comet_newest_letter(gap_ms: u64, unbudgeted: bool) -> f32 {
     worst
 }
 
-/// The letter beside a comet caret reads at 3:1 or better on the dark default
-/// page with the typing-momentum glow on (the 2026-10 gallery's comet-dark.mid
-/// measured 1.9:1): the comet's cell bed, drawn under the letters and blended
-/// in linear light, is held to [`crate::cursor_fx::BED_INK_FLOOR`] on its own
-/// (`bed_legible_share`), the icy tail lies under the letters as the glow's
-/// bed, and the crown, the nucleus and the glow spend one over-ink account,
-/// at the gallery's 57 ms a key and a 40 ms burst. Negative control: the same
-/// runs with the streak drawn as light over the letters and no account sink
-/// the letter under 3:1.
+/// The letter beside a comet caret maintains at least 3:1 contrast on the dark default page with typing-momentum glow enabled.
 #[test]
 fn the_letter_beside_a_comet_caret_reads_with_the_momentum_glow_on() {
     for gap_ms in [57u64, 40] {
@@ -338,15 +307,7 @@ fn the_letter_beside_a_comet_caret_reads_with_the_momentum_glow_on() {
     }
 }
 
-/// ON PAPER THE COMET IS NOT LUMEN: typed on GitHub Light, the comet strings
-/// ice glints along its tail, four-point stars of its ink, behind the caret
-/// inside the typed row and in its leading, off every letter's ink: each
-/// star, arms and all, lies above the ascenders' tops (0.15 of the row
-/// down at the gallery's 22 px) or under the baseline (0.77 down). At each
-/// the ink reaches out along the two arms and leaves the diagonals between
-/// them paler, a cross, not a blot. Lumen, the plain quiet tracer, lays none
-/// on the same run. Negative control: the same probe midway between two
-/// glints finds no cross, so it sees the glints, not the tail.
+/// On a light theme, the comet strings four-point ice glints along its tail outside the glyph band, whereas Lumen lays none.
 #[test]
 fn the_light_comet_strings_ice_glints_that_lumen_does_not() {
     let g = tall_geom();
@@ -437,16 +398,12 @@ fn the_light_comet_strings_ice_glints_that_lumen_does_not() {
             bottom / chf
         );
     }
-    // The tail thins toward its tip, so the farthest glint may find little
-    // ink to cut; the nearer two always show.
     let shown = glints.iter().filter(|&&c| crossed(c)).count();
     assert!(
         shown >= 2,
         "crosses of white in the tail: {shown} of {glints:?}"
     );
     assert!(none.is_empty(), "Lumen lays no glint");
-    // Midway between two glints, on the tail's spine (where its profile is
-    // flat, so only a glint could cross it).
     let between = (0.5 * (glints[0].0 + glints[1].0), row.start + 0.54 * chf);
     assert!(
         !crossed(between),
@@ -454,13 +411,7 @@ fn the_light_comet_strings_ice_glints_that_lumen_does_not() {
     );
 }
 
-/// ON PAPER THE COMET HAS A HEAD: typed on GitHub Light, a round coma
-/// stands around the caret, as tall as the row and ringed in a deeper rim:
-/// past the caret's leading edge its ink deepens toward its outer edge (the
-/// rim) and draws in toward the row's top and bottom (round, not a slab or
-/// a lozenge). Lumen, the plain quiet tracer, and Beam, the even tube, lay no
-/// ink past the caret's leading edge. Negative control: the same comet once
-/// its head has gone cold lays no coma.
+/// On a light theme, the comet draws a round, rimmed coma past the caret's leading edge, whereas Lumen and Beam do not.
 #[test]
 fn the_light_comet_carries_a_round_rimmed_coma_that_lumen_does_not() {
     let g = tall_geom();
@@ -510,8 +461,6 @@ fn the_light_comet_carries_a_round_rimmed_coma_that_lumen_does_not() {
     let (cw, ch) = (g.cw as i32, g.ch as i32);
     let lead = i32::from(caret + 1) * cw;
     let mid = i32::from(row) * ch + ch / 2;
-    // The deepest ink past the caret's leading edge on scanline `y`, and the
-    // farthest column it reaches there.
     let past = |deep: &dyn Fn(i32, i32) -> f32, y: i32| {
         let mut best = (0.0f32, 0i32);
         for x in lead..lead + ch {
@@ -533,8 +482,6 @@ fn the_light_comet_carries_a_round_rimmed_coma_that_lumen_does_not() {
         reach_high + 2 < reach_mid,
         "the coma is not round: {reach_high} px near the row's top against {reach_mid} px across its middle"
     );
-    // Along the middle scanline the rim, near the outer edge, is deeper
-    // than the coma's fill just past the caret.
     let fill = comet(lead + 1, mid);
     let rim = (lead..lead + reach_mid)
         .map(|x| comet(x, mid))
@@ -560,12 +507,7 @@ fn the_light_comet_carries_a_round_rimmed_coma_that_lumen_does_not() {
     );
 }
 
-/// ON A DARK GROUND THE COMET'S DUST KEEPS TO THE LEADING: typed between
-/// blank rows, no grain of the comet's shed ice stands in the typed row's
-/// glyph band (from above its ascenders to its descenders' feet), where a
-/// grain between two words reads as a typed interpunct; the dust it keeps
-/// hangs above or under the letters. Negative control: with the over-ink
-/// laws off the same run's grains stand at the letters' x-height.
+/// On a dark theme, the comet's dust grains stay in the leading outside the typed row's glyph band.
 #[test]
 fn the_dark_comet_dust_keeps_to_the_leading() {
     let g = tall_geom();

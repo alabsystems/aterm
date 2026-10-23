@@ -1,14 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Matching behaviour over corpora: the patterns aterm ships, a hand-written
-//! syntax corpus, the perl classes and case folding across all of Unicode,
-//! zero-width and nullable repetitions, and the prefilter at every alignment.
-//!
-//! Each corpus is pinned by an FNV-1a digest of what this engine reports —
-//! `find_iter` spans, `is_match` and `find` — recorded when every one of those
-//! answers matched the `regex` crate this engine replaced. A changed digest is
-//! a changed answer somewhere in that corpus.
+//! Pinned digest and corpus tests for `aterm-regex`.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -18,7 +11,6 @@ thread_local! {
     static GOLDEN: Cell<u64> = const { Cell::new(0xcbf2_9ce4_8422_2325) };
 }
 
-/// Fold `bytes` (and a separator) into this test thread's digest.
 fn feed(bytes: &[u8]) {
     GOLDEN.with(|g| {
         let mut h = g.get();
@@ -45,9 +37,6 @@ fn pin(expected: &str) {
     assert_eq!(format!("{got:016x}"), expected, "the pinned corpus changed");
 }
 
-/// The eleven `aterm-selection` built-in patterns: the specification this engine must
-/// meet. `file_path` is an earlier form of the shipped rule; `step_budget_tests` in
-/// `src/lib.rs` carries the current one.
 const BUILTIN: &[(&str, &str)] = &[
     (
         "url",
@@ -83,7 +72,6 @@ const BUILTIN: &[(&str, &str)] = &[
     ),
 ];
 
-/// Terminal lines of the kind selection actually runs over.
 const HAYSTACKS: &[&str] = &[
     "see https://example.com/a/b?c=d#e for details.",
     "ftp://user.host:21/pub/file.tar.gz, and file:///Users//example/aterm/Cargo.toml",
@@ -106,7 +94,6 @@ const HAYSTACKS: &[&str] = &[
     "",
     " ",
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    // Newline-bearing: these tell `StartText` from `StartLine`.
     "a\nb\nc",
     "ERROR one\nERROR two\nok three",
     "\nleading",
@@ -117,7 +104,6 @@ const HAYSTACKS: &[&str] = &[
     "  indented\n\tTabbed\n",
 ];
 
-/// A pattern's `find_iter` spans, or `None` when it does not compile.
 fn spans_mine(p: &str, h: &str) -> Option<Vec<(usize, usize)>> {
     let re = aterm_regex::Regex::new(p).ok()?;
     Some(re.find_iter(h).map(|m| (m.start(), m.end())).collect())
@@ -141,8 +127,6 @@ fn record(p: &str, h: &str) {
         first.is_some(),
         "is_match vs find for {p:?} on {h:?}"
     );
-    // Every offset must land on a code-point boundary, or the call sites'
-    // `&text[m.start()..m.end()]` would panic.
     for &(start, end) in &spans {
         assert!(
             h.is_char_boundary(start) && h.is_char_boundary(end),
@@ -167,8 +151,6 @@ fn builtin_selection_patterns_are_pinned() {
     pin(BUILTIN_DIGEST);
 }
 
-/// The specific spans the built-in rules are supposed to pick out, spelled out
-/// rather than only cross-checked, so a change of behaviour is legible.
 #[test]
 fn builtin_patterns_select_what_they_are_for() {
     let find = |p: &str, h: &str| {
@@ -239,7 +221,6 @@ fn builtin_patterns_select_what_they_are_for() {
 #[test]
 fn syntax_corpus_is_pinned() {
     const PATTERNS: &[&str] = &[
-        // Quantifiers, greedy and lazy.
         r"a",
         r"a*",
         r"a+",
@@ -257,7 +238,6 @@ fn syntax_corpus_is_pinned() {
         r"a{2}{3}",
         r"(?U)a*",
         r"(?U)a*?",
-        // Alternation, including empty branches.
         r"a|b",
         r"(a|b)c",
         r"(?:a|b)*",
@@ -275,7 +255,6 @@ fn syntax_corpus_is_pinned() {
         r"(a*)+",
         r"(?:)",
         r"()",
-        // Assertions.
         r"^a",
         r"a$",
         r"^a$",
@@ -296,8 +275,6 @@ fn syntax_corpus_is_pinned() {
         r"(?m)a$",
         r"(?m)^",
         r"(?m)$",
-        // Start-anchor adversaries: each contains a `^` but is not anchored, so a
-        // `Program::start_anchored` walk that stopped at the `^` would miss a match.
         r"a|^b",
         r"^a|b",
         r"(^a)*",
@@ -310,7 +287,6 @@ fn syntax_corpus_is_pinned() {
         r"(?:^)|a",
         r"(?m:^)a",
         r"(?:(?m)^)a",
-        // Classes.
         r"[abc]",
         r"[^abc]",
         r"[a-z]",
@@ -335,7 +311,6 @@ fn syntax_corpus_is_pinned() {
         r"[.!?]",
         r"[^\s<>]",
         r"[\u{e0}-\u{ff}]",
-        // Perl classes and dot.
         r"\d+",
         r"\w+",
         r"\s+",
@@ -346,7 +321,6 @@ fn syntax_corpus_is_pinned() {
         r".*",
         r"(?s).",
         r"(?s).*",
-        // Flags.
         r"(?i)abc",
         r"(?i)[a-z]",
         r"(?i)[^k]",
@@ -359,7 +333,6 @@ fn syntax_corpus_is_pinned() {
         r"(?x) a  b ",
         r"(?x)a#c",
         r"(?u)a",
-        // Escapes.
         r"\.",
         r"\\",
         r"\-",
@@ -373,12 +346,10 @@ fn syntax_corpus_is_pinned() {
         r"e\u{301}",
         r"(?i)\u{3c3}",
         r"(?i)stra\u{df}e",
-        // Groups.
         r"(?<name>a)b",
         r"(?P<other>a)b",
         r"((a))",
         r"(a)(b)",
-        // Shapes that stress the simulation.
         r"(a+)+b",
         r"(a|a)*b",
         r"(a*)*b",
@@ -434,9 +405,6 @@ fn syntax_corpus_is_pinned() {
     pin(SYNTAX_DIGEST);
 }
 
-/// `\d`, `\w` and `\s` over every code point. Only the baked part of `\w` is pinned, not
-/// `char::is_alphabetic`, so a toolchain bump cannot move the digest. Recorded when `\d`,
-/// `\s` and the non-alphabetic `\w` matched `regex` exactly.
 #[test]
 fn perl_classes_are_pinned() {
     let d = aterm_regex::Regex::new(r"^\d$").expect("compiles");
@@ -464,11 +432,6 @@ fn perl_classes_are_pinned() {
     pin(PERL_DIGEST);
 }
 
-/// Case folding over the whole cased range, one code point at a time. Candidates are
-/// bucketed by case mapping in both directions, which finds distant orbit partners
-/// (`\u{390}` and `\u{1fd3}`, 0x1c43 apart, both uppercase to a string starting
-/// `\u{399}`). Recorded when every answer matched `regex` except pairs `std`'s own case
-/// mappings link (Unicode-version skew, folding more).
 #[test]
 fn case_folding_is_pinned() {
     let mut lower_bucket: BTreeMap<char, Vec<char>> = BTreeMap::new();
@@ -521,7 +484,6 @@ fn case_folding_is_pinned() {
     pin(FOLD_DIGEST);
 }
 
-/// The exotic orbits that make case folding more than `to_lowercase`.
 #[test]
 fn exotic_fold_orbits_are_pinned() {
     for (p, h) in [
@@ -541,7 +503,6 @@ fn exotic_fold_orbits_are_pinned() {
     pin(EXOTIC_DIGEST);
 }
 
-/// Zero-width matching, where `find_iter`'s advance rule lives.
 #[test]
 fn zero_width_matches_are_pinned() {
     for p in [
@@ -566,10 +527,6 @@ fn zero_width_matches_are_pinned() {
     pin(ZERO_WIDTH_DIGEST);
 }
 
-/// Repetitions whose body can match nothing, and repetitions whose body is
-/// itself a lazy loop. This is the corner where the compiled shape decides the
-/// answer — `(|a)*` has to prefer the empty iteration, and `(.*?){2,}\b` has to
-/// stop at the first word boundary rather than run to the end.
 #[test]
 fn nullable_and_lazy_repetitions_are_pinned() {
     const PATTERNS: &[&str] = &[
@@ -645,9 +602,6 @@ fn nullable_and_lazy_repetitions_are_pinned() {
     pin(NULLABLE_DIGEST);
 }
 
-/// `(?x)` extended mode, the flag with the most parser quirks: whitespace may separate
-/// `(` from its `?`, `[` from its `^`, and a counted repetition from its lazy `?`, but not
-/// `*`, `+` or `?` from theirs (`a? ?` is `(a?)?`).
 #[test]
 fn extended_mode_is_pinned() {
     const PATTERNS: &[&str] = &[
@@ -720,9 +674,6 @@ fn extended_mode_is_pinned() {
     pin(EXTENDED_DIGEST);
 }
 
-/// The prefilter is the one place a walk could stop inside a multi-byte code point and
-/// the one optimisation that could cost a match: drive it at every alignment over
-/// multi-byte filler.
 #[test]
 fn the_prefilter_never_changes_the_answer() {
     const PATTERNS: &[&str] = &[
@@ -742,8 +693,6 @@ fn the_prefilter_never_changes_the_answer() {
         r"[a-z\u{4f60}]+",
         r"(?i)[k]\u{e9}",
         r"\u{1F600}+",
-        // A failing assertion *mid*-pattern empties the thread list without
-        // emptying its visited marks, and the next skip has to retire them.
         r"ab\Bc",
         r"x\B\d",
         r"\-?\B\d",
@@ -780,8 +729,6 @@ fn the_prefilter_never_changes_the_answer() {
     pin(PREFILTER_DIGEST);
 }
 
-/// Every construct this engine deliberately refuses (each one a construct the
-/// `regex` crate accepted), so a change that starts accepting one is visible.
 #[test]
 fn refusals_are_refusals() {
     for (pattern, expected) in [
@@ -804,7 +751,6 @@ fn refusals_are_refusals() {
     }
 }
 
-/// Malformed patterns are rejected rather than compiled into something bogus.
 #[test]
 fn malformed_patterns_are_rejected() {
     for pattern in [
@@ -855,14 +801,8 @@ fn malformed_patterns_are_rejected() {
     }
 }
 
-/// A negated POSIX item is folded before it is negated, as a bracketed class is:
-/// `(?i)[[:^lower:]]` is "not a letter of either case". Folding the complement of `[a-z]`
-/// (which holds `A-Z`, `ſ` and KELVIN SIGN) would yield every code point instead. The
-/// expected spans are what `regex` 1.12.4 reports; `aterm-search`'s default `(?i)` makes
-/// them the find bar's answers.
 #[test]
 fn negated_posix_items_fold_before_they_negate() {
-    // a Z ␠ k K ␠ s S ſ K ␠ 1 é _ -
     let haystack = "aZ kK sS\u{17f}\u{212a} 1\u{e9}_-";
     let not_a_letter = vec![
         (2, 3),
@@ -898,7 +838,6 @@ fn negated_posix_items_fold_before_they_negate() {
             vec![(2, 3), (5, 6), (13, 14), (15, 17), (18, 19)],
         ),
         (r"(?i)[[:^print:]]", vec![(15, 17)]),
-        // Controls: the same items without `(?i)`, and class-level negation.
         (
             r"[[:^lower:]]",
             vec![
@@ -923,8 +862,6 @@ fn negated_posix_items_fold_before_they_negate() {
     }
 }
 
-/// A quantifier right after a flag directive has nothing to repeat and is refused, as in
-/// `regex`, not applied to the item before the directive.
 #[test]
 fn a_quantifier_after_a_flag_directive_is_refused() {
     for pattern in [
@@ -946,15 +883,11 @@ fn a_quantifier_after_a_flag_directive_is_refused() {
             "{pattern:?}: {err}"
         );
     }
-    // The item after the directive is still repeatable, and a group after it is an
-    // item like any other.
     assert_eq!(spans_mine(r"a(?i)b*", "aBB"), Some(vec![(0, 3)]));
     assert_eq!(spans_mine(r"a(?i)(?:b)*", "aBB"), Some(vec![(0, 3)]));
     assert_eq!(spans_mine(r"a(?i)(?:)*", "aa"), Some(vec![(0, 1), (1, 2)]));
 }
 
-/// The leftmost start when a repetition over multi-byte code points precedes a multi-byte
-/// literal; some `regex-automata` versions report `2..7` for `(.*b)*é` on `"aaébé"`.
 #[test]
 fn this_engine_finds_the_leftmost_start() {
     for (pattern, haystack, correct) in [
@@ -971,8 +904,6 @@ fn this_engine_finds_the_leftmost_start() {
     }
 }
 
-/// `escape` must round-trip: an escaped string matches itself and nothing it
-/// should not.
 #[test]
 fn escape_round_trips() {
     let mut seen = BTreeSet::new();

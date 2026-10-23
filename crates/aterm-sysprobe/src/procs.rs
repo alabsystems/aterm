@@ -132,8 +132,7 @@ pub(crate) mod imp {
     use crate::jobs::RunState;
     use crate::jobs::darwin::PROC_FLAG_CONTROLT;
 
-    /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`), as the crate's macOS arm
-    /// declares it (the reference `libc` does not export it).
+    /// `PROC_PIDT_SHORTBSDINFO` (`sys/proc_info.h`), as the crate's macOS arm declares it (the reference `libc` does not export it).
     const PROC_PIDT_SHORTBSDINFO: c_int = 13;
 
     /// `struct proc_bsdshortinfo` (64 bytes, as the macOS arm pins it).
@@ -314,8 +313,7 @@ mod imp {
 pub(crate) mod stopped_spinner {
     use std::time::{Duration, Instant};
 
-    /// `struct rusage` (`<sys/resource.h>`): the two times, then fourteen
-    /// `long` counters these tests do not read; 144 bytes on Darwin.
+    /// `struct rusage` (`<sys/resource.h>`): the two times, then fourteen `long` counters these tests do not read; 144 bytes on Darwin.
     #[repr(C)]
     struct Rusage {
         utime: libc::timeval,
@@ -333,15 +331,12 @@ pub(crate) mod stopped_spinner {
         ) -> libc::pid_t;
     }
 
-    /// Keeps the spinner owned until a successful manual reap. Dropping the
-    /// ordinary handle alone only gives a running child to a passive reaper.
+    /// Keeps the spinner owned until a successful manual reap.
     struct OwnedSpinner(Option<aterm_uds::spawnfd::Child>);
 
     impl OwnedSpinner {
         fn forget_reaped(&mut self) {
             if let Some(child) = self.0.take() {
-                // The raw wait already reaped it. Do not let the handle's
-                // drop ask for a PID that another child may now reuse.
                 std::mem::forget(child);
             }
         }
@@ -353,8 +348,6 @@ pub(crate) mod stopped_spinner {
                 && matches!(child.try_wait(), Ok(None))
                 && child.kill().is_ok()
             {
-                // Still our unreaped child, even if the read panicked while
-                // it was stopped. The handle caches this reap before drop.
                 let _ = child.wait();
             }
         }
@@ -462,9 +455,7 @@ mod tests {
         assert_eq!(timebase_of_frequency(u64::MAX), None, "terms past u32");
     }
 
-    /// The sweep's CPU time is the kernel's, in nanoseconds, however this
-    /// process runs: a spinning child, stopped so that both readings count the
-    /// same CPU at any load, reads within 2x of what `wait4` reports for it.
+    /// The sweep's CPU time is the kernel's, in nanoseconds, however this process runs: a spinning child, stopped so that both readings count the same CPU at any load, reads within 2x of what `wait4` reports for it.
     #[cfg(target_os = "macos")]
     #[test]
     fn the_sweep_reads_a_stopped_childs_cpu_time_as_wait4_counts_it() {
@@ -484,9 +475,7 @@ mod tests {
         );
     }
 
-    /// A sweep asked for coalitions reads each process's, as the one-process
-    /// reader does, another user's too (launchd's, root's); a plain sweep
-    /// reads none.
+    /// A sweep asked for coalitions reads each process's, as the one-process reader does, another user's too (launchd's, root's); a plain sweep reads none.
     #[cfg(target_os = "macos")]
     #[test]
     fn a_sweep_reads_coalitions_only_when_asked() {

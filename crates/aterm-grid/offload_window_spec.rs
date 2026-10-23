@@ -1,31 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//
-// Model of the scrollback-offload detach window, `include!`d by
-// tests/conformance_offload.rs, which proves it and drives the real `Grid`
-// against it. Requires `Model` + `ty_model` in scope at the include site.
-//
-// The offload detaches the tiered store, rewraps it off the lock on a worker,
-// then re-attaches. While detached, these steps interleave in any order:
-//   Produce             — the PTY reader scrolls a line off
-//   Erase               — an ED3 / `clear` lands
-//   SetLine*/SetBudget* — a host changes the line limit / byte budget; newest wins
-//   AttachReplacement   — reset/recovery installs an authoritative replacement store
-//   Reattach            — the worker finishes and re-attaches
-//   Abort               — the worker died; `abort_reflow_offload` recovers to a
-//                         bounded state instead of wedging
-//
-// Not modelled: a resize while the window is open. With the store out,
-// `resize_offloading_scrollback` detaches nothing, so it is a plain `Grid::resize`
-// that stages rows into `lazy_buffer` with no PTY scroll-off (see
-// `StagedWithinProduced`).
-//
-// `Buggy=0` is the shipped logic; `Buggy=1` loses window output, resurrects
-// erased history, exposes stale deferred settings and loses staged output on a
-// replacement-backed Abort. The gate requires a `Buggy=1` counterexample so the
-// invariants cannot go vacuous.
 
-/// The detach window as a bounded state machine (see file comment above).
+/// Bounded state-machine model of the scrollback-offload detach window.
 fn offload_window_model() -> Model {
     ty_model! {
         ScrollbackOffloadWindow {

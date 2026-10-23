@@ -12,8 +12,6 @@ fn unit(unit: TextUnit) -> Result<Unit> {
         TextUnit_Format | TextUnit_Word => Unit::Word,
         TextUnit_Line => Unit::Line,
         TextUnit_Paragraph => Unit::Paragraph,
-        // The model has no formatting/page breaks; UIA promotes unsupported
-        // units to the next supported larger unit.
         TextUnit_Page | TextUnit_Document => Unit::Document,
         _ => return Err(E_INVALIDARG.into()),
     })
@@ -57,8 +55,6 @@ impl TextRange {
     }
 
     fn other<'a>(&self, other: &'a ITextRangeProvider) -> Result<&'a TextRange_Impl> {
-        // Query the Rust object's identity instead of assuming an arbitrary
-        // caller's ITextRangeProvider has this provider's private layout.
         let other = other
             .cast_object_ref::<TextRange>()
             .map_err(|_| Error::from(E_INVALIDARG))?;
@@ -99,8 +95,6 @@ impl ITextProvider_Impl for Provider_Impl {
         array_com(&values)
     }
     fn GetVisibleRanges(&self) -> Result<*mut SAFEARRAY> {
-        // The host projects its visible text viewport, so the whole published
-        // document is the current visible range, not unexposed scrollback.
         array_com(&[self.DocumentRange()?.cast()?])
     }
     fn RangeFromChild(&self, child: Ref<IRawElementProviderSimple>) -> Result<ITextRangeProvider> {
@@ -111,8 +105,6 @@ impl ITextProvider_Impl for Provider_Impl {
         if !self.shared.ptr_eq(&child.shared) {
             return Err(E_INVALIDARG.into());
         }
-        // Text runs are not independent fragment children. The current model
-        // has no embedded object offsets to hand to this method.
         self.key().read(|node, _| {
             if node.supports_text_ranges() {
                 Err(unsupported())
@@ -364,8 +356,6 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
             let (start, _) = doc.enclosing(bounds[0], by);
             let (at, mut moved) = doc.step(start, by, count);
             let (next, end) = doc.enclosing(at, by);
-            // A nondegenerate range cannot move onto a nonexistent unit after
-            // the document; report the number of units actually traversed.
             if count > 0 && next < at {
                 moved = moved.saturating_sub(1);
             }
@@ -420,8 +410,6 @@ impl ITextRangeProvider_Impl for TextRange_Impl {
         )
     }
     fn AddToSelection(&self) -> Result<()> {
-        // The model exposes None or Single selection; adding another range
-        // must not silently replace an existing one.
         Err(unsupported())
     }
     fn RemoveFromSelection(&self) -> Result<()> {

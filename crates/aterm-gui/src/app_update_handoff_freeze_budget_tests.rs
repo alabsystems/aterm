@@ -7,8 +7,7 @@ use std::time::Duration;
 
 /// Whatever the seed, every rung is strictly wider than the one before, rung 0
 /// stays inside its clamp, more failures never buy less time, and an explicit
-/// apply gets the widest window at once. An absurd capture reading saturates
-/// rung 0, never wraps.
+/// apply gets the widest window at once.
 #[test]
 fn every_seed_keeps_the_ladder_strictly_wider_rung_over_rung() {
     use super::{FREEZE_RUNG0_CEILING, FREEZE_RUNG0_FLOOR};
@@ -73,15 +72,13 @@ fn the_ledgers_last_timed_capture_seeds_a_lane_that_times_none() {
         }
     );
     assert_eq!(FreezeSeed::last_park_of(Some(&record)), None);
-    // Neither measured: the default, not a zero-millisecond "measurement".
     let empty = aterm_update::HandoffCaptureRecord::default();
     assert_eq!(FreezeSeed::from_prior(Some(&empty)), FreezeSeed::Default);
 }
 
 /// The park the dry run cannot time: the capture itself is around a millisecond,
 /// while most of a park is stopping the readers, which only a real park
-/// measures. So a landed park's cost is kept and rung 0 is never below it, from
-/// the ledger alone (fork lane) or beside the dry run.
+/// measures.
 #[test]
 fn a_landed_parks_cost_is_the_floor_the_dry_run_cannot_see() {
     let ms = Duration::from_millis;

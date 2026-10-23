@@ -8,32 +8,24 @@ use std::sync::OnceLock;
 
 use crate::win_ffi::{Apartment, Com, Guid, StepError, check, co_create};
 
-/// `CLSID_WICImagingFactory` {CACAF262-9370-4615-A13B-9F5539DA4C0A}: the
-/// factory every Windows since Vista registers (WICImagingFactory2 adds only
-/// Direct2D interop, which this module has no use for).
 const CLSID_WIC_IMAGING_FACTORY: Guid = Guid {
     data1: 0xCACA_F262,
     data2: 0x9370,
     data3: 0x4615,
     data4: [0xA1, 0x3B, 0x9F, 0x55, 0x39, 0xDA, 0x4C, 0x0A],
 };
-/// `IID_IWICImagingFactory` {EC5EC8A9-C395-4314-9C77-54D7A935FF70}.
 const IID_IWIC_IMAGING_FACTORY: Guid = Guid {
     data1: 0xEC5E_C8A9,
     data2: 0xC395,
     data3: 0x4314,
     data4: [0x9C, 0x77, 0x54, 0xD7, 0xA9, 0x35, 0xFF, 0x70],
 };
-/// `IID_IWICBitmapCodecInfo` {E87A44C4-B76E-4C47-8B09-298EB12A2714}.
 const IID_IWIC_BITMAP_CODEC_INFO: Guid = Guid {
     data1: 0xE87A_44C4,
     data2: 0xB76E,
     data3: 0x4C47,
     data4: [0x8B, 0x09, 0x29, 0x8E, 0xB1, 0x2A, 0x27, 0x14],
 };
-/// `GUID_WICPixelFormat32bppBGRA` {6FDDC324-4E03-4BFE-B185-3D77768DC90F}:
-/// straight (not premultiplied) alpha, the format every WIC converter and
-/// colour transform supports.
 const PIXEL_FORMAT_32BPP_BGRA: Guid = Guid {
     data1: 0x6FDD_C324,
     data2: 0x4E03,
@@ -41,19 +33,12 @@ const PIXEL_FORMAT_32BPP_BGRA: Guid = Guid {
     data4: [0xB1, 0x85, 0x3D, 0x77, 0x76, 0x8D, 0xC9, 0x0F],
 };
 
-/// `WICDecodeMetadataCacheOnDemand`: read metadata only when asked.
 const DECODE_METADATA_ON_DEMAND: i32 = 0;
-/// `WICDecoder`, the component type [`decodable_extensions`] enumerates.
 const COMPONENT_DECODER: u32 = 0x1;
-/// `WICComponentEnumerateDefault`.
 const ENUMERATE_DEFAULT: u32 = 0;
-/// `WICBitmapDitherTypeNone`.
 const DITHER_NONE: i32 = 0;
-/// `WICBitmapPaletteTypeCustom` (no palette is handed over).
 const PALETTE_CUSTOM: i32 = 0;
-/// The EXIF colour space id of sRGB, what the transform converts into.
 const EXIF_COLOR_SPACE_SRGB: u32 = 1;
-/// How many colour contexts a frame may carry that the decoder looks at.
 const MOST_COLOR_CONTEXTS: u32 = 8;
 
 type Raw = *mut c_void;
@@ -225,17 +210,11 @@ struct CodecInfoVtbl {
     get_file_extensions: unsafe extern "system" fn(Raw, u32, *mut u16, *mut u32) -> i32,
 }
 
-/// The vtable of the live interface `object`, viewed as `V`.
-/// # Safety
-///
-/// `object` must be a live interface pointer whose vtable begins with `V`'s
-/// slots, in order.
 unsafe fn vtable<'a, V>(object: &'a Com) -> &'a V {
     // SAFETY: the caller vouches that the vtable starts with `V`'s slots.
     unsafe { object.vtable::<V>() }
 }
 
-/// Call a factory method that hands back one interface pointer, owned.
 fn created(hr: i32, out: *mut c_void, step: &'static str) -> Result<Com, StepError> {
     check(hr, step)?;
     // SAFETY: every caller passes the out pointer of the factory method whose result is `hr`, which
@@ -243,7 +222,6 @@ fn created(hr: i32, out: *mut c_void, step: &'static str) -> Result<Com, StepErr
     unsafe { Com::from_raw(out) }.ok_or((step, 0))
 }
 
-/// The imaging factory, in process.
 fn factory() -> Result<Com, StepError> {
     co_create(
         &CLSID_WIC_IMAGING_FACTORY,
@@ -344,8 +322,6 @@ fn decode(bytes: &[u8], len: u32, max_dimension: usize) -> Result<Decoded, StepE
     }
 }
 
-/// `source`'s pixels, `w` by `h`, as straight RGBA8 rows top-down: through a
-/// format converter to straight BGRA, copied whole, the channels swapped.
 fn copy_rgba(factory: &Com, source: &Com, w: usize, h: usize) -> Result<Decoded, StepError> {
     // SAFETY: `factory` is a live IWICImagingFactory.
     let fv = unsafe { vtable::<ImagingFactoryVtbl>(factory) };
@@ -397,16 +373,12 @@ fn copy_rgba(factory: &Com, source: &Com, w: usize, h: usize) -> Result<Decoded,
     Ok(Decoded::Pixels((pixels, w, h)))
 }
 
-/// Swap each pixel's blue and red in place: BGRA8 to RGBA8.
 fn bgra_to_rgba(pixels: &mut [u8]) {
     for pixel in pixels.chunks_exact_mut(4) {
         pixel.swap(0, 2);
     }
 }
 
-/// The frame converted from its own colour profile into sRGB, as straight
-/// BGRA: `None` where the frame carries no profile, or any step fails (the
-/// frame is then drawn as it is, as the first-party decoders draw theirs).
 fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
     // SAFETY: both are live interfaces of the named kinds.
     let fv = unsafe { vtable::<ImagingFactoryVtbl>(factory) };
@@ -476,9 +448,7 @@ fn to_srgb(factory: &Com, frame: &Com) -> Option<Com> {
     (hr >= 0).then_some(transform)
 }
 
-/// THE FILE EXTENSIONS WIC'S INSTALLED DECODERS CLAIM, lower case and without their dot (`bmp`,
-/// `gif`, `tif`, `heic` where the HEIF codec is installed), each once: what [`decode_rgba8`] reads
-/// beyond the first-party decoders, and so what the wallpaper picker offers.
+/// Lowercase dotless file extensions claimed by installed WIC decoders.
 pub(crate) fn decodable_extensions() -> &'static [String] {
     static EXTENSIONS: OnceLock<Vec<String>> = OnceLock::new();
     EXTENSIONS.get_or_init(|| match enumerate_extensions() {
@@ -537,7 +507,6 @@ fn enumerate_extensions() -> Result<Vec<String>, StepError> {
     Ok(extensions)
 }
 
-/// One codec's extensions (`.bmp,.dib,.rle`), split.
 fn file_extensions(info: &Com) -> Vec<String> {
     // SAFETY: `info` is a live IWICBitmapCodecInfo.
     let iv = unsafe { vtable::<CodecInfoVtbl>(info) };
@@ -564,8 +533,6 @@ fn file_extensions(info: &Com) -> Vec<String> {
     split_extensions(&String::from_utf16_lossy(&buffer[..end]))
 }
 
-/// `.bmp,.DIB, .rle` as `["bmp", "dib", "rle"]`: lower case, no dot, no
-/// blanks, each once.
 fn split_extensions(list: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for extension in list.split(',') {
@@ -590,8 +557,6 @@ mod tests {
         StreamVtbl, bgra_to_rgba, decodable_extensions, decode_rgba8, split_extensions,
     };
 
-    /// STRUCTURAL FENCE on the hand-rolled vtables: each called slot sits at
-    /// its `wincodec.h` / `objidl.h` index (a slot is one pointer).
     #[test]
     fn the_vtables_put_each_called_slot_at_its_index() {
         let slot = |offset: usize| offset / std::mem::size_of::<usize>();
@@ -652,8 +617,6 @@ mod tests {
         );
     }
 
-    /// A codec's comma-separated list becomes bare lower-case extensions,
-    /// each once.
     #[test]
     fn a_codecs_extensions_are_bare_and_lower_case() {
         assert_eq!(
@@ -670,8 +633,6 @@ mod tests {
         assert_eq!(pixels, [3, 2, 1, 4, 7, 6, 5, 8]);
     }
 
-    /// A 2x2 24-bit BMP: red, green on the top row; blue, white below,
-    /// stored bottom-up as B,G,R with 4-byte row padding.
     fn two_by_two_bmp() -> Vec<u8> {
         let mut v = Vec::new();
         v.extend_from_slice(b"BM");
@@ -694,9 +655,6 @@ mod tests {
         v
     }
 
-    /// WIC reads what the first-party decoders do not (a BMP), top-down and
-    /// in RGBA order, and its decoders claim it; a picture past the bound is
-    /// refused, and bytes that are no image are refused by name.
     #[test]
     fn wic_decodes_a_bmp_top_down_in_rgba() {
         let (rgba, w, h) = decode_rgba8(&two_by_two_bmp(), 8192).expect("WIC read the BMP");

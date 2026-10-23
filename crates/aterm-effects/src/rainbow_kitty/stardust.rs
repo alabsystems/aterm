@@ -68,7 +68,7 @@ pub const DEAL_M1_IN: u32 = 12;
 /// One in this many laid ribbon cells carries a field star (§5.6), hashed stably per cell so the sky does not shimmer as the ribbon re-plans.
 pub const FIELD_DEAL_IN: u32 = 2;
 
-/// ...and one in this many of those is an m2 rather than an m3 (§5.6).
+/// One in this many field stars is an m2 rather than an m3.
 pub const FIELD_M2_IN: u32 = 2;
 
 /// The hot field deal: every laid cell carries a field star once the honest spine (`ctx.disp`, not the resume-floored birth spine) is at or over [`FIELD_HOT_DISP`].
@@ -98,7 +98,7 @@ pub const FIELD_LIFE_S: f32 = SWOOSH_TOTAL_S;
 /// A field star's hold after the last key on its row ([`Star::lit`]), ms: the `H` of the field lane's half-life envelope (§5.6).
 pub const FIELD_HOLD_MS: f32 = 300.0;
 
-/// ...and its half-life, ms.
+/// A field star's half-life after hold, ms.
 pub const FIELD_TAU_MS: f32 = 250.0;
 
 /// The field fade's span after the last key, seconds (`H + 2.32·τ` through [`half_life_life_s`], 0.88 s): when [`Star::dead`] drops a field star whose row the hand has left, and the end of the reduced-motion fade.
@@ -144,7 +144,7 @@ pub const WARM_STOPS: usize = 3;
 /// Top of the sky band above the ribbon, in `ch` above [`super::ribbon::Band`]'s `top` (§5.4).
 pub const SKY_TOP_CH: f32 = 0.30;
 
-/// …and its bottom, in `ch` above the band's top (§5.4).
+/// Bottom of the sky band above the ribbon, in `ch` above the band's top.
 pub const SKY_BOTTOM_CH: f32 = 0.04;
 
 /// Horizontal jitter of a birth about the cell centre, in `cw` (§5.4, hashed).
@@ -524,11 +524,11 @@ pub const ERASE_M3_N: u16 = 3;
 pub const ERASE_M2_N: u16 = 1;
 /// A kill mints one star per this many erased cells (§5.6, and [`Event::Kill`]'s own restatement: "1 star per 3 cells, cap 8").
 pub const KILL_CELLS_PER_STAR: u16 = 3;
-/// …capped here, because a clause going is one gesture and not a shower (§5.6).
+/// Maximum stars minted by a single kill gesture.
 pub const KILL_STAR_MAX: u16 = 8;
 /// A mini-fan is exactly this many m2 stars (§5.6, D17).
 pub const MINI_FAN_M2_N: u16 = 1;
-/// …and this many m3 grains (§5.6, D17).
+/// How many m3 grains a mini-fan throws.
 pub const MINI_FAN_M3_N: u16 = 2;
 
 /// Quads stardust may spend on one frame (§18: "Stardust | 40 live | ≤ 284").
@@ -872,8 +872,6 @@ impl Star {
         let age = self.age_s(now);
         let fin = self.finish.map_or(1.0, |f| f.gain(now));
         if self.lane == StarLane::Field {
-            // The field lane's one envelope — shared with the aurora's veil,
-            // which rides the same cell the same way ([`Veil::envelope`]).
             return field_lane_envelope(age, self.idle_s(now), fin, reduced_motion);
         }
         if reduced_motion {
@@ -1223,7 +1221,7 @@ pub const fn cell_ink(ch: char) -> CellInk {
 /// Where a light horizontal rule's stroke begins, as a fraction of the cell height from its top (§5.4).
 pub const RULE_INK_TOP_CH: f32 = 0.35;
 
-/// ...and where it ends: the sky zone's top edge under `tall`, derived.
+/// Where a light horizontal rule's stroke ends, as a fraction of the cell height from its top.
 pub const RULE_INK_BOT_CH: f32 = 1.0 - (super::ribbon::TALL_UP_CH - 1.0) - SKY_TOP_CH;
 
 const _: () = assert!(
@@ -1300,6 +1298,24 @@ impl GlyphProbe {
         }
     }
 
+    /// [`Self::probe_row_ink`] classifying each `char` with [`cell_ink`] in place.
+    #[inline]
+    pub fn probe_row_chars(&mut self, row: i32, chars: &[char]) {
+        let slot = self.slot_for(row, chars.len());
+        let r = &mut self.rows[slot];
+        for (col, &ch) in chars.iter().enumerate() {
+            let bit = 1u64 << (col % 64);
+            match cell_ink(ch) {
+                CellInk::Blank => {}
+                CellInk::Glyph => r.ink[col / 64] |= bit,
+                CellInk::Rule => {
+                    r.ink[col / 64] |= bit;
+                    r.rule[col / 64] |= bit;
+                }
+            }
+        }
+    }
+
     #[inline]
     fn slot_for(&mut self, row: i32, width: usize) -> usize {
         let words = width.div_ceil(64);
@@ -1366,7 +1382,6 @@ impl GlyphProbe {
     #[inline]
     fn cell_at(&self, row: i32, col: u16, rows: usize) -> Option<(bool, bool)> {
         if row < 0 || row as usize >= rows {
-            // Off-grid bands hold no glyphs by construction.
             return Some((false, false));
         }
         let r = self.rows[..self.live].iter().find(|r| r.row == row)?;
@@ -1678,12 +1693,8 @@ impl Stardust {
             let v0 = (dx / FAN_THROW_MS, dy / FAN_THROW_MS);
             let gold = class == StarClass::M1 && spec.hero;
             let tint = if gold {
-                // D6: the fan's own hero is gold, always — it is the mark the
-                // five rain glints are counted against.
                 TINT_GOLD_RGB
             } else {
-                // A point mark snaps (C1) to the band's stop at the column the
-                // throw rests on ([`FanSow::walk`]).
                 spectrum_snap(spec.walk.at(dx / cw))
             };
             self.throw(
@@ -1857,8 +1868,6 @@ impl Stardust {
                 if age < EDGE_IN_S {
                     cad.tail(EDGE_IN_S - age);
                 } else if age >= field_melt_start {
-                    // The horizon's melt is moving under a hand that is
-                    // still on the row.
                     cad.tail(0.0);
                 }
             }
@@ -2874,7 +2883,6 @@ impl Paint {
         let rm = ctx.cfg.reduced_motion;
         let alpha = star.envelope(ctx.now, rm);
         if alpha < STAR_CULL_ALPHA {
-            // D3: below the cull a star is gone, never a grey speck.
             return None;
         }
         let held = rm || star.in_hold(ctx.now);
@@ -2882,8 +2890,6 @@ impl Paint {
         let (env, e) = if held {
             (1.0, 1.0)
         } else {
-            // `e = (env − 0.55)/0.45 ∈ [0, 1]` — the twinkle as a unit depth,
-            // which is what §5.5's per-class core-brightness rules take.
             (tw, clamp01((tw - 0.55) / 0.45))
         };
         let (x, y) = star.pos(ctx.now, rm);
@@ -3525,15 +3531,7 @@ impl Veil {
     }
 }
 
-/// The field lane's envelope, shared by the field star ([`Star::envelope`])
-/// and the aurora's veil ([`Veil::envelope`]), both being the cell's sky
-/// (§5.6), as the product of three alpha clocks:
-///
-/// * the birth: the cell's 18 ms `edge-in` from [`BIRTH_EDGE_FLOOR`] (T2);
-/// * the horizon: the ribbon's `expiry_melt` over [`FIELD_LIFE_S`];
-/// * the hand: [`FIELD_HOLD_MS`] / [`FIELD_TAU_MS`] from the row's last key:
-///   full while the hand is there, half at 550 ms, culled at 880 ms, before
-///   the ribbon's retract.
+/// The field lane's envelope, shared by the field star ([`Star::envelope`]) and the aurora's veil ([`Veil::envelope`]).
 #[inline]
 #[must_use]
 pub fn field_lane_envelope(age_s: f32, idle_s: f32, fin: f32, reduced_motion: bool) -> f32 {
@@ -4583,8 +4581,6 @@ mod tests {
                     band.end
                 );
                 if band.contains(&off) {
-                    // Born on the stroke: no headroom, and the rest is
-                    // `settle`'s to nudge.
                     continue;
                 }
                 let held = y as i32 - room as i32;
@@ -5115,8 +5111,6 @@ mod tests {
                 s.y
             );
             if s.lane == StarLane::Strike && s.v0 != (0.0, 0.0) {
-                // an m1/m2 strike — the partition's own births (grains may be
-                // the leading-edge second)
                 *strike_per_cell.entry(col_of(s)).or_insert(0) += 1;
             }
         }

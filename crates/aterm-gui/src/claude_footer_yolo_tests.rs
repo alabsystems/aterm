@@ -554,6 +554,59 @@ fn the_relabel_allocates_nothing_once_its_buffers_are_grown() {
     let _ = session;
 }
 
+/// A WINDOW RELABELS NO MORE PILLS THAN IT KEEPS SHIFTS FOR (the glass
+/// review of 2026-10-23): past [`GLASS_SHIFTS`] panes the collector leaves
+/// the pill Claude's, so no pill reads `YOLO on` whose clicks and selection
+/// still land on the unshifted columns.
+#[test]
+fn a_window_relabels_no_more_pills_than_it_keeps_shifts_for() {
+    let (mut app, wid, session, _reader, _host) = app();
+    draw(&app, session, BYPASS);
+    frame(&mut app, wid);
+    let scratch = app.windows[&wid].input_scratch.clone();
+    let rows: Vec<String> = (0..24)
+        .map(|r| {
+            let row = &scratch.cells[strip(&app, wid) + r];
+            row.iter().map(|c| c.ch).collect()
+        })
+        .collect();
+    let region = PaneTextRegion {
+        strip: strip(&app, wid),
+        row_off: 0,
+        col_off: 0,
+        rows: 24,
+        cols: COLS,
+    };
+    let relabel = footer::relabel_under(&rows, 22).expect("the pill");
+    let mut out = Vec::new();
+    let mut cells = Vec::new();
+    let taken: Vec<bool> = (0..=GLASS_SHIFTS)
+        .map(|_| {
+            collect_pill_relabel(
+                &scratch,
+                &rows,
+                region,
+                relabel,
+                |_| false,
+                scratch.implicit_blank,
+                &mut out,
+                &mut cells,
+            )
+        })
+        .collect();
+    let mut glass = GlassColumns::default();
+    for e in &out {
+        glass.push(e.shift);
+    }
+    assert!(
+        taken[..GLASS_SHIFTS].iter().all(|&t| t),
+        "CONTROL: each relabels"
+    );
+    assert!(!taken[GLASS_SHIFTS], "the pane past the cap stays Claude's");
+    assert_eq!(glass.len, out.len(), "every relabel keeps its shift");
+    let _ = session;
+}
+
 /// THE PILL IS READ WITH THE RULE, NOT EVERY FRAME (the cross-track review
 /// of 2026-10-19): frames at rest — the screen unchanged, or a keystroke's
 /// echo in the composer — read Claude's mode row for its relabel no more:

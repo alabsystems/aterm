@@ -2,11 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Live upgrade status rows and operator requests backed by per-conversation state files.
-//!
-//! * [`rows`] and [`View`]: project one [`Row`] per upgrade record (vetted by [`Row::standing`]
-//!   and [`Holder`]), raising `attention owner=upgrade` when [`Row::stall`] holds.
-//! * [`ask`]: persists the operator [`Request`] under the sweep lock and wakes the window host
-//!   via [`word_marker`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -25,21 +20,16 @@ pub const STALLED_AFTER_S: u64 = upgrade::RUNG_LAND_S + LAND_GRACE_S;
 /// The grace past the ladder's Land rung before an unmoved upgrade reads `overdue`.
 pub const LAND_GRACE_S: u64 = 4 * 3_600;
 
-/// The words of a row of an agent with no upgrade lane.
 const NO_LANE_WORDS: &str = "no lane of aterm's moves this agent, so nothing is asked or typed";
 
-/// The words of a row of Muse Code's or agy's where a ladder's words are owed.
 const QUIET_LANE_WORDS: &str = "aterm restarts this agent onto a newer build at a genuinely \
                                 idle point and types nothing into it";
 
 const _: () = assert!(STALLED_AFTER_S == 6 * 3_600);
 
-/// How long a finished restart stays in the host's summary.
 const DONE_SHOWN_S: u64 = 10 * 60;
 
-/// How long a move that failed after its exit (a Codex `/exit`, a Claude Code
-/// SIGTERM) stays in the host's summary (band row, `upgrade=` column, tab
-/// mark) once no process is left to vet it by ([`Row::exited_at`]).
+/// How long a move that failed after its exit (a Codex `/exit`, a Claude Code SIGTERM) stays in the host's summary (band row, `upgrade=` column, tab mark) once no process is left to vet it by.
 pub const EXITED_FAILURE_SHOWN_S: u64 = 24 * 3_600;
 
 /// The keyed attention owner the host raises on a stalled tab.
@@ -48,10 +38,7 @@ pub const ATTENTION_OWNER: &str = "upgrade";
 /// How long the owner's `--now` keeps an overdue upgrade from reading stalled ([`Row::stall`]).
 pub const NOW_QUIETS_S: u64 = upgrade::REASK_S;
 
-/// How long aterm's own failure to type a due notice (the notice's fence
-/// refused it at every look since, [`Row::refused_notice`]) may stand before
-/// the owner is told: three re-ask intervals, enough for a repaint or a
-/// person's typing to end.
+/// How long aterm's own failure to type a due notice (the notice's fence refused it at every look since, [`Row::refused_notice`]) may stand before the owner is told.
 pub const TELL_S: u64 = 90 * 60;
 
 /// How long past a usage limit's named reset its notice may still be the recorded wait.
@@ -65,9 +52,7 @@ const _: () = assert!(QUIET_MOVE_S >= super::LATER[super::LATER.len() - 1].as_se
 /// The longest a usage limit lasts (the weekly limits).
 pub const LONGEST_LIMIT_S: u64 = 7 * 24 * 3_600;
 
-/// The move clock: how long a session may be behind before an upgrade that asks again on its
-/// own ([`Row::asks_on_its_own`]) is no longer only a record, whatever it waits on (a usage
-/// limit alone excepted: it ends at its named reset).
+/// The move clock: how long a session may be behind before an upgrade that asks again on its own ([`Row::asks_on_its_own`]) is no longer only a record, whatever it waits on.
 pub const MOVE_BUDGET_S: u64 = 24 * 3_600;
 
 const _: () = assert!(MOVE_BUDGET_S > STALLED_AFTER_S);
@@ -95,8 +80,6 @@ pub fn unwatched_since(watch_at: u64, looked_at: u64, now: u64, awake_since: u64
     (late && unread && awake).then_some(if looked_at != 0 { looked_at } else { watch_at })
 }
 
-/// The first unix second at which [`unwatched_since`] reads `Some` for these
-/// fields if nothing looks meanwhile, for [`next_change`].
 fn unwatched_turns_at(watch_at: u64, looked_at: u64, awake_since: u64) -> Option<u64> {
     (watch_at != 0 && awake_since != 0).then(|| {
         watch_at
@@ -121,7 +104,6 @@ pub fn awake_since() -> u64 {
 
 #[cfg(test)]
 thread_local! {
-    /// The awake clock a test of this crate reads ([`awake_since`]), per thread.
     static AWAKE_PIN: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
@@ -163,9 +145,7 @@ fn sysctl_secs(name: &std::ffi::CStr) -> u64 {
         tv_usec: 0,
     };
     let mut len: libc::size_t = std::mem::size_of::<libc::timeval>();
-    // SAFETY: `name` is NUL-terminated and outlives the call; `tv` and `len` are live locals,
-    // `len` the buffer's real size so the copy is bounded; the new-value pair is null/0, so
-    // this only reads the sysctl. No pointer escapes.
+    // SAFETY: `name` is NUL-terminated and outlives the call; `tv` and `len` are live locals, `len` the buffer's real size so the copy is bounded; the new-value pair is null/0, so this only reads the sysctl. No pointer escapes.
     let rc = unsafe {
         libc::sysctlbyname(
             name.as_ptr(),
@@ -181,7 +161,6 @@ fn sysctl_secs(name: &std::ffi::CStr) -> u64 {
     u64::try_from(tv.tv_sec).unwrap_or(0)
 }
 
-/// Whether a recorded wait is one only a person can end.
 fn person_holds(wait: &str) -> bool {
     let wait = wait.strip_prefix("release:").unwrap_or(wait);
     if wait.starts_with("left-typed:") {
@@ -202,9 +181,6 @@ fn person_holds(wait: &str) -> bool {
 }
 
 impl Row {
-    /// The instant an announced round's person hold ([`person_holds`]) has
-    /// kept the re-ask from happening: the same word stood a whole
-    /// [`upgrade::REASK_S`] ([`Self::wait_since`]) and the last ask is as old.
     fn person_hold_stands_at(&self) -> Option<u64> {
         let Phase::Announced { at_s, .. } = self.phase else {
             return None;
@@ -282,9 +258,7 @@ pub struct Row {
     pub hand_seen: u64,
     /// What ran under the agent at the last look whose step waited ([`HeldBy`], [`St::held_by`]).
     pub held_by: Vec<HeldBy>,
-    /// A round that gave up ([`upgrade::GAVE_UP`]) whose agent's own work was seen since its
-    /// latest notice (`St::work_seen`): what tells a give-up held by that work from one held by
-    /// a lagging status ([`Self::rests_on_own_work`]).
+    /// A round that gave up ([`upgrade::GAVE_UP`]) whose agent's own work was seen since its latest notice.
     pub work_seen: bool,
     /// When a stopped round starts the next one (unix seconds).
     pub retry_at: u64,
@@ -328,8 +302,7 @@ pub struct Row {
     pub waits: Vec<super::WaitNote>,
     /// The first time each distinct wait word was recorded, for the record's life (`St::firsts`).
     pub firsts: Vec<(String, u64)>,
-    /// The usage limit's named reset as the transcript (a Codex row: its wall) said it at the
-    /// last look that read it (`St::limit_until`, unix seconds; `0`: none named).
+    /// The usage limit's named reset as the transcript (a Codex row: its wall) said it at the last look that read it.
     pub limit_until: u64,
     /// The limit is money (`St::limit_spend`).
     pub limit_spend: bool,
@@ -339,8 +312,7 @@ pub struct Row {
     pub outside: bool,
     /// Why no host worker runs for its tab by someone else's hand.
     pub aside: String,
-    /// The flow the row is read under: the quiet upgrade (`[harness] upgrade_ask = false`, the
-    /// default) or, `false`, the ask flow and hand-built rows.
+    /// The flow the row is read under.
     pub quiet: bool,
     /// A restart in flight whose agent was read gone, held again ([`Self::held_again`]).
     pub held_back: bool,
@@ -364,7 +336,6 @@ pub(super) fn round_notices(phase: &Phase, streak_why: &str, stop_streak: u32) -
         .saturating_add(asks)
 }
 
-/// When the row reads its agent gone ([`Row::exited_at`]).
 fn exited_seen(st: &St, now: u64, gone: bool) -> u64 {
     match st.phase {
         Phase::Exiting { at_s } if gone && now.saturating_sub(at_s) > HUNG_EXIT_AFTER_S => {
@@ -374,7 +345,6 @@ fn exited_seen(st: &St, now: u64, gone: bool) -> u64 {
     }
 }
 
-/// Whether the process table says a restart's agent no look stamped is gone.
 fn ended_unstamped(st: &St, now: u64) -> bool {
     matches!(st.phase, Phase::Exiting { at_s }
         if st.exited_at == 0
@@ -383,8 +353,6 @@ fn ended_unstamped(st: &St, now: u64) -> bool {
             && super::super::upgrade_wake::wait_exit(st.pid, std::time::Duration::ZERO))
 }
 
-/// Since when the session has been behind, as the view reads a record no visit of this build
-/// has vetted (`St::for_target`).
 const fn read_age(st: &St) -> u64 {
     if st.proc_start.is_empty()
         && st.waits.is_empty()
@@ -484,7 +452,6 @@ impl Row {
         row
     }
 
-    /// This row read under the flow `opts` names.
     fn in_flow(mut self, opts: &Opts, now: u64) -> Row {
         self.quiet = !opts.ask;
         self.read_at(now);
@@ -505,7 +472,6 @@ impl Row {
         self.level = self.attention(now).level();
     }
 
-    /// This row read by a host whose watch started or resumed after a sleep at `since`.
     fn host_watching_since(&mut self, since: u64, now: u64) {
         if self.awake_since != 0 && since > self.awake_since {
             self.awake_since = since;
@@ -530,7 +496,6 @@ impl Row {
         (!words.is_empty()).then_some(words)
     }
 
-    /// [`Self::held_words`] as one `--status` value.
     fn held_token(&self, now: u64) -> String {
         let mut held: Vec<&HeldBy> = self.held_by.iter().collect();
         held.sort_by_key(|h| h.since);
@@ -580,12 +545,10 @@ impl Row {
         }
     }
 
-    /// A restart whose carry-on is typed.
     fn restarting(&self, now: u64) -> bool {
         self.phase == Phase::Done && self.done_at == 0 && now <= self.confirm_by
     }
 
-    /// When the move finished for the owner.
     const fn finished_at(&self) -> u64 {
         if self.done_at == 0 {
             self.confirm_by
@@ -600,7 +563,6 @@ impl Row {
         self.owner_holds(now) || self.hurried(now)
     }
 
-    /// Whether the owner's word holds this upgrade.
     fn owner_holds(&self, now: u64) -> bool {
         match &self.request {
             Request::Skip(v) => upgrade::Version::parse(v) == upgrade::Version::parse(&self.to),
@@ -647,9 +609,6 @@ impl Row {
                 if let Some(owner) = self.wait.strip_prefix("terminal:") {
                     Some(format!("held-back:{}", word(owner)))
                 } else if self.repeating_stop() {
-                    // A repeating stop stays the stall through the re-armed
-                    // round until it moves or stops for another reason, so the
-                    // band keeps one entry for it.
                     Some(format!("failed:{}", word(&self.streak_why)))
                 } else {
                     overdue
@@ -662,7 +621,6 @@ impl Row {
         }
     }
 
-    /// A restart under way that has not moved ([`stuck_on`]).
     fn stuck(&self, now: u64) -> Option<&'static str> {
         let seen = if self.ended_unstamped {
             self.exited_at.max(1)
@@ -685,9 +643,6 @@ impl Row {
             .and_then(|since| behind_words(since, now))
     }
 
-    /// The instant [`Self::age_said`] counts from: behind-since for `overdue`,
-    /// the last check for `unwatched` ([`Self::unwatched`]); `None` for other
-    /// stalls.
     fn age_from(&self, now: u64) -> Option<u64> {
         match self.stall(now).as_deref() {
             Some("overdue") => Some(self.behind_since),
@@ -705,8 +660,6 @@ impl Row {
             && now.saturating_sub(self.refused_at) >= TELL_S
     }
 
-    /// Whether the notice was refused for a state that is not aterm's: a person's draft or
-    /// box, or another driver's lease (`held`).
     fn refusal_stands(&self) -> bool {
         matches!(
             self.wait.as_str(),
@@ -720,7 +673,6 @@ impl Row {
         self.limit_told_at().is_some_and(|at| now >= at)
     }
 
-    /// The instant a recorded `limited` wait is told ([`Self::limit_passed`], for [`next_change`]).
     fn limit_told_at(&self) -> Option<u64> {
         let end = self.limit_ends_at()?;
         let moves = if self.quiet && self.limit_until != 0 {
@@ -761,7 +713,6 @@ impl Row {
         unwatched_since(self.watch_at, self.looked_at, now, self.awake_since)
     }
 
-    /// Whether a watch is for this record at all ([`Self::unwatched`]).
     const fn watch_owed(&self) -> bool {
         matches!(
             self.phase,
@@ -777,7 +728,6 @@ impl Row {
         self.wait.starts_with("announce-refused:") && self.request == Request::Now
     }
 
-    /// Whether the owner's `--now` still quiets an overdue stall at `now`.
     fn hurried(&self, now: u64) -> bool {
         self.request == Request::Now && now < self.request_at.saturating_add(NOW_QUIETS_S)
     }
@@ -801,8 +751,6 @@ impl Row {
                          limit"
                     ))
                 } else {
-                    // No look read the reset: say what is known, never a reset
-                    // time (stall words stay within 64 characters).
                     with("its limit has outlasted any usage limit")
                 }
             }
@@ -904,7 +852,6 @@ impl Row {
         }
     }
 
-    /// Whether a round re-armed after a give-up is still the rest before it.
     fn rest_carries_on(&self, now: u64) -> bool {
         match self.wait.as_str() {
             "" | "attended" | upgrade::NEXT_POINT => true,
@@ -912,9 +859,6 @@ impl Row {
         }
     }
 
-    /// The instant a re-armed round's person hold ([`person_holds`]) has
-    /// stood a whole [`upgrade::REASK_S`] and stops being the rest before it
-    /// ([`Self::rest_carries_on`]); `None` for any other row or word.
     fn rearmed_hold_stands_at(&self) -> Option<u64> {
         (self.phase == Phase::Pending
             && self.last_stop == upgrade::GAVE_UP
@@ -926,8 +870,6 @@ impl Row {
         })
     }
 
-    /// Whether the session has been behind [`MOVE_BUDGET_S`] or more at `now`
-    /// and waits on anything but a usage limit; a start of 0 is no age.
     fn past_move_budget(&self, now: u64) -> bool {
         self.behind_since > 0
             && now.saturating_sub(self.behind_since) >= MOVE_BUDGET_S
@@ -943,7 +885,6 @@ impl Row {
             && !refusal(&self.streak_why)
     }
 
-    /// What a wait stands for, in a person's words.
     fn wait_words(&self, now: u64) -> Option<&'static str> {
         if self.person_gone(now) {
             return Some("it waits for its next turn end");
@@ -951,12 +892,10 @@ impl Row {
         self.recorded_wait_words()
     }
 
-    /// Whether this row's wait is a Claude Code tab's `attended` person no look has seen.
     fn person_gone(&self, now: u64) -> bool {
         attended_is_person(self.agent) && self.wait == "attended" && self.attended_unseen(now)
     }
 
-    /// [`Self::wait_words`] as the look that recorded the wait said it, with no clock.
     fn recorded_wait_words(&self) -> Option<&'static str> {
         if self.wait.is_empty() {
             return None;
@@ -994,7 +933,6 @@ impl Row {
                 && self.release.is_empty())
     }
 
-    /// Whether the owner's `--now` moves this wait once it is overdue.
     fn now_moves(&self) -> bool {
         now_moves_past(&self.wait) || (self.quiet && self.wait.starts_with("status-stale"))
     }
@@ -1048,7 +986,6 @@ impl Row {
         }
     }
 
-    /// Whether no look has seen the wait lately ([`ATTENDED_SEEN_S`]).
     fn attended_unseen(&self, now: u64) -> bool {
         now.saturating_sub(self.wait_seen.max(self.wait_since)) > ATTENDED_SEEN_S
     }
@@ -1059,7 +996,6 @@ impl Row {
         attended_is_person(self.agent) && self.wait == "attended" && !self.attended_unseen(now)
     }
 
-    /// The unix second this row's words stop naming a person at the tab ([`Self::person_seen`]).
     fn person_unseen_at(&self) -> Option<u64> {
         (attended_is_person(self.agent) && self.wait == "attended").then(|| {
             self.wait_seen
@@ -1153,7 +1089,6 @@ impl Row {
             && (!self.held_by.is_empty() || (self.work_seen && !self.now_moves()))
     }
 
-    /// Whether this row's phase is one a live process must still hold for it to mean anything.
     const fn held_by_a_process(&self) -> bool {
         matches!(
             self.phase,
@@ -1167,17 +1102,14 @@ impl Row {
         self.exited_at != 0 && matches!(self.phase, Phase::Failed(_))
     }
 
-    /// A restart in flight whose agent was read gone ([`Self::exited_at`]) and is not yet held.
     const fn down_in_flight(&self) -> bool {
         self.exited_at != 0 && !self.held_back && matches!(self.phase, Phase::Exiting { .. })
     }
 
-    /// Down after its agent's exit.
     const fn down_after_exit(&self) -> bool {
         self.failed_after_exit() || self.down_in_flight()
     }
 
-    /// This row's down answered ([`Self::held_again`], [`View::back`]).
     const fn answer_down(&mut self) {
         if matches!(self.phase, Phase::Exiting { .. }) {
             self.held_back = true;
@@ -1186,7 +1118,6 @@ impl Row {
         }
     }
 
-    /// A Claude Code move that failed after its exit, held again.
     fn held_again(&mut self, holders: &[Holder], unproven_tab: bool) {
         let in_front = |h: &Holder| !h.aside && (h.led || unproven_tab);
         let leads_its_tab = |h: &Holder| {
@@ -1210,15 +1141,11 @@ impl Row {
         }
     }
 
-    /// A fresh restart's Claude Code move that failed after its exit because the shell it ran in
-    /// is gone ([`Self::answered_by_its_tabs_agent`], `shell-gone`): its remedy is a new tab
-    /// ([`Self::held_again`]).
     fn shell_gone_afresh(&self) -> bool {
         self.answered_by_its_tabs_agent()
             && matches!(&self.phase, Phase::Failed(why) if why == "shell-gone")
     }
 
-    /// A fresh restart's Claude Code move down after its exit.
     fn answered_by_its_tabs_agent(&self) -> bool {
         self.fresh
             && held_again_after_exit(self.agent)
@@ -1236,14 +1163,12 @@ impl Row {
             .any(|h| self.held_here(h, unproven_tab))
     }
 
-    /// Whether live holder `h` holds this row's conversation in its tab.
     fn held_here(&self, h: &Holder, unproven_tab: bool) -> bool {
         h.tab
             .as_deref()
             .map_or(unproven_tab, |t| self.tab.is_empty() || t == self.tab)
     }
 
-    /// Whether at least one.
     fn held_aside(&self, holders: &[Holder], unproven_tab: bool) -> bool {
         let mut here = self
             .behind_holders(holders)
@@ -1252,7 +1177,6 @@ impl Row {
         here.peek().is_some() && here.all(|h| h.aside)
     }
 
-    /// Which of one tab's rows speaks FOR the tab ([`tab_rows`], lc-9).
     fn tab_rank(&self) -> (bool, bool, bool, bool, u64, u64, &str) {
         (
             self.aside != NOT_FOREGROUND,
@@ -1265,7 +1189,6 @@ impl Row {
         )
     }
 
-    /// This row set aside by `why`.
     fn go_aside(&mut self, why: &str, now: u64) {
         if !self.held_by_a_process() {
             return;
@@ -1279,7 +1202,6 @@ impl Row {
         self.person_named = self.person_seen(now);
     }
 
-    /// Sets this row aside if any hand but a host's holds its tab.
     fn set_aside(&mut self, held: &[Holder], unproven_tab: bool, aside: &Aside, now: u64) {
         if self.held_aside(held, unproven_tab) {
             self.go_aside(NOT_FOREGROUND, now);
@@ -1299,7 +1221,6 @@ impl Row {
         }
     }
 
-    /// Lets a row no look has reached read Claude's live status.
     fn unreached_status(&mut self, holders: &[Holder], unproven_tab: bool, now: u64) -> bool {
         let has_status = match self.agent {
             upgrade::Agent::Claude => true,
@@ -1329,14 +1250,11 @@ impl Row {
         true
     }
 
-    /// The tab a behind live holder of this conversation is proven to run in:
-    /// where a row with no recorded tab is shown, and what the owner's word
-    /// may name.
+    /// The tab a behind live holder of this conversation is proven to run in: where a row with no recorded tab is shown, and what the owner's word may name.
     pub(super) fn proven_tab(&self, holders: &[Holder]) -> Option<String> {
         self.behind_holders(holders).find_map(|h| h.tab.clone())
     }
 
-    /// The live holders of this conversation on a build older than its target.
     fn behind_holders<'a>(&'a self, holders: &'a [Holder]) -> impl Iterator<Item = &'a Holder> {
         let to = Version::parse(&self.to);
         let same_build = to.is_some() && Version::parse(&self.from) == to;
@@ -1410,7 +1328,6 @@ impl Row {
         format!("{state}/{to}/{}/{age}", word(&why))
     }
 
-    /// `next-round:<span>` until a stopped round's next one.
     fn next_round_word(&self, now: u64) -> String {
         if self.late_ready {
             return "ready".to_string();
@@ -1422,7 +1339,6 @@ impl Row {
         }
     }
 
-    /// The ladder's rung as `--status`'s `rung=`.
     fn rung_word(&self, now: u64) -> String {
         if !matches!(self.phase, Phase::Pending | Phase::Announced { .. }) {
             return "-".to_string();
@@ -1645,7 +1561,6 @@ impl Row {
         format!("{}: {why}", self.move_words())
     }
 
-    /// The tab's attention text (at most [`MARK_MAX`] bytes, one line: the keyed attention cap).
     fn badge(&self, now: u64) -> Option<String> {
         let Attention::Interrupt(need) = self.attention(now) else {
             return None;
@@ -1667,7 +1582,6 @@ impl Row {
         Some(super::super::one_line(&format!("{head}{tail}"), CAP))
     }
 
-    /// What holds an overdue move, as a class in the owner's words.
     fn overdue_cause(&self, now: u64) -> String {
         // A limit whose named reset has passed ([`Self::limit_passed`]): aterm's own class, said
         // as what the record read.
@@ -1707,12 +1621,10 @@ impl Row {
         }
     }
 
-    /// What holds the move, by class ([`Cause`]).
     fn cause(&self) -> Cause {
         Self::cause_of(&self.wait, !self.held_by.is_empty())
     }
 
-    /// [`Self::cause`] for a recorded `wait`, with processes under the agent (`held`) or none.
     fn cause_of(wait: &str, held: bool) -> Cause {
         match Self::class_of(wait, held) {
             WaitClass::OwnWork => Cause::OwnWork,
@@ -1733,7 +1645,6 @@ impl Row {
         }
     }
 
-    /// The class of a recorded `wait`, with processes under the agent (`held`) or none.
     fn class_of(wait: &str, held: bool) -> WaitClass {
         if held && Self::passes_under_work(wait) {
             WaitClass::OwnWork
@@ -1744,7 +1655,6 @@ impl Row {
         }
     }
 
-    /// A person's or a peer's state that outlasts a look.
     fn stands(wait: &str) -> bool {
         let wait = wait.strip_prefix("release:").unwrap_or(wait);
         matches!(
@@ -1753,27 +1663,23 @@ impl Row {
         )
     }
 
-    /// The notice path's passing gates and a resting round's quiet word.
     fn passes_under_work(wait: &str) -> bool {
         let wait = wait.strip_prefix("release:").unwrap_or(wait);
         let head = wait.split_once(':').map_or(wait, |(head, _)| head);
         !Self::stands(wait) && matches!(head, "" | "attended" | "announce-refused" | "failed")
     }
 
-    /// The class [`Self::overdue_cause`] words.
     fn overdue_class(&self, now: u64) -> WaitClass {
         let held = !self.held_by.is_empty();
         if self.person_gone(now) || (held && Self::passes_under_work(&self.wait)) {
             WaitClass::OwnWork
         } else if self.spend_held() {
-            // Money no reset ends: the owner's hold ([`Self::spend_held`]).
             WaitClass::Person
         } else {
             Self::class_of(&self.wait, held)
         }
     }
 
-    /// What holds the move, as one word (`--status` `cause=`, `--json` `cause`).
     fn cause_word(&self, now: u64) -> &'static str {
         if !matches!(
             self.phase,
@@ -1787,7 +1693,6 @@ impl Row {
         self.overdue_class(now).word()
     }
 
-    /// What the owner is told, as one word (`--status`'s `told=`, `--json`'s `told`).
     fn told_word(&self, now: u64) -> String {
         match self.attention(now) {
             Attention::Quiet => "-".to_string(),
@@ -1828,7 +1733,6 @@ enum WaitClass {
 }
 
 impl WaitClass {
-    /// The class as `--status` says it (`cause=`, [`Row::cause_word`]).
     const fn word(self) -> &'static str {
         match self {
             WaitClass::OwnWork => "own-work",
@@ -1847,7 +1751,6 @@ impl WaitClass {
     }
 }
 
-/// The class of `wait` ([`WaitClass`]).
 fn wait_class(wait: &str) -> WaitClass {
     let wait = wait.strip_prefix("release:").unwrap_or(wait);
     let head = wait.split_once(':').map_or(wait, |(head, _)| head);
@@ -1914,7 +1817,6 @@ fn wait_class(wait: &str) -> WaitClass {
     }
 }
 
-/// The waiting record's sentence for a wait with no words of its own ([`Row::waiting_line`]).
 fn unworded_waiting_line(wait: &str) -> &'static str {
     match wait {
         "changed" | "changed-before-signal" => {
@@ -1968,21 +1870,16 @@ const _: () = assert!(
     "one day: the digest's, the backstop's and the move clock"
 );
 
-/// How long an agent suspended (`^Z`) or put in the background may stand
-/// before the digest says so: the person did it, and knows.
+/// How long an agent suspended (`^Z`) or put in the background may stand before the digest says so.
 pub const SUSPENDED_AFTER_S: u64 = 3_600;
 
-/// How long a wait that is aterm's own fault (its notice could not be typed, or a word this
-/// build does not classify) may stand before the log says so: [`TELL_S`], the bound a notice a
-/// fence keeps refusing has.
+/// How long a wait that is aterm's own fault (its notice could not be typed, or a word this build does not classify) may stand before the log says so.
 pub const HARNESS_TELL_S: u64 = TELL_S;
 
 /// How long a SIGTERMed agent may still be alive before the owner is interrupted.
 pub const HUNG_EXIT_AFTER_S: u64 = 3 * STALE_S;
 
-/// How long the agent's own work is remembered as what holds a move after the last look that
-/// saw it ([`Row::own_work_at`]): one hour, two re-asks, far more than the longest pause between
-/// looks (the ten-minute rung).
+/// How long the agent's own work is remembered as what holds a move after the last look that saw it.
 pub const OWN_WORK_HOLD_S: u64 = 2 * upgrade::REASK_S;
 
 /// The longest a record may go without progress (a notice typed, a round begun, a restart).
@@ -1994,12 +1891,10 @@ pub const LIMIT_MAX_S: u64 = 8 * 86_400;
 /// The longest notices may wait unread behind a full queue.
 pub const QUEUED_MAX_S: u64 = 3 * 86_400;
 
-/// How long a relaunched agent may go without reaching an idle point before the log says so:
-/// three times [`STALE_S`], as a hung shutdown is.
+/// How long a relaunched agent may go without reaching an idle point before the log says so.
 pub const RELAUNCH_STUCK_S: u64 = 3 * STALE_S;
 
-/// How long a relaunched agent may go without reaching an idle point before the owner is
-/// interrupted: twice [`RELAUNCH_STUCK_S`].
+/// How long a relaunched agent may go without reaching an idle point before the owner is interrupted.
 pub const RELAUNCH_INTERRUPT_S: u64 = 2 * RELAUNCH_STUCK_S;
 
 /// Whether the agent's own work holds a move for a look that recorded `wait` with (`held`).
@@ -2007,14 +1902,12 @@ pub(super) fn holds_by_own_work(wait: &str, held: bool) -> bool {
     Row::cause_of(wait, held) == Cause::OwnWork
 }
 
-/// How loud one upgrade is: an alert persists only with a clear reason the owner is needed and
-/// one thing to do.
+/// How loud one upgrade is: an alert persists only with a clear reason the owner is needed and one thing to do.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Attention {
     /// Nothing for the glass: the upgrade is working.
     Quiet,
-    /// Aterm's own fault, which the owner cannot act on: a wait this build does not classify, a
-    /// notice its screen keeps refusing, a daemon move that keeps failing.
+    /// Aterm's own fault, which the owner cannot act on: a wait this build does not classify, a notice its screen keeps refusing, a daemon move that keeps failing.
     Fault(Need),
     /// The owner should know, only the owner can end it, and nothing is lost by waiting a day.
     Digest(Need),
@@ -2097,7 +1990,6 @@ enum Special {
     Foreground,
 }
 
-/// The resume line a person is told for `session`.
 fn resume_command(line: &str, session: &str) -> Option<String> {
     let launch = launch_of(line)?;
     let told = crate::harness::upgrade_drive::resume_command_kept(None, &launch, session)?;
@@ -2106,7 +1998,6 @@ fn resume_command(line: &str, session: &str) -> Option<String> {
     crate::harness::resume::with_env(&env, &told)
 }
 
-/// The claude HOME the recorded relaunch line carries.
 fn home_exports(line: &str) -> Vec<(&'static str, String)> {
     let last = last_command(line);
     let exports: Vec<(&str, &str)> = last[..program_at(&last)]
@@ -2127,7 +2018,6 @@ fn home_exports(line: &str) -> Vec<(&'static str, String)> {
     .collect()
 }
 
-/// The launch a relaunch line planned, as its argv.
 fn launch_of(line: &str) -> Option<Vec<String>> {
     let last = last_command(line);
     let (exe, rest) = last.get(program_at(&last)..)?.split_first()?;
@@ -2147,7 +2037,6 @@ fn launch_of(line: &str) -> Option<Vec<String>> {
     None
 }
 
-/// Whether `word` is one of the relaunch line's `NAME=VALUE` exports, and then its name and value.
 fn export_of(word: &str) -> Option<(&str, &str)> {
     word.split_once('=').filter(|(name, _)| {
         !name.is_empty()
@@ -2157,7 +2046,6 @@ fn export_of(word: &str) -> Option<(&str, &str)> {
     })
 }
 
-/// Where the program stands among `last` ([`last_command`]).
 fn program_at(last: &[String]) -> usize {
     let mut at = 0;
     while let Some(word) = last.get(at).map(String::as_str) {
@@ -2171,7 +2059,6 @@ fn program_at(last: &[String]) -> usize {
     at.min(last.len())
 }
 
-/// The login the recorded relaunch line carries.
 fn resume_login(line: &str) -> Option<String> {
     let last = last_command(line);
     last[..program_at(&last)]
@@ -2228,13 +2115,10 @@ pub(in crate::harness) fn last_command(line: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The most bytes of launch flags a manual resume command carries whole ([`Row::resume_said`]).
 const RESUME_FLAGS_MAX: usize = 80;
 
-/// The tab's mark, in bytes.
 const MARK_MAX: usize = 200;
 
-/// [`Special`] for a recorded wait word, if it is one.
 fn special(wait: &str) -> Option<Special> {
     match wait {
         "draft" | "announce-refused:draft" => Some(Special::Draft),
@@ -2312,10 +2196,6 @@ impl Row {
             Phase::Relaunched { at_s } => {
                 let waited = now.saturating_sub(*at_s);
                 if waited >= RELAUNCH_INTERRUPT_S {
-                    // The upgrade's own damage, and only the owner can act: it ended their agent,
-                    // which came back and reached no prompt (a start-up screen the supervisor
-                    // cannot answer). The same fact as an agent that did not come back
-                    // ([`Self::agent_down`]).
                     Attention::Interrupt(self.relaunch_stuck_interrupt(*at_s))
                 } else if waited >= RELAUNCH_STUCK_S {
                     Attention::Fault(self.relaunch_stuck(waited, *at_s))
@@ -2327,9 +2207,6 @@ impl Row {
                 if self.failed_after_exit() {
                     Attention::Interrupt(self.agent_down(why))
                 } else if why == crate::harness::upgrade_drive::BUILD_FAILS {
-                    // A round the build's hold stopped (its agent released,
-                    // `upgrade::build_hold`): the build is the fact, told as a waiting round tells
-                    // it.
                     Attention::Fault(self.build_fails())
                 } else if why == upgrade::GAVE_UP {
                     self.or_backstop(self.own_work(now), now)
@@ -2401,7 +2278,6 @@ impl Row {
         }
     }
 
-    /// `first`, unless it is quiet.
     fn or_backstop(&self, first: Attention, now: u64) -> Attention {
         if first == Attention::Quiet {
             self.backstop(now)
@@ -2410,7 +2286,6 @@ impl Row {
         }
     }
 
-    /// The backstop: a record that has made no progress (no notice typed, no round begun).
     fn backstop(&self, now: u64) -> Attention {
         let Some(since) = self.last_progress() else {
             return Attention::Quiet;
@@ -2428,7 +2303,6 @@ impl Row {
         }
     }
 
-    /// The last instant this record made progress.
     fn last_progress(&self) -> Option<u64> {
         let past = matches!(self.phase, Phase::Announced { asks, .. } if asks > upgrade::MAX_ASKS);
         let announced = match self.phase {
@@ -2446,7 +2320,6 @@ impl Row {
         (at != 0).then_some(at)
     }
 
-    /// How long a wait that is aterm's own business may stand before it is a fault.
     fn transient_bound(&self) -> Option<u64> {
         let wait = self.wait.strip_prefix("release:").unwrap_or(&self.wait);
         let own = matches!(
@@ -2468,7 +2341,6 @@ impl Row {
         own.then_some(HARNESS_TELL_S)
     }
 
-    /// Whether the agent's own work is what holds the move now.
     fn works(&self, now: u64) -> bool {
         match self.cause() {
             Cause::OwnWork => true,
@@ -2477,7 +2349,6 @@ impl Row {
         }
     }
 
-    /// A record never asked: still pending, and no round has stopped.
     fn never_asked(&self) -> bool {
         self.phase == Phase::Pending
             && self.notices_asked() == 0
@@ -2535,7 +2406,6 @@ impl Row {
             .find(|at| self.attention(*at).level() != here)
     }
 
-    /// The whole rounds of notices in a row that ended in a give-up.
     fn unanswered_rounds(&self) -> u32 {
         if self.streak_why == upgrade::GAVE_UP {
             self.stop_streak
@@ -2544,7 +2414,6 @@ impl Row {
         }
     }
 
-    /// The agent's own work holds the move.
     fn own_work(&self, now: u64) -> Attention {
         let behind = now.saturating_sub(self.behind_since);
         let (rounds, never_asked) = (self.unanswered_rounds(), self.never_asked());
@@ -2599,7 +2468,6 @@ impl Row {
         })
     }
 
-    /// The notices this row's session has been asked and left unanswered so far, in every round.
     fn notices_asked(&self) -> u32 {
         self.notices.max(round_notices(
             &self.phase,
@@ -2636,7 +2504,6 @@ impl Row {
         lines.into_iter().map(|line| cut(&line, 200)).collect()
     }
 
-    /// The upgrade ended the agent and nothing runs in the tab.
     fn agent_down(&self, why: &str) -> Need {
         let (then, command) = match (self.agent, why) {
             (upgrade::Agent::Codex, "no-rollout") => {
@@ -2702,7 +2569,6 @@ impl Row {
         }
     }
 
-    /// A relaunched agent that has reached no idle point for [`RELAUNCH_INTERRUPT_S`].
     fn relaunch_stuck_interrupt(&self, since: u64) -> Need {
         Need {
             kind: "relaunch-stuck",
@@ -2723,7 +2589,6 @@ impl Row {
         }
     }
 
-    /// A SIGTERMed agent that has not exited.
     fn hung_exit(&self, since: u64) -> Need {
         Need {
             kind: "hung-exit",
@@ -2741,7 +2606,6 @@ impl Row {
         }
     }
 
-    /// The agent runs where the upgrade's typing cannot reach it.
     fn no_terminal(&self, owner: &str) -> Need {
         let who = self.agent.product();
         let pane = runs_under(owner);
@@ -2762,7 +2626,6 @@ impl Row {
         }
     }
 
-    /// A build that failed to start and has not been proved to start.
     fn build_fails(&self) -> Need {
         let who = self.agent.product();
         Need {
@@ -2790,7 +2653,6 @@ impl Row {
         }
     }
 
-    /// A launch a resume cannot repeat.
     fn refused_launch(&self, why: &str) -> Need {
         let who = self.agent.product();
         let (how, then) = if why == "not-a-shell-job" {
@@ -2823,7 +2685,6 @@ impl Row {
         }
     }
 
-    /// A stop that repeats.
     fn repeating_stop_need(&self) -> Need {
         let who = self.agent.product();
         let (then, command) = self.resume_said("Quit it and resume it in that tab");
@@ -2854,7 +2715,6 @@ impl Row {
         }
     }
 
-    /// The agent is suspended or in the background of its shell.
     fn suspended(&self) -> Need {
         let who = self.agent.product();
         Need {
@@ -2873,7 +2733,6 @@ impl Row {
         }
     }
 
-    /// A draft nobody sent.
     fn typed_draft(&self, waited: u64) -> Need {
         Need {
             kind: "typed-draft",
@@ -2894,7 +2753,6 @@ impl Row {
         }
     }
 
-    /// A usage limit whose named reset has passed, its notice still the recorded wait.
     fn limit_passed_need(&self, now: u64) -> Need {
         let ended = self.limit_ends_at().unwrap_or(0);
         let ago = behind_words(ended, now).map_or_else(String::new, |span| format!(" {span} ago"));
@@ -2922,7 +2780,6 @@ impl Row {
         }
     }
 
-    /// A wait that is aterm's own fault (`Cause::CouldNotType`, an unclassified word).
     fn harness_stuck(&self, waited: u64) -> Need {
         let what = match self.cause() {
             Cause::Unclassified(word) => {
@@ -2958,7 +2815,6 @@ impl Row {
         }
     }
 
-    /// A record no look has read for two watch gaps, the machine awake past its wake grace.
     fn unwatched_need(&self, since: u64) -> Need {
         Need {
             kind: "unwatched",
@@ -2983,7 +2839,6 @@ impl Row {
         }
     }
 
-    /// A Pending record no look has recorded a wait for (a fault, a record: [`Attention::Fault`]).
     fn no_look(&self, waited: u64) -> Need {
         Need {
             kind: "harness-stuck",
@@ -3007,10 +2862,6 @@ impl Row {
         }
     }
 
-    /// A record that has made no progress in a day, whatever it waits on
-    /// (a fault, a record: [`Attention::Fault`]): the last waits, quoted, so
-    /// the log line answers "why has this tab not been upgraded" without a
-    /// transcript, a journal and a process table.
     fn no_progress(&self, stood: u64, since: u64) -> Need {
         let last: Vec<String> = self
             .waits
@@ -3055,7 +2906,6 @@ impl Row {
         }
     }
 
-    /// A relaunched agent that has reached no idle point (a fault, a record: [`Attention::Fault`]).
     fn relaunch_stuck(&self, waited: u64, since: u64) -> Need {
         Need {
             kind: "relaunch-stuck",
@@ -3079,7 +2929,6 @@ impl Row {
         }
     }
 
-    /// `then` for a need whose command is the resume line ([`Self::resume_said`]).
     fn resume_then(&self, then: &str) -> String {
         let named = match self.agent {
             upgrade::Agent::Claude => resume_login(&self.line).is_some(),
@@ -3098,7 +2947,6 @@ impl Row {
         )
     }
 
-    /// The sentence and the resume command a need hands the owner.
     fn resume_said(&self, then: &str) -> (String, Option<String>) {
         let said = cut(&self.resume_then(then), NEED_THEN_MAX);
         match self.agent {
@@ -3172,12 +3020,10 @@ impl Row {
         crate::harness::resume::with_env(&env, "claude")
     }
 
-    /// The once-only key of a need of `kind` in this row's tab ([`Need::fingerprint`]).
     fn fp(&self, kind: &str) -> String {
         format!("{kind}/{}", word(&self.tab))
     }
 
-    /// The one line the log keeps for a need of `kind` (`detail`: the fact).
     fn log_line(&self, kind: &str, detail: &str) -> String {
         format!(
             "upgrade need={kind} tab={} session={} move={}->{} phase={} behind_since={} {detail}",
@@ -3191,7 +3037,6 @@ impl Row {
     }
 }
 
-/// A wait word cut to what a sentence can hold.
 fn word_short(w: &str) -> String {
     cut(&word(w), 32)
 }
@@ -3255,7 +3100,6 @@ impl Need {
     }
 }
 
-/// `text` cut to at most `max` characters, the cut marked with `…`.
 fn cut(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
@@ -3264,24 +3108,17 @@ fn cut(text: &str, max: usize) -> String {
     out.push('…');
     out
 }
-/// The class [`Row::overdue_cause`] names a move its agent's own work holds
-/// by — what [`Row::asks_on_its_own`] keeps a record.
 const OWN_WORK: &str = "held by its own work";
 
-/// The mark's cause for a round whose last look found nothing holding its next step.
 const NEXT_POINT_CAUSE: &str = "nothing holds it now; its next step goes at its next pause";
 
-/// The row's words for the same round ([`claude_wait_words`]).
 const NEXT_POINT_WORDS: &str = "its next step goes at its next pause";
 
-/// A spend or credit wall naming no reset ([`Row::spend_held`]).
 const SPEND_HELD: &str = "held by its account's credits or spend cap, which only you can lift";
 
 /// The same wall in a stall's own words ([`Row::stall_words`]; within 64 characters).
 pub const SPEND_WORDS: &str = "it is out of credits or at its spend cap";
 
-/// The mark's cause for a usage limit whose named reset has passed with its notice still the
-/// recorded wait ([`Row::limit_passed`]): aterm's own class.
 const LIMIT_PASSED: &str =
     "its usage limit's reset has passed and the last look still read the limit";
 
@@ -3294,8 +3131,7 @@ pub const CLAIMED: &str = "claimed";
 /// The wait of a move whose tab's Autopilot is Off ([`Row::aside`], [`View::set_off`]).
 pub const AUTOPILOT_OFF: &str = "autopilot-off";
 
-/// The wait of a move whose tab's agent its own switch holds off
-/// (`[harness.<agent>] enabled = false`).
+/// The wait of a move whose tab's agent its own switch holds off.
 pub const AGENT_OFF: &str = "agent-off";
 
 /// The tabs where no host worker runs by a hand the host does not hold ([`Row::set_aside`]).
@@ -3329,7 +3165,6 @@ pub enum Remedy {
 /// How long a person at the tab (`attended`) stays the owner's word for a wait with no look.
 pub const ATTENDED_SEEN_S: u64 = 3 * upgrade::QUIET_S;
 
-/// Whether `--now` moves an overdue upgrade past the wait a step recorded ([`upgrade::wait_word`]).
 fn now_moves_past(wait: &str) -> bool {
     matches!(wait, "left-typed-backoff" | "queued") || wait.starts_with("announce-refused:")
 }
@@ -3345,7 +3180,6 @@ pub(in crate::harness) fn wait_words_of(agent: upgrade::Agent, wait: &str) -> Op
     }
 }
 
-/// Whether a row of `agent`'s reads its record's ready clock.
 const fn reads_ready_clock(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
@@ -3356,7 +3190,6 @@ const fn reads_ready_clock(agent: upgrade::Agent) -> bool {
     }
 }
 
-/// Whether `agent`'s lane types a release line (`upgrade_drive::release`, [`Row::release`]).
 const fn types_release(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
@@ -3367,7 +3200,6 @@ const fn types_release(agent: upgrade::Agent) -> bool {
     }
 }
 
-/// Whether `agent`'s `attended` wait names the person at its tab on the look's clock.
 const fn attended_is_person(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
@@ -3378,7 +3210,6 @@ const fn attended_is_person(agent: upgrade::Agent) -> bool {
     }
 }
 
-/// Whether a move of `agent`'s that failed after its exit is an ordinary stopped upgrade again.
 const fn held_again_after_exit(agent: upgrade::Agent) -> bool {
     match agent {
         upgrade::Agent::Claude => true,
@@ -3389,7 +3220,6 @@ const fn held_again_after_exit(agent: upgrade::Agent) -> bool {
     }
 }
 
-/// What a Claude Code wait stands for, in a person's words ([`Row::wait_words`]).
 fn claude_wait_words(wait: &str) -> Option<&'static str> {
     Some(match wait {
         "background" | "not-idle:shell" => "its own work runs",
@@ -3435,7 +3265,6 @@ fn claude_wait_words(wait: &str) -> Option<&'static str> {
     })
 }
 
-/// The relaunch line's own waits.
 fn relaunch_line_words(wait: &str) -> Option<&'static str> {
     Some(match wait {
         "exiting" => "it has not exited yet",
@@ -3453,7 +3282,6 @@ fn relaunch_line_words(wait: &str) -> Option<&'static str> {
     })
 }
 
-/// How long a session has been behind, in a person's words (`40 min`, `8 h`, `3 days`).
 fn behind_words(since: u64, now: u64) -> Option<String> {
     const YEAR_S: u64 = 365 * 86_400;
     let secs = now.checked_sub(since).filter(|_| since > 0)?;
@@ -3475,7 +3303,6 @@ pub fn elapsed_words(secs: u64) -> String {
     }
 }
 
-/// The first unix second after `now` at which [`behind_words`] of `since` reads otherwise.
 fn behind_words_change_at(since: u64, now: u64) -> Option<u64> {
     behind_words(since, now)?;
     let secs = now - since;
@@ -3489,7 +3316,6 @@ fn behind_words_change_at(since: u64, now: u64) -> Option<u64> {
     Some(since.saturating_add((secs / unit + 1) * unit))
 }
 
-/// Why a stall of `kind` ([`Row::stall`], any kind but `overdue`) will not move on its own.
 fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
     let after_exit = match agent {
         upgrade::Agent::Claude => None,
@@ -3529,7 +3355,6 @@ fn stall_reason(agent: upgrade::Agent, kind: &str) -> String {
     }
 }
 
-/// Why a move stopped, in a person's words.
 fn stop_words(agent: upgrade::Agent, why: &str) -> String {
     let who = match agent {
         upgrade::Agent::Claude => "Claude",
@@ -3557,7 +3382,6 @@ fn stop_words(agent: upgrade::Agent, why: &str) -> String {
     }
 }
 
-/// Why a Codex move stopped, for the kinds that stop it after its exit.
 fn codex_failure(why: &str) -> Option<&'static str> {
     Some(match why {
         "no-resume" => "its resume line was typed at the prompt and no Codex came up in the tab",
@@ -3640,12 +3464,10 @@ pub(in crate::harness) fn runs_under(owner: &str) -> &str {
     }
 }
 
-/// Whether a stop's reason is a refusal (the upgrade would not type or signal at all).
 fn refusal(why: &str) -> bool {
     why == "not-a-shell-job" || why.starts_with("argv:") || why.starts_with("line:")
 }
 
-/// A third party's or a derived word, cut to what a roster token may carry.
 fn word(s: &str) -> String {
     let keep =
         |c: char| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '(' | ')');
@@ -3666,7 +3488,6 @@ fn rows_at(opts: &Opts, now: u64) -> Vec<Row> {
     read_rows(opts, now).0
 }
 
-/// [`rows_at`], plus whether the records were read whole.
 fn read_rows(opts: &Opts, now: u64) -> (Vec<Row>, bool) {
     let (rows, listed, unread) = read_records(opts, now);
     (rows, listed && unread.is_empty())
@@ -3680,7 +3501,6 @@ struct Unread {
     path: std::path::PathBuf,
 }
 
-/// [`read_rows`] apart: the rows of the records read.
 fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
     let dir = match std::fs::read_dir(state_dir(opts)) {
         Ok(dir) => dir,
@@ -3742,7 +3562,6 @@ fn read_records(opts: &Opts, now: u64) -> (Vec<Row>, bool, Vec<Unread>) {
     (out, whole, unread)
 }
 
-/// One upgrade record's row ([`read_rows`]).
 fn record_row(opts: &Opts, session: &str, text: &str, now: u64) -> Option<Row> {
     #[cfg(test)]
     if session == RECORD_PANICS {
@@ -3770,7 +3589,6 @@ pub fn status_rows(opts: &Opts, claims: bool) -> (Vec<Row>, bool) {
     )
 }
 
-/// The tabs set aside by a hand the host does not hold ([`Aside`]).
 fn aside_tabs(opts: &Opts, claims: bool) -> Aside {
     if !claims {
         return Aside::default();
@@ -3795,7 +3613,6 @@ fn aside_tabs(opts: &Opts, claims: bool) -> Aside {
     }
 }
 
-/// [`status_rows`] at `now`, over `holders` and the tabs `aside` names.
 fn status_rows_with(
     opts: &Opts,
     now: u64,
@@ -3853,7 +3670,6 @@ pub fn tab_row<'a>(rows: &'a [Row], tab: &str) -> Option<&'a Row> {
         .max_by(|a, b| a.tab_rank().cmp(&b.tab_rank()))
 }
 
-/// The conversations whose rows [`Row::standing`] must vet.
 fn sessions_to_vet(rows: &[Row]) -> BTreeSet<String> {
     rows.iter()
         .filter(|r| {
@@ -3877,12 +3693,10 @@ pub(super) struct Holder {
     pub(super) answers: Option<String>,
 }
 
-/// Whether `pid` is proven not the foreground of its terminal, from the kernel now.
 fn not_in_front(pid: u32) -> bool {
     super::ids(pid).is_some_and(|(_, group, front)| group > 0 && front > 0 && group != front)
 }
 
-/// The live holders of `sessions`.
 fn holders(
     opts: &Opts,
     sessions: &BTreeSet<String>,
@@ -3978,7 +3792,6 @@ pub(super) struct ShellGone {
     pub(super) exited_at: u64,
 }
 
-/// The fresh restarts' rows in `sessions` whose shell is gone and that are still shown at `now`.
 fn shell_gone_afresh(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> Vec<ShellGone> {
     sessions
         .iter()
@@ -4030,10 +3843,6 @@ pub(super) fn answering_shell_gone(
     out
 }
 
-/// The live holder session file `sf` is: its tab proven by its process group
-/// being one tab's foreground group in `tabs`, or by its environment's
-/// `ATERM_PARENT_SESSION_ID`, two disagreeing proofs proving nothing
-/// ([`holders`]).
 fn holder_of(sf: &upgrade::SessionFile, tabs: Option<&[LiveTab]>) -> Holder {
     let by_group =
         tabs.and_then(|tabs| unique_tab_for_group(tabs, process_group(sf.pid)?).map(str::to_owned));
@@ -4058,7 +3867,6 @@ fn holder_of(sf: &upgrade::SessionFile, tabs: Option<&[LiveTab]>) -> Holder {
     }
 }
 
-/// The tabs a fresh restart left with no agent.
 fn agent_down_tabs(opts: &Opts, sessions: &BTreeSet<String>, now: u64) -> BTreeSet<String> {
     sessions
         .iter()
@@ -4112,7 +3920,6 @@ pub fn ask(opts: &Opts, sid: &str, what: Ask, claims: bool) -> Result<Row, Strin
     ask_aside(opts, sid, what, &|| aside_tabs(opts, claims))
 }
 
-/// [`ask`] over the tabs `aside` names, asked only for a row a live process may hold.
 fn ask_aside(opts: &Opts, sid: &str, what: Ask, aside: &dyn Fn() -> Aside) -> Result<Row, String> {
     let (mut row, held) = ask_within(opts, sid, what, None, ASK_LOCK_WAIT, &|s| {
         holders(opts, s, None)
@@ -4150,7 +3957,6 @@ struct Shown<'a> {
     session: &'a str,
 }
 
-/// The word written as [`ask`] writes it, waiting at most `wait` for the lock.
 fn ask_within(
     opts: &Opts,
     sid: &str,
@@ -4368,9 +4174,6 @@ fn ask_within(
     Ok((Row::of(&session, &st, now).in_flow(opts, now), held))
 }
 
-/// Whether the build a word was given for is the one an upgrade moves to:
-/// equal as versions (`2.1` is `2.1.0`), or, where either does not parse, as
-/// text.
 fn same_target(shown: &str, to: &str) -> bool {
     match (upgrade::Version::parse(shown), upgrade::Version::parse(to)) {
         (Some(a), Some(b)) => a == b,
@@ -4415,10 +4218,8 @@ pub struct View {
 /// Where a view keeps [`View::back`] beside the records it reads.
 pub const BACK_FILE: &str = "agents-back";
 
-/// The most [`BACK_FILE`] is read of: far past one line per record.
 const BACK_MAX: u64 = 64 * 1024;
 
-/// [`View::back`] as [`write_back`] left it.
 fn read_back(opts: &Opts) -> BTreeMap<String, u64> {
     let path = state_dir(opts).join(BACK_FILE);
     let Some(text) = std::fs::File::open(&path).ok().and_then(|f| {
@@ -4439,7 +4240,6 @@ fn read_back(opts: &Opts) -> BTreeMap<String, u64> {
         .collect()
 }
 
-/// Writes `back` to [`BACK_FILE`] (renamed into place).
 fn write_back(opts: &Opts, back: &BTreeMap<String, u64>) {
     let path = state_dir(opts).join(BACK_FILE);
     if back.is_empty() {
@@ -4453,12 +4253,8 @@ fn write_back(opts: &Opts, back: &BTreeMap<String, u64>) {
     let _ = crate::harness::upgrade_models::write_atomic(&path, &body);
 }
 
-/// How far the wall clock may run ahead of the monotonic one between two looks
-/// before the host is taken to have slept ([`View::note_look`]): past any
-/// clock slew, well short of a watch gap.
 const SLEPT_S: u64 = 60;
 
-/// Pauses before looking again at an unreadable roster, from two seconds to ten minutes.
 const UNREAD_RETRY: [std::time::Duration; 4] = [
     std::time::Duration::from_secs(2),
     std::time::Duration::from_secs(16),
@@ -4512,7 +4308,6 @@ impl View {
         self.refresh_with_keeping(opts, tabs, now, holders, &mut |rows, _| summary(rows))
     }
 
-    /// [`Self::refresh_with`], handing over the tabs left as they stand.
     fn refresh_with_keeping(
         &mut self,
         opts: &Opts,
@@ -4702,7 +4497,6 @@ impl View {
         next
     }
 
-    /// Lowers `owner=upgrade` marks this view did not raise.
     fn reconcile(
         &mut self,
         opts: &Opts,
@@ -4748,10 +4542,7 @@ impl View {
         self.aside.off = tabs.iter().cloned().collect();
     }
 
-    /// The tabs whose agent its own switch holds off (`aterm-gui`'s `harness_host`;
-    /// `[harness.<agent>] enabled = false` admits no worker there), said before each look: a move
-    /// owed there reads as held by that switch ([`AGENT_OFF`], [`Row::set_aside`]), never as a
-    /// record its host stopped checking.
+    /// The tabs whose agent its own switch holds off (`aterm-gui`'s `harness_host`; `[harness.<agent>] enabled = false` admits no worker there), said before each look.
     pub fn set_agent_off(&mut self, tabs: &[String]) {
         self.aside.agent_off = tabs.iter().cloned().collect();
     }
@@ -4834,7 +4625,6 @@ impl View {
         }
     }
 
-    /// Brings the tabs' `owner=upgrade` attention to `want`.
     fn mark(&mut self, opts: &Opts, want: &BTreeMap<String, String>) {
         if *want == self.badged {
             return;
@@ -4880,7 +4670,6 @@ pub fn tab_rows(rows: &[Row]) -> Vec<Row> {
         .collect()
 }
 
-/// Each live tab's `owner=upgrade` mark.
 fn marks(rows: &[Row], now: u64) -> BTreeMap<String, String> {
     tab_rows(rows)
         .into_iter()
@@ -4891,7 +4680,6 @@ fn marks(rows: &[Row], now: u64) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// The unix second after `now` at which one of `rows` next reads otherwise by time alone.
 fn next_change(rows: &[Row], now: u64) -> Option<u64> {
     rows.iter()
         .flat_map(|r| {
@@ -4992,7 +4780,6 @@ pub fn word_marker(state: &Path) -> std::path::PathBuf {
     state.join("upgrade").join("owner").join("word")
 }
 
-/// Replaces the [`word_marker`] (new file renamed over the old, so its identity changes).
 fn announce_word(opts: &Opts, now: u64) {
     let path = word_marker(&opts.state);
     let Some(dir) = path.parent() else {

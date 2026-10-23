@@ -133,8 +133,6 @@ fn shift_block(
                 } else if there.is_blank() {
                     tail = true;
                 } else {
-                    // A glyph of the tail standing on other text: a
-                    // rewrite, not a move.
                     return None;
                 }
             }
@@ -405,7 +403,7 @@ enum SoleArrival {
 }
 
 impl Witness {
-    /// An empty witness with capacity reserved once ([`WITNESS_CAP`]) for the records and the deferral's scratch (at most one entry per record), so a frame with a withheld row never allocates.
+    /// An empty witness with capacity reserved once ([`WITNESS_CAP`]).
     #[inline]
     #[must_use]
     pub fn new() -> Self {
@@ -437,7 +435,7 @@ impl Witness {
         }
     }
 
-    /// THE SCROLL RETURN: how many rows full-grid scrolls carried the records up since the last walk, while that is past the follow offsets (`> 2`), else `0`.
+    /// Rows full-grid scrolls carried the records up since the last walk, while past the follow offsets (`> 2`), else `0`.
     #[inline]
     #[must_use]
     pub const fn scroll_carry(&self) -> u16 {
@@ -510,9 +508,20 @@ impl Witness {
                 .find(|cell| !cell.leaving() && cell.row == from.0 && cell.col == last_col)
                 .map(|cell| (from.0, cell.cohort))
         });
+        let mut sample_row: Option<(u16, bool)> = None;
         for cell in cells {
-            if !cell.leaving() && rows.iter().any(|s| s.row == cell.row) {
-                self.follow_runs.push((cell.row, cell.cohort));
+            if !cell.leaving() {
+                let sampled = match sample_row {
+                    Some((r, ok)) if r == cell.row => ok,
+                    _ => {
+                        let ok = rows.iter().any(|s| s.row == cell.row);
+                        sample_row = Some((cell.row, ok));
+                        ok
+                    }
+                };
+                if sampled {
+                    self.follow_runs.push((cell.row, cell.cohort));
+                }
             }
         }
         self.follow_runs.sort_unstable();
@@ -744,7 +753,6 @@ impl Witness {
                 if v.found == 0 {
                     lead.get_or_insert(col);
                 } else if !after {
-                    // Inside the block, or trailing it flush: it rides.
                     ext_hi = col;
                 }
             } else {
@@ -795,11 +803,20 @@ impl Witness {
     ) {
         out.clear();
         self.follow_runs.clear();
+        let mut sample_row: Option<(u16, Option<RowSample<'_>>)> = None;
         for cell in cells {
             if cell.leaving() {
                 continue;
             }
-            let Some(own) = rows.iter().find(|s| s.row == cell.row) else {
+            let own = match sample_row {
+                Some((r, s)) if r == cell.row => s,
+                _ => {
+                    let s = rows.iter().find(|s| s.row == cell.row).copied();
+                    sample_row = Some((cell.row, s));
+                    s
+                }
+            };
+            let Some(own) = own else {
                 continue;
             };
             let gone = self
@@ -1201,8 +1218,6 @@ impl Witness {
                         self.seen[i].deferred = true;
                     }
                 } else if self.was_blank(cell) {
-                    // No verdict this walk: it keeps what the witness knew
-                    // ([`Witness::blank_seen`]).
                     self.blank_next.push((cell.row, cell.col, cell.born));
                 }
                 continue;
@@ -1221,9 +1236,6 @@ impl Witness {
                         !unit.is_blank() && unit != self.seen[i].unit
                     });
                     if replaced {
-                        // A dark partial release is still an identity claim:
-                        // different content revokes it rather than letting a
-                        // later coincidentally identical repaint restore it.
                         Self::push_unit(retire, cell.row, cell.col, cell.born, self.seen[i].unit);
                     } else {
                         self.seen[i].live = true;
@@ -1235,7 +1247,6 @@ impl Witness {
                 if let Some(i) = self.find(cell.row, cell.col, cell.born) {
                     self.seen[i].live = true;
                 } else if self.was_blank(cell) {
-                    // Unsampled, it keeps what the witness knew.
                     self.blank_next.push((cell.row, cell.col, cell.born));
                 }
                 continue;
@@ -1369,7 +1380,10 @@ impl Witness {
                 }
             }
         }
-        if !retire.is_empty() {
+        if !retire.is_empty() && !self.retired_runs.is_empty() {
+            self.retired_cells.clear();
+            self.retired_cells.extend_from_slice(retire);
+            self.retired_cells.sort_unstable();
             for i in 0..self.retired_runs.len() {
                 let (row, cohort) = self.retired_runs[i];
                 let mut lo = u16::MAX;
@@ -1378,7 +1392,10 @@ impl Witness {
                 for cell in cells {
                     if cell.row == row
                         && cell.cohort == cohort
-                        && retire.contains(&(cell.row, cell.col, cell.born))
+                        && self
+                            .retired_cells
+                            .binary_search(&(cell.row, cell.col, cell.born))
+                            .is_ok()
                     {
                         named = true;
                         lo = lo.min(cell.col);
@@ -1398,7 +1415,10 @@ impl Witness {
                         continue;
                     }
                     let id = (cell.row, cell.col, cell.born);
-                    if !retire.contains(&id) && !release.contains(&id) {
+                    if self.retired_cells.binary_search(&id).is_err()
+                        && !retire.contains(&id)
+                        && !release.contains(&id)
+                    {
                         retire.push(id);
                     }
                 }

@@ -439,6 +439,130 @@ pub fn hang_detector(secs: u32) -> Vec<String> {
 /// The packages whose Linux tests the proof runs.
 pub const TESTED: [&str; 3] = ["aterm-uds", "aterm-pty", "libc"];
 
+/// The static bootstrap verifier's package and executable (install.sh's Linux verifier).
+pub const VERIFIER: &str = "aterm-bootstrap-verify";
+
+/// The two static builds of [`VERIFIER`] the lane makes, as `(shape, target dir under the
+/// lane, debug assertions)`: the shipped one, and one with the test anchor compiled in.
+pub const VERIFIER_SHAPES: [(&str, &str, bool); 2] = [
+    ("shipped", "verifier-target", false),
+    ("test", "verifier-test-target", true),
+];
+
+/// The cargo arguments of one static build of [`VERIFIER`] for `triple`, as the release
+/// producer builds it: `--release --target <triple>` with the C library linked in
+/// (`aterm_bootstrap_verify::pin::static_build_config`), and with debug assertions on for
+/// the test shape.
+#[must_use]
+pub fn verifier_build_args(manifest: &str, triple: &str, assertions: bool) -> Vec<String> {
+    let mut argv: Vec<String> = [
+        "cargo",
+        "build",
+        "--locked",
+        "--release",
+        "--manifest-path",
+        manifest,
+        "-p",
+        VERIFIER,
+        "--target",
+        triple,
+        "--config",
+    ]
+    .iter()
+    .map(|s| (*s).to_string())
+    .collect();
+    argv.push(aterm_bootstrap_verify::pin::static_build_config(triple));
+    if assertions {
+        argv.extend([
+            "--config".to_string(),
+            "profile.release.debug-assertions=true".to_string(),
+        ]);
+    }
+    argv
+}
+
+/// install.sh's bootstrap verifier on one architecture: [`VERIFIER_SHAPES`] built
+/// ([`verifier_build_args`]); its install_sh suite run through install.sh over the test
+/// shape, the shipped shape's own test (`--include-ignored`) holding it to a static ELF
+/// that trusts the paper master alone; then install.sh's embedded verifier's tests, which
+/// need the Python 3.11+ and OpenSSL 3 this guest provides.
+fn verifier_rows(up: &Up, arch: Arch, tag: &str, repo: &str, lane: &str) -> Vec<Row> {
+    let manifest = format!("{repo}/Cargo.toml");
+    let mut rows = Vec::new();
+    let mut built = Vec::new();
+    for (shape, dir, assertions) in VERIFIER_SHAPES {
+        let target_dir = format!("{lane}/{dir}");
+        let mut argv = hang_detector(TEST_ROW_HANG_SECS);
+        argv.extend(guest::with_env(
+            &guest::cargo_env(arch, &target_dir, false),
+            &verifier_build_args(&manifest, arch.triple(), assertions),
+        ));
+        let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+        let exe = format!("{target_dir}/{}/release/{VERIFIER}", arch.triple());
+        let name = format!("{tag} bootstrap verifier: static {shape} build");
+        if !out.ok() {
+            rows.push(Row {
+                name,
+                verdict: Verdict::Fail,
+                secs: out.secs,
+                detail: format!("exit {:?}: {}", out.code, out.tail(5)),
+            });
+            return rows;
+        }
+        rows.push(Row {
+            name,
+            verdict: Verdict::Pass,
+            secs: out.secs,
+            detail: exe.clone(),
+        });
+        built.push(exe);
+    }
+    let mut env = guest::cargo_env(arch, &format!("{lane}/target"), false);
+    env.push(("ATERM_TEST_BOOTSTRAP_VERIFIER".into(), built[1].clone()));
+    env.push((
+        "ATERM_TEST_BOOTSTRAP_VERIFIER_SHIPPED".into(),
+        built[0].clone(),
+    ));
+    let suites: [(&str, &[&str]); 2] = [
+        (
+            "bootstrap verifier, static, through install.sh",
+            &["-p", VERIFIER, "--tests", "--", "--include-ignored"],
+        ),
+        (
+            "install.sh's embedded verifier (Python 3.11+, OpenSSL 3)",
+            &[
+                "-p",
+                "aterm-update",
+                "--test",
+                "install_sh",
+                "--",
+                "linux_verify::",
+            ],
+        ),
+    ];
+    for (what, selection) in suites {
+        let mut cargo = vec![
+            "cargo".to_string(),
+            "test".into(),
+            "--locked".into(),
+            "--no-fail-fast".into(),
+            "--manifest-path".into(),
+            manifest.clone(),
+        ];
+        cargo.extend(arch.target_args());
+        cargo.extend(selection.iter().map(|s| (*s).to_string()));
+        let mut argv = hang_detector(TEST_ROW_HANG_SECS);
+        argv.extend(guest::with_env(&env, &cargo));
+        let out = up.lima.shell_streamed(&up.home, &argv, "  | ");
+        rows.push(translator_not_runs(
+            test_verdict(&format!("{tag} tests: {what}"), &out),
+            &out.text,
+            arch,
+        ));
+    }
+    rows
+}
+
 /// The shell integration's suite (aterm-shell-integration's unit and integration tests), on real shells on a real pty.
 pub const SHELLS: &str = "aterm-shell-integration";
 
@@ -1945,6 +2069,12 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
                 stopped = Some(s);
                 break 'arches;
             }
+            println!("\n=== {tag}: install.sh's bootstrap verifier, static and embedded ===");
+            rows.extend(verifier_rows(&up, arch, &tag, &repo, &lane));
+            if let Err(s) = crate::stop::check() {
+                stopped = Some(s);
+                break 'arches;
+            }
             println!(
                 "\n=== {tag}: aterm-dl, aterm-x11, aterm-wayland, aterm-xkb, aterm-window tests (Xvfb, weston, Mutter) ==="
             );
@@ -2447,6 +2577,39 @@ mod tests {
             secs: 1.0,
             detail: String::new(),
         }
+    }
+
+    /// The lane builds the verifier as a release does, static for an explicit target, and
+    /// only its test shape with debug assertions, in a target directory of its own.
+    #[test]
+    fn the_lane_builds_the_verifier_as_a_release_does() {
+        for arch in [Arch::Aarch64, Arch::X86_64] {
+            let triple = arch.triple();
+            for (_, _, assertions) in VERIFIER_SHAPES {
+                let argv = verifier_build_args("/r/Cargo.toml", triple, assertions);
+                let pair = |a: &str, b: &str| argv.windows(2).any(|w| w[0] == a && w[1] == b);
+                assert!(pair("--target", triple), "{argv:?}");
+                assert!(pair("-p", VERIFIER), "{argv:?}");
+                assert!(argv.iter().any(|a| a == "--release"), "{argv:?}");
+                assert!(
+                    pair(
+                        "--config",
+                        &aterm_bootstrap_verify::pin::static_build_config(triple)
+                    ),
+                    "{argv:?}"
+                );
+                assert_eq!(
+                    pair("--config", "profile.release.debug-assertions=true"),
+                    assertions,
+                    "{argv:?}"
+                );
+            }
+        }
+        assert_ne!(VERIFIER_SHAPES[0].1, VERIFIER_SHAPES[1].1);
+        assert!(
+            !VERIFIER_SHAPES[0].2 && VERIFIER_SHAPES[1].2,
+            "the shipped shape first"
+        );
     }
 
     #[test]

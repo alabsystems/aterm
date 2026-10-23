@@ -1,10 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! One terminal hold per single-pane frame: effect probes, grid extraction,
-//! damage consume and cursor/colour facts come from one acquisition, so no
-//! PTY write lands between them. Driven through `redraw_window` on a
-//! scripted CPU surface.
+//! One terminal hold per single-pane frame: effect probes, grid extraction, damage consume and cursor/colour facts come from one acquisition, so no PTY write lands between them.
 use super::redraw_hold_hook;
 use crate::scripted_redraw_fixture::{feed, has_damage, scripted_app};
 use crate::{WindowId, term_lock, term_lock_acquisitions_on_this_thread};
@@ -35,8 +32,7 @@ fn lit_app() -> crate::App {
     app
 }
 
-/// An echo frame takes the terminal mutex once, with effects off and with
-/// the cursor effect live.
+/// An echo frame takes the terminal mutex once, with effects off and with the cursor effect live.
 #[test]
 fn an_ordinary_echo_frame_takes_the_terminal_lock_once() {
     let wid = WindowId(0);
@@ -62,9 +58,7 @@ fn an_ordinary_echo_frame_takes_the_terminal_lock_once() {
     }
 }
 
-/// A PTY write landing right after the frame's hold is released leaves the
-/// frame coherent (key, extraction and glass all describe the grid before
-/// the write); the write stays damaged and the next frame presents it.
+/// A PTY write landing right after the frame's hold is released leaves the frame coherent (key, extraction and glass all describe the grid before the write); the write stays damaged and the next frame presents it.
 #[test]
 fn a_write_landing_after_the_hold_leaves_the_frame_coherent_and_presents_next() {
     let wid = WindowId(0);
@@ -82,7 +76,6 @@ fn a_write_landing_after_the_hold_leaves_the_frame_coherent_and_presents_next() 
         let (term, seen) = (term.clone(), Rc::clone(&seen));
         redraw_hold_hook::install(move || {
             let mut t = term_lock(&term);
-            // Nothing has written since the hold: these are the frame's facts.
             let cursor = t.cursor();
             seen.set(Some((t.damage_epoch(), (cursor.row, cursor.col))));
             t.process(b"\r\nADVERSARY");
@@ -125,8 +118,7 @@ fn a_write_landing_after_the_hold_leaves_the_frame_coherent_and_presents_next() 
     );
 }
 
-/// With the cursor glow off an echo frame copies no cursor row into the
-/// probe buffers; with it on (control) it does.
+/// With the cursor glow off an echo frame copies no cursor row into the probe buffers; with it on (control) it does.
 #[test]
 fn an_effects_off_echo_frame_copies_no_cursor_row() {
     let wid = WindowId(0);
@@ -154,8 +146,7 @@ fn an_effects_off_echo_frame_copies_no_cursor_row() {
     );
 }
 
-/// The single-pane present reuses the glow's RenderInput allocation across
-/// presents, and switching the effect off erases the glow.
+/// The single-pane present reuses the glow's RenderInput allocation across presents, and switching the effect off erases the glow.
 #[test]
 fn single_pane_glow_handoff_reuses_buffers_and_erases_on_disable() {
     let wid = WindowId(0);
@@ -215,9 +206,7 @@ fn single_pane_glow_handoff_reuses_buffers_and_erases_on_disable() {
     );
 }
 
-/// Single-pane predictive local echo reconciles against the frame hold's own
-/// snapshot without taking a second terminal lock, so an echo arriving right
-/// after the hold is released never blanks the predicted glyph for a frame.
+/// Single-pane predictive local echo reconciles against the frame hold's own snapshot without taking a second terminal lock, so an echo arriving right after the hold is released never blanks the predicted glyph for a frame.
 #[test]
 fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_echo() {
     let wid = WindowId(0);
@@ -227,8 +216,6 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
     feed(&app, b"$ ");
     app.redraw_window(wid);
 
-    // 1. Arm a prediction at the live cursor (0, 2) with no PTY echo yet:
-    //    the frame takes ONE terminal hold and overlays the tentative glyph.
     let now = crate::app_input::past_timeline_start();
     let coords = {
         let term = app
@@ -254,8 +241,6 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
             now,
         ));
     }
-    // Every frame below presents at the guess's own instant: a stalled test
-    // thread must not age it past its glitch window.
     let before = term_lock_acquisitions_on_this_thread();
     app.redraw_window_at(wid, now);
     let taken = term_lock_acquisitions_on_this_thread() - before;
@@ -272,14 +257,6 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
         "the predicted glyph is visible at (0, 2)"
     );
 
-    // 2. Interleaved PTY echo race: the PTY echoes `k` immediately after the
-    //    frame's one terminal hold drops (before prediction reconciliation runs).
-    //    Under the old two-lock path, reconciliation re-locked the terminal,
-    //    observed the post-echo cursor `(0, 3)` and grid `'k'`, retired the
-    //    prediction, and left the pre-echo `input_scratch` cell `(0, 2)` blank
-    //    for one frame (`SingleHoldPredictionReconcile`). Under single-hold
-    //    reconciliation, the prediction survives to paint this frame and is
-    //    confirmed on the next frame when the echo's grid snapshot is extracted.
     let term = app
         .front_terminal(wid)
         .expect("front terminal")
@@ -308,8 +285,6 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
         "the interleaved echo's damage remains pending for the next frame"
     );
 
-    // 3. The next frame extracts the echoed `'k'` from the terminal grid and
-    //    retires the prediction cleanly.
     let before = term_lock_acquisitions_on_this_thread();
     app.redraw_window_at(wid, now);
     let taken = term_lock_acquisitions_on_this_thread() - before;
@@ -332,10 +307,7 @@ fn a_predicted_frame_takes_one_terminal_lock_and_never_blanks_on_interleaved_ech
     );
 }
 
-/// Type `ch` as a guess at the front terminal's cursor, at `born`. Returns what a
-/// predictor holding only that guess hands over
-/// ([`crate::predict::Predictor::take_link_estimate`]): a link nothing has
-/// measured, owing that one keystroke's echo.
+/// Type `ch` as a guess at the front terminal's cursor, at `born`.
 fn arm_prediction(
     app: &mut crate::App,
     ch: char,
@@ -344,8 +316,7 @@ fn arm_prediction(
     arm_prediction_with(app, ch, born, None)
 }
 
-/// [`arm_prediction`] with `rule_off` switched off in both predictors it arms,
-/// through the predictor's debug-only negative-control seam.
+/// [`arm_prediction`] with `rule_off` switched off in both predictors it arms, through the predictor's debug-only negative-control seam.
 fn arm_prediction_with(
     app: &mut crate::App,
     ch: char,
@@ -379,12 +350,7 @@ fn arm_prediction_with(
     unmeasured.take_link_estimate()
 }
 
-/// The frame's observe reads a row the engine reorders (right-to-left text) at
-/// LOGICAL columns, so a guess's echo there is found where its key typed it, and
-/// confirms. The predictor declines a right-to-left glyph outright
-/// (`Rule::RightToLeftRows`: UAX #9 decides where its echo is drawn, and moves
-/// its neighbours), so the host's half is driven with that rule switched off;
-/// with it in force the glyph is declined, owed, and nothing is armed.
+/// The frame's observe reads a row the engine reorders (right-to-left text) at LOGICAL columns, so a guess's echo there is found where its key typed it, and confirms.
 #[test]
 fn prediction_reconcile_confirms_rtl_echo_in_logical_columns() {
     let wid = WindowId(0);
@@ -439,8 +405,6 @@ fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
     app.redraw_window_at(wid, born);
     let ws = app.windows.get_mut(&wid).unwrap();
     assert!(!ws.predictor.idle(), "IME preedit has not reached the PTY");
-    // The armed guess still owes its echo (custody, 90bb2dc9b7): taking the
-    // estimate retires it with that debt. What must not happen is a measurement.
     let estimate = ws.predictor.take_link_estimate();
     assert!(
         !estimate.has_sample(),
@@ -452,15 +416,7 @@ fn prediction_reconcile_never_confirms_uncommitted_ime_text() {
     );
 }
 
-/// The single-pane path paints a state chain as the composed path does
-/// (`render-paint-prediction-chain`): every cell of its displayed state or
-/// none, with the chain's OWN cursor, which a pure motion moves with no cell
-/// painted and an erase leaves on the cell it vacated. Driven through the
-/// press path (`App::input`) and `redraw_window` on a one-pane window, in
-/// `always` (the class ladder is Adaptive's; this is the painter's half). The
-/// glyph lane's cursor, one past the newest painted cell, would put a pure
-/// motion's cursor nowhere (it paints no cell) and an erase's a cell right of
-/// its vacated cell.
+/// The single-pane path paints a state chain as the composed path does (`render-paint-prediction-chain`): every cell of its displayed state or none, with the chain's OWN cursor, which a pure motion moves with no cell painted and an erase leaves on the cell it vacated.
 #[test]
 fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
     use crate::input::{InputEvent, Source};
@@ -473,7 +429,6 @@ fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
         event_type: KeyEventType::Press,
     };
     let wid = WindowId(0);
-    // (the edit key, the cell `$ ab`'s (0, 3) shows on glass)
     for (key, on_glass) in [(NamedKey::ArrowLeft, 'b'), (NamedKey::Backspace, ' ')] {
         let mut app = scripted_app();
         app.config.predictive_echo = Some("always".into());
@@ -481,8 +436,6 @@ fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
         app.windows.get_mut(&wid).expect("window").focused = true;
         feed(&app, b"$ ");
         app.redraw_window(wid);
-        // Every press and frame below is at one instant: a stalled test thread
-        // must not age the chain past its glitch window.
         let now = crate::app_input::past_timeline_start();
         crate::app_input::pin_input_clock(Some(now));
         for c in ['a', 'b'] {
@@ -514,11 +467,7 @@ fn a_single_pane_frame_paints_a_state_chain_with_its_cursor() {
     }
 }
 
-/// The scroll's own frame reads the content witness's rows in the frame's one hold, after
-/// the translation (`CursorEffectScrollChange::translated_only`): a box redrawn in place
-/// under a scroll, as Claude Code's composer is when a tool result lands under a full
-/// transcript, keeps its band on the frame it is drawn, never on the row the scroll
-/// carried it to, still in one terminal hold.
+/// The scroll's own frame reads the content witness's rows in the frame's one hold, after the translation (`CursorEffectScrollChange::translated_only`): a box redrawn in place under a scroll, as Claude Code's composer is when a tool result lands under a full transcript, keeps its band on the frame it is drawn, never on the row the scroll carried it to, still in one terminal hold.
 #[test]
 fn a_box_redrawn_in_place_under_a_scroll_keeps_its_band_in_the_scroll_s_one_hold() {
     let wid = WindowId(0);
@@ -531,7 +480,6 @@ fn a_box_redrawn_in_place_under_a_scroll_keeps_its_band_in_the_scroll_s_one_hold
         .term
         .clone();
     let rows = term_lock(&term).grid().rows();
-    // The line on the fourth row from the bottom, 1-based `line`.
     let line = rows - 3;
     let row = line - 1;
     feed(&app, format!("\x1b[{line};1H").as_bytes());

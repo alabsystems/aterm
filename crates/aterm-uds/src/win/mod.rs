@@ -22,9 +22,7 @@ fn init() {
     });
 }
 
-/// The current thread's last winsock error as an [`io::Error`] (std maps the
-/// `WSAE*` codes onto the portable [`io::ErrorKind`]s, e.g.
-/// `WSAECONNREFUSED` → `ConnectionRefused`).
+/// The current thread's last Winsock error as an [`io::Error`].
 fn last_wsa_error() -> io::Error {
     io::Error::from_raw_os_error(unsafe { ffi::WSAGetLastError() })
 }
@@ -398,8 +396,6 @@ impl io::Read for &CtlStream {
                         &inner.recv_shutdown,
                         deadline,
                     )? {
-                        // Locally shut down: EOF, as on Unix, so a relay pump
-                        // parked on a clone exits cleanly.
                         return Ok(0);
                     }
                 }
@@ -436,8 +432,6 @@ impl CtlStream {
                         &inner.send_shutdown,
                         deadline,
                     )? {
-                        // Locally shut down for writing: `BrokenPipe`, as on
-                        // Unix.
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
                             "control socket shut down for writing",
@@ -492,7 +486,6 @@ impl io::Write for &CtlStream {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // sends are unbuffered; nothing to push
         Ok(())
     }
 }
@@ -585,13 +578,10 @@ impl Iterator for Incoming<'_> {
 mod tests {
     use super::*;
 
-    /// A hang detector, never a latency budget: a wake that must come ends the
-    /// wait the moment it lands.
+    /// Hang detector for wake tests.
     const HANG_DETECTOR: Duration = Duration::from_secs(60);
 
-    /// Non-ASCII (but valid-UTF-8) paths encode directly — the default socket
-    /// dir under a Cyrillic/CJK `%LOCALAPPDATA%` must not need any fallback —
-    /// while the 107-byte sun_path budget stays enforced on the UTF-8 length.
+    /// Non-ASCII UTF-8 paths encode directly within the 107-byte `sun_path` budget.
     #[test]
     fn utf8_non_ascii_paths_encode_directly() {
         let s = "C:\\Users\\Владимир\\AppData\\Local\\aterm\\aterm-1234.sock";

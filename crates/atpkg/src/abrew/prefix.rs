@@ -78,7 +78,6 @@ fn overlaps_brew_roots(root: &Path, real: &[&Path]) -> bool {
         .any(|brew| physical_destination(brew).is_none_or(|brew| overlaps(&root, &brew)))
 }
 
-/// Resolve only existing directories; never create or open a destination's contents.
 fn physical_destination(path: &Path) -> Option<PathBuf> {
     if !path.is_absolute()
         || path
@@ -599,9 +598,6 @@ impl Prefix {
         let link = dir.join(name);
         match std::fs::symlink_metadata(&link) {
             Ok(_) if self.is_pinned(name) || self.pin_link_dangling_ours(name) => {
-                // A live owned pin refreshes; a dangling pin of
-                // ours (keg hand-deleted, then reinstalled) must
-                // not block re-pinning forever.
                 std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))?;
             }
             Ok(_) => {
@@ -623,8 +619,6 @@ impl Prefix {
         self.ensure()?;
         let link = self.root.join("Pinned").join(name);
         if self.pinned_version(name).is_none() && !self.pin_link_dangling_ours(name) {
-            // A dangling pin of ours is still removable — refusing
-            // would strand it forever short of a manual rm.
             return Err(format!("abrew: {name} has no owned pin"));
         }
         std::fs::remove_file(&link).map_err(|e| format!("abrew: {e}"))
@@ -670,9 +664,6 @@ impl Prefix {
         }
     }
 
-    /// Restore a stranded same-version-reinstall aside: the staging
-    /// dir's `payload` is the live keg, set aside by a run that died
-    /// before publishing its replacement.
     fn restore_aside(&self, kind: Kind, staging: &Path) {
         let payload = staging.join("payload");
         if !std::fs::symlink_metadata(&payload)
@@ -798,8 +789,6 @@ pub(super) fn write_metadata(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(staged, path)
 }
 
-/// Existing canonical layout bases must be real directories. Missing bases
-/// can be created after all existing ones pass, without following a final link.
 fn ensure_directories(directories: &[PathBuf]) -> Result<(), String> {
     for directory in directories {
         real_base(directory)?;
@@ -811,10 +800,6 @@ fn ensure_directories(directories: &[PathBuf]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a directory name is abrew scratch rather than state:
-/// `aterm_tempfile`'s default staging prefix, worn by every scratch
-/// dir abrew makes inside the prefix (pour staging, download
-/// scratch, reinstall asides).
 fn is_staging_name(name: &str) -> bool {
     name.starts_with(".tmp")
 }
@@ -849,9 +834,6 @@ pub(super) fn receipt_on_request(dir: &Path) -> bool {
         == Some("true")
 }
 
-/// The (name, version) an owned receipt in `dir` claims, when the
-/// receipt is abrew's and both are single safe components — the
-/// identity a stranded reinstall aside is restored under.
 fn receipt_identity(dir: &Path, kind: Kind) -> Option<(String, String)> {
     let bytes =
         crate::metadata_io::read_bounded_regular(&dir.join("INSTALL_RECEIPT.json"), 64 * 1024)

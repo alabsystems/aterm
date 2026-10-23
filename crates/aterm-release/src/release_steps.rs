@@ -93,7 +93,7 @@ impl crate::site::Launch for StepChildren {
 /// A pid's start time (`ps -o lstart=`), `None` when no such process lives.
 fn started_of(pid: u32) -> Option<String> {
     let out = {
-        command("ps")
+        command(aterm_uds::os_path!("ps"))
             .args(["-p", &pid.to_string(), "-o", "lstart="])
             .output()
             .ok()?
@@ -172,13 +172,13 @@ impl Real {
             |cwd| crate::release::anchor(&engine, &cwd),
         );
         let state = home.join(".local/state/aterm-release");
-        let stamp = command("date")
-            .arg("+%Y%m%dT%H%M%S")
-            .output()
+        // The local clock, read in this process (`localtime_r`), never a `date` child.
+        let started = now();
+        let offset = i64::try_from(started)
             .ok()
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| now().to_string());
+            .and_then(aterm_uds::zone::local_offset_at)
+            .unwrap_or(0);
+        let stamp = local_stamp(started, offset);
         let logs = if dry {
             static NTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -189,12 +189,6 @@ impl Real {
                 .join(format!("{stamp}-{}", std::process::id()))
         };
         std::fs::create_dir_all(&logs).map_err(|e| format!("create {}: {e}", logs.display()))?;
-        let offset = command("date")
-            .arg("+%z")
-            .output()
-            .ok()
-            .and_then(|o| parse_offset(String::from_utf8_lossy(&o.stdout).trim()))
-            .unwrap_or(0);
         let release = GitCli::new(repo)
             .git(&["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .ok()
@@ -231,14 +225,14 @@ impl Real {
 
     /// `git -C <clone>` that talks to origin (a fetch, `ls-remote`): forwarded.
     fn remote_git(&self, args: &[&str]) -> std::io::Result<std::process::Output> {
-        let mut cmd = command("git");
+        let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.arg("-C").arg(&self.repo).args(args);
         self.output_forwarded(&mut cmd)
     }
 
     /// `git -C <engine>` (its fetch and push among them): forwarded.
     fn engine_git(&self, args: &[&str]) -> Option<String> {
-        let mut cmd = command("git");
+        let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.arg("-C").arg(&self.engine).args(args);
         let out = self.output_forwarded(&mut cmd).ok()?;
         out.status
@@ -250,7 +244,7 @@ impl Real {
     /// `Err` when git did not run or was ended by a signal.
     fn engine_git_code(&self, args: &[&str]) -> Result<(i32, std::process::Output), String> {
         let e = self.engine.display();
-        let mut cmd = command("git");
+        let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.arg("-C").arg(&self.engine).args(args);
         let out = self
             .output_forwarded(&mut cmd)
@@ -574,7 +568,7 @@ impl Real {
     /// declares for it ([`crate::gates::submodules_on_declared_branch`]): at the sync
     /// and at every commit move, so before anything is staged or published.
     fn submodule_sync(&self, step: Step) -> Result<(), Refusal> {
-        let mut cmd = command("git");
+        let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.args(["submodule", "update", "--init", "vendor/astream"])
             .current_dir(&self.repo);
         let ran = self.logged(step, &mut cmd);
@@ -628,7 +622,7 @@ impl Real {
     fn main_to(&mut self, rev: &str) -> Result<(), Refusal> {
         let head = self.head();
         let ancestor = |s: &mut Self, a: &str, b: &str| s.is_ancestor(a, b);
-        let mut cmd = command("git");
+        let mut cmd = command(aterm_uds::os_path!("git"));
         cmd.current_dir(&self.repo);
         if ancestor(self, &head, rev) {
             cmd.args(["merge", "-q", "--ff-only", rev]);
@@ -710,11 +704,11 @@ impl Real {
         let copy_s = copy.display().to_string();
         let ran = |cmd: &mut Command| self.output_forwarded(cmd).is_ok_and(|o| o.status.success());
         let in_copy = |args: &[&str]| {
-            let mut cmd = command("git");
+            let mut cmd = command(aterm_uds::os_path!("git"));
             cmd.arg("-C").arg(&copy).args(args);
             cmd
         };
-        let mut clone = command("git");
+        let mut clone = command(aterm_uds::os_path!("git"));
         clone.arg("clone").args(BYTE_EXACT).args([
             "--quiet",
             "--shared",
@@ -886,7 +880,12 @@ impl Real {
             .git_out(&["remote", "get-url", "origin"])
             .ok_or("this checkout names no origin")?;
         let git = |dir: &Path, args: &[&str]| -> bool {
-            let out = self.output_forwarded(command("git").arg("-C").arg(dir).args(args));
+            let out = self.output_forwarded(
+                command(aterm_uds::os_path!("git"))
+                    .arg("-C")
+                    .arg(dir)
+                    .args(args),
+            );
             if let Ok(o) = &out
                 && let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&log)
             {
@@ -926,7 +925,7 @@ impl Real {
             crate::gates::gitlinks(&self.git_out(&["ls-tree", "-r", r]).unwrap_or_default())
         {
             let sub = self.repo.join(&path);
-            let own = command("git")
+            let own = command(aterm_uds::os_path!("git"))
                 .arg("-C")
                 .arg(&sub)
                 .args(["rev-parse", "--show-toplevel"])
@@ -1347,7 +1346,7 @@ impl Real {
         {
             return Ok(vec![problem]);
         }
-        let served = self.output_forwarded(command("curl").args([
+        let served = self.output_forwarded(command(aterm_uds::os_path!("curl")).args([
             "-fsSL",
             "--proto-redir",
             "=https",
@@ -1605,19 +1604,20 @@ fn short(sha: &str) -> &str {
     sha.get(..9).unwrap_or(sha)
 }
 
-/// `+0200` → 7200; `-0700` → -25200.
-fn parse_offset(z: &str) -> Option<i64> {
-    let (sign, digits) = match z.as_bytes().first()? {
-        b'+' => (1, &z[1..]),
-        b'-' => (-1, &z[1..]),
-        _ => return None,
-    };
-    if digits.len() != 4 {
-        return None;
-    }
-    let h: i64 = digits[..2].parse().ok()?;
-    let m: i64 = digits[2..].parse().ok()?;
-    Some(sign * (h * 3600 + m * 60))
+/// `unix` on a clock `offset` seconds east of UTC, as a log directory's stamp:
+/// `YYYYMMDDTHHMMSS` (what `date +%Y%m%dT%H%M%S` printed).
+fn local_stamp(unix: u64, offset: i64) -> String {
+    let local = i64::try_from(unix)
+        .unwrap_or(i64::MAX)
+        .saturating_add(offset);
+    let (y, m, d) = aterm_types::rfc3339::civil_from_days(local.div_euclid(86_400));
+    let s = local.rem_euclid(86_400);
+    format!(
+        "{y:04}{m:02}{d:02}T{:02}{:02}{:02}",
+        s / 3600,
+        s % 3600 / 60,
+        s % 60
+    )
 }
 
 /// The variables cleared from every child, so every step builds what the operator's shell would: each `RUST*` and `CARGO*` (target-directory overrides included) but the inert knobs (job count, incremental, logging, backtraces, cargo's terminal output), and the C toolchain's (the `cc` crate's names, also as `<NAME>_<target>`, `TARGET_<NAME>`, `HOST_<NAME>`).
@@ -2990,7 +2990,7 @@ impl Backend for Real {
                 .detail(moved));
             }
             let msg = format!("release: {to} — the version and the lockfile move together");
-            let mut commit = command("git");
+            let mut commit = command(aterm_uds::os_path!("git"));
             commit
                 .args(["commit", "-q", "-m", &msg, "--", "Cargo.toml", "Cargo.lock"])
                 .current_dir(&self.repo);
@@ -3000,7 +3000,7 @@ impl Backend for Real {
                     "read the commit step's log",
                 ));
             }
-            let mut push = command("git");
+            let mut push = command(aterm_uds::os_path!("git"));
             push.args(["push", "-q", "origin", "HEAD:main"])
                 .current_dir(&self.repo);
             if self.logged(Step::Commit, &mut push).code == 0 {
@@ -3109,7 +3109,7 @@ impl Backend for Real {
     }
 
     fn disk(&mut self) -> (Option<u64>, bool) {
-        let free = command("df")
+        let free = command(aterm_uds::os_path!("df"))
             .arg("-Pk")
             .arg(&self.repo)
             .output()
@@ -4804,7 +4804,7 @@ mod tests {
         let probe = |nohup: bool, mode: &str| {
             let exe = std::env::current_exe().unwrap();
             let mut cmd = if nohup {
-                let mut cmd = command("nohup");
+                let mut cmd = command(aterm_uds::os_path!("nohup"));
                 cmd.arg(exe);
                 cmd
             } else {
@@ -4840,8 +4840,9 @@ mod tests {
             audit_rows_merged(text, &kept),
             "{\"at\":\"1\"}\n{\"at\":\"2\"}\n{\"at\":\"3\"}\n"
         );
-        assert_eq!(parse_offset("+0200"), Some(7200));
-        assert_eq!(parse_offset("-0730"), Some(-27000));
+        assert_eq!(local_stamp(0, 0), "19700101T000000");
+        assert_eq!(local_stamp(1_792_627_200, 7200), "20261022T020000");
+        assert_eq!(local_stamp(1_792_627_200, -27_000), "20261021T163000");
         assert!(clears("RUSTFLAGS") && clears("CARGO_TARGET_DIR") && !clears("PATH"));
         for name in [
             "CARGO",

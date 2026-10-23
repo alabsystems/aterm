@@ -8,17 +8,7 @@ use crate::state::State;
 use super::set_range;
 use super::types::{ActionType, Transition};
 
-/// A DCS header ignores a GR byte (`0xA0..=0xFF`: UTF-8, Latin-1 or binary
-/// data) and stays where it is, as vte's header states do; sending it to Ground
-/// would print and run the string after it (a sixel, a tmux wrapper, a query)
-/// as terminal input. `0x80..=0x9F` keep their C1 entries, which dispatch.rs's
-/// C1 guard drops when C1 controls are off.
-///
-/// The escape and CSI states keep the abort to Ground (vte ignores there): an
-/// abort costs one short sequence printed as text, while ignoring would keep
-/// the sequence open across text, so `ESC [` then UTF-8 text would dispatch,
-/// on its first letter, a CSI the program never wrote; and `try_parse_csi_fast`
-/// would have to change in step.
+/// A DCS header ignores a GR byte.
 const fn ignore_gr_bytes(table: &mut [[Transition; 256]; State::COUNT], state: State) {
     set_range(
         table,
@@ -202,8 +192,6 @@ pub(super) const fn apply_dcs_passthrough_transitions(
     );
     table[State::DcsPassthrough as usize][0x7F] =
         Transition::new(State::DcsPassthrough, ActionType::Ignore);
-    // 0x80..=0xFF but 0x9C is payload (UTF-8, sixel and tmux binary data),
-    // over the anywhere C1 entries.
     set_range(
         table,
         State::DcsPassthrough,
@@ -211,9 +199,6 @@ pub(super) const fn apply_dcs_passthrough_transitions(
         0x9B,
         Transition::new(State::DcsPassthrough, ActionType::DcsPut),
     );
-    // 0x9C stays ST. With C1 controls off, one inside a UTF-8 character is that
-    // character's byte; that depends on the bytes before it, so dispatch.rs
-    // decides it.
     set_range(
         table,
         State::DcsPassthrough,
@@ -246,9 +231,6 @@ pub(super) const fn apply_dcs_ignore_transitions(table: &mut [[Transition; 256];
         0x7F,
         Transition::new(State::DcsIgnore, ActionType::Ignore),
     );
-    // An ignored DCS reads every byte as `DcsPassthrough` does, delivering
-    // none: its high bytes stay in the string, so the rest of the payload
-    // never reaches Ground as terminal input.
     set_range(
         table,
         State::DcsIgnore,
@@ -256,7 +238,6 @@ pub(super) const fn apply_dcs_ignore_transitions(table: &mut [[Transition; 256];
         0x9B,
         Transition::new(State::DcsIgnore, ActionType::Ignore),
     );
-    // 0x9C stays ST, as in `DcsPassthrough`.
     set_range(
         table,
         State::DcsIgnore,
@@ -297,9 +278,6 @@ pub(super) const fn apply_osc_string_transitions(table: &mut [[Transition; 256];
         0x7F,
         Transition::new(State::OscString, ActionType::OscPut),
     );
-    // All of 0x80..=0x9F is payload: 0x9C is a UTF-8 continuation byte (本 is
-    // E6 9C AC), and as ST it would cut a title short. BEL and ESC \ end an
-    // OSC; with C1 controls on, dispatch.rs also ends it at 0x9C.
     set_range(
         table,
         State::OscString,
@@ -342,7 +320,6 @@ pub(super) const fn apply_sos_pm_apc_string_transitions(
         0x7F,
         Transition::new(State::SosPmApcString, ActionType::ApcPut),
     );
-    // 0x80..=0xFF but 0x9C is payload, as in `DcsPassthrough`.
     set_range(
         table,
         State::SosPmApcString,
@@ -350,7 +327,6 @@ pub(super) const fn apply_sos_pm_apc_string_transitions(
         0x9B,
         Transition::new(State::SosPmApcString, ActionType::ApcPut),
     );
-    // 0x9C stays ST, as in `DcsPassthrough`.
     set_range(
         table,
         State::SosPmApcString,

@@ -287,7 +287,7 @@ pub fn parse_ceiling(text: &str) -> Option<Option<Duration>> {
 static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// macOS's QoS launcher.
-pub const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+pub const TASKPOLICY: &str = aterm_uds::os_path!("taskpolicy");
 
 /// Spawn, wait, and collect.
 #[must_use]
@@ -386,7 +386,7 @@ fn spawn_command(cmd: &Cmd, env: ExecEnv<'_>, taskpolicy: &Path) -> Command {
     c
 }
 
-const ENV: &str = "/usr/bin/env";
+const ENV: &str = aterm_uds::os_path!("env");
 
 fn dyld_assignments(envs: &[(OsString, OsString)]) -> Vec<OsString> {
     envs.iter()
@@ -1170,7 +1170,7 @@ mod tests {
     fn gone_within(pid: &str, window: Duration) -> bool {
         let deadline = Instant::now() + window;
         loop {
-            let stat = std::process::Command::new("ps")
+            let stat = std::process::Command::new(aterm_uds::os_path!("ps"))
                 .args(["-o", "stat=", "-p", pid])
                 .output()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())

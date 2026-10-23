@@ -994,7 +994,7 @@ struct Attempt {
 type Prepare =
     Box<dyn FnMut(&dyn System, WorkstationGroup, Selection) -> Result<Workstation, String>>;
 
-const DEFAULTS: &str = "/usr/bin/defaults";
+const DEFAULTS: &str = aterm_uds::os_path!("defaults");
 
 struct NativeHost {
     sys: Box<dyn System>,

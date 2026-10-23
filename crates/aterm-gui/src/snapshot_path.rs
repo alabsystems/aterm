@@ -1,13 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Where a SIGUSR1 screen snapshot lands, and how it is written.
-//!
-//! The snapshot carries sensitive terminal content, so it gets the control socket's
-//! `image` posture (`control_auth`): the PNG/.txt/.done files land in the per-user `0700`
-//! control directory under a per-process name (`aterm_snapshot-<pid>.png`), written
-//! `0600`. That is the only destination (no environment variable moves it); a capture
-//! elsewhere is `aterm ctl image <file>`.
+//! Destination resolution and private writing for `SIGUSR1` screen snapshots.
 
 #[cfg(test)]
 use std::path::{Path, PathBuf};
@@ -20,9 +14,7 @@ fn default_snapshot_file_name(pid: u32) -> String {
     format!("aterm_snapshot-{pid}.png")
 }
 
-/// Resolve the path the snapshot PNG may be written to (`.txt`/`.done` are
-/// siblings), or `None` — with the reason already logged — when there is no
-/// per-user control directory.
+/// Resolve the path the snapshot PNG may be written to, or `None` when unavailable.
 #[must_use]
 #[cfg(unix)]
 pub(crate) fn resolve() -> Option<String> {
@@ -42,15 +34,6 @@ pub(crate) fn resolve() -> Option<String> {
     }
 }
 
-// The wrapper below — and the lexical-absolutization helper it uses —
-// have no production caller left: the snapshot writer now pins the directory
-// itself and keeps the handle across the whole PNG/.txt/.done generation
-// (`app_introspect::begin_snapshot_generation`), so it cannot re-derive the
-// parent per file. They are kept, compiled for the TEST build only, because
-// they are the smallest harness that drives the pinned-writer contract this
-// module depends on end to end: `0600` on creation, mode re-tightened on
-// overwrite, and `O_NOFOLLOW` on the final component.
-// Shipping them would be unreachable code in the binary.
 #[cfg(test)]
 fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     let source = if path.is_absolute() {
@@ -78,8 +61,7 @@ fn absolute_lexical(path: &Path) -> std::io::Result<PathBuf> {
     Ok(result)
 }
 
-/// Write `path` through the retained-handle writer; the directory and file stay pinned
-/// until the durable write and identity validation complete.
+/// Write `path` through the retained-handle writer.
 #[cfg(test)]
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let name = path.file_name().ok_or_else(|| {
@@ -107,7 +89,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn write_private_refuses_symlinked_final_component() {
-        // A symlink at the final name is not followed (O_NOFOLLOW): the write fails.
         use std::os::unix::fs::symlink;
         let dir = std::env::temp_dir().join(format!("aterm-snap-at-sym-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();
@@ -118,7 +99,6 @@ mod tests {
             write_private(&dir.join("evil.png"), b"attack").is_err(),
             "writing through a symlinked final component must be refused",
         );
-        // The victim is untouched.
         assert_eq!(std::fs::read(&victim).unwrap(), b"original");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -126,9 +106,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn write_private_refuses_symlinked_target() {
-        // A symlink at the target name is not followed (FILE_FLAG_OPEN_REPARSE_POINT plus
-        // the reparse-attribute reject). Skips without symlink privilege (no Developer
-        // Mode / SeCreateSymbolicLink).
         let dir = std::env::temp_dir().join(format!("aterm-snap-win-sym-{}", std::process::id()));
         ensure_private_dir(&dir).unwrap();
         let victim = dir.join("victim.txt");
@@ -156,7 +133,6 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"first");
-        // A pre-existing loose file is truncated and tightened to 0600.
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         write_private(&path, b"x").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

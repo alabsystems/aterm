@@ -1,33 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Tier-1 conformance: what [`aterm_slog::Fold::apply`] and the clause make
-//! of a run, its turn, a wall step, a claimed need and a label, against the
-//! derived `SessionLogFold` model
-//! (`aterm_models_session::session_log_fold_model`, checked at Tier-0 in
-//! `aterm-models/tests/derived_ring_ty.rs`).
-//!
-//! A seeded walk writes real records into a real [`Log`]: the run's and the
-//! turn's opens, the screen's strong close, exact and strong `out=` amends
-//! (on the open turn and the closed one), a strong wall step, its exact
-//! `confirmed=1` and its retraction, the run's close (which cascades), a
-//! harness `need` mark and a harness label; time passes (a `Tick`: the
-//! clause read later over an unchanged fold) and past the label's TTL. A
-//! second [`Fold`] is fed the log's window as it grows and, now and then, a
-//! record it already applied (`Replay`); the projection is that fold's
-//! state, and `dup` is whether it differs from the log's own fold, which
-//! never sees a replay. The ghosts (`gw`/`gc`, `sg`) are what
-//! the outcome and the need's rank must be, tracked from the records
-//! written. After every step the real state is projected onto the model and
-//! the step must be the model's.
-//!
-//! NEGATIVE CONTROLS, one per mutant, each the broken real call it names
-//! replaying its witness: `Fold::apply` without its `as_of` check, a strong
-//! amend decided by `confidence_law` alone, an amend's `out=` written past the
-//! law, `need_takes_amend` answering no, `turn_out_rebucket` that only adds,
-//! a closed step's need kept, a later clause naming a need the fold does not
-//! hold, a run's close that leaves its turn open, `shown_label` without its
-//! `until` test, and the label row above the need row.
+//! Tier-1 conformance test for [`aterm_slog::Fold::apply`] and clause projection against `SessionLogFold`.
 
 use aterm_models_session::session_log_fold_model;
 use aterm_slog::{
@@ -41,10 +15,7 @@ use aterm_spec::rng::XorShift;
 
 use crate::support::{WALL0, at};
 
-/// The wall the step and the exact amend name.
 const WALL: &str = "wall:usage-session";
-
-/// A label's TTL, in seconds.
 const TTL_S: u64 = 600;
 
 struct World {
@@ -68,7 +39,6 @@ fn rank(c: Conf) -> i64 {
     i64::from(c.rank())
 }
 
-/// The model's code for a turn's outcome.
 fn out_code(w: &str) -> i64 {
     match w {
         "done" => 1,
@@ -118,7 +88,6 @@ impl World {
         WALL0 + self.clock
     }
 
-    /// Feed the fold under test what the log appended since it was last fed.
     fn feed(&mut self) {
         let read = self
             .log
@@ -131,8 +100,6 @@ impl World {
         }
     }
 
-    /// Where `mine` stands: 0 never opened, 1 the open one, 2 the held
-    /// closed one, 9 neither (a projection the model has no word for).
     fn level(open: Option<Node>, last: Option<Node>, mine: Option<Node>) -> i64 {
         match mine {
             None if open.is_none() && last.is_none() => 0,
@@ -168,7 +135,6 @@ impl World {
             .expect("amends");
     }
 
-    /// One real step and the model's name for it, when it is enabled.
     fn step(&mut self, m: &Model, rng: &mut XorShift) -> Option<&'static str> {
         const ACTIONS: [&str; 18] = [
             "OpenRun",
@@ -185,8 +151,6 @@ impl World {
             "Expire",
             "Tick",
             "Replay",
-            // Twice as likely: the order of these against the close is what
-            // the outcome laws judge.
             "AmendOutExact",
             "OpenStep",
             "Replay",
@@ -200,7 +164,6 @@ impl World {
         Some(pick)
     }
 
-    /// The real records (or reads) of model action `pick`.
     fn real(&mut self, pick: &str, rng: &mut XorShift) {
         match pick {
             "OpenRun" => {
@@ -340,7 +303,6 @@ impl World {
             }
             "Tick" => self.clock += 1000,
             _ => {
-                // A record the fold applied, at its own seq.
                 let as_of = self.fold.state().as_of;
                 let old: Vec<Rec> = self
                     .log
@@ -358,8 +320,6 @@ impl World {
     }
 }
 
-/// The projection of `fold` (with `w`'s nodes, ghosts and clock) onto the
-/// model's variables.
 fn project_fold(w: &World, fold: &Fold) -> State {
     let st = fold.state();
     let now = w.now();
@@ -458,7 +418,6 @@ fn fold_conforms_to_derived_model() {
     assert!(exact_while_open, "no exact amend reached an open turn");
 }
 
-/// The world after `path` of the model's actions, each checked.
 fn world_after(m: &Model, path: &[&str]) -> World {
     let mut w = World::new();
     let mut rng = XorShift::new(7);
@@ -471,8 +430,6 @@ fn world_after(m: &Model, path: &[&str]) -> World {
     w
 }
 
-/// The broken state `broken` is not the honest `action`'s, and it is exactly
-/// what mutant `mutant` makes of `prev`.
 fn rejected(m: &Model, (action, mutant): (&str, &str), prev: &State, broken: &State) {
     assert!(
         !m.successors(action, prev).contains(broken),
@@ -484,16 +441,11 @@ fn rejected(m: &Model, (action, mutant): (&str, &str), prev: &State, broken: &St
     );
 }
 
-/// NEGATIVE CONTROLS: each mutant's broken real call, replayed from its
-/// witness, makes a state the honest action never does, and exactly the one
-/// its mutant does.
 #[test]
 fn fold_conformance_rejects_each_broken_call() {
     let m = session_log_fold_model();
     let closed = ["OpenRun", "OpenTurn", "CloseDone"];
 
-    // `Fold::apply` without its `as_of` check: the turn's close, replayed,
-    // counts the turn again.
     let w = world_after(&m, &closed);
     let prev = w.project();
     let close = w
@@ -515,9 +467,6 @@ fn fold_conformance_rejects_each_broken_call() {
     assert!(!m.successors("Replay", &prev).contains(&replayed));
     assert!(!m.check_invariant("Idempotent", &replayed));
 
-    // A strong amend decided by `confidence_law` alone (the 3A on_amend
-    // with the outcome offered): it ties the screen's strong close, is
-    // later, and would overrule it. `amend_refines_out` refuses it.
     let mut w = world_after(&m, &closed);
     let prev = w.project();
     let held = w.fold.state().last[1]
@@ -539,8 +488,6 @@ fn fold_conformance_rejects_each_broken_call() {
     broken.insert("nw", i64::from(totals.walled));
     rejected(&m, ("AmendOutStrong", "StrongAmendRefines"), &prev, &broken);
 
-    // An amend's `out=` written past the law: a strong amend after the
-    // exact one takes the field. `confidence_law` refuses it.
     let mut w = world_after(&m, &["OpenRun", "OpenTurn", "CloseDone", "AmendOutExact"]);
     let prev = w.project();
     let held = w.fold.state().last[1]
@@ -562,8 +509,6 @@ fn fold_conformance_rejects_each_broken_call() {
     broken.insert("oc", rank(Conf::Strong));
     rejected(&m, ("AmendOutStrong", "LowerAmendWins"), &prev, &broken);
 
-    // `need_takes_amend` answering no: the confirmation leaves the need at
-    // the screen's rank.
     let mut w = world_after(&m, &["OpenRun", "OpenTurn", "OpenStep"]);
     let prev = w.project();
     let need = w.fold.state().top_need().cloned().expect("the wall's need");
@@ -576,7 +521,6 @@ fn fold_conformance_rejects_each_broken_call() {
     broken.insert("nc", rank(need.conf));
     rejected(&m, ("ConfirmStep", "ConfirmNoUpgrade"), &prev, &broken);
 
-    // `turn_out_rebucket` that only adds: the refined turn counted twice.
     let mut w = world_after(&m, &closed);
     let prev = w.project();
     let mut only_adds = w.fold.state().totals.clone();
@@ -594,8 +538,6 @@ fn fold_conformance_rejects_each_broken_call() {
         &broken,
     );
 
-    // `on_close` keeping a closed step's need: the wall retracted, its need
-    // still first and still the clause.
     let mut w = world_after(&m, &["OpenRun", "OpenTurn", "OpenStep"]);
     let prev = w.project();
     w.real("RetractStep", &mut XorShift::new(1));
@@ -607,9 +549,6 @@ fn fold_conformance_rejects_each_broken_call() {
     }
     rejected(&m, ("RetractStep", "RetractKeepsNeed"), &prev, &broken);
 
-    // The clause read later over an unchanged fold naming a need it does
-    // not hold (silence read as `not responding`). The real later read
-    // names none, and hints never do.
     let mut w = world_after(&m, &["OpenRun", "OpenTurn"]);
     let prev = w.project();
     w.real("Tick", &mut XorShift::new(1));
@@ -622,7 +561,6 @@ fn fold_conformance_rejects_each_broken_call() {
     broken.insert("cl", 1);
     rejected(&m, ("Tick", "TickRaisesNeed"), &prev, &broken);
 
-    // `on_close` without its child walk: the run closed, its turn open.
     let mut w = world_after(&m, &["OpenRun", "OpenTurn"]);
     let prev = w.project();
     w.real("CloseRun", &mut XorShift::new(1));
@@ -632,8 +570,6 @@ fn fold_conformance_rejects_each_broken_call() {
     broken.insert("r", 2);
     rejected(&m, ("CloseRun", "CloseRunLeavesTurn"), &prev, &broken);
 
-    // `shown_label` without its `until` test: the expired label still the
-    // clause.
     let mut w = world_after(&m, &["OpenRun", "Label"]);
     let prev = w.project();
     w.real("Expire", &mut XorShift::new(1));
@@ -645,8 +581,6 @@ fn fold_conformance_rejects_each_broken_call() {
     broken.insert("cl", prev["cl"]);
     rejected(&m, ("Expire", "ExpiredLabelShown"), &prev, &broken);
 
-    // `clause_of` with the label row above the need row: a label hides the
-    // wall.
     let mut w = world_after(&m, &["OpenRun", "OpenTurn", "OpenStep"]);
     let prev = w.project();
     w.real("Label", &mut XorShift::new(1));

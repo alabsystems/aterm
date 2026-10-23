@@ -25,10 +25,6 @@ fn fill_socket_to_backpressure(writer: &mut std::os::unix::net::UnixStream) -> u
     wedged
 }
 
-/// Tier-1: the model's Begin/Complete actions drive the real sink counter, and
-/// each Read action is compared with the shipping GUI decision. Negative
-/// control: A pending while B is idle, where a process-wide decision would
-/// queue B but B's own sink answers inline.
 #[test]
 fn a_sink_reads_only_its_own_ordered_input_jobs() {
     let model = paste_order_sink_isolation_model();
@@ -134,7 +130,6 @@ fn an_unrelated_key_decides_while_the_cold_registry_is_locked() {
 
 /// A sink that outlives its borrowed fd leaves its writer slot under a number the next fd can
 /// take: the new sink gets a slot of its own, so the handoff gate reads the new sink's queue.
-/// Negative control: handing the new sink the stale slot leaves the gate reading an idle sink.
 #[cfg(unix)]
 #[test]
 fn a_reused_master_number_gates_on_the_new_sink() {
@@ -167,7 +162,6 @@ fn a_paste_in_one_session_does_not_queue_another_sessions_keys() {
 
     fn read_exact_pipe(fd: i32, count: usize) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(count);
-        // A hang detector, never a latency budget.
         let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         while std::time::Instant::now() < deadline {
             if bytes.len() == count {
@@ -245,7 +239,6 @@ fn a_paste_in_one_session_does_not_queue_another_sessions_keys() {
     }
     assert_eq!(read_exact_pipe(pipe_b[0], 128), vec![b'b'; 128]);
     assert_eq!(read_exact_pipe(pipe_a[0], 2), b"Pa");
-    // A hang detector, never a latency budget.
     let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     while std::time::Instant::now() < deadline {
         if sink_a.ordered_egress_count() == 1 {
@@ -270,6 +263,7 @@ fn a_paste_in_one_session_does_not_queue_another_sessions_keys() {
         libc::close(pipe_b[1]);
     }
 }
+
 /// Tier-1 conformance: a real wedged sink accepts the whole key into its
 /// spill, but the GUI's production decision returns without a wake or a
 /// wait. Draining later cannot relabel that old receipt as direct.
@@ -283,7 +277,6 @@ fn spilled_queued_key_never_grants_a_direct_delivery_wake() {
     use std::time::Duration;
 
     let (mut reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
-    // The drain below waits for bytes that must arrive: a hang detector.
     reader
         .set_read_timeout(Some(Duration::from_secs(60)))
         .unwrap();
@@ -314,8 +307,6 @@ fn spilled_queued_key_never_grants_a_direct_delivery_wake() {
         tx.send(paste_order::completed_queued_key_wake(receipt, Some(7)))
             .unwrap();
     });
-    // A hang detector, not a latency budget: nothing reads the wedged sink until
-    // after this answer, so a decision waiting for the drain would never answer.
     assert!(
         rx.recv_timeout(Duration::from_secs(60))
             .expect("spill decision never waits for whole-sink drain")

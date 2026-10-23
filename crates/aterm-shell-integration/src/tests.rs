@@ -2272,7 +2272,8 @@ const REROUTE_DIR_MARKER: &str = ".atpkg-reroute-dir";
 struct LiveShell {
     label: String,
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    /// Its stdin pipe, or its pty's master.
+    stdin: std::fs::File,
     stdout: std::sync::Arc<Pumped>,
     stderr: std::sync::Arc<Pumped>,
     /// The hermetic home the shell's environment points into, when the
@@ -2392,6 +2393,21 @@ fn pump(mut reader: impl std::io::Read + Send + 'static) -> std::sync::Arc<Pumpe
     sink
 }
 
+/// A pty's master read as a pipe: its end once no process holds the slave, which Linux
+/// answers `EIO`, is an EOF.
+#[cfg(unix)]
+struct PtyMaster(std::fs::File);
+
+#[cfg(unix)]
+impl std::io::Read for PtyMaster {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match std::io::Read::read(&mut self.0, buf) {
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => Ok(0),
+            other => other,
+        }
+    }
+}
+
 /// What a [`pump`] has read from one of a shell's pipes.
 #[cfg(unix)]
 struct Pumped {
@@ -2422,9 +2438,83 @@ impl LiveShell {
     /// A hang detector, never a latency budget.
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
-    /// The shell holds its three pipes and nothing else of this process, and a
-    /// fish finds its completions made ([`mark_fish_completions_made`]).
+    /// The shell holds its three pipes and nothing else of this process ([`Self::defaults`]).
     fn spawn(label: &str, cmd: &mut Command) -> Self {
+        Self::defaults(cmd);
+        cmd.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|error| panic!("{label}: spawn: {error}"));
+        let stdin = child.stdin.take().expect("piped stdin");
+        let stdout = pump(child.stdout.take().expect("piped stdout"));
+        let stderr = pump(child.stderr.take().expect("piped stderr"));
+        Self::started(
+            label,
+            child,
+            std::fs::File::from(std::os::fd::OwnedFd::from(stdin)),
+            stdout,
+            stderr,
+        )
+    }
+
+    /// [`Self::spawn`] on a new pty of its own (aterm-pty's pair, §6.1 row 7), as a tab's
+    /// shell runs: its stdin, stdout and stderr the slave, its controlling terminal in a
+    /// session it leads; the test writes to and reads the master. Its stderr reaches the
+    /// master with its stdout, so [`Self::stderr`] reads a pipe nothing holds. The master's
+    /// end once every holder of the slave has closed it (`EIO` on Linux) is the read's EOF.
+    fn spawn_on_pty(label: &str, cmd: &mut Command) -> Self {
+        use std::os::fd::{FromRawFd as _, OwnedFd};
+        use std::os::unix::process::CommandExt as _;
+        let (master, slave) = aterm_pty::open_pty_pair()
+            .unwrap_or_else(|error| panic!("{label}: open a pty: {error}"));
+        // SAFETY: the pair just opened, both close-on-exec, each owned here alone.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let end = |fd: &OwnedFd| {
+            std::process::Stdio::from(
+                fd.try_clone()
+                    .unwrap_or_else(|error| panic!("{label}: the pty's slave: {error}")),
+            )
+        };
+        Self::defaults(cmd);
+        cmd.stdin(end(&slave))
+            .stdout(end(&slave))
+            .stderr(end(&slave));
+        // SAFETY: between fork and exec, `setsid` and `ioctl` alone, both
+        // async-signal-safe: a new session, the slave on stdin its terminal.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let child = cmd
+            .spawn()
+            .unwrap_or_else(|error| panic!("{label}: spawn: {error}"));
+        drop(slave);
+        let reader = master
+            .try_clone()
+            .unwrap_or_else(|error| panic!("{label}: the pty's master: {error}"));
+        let stdout = pump(PtyMaster(std::fs::File::from(reader)));
+        let (nothing, _) =
+            std::io::pipe().unwrap_or_else(|error| panic!("{label}: a pipe: {error}"));
+        Self::started(
+            label,
+            child,
+            std::fs::File::from(master),
+            stdout,
+            pump(nothing),
+        )
+    }
+
+    /// What every live shell starts with ([`Self::spawn`], [`Self::spawn_on_pty`]): nothing
+    /// of this process, the default SIGINT and SIGQUIT, and a fish's completions made
+    /// ([`mark_fish_completions_made`]).
+    fn defaults(cmd: &mut Command) {
         use aterm_uds::spawnfd::InheritNothing as _;
         use std::os::unix::process::CommandExt as _;
         cmd.inherit_nothing();
@@ -2441,15 +2531,17 @@ impl LiveShell {
             });
         }
         mark_fish_completions_made(cmd);
-        cmd.stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .unwrap_or_else(|error| panic!("{label}: spawn: {error}"));
-        let stdin = child.stdin.take().expect("piped stdin");
-        let stdout = pump(child.stdout.take().expect("piped stdout"));
-        let stderr = pump(child.stderr.take().expect("piped stderr"));
+    }
+
+    /// A live shell just spawned: `stdin` what the test writes it, `stdout` and `stderr`
+    /// what it has written.
+    fn started(
+        label: &str,
+        child: std::process::Child,
+        stdin: std::fs::File,
+        stdout: std::sync::Arc<Pumped>,
+        stderr: std::sync::Arc<Pumped>,
+    ) -> Self {
         Self {
             label: label.to_owned(),
             child,
@@ -3026,7 +3118,7 @@ fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> Live
     let InjectionEnv { env_add, .. } = prepare_into(ShellType::Fish, &fx.base)
         .expect("prepare")
         .expect("fish injection");
-    let mut cmd = pty_script(&[fish, "-i"]);
+    let mut cmd = pty_command(&[fish, "-i"]);
     let hermetic = shell_command(fish);
     for (key, value) in hermetic.get_envs() {
         match value {
@@ -3060,7 +3152,7 @@ fn spawn_live_fish(fish: &str, fx: &LiveFixture, extra: &[(&str, &str)]) -> Live
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    LiveShell::spawn("fish", &mut cmd).holding(hermetic.into_home())
+    LiveShell::spawn_on_pty("fish", &mut cmd).holding(hermetic.into_home())
 }
 
 #[cfg(unix)]
@@ -3070,32 +3162,106 @@ const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR
 #[cfg(unix)]
 const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
 
-/// `script(1)` running `argv` on a new pty, with the program `argv` names as its one child.
+/// `argv` on a new pty of its own ([`LiveShell::spawn_on_pty`]: aterm-pty's pair, never `script(1)`, whose BSD and util-linux forms differ; §6.1 row 7).
 #[cfg(unix)]
-fn pty_script(argv: &[&str]) -> Command {
-    let mut cmd = Command::new("script");
-    if cfg!(target_os = "macos") {
-        cmd.args(["-q", "/dev/null"]).args(argv);
-    } else {
-        let quoted: Vec<String> = argv
-            .iter()
-            .map(|a| format!("'{}'", a.replace('\'', "'\\''")))
-            .collect();
-        cmd.args([
-            "-q",
-            "-c",
-            &format!("exec {}", quoted.join(" ")),
-            "/dev/null",
-        ])
-        .env("SHELL", "/bin/sh");
-    }
+fn pty_command(argv: &[&str]) -> Command {
+    let (program, args) = argv.split_first().expect("a program to run");
+    let mut cmd = Command::new(program);
+    cmd.args(args);
     cmd
 }
 
+/// A shell [`LiveShell::spawn_on_pty`] starts has the pty as its controlling terminal on all
+/// three of its standard descriptors, leading its process group, as `script(1)` gave it:
+/// `/dev/tty` opens, and `ps` names the pty as its terminal. A non-interactive `sh`, which
+/// opens no terminal of its own (an interactive one does, and a session leader's open
+/// takes the terminal), opens `/dev/tty` too: the spawn made it the controlling terminal.
+/// That guards the spawn's `TIOCSCTTY` where Linux runs it, since Linux hands a session a
+/// terminal only on that ioctl or an open; on macOS the session had the pty without it
+/// (measured 2026-10-22: the probe passes with the ioctl removed).
+/// It runs in a scratch `HOME` ([`shell_command`]), so the history an interactive `sh`
+/// writes at its exit (macOS's `~/.bash_history`) lands there. NEGATIVE CONTROL: the same
+/// shell [`LiveShell::spawn`] starts on pipes has no terminal at all.
 #[cfg(unix)]
-fn script_can_allocate_a_pty() -> bool {
-    Command::new("script").arg("-V").output().is_ok()
-        || Command::new("script").arg("--version").output().is_ok()
+#[test]
+fn a_shell_on_its_pty_has_it_for_its_terminal() {
+    const PROBE: &str = "tty; tty <&1; tty <&2; /bin/ps -o pid= -o pgid= -o tty= -p $$; \
+        if : 3</dev/tty; then echo CTTY=yes; else echo CTTY=no; fi; \
+        echo \"HOME=$HOME\"; echo MARK$((40+2))";
+    let mut cmd = shell_command("/bin/sh");
+    cmd.arg("-i");
+    let home = cmd.home().to_path_buf();
+    let mut on_pty = LiveShell::spawn_on_pty("sh", &mut cmd).holding(cmd.into_home());
+    on_pty.send(PROBE);
+    let at = on_pty.wait_for_after("MARK42", 0);
+    let seen = {
+        let text = on_pty
+            .stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&text[..at]).into_owned()
+    };
+    let terminals: Vec<&str> = seen
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("/dev/"))
+        .collect();
+    assert_eq!(terminals.len(), 3, "{seen}");
+    assert!(terminals.iter().all(|t| *t == terminals[0]), "{seen}");
+    // `ps`'s `tty` is the process's CONTROLLING terminal (`ttys004`, `pts/3`), which a
+    // descriptor open on a pty is not by itself.
+    let pid = on_pty.child.id().to_string();
+    let controlling = terminals[0].trim_start_matches("/dev/");
+    assert!(
+        seen.lines().any(|l| {
+            l.split_whitespace().collect::<Vec<_>>() == [pid.as_str(), pid.as_str(), controlling]
+        }),
+        "the shell leads its process group, on the pty it controls\n{seen}"
+    );
+    assert!(seen.contains("CTTY=yes"), "its /dev/tty is the pty\n{seen}");
+    assert!(
+        seen.lines()
+            .any(|l| l.trim() == format!("HOME={}", home.display())),
+        "the shell's HOME is the scratch one\n{seen}"
+    );
+    assert_ne!(
+        std::env::var_os("HOME").as_deref(),
+        Some(home.as_os_str()),
+        "the scratch HOME is not this process's"
+    );
+    on_pty.finish();
+    let mut cmd = shell_command("/bin/sh");
+    cmd.args([
+        "-c",
+        "if : 3</dev/tty; then echo CTTY=yes; else echo CTTY=no; fi; echo MARK$((40+2)); read line",
+    ]);
+    let mut quiet = LiveShell::spawn_on_pty("sh -c", &mut cmd).holding(cmd.into_home());
+    let at = quiet.wait_for_after("MARK42", 0);
+    let seen = {
+        let text = quiet
+            .stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&text[..at]).into_owned()
+    };
+    assert!(
+        seen.contains("CTTY=yes"),
+        "a shell that opens no terminal has the pty for its own\n{seen}"
+    );
+    quiet.finish();
+    let mut cmd = shell_command("/bin/sh");
+    let mut on_pipes = LiveShell::spawn("sh", &mut cmd).holding(cmd.into_home());
+    on_pipes.send("tty; echo MARK$((40+2))");
+    let at = on_pipes.wait_for_after("MARK42", 0);
+    let seen = {
+        let text = on_pipes
+            .stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        String::from_utf8_lossy(&text[..at]).into_owned()
+    };
+    assert!(seen.contains("not a tty"), "{seen}");
+    on_pipes.finish();
 }
 
 /// [`zsh_shell`] for a test that needs a real zsh.
@@ -3128,17 +3294,6 @@ fn need_fish() -> &'static str {
     })
 }
 
-/// A `script(1)` that can allocate a pty, for a live-pty test.
-#[cfg(unix)]
-fn need_pty_script() {
-    if !script_can_allocate_a_pty() {
-        aterm_spec::host::could_not_run(format!(
-            "no `script` that can allocate a pty on this host: {}",
-            aterm_spec::host::tool("script").remedy()
-        ));
-    }
-}
-
 /// A live `label` shell ("bash", "zsh" or "fish") inside a session, with no rc prelude.
 #[cfg(unix)]
 fn spawn_live(
@@ -3152,10 +3307,9 @@ fn spawn_live(
         "zsh" => shells
             .zsh()
             .map(|zsh| (spawn_live_zsh(zsh, fx, "", extra), ZSH_PRINT_PATH)),
-        _ => shells.fish().map(|fish| {
-            need_pty_script();
-            (spawn_live_fish(fish, fx, extra), FISH_PRINT_PATH)
-        }),
+        _ => shells
+            .fish()
+            .map(|fish| (spawn_live_fish(fish, fx, extra), FISH_PRINT_PATH)),
     }
 }
 
@@ -3402,7 +3556,6 @@ fn test_hook_naming_an_agents_dir_that_appears_later_is_fronted_live() {
 #[test]
 fn test_fish_already_running_session_shell_picks_up_the_managed_dirs_live() {
     let fish = need_fish();
-    need_pty_script();
     let fx = LiveFixture::new();
     let mut sh = spawn_live_fish(fish, &fx, &[]);
     sh.send("claude");

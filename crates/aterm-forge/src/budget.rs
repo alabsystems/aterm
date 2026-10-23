@@ -1,36 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `tools/forge-budget.tsv`: the ratchet. The third-party surface may only shrink, and every
-//! exception is recorded in the file.
-//!
-//! The file is tab-separated, no header, one fact per line, readable with `awk -F'\t'`:
-//!
-//! ```text
-//! <scope>\t<metric>\t<ceiling>[\t<regress-reason>]
-//! ```
-//!
-//! A `#` line is refused by line number, so rows cannot be commented out.
-//!
-//! * `live < ceiling` → green with the slack named. `--update` lowers the ceiling to the live
-//!   value, the only edit forge makes on its own.
-//! * `live == ceiling` → green, at ceiling.
-//! * `live > ceiling` → red. Raising needs `--update --allow-regress "<reason>"`; the reason (one
-//!   line) is written as the 4th column, and every run counts raised ceilings and points at the
-//!   file. The history of a row is git's.
-//! * an armed fact (`seed_shape`) with no row → red, naming the line that
-//!   arms it. `--update` never adds a row, so a deleted one is restored by
-//!   hand; a measured cell is never silently out of the ratchet.
-//!
-//! Package counts, build scripts, proc macros and duplicated names are ratcheted per cell. Build
-//! scripts and proc macros have ceilings of their own: `targo trust` marks every build script
-//! `-Ztrust-verify=off`, so while any third-party build script remains no amount of source
-//! deletion retires that opt-out. Lines of code are a reporting number (`forge survey` prints
-//! them), not a ceiling: a local edit to a vendored fork moves them without moving the surface.
-//!
-//! `shipped.<triple> packages` and `lock packages` are supported but not seeded (`seed_shape`):
-//! both count aterm's own crates, so a new first-party crate would demand a justification for
-//! growth that is not third-party surface. They can be added by hand.
+//! Third-party surface ratchet (`tools/forge-budget.tsv`).
 
 use crate::Outcome;
 use crate::model::{Cell, CellSurvey};
@@ -51,10 +22,7 @@ const SHIPPED_METRICS: &[&str] = &[
 ];
 /// Metrics measured for the `lock` scope (the whole `Cargo.lock`, every target).
 const LOCK_METRICS: &[&str] = &["packages", "third_party_packages"];
-/// Metrics measured for the `patch` scope: the vendored arm of `[patch.crates-io]`. A
-/// first-party or absorbed patch target is an aterm workspace member and is not counted (as
-/// with the unseeded `packages` rows); `forge attest` [OB-1]/[OB-2] and `forge check` [OB-12]
-/// hold it to existing and being live.
+/// Metrics measured for the `patch` scope.
 const PATCH_METRICS: &[&str] = &["entries", "live_entries"];
 
 /// One ratchet row.
@@ -63,7 +31,7 @@ pub struct Row {
     /// `shipped.<triple>`, `lock`, or `patch`.
     pub scope: String,
     pub metric: String,
-    /// The recorded high-water mark. Live may equal it; never exceed it.
+    /// The recorded high-water mark.
     pub ceiling: u64,
     /// The accepted `--allow-regress` prose, recorded in the file's 4th column.
     pub regress_reason: Option<String>,
@@ -79,10 +47,7 @@ impl Row {
     }
 }
 
-// --- reading and writing the file ------------------------------------------
-
-/// Read `<root>/tools/forge-budget.tsv`. An absent file is an empty `Vec`;
-/// [`run`] refuses to call an unarmed ratchet a pass.
+/// Read `<root>/tools/forge-budget.tsv` ([`run`]).
 pub fn load(root: &Path) -> Result<Vec<Row>, String> {
     match std::fs::read_to_string(root.join(BUDGET_PATH)) {
         Ok(text) => parse(&text),
@@ -95,8 +60,7 @@ pub fn load(root: &Path) -> Result<Vec<Row>, String> {
     }
 }
 
-/// Parse a ratchet body. Every refusal names the line number, because a
-/// one-fact-per-line file's only useful coordinate is the line.
+/// Parse a ratchet body.
 pub fn parse(text: &str) -> Result<Vec<Row>, String> {
     let mut rows: Vec<Row> = Vec::new();
     for (i, raw) in text.lines().enumerate() {
@@ -185,14 +149,12 @@ pub fn render(rows: &[Row]) -> String {
     s
 }
 
-/// Is a `shipped.<triple>` metric armed (seeded, and owed a row)? Every one
-/// but `packages`, which counts aterm's own crates (the module docs).
+/// Is a `shipped.<triple>` metric armed (seeded, and owed a row)?
 pub(crate) fn armed(metric: &str) -> bool {
     metric != "packages"
 }
 
-/// The armed rows, in file order: the third-party facts per cell, then the lock
-/// and patch facts.
+/// The armed rows, in file order.
 fn seed_shape(live: &Live) -> Vec<(String, String)> {
     let mut out = Vec::new();
     for scope in live.scopes.iter().filter(|s| s.starts_with("shipped.")) {
@@ -206,11 +168,7 @@ fn seed_shape(live: &Live) -> Vec<(String, String)> {
     out
 }
 
-// --- measuring the live surface --------------------------------------------
-
-/// Extra per-scope facts that make a red row actionable: forge cannot name
-/// what is new (it does not record the package set), but it can name what the
-/// mass is made of.
+/// Extra per-scope facts that make a red row actionable.
 #[derive(Clone, Debug, Default)]
 struct ScopeDetail {
     duplicates: Vec<String>,
@@ -224,7 +182,7 @@ struct Live {
     values: BTreeMap<(String, String), u64>,
     /// Scopes in measurement order, for stable seeding.
     scopes: Vec<String>,
-    /// Scope → why it could not be measured. Never silently absent.
+    /// Scope → why it could not be measured.
     unavailable: BTreeMap<String, String>,
     detail: BTreeMap<String, ScopeDetail>,
     /// Free-text observations printed under the table (patch liveness, …).
@@ -247,11 +205,8 @@ fn u(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
-/// The ratchet scope one cell's rows live under; a scope names exactly one cell. Native cells
-/// use `shipped.<triple>`; a triple with two cells (the two wasm browser modules) appends the
-/// cell handle: `shipped.wasm32-unknown-unknown.wasm-gpu`. If a shared triple drops to one cell,
-/// the old rows name a scope nothing measures, and [`validate_metric`] makes that a
-/// could-not-run.
+/// The ratchet scope one cell's rows live under; a scope names exactly one cell
+/// ([`validate_metric`]).
 pub(crate) fn scope_of(cell: &Cell, cells: &[Cell]) -> String {
     if cells.iter().filter(|c| c.triple == cell.triple).count() > 1 {
         format!("shipped.{}.{}", cell.triple, cell.name)
@@ -278,8 +233,6 @@ fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
     for cell in &cells {
         let scope = scope_of(cell, &cells);
         live.scopes.push(scope.clone());
-        // The resolver's notes (forge's offline-retry note among them) go into
-        // the report, not to stderr: only forge's own CLI prints as it goes.
         let mut resolver_log = String::new();
         let surveyed = crate::loc::survey_cell_logged(cargo, root, cell, &mut resolver_log);
         live.notes.extend(
@@ -295,8 +248,6 @@ fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
                 }
                 live.detail.insert(scope.clone(), detail(&s));
             }
-            // A cell that cannot resolve is named, and every row scoped to it reads
-            // UNMEASURED, never a pass.
             Err(e) => {
                 live.unavailable.insert(scope.clone(), e);
             }
@@ -305,9 +256,6 @@ fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
 
     let lock = crate::policy::lock_entries(root)?;
     let patches = crate::policy::patch_entries(root)?;
-    // A lock entry with no `source` is a path package: a workspace member or a first-party or
-    // absorbed `[patch]` crate under crates/ (aterm's own), or a vendored `[patch]` fork under
-    // vendor/, which counts as third-party here as in a shipped cell.
     let vendored_patch_names: Vec<&str> = patches
         .iter()
         .filter(|p| p.is_vendored())
@@ -355,8 +303,6 @@ fn measure(cargo: &crate::resolve::Cargo, root: &Path) -> Result<Live, String> {
             if p.is_live() { "LIVE" } else { "NOT LIVE" }
         ));
     }
-    // Liveness notes cover every entry, vendored or not: a dead patch compiles into nothing
-    // either way.
     for p in &patches {
         if !p.is_live() {
             live.notes.push(format!(
@@ -407,8 +353,6 @@ fn detail(s: &CellSurvey) -> ScopeDetail {
     }
 }
 
-// --- the ratchet decision (pure, so the rules are testable without a graph) -
-
 /// What one row's comparison came to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Verdict {
@@ -417,7 +361,7 @@ enum Verdict {
     At,
     /// Live is above the ceiling by `over`.
     Over(u64),
-    /// The scope could not be measured — never a pass.
+    /// The scope could not be measured.
     Unmeasured,
 }
 
@@ -459,8 +403,7 @@ struct Plan {
     rows: Vec<Row>,
     changed: bool,
     ok: bool,
-    /// How many ceilings this run raised. More than one means one `--allow-regress` sentence
-    /// was recorded against several rows.
+    /// How many ceilings this run raised.
     raised: usize,
     table: Vec<[String; 5]>,
     problems: Vec<String>,
@@ -530,8 +473,6 @@ fn plan(rows: &[Row], live: &Live, update: bool, reason: Option<&str>) -> Plan {
             note,
         ]);
     }
-    // An armed fact with no row is RED, never advisory: deleting a row would
-    // otherwise drop its scope out of the ratchet and leave the run green.
     for (scope, metric, value) in missing_armed(rows, live) {
         out.ok = false;
         out.problems.push(format!(
@@ -559,8 +500,7 @@ fn missing_armed(rows: &[Row], live: &Live) -> Vec<(String, String, u64)> {
         .collect()
 }
 
-/// The red diagnostic for one row: what it costs, what forge can and cannot say about why, and
-/// the two ways out.
+/// The red diagnostic for one row.
 fn over_message(row: &Row, over: u64, live: &Live) -> String {
     let mut s = format!(
         "RED  {} {} is {over} over the ceiling of {}.\n",
@@ -600,8 +540,6 @@ fn over_message(row: &Row, over: u64, live: &Live) -> String {
     s
 }
 
-// --- the verb --------------------------------------------------------------
-
 /// Compare the live surface, as `cargo` resolves it, against `tools/forge-budget.tsv`.
 pub fn run(
     cargo: &crate::resolve::Cargo,
@@ -609,7 +547,6 @@ pub fn run(
     update: bool,
     allow_regress: Option<&str>,
 ) -> Result<Outcome, String> {
-    // Refuse a bad reason before the survey, so an argument error comes back immediately.
     let reason = match validate_reason(update, allow_regress) {
         Ok(r) => r,
         Err(msg) => {
@@ -660,7 +597,6 @@ pub fn run(
         );
     }
 
-    // A count and the file, not the reasons: printed in full they run to tens of KB.
     let recorded = plan
         .rows
         .iter()
@@ -687,7 +623,6 @@ pub fn run(
         }
     }
 
-    // An unresolved cell fails the run even when no row depends on it.
     let mut ok = plan.ok;
     if !live.unavailable.is_empty() {
         ok = false;
@@ -736,8 +671,7 @@ pub fn run(
     Ok(Outcome { ok, log })
 }
 
-/// The report when no ratchet file exists. Not a pass: a ratchet that ratchets nothing never
-/// reads as "the surface is fine".
+/// The report when no ratchet file exists.
 fn unarmed(root: &Path, live: &Live, update: bool) -> Outcome {
     let mut log = String::new();
     let _ = writeln!(log, "cargo forge budget — {BUDGET_PATH} is not armed\n");
@@ -788,8 +722,7 @@ fn indent(body: &str) -> String {
     body.lines().map(|l| format!("      {l}\n")).collect()
 }
 
-/// Every measured fact that is not armed and has no row in the file: the
-/// advisory list. An armed one with no row is RED ([`missing_armed`]).
+/// Every measured fact that is not armed and has no row in the file ([`missing_armed`]).
 fn unratcheted(rows: &[Row], live: &Live) -> Vec<(String, String, u64)> {
     let armed = seed_shape(live);
     live.values
@@ -800,8 +733,7 @@ fn unratcheted(rows: &[Row], live: &Live) -> Vec<(String, String, u64)> {
         .collect()
 }
 
-/// A row naming a scope or metric forge does not measure is a broken ledger:
-/// could-not-run, never a pass.
+/// A row naming a scope or metric forge does not measure is a broken ledger.
 fn validate_metric(row: &Row, live: &Live) -> Result<(), String> {
     let known: &[&str] = if row.scope == "lock" {
         LOCK_METRICS
@@ -896,7 +828,6 @@ mod tests {
 
     const REASON: &str = "wgpu 29 pulled naga's new backend in for the WebGPU path";
 
-    /// A three- or four-column row parses and renders back byte for byte.
     #[test]
     fn a_row_round_trips_through_render() {
         let text = format!(
@@ -911,8 +842,6 @@ mod tests {
         assert_eq!(render(&rows), text);
     }
 
-    /// Every malformed line is refused at its line number, never skipped: a
-    /// skipped row is a ceiling nobody enforces.
     #[test]
     fn a_malformed_line_is_refused_by_line_number() {
         for (name, text, line) in [
@@ -939,8 +868,6 @@ mod tests {
         }
     }
 
-    /// A row naming a metric or scope forge does not measure is could-not-run,
-    /// never silently unenforced.
     #[test]
     fn an_unknown_metric_or_scope_is_refused() {
         let live = live_with("lock", "packages", 624);
@@ -948,10 +875,6 @@ mod tests {
         assert!(validate_metric(&row("shipped.sparc-unknown-none", "packages", 1), &live).is_err());
     }
 
-    // --- the ratchet rules --------------------------------------------------
-
-    /// `--update` lowers a ceiling to the live value; without it the slack is
-    /// left in the file.
     #[test]
     fn update_lowers_a_ceiling_and_only_update_writes() {
         let live = live_with("patch", "entries", 4);
@@ -989,8 +912,6 @@ mod tests {
         assert!(render(&p.rows).contains(REASON));
     }
 
-    /// The file is TSV: a tab inside the reason would split the row into five
-    /// columns, which the next run refuses to read.
     #[test]
     fn a_tab_in_the_reason_is_refused_because_the_file_is_tsv() {
         let r = format!("{REASON}\tand more");
@@ -1017,8 +938,6 @@ mod tests {
         assert!(!p.ok);
     }
 
-    /// An armed fact with no row is RED with the line that arms it, even under
-    /// `--update`; an unarmed one (`packages`) stays advisory.
     #[test]
     fn a_missing_armed_row_is_red_and_an_unarmed_one_advisory() {
         let scope = "shipped.aarch64-unknown-linux-gnu";

@@ -141,7 +141,6 @@ pub fn exclude_from_backup(dir: &Path) {
         0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09,
     ];
     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        // an interior NUL cannot name a real path
         return;
     };
     #[cfg(target_os = "macos")]
@@ -178,7 +177,6 @@ pub fn exclude_from_backup(dir: &Path) {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // Other Unixes have no Time Machine convention to honour.
         let _ = (path, ATTR, TRUE_BPLIST);
     }
 }
@@ -223,7 +221,6 @@ pub fn universal_control_state() -> [crate::machine::Read<bool>; 2] {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // No domain to read: a known absence of the feature, not a failed read.
         [crate::machine::Read::Absent, crate::machine::Read::Absent]
     }
 }
@@ -266,10 +263,7 @@ pub fn rosetta_present(runtime: &Path) -> Result<bool, String> {
     }
 }
 
-/// The one Rosetta 2 install, program and arguments: `softwareupdate`'s Rosetta verb, which
-/// installs it as the user who runs it, with no administrator password and no dialog
-/// (measured 2026-10-18 and 2026-10-21 on macOS 27.0.1: uid 501, `installAuth=NO` in
-/// `/var/log/install.log`, exit 0).
+/// The Rosetta 2 install command (`softwareupdate --install-rosetta --agree-to-license`).
 #[cfg(target_os = "macos")]
 const ROSETTA_INSTALL: [&str; 3] = [
     "/usr/sbin/softwareupdate",
@@ -386,7 +380,6 @@ pub fn dir_meta_is_private(meta: &Metadata) -> bool {
 #[must_use]
 pub fn dir_writable_by_caller(dir: &Path) -> bool {
     let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
-        // An interior NUL cannot name a real directory.
         return false;
     };
     // SAFETY: `c` is a NUL-terminated C string that outlives the call; `access` only reads it.
@@ -616,34 +609,85 @@ pub fn exec_or_run(command: &mut aterm_uds::spawnfd::StdCommand) -> io::Error {
     command.exec()
 }
 
-/// Wait for `child` while this process stands aside from the terminal's interrupt and quit keys, as `system(3)` does.
-///
-/// # Errors
-/// The wait's.
-pub fn wait_standing_aside(
-    child: &mut aterm_uds::spawnfd::TransparentChild,
-) -> io::Result<std::process::ExitStatus> {
+/// SIGTERM and SIGHUP armed to pass on to the child [`wait_standing_aside`] waits on, from before that child is spawned ([`arm_forwarding`]).
+pub struct Forwarding {
+    previous: [(libc::c_int, libc::sighandler_t); 2],
+}
+
+/// Arm the SIGTERM and SIGHUP forwarding before the child is spawned.
+#[must_use]
+pub fn arm_forwarding() -> Forwarding {
     use std::sync::atomic::Ordering;
-    let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
-    FORWARD_TO.store(pid, Ordering::SeqCst);
+    HELD.store(0, Ordering::SeqCst);
+    FORWARD_TO.store(ARMING, Ordering::SeqCst);
     let forward = forward_to_child as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: `signal(2)` with `SIG_IGN`, or with a handler that makes only
-    // async-signal-safe calls ([`forward_to_child`]); the previous dispositions are kept
-    // to be restored below.
+    // SAFETY: `signal(2)` with a handler that makes only async-signal-safe calls
+    // ([`forward_to_child`]); the previous dispositions are kept to be restored on drop.
     let previous = unsafe {
         [
-            (libc::SIGINT, libc::signal(libc::SIGINT, libc::SIG_IGN)),
-            (libc::SIGQUIT, libc::signal(libc::SIGQUIT, libc::SIG_IGN)),
             (libc::SIGTERM, libc::signal(libc::SIGTERM, forward)),
             (libc::SIGHUP, libc::signal(libc::SIGHUP, forward)),
         ]
     };
-    for (sig, was) in &previous[2..] {
+    for (sig, was) in &previous {
         if *was == libc::SIG_IGN {
             // SAFETY: puts back the `SIG_IGN` this process was started with.
             unsafe { libc::signal(*sig, libc::SIG_IGN) };
         }
     }
+    Forwarding { previous }
+}
+
+impl Drop for Forwarding {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        FORWARD_TO.store(0, Ordering::SeqCst);
+        for (sig, was) in self.previous {
+            if was != libc::SIG_ERR {
+                // SAFETY: puts back the disposition [`arm_forwarding`] replaced.
+                unsafe { libc::signal(sig, was) };
+            }
+        }
+        let held = HELD.swap(0, Ordering::SeqCst);
+        if held != 0 {
+            // SAFETY: delivers the held SIGTERM or SIGHUP to its restored disposition.
+            unsafe {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "re-raises a SIGTERM or SIGHUP held for a child that never started: neither dumps core"
+                )]
+                libc::raise(held);
+            }
+        }
+    }
+}
+
+/// Wait for `child` while this process stands aside from the terminal's interrupt and quit
+/// keys, as `system(3)` does, passing SIGTERM and SIGHUP on to it (`forwarding`, armed
+/// before its spawn).
+///
+/// # Errors
+/// The wait's.
+pub fn wait_standing_aside(
+    child: &mut aterm_uds::spawnfd::TransparentChild,
+    forwarding: Forwarding,
+) -> io::Result<std::process::ExitStatus> {
+    use std::sync::atomic::Ordering;
+    let pid = libc::pid_t::try_from(child.id()).unwrap_or(0);
+    FORWARD_TO.store(pid, Ordering::SeqCst);
+    let held = HELD.swap(0, Ordering::SeqCst);
+    if held != 0 && pid > 0 {
+        // SAFETY: passes the held signal on to the child this process spawned.
+        unsafe { libc::kill(pid, held) };
+    }
+    // SAFETY: `signal(2)` with `SIG_IGN`; the previous dispositions are restored below. Set
+    // after the spawn, so the child does not inherit them.
+    let previous = unsafe {
+        [
+            (libc::SIGINT, libc::signal(libc::SIGINT, libc::SIG_IGN)),
+            (libc::SIGQUIT, libc::signal(libc::SIGQUIT, libc::SIG_IGN)),
+        ]
+    };
     let status = child.wait();
     let _ = FORWARD_TO.compare_exchange(pid, 0, Ordering::SeqCst, Ordering::SeqCst);
     for (sig, was) in previous {
@@ -652,21 +696,40 @@ pub fn wait_standing_aside(
             unsafe { libc::signal(sig, was) };
         }
     }
+    drop(forwarding);
     status
 }
 
-/// The child [`wait_standing_aside`] passes SIGTERM and SIGHUP on to; `0` while it waits on
-/// none.
+/// [`FORWARD_TO`] while the forwarding is armed and the child's pid is not known yet.
+const ARMING: libc::pid_t = -1;
+
+/// The child [`wait_standing_aside`] passes SIGTERM and SIGHUP on to; [`ARMING`] before its
+/// pid is known; `0` while it waits on none.
 static FORWARD_TO: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
 
-/// [`wait_standing_aside`]'s handler: the signal sent on to the child it waits on, or, with
-/// none (a handler outliving its wait), the default action.
+/// A SIGTERM or SIGHUP that arrived while [`FORWARD_TO`] was [`ARMING`], to pass on once the
+/// child's pid is known; `0` for none.
+static HELD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// [`wait_standing_aside`]'s handler: the signal sent on to the child it waits on, held while
+/// that child's pid is not known yet, or, with none (a handler outliving its wait), the
+/// default action.
 extern "C" fn forward_to_child(sig: libc::c_int) {
-    let pid = FORWARD_TO.load(std::sync::atomic::Ordering::SeqCst);
-    // SAFETY: `kill`, `signal` and `raise` are async-signal-safe.
+    use std::sync::atomic::Ordering;
+    let pid = FORWARD_TO.load(Ordering::SeqCst);
+    // SAFETY: `kill`, `signal` and `raise` are async-signal-safe, and so are lock-free atomics.
     unsafe {
         if pid > 0 {
             libc::kill(pid, sig);
+        } else if pid == ARMING {
+            HELD.store(sig, Ordering::SeqCst);
+            let now = FORWARD_TO.load(Ordering::SeqCst);
+            if now > 0 {
+                let held = HELD.swap(0, Ordering::SeqCst);
+                if held != 0 {
+                    libc::kill(now, held);
+                }
+            }
         } else {
             libc::signal(sig, libc::SIG_DFL);
             #[expect(
@@ -710,9 +773,6 @@ pub fn exit_code_like(status: std::process::ExitStatus) -> std::process::ExitCod
 mod tests {
     use super::*;
 
-    /// The Rosetta 2 probe is a `stat`: a file is present; nothing there, a missing
-    /// parent, a parent that is a file, or a directory at the name is missing; a parent
-    /// the probe may not search is no answer at all.
     #[test]
     fn the_rosetta_probe_reads_a_file_and_never_guesses_an_unsearchable_one() {
         let root = crate::testdir::dir("atpkg-rosetta-probe-");
@@ -736,9 +796,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A shared directory already `0755` is not rewritten (a same-mode `chmod(2)` moves
-    /// `st_ctime`, which tippy's ancestor check reads); a drifted mode is forced to `0755`;
-    /// a symlink at the name is refused and its target left alone.
     #[test]
     fn a_shared_dir_already_0755_is_not_rewritten_and_a_drifted_one_is_forced() {
         let root = crate::testdir::dir("atpkg-shared-dir-");
@@ -781,7 +838,6 @@ mod tests {
         assert_eq!(named, 0o700, "the refused link's target was chmodded");
     }
 
-    /// `account_home()` resolves on the machine running the test.
     #[test]
     fn the_account_home_resolves_on_the_machine_running_this_test() {
         let account = account_home().expect(

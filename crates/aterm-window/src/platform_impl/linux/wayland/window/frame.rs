@@ -39,8 +39,7 @@ struct Buffer {
     released: Arc<AtomicBool>,
 }
 
-/// One border part: its subsurface role (destroyed first), its surface, and the buffer it
-/// shows.
+/// One border part: its subsurface role (destroyed first), its surface, and the buffer it shows.
 struct PartSurface {
     subsurface: Owned,
     surface: Owned,
@@ -107,7 +106,6 @@ impl ShadowFrame {
             return false;
         }
         self.retired.retain(|buffer| !buffer.released.load(Ordering::Relaxed));
-        // A compositor need not release a buffer superseded before commit; cap retired buffers.
         let excess = self.retired.len().saturating_sub(MAX_RETIRED);
         self.retired.drain(..excess);
         match look {
@@ -173,8 +171,7 @@ impl ShadowFrame {
     }
 }
 
-/// A `width`×`height` ARGB8888 `wl_buffer` holding `bytes`, in a pool of its own (the pool goes
-/// at once; the buffer keeps its memory), with its `release` heard.
+/// A `width`×`height` ARGB8888 `wl_buffer` holding `bytes`, in a pool of its own (the pool goes at once; the buffer keeps its memory), with its `release` heard.
 fn shm_buffer(shm: &Owned, bytes: &[u8], width: usize, height: usize) -> Result<Buffer, String> {
     let len = i32::try_from(bytes.len()).map_err(|_| "a buffer over 2 GiB".to_string())?;
     let (w, h, stride) = (

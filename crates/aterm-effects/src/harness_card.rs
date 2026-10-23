@@ -10,7 +10,7 @@ use aterm_time::Instant;
 use std::ops::Range;
 use std::time::Duration;
 
-use crate::color_math::relative_luminance;
+use crate::color_math::{floor_contrast_keeping_hue, relative_luminance};
 use crate::cursor_glow::InkRole;
 use crate::effect_util::{
     STAR_ARM_FINE, STAR_ARM_HERO, STAR_ARM_INK, STAR_ARM_STD, STAR_CORE_ADD, STAR_GLINT_COV,
@@ -671,6 +671,11 @@ const LINE_SWEEP_GAIN: f32 = 0.55;
 const LINE_SWEEP_GAIN_LIGHT: f32 = 0.3;
 /// Minimum WCAG relative luminance for dark-theme line ink.
 pub(crate) const LINE_DARK_LUMA_FLOOR: f32 = 0.30;
+/// Minimum WCAG contrast of a line letter on the ground it is laid on, either polarity: the
+/// print law's floor ([`PAPER_MARK_CONTRAST`]), which a letter lifted to
+/// [`LINE_DARK_LUMA_FLOOR`] misses on a ground [`dark_ground`] calls dark but that is not
+/// near-black (Nord's `#2e3440` at 4.16:1, an imported mid grey at 1.00:1).
+const LINE_CONTRAST: f32 = PAPER_MARK_CONTRAST;
 const LINE_HERO_SPREAD: f32 = 1.0;
 const LINE_HERO_DARK_LUMA_FLOOR: f32 = 0.36;
 const LINE_HERO_SWEEP_GAIN: f32 = GLINT_CREST_DARK;
@@ -806,13 +811,15 @@ impl CardPalette {
         }
     }
 
-    /// Returns the resting line letter color at `t` (`0.0..=1.0`) against `ground` (`0x00RRGGBB`).
+    /// Returns the resting line letter color at `t` (`0.0..=1.0`) against `ground` (`0x00RRGGBB`),
+    /// reading at least 4.5:1 on it: on a dark ground the lifted letter floored along its hue, on
+    /// paper the print law's ink.
     #[must_use]
     #[inline]
     pub fn letter_on(self, t: f32, ground: u32) -> u32 {
         let ground = ground & 0x00FF_FFFF;
         if dark_ground(ground) {
-            self.letter(t, true)
+            line_floor(self.letter(t, true), ground)
         } else {
             self.text_at(t, ground)
         }
@@ -2333,10 +2340,13 @@ impl HarnessCard {
                         let k = f32::from(i - hero.start) / hero_span;
                         let place = tri(k * LINE_HERO_SPREAD + phi);
                         if dark {
-                            mix_rgb(
-                                lift_to_luminance(palette.at(place), LINE_HERO_DARK_LUMA_FLOOR),
-                                WHITE,
-                                crest * LINE_HERO_SWEEP_GAIN,
+                            line_floor(
+                                mix_rgb(
+                                    lift_to_luminance(palette.at(place), LINE_HERO_DARK_LUMA_FLOOR),
+                                    WHITE,
+                                    crest * LINE_HERO_SWEEP_GAIN,
+                                ),
+                                ground,
                             )
                         } else {
                             mix_rgb(
@@ -2346,7 +2356,10 @@ impl HarnessCard {
                             )
                         }
                     } else if dark {
-                        mix_rgb(palette.letter(place, true), WHITE, crest * LINE_SWEEP_GAIN)
+                        line_floor(
+                            mix_rgb(palette.letter(place, true), WHITE, crest * LINE_SWEEP_GAIN),
+                            ground,
+                        )
                     } else {
                         mix_rgb(
                             inks.at(palette, ground, place),
@@ -2362,6 +2375,15 @@ impl HarnessCard {
                 }),
         );
     }
+}
+
+/// A dark-ground line letter `rgb` floored along its hue to [`LINE_CONTRAST`] on `ground`: kept
+/// where it already reads, lifted further toward white on a dim ground (Nord's `#2e3440`), and
+/// darkened on one past the polarity at which black reads better than white though still under
+/// [`dark_ground`]'s cut (an imported mid grey), so a sweep's white never washes it out.
+#[inline]
+fn line_floor(rgb: u32, ground: u32) -> u32 {
+    floor_contrast_keeping_hue(rgb, ground, LINE_CONTRAST)
 }
 
 /// Mixes `rgb` toward white to reach WCAG relative luminance `floor` on a `2^-14` step grid.
@@ -5098,6 +5120,104 @@ mod tests {
                 .fold(f32::MAX, f32::min);
             assert!(worst < 4.5, "CONTROL {palette:?}: {worst:.2}");
         }
+    }
+
+    /// The line reads 4.5:1 on every ground [`dark_ground`] calls dark, not only near-black ones:
+    /// every dark built-in (Nord's `#2e3440` read 4.16:1), a grey every few steps up to the cut,
+    /// and the mid grounds imported themes bring (Silver Aerogel `#929292`, Unikitty `#ff8cd9`),
+    /// where a letter lifted to [`LINE_DARK_LUMA_FLOOR`] can sit on the ground's own luminance
+    /// (1.00:1) — the resting letters ([`CardPalette::letter_on`]) and every frame of the
+    /// episode, hero word and sweeps included. NEGATIVE CONTROL: the lifted letter alone on
+    /// Silver Aerogel's ground, so the grounds reach the case the floor answers.
+    #[test]
+    fn the_dark_line_reads_on_every_dark_ground() {
+        use aterm_types::scheme::{Appearance, builtin, builtin_names};
+        let mut grounds: Vec<u32> = builtin_names()
+            .into_iter()
+            .filter_map(builtin)
+            .filter(|s| s.appearance == Appearance::Dark)
+            .map(|s| {
+                let c = s.background;
+                (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)
+            })
+            .collect();
+        assert!(grounds.len() >= 7, "{grounds:?}");
+        grounds.extend((0..=255u32).step_by(6).map(|v| v * 0x0001_0101));
+        grounds.extend([0x0092_9292, 0x00FF_8CD9]);
+        grounds.retain(|&g| dark_ground(g));
+        let line = LineAt {
+            row: 0,
+            col: 0,
+            len: 60,
+            hero: 20..26,
+            wand: None,
+        };
+        let mut ink = Vec::new();
+        let mut lows = Vec::new();
+        for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
+            for &g in &grounds {
+                // The ground's least: `(contrast, what)`.
+                let mut least = (f32::MAX, String::new());
+                let mut note = |rgb: u32, what: &dyn Fn() -> String| {
+                    let c = contrast(rgb, g);
+                    if c < least.0 {
+                        least = (c, format!("{rgb:06x} {}", what()));
+                    }
+                };
+                for k in 0..=255u8 {
+                    let t = f32::from(k) / 255.0;
+                    note(palette.letter_on(t, g), &|| format!("resting at {t:.3}"));
+                }
+                let t0 = Instant::now();
+                let mut card = HarnessCard::default();
+                card.tick(
+                    t0,
+                    &CardScene {
+                        palette,
+                        ground: g,
+                        ..scene()
+                    },
+                    false,
+                    &mut Vec::new(),
+                    &mut Vec::new(),
+                );
+                card.arm(t0, 9);
+                for at in (0..=EPISODE_MS + 100).step_by(50) {
+                    ink.clear();
+                    card.line_ink_into(Some(t0 + ms(at)), &line, g, true, &mut ink);
+                    for c in &ink {
+                        let rgb = (u32::from(c.color[0]) << 16)
+                            | (u32::from(c.color[1]) << 8)
+                            | u32::from(c.color[2]);
+                        note(rgb, &|| format!("cell {} at {at} ms", c.col));
+                    }
+                }
+                if least.0 < 4.5 {
+                    lows.push(format!(
+                        "{palette:?} on {g:06x}: {} at {:.2}:1",
+                        least.1, least.0
+                    ));
+                }
+            }
+        }
+        assert!(
+            lows.is_empty(),
+            "{} grounds under 4.5:1: {lows:#?}",
+            lows.len()
+        );
+        let aerogel = 0x0092_9292;
+        let lifted = (0..=255u8)
+            .map(|k| {
+                contrast(
+                    CardPalette::Cruise.letter(f32::from(k) / 255.0, true),
+                    aerogel,
+                )
+            })
+            .fold(f32::MAX, f32::min);
+        assert!(
+            lifted < 1.5,
+            "CONTROL: the lifted letter alone, {lifted:.2}:1"
+        );
     }
 
     #[test]

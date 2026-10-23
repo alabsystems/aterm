@@ -5,9 +5,6 @@
 use super::*;
 use crate::{CellFlags, PackedColor};
 
-// Row's unsafe write paths stay sound when rows share a PageStore and when a
-// resize reallocates (exercised under Miri).
-
 /// Rows sharing a PageStore are independent: writing one does not alias or
 /// invalidate another.
 #[test]

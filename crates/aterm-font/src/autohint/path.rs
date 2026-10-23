@@ -27,7 +27,6 @@ impl ContourPoint {
         (self.x.to_f32(), self.y.to_f32())
     }
 
-    /// The midpoint, by FreeType's integer division on 26.6.
     fn midpoint(&self, other: Self) -> Self {
         let mid =
             |a: F26Dot6, b: F26Dot6| F26Dot6::from_bits(a.to_bits().wrapping_add(b.to_bits()) / 2);

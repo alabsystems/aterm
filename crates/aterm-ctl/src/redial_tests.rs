@@ -771,7 +771,7 @@ impl Orphan {
             let fields = &stat[stat.rfind(')')? + 1..];
             return fields.split_ascii_whitespace().nth(1)?.parse().ok();
         }
-        let out = std::process::Command::new("ps")
+        let out = std::process::Command::new(aterm_uds::os_path!("ps"))
             .args(["-o", "ppid=", "-p", &pid.to_string()])
             .output()
             .ok()?;

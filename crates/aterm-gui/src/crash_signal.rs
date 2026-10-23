@@ -20,17 +20,11 @@ pub(crate) fn install_signal_handlers_as(arming: Arming) {
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MarkerOwner {
-    /// The installed, updater-owned `.app` bundle running windowed and, when it arrived through
-    /// an update handoff, past its Commit: the daily driver.
+    /// The installed.
     App,
-    /// Everything else: a test binary, a `target/` or store binary, a dev-marked
-    /// bundle, a DMG or translocated launch, a `--headless` start, and a handoff
-    /// candidate its parent may still reject (and reap with SIGKILL).
+    /// Everything else.
     Other,
-    /// A LAB DESK's: a headless
-    /// instance under the lab's desk seam in a development build, under a
-    /// private state root ([`crate::desk::Desk::LabHeadless`]), whose log
-    /// directory is that root's.
+    /// A lab desk's headless instance ([`crate::desk::Desk::LabHeadless`]).
     Lab,
 }
 
@@ -45,10 +39,7 @@ impl MarkerOwner {
         }
     }
 
-    /// Whether this owner's dead, empty marker is NEWS to a sweep run by a
-    /// launch whose own marker is `scan`'s ([`markers::sweep`]): an `app` one
-    /// to every sweep (the windowed launch reports it), a `lab` one to a lab
-    /// desk's sweep alone, and an `other` one to none.
+    /// Whether this owner's dead ([`markers::sweep`]).
     #[cfg(unix)]
     pub(crate) const fn is_news_to(self, scan: MarkerOwner) -> bool {
         match self {
@@ -62,29 +53,18 @@ impl MarkerOwner {
 /// How a launch arms its marker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arming {
-    /// As [`MarkerOwner::App`] from the start: a cold windowed launch of the
-    /// installed bundle.
+    /// As [`MarkerOwner::App`] from the start.
     App,
     /// As [`MarkerOwner::Other`], for good.
     Other,
-    /// As [`MarkerOwner::Other`] until [`adopt_app_identity`]: an installed, windowed handoff
-    /// candidate.
+    /// As [`MarkerOwner::Other`] until [`adopt_app_identity`].
     AppAfterCommit,
-    /// As [`MarkerOwner::Lab`], for good: a lab desk
-    /// ([`crate::desk::Desk::LabHeadless`]), whose launch also runs the
-    /// recovery census on its own private root (`recovery_census::cold_census`).
+    /// As [`MarkerOwner::Lab`], for good ([`crate::desk::Desk::LabHeadless`]).
     Lab,
 }
 
 impl Arming {
-    /// The arming of a launch: `installed_bundle` is the updater's own
-    /// classification of the running copy (`which_copy::Running::InstalledApp` —
-    /// an owned `.app`, not dev-marked, not on a disk image, not translocated),
-    /// `headless` whether the launch arms headless mode, `handoff_candidate`
-    /// whether it arrived through a validated update handoff, and `lab_desk`
-    /// whether its desk is the lab's (`desk::Desk::of(headless) ==
-    /// Desk::LabHeadless`: the seam, read only by a development build, under a
-    /// private state root), which arms as [`Arming::Lab`] whatever else holds.
+    /// The arming of a launch ([`Arming::Lab`]).
     #[must_use]
     pub(crate) const fn for_launch(
         installed_bundle: bool,
@@ -114,59 +94,48 @@ impl Arming {
     }
 }
 
-/// This process is about to end cleanly: remove its own marker, so the empty marker of a process
-/// that did not end cleanly stays meaningful.
+/// This process is about to end cleanly.
 #[cfg(unix)]
 pub(crate) fn release_own_marker() {
     imp::release_own_marker();
 }
 
-/// The start this process's crash marker is named with
-/// (`crash-marker-<pid>-<nanos>-<owner>.log`), once the install armed one;
-/// `None` when it did not.
+/// The start this process's crash marker is named with.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn own_marker_nanos() -> Option<u128> {
     imp::own_marker_nanos()
 }
 
-/// Where this process's crash marker is (its directory and the start it is named with) while it
-/// is still linked: `None` before the install armed one and after the clean exit released it.
+/// Where this process's crash marker is.
 #[cfg(unix)]
 #[must_use]
 pub(crate) fn own_marker_place() -> Option<(std::path::PathBuf, u128)> {
     imp::own_marker_place()
 }
 
-/// The handoff candidate this process was is now the daily driver (its Commit arrived): rename
-/// its marker as [`MarkerOwner::App`].
+/// The handoff candidate this process was is now the daily driver ([`MarkerOwner::App`]).
 #[cfg(unix)]
 pub(crate) fn adopt_app_identity() -> bool {
     imp::adopt_app_identity()
 }
 
-/// Leave the process with `code` NOW, through `_exit(2)`, after removing this
-/// process's marker ([`release_own_marker`]).
+/// Leave the process with `code` NOW ([`release_own_marker`]).
 #[cfg(unix)]
 pub(crate) fn clean_exit_now(code: i32) -> ! {
     let _ = crate::logging::flush_within(crate::logging::LOG_FLUSH_EXIT_WAIT);
     release_own_marker();
-    // SAFETY: async-signal-safe immediate exit of the calling process. It ends
-    // this process and nothing else, runs no handler and no destructor, and
-    // cannot return.
+    // SAFETY: async-signal-safe immediate exit of the calling process.
     unsafe { libc::_exit(code) }
 }
 
-/// Release this launch's crash marker at a clean exit (Windows): close the pre-opened handle and
-/// delete the file if it is still empty.
+/// Release this launch's crash marker at a clean exit (Windows).
 pub(crate) fn remove_marker_on_clean_exit() {
     #[cfg(windows)]
     imp_windows::release_marker();
 }
 
-/// Launch-unique marker path: `crash-signal-<pid>-<nanos>.log`. Windows recycles PIDs
-/// aggressively; the startup timestamp keeps a later launch with a crashed instance's PID from
-/// truncating its marker.
+/// Launch-unique marker path.
 #[cfg(windows)]
 fn marker_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join(format!(
@@ -194,15 +163,13 @@ fn remove_marker_if_empty(path: &std::path::Path) -> bool {
     }
 }
 
-/// Nanoseconds since the epoch — the launch salt in a marker's name.
+/// Nanoseconds since the epoch.
 #[cfg(any(unix, windows))]
 fn startup_nanos() -> u128 {
     aterm_time::since_epoch().map_or(0, |d| d.as_nanos())
 }
 
-/// Delete zero-length `crash-signal-*.log` files left in `dir` (Windows). A clean exit removes
-/// its own ([`remove_marker_on_clean_exit`]), but a kill or a crash that wrote nothing cannot, so
-/// without this sweep they accumulate.
+/// Delete zero-length `crash-signal-*.log` files left in `dir` ([`remove_marker_on_clean_exit`]).
 #[cfg(windows)]
 fn sweep_stale_markers(dir: &std::path::Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -223,10 +190,7 @@ fn sweep_stale_markers(dir: &std::path::Path) {
     }
 }
 
-/// The unix marker's lifecycle: named for its owner, locked for its owner's life, removed by its
-/// owner's clean exit, so another aterm start can tell a live marker from a dead one (a
-/// lock-blind sweep would unlink the live daily driver's marker, leaving its crash banner to an
-/// unlinked inode), and a dead empty one from a clean run.
+/// The unix marker's lifecycle.
 #[cfg(unix)]
 pub(crate) mod markers {
     use std::path::{Path, PathBuf};
@@ -244,9 +208,7 @@ pub(crate) mod markers {
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) struct MarkerName {
         pub(crate) pid: u32,
-        /// The owner's start, nanoseconds since the epoch: with the pid, what
-        /// tells this run from an earlier one that had the same pid (the crash
-        /// journal reads it, `crate::crash_journal::classify_death`).
+        /// The owner's start, nanoseconds since the epoch.
         pub(crate) nanos: u128,
         pub(crate) owner: MarkerOwner,
     }
@@ -257,8 +219,7 @@ pub(crate) mod markers {
         format!("{PREFIX}{pid}-{nanos}-{}.log", owner.tag())
     }
 
-    /// Parse a [`file_name`]; `None` for anything else (a legacy marker, a
-    /// consumed `.seen` record, a pending one, a stranger).
+    /// Parse a [`file_name`].
     #[must_use]
     pub(crate) fn parse(name: &str) -> Option<MarkerName> {
         let body = name.strip_prefix(PREFIX)?.strip_suffix(".log")?;
@@ -287,18 +248,15 @@ pub(crate) mod markers {
     /// What trying a marker's owner lock says about its owner.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Owner {
-        /// Someone holds it: the owner is alive.
+        /// Someone holds it.
         Live,
-        /// The lock was free: the owner is gone.
+        /// The lock was free.
         Dead,
-        /// The file could not be opened or locked for another reason — no
-        /// evidence either way, so nothing is removed or reported.
+        /// The file could not be opened or locked for another reason.
         Unknown,
     }
 
-    /// Probe `path`'s owner lock without waiting: `open` it read-only, not following a symlink
-    /// and not blocking on a FIFO (a file in the log dir is not necessarily one aterm wrote),
-    /// then `flock(LOCK_EX|LOCK_NB)`, then close.
+    /// Probe `path`'s owner lock without waiting.
     #[must_use]
     pub(crate) fn probe(path: &Path) -> Owner {
         use std::os::unix::ffi::OsStrExt as _;
@@ -343,17 +301,14 @@ pub(crate) mod markers {
         }
     }
 
-    /// An empty regular file (not a symlink, FIFO or directory): the only shape a clean-run
-    /// marker has.
+    /// An empty regular file (not a symlink, FIFO or directory).
     fn empty_regular_file(entry: &std::fs::DirEntry) -> bool {
         entry
             .metadata()
             .is_ok_and(|meta| meta.file_type().is_file() && meta.len() == 0)
     }
 
-    /// Remove the markers in `dir` whose owners are gone and whose emptiness is
-    /// not news to `scan` (the rules on this module;
-    /// [`MarkerOwner::is_news_to`]).
+    /// Remove dead markers in `dir` whose emptiness is not news ([`MarkerOwner::is_news_to`]).
     pub(crate) fn sweep(dir: &Path, own_pid: u32, scan: MarkerOwner) -> Vec<MarkerName> {
         let mut swept = Vec::new();
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -363,7 +318,6 @@ pub(crate) mod markers {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             if !empty_regular_file(&entry) {
-                // a real crash record, or not a marker at all
                 continue;
             }
             let path = entry.path();
@@ -391,8 +345,7 @@ pub(crate) mod markers {
         swept
     }
 
-    /// What this process's install-time [`sweep`] removed, kept for the crash
-    /// journal's claim, which runs later in the same launch.
+    /// What this process's install-time [`sweep`] removed.
     static SWEPT_AT_INSTALL: std::sync::OnceLock<Vec<MarkerName>> = std::sync::OnceLock::new();
 
     /// Keep the install-time sweep's answer (the first call wins).
@@ -400,25 +353,20 @@ pub(crate) mod markers {
         let _ = SWEPT_AT_INSTALL.set(swept);
     }
 
-    /// The dead, empty markers of other processes this launch's install-time
-    /// sweep removed — empty when nothing was swept or the install never ran.
+    /// The dead, empty markers of other processes this launch's install-time sweep removed.
     #[must_use]
     pub(crate) fn swept_at_install() -> &'static [MarkerName] {
         SWEPT_AT_INSTALL.get().map_or(&[], Vec::as_slice)
     }
 
-    /// The dead, empty [`MarkerOwner::App`] markers in `dir` another process
-    /// left: evidence that the daily driver ended without a signal and without
-    /// a clean exit.
+    /// The dead, empty [`MarkerOwner::App`] markers in `dir` another process left.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn dead_app_markers(dir: &Path, own_pid: u32) -> Vec<PathBuf> {
         dead_markers_of(dir, own_pid, MarkerOwner::App)
     }
 
-    /// The dead, empty markers of `owner` in `dir` another process left
-    /// ([`dead_app_markers`]'s rule, for any owner: a lab desk reads its own,
-    /// [`MarkerOwner::Lab`]).
+    /// Dead, empty markers of `owner` in `dir` ([`dead_app_markers`], [`MarkerOwner::Lab`]).
     #[must_use]
     pub(crate) fn dead_markers_of(dir: &Path, own_pid: u32, owner: MarkerOwner) -> Vec<PathBuf> {
         let Ok(entries) = std::fs::read_dir(dir) else {
@@ -438,9 +386,7 @@ pub(crate) mod markers {
             .collect()
     }
 
-    /// Create `dir/<name>` `0600`, locked before it is visible under that name: created
-    /// exclusively as `.<name>.pending` (which no sweep removes while it is locked), `flock`ed,
-    /// then renamed into place.
+    /// Create `dir/<name>` `0600`, locked before it is visible under that name.
     pub(crate) fn create_locked(dir: &Path, name: &str) -> Option<(i32, PathBuf)> {
         use std::os::unix::fs::OpenOptionsExt as _;
         use std::os::unix::io::IntoRawFd as _;
@@ -483,14 +429,11 @@ pub(crate) mod markers {
         pub(crate) fd: i32,
         /// Its name in the log dir.
         pub(crate) path: PathBuf,
-        /// Whether the owner lock is held — `false` only for the fallback.
+        /// Whether the owner lock is held.
         pub(crate) locked: bool,
     }
 
-    /// Arm this launch's marker in `dir`: [`create_locked`] under `owner`'s name. When that
-    /// fails (a filesystem without `flock`, a refused rename, a stale pending name), an unlocked
-    /// marker is created directly under its final name, so a native crash still leaves its
-    /// banner on disk.
+    /// Arm this launch's marker in `dir` ([`create_locked`]).
     pub(crate) fn arm(dir: &Path, pid: u32, nanos: u128, owner: MarkerOwner) -> Option<Armed> {
         if let Some((fd, path)) = create_locked(dir, &file_name(pid, nanos, owner)) {
             return Some(Armed {
@@ -529,8 +472,7 @@ pub(crate) mod markers {
 mod imp {
     use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
-    /// Fatal signals we trap. Each bypasses the Rust panic hook entirely, so
-    /// without this handler they leave no on-disk trace for a windowed app.
+    /// Fatal signals we trap.
     const FATAL_SIGNALS: [i32; 5] = [
         libc::SIGSEGV,
         libc::SIGABRT,
@@ -539,33 +481,26 @@ mod imp {
         libc::SIGFPE,
     ];
 
-    /// Pre-built banner halves around the signal number, so the handler does no string work at
-    /// signal time.
+    /// Pre-built banner halves around the signal number.
     const BANNER_PREFIX: &[u8] = b"aterm: fatal signal ";
     const BANNER_SUFFIX: &[u8] = b"\n";
 
-    /// fd of the pre-opened crash-marker file, or `-1` when none was opened
-    /// (no writable private dir at install time).
+    /// fd of the pre-opened crash-marker file.
     static MARKER_FD: AtomicI32 = AtomicI32::new(-1);
 
-    /// Tripped once we have armed the `sigaction` handlers, so a second
-    /// `install` call (defensive) does not re-open the marker fd.
+    /// Tripped once we have armed the `sigaction` handlers.
     static ARMED: AtomicBool = AtomicBool::new(false);
 
-    /// The marker's path as a leaked NUL-terminated string for the clean-exit `unlink`
-    /// ([`release_own_marker`]), or null when there is none or it was released.
+    /// Leaked NUL-terminated marker path for clean-exit `unlink` ([`release_own_marker`]).
     static MARKER_PATH: AtomicPtr<libc::c_char> = AtomicPtr::new(std::ptr::null_mut());
 
-    /// The pid that armed the marker: [`release_own_marker`] in any other
-    /// process (a forked child calling `exit`) is a no-op.
+    /// The pid that armed the marker ([`release_own_marker`]).
     static OWNER_PID: AtomicI32 = AtomicI32::new(0);
 
-    /// Set for an [`super::Arming::AppAfterCommit`] launch until
-    /// [`adopt_app_identity`] renames the marker.
+    /// Set for [`super::Arming::AppAfterCommit`] until [`adopt_app_identity`] renames the marker.
     static PROMOTE_ON_COMMIT: AtomicBool = AtomicBool::new(false);
 
-    /// The `<nanos>` this process's marker is named with, once armed; 0 when
-    /// none was.
+    /// The `<nanos>` this process's marker is named with, once armed.
     static MARKER_NANOS: AtomicU64 = AtomicU64::new(0);
 
     /// See [`super::own_marker_nanos`].
@@ -584,15 +519,13 @@ mod imp {
             return None;
         }
         use std::os::unix::ffi::OsStrExt as _;
-        // SAFETY: a non-null MARKER_PATH is a leaked, never-freed CString
-        // (`publish_marker_path`).
+        // SAFETY: a non-null MARKER_PATH is a leaked, never-freed CString (`publish_marker_path`).
         let current = unsafe { std::ffi::CStr::from_ptr(current) };
         let path = std::path::Path::new(std::ffi::OsStr::from_bytes(current.to_bytes()));
         Some((path.parent()?.to_path_buf(), nanos))
     }
 
-    /// Park `path` in [`MARKER_PATH`] (leaking the string: it must outlive every
-    /// exit path).
+    /// Park `path` in [`MARKER_PATH`] (leaking the string: it must outlive every exit path).
     fn publish_marker_path(path: &std::path::Path) -> bool {
         use std::os::unix::ffi::OsStrExt as _;
         let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
@@ -615,20 +548,13 @@ mod imp {
         }
     }
 
-    /// The `atexit` half of [`release_own_marker`]: every `exit(3)` of this process removes its
-    /// marker.
+    /// The `atexit` half of [`release_own_marker`].
     extern "C" fn release_at_exit() {
         release_own_marker();
     }
 
     unsafe extern "C" {
-        /// `stdlib.h`: register a handler for `exit(3)`. Declared here, as the
-        /// launch-fatal fixture in `lib.rs` declares it, rather than added to
-        /// `aterm-libc`: this marker's removal and `aterm.log`'s queue flush
-        /// (`logging::flush_at_exit`, registered later, so run first) are the
-        /// handlers the product registers, and they run on `exit(3)` only —
-        /// every `_exit` path (the launch-fatal law) does both itself, through
-        /// [`super::clean_exit_now`].
+        /// `stdlib.h`: register a handler for `exit(3)` ([`super::clean_exit_now`]).
         fn atexit(cb: extern "C" fn()) -> libc::c_int;
     }
 
@@ -672,15 +598,14 @@ mod imp {
         &buf[pos..]
     }
 
-    /// Async-signal-safe `write(2)` of `bytes` to `fd`, looping over short and
-    /// `EINTR`-interrupted writes.
+    /// Async-signal-safe `write(2)` of `bytes` to `fd`.
     fn write_all_signal_safe(fd: i32, bytes: &[u8]) {
         if fd < 0 {
             return;
         }
         let mut off = 0usize;
         while off < bytes.len() {
-            // SAFETY: `bytes[off..]` is live for the call and `fd` is non-negative; `write` is async-signal-safe.
+            // SAFETY: `bytes[off..]` is live for the call and `fd` is non-negative.
             let n = unsafe {
                 libc::write(
                     fd,
@@ -693,9 +618,7 @@ mod imp {
                 continue;
             }
             if n < 0 {
-                // SAFETY: `errno_location()` returns a valid, thread-local
-                // `*mut c_int`; reading it on this thread is sound and
-                // async-signal-safe.
+                // SAFETY: `errno_location()` returns a valid, thread-local `*mut c_int`.
                 let err = unsafe { *errno_location() };
                 if err == libc::EINTR {
                     continue;
@@ -705,6 +628,7 @@ mod imp {
         }
     }
 
+    /// # Safety The returned pointer is valid for the calling thread only.
     /// # Safety
     /// The returned pointer is valid for the calling thread only.
     #[inline]
@@ -721,8 +645,7 @@ mod imp {
         }
     }
 
-    /// The fatal-signal handler, installed without `SA_SIGINFO` (it gets only the signal
-    /// number).
+    /// The fatal-signal handler, installed without `SA_SIGINFO` (it gets only the signal number).
     extern "C" fn handle_fatal_signal(sig: libc::c_int) {
         let mut digits = [0u8; U32_MAX_DIGITS];
         let num = fmt_u32_decimal(sig.max(0) as u32, &mut digits);
@@ -734,7 +657,7 @@ mod imp {
             write_all_signal_safe(fd, BANNER_SUFFIX);
         }
 
-        // SAFETY: `act` is a zeroed `sigaction` with `SIG_DFL`; `sigaction` and `raise` are async-signal-safe.
+        // SAFETY: `act` is a zeroed `sigaction` with `SIG_DFL`.
         unsafe {
             let mut act: libc::sigaction = std::mem::zeroed();
             act.sa_sigaction = libc::SIG_DFL;
@@ -747,8 +670,7 @@ mod imp {
         }
     }
 
-    /// Open this launch's crash marker (`0600`, locked for the process's life: [`super::markers`])
-    /// and return its raw fd, or `-1` when there is no log dir.
+    /// Open this launch's crash marker ([`super::markers`]).
     fn open_marker_fd(owner: super::MarkerOwner) -> i32 {
         let Some(dir) = crate::logging::log_dir() else {
             return -1;
@@ -760,9 +682,6 @@ mod imp {
             Some(armed) if publish_marker_path(&armed.path) => {
                 MARKER_NANOS.store(u64::try_from(nanos).unwrap_or(0), Ordering::SeqCst);
                 if !armed.locked {
-                    // The unlocked fallback is named `Other` and must stay so: a
-                    // Commit must not rename it into a marker that reads as a
-                    // killed daily driver while its owner lives.
                     PROMOTE_ON_COMMIT.store(false, Ordering::SeqCst);
                 }
                 armed.fd
@@ -784,11 +703,9 @@ mod imp {
         }
     }
 
-    /// Arm async-signal-safe capture of the fatal signals. Idempotent: the
-    /// marker fd is opened (and handlers installed) only on the first call.
+    /// Arm async-signal-safe capture of the fatal signals.
     pub(super) fn install_signal_handlers(arming: super::Arming) {
         if ARMED.swap(true, Ordering::SeqCst) {
-            // already armed
             return;
         }
         // SAFETY: `getpid` has no preconditions.
@@ -817,8 +734,6 @@ mod imp {
     mod tests {
         use super::*;
 
-        /// Render `value` via the allocation-free helper into a `String` for
-        /// easy comparison against `to_string`.
         fn render(value: u32) -> String {
             let mut buf = [0u8; U32_MAX_DIGITS];
             let bytes = fmt_u32_decimal(value, &mut buf);
@@ -861,8 +776,6 @@ mod marker_tests {
     use crate::crash_journal::tests::{reaped_pid, scratch};
     use std::path::Path;
 
-    /// Let go of a locked marker's descriptor as its owner does: `LOCK_UN`,
-    /// then the close — never by the close alone (the flock release rule).
     fn let_go(fd: i32) {
         // SAFETY: `fd` is an open descriptor owned by the caller; LOCK_UN never waits.
         #[expect(
@@ -876,15 +789,12 @@ mod marker_tests {
         unsafe { libc::close(fd) };
     }
 
-    /// An empty marker nobody holds: what a dead owner leaves.
     fn dead_marker(dir: &Path, pid: u32, owner: MarkerOwner) -> std::path::PathBuf {
         let path = dir.join(markers::file_name(pid, 7, owner));
         std::fs::write(&path, b"").unwrap();
         path
     }
 
-    /// The negative control: a lock-blind sweep that removes every empty `crash-*` marker,
-    /// owner alive or not.
     fn sweep_as_before(dir: &Path) {
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -933,9 +843,6 @@ mod marker_tests {
         );
     }
 
-    /// A marker whose owner holds its lock (here through a second open file description in this
-    /// process: `flock` conflicts across descriptions) survives the sweep; the dead one beside it
-    /// goes.
     #[test]
     fn a_sweep_keeps_a_live_owners_marker_and_removes_a_dead_ones() {
         let dir = scratch("marker-live");
@@ -962,11 +869,6 @@ mod marker_tests {
         let_go(fd);
     }
 
-    /// `arm` takes the locked lifecycle when it can. When it cannot (here a stale pending entry
-    /// the exclusive create cannot replace, standing in for a filesystem without `flock` or a
-    /// refused rename), the launch still gets a marker, so a native crash still leaves its
-    /// banner; it is unlocked and so named `other` even for an `app` launch, never evidence of a
-    /// killed daily driver.
     #[test]
     fn a_launch_that_cannot_lock_still_gets_an_unlocked_marker_that_is_never_news() {
         let dir = scratch("marker-arm");
@@ -1009,7 +911,6 @@ mod marker_tests {
         unsafe { libc::close(fallback.fd) };
     }
 
-    /// A dead `app` marker is news: the sweep leaves it for the windowed launch, which finds it.
     #[test]
     fn only_a_dead_app_marker_of_another_process_is_evidence() {
         let dir = scratch("marker-news");
@@ -1043,13 +944,6 @@ mod marker_tests {
         let_go(fd);
     }
 
-    /// A LAB DESK'S MARKER IS NEWS TO A LAB DESK'S SWEEP ALONE:
-    /// under a lab desk's sweep a dead `lab`
-    /// marker of another process is left for that desk's census (and its own
-    /// kill scan finds it), while a dead `other` one beside it goes and this
-    /// process's own previous image's `lab` one goes too; under the installed
-    /// app's sweep, or any other start's, the same `lab` marker is not news and
-    /// goes, and no windowed launch's kill scan ever reports one.
     #[test]
     fn a_lab_marker_is_news_to_a_lab_desks_sweep_alone() {
         for scan in [MarkerOwner::Lab, MarkerOwner::App, MarkerOwner::Other] {
@@ -1080,9 +974,6 @@ mod marker_tests {
         }
     }
 
-    /// The sweep answers the dead starts it removed: a dead `other` start's empty marker is no
-    /// row, but it is the evidence the crash journal reopens that start's layout by, and the
-    /// sweep runs before the claim.
     #[test]
     fn the_sweep_answers_the_dead_starts_it_removed() {
         let dir = scratch("marker-swept");
@@ -1120,9 +1011,6 @@ mod marker_tests {
         let_go(fd);
     }
 
-    /// A build that predates the lifecycle never locked its `crash-signal-*`
-    /// marker, so its pid is the only liveness there is: a live pid keeps its
-    /// marker, a gone one does not.
     #[test]
     fn legacy_markers_follow_their_pid_and_pending_ones_their_lock() {
         let dir = scratch("marker-legacy");
@@ -1151,9 +1039,6 @@ mod marker_tests {
         assert!(!stale_pending.exists(), "an arming that died mid-way");
     }
 
-    /// Two real processes: a child arms a marker the way `install` does and
-    /// is SIGKILLed — its lock dies with it, so the marker reads Dead; while
-    /// it lived, the same marker read Live from here.
     #[test]
     fn a_killed_owner_releases_its_lock() {
         use std::io::Read as _;
@@ -1213,8 +1098,6 @@ mod imp_windows {
 
     const STD_ERROR_HANDLE: u32 = -12i32 as u32;
     const INVALID_HANDLE_VALUE: isize = -1;
-    /// Hand the exception on to the default WER/termination path after the
-    /// marker is written — the analogue of the unix restore-default-and-raise.
     const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
     /// Minimal `EXCEPTION_POINTERS`: only `ExceptionRecord` is followed.
@@ -1237,12 +1120,8 @@ mod imp_windows {
         exception_information: [usize; 15],
     }
 
-    /// `STATUS_ACCESS_VIOLATION`: the one code whose `ExceptionInformation`
-    /// layout (op at [0], faulting address at [1]) we decode.
     const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC000_0005;
 
-    /// Pre-built banner fragments around the hex fields, so the filter does no string work:
-    /// `PREFIX <code> AT <pc> [AV_OP <op> AV_AT <addr>] SUFFIX`.
     const BANNER_PREFIX: &[u8] = b"aterm: fatal exception 0x";
     const BANNER_AT: &[u8] = b" at 0x";
     const BANNER_AV_OP: &[u8] = " \u{2014} access violation ".as_bytes();
@@ -1259,11 +1138,8 @@ mod imp_windows {
     pub(super) static MARKER_PATH: std::sync::OnceLock<std::path::PathBuf> =
         std::sync::OnceLock::new();
 
-    /// Tripped once the filter is registered, so a second `install` call
-    /// (defensive) does not re-open the marker handle.
     static ARMED: AtomicBool = AtomicBool::new(false);
 
-    /// Format `value` as exactly 8 uppercase hex digits into `buf`, returning the filled slice.
     fn fmt_u32_hex(value: u32, buf: &mut [u8; 8]) -> &[u8] {
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         for (i, b) in buf.iter_mut().enumerate() {
@@ -1272,9 +1148,6 @@ mod imp_windows {
         &buf[..]
     }
 
-    /// Format `value` as exactly 16 uppercase hex digits — the pointer-width
-    /// sibling of [`fmt_u32_hex`], for `ExceptionAddress` and the faulting
-    /// address.
     fn fmt_u64_hex(value: u64, buf: &mut [u8; 16]) -> &[u8] {
         const HEX: &[u8; 16] = b"0123456789ABCDEF";
         for (i, b) in buf.iter_mut().enumerate() {
@@ -1283,8 +1156,6 @@ mod imp_windows {
         &buf[..]
     }
 
-    /// Allocation-free `WriteFile` loop over short writes. Errors are swallowed: the filter must
-    /// still return so the default termination proceeds.
     fn write_all_handle(handle: isize, bytes: &[u8]) {
         if handle == INVALID_HANDLE_VALUE || handle == 0 {
             return;
@@ -1293,8 +1164,7 @@ mod imp_windows {
         while off < bytes.len() {
             let mut written = 0u32;
             let len = u32::try_from(bytes.len() - off).unwrap_or(u32::MAX);
-            // SAFETY: `bytes[off..]` is live and `written` is a valid out-param; `WriteFile`
-            // allocates nothing on our side, so a possibly corrupt heap does not matter.
+            // SAFETY: `bytes[off..]` is live and `written` is a valid out-param.
             let ok = unsafe {
                 WriteFile(
                     handle,
@@ -1311,15 +1181,11 @@ mod imp_windows {
         }
     }
 
-    /// The unhandled-exception filter, allocation-free: a stack hex buffer, the pre-built banner
-    /// bytes, and `WriteFile` loops to stderr and the marker.
     extern "system" fn handle_fatal_exception(info: *mut ExceptionPointers) -> i32 {
         let mut code = 0u32;
         let mut address = 0u64;
         let mut av: Option<(&[u8], u64)> = None;
-        // SAFETY: `info` is a valid `EXCEPTION_POINTERS` from the OS with guarded pointers; the
-        // record's fixed `#[repr(C)]` layout and the `number_parameters` check keep the
-        // `exception_information` reads in bounds.
+        // SAFETY: `info` is a valid `EXCEPTION_POINTERS` from the OS with guarded pointers.
         unsafe {
             if !info.is_null() {
                 let rec = (*info).exception_record;
@@ -1364,8 +1230,6 @@ mod imp_windows {
         EXCEPTION_CONTINUE_SEARCH
     }
 
-    /// Open a launch-unique crash-marker file and return its raw HANDLE, or `-1` when no log dir
-    /// is available.
     fn open_marker_handle() -> isize {
         use std::os::windows::io::IntoRawHandle;
         let Some(dir) = crate::logging::log_dir() else {
@@ -1382,8 +1246,6 @@ mod imp_windows {
         }
     }
 
-    /// `FILE_SHARE_READ | FILE_SHARE_WRITE`: everything `std`'s default share
-    /// mode grants EXCEPT `FILE_SHARE_DELETE`.
     const MARKER_SHARE_MODE: u32 = 0x1 | 0x2;
 
     /// Create (truncating) the marker at `path`, held against deletion while the returned handle
@@ -1417,7 +1279,6 @@ mod imp_windows {
     /// opened (and the filter registered) only on the first call.
     pub(crate) fn install() {
         if ARMED.swap(true, Ordering::SeqCst) {
-            // already armed
             return;
         }
         MARKER_HANDLE.store(open_marker_handle(), Ordering::SeqCst);
@@ -1431,7 +1292,6 @@ mod imp_windows {
     mod tests {
         use super::*;
 
-        /// Render `value` via the allocation-free hex helper.
         fn render(value: u32) -> String {
             let mut buf = [0u8; 8];
             String::from_utf8(fmt_u32_hex(value, &mut buf).to_vec()).unwrap()
@@ -1496,8 +1356,6 @@ mod imp_windows {
             assert!(ARMED.load(Ordering::SeqCst));
         }
 
-        /// A marker opened by [`open_marker_file`] survives a sibling's sweep and any delete
-        /// while its handle is open, and is an ordinary empty leftover once released.
         #[test]
         fn a_held_marker_survives_the_sweep_and_goes_once_released() {
             let dir =
@@ -1560,8 +1418,6 @@ mod clean_exit_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The seam runs on every clean exit, armed or not, and may run twice: afterwards nothing is
-    /// held on Windows, and on unix it is a harmless no-op.
     #[test]
     fn release_without_an_armed_marker_is_a_harmless_no_op() {
         #[cfg(windows)]

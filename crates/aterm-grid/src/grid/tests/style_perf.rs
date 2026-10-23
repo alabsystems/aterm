@@ -27,9 +27,6 @@ fn mark_cursor_damage_marks_cursor_cell() {
     assert!(b.left <= 40 && b.right > 40);
 }
 
-// Boundary regressions
-
-/// scroll_down() shifts content (delegates to scroll_region_down()).
 #[test]
 fn grid_scroll_down_shifts_content_and_clears_top() {
     let mut grid = Grid::new(5, 10);
@@ -69,7 +66,6 @@ fn grid_scroll_down_shifts_content_and_clears_top() {
     );
 }
 
-/// scroll_down(n) with n >= visible_rows clears the entire screen.
 #[test]
 fn grid_scroll_down_full_screen_clears_all() {
     let mut grid = Grid::new(4, 10);
@@ -89,9 +85,6 @@ fn grid_scroll_down_full_screen_clears_all() {
     }
 }
 
-// HAS_EXTRAS per-cell flag
-
-/// remove_cell_extra atomically clears HAS_EXTRAS and removes the extras entry.
 #[test]
 fn remove_cell_extra_clears_flag_and_entry() {
     let mut grid = Grid::new(1, 10);
@@ -119,7 +112,6 @@ fn remove_cell_extra_clears_flag_and_entry() {
     assert!(!removed_again, "second remove should return false");
 }
 
-/// sync_extras_flags_for_row sets HAS_EXTRAS on cells that have extras entries.
 #[test]
 fn sync_extras_flags_for_row_sets_flags_correctly() {
     let mut grid = Grid::new(1, 10);
@@ -129,7 +121,6 @@ fn sync_extras_flags_for_row_sets_flags_correctly() {
         grid.write_char((b'A' + col as u8) as char);
     }
 
-    // Entries on cols 1 and 3, then every flag cleared, as after a checkpoint load.
     {
         let extra = grid.cell_extra_mut(0, 1);
         extra.set_fg_rgb(Some([255, 0, 0]));
@@ -173,7 +164,6 @@ fn sync_extras_flags_for_row_sets_flags_correctly() {
     );
 }
 
-/// sync_extras_flags_for_row clears a HAS_EXTRAS flag that has no extras entry.
 #[test]
 fn sync_extras_flags_for_row_clears_stale_flags() {
     let mut grid = Grid::new(1, 10);
@@ -185,7 +175,6 @@ fn sync_extras_flags_for_row_clears_stale_flags() {
     let extra = grid.cell_extra_mut(0, 2);
     extra.set_fg_rgb(Some([255, 0, 0]));
 
-    // HAS_EXTRAS without an entry on cols 0, 1 and 4.
     for col in [0u16, 1, 4] {
         if let Some(row) = grid.row_mut(0)
             && let Some(cell) = row.get_mut(col)
@@ -231,7 +220,6 @@ fn sync_extras_flags_for_row_clears_stale_flags() {
     );
 }
 
-/// Erase operations clear HAS_EXTRAS by resetting cells to empty.
 #[test]
 fn erase_to_end_of_screen_clears_has_extras() {
     let mut grid = Grid::new(3, 10);

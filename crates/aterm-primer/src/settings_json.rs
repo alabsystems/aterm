@@ -1,40 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A minimal JSON value — parser and pretty-printer — for the ONE JSON document
-//! this crate edits: an agent vendor's settings file. Its writers are hook
-//! removal ([`crate::remove_aterm_hooks`]: takes the hook entries an earlier
-//! aterm wrote, and restores a `statusLine` the harness took), and the
-//! defaults fill ([`crate::add_claude_defaults`]: adds only keys that are
-//! unset); other readers look at keys a person set by hand.
-//!
-//! What that needs is small — read a document, keep every key it does not
-//! own, add or drop the ones it does, write it back — and every part of that is
-//! here, with nothing clever: a recursive-descent parser with a depth bound,
-//! and a printer that emits the two-space form the vendor's own writer uses.
-//! `aterm-json` is not used because its objects are sorted maps.
-//!
-//! **Keys keep their order and numbers keep their text.** An object is a
-//! `Vec<(String, Json)>`, not a map, so a rewritten file reads back in the
-//! order its owner wrote it; a number is the literal that was parsed, so `1.0`
-//! does not come back as `1` and `1e3` does not come back as `1000`. A
-//! rewrite touches only the keys its caller owns and must be able to say, of
-//! every other byte of meaning in the file, that it is still there.
-//!
-//! **A key written twice is read as the vendor reads it.** Claude Code reads
-//! its settings with `JSON.parse`, where the LAST value of a duplicated key is
-//! the one in force, kept in the key's FIRST position. The parser reads it so,
-//! at every depth, so each object holds every key once and no caller can edit
-//! (or keep, or delete) a shadowed copy the agent never sees. A rewrite drops
-//! the shadowed copies, as the vendor's own save does; the caller's backup
-//! keeps the bytes.
+//! Order-preserving JSON parser and two-space pretty-printer for vendor settings files.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-/// The most nested a document may be before the parser refuses it. A settings
-/// file is three or four levels deep; this is a bound against a crafted file
-/// exhausting the stack, not a limit anyone will meet.
 const DEPTH_MAX: usize = 64;
 
 /// One JSON value.
@@ -42,23 +13,18 @@ const DEPTH_MAX: usize = 64;
 pub enum Json {
     Null,
     Bool(bool),
-    /// The number's own text, validated against the JSON grammar and kept as
-    /// written.
+    /// The number's own text, validated against the JSON grammar and kept as written.
     Number(String),
     Str(String),
     Array(Vec<Json>),
-    /// Members in source order. A parsed object holds each key once: a key
-    /// written twice keeps its first position and its last value, as
-    /// `JSON.parse` reads it (see the module docs).
+    /// Members in source order.
     Object(Vec<(String, Json)>),
 }
 
 impl Json {
-    /// Parse one document. Leading and trailing whitespace is allowed; anything
-    /// else after the value is an error.
+    /// Parse one document.
     ///
     /// # Errors
-    ///
     /// The byte offset and a word about what was expected.
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut p = Parser {
@@ -74,8 +40,7 @@ impl Json {
         Ok(value)
     }
 
-    /// The member `key` of an object, or `None` for a missing key or a
-    /// non-object.
+    /// The member `key` of an object, or `None` for a missing key or a non-object.
     #[must_use]
     pub fn get(&self, key: &str) -> Option<&Self> {
         match self {
@@ -135,9 +100,7 @@ impl Json {
         }
     }
 
-    /// The document, pretty-printed with two-space indentation and no trailing
-    /// newline — the form the vendor's own settings writer emits, so a merged
-    /// file diffs against what was there by the lines that changed.
+    /// The document, pretty-printed with two-space indentation and no trailing newline.
     #[must_use]
     pub fn render(&self) -> String {
         let mut out = String::new();
@@ -297,8 +260,6 @@ impl Parser<'_> {
             }
             self.digits();
         }
-        // The slice is ASCII by construction: every byte stepped over above
-        // is a digit, a sign, a dot or an `e`.
         Ok(Json::Number(
             String::from_utf8_lossy(&self.src[start..self.at]).into_owned(),
         ))
@@ -357,8 +318,6 @@ impl Parser<'_> {
                 }
                 b if b < 0x20 => return Err(self.err("no control byte inside a string")),
                 _ => {
-                    // Copy one whole UTF-8 sequence: the source is a `&str`, so
-                    // the sequence starting here is well-formed.
                     let start = self.at - 1;
                     let len = utf8_len(b);
                     let end = (start + len).min(self.src.len());
@@ -372,9 +331,6 @@ impl Parser<'_> {
         }
     }
 
-    /// Four hex DIGITS, nothing else: `u32::from_str_radix` alone also takes a
-    /// leading `+`, which read `\u+041` as U+0041 — a file the vendor refuses
-    /// would have been rewritten as valid JSON with a changed value.
     fn hex4(&mut self) -> Result<u32, String> {
         let end = self.at + 4;
         let value = self.src.get(self.at..end).and_then(|digits| {
@@ -415,8 +371,6 @@ impl Parser<'_> {
     fn object(&mut self, depth: usize) -> Result<Json, String> {
         self.eat(b'{')?;
         let mut members: Vec<(String, Json)> = Vec::new();
-        // Where each key sits in `members`, so a key written again replaces its
-        // value in place: `JSON.parse`'s reading (the module docs).
         let mut slot: HashMap<String, usize> = HashMap::new();
         self.ws();
         if self.peek() == Some(b'}') {
@@ -465,8 +419,6 @@ const fn utf8_len(lead: u8) -> usize {
 mod tests {
     use super::*;
 
-    /// A vendor settings document survives a parse and a render with every
-    /// key in its place and every number as written.
     #[test]
     fn a_settings_document_round_trips_in_order() {
         let text = r#"{
@@ -512,8 +464,6 @@ mod tests {
         assert!(doc.render().contains("\"ratio\": 1.50"));
     }
 
-    /// Every escape the grammar names, in both directions, including a
-    /// surrogate pair and a raw multi-byte character.
     #[test]
     fn strings_escape_and_unescape() {
         let doc = Json::parse(r#""a\"b\\c\/d\b\f\n\r\t\u00e9\ud83d\ude00 héllo""#).unwrap();
@@ -527,7 +477,6 @@ mod tests {
         assert_eq!(round, Json::Str("tab\there \u{1F600}".into()));
     }
 
-    /// Malformed input is refused with an offset — never accepted in part.
     #[test]
     fn malformed_documents_are_refused() {
         for bad in [
@@ -547,7 +496,6 @@ mod tests {
             "tru",
             "{} trailing",
             "\"\\u12\"",
-            // Four hex DIGITS: a sign is none (`\u+041` read as U+0041).
             "\"\\u+041\"",
             "\"\\u+0041\"",
         ] {
@@ -559,8 +507,6 @@ mod tests {
         assert!(Json::parse(&fine).is_ok());
     }
 
-    /// A key written twice reads as `JSON.parse` — the vendor's reader — reads
-    /// it, at every depth: its LAST value, in its FIRST position.
     #[test]
     fn a_key_written_twice_reads_as_json_parse_reads_it() {
         let doc = Json::parse(r#"{"a": 1, "b": {"c": 1, "c": 2}, "a": 3}"#).unwrap();

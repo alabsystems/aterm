@@ -4,11 +4,6 @@
 // Derived from winit 0.30.13 src/platform_impl/windows/ime.rs,
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
-// Modified by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Update IME handle imports and null context arguments for windows-sys 0.61. Read the
-// composition through `CompositionSource` and decide the IME messages' events in `ime_events`,
-// so a recorded composition can drive both.
-
 use std::ffi::{c_void, OsString};
 use std::os::windows::prelude::OsStringExt;
 use std::ptr::null_mut;

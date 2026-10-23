@@ -92,7 +92,7 @@ pub(crate) fn sync_durable(f: &std::fs::File) -> io::Result<()> {
 /// macOS's QoS launcher, the one the window wraps its package passes in. Absent
 /// elsewhere, where [`utility_clamped`] leaves a program bare.
 #[cfg(unix)]
-const TASKPOLICY: &str = "/usr/sbin/taskpolicy";
+const TASKPOLICY: &str = aterm_uds::os_path!("taskpolicy");
 
 /// The argv head that starts `program` at UTILITY QoS for a detached background pass.
 #[cfg(unix)]

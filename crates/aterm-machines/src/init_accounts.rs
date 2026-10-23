@@ -14,9 +14,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 const STORE: &str = "Library/IdentityServices/Persistence/accounts.data";
-const GZIP: &str = "/usr/bin/gzip";
-const PLUTIL: &str = "/usr/bin/plutil";
-const OSASCRIPT: &str = "/usr/bin/osascript";
+const GZIP: &str = aterm_uds::os_path!("gzip");
+const PLUTIL: &str = aterm_uds::os_path!("plutil");
+const OSASCRIPT: &str = aterm_uds::os_path!("osascript");
 
 #[derive(Clone, Copy)]
 enum Service {

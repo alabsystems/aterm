@@ -126,7 +126,7 @@ impl Fixture {
         fx.write_notice(&[(FORK, &fork_version(), FORK_LICENSE)]);
         fx.write_ledger("");
 
-        let _ = Command::new("git")
+        let _ = Command::new(aterm_uds::os_path!("git"))
             .args(["init", "-q"])
             .current_dir(&fx.root)
             .status();

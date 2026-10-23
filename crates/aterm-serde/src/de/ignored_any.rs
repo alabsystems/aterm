@@ -12,10 +12,6 @@ use crate::de::{
 };
 
 /// An efficient way of discarding data from a deserializer.
-///
-/// Think of this like `serde_json::Value` in that it can be deserialized from
-/// any type, except that it does not store any information about the data that
-/// gets deserialized.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
 pub struct IgnoredAny;
 
@@ -102,9 +98,7 @@ impl<'de> Visitor<'de> for IgnoredAny {
     where
         A: SeqAccess<'de>,
     {
-        while let Some(IgnoredAny) = tri!(seq.next_element()) {
-            // Gobble
-        }
+        while let Some(IgnoredAny) = tri!(seq.next_element()) {}
         Ok(IgnoredAny)
     }
 
@@ -113,9 +107,7 @@ impl<'de> Visitor<'de> for IgnoredAny {
     where
         A: MapAccess<'de>,
     {
-        while let Some((IgnoredAny, IgnoredAny)) = tri!(map.next_entry()) {
-            // Gobble
-        }
+        while let Some((IgnoredAny, IgnoredAny)) = tri!(map.next_entry()) {}
         Ok(IgnoredAny)
     }
 

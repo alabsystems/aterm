@@ -4,7 +4,6 @@
 
 //! Character set support (G0-G3, GL/GR, SI/SO, SS2/SS3) as plain data types.
 
-// The charset types are small `Copy` values but take `&self` like the rest of the terminal API.
 #![allow(clippy::trivially_copy_pass_by_ref)]
 
 /// 94-character set designations (VT510), each with its SCS final byte.
@@ -67,8 +66,7 @@ impl CharacterSet {
         }
     }
 
-    /// Translate a character using this character set. Only ASCII positions are remapped;
-    /// U+0080 and above pass through.
+    /// Translate a character using this character set.
     #[inline]
     #[must_use]
     pub const fn translate(&self, c: char) -> char {
@@ -79,8 +77,11 @@ impl CharacterSet {
             Self::Ascii => c,
             Self::DecLineDrawing => Self::translate_dec_line_drawing(c),
             Self::UnitedKingdom => {
-                // UK: # (0x23) → £ (pound sign)
-                if c == '#' { '£' } else { c }
+                if c == '#' {
+                    '£'
+                } else {
+                    c
+                }
             }
             Self::DecSupplemental => Self::translate_dec_supplemental(c),
             Self::Dutch => Self::translate_dutch(c),
@@ -136,8 +137,7 @@ impl CharacterSet {
         }
     }
 
-    /// Translate using DEC Supplemental. Only `$` (general currency sign) is remapped; apps rely
-    /// on UTF-8 and rarely activate this set.
+    /// Translate using DEC Supplemental.
     #[inline]
     const fn translate_dec_supplemental(c: char) -> char {
         match c {
@@ -364,8 +364,7 @@ impl From<GlMapping> for u8 {
     }
 }
 
-/// Which G-set is currently mapped to GR (right half, 0xA0-0xFF). Only G1-G3 can be invoked
-/// into GR; G2 is the VT220 default.
+/// Which G-set is currently mapped to GR (right half, 0xA0-0xFF).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -417,7 +416,6 @@ pub enum SingleShift {
 }
 
 /// 96-character set designations (ISO 2022), mapping all 96 positions when invoked into GL/GR.
-/// Designated via ESC - (G1), ESC . (G2), ESC / (G3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[non_exhaustive]
@@ -457,8 +455,6 @@ impl CharacterSet96 {
         if offset >= 96 {
             return '\u{FFFD}';
         }
-        // `get`, not indexing: the Trust model checker cannot see that the guard above bounds
-        // `offset`. The `None` arm is unreachable.
         let idx = usize::from(offset);
         let lookup = |table: &'static [char; 96]| match table.get(idx) {
             Some(c) => *c,
@@ -474,9 +470,7 @@ impl CharacterSet96 {
     }
 }
 
-// ISO 8859 translation tables: 96 entries each, positions 0xA0-0xFF.
-
-/// ISO 8859-2 (Latin-2): Central European. Positions 0xA0-0xFF → Unicode.
+/// ISO 8859-2 (Latin-2): Central European.
 #[rustfmt::skip]
 static ISO_8859_2_TABLE: [char; 96] = [
     '\u{00A0}', '\u{0104}', '\u{02D8}', '\u{0141}', '\u{00A4}', '\u{013D}', '\u{015A}', '\u{00A7}',
@@ -493,7 +487,7 @@ static ISO_8859_2_TABLE: [char; 96] = [
     '\u{0159}', '\u{016F}', '\u{00FA}', '\u{0171}', '\u{00FC}', '\u{00FD}', '\u{0163}', '\u{02D9}',
 ];
 
-/// ISO 8859-5 (Latin/Cyrillic). Positions 0xA0-0xFF → Unicode.
+/// ISO 8859-5 (Latin/Cyrillic).
 #[rustfmt::skip]
 static ISO_8859_5_TABLE: [char; 96] = [
     '\u{00A0}', '\u{0401}', '\u{0402}', '\u{0403}', '\u{0404}', '\u{0405}', '\u{0406}', '\u{0407}',
@@ -510,7 +504,7 @@ static ISO_8859_5_TABLE: [char; 96] = [
     '\u{0458}', '\u{0459}', '\u{045A}', '\u{045B}', '\u{045C}', '\u{00A7}', '\u{045E}', '\u{045F}',
 ];
 
-/// ISO 8859-7 (Latin/Greek). Positions 0xA0-0xFF → Unicode.
+/// ISO 8859-7 (Latin/Greek).
 #[rustfmt::skip]
 static ISO_8859_7_TABLE: [char; 96] = [
     '\u{00A0}', '\u{2018}', '\u{2019}', '\u{00A3}', '\u{20AC}', '\u{20AF}', '\u{00A6}', '\u{00A7}',
@@ -527,7 +521,7 @@ static ISO_8859_7_TABLE: [char; 96] = [
     '\u{03C8}', '\u{03C9}', '\u{03CA}', '\u{03CB}', '\u{03CC}', '\u{03CD}', '\u{03CE}', '\u{FFFD}',
 ];
 
-/// ISO 8859-9 (Latin-5/Turkish). Identical to 8859-1 except 6 positions.
+/// ISO 8859-9 (Latin-5/Turkish).
 #[rustfmt::skip]
 static ISO_8859_9_TABLE: [char; 96] = [
     '\u{00A0}', '\u{00A1}', '\u{00A2}', '\u{00A3}', '\u{00A4}', '\u{00A5}', '\u{00A6}', '\u{00A7}',
@@ -585,9 +579,6 @@ impl CharacterSetState {
     pub const fn new() -> Self {
         Self {
             g0: CharacterSet::Ascii,
-            // xterm resetCharsets() does initCharset(screen, 1, nrc_ASCII):
-            // G1 defaults to ASCII at VT100+ level (DEC Special Graphics is
-            // the G1 default only in VT52 graphics mode).
             g1: CharacterSet::Ascii,
             g2: CharacterSet::Ascii,
             g3: CharacterSet::Ascii,
@@ -634,7 +625,7 @@ impl CharacterSetState {
     }
 
     /// Whether U+00A0-U+00FF pass through unchanged: the GR-mapped G-set has no 96-character
-    /// designation and is ASCII. Otherwise they must go through `translate()`.
+    /// designation and is ASCII.
     #[must_use]
     #[inline]
     pub const fn gr_is_passthrough(&self) -> bool {
@@ -667,8 +658,6 @@ impl CharacterSetState {
     pub fn translate(&mut self, c: char) -> char {
         let cp = c as u32;
 
-        // GR range: the GR-mapped G-set's 96-character designation first, else its
-        // 94-character set.
         if (0xA0..=0xFF).contains(&cp) {
             self.clear_single_shift();
             let cs96 = match self.gr {
@@ -677,13 +666,9 @@ impl CharacterSetState {
                 GrMapping::G3 => self.g3_96,
             };
             if let Some(cs96) = cs96 {
-                // Offsets 0-95 for 0xA0-0xFF. `wrapping_sub` and the byte mask let the
-                // Trust gate see the narrowing is lossless; with `cp` in 0xA0..=0xFF neither
-                // changes the value.
                 let offset = (cp.wrapping_sub(0xA0) & 0xFF) as u8;
                 return cs96.translate(offset);
             }
-            // As above: `cp >= 0xA0`, so `wrapping_sub` never wraps and the mask is identity.
             let masked = (cp.wrapping_sub(0x80) & 0xFF) as u8;
             let charset = match self.gr {
                 GrMapping::G1 => self.g1,
@@ -696,13 +681,11 @@ impl CharacterSetState {
             return charset.translate(masked as char);
         }
 
-        // Above 0xFF nothing is remapped, but the single shift is still consumed.
         if cp >= 0x80 {
             self.clear_single_shift();
             return c;
         }
 
-        // A 96-character override on the active GL G-set covers all of 0x20-0x7F.
         if let Some(cs96) = self.effective_96() {
             self.clear_single_shift();
             if (0x20..=0x7F).contains(&cp) {

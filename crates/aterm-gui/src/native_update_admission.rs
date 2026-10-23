@@ -2,10 +2,6 @@
 // Copyright 2026 Andrew Yates
 
 //! Pure admission policy for the updater's final process-replacement lane.
-//!
-//! Foreground terminal jobs are safe only once the live-session handoff is prepared. The
-//! decision is kept apart from the mechanics so unit tests and the formal model's conformance
-//! test (`native_updater_conformance`) can drive it.
 
 /// Complete facts at the point immediately before process replacement.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,10 +18,8 @@ pub(crate) struct AdmissionFacts {
     pub(crate) foreground_jobs: usize,
     /// PTYs for which the foreground process group could not be observed.
     pub(crate) unknown_foregrounds: usize,
-    /// This process keeps the image it was launched with
-    /// (`aterm_update::ImageReplacement`: a macOS window no parent handed off to, or a
-    /// seamless successor LaunchServices launched): it never execs in place, so the cold
-    /// lane is closed to it.
+    /// This process keeps the image it was launched with (`aterm_update::ImageReplacement`),
+    /// so it never execs in place and the cold lane is closed to it.
     pub(crate) image_kept: bool,
 }
 
@@ -82,38 +76,20 @@ pub(crate) const fn classify(facts: AdmissionFacts) -> AdmissionDecision {
     if !facts.native_state_certified {
         return AdmissionDecision::Block(AdmissionBlock::NativeStateUncertified);
     }
-    // The unknown-foreground probe gates only the cold lane: it asks whether replacing the app
-    // would kill what the person is running. The seamless lane signals nothing (the shell keeps
-    // running on the same pty), so an unprobeable foreground must not veto it; `foreground_pgrp`
-    // counts any `tcgetpgrp` error as unknown, so one exited shell in an open tab would
-    // otherwise block every automatic update.
-    //
-    // More foreground jobs than PTYs is no real session state, so it fails closed for every
-    // lane. A seamless attempt that fails later goes to the manual-only path, never back here.
+    // The unknown-foreground probe gates only the cold lane; more foreground jobs than
+    // PTYs is inconsistent state and fails closed for every lane.
     if facts.foreground_jobs > facts.live_ptys {
         return AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless);
     }
     if facts.seamless_capable {
         return AdmissionDecision::Apply(ApplyLane::Seamless);
     }
-    // Past here only the cold lane remains, and it closes every PTY, even an idle shell's: it
-    // is admitted only when there is no session to lose. The live-session block comes before
-    // the probe's because, without the seamless lane, the foreground decides nothing; the
-    // live-session refusal is the one that says why the handoff is unavailable.
     if facts.live_ptys > 0 || facts.foreground_jobs > 0 {
         return AdmissionDecision::Block(AdmissionBlock::LivePtysNeedSeamless);
     }
-    // A probe failure with no live PTY is no real state (the probe runs once per live PTY),
-    // so it is not evidence of an idle shell: fail closed.
     if facts.unknown_foregrounds > 0 {
         return AdmissionDecision::Block(AdmissionBlock::ForegroundProbeUnknown);
     }
-    // THE COLD LANE EXECS IN PLACE, which a process that keeps its image never does: an
-    // `execve` after a LaunchServices launch leaves LaunchServices answering pid -1 for the
-    // app for the rest of the process's life (no Quit & Reopen, no menu-bar item, TCC
-    // attributing it to the rollback path). Refused, never failed: the block is retried, and
-    // the seamless lane carries the update once a terminal tab is open, when the overlap
-    // handoff is available (`update_admission_refusal` names the cause when it is not).
     if facts.image_kept {
         return AdmissionDecision::Block(AdmissionBlock::KeptImageNeedsTerminal);
     }

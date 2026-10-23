@@ -80,6 +80,23 @@ pub struct You {
     pub unattributed_mc: Option<i64>,
 }
 
+impl You {
+    /// Returns the human-readable tab attribution clause for this role.
+    #[must_use]
+    pub fn clause(&self) -> &'static str {
+        match self.role {
+            Role::Main => "this tab is the main cause",
+            Role::Part => "this tab is part of the cause",
+            Role::Minor => "this tab is not the cause",
+            Role::None => "this tab uses none of it",
+            Role::Unavailable(_) if self.figure.is_some() && self.unattributed_mc.is_none() => {
+                "whether this tab is the largest part is not read now"
+            }
+            Role::Unavailable(_) => "this tab's share is not read now",
+        }
+    }
+}
+
 /// A cause that holds over the window, as a reply prints it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Shown {
@@ -110,7 +127,22 @@ pub struct Account {
     pub cannot: Vec<(&'static str, &'static str)>,
 }
 
-/// Compute `part` of `whole` in per mille (capped at 1000), or `None` when `whole` is zero.
+impl Account {
+    /// Returns whether the CPU's tab share is a lower bound and the rest of aterm is an upper
+    /// bound.
+    #[must_use]
+    pub fn bounded(&self, snap: &Snapshot) -> bool {
+        let cut = snap.procs_truncated || self.facts.as_deref().is_some_and(|f| f.procs_truncated);
+        cut || self.you.unattributed_mc.is_some_and(|u| u > 0) || self.parts.is_none()
+    }
+
+    /// Returns whether the CPU's tab figure is a lower bound (`tab_mc=≥`).
+    #[must_use]
+    pub fn tab_at_least(&self, snap: &Snapshot) -> bool {
+        self.bounded(snap) || !snap.delegated.is_empty()
+    }
+}
+
 fn per_mille(part: i64, whole: i64) -> Option<u16> {
     (whole > 0).then(|| {
         let pm = (part.max(0) * 1000 + whole / 2) / whole;
@@ -142,10 +174,7 @@ pub fn account(subject: WhySubject, you: Option<u64>, snap: &Snapshot) -> Accoun
     account_of(subject, you.as_slice(), snap)
 }
 
-/// [`account`] for a caller whose tab is the sessions `panes` (its split
-/// panes, by the host's keys, in layout order, the first standing for the
-/// tab in [`You::tab`]; none for a caller in no tab): the tab's figure is
-/// theirs summed.
+/// Computes `subject`'s account for a caller tab spanning `panes` from snapshot `snap`.
 #[must_use]
 pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Account {
     let facts = snap.why.clone();
@@ -232,7 +261,6 @@ pub fn account_of(subject: WhySubject, panes: &[u64], snap: &Snapshot) -> Accoun
     }
 }
 
-/// The CPU's parts for the tab of the sessions `panes`, and the tab's role (the bound rule), under the lane `lane`.
 fn cpu_you(
     facts: Option<&WhyFacts>,
     lane: CoalLane,
@@ -258,7 +286,6 @@ fn cpu_you(
     };
     let split = &f.split;
     let cut = f.procs_truncated || snap.procs_truncated || snap.aterm.is_none();
-    // The split keys a tab by one of its panes ([`crate::model::TabRoot::tab`]).
     if !panes.is_empty() && !split.tabs.iter().any(|t| panes.contains(&t.0)) {
         return (None, unread(if cut { "truncated" } else { "warming" }));
     }
@@ -297,7 +324,6 @@ fn cpu_you(
     (Some(parts), you)
 }
 
-/// The role in used memory of the tab of the sessions `panes`, by their footprints summed.
 fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
     let tab = panes.first().copied();
     let unread = |word| You {
@@ -324,8 +350,6 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
         }
     }
     let bytes = |b: u64| i64::try_from(b).unwrap_or(i64::MAX);
-    // The parts beside the tab: the rest of aterm, and each coalition outside
-    // it where the lane reads them (with it off, none is read).
     let rest = snap
         .aterm
         .as_ref()
@@ -342,7 +366,6 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
         None => vec![None],
     };
     let beside: Vec<Option<i64>> = std::iter::once(rest).chain(outside).collect();
-    // No part larger: not once one read is, and unknown while one is unread.
     let largest = if beside.iter().flatten().any(|&p| p > fig) {
         Some(false)
     } else {
@@ -351,9 +374,6 @@ fn mem_you(panes: &[u64], snap: &Snapshot) -> You {
     let above =
         u64::try_from(fig).is_ok_and(|b| b >= MEM_FLOOR_BYTES) && fig * 1000 >= whole * FLOOR_PM;
     let (mut role, mut calm) = you_role(fig, whole, largest.unwrap_or(false), above);
-    // A role that turns on a comparison not read is not read either: the
-    // lane's word where it is off, warming before its first window, as the
-    // CPU's ([`cpu_you`]), else not sampled.
     if largest.is_none() && you_role(fig, whole, true, above).0 != role {
         let lane = snap.why.as_deref().map_or(snap.coal_lane, |f| f.lane);
         let word = match lane.word() {

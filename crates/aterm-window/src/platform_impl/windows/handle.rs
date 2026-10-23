@@ -4,14 +4,8 @@
 // Added by the aterm project in 2026 to its copy of winit 0.30.13
 // (see the repository NOTICE).
 
-// Added by Andrew Yates for the aterm project in 2026; see the repository NOTICE.
-// Provide typed handle conversions and thread-transfer wrappers for windows-sys 0.61.
-
-//! Typed conversions between windows-sys handle types (opaque pointers since
-//! 0.59) and the integer handle values Win32 message parameters and winit's
-//! public API carry — in place of `as` casts, so a future change of a handle's
-//! type is a compile error, not a silent reinterpretation (aterm fork,
-//! 2026-09-25). A handle is an opaque id, never dereferenced: no provenance.
+//! Typed conversions between windows-sys handle pointers and integer Win32
+//! handle values. A handle is an opaque id, never dereferenced: no provenance.
 
 use std::ffi::c_void;
 

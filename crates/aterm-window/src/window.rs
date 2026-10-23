@@ -5,12 +5,6 @@
 // modified by the aterm project in 2026 (see the repository NOTICE).
 
 //! Modified by the aterm project in 2026; see the repository NOTICE.
-//!
-//! The [`Window`] struct and associated types.
-//!
-//! LOCAL PATCH (aterm): an item marked `#[cfg(not(macos_platform))]` is API no aterm crate calls on
-//! macOS, and one marked `#[cfg(windows_platform)]` API no aterm crate calls on Linux either; only
-//! the Windows backend still implements them.
 
 use std::fmt;
 
@@ -27,8 +21,6 @@ pub use crate::cursor::{BadImage, CustomCursor, CustomCursorSource, MAX_CURSOR_S
 #[cfg(not(macos_platform))]
 pub use crate::icon::{BadIcon, Icon};
 
-// LOCAL PATCH (aterm): the crate's own type, where upstream re-exports cursor-icon's (and its
-// `ParseError`).
 #[doc(inline)]
 pub use crate::cursor_icon::CursorIcon;
 
@@ -43,16 +35,10 @@ impl fmt::Debug for Window {
     }
 }
 
-// LOCAL PATCH (aterm): Windows only; macOS, X11 and Wayland have no exclusive fullscreen to leave,
-// and their windows close in their own `Drop`.
 #[cfg(windows_platform)]
 impl Drop for Window {
     fn drop(&mut self) {
         self.window.maybe_wait_on_main(|w| {
-            // If the window is in exclusive fullscreen, we must restore the desktop
-            // video mode (generally this would be done on application exit, but
-            // closing the window doesn't necessarily always mean application exit,
-            // such as when there are multiple windows)
             if let Some(Fullscreen::Exclusive(_)) = w.fullscreen().map(|f| f.into()) {
                 w.set_fullscreen(None);
             }
@@ -93,10 +79,6 @@ impl From<u64> for WindowId {
 }
 
 /// Attributes used when creating a window.
-///
-/// LOCAL PATCH (aterm): only the builders aterm calls. Upstream's other fifteen (`with_resizable`,
-/// `with_fullscreen`, `with_decorations`, `with_parent_window` and the rest) are gone, so the
-/// fields they set hold their [`Default`].
 #[derive(Debug, Clone)]
 pub struct WindowAttributes {
     pub(crate) inner_size: Option<Size>,
@@ -263,10 +245,7 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.scale_factor())
     }
 
-    /// Queues a [`WindowEvent::RedrawRequested`] event to be emitted that aligns with the windowing
-    /// system drawing loop.
-    ///
-    /// [`WindowEvent::RedrawRequested`]: crate::event::WindowEvent::RedrawRequested
+    /// Queues a [`WindowEvent::RedrawRequested`] event to be emitted that aligns with the windowing system drawing loop.
     #[inline]
     pub fn request_redraw(&self) {
         let _span = tracing::debug_span!("aterm_window::Window::request_redraw",).entered();
@@ -275,15 +254,6 @@ impl Window {
     }
 
     /// Notify the windowing system before presenting to the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::window::Window;
-    /// # fn swap_buffers() {}
-    /// # fn scope(window: &Window) {
-    /// window.pre_present_notify();
-    /// swap_buffers();
-    /// # }
-    /// ```
     #[cfg(windows_platform)]
     #[inline]
     pub fn pre_present_notify(&self) {
@@ -302,8 +272,7 @@ impl Window {
 }
 
 impl Window {
-    /// Returns the position of the top-left hand corner of the window's client area relative to the
-    /// top-left hand corner of the desktop.
+    /// Returns the position of the top-left hand corner of the window's client area relative to the top-left hand corner of the desktop.
     #[inline]
     pub fn inner_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         let _span = tracing::debug_span!("aterm_window::Window::inner_position",).entered();
@@ -311,8 +280,7 @@ impl Window {
         self.window.maybe_wait_on_main(|w| w.inner_position())
     }
 
-    /// Returns the position of the top-left hand corner of the window relative to the
-    /// top-left hand corner of the desktop.
+    /// Returns the position of the top-left hand corner of the window relative to the top-left hand corner of the desktop.
     #[inline]
     pub fn outer_position(&self) -> Result<PhysicalPosition<i32>, NotSupportedError> {
         let _span = tracing::debug_span!("aterm_window::Window::outer_position",).entered();
@@ -321,17 +289,6 @@ impl Window {
     }
 
     /// Modifies the position of the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalPosition, PhysicalPosition};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the position in logical dimensions like this:
-    /// window.set_outer_position(LogicalPosition::new(400.0, 200.0));
-    /// // Or specify the position in physical dimensions like this:
-    /// window.set_outer_position(PhysicalPosition::new(400, 200));
-    /// # }
-    /// ```
     #[inline]
     pub fn set_outer_position<P: Into<Position>>(&self, position: P) {
         let position = position.into();
@@ -353,17 +310,6 @@ impl Window {
     }
 
     /// Request the new size for the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalSize, PhysicalSize};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the size in logical dimensions like this:
-    /// let _ = window.request_inner_size(LogicalSize::new(400.0, 200.0));
-    /// // Or specify the size in physical dimensions like this:
-    /// let _ = window.request_inner_size(PhysicalSize::new(400, 200));
-    /// # }
-    /// ```
     #[inline]
     #[must_use]
     pub fn request_inner_size<S: Into<Size>>(&self, size: S) -> Option<PhysicalSize<u32>> {
@@ -384,17 +330,6 @@ impl Window {
     }
 
     /// Sets a minimum dimension size for the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalSize, PhysicalSize};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the size in logical dimensions like this:
-    /// window.set_min_inner_size(Some(LogicalSize::new(400.0, 200.0)));
-    /// // Or specify the size in physical dimensions like this:
-    /// window.set_min_inner_size(Some(PhysicalSize::new(400, 200)));
-    /// # }
-    /// ```
     #[inline]
     pub fn set_min_inner_size<S: Into<Size>>(&self, min_size: Option<S>) {
         let min_size = min_size.map(|s| s.into());
@@ -407,17 +342,6 @@ impl Window {
     }
 
     /// Sets a maximum dimension size for the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalSize, PhysicalSize};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the size in logical dimensions like this:
-    /// window.set_max_inner_size(Some(LogicalSize::new(400.0, 200.0)));
-    /// // Or specify the size in physical dimensions like this:
-    /// window.set_max_inner_size(Some(PhysicalSize::new(400, 200)));
-    /// # }
-    /// ```
     #[cfg(windows_platform)]
     #[inline]
     pub fn set_max_inner_size<S: Into<Size>>(&self, max_size: Option<S>) {
@@ -565,8 +489,7 @@ impl Window {
             reason = "The Linux backends dispatch through runtime window state."
         )
     )]
-    /// LOCAL PATCH (aterm): added; upstream has no such query, so a tiled frame read as the normal
-    /// one.
+    /// LOCAL PATCH (aterm): added; upstream has no such query, so a tiled frame read as the normal one.
     pub fn is_tiled(&self) -> bool {
         let _span = tracing::debug_span!("aterm_window::Window::is_tiled",).entered();
         #[cfg(any(x11_platform, wayland_platform))]
@@ -580,9 +503,6 @@ impl Window {
     }
 
     /// Whether the window shows full screen now, however it got there.
-    ///
-    /// LOCAL PATCH (aterm): added; on X11 [`Window::fullscreen`] says only what this window asked
-    /// for, not a full screen the window manager gave it.
     #[inline]
     pub fn is_shown_fullscreen(&self) -> bool {
         let _span = tracing::debug_span!("aterm_window::Window::is_shown_fullscreen",).entered();
@@ -650,17 +570,6 @@ impl Window {
     }
 
     /// Set the IME cursor editing area.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalPosition, PhysicalPosition, LogicalSize, PhysicalSize};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the position in logical dimensions like this:
-    /// window.set_ime_cursor_area(LogicalPosition::new(400.0, 200.0), LogicalSize::new(100, 100));
-    /// // Or specify the position in physical dimensions like this:
-    /// window.set_ime_cursor_area(PhysicalPosition::new(400, 200), PhysicalSize::new(100, 100));
-    /// # }
-    /// ```
     #[inline]
     pub fn set_ime_cursor_area<P: Into<Position>, S: Into<Size>>(&self, position: P, size: S) {
         let position = position.into();
@@ -763,17 +672,6 @@ impl Window {
     }
 
     /// Changes the position of the cursor in window coordinates.
-    ///
-    /// ```no_run
-    /// # use aterm_window::dpi::{LogicalPosition, PhysicalPosition};
-    /// # use aterm_window::window::Window;
-    /// # fn scope(window: &Window) {
-    /// // Specify the position in logical dimensions like this:
-    /// window.set_cursor_position(LogicalPosition::new(400.0, 200.0));
-    /// // Or specify the position in physical dimensions like this:
-    /// window.set_cursor_position(PhysicalPosition::new(400, 200));
-    /// # }
-    /// ```
     #[cfg(windows_platform)]
     #[inline]
     pub fn set_cursor_position<P: Into<Position>>(&self, position: P) -> Result<(), ExternalError> {
@@ -787,16 +685,6 @@ impl Window {
     }
 
     /// Set grabbing [mode][CursorGrabMode] on the cursor preventing it from leaving the window.
-    ///
-    /// ```no_run
-    /// # use aterm_window::window::{CursorGrabMode, Window};
-    /// # fn scope(window: &Window) {
-    /// window
-    ///     .set_cursor_grab(CursorGrabMode::Confined)
-    ///     .or_else(|_e| window.set_cursor_grab(CursorGrabMode::Locked))
-    ///     .unwrap();
-    /// # }
-    /// ```
     #[cfg(windows_platform)]
     #[inline]
     pub fn set_cursor_grab(&self, mode: CursorGrabMode) -> Result<(), ExternalError> {
@@ -883,9 +771,6 @@ impl Window {
     }
 }
 
-// LOCAL PATCH (aterm): the X11 or Wayland handles through first-party
-// `aterm_types::native_window::HasNativeWindow`, so the GL arm and aterm-gui's CPU presenters reach
-// them without `raw-window-handle` (`rwh_06` is opt-in and wraps this answer).
 // SAFETY: the display is the event loop's connection, which every window holds a reference to
 // (X11's `Arc<XConnection>`, Wayland's `Arc<Connection>`), so it stays open while `self` lives;
 // the X11 window is destroyed and the `wl_surface` released only when `self` drops.

@@ -49,7 +49,7 @@ impl Watcher {
         self.imp.remove(id);
     }
 
-    /// Whether watch `id` will never fire again: its object was removed (kqueue `NOTE_DELETE` or `NOTE_REVOKE`; inotify `IN_IGNORED`, which follows `IN_DELETE_SELF` and an unmount), the kernel's queue overflowed so such an edge may have been lost, or the id names no watch (never added, or removed).
+    /// Whether watch `id` will never fire again.
     #[must_use]
     pub fn is_gone(&self, id: WatchId) -> bool {
         self.imp.is_gone(id)
@@ -98,11 +98,8 @@ mod imp {
 
     use super::{Kind, WatchId};
 
-    /// The `EVFILT_USER` identifier [`Watcher::wake`] triggers. User events
-    /// have their own identifier space, apart from descriptors.
     const BELL: libc::uintptr_t = 0;
 
-    /// How many events one `kevent` call collects.
     const BATCH: usize = 16;
 
     pub(super) struct Watcher {
@@ -112,8 +109,6 @@ mod imp {
         open: Mutex<HashMap<WatchId, Open>>,
     }
 
-    /// One watch's open descriptor (closing it removes its knote, pending
-    /// events included), and whether a wait read its object's removal.
     struct Open {
         #[expect(dead_code, reason = "held for its close, which removes the knote")]
         fd: OwnedFd,
@@ -140,7 +135,6 @@ mod imp {
             Ok(watcher)
         }
 
-        /// Submit one change and collect nothing.
         fn change(
             &self,
             ident: libc::uintptr_t,
@@ -276,8 +270,6 @@ mod imp {
                         .unwrap_or_else(|p| p.into_inner())
                         .get_mut(&id)
                 {
-                    // The knote stays on the removed vnode and never fires
-                    // again; a new object at the path is another vnode.
                     open.gone = true;
                 }
                 ids.push(id);
@@ -308,8 +300,6 @@ mod imp {
     const IN_Q_OVERFLOW: u32 = 0x0000_4000;
     const IN_IGNORED: u32 = 0x0000_8000;
 
-    /// The directory edges the macOS arm's `NOTE_WRITE`, `NOTE_DELETE` and
-    /// `NOTE_RENAME` report.
     const DIR_MASK: u32 = libc::IN_CREATE
         | libc::IN_DELETE
         | libc::IN_MOVED_FROM
@@ -319,16 +309,12 @@ mod imp {
         | libc::IN_ONLYDIR
         | libc::IN_DONT_FOLLOW;
 
-    /// The file edges the macOS arm's `NOTE_WRITE`, `NOTE_EXTEND`,
-    /// `NOTE_DELETE` and `NOTE_RENAME` report.
     const FILE_MASK: u32 = IN_MODIFY
         | IN_CLOSE_WRITE
         | libc::IN_DELETE_SELF
         | libc::IN_MOVE_SELF
         | libc::IN_DONT_FOLLOW;
 
-    /// The fixed head of a `struct inotify_event`: `wd`, `mask`, `cookie`,
-    /// `len`, then `len` bytes of name.
     const HEAD: usize = 16;
 
     pub(super) struct Watcher {
@@ -419,7 +405,6 @@ mod imp {
                 return;
             };
             let Some(ids) = wds.ids.get_mut(&wd) else {
-                // The kernel already dropped it (its object removed).
                 return;
             };
             ids.retain(|other| *other != id);
@@ -474,7 +459,6 @@ mod imp {
             Ok(ids)
         }
 
-        /// Read every queued event, naming the watches they are for.
         fn drain(&self, ids: &mut Vec<WatchId>) -> io::Result<()> {
             let mut buf = [0u8; 4096];
             loop {
@@ -575,15 +559,8 @@ mod imp {
 mod tests {
     use super::*;
 
-    /// No wait: whatever the kernel queued, now. Every edge these tests make
-    /// is queued by the syscall that makes it, so a zero-timeout wait after
-    /// that syscall returns sees it, and one that sees nothing proves nothing
-    /// was queued.
     const NOW: Option<Duration> = Some(Duration::ZERO);
 
-    /// An entry renamed into one watched directory names that directory's
-    /// watch and not another's; a removal and the directory's own removal
-    /// name it too.
     #[test]
     fn a_directory_entry_names_its_watch_alone() {
         let root = crate::testdir::dir("atpkg-dirwatch-dir-");
@@ -607,9 +584,6 @@ mod tests {
         assert_eq!(watcher.wait(NOW).unwrap(), [wb], "the directory itself");
     }
 
-    /// A file written in place names the file's watch and NOT its directory's:
-    /// the edge a directory watch alone misses (Claude Code creates its
-    /// registry row, then writes it).
     #[test]
     fn a_file_written_in_place_names_the_file_and_not_its_directory() {
         use std::io::Write as _;
@@ -630,8 +604,6 @@ mod tests {
         assert_eq!(watcher.wait(NOW).unwrap(), [file]);
     }
 
-    /// The edge after the registration is kept for a wait that starts later;
-    /// the one before it is not (register first, then read).
     #[test]
     fn an_edge_after_registration_is_kept_for_a_later_wait() {
         let root = crate::testdir::dir("atpkg-dirwatch-kept-");
@@ -649,8 +621,6 @@ mod tests {
         );
     }
 
-    /// A removed watch names nothing, the watcher's others still do, and its
-    /// id is never handed out again.
     #[test]
     fn a_removed_watch_names_nothing() {
         let root = crate::testdir::dir("atpkg-dirwatch-removed-");
@@ -671,10 +641,6 @@ mod tests {
         assert_eq!(watcher.wait(NOW).unwrap(), [again], "CONTROL: kept");
     }
 
-    /// A watch whose object is removed fires once and is then gone, and
-    /// stays gone when the path is made again (another object, which on Linux
-    /// may carry the old inode number); a removed watch, and an id never
-    /// handed out, are gone too.
     #[test]
     fn a_watch_whose_object_is_removed_is_gone() {
         let root = crate::testdir::dir("atpkg-dirwatch-gone-");
@@ -712,8 +678,6 @@ mod tests {
         assert!(watcher.is_gone(WatchId(u64::MAX)), "an id never handed out");
     }
 
-    /// One directory watched twice is two watches: removing one leaves the
-    /// other live (inotify gives both one kernel descriptor).
     #[test]
     fn one_directory_watched_twice_keeps_the_other_watch() {
         let root = crate::testdir::dir("atpkg-dirwatch-twice-");
@@ -727,8 +691,6 @@ mod tests {
         assert_eq!(watcher.wait(NOW).unwrap(), [second]);
     }
 
-    /// A wake ends a wait another thread is blocked in, and one given while
-    /// no wait runs ends the next at once; neither names a watch.
     #[test]
     fn a_wake_ends_the_wait() {
         let watcher = std::sync::Arc::new(Watcher::new().unwrap());
@@ -751,8 +713,6 @@ mod tests {
         assert!(woke.is_empty());
     }
 
-    /// A watch is on what the caller named: a symlink is refused (its target
-    /// is not watched through it), and each kind refuses the other.
     #[test]
     fn a_symlink_or_the_wrong_kind_is_refused() {
         let root = crate::testdir::dir("atpkg-dirwatch-kind-");

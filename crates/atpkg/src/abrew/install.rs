@@ -632,7 +632,7 @@ fn relocate_staged(
                 )));
             }
             let out = fetch::run_capture(
-                "codesign",
+                aterm_uds::os_path!("codesign"),
                 &[
                     "--sign",
                     "-",

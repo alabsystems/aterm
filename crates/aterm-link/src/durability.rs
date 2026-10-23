@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Broker ack durability tiers (`--durability strict|ordered|relaxed`, [`default_for`],
-//! [`describe_served`]), [`escalation`] rules ([`astream_broker::Durability::Ordered`] at
-//! [`ORDERED_HORIZON`] and [`astream_broker::Durability::Relaxed`]), log-lineage clamping across
-//! unclean stops ([`astream_broker::LogIdentity::continues`], [`crate::state::LogWitness::continues`]),
-//! and legacy `<log>.aterm-relaxed` ([`MARK_SUFFIX`]) migration in [`open`].
+//! Broker ack durability tiers, escalation rules, and legacy relaxed-mark migration.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -13,16 +9,16 @@ use std::path::{Path, PathBuf};
 /// The flag a broker argv carries for a named tier.
 pub const FLAG: &str = "--durability";
 
-/// Dev-only volume seam: `other` opens the log as if it were off the boot volume ([`open_escalating`]).
+/// Dev-only volume seam environment variable.
 pub const VOLUME_SEAM: &str = "ATERM_LINK_BROKER_VOLUME";
 
-/// Legacy relaxed-mode boot mark suffix (`<log>.aterm-relaxed`); read for migration, never written.
+/// Legacy relaxed-mode boot mark suffix (`<log>.aterm-relaxed`).
 pub const MARK_SUFFIX: &str = ".aterm-relaxed";
 
-/// The tier a broker acks at ([module docs](self)).
+/// The tier a broker acks at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Durability {
-    /// Ack after a full flush (`F_FULLFSYNC`); fallback for unrecognised argv ([`Durability::of_argv`]).
+    /// Ack after a full flush (`F_FULLFSYNC`).
     #[default]
     Strict,
     /// Ack after an ordering barrier, with full flushes at [`ORDERED_HORIZON`] and for [`escalation`] records.
@@ -31,10 +27,10 @@ pub enum Durability {
     Relaxed,
 }
 
-/// Horizon (100 ms) after which an ordered broker issues a full flush for uncovered acks.
+/// Horizon after which an ordered broker issues a full flush for uncovered acks.
 pub const ORDERED_HORIZON: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Escalation rules ([`astream_broker::OpenOptions::escalation`]) flushed in full before ack on weak tiers.
+/// Escalation rules flushed in full before ack on weak tiers.
 #[must_use]
 pub fn escalation() -> astream_broker::Escalation {
     use astream_broker::Escalate::{Group, PrincipalPrefix, Subject};
@@ -73,7 +69,7 @@ impl Durability {
         }
     }
 
-    /// Corresponding [`astream_broker::Durability`] tier (using [`ORDERED_HORIZON`] for `Ordered`).
+    /// Corresponding [`astream_broker::Durability`] tier.
     #[must_use]
     pub const fn tier(self) -> astream_broker::Durability {
         match self {
@@ -126,7 +122,7 @@ impl Durability {
         Self::try_of_argv(argv).unwrap_or_default()
     }
 
-    /// Serving durability of a syntactically recognised broker `argv` (resolving bare argv via [`resolve`]).
+    /// Serving durability of a syntactically recognised broker `argv`.
     #[must_use]
     pub fn try_of_argv<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> Option<Self> {
         crate::broker_args::BrokerArgs::from_invocation(argv)?.serving_durability()
@@ -149,13 +145,13 @@ pub const fn default_for(guarded: bool) -> Durability {
     }
 }
 
-/// Resolve an explicit `named` tier or fall back to [`default_for`]`(guarded)`.
+/// Resolve an explicit `named` tier or fall back to [`default_for`].
 #[must_use]
 pub fn resolve(named: Option<Durability>, guarded: bool) -> Durability {
     named.unwrap_or_else(|| default_for(guarded))
 }
 
-/// Argv words (`["--durability", <tier>]`) for an explicit tier, or empty for the build default.
+/// Argv words for an explicit tier, or empty for the build default.
 #[must_use]
 pub fn argv_words(named: Option<Durability>) -> Vec<String> {
     match named {
@@ -170,7 +166,6 @@ pub fn tier_name(tier: astream_broker::Tier) -> &'static str {
     Durability::of_tier(tier).map_or("other", Durability::name)
 }
 
-/// Why a broker serves a tier other than the one asked for, in words.
 fn served_reason(reason: astream_broker::ServedReason) -> String {
     use astream_broker::ServedReason;
     match reason {
@@ -223,18 +218,13 @@ pub fn describe_served(
         return promise;
     }
     let why = if info.reason != ServedReason::None {
-        // The broker lowered what it was asked for itself.
         served_reason(info.reason)
     } else if asked == Durability::Ordered
         && info.served == Tier::Strict
         && info.requested == Tier::Strict
     {
-        // A broker of an older build: it took the word and opened the log
-        // strict, as the build before this one did.
         "its build serves ordered as strict".to_string()
     } else {
-        // Asked one tier, opened at another, and not lowered: a broker of
-        // another build — one whose default a bare argv runs.
         format!("its build opened it {}", tier_name(info.requested))
     };
     format!("served {} ({why}) — {promise}", tier_name(info.served))
@@ -253,21 +243,11 @@ pub fn describe_own(tier: Durability) -> String {
     }
 }
 
-/// What a strict ack promises: its batch's full flush came first.
 const STRICT_PROMISE: &str = "an ack is on the disk: a power loss loses nothing acked";
 
-/// The records aterm's [`escalation`] table keeps through a power loss, in
-/// the words this build's own promise uses ([`Durability::promise`]).
 const SPARED: &str =
     "never a halt, a person's own words, mail to a person, or a person's read mark";
 
-/// WHAT A WEAK TIER CAN LOSE (`tier` is ordered or relaxed), as `(head,
-/// loss)`: for ordered, bounded by `horizon_ms` as a `Hello` reports it
-/// (`None`: no horizon, so only an escalated record, a flush asked for or a
-/// clean stop flushes in full) by the bound astream states
-/// ([`astream_broker::ServedInfo::horizon_ms`]: the oldest ack no full flush
-/// covers is at most the horizon plus one batch plus one full flush old); for
-/// relaxed, everything since the open.
 fn loss(tier: Durability, horizon_ms: Option<u32>, what: &str) -> (&'static str, String) {
     match tier {
         Durability::Ordered => (
@@ -302,14 +282,6 @@ fn loss(tier: Durability, horizon_ms: Option<u32>, what: &str) -> (&'static str,
     }
 }
 
-/// A WEAK TIER'S PROMISE WITH THE NUMBERS ITS BROKER REPORTS (`tier` is
-/// ordered or relaxed): what a power loss can take — for ordered, bounded by
-/// the horizon it reports (`None`: no horizon, so only an escalated record, a
-/// flush asked for or a clean stop flushes in full), the bound astream states
-/// ([`astream_broker::ServedInfo::horizon_ms`]: the oldest ack no full flush
-/// covers is at most the horizon plus one batch plus one full flush old) —
-/// and what it never takes: the records its reported rules name, or nothing
-/// when it has none.
 fn weak_promise(
     tier: Durability,
     info: &astream_broker::ServedInfo,
@@ -539,8 +511,6 @@ pub fn open_escalating(
     };
     let broker = astream_broker::Broker::open_opts(log, opts, prepare)?;
     let Some((mark, renewed)) = decided else {
-        // astream runs `prepare` once before any open succeeds; an open that
-        // did not is one whose mark nobody judged, so it does not serve.
         return Err(io::Error::other(
             "the broker log opened without its legacy mark being judged",
         ));
@@ -556,8 +526,6 @@ pub fn open_escalating(
     })
 }
 
-/// Remove `path` so a power loss does not bring it back. An absent one is
-/// removed already.
 fn remove_durably(path: &Path) -> io::Result<()> {
     match std::fs::remove_file(path) {
         Ok(()) => crate::state::sync_dir(path.parent().unwrap_or(Path::new(""))),
@@ -571,7 +539,6 @@ mod tests {
     use super::*;
     use crate::state::LogWitness;
 
-    /// A scratch dir short enough for a socket path (`sun_path`).
     fn scratch() -> aterm_tempfile::TempDir {
         aterm_tempfile::Builder::new()
             .prefix("dur")
@@ -579,8 +546,6 @@ mod tests {
             .expect("scratch")
     }
 
-    /// `n` publishes through the broker served at `sock`, each one acked
-    /// before the next is sent.
     fn publish(sock: &Path, producer: u64, from_seq: u64, n: u64) {
         let mut c = astream_broker::Client::connect(sock).expect("connect");
         for seq in from_seq..from_seq + n {
@@ -593,8 +558,6 @@ mod tests {
         std::fs::metadata(path).expect("the log").len()
     }
 
-    /// Cut the log file back to `len` bytes: what a power loss leaves of
-    /// writes that never reached the disk.
     fn cut(log: &Path, len: u64) {
         std::fs::OpenOptions::new()
             .write(true)
@@ -604,8 +567,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Option values are whole argument words, including a filename that is
-    /// itself the durability flag.
     #[test]
     fn a_broker_option_value_is_not_a_durability_flag() {
         let base = ["aterm", "link", "broker", "/r/bus.sock"];
@@ -710,11 +671,6 @@ mod tests {
         assert!(named.iter().all(Option::is_none));
     }
 
-    /// THE WORD, THE ARGV AND THE DEFAULT. Every word round-trips, a bare
-    /// argv names nothing and runs the build's default ([`default_for`]):
-    /// ordered for a guarded broker on every platform (astream decides where
-    /// it is served, and serves it strict elsewhere), strict for an unguarded
-    /// one.
     #[test]
     fn the_word_the_argv_and_the_default() {
         for tier in [Durability::Strict, Durability::Ordered, Durability::Relaxed] {
@@ -768,10 +724,6 @@ mod tests {
         );
     }
 
-    /// `ORDERED IS SERVED ORDERED, WITH ATERM'S TABLE`. The word maps to
-    /// astream's Ordered tier at aterm's 100 ms horizon, and every weak tier opens with the
-    /// four-rule table while strict opens with none (its every batch is a
-    /// full flush).
     #[test]
     fn ordered_is_served_ordered_with_aterms_table() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
@@ -878,13 +830,6 @@ mod tests {
         }
     }
 
-    /// A BROKER THAT SERVES A WEAK TIER IS TOLD BY WHAT IT REPORTS. Ordered
-    /// is never told as strict: asked ordered, or asked what this build reads
-    /// a bare argv as (strict) while the broker's build opened it ordered,
-    /// the line says ordered's words with the broker's own horizon — never
-    /// strict's "loses nothing acked", which a power loss there would make a
-    /// lie — and in the second case says the tier served differs from the one
-    /// asked.
     #[test]
     fn a_weak_tier_is_told_by_what_its_broker_reports() {
         use astream_broker::{ServedInfo, ServedReason, Tier};
@@ -974,9 +919,6 @@ mod tests {
         assert_eq!(Durability::of_tier(Tier::Other(9)), None);
     }
 
-    /// The legacy mark reads as unclean against exactly another boot, an
-    /// unreadable mark or no boot to compare — never the same boot, never no
-    /// mark.
     #[test]
     fn only_another_boot_or_an_uncertain_mark_is_unclean() {
         let (one, two) = (test_boot(1), test_boot(2));
@@ -1025,10 +967,6 @@ mod tests {
         assert_eq!(read_mark(&log), Mark::Unreadable, "a dangling link");
     }
 
-    /// The kernel's own text for this boot, read as a build before this one
-    /// read it and NOT through astream: `sysctl -n kern.bootsessionuuid` on
-    /// macOS (the sysctl that build called), `/proc/sys/kernel/random/boot_id`
-    /// on Linux.
     fn kernel_boot_text() -> Option<String> {
         if cfg!(target_vendor = "apple") {
             let mut sysctl = aterm_uds::spawnfd::command("/usr/sbin/sysctl");
@@ -1044,7 +982,6 @@ mod tests {
         }
     }
 
-    /// ONE BOOT: THE BROKER'S, THE LEASE'S, AND THE ONE AN OLDER BUILD WROTE.
     #[test]
     fn the_broker_the_lease_and_an_older_builds_mark_name_one_boot() {
         let boot = this_boot();
@@ -1052,7 +989,6 @@ mod tests {
             assert!(boot.is_some(), "this host's kernel names its boot");
         }
         let Some(boot) = boot else {
-            // a kernel that names no boot: nothing to agree on
             return;
         };
         let kernel_text = kernel_boot_text().expect("the kernel's own text for its boot");
@@ -1061,10 +997,8 @@ mod tests {
         let state = crate::state::StateDir::open(dir.path().join("state")).expect("state dir");
         let lease = state.trusted_boot();
         if cfg!(target_vendor = "apple") {
-            // The temp dir is on the boot volume's data volume, as `~` is.
             assert_eq!(lease, Some(boot), "the lease trusts the broker's boot");
         } else {
-            // A tmpfs `/tmp` is off the boot volume: no lease at all, never another boot.
             assert!(lease.is_none_or(|b| b == boot), "{lease:?} vs {boot:?}");
         }
 
@@ -1103,9 +1037,6 @@ mod tests {
         );
     }
 
-    /// THE HAZARD, AND ASTREAM'S CURE, ON REAL FILES. A relaxed broker in
-    /// boot 1 acks ten records; a consumer witnesses head 10 under the log's
-    /// identity.
     #[test]
     fn a_power_loss_under_relaxed_moves_the_generation_with_lineage() {
         let dir = scratch();
@@ -1181,9 +1112,6 @@ mod tests {
         h.shutdown();
     }
 
-    /// A RESTART IN ONE BOOT IS NOT A LOG CHANGE: the page cache outlived the
-    /// broker, so a relaxed reopen after a stop that did not close the log
-    /// keeps the identity and the records.
     #[test]
     fn a_restart_or_a_clean_stop_keeps_the_identity() {
         let dir = scratch();
@@ -1225,9 +1153,6 @@ mod tests {
         );
     }
 
-    /// THE LEGACY-MARK MIGRATION: ONE DECISION, NO DOUBLE RENEWAL. A build
-    /// before lineage left a relaxed run unclean in boot 1: its mark and its
-    /// `Open` sidecar both stand.
     #[test]
     fn the_legacy_mark_moves_the_generation_once_and_is_removed() {
         let dir = scratch();
@@ -1297,10 +1222,6 @@ mod tests {
         );
     }
 
-    /// THE LINEAGE WINDOW, END TO END: astream keeps the newest
-    /// [`astream_broker::Lineage::MAX`] steps, and a reader whose generation
-    /// needs an older one forgets ([`crate::state::LogWitness::continues`]
-    /// answers `None`), exactly as before lineage.
     #[test]
     fn a_reader_older_than_the_lineage_window_forgets() {
         let dir = scratch();
@@ -1357,12 +1278,6 @@ mod tests {
         );
     }
 
-    /// THE LEGACY MARK ALONE MOVES THE GENERATION WITH LINEAGE. Every other
-    /// lineage check in this crate goes through astream's own verdict (an `Open`
-    /// sidecar opened in another boot); a log a build before lineage left
-    /// marked moves ONLY on the embedder's verdict (`Prepared::Unclean`), so
-    /// this one leaves astream nothing of its own to go by: the boot-1 run
-    /// stops cleanly (`Closed`), and the mark is planted after it.
     #[test]
     fn a_legacy_mark_alone_moves_the_generation_with_lineage() {
         let dir = scratch();
@@ -1418,9 +1333,6 @@ mod tests {
         }
     }
 
-    /// RELAXED ON A HOST THAT NAMES NO BOOT RUNS, the safe way: astream
-    /// cannot tell a reboot from a restart there, so every unclean stop moves
-    /// the generation, a process crash included.
     #[test]
     fn what_open_refuses_and_what_it_leaves_alone() {
         let dir = scratch();
@@ -1475,8 +1387,6 @@ mod tests {
         drop(held);
     }
 
-    /// One record kind the table test writes: who writes it, where, and
-    /// whether the table must escalate it.
     enum Write {
         /// A publish on `subject` under `who`'s caps.
         Publish(Who, String),
@@ -1499,8 +1409,6 @@ mod tests {
     const TABLE_NODE: &str = "n-00000000000000aa";
     const TABLE_PERSON: &str = "h-x";
 
-    /// Every record kind of the table, as aterm's own builders spell it
-    /// ([`crate::subject`]), with whether it must be escalated.
     fn table_writes() -> Vec<(&'static str, Write, bool)> {
         use crate::subject;
         let (f, node, p) = (TABLE_FLEET, TABLE_NODE, TABLE_PERSON);
@@ -1561,10 +1469,6 @@ mod tests {
         ]
     }
 
-    /// Write every [`table_writes`] record through a guarded broker opened
-    /// at `tier` with `table`, and answer, per kind, whether its record was
-    /// on stable media when its ack arrived — astream's own matcher, staged
-    /// as a real client's records are.
     fn escalated_by(
         tier: Durability,
         table: astream_broker::Escalation,
@@ -1575,9 +1479,6 @@ mod tests {
         let secret = b"a-mint-secret-of-thirty-two-bytes".to_vec();
         let mut opts = tier.options();
         if tier == Durability::Ordered {
-            // NO HORIZON: the durable head then moves only for an escalated
-            // record, so what this answers depends on nothing but the code
-            // under test — never on how long the loop took between two acks.
             opts.durability = astream_broker::Durability::Ordered { horizon: None };
         }
         opts.escalation = table;
@@ -1632,7 +1533,6 @@ mod tests {
         Some(out)
     }
 
-    /// EACH RECORD A PERSON WOULD MISS IS ESCALATED, AND NOTHING ELSE IS.
     #[test]
     fn each_record_a_person_would_miss_is_escalated() {
         let want: Vec<(&str, bool)> = table_writes()
@@ -1669,8 +1569,6 @@ mod tests {
         );
     }
 
-    /// The guarded broker takes the tier too (astream's `OpenOptions::guard`):
-    /// a relaxed guarded open refuses an un-attached publish like a strict one.
     #[test]
     fn a_guarded_relaxed_broker_is_still_guarded() {
         let dir = scratch();

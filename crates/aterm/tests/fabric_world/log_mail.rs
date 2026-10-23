@@ -1,27 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! MAIL DIR=IN END TO END THROUGH A BRIDGE (3B wrote
-//! the fabric's marks, `SessionLog::observe_fabric`, and no world test read
-//! them back): a guarded broker, a headless aterm and the bridge it launches,
-//! the bridge
-//! mirroring (`serve --log turns`). What reached a session's inbox is a
-//! `mail dir=in` mark in its log, `by=bridge src=fabric conf=exact`, of the
-//! kind delivered — an accepted principal's `task` as `task`, an unlisted
-//! one's as `note`, a peer's `ask` as `ask` at its broker offset. The asker's
-//! `mail-landed off=` is that offset; an `inbox seen` is `mail-seen`; no
-//! body is in either log; and no mail record is on the session's `ev` face,
-//! read after a barrier (a turn-class record written after the mail has
-//! landed there). Every wait is a one-minute hang detector.
-//!
-//! PRESENCE ONLY (T13's fallback): the delivery path's real fault (aterm
-//! lost before it delivers) gives no final positive signal — the bridge
-//! redelivers — and a record the bridge refuses at parse never reaches
-//! aterm, so no world-side negative control here can catch an aterm defect.
-//! The negative control is the in-process one T13 names: aterm-gui's
-//! `a_delivery_whose_hook_drops_the_fact_writes_the_row_and_no_mail_mark`
-//! (the fabric hook that drops the `MailIn` fact writes the inbox row and no
-//! `mail dir=in` mark, and this test's presence check fails on it).
+//! End-to-end test that delivered mail writes a `mail dir=in` mark in the session log.
 
 use super::harness::{FLEET, World, kv, off_of, until};
 
@@ -82,7 +62,6 @@ fn delivered_mail_is_a_mail_mark_in_the_log_end_to_end() {
     let w = world("lmail");
     let (a, b) = w.two_sessions();
 
-    // A listed principal's task and an unlisted one's, published to B.
     let mut god = w.god();
     let mut tasks = Vec::new();
     for (who, text) in [
@@ -102,7 +81,6 @@ fn delivered_mail_is_a_mail_mark_in_the_log_end_to_end() {
         tasks.push((who, off));
     }
 
-    // A asks B, and is answered the ask's broker offset.
     let reply = w.verb(&format!(
         "@{a} post to=@{b} kind=ask --wait=60000 SENTINEL-ASK"
     ));
@@ -114,15 +92,12 @@ fn delivered_mail_is_a_mail_mark_in_the_log_end_to_end() {
     );
     let r_off = off_of(reply.header());
 
-    // B's log: the ask as delivered, by the bridge, exactly (T13: kind=ask
-    // at <R>).
     let ask = mail_in_at(&w, &b, r_off);
     assert!(
         ask.contains(" kind=ask ") && ask.contains(" by=bridge src=fabric conf=exact "),
         "{ask}"
     );
     assert!(ask.contains(&format!(" from={a}@{} ", w.node)), "{ask}");
-    // The tasks: the listed one's kind kept, the unlisted one's demoted.
     for (who, off) in &tasks {
         let row = mail_in_at(&w, &b, *off);
         let want = if *who == "a-orchestrator" {
@@ -134,7 +109,6 @@ fn delivered_mail_is_a_mail_mark_in_the_log_end_to_end() {
         assert!(row.contains(" by=bridge src=fabric conf=exact "), "{row}");
     }
 
-    // A's landing names the offset B's mark does.
     let landed = until("A's mail-landed", || {
         mail(&w, &a)
             .into_iter()
@@ -146,7 +120,6 @@ fn delivered_mail_is_a_mail_mark_in_the_log_end_to_end() {
         "{landed}"
     );
 
-    // B handles the ask: `mail-seen`.
     let inbox = kv(&ask, "inbox").expect("the ask's inbox id").to_string();
     let seen = w.verb(&format!("@{b} inbox seen {inbox} handled"));
     assert!(seen.ok(), "inbox seen: {}", seen.header());
@@ -157,15 +130,12 @@ fn delivered_mail_is_a_mail_mark_in_the_log_end_to_end() {
     });
     assert!(seen_mark.contains(" word=handled "), "{seen_mark}");
 
-    // No body in either log, at any tier.
     for sid in [&a, &b] {
         for row in log_rows(&w, sid, "tier=content") {
             assert!(!row.contains("SENTINEL"), "a body in {sid}'s log: {row}");
         }
     }
 
-    // THE ev FACE, after a barrier (T13): a turn-class record B writes after
-    // the mail has landed on its face; then no mail record is there.
     assert!(w.verb(&format!("@{b} mark - need word=review")).ok());
     let need: u64 = log_rows(&w, &b, "kinds=need")
         .last()

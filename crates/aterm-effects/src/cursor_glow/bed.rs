@@ -33,38 +33,41 @@ pub(crate) fn dark_bed_ink(rgb: u32, bg: u32, budget: f32, sat: f32) -> u32 {
     let ch = |c: u32, sh: u32| (c >> sh) & 0xff;
     let mx = ch(rgb, 16).max(ch(rgb, 8)).max(ch(rgb, 0));
     let full = if mx == 0 {
-        0
+        [0.0; 3]
     } else {
         let k = 255.0 / mx as f32;
-        let up = |sh: u32| ((ch(rgb, sh) as f32 * k).round() as u32).min(255);
-        (up(16) << 16) | (up(8) << 8) | up(0)
+        [16u32, 8, 0].map(|sh| ((ch(rgb, sh) as f32 * k).round() as u32).min(255) as f32)
     };
-    let family = |t: f32| {
-        let pick = |sh: u32| {
-            let c = ch(full, sh) as f32;
+    let bg_rgb = [16u32, 8, 0].map(|sh| ch(bg, sh) as usize);
+    let pick_rgb = |t: f32| -> [usize; 3] {
+        full.map(|c| {
             let v = if t <= 0.5 {
                 c * 2.0 * t
             } else {
                 c + (255.0 - c) * (2.0 * t - 1.0)
             };
-            (v as u32).min(255)
-        };
-        (pick(16) << 16) | (pick(8) << 8) | pick(0)
+            (v as usize).min(255)
+        })
     };
-    let seen = |ink: u32| {
-        let top = |sh: u32| ch(ink, sh).max(ch(bg, sh));
-        crate::color_math::relative_luminance_with(table, (top(16) << 16) | (top(8) << 8) | top(0))
+    let seen = |ink: [usize; 3]| {
+        crate::color_math::relative_luminance_rgb(
+            table,
+            ink[0].max(bg_rgb[0]),
+            ink[1].max(bg_rgb[1]),
+            ink[2].max(bg_rgb[2]),
+        )
     };
     let (mut lo, mut hi) = (0.0f32, 1.0f32);
     for _ in 0..20 {
         let mid = 0.5 * (lo + hi);
-        if seen(family(mid)) <= budget {
+        if seen(pick_rgb(mid)) <= budget {
             lo = mid;
         } else {
             hi = mid;
         }
     }
-    family(lo)
+    let [r, g, b] = pick_rgb(lo);
+    ((r as u32) << 16) | ((g as u32) << 8) | (b as u32)
 }
 
 /// A style's bed.

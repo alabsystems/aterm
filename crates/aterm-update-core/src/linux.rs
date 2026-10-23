@@ -1,18 +1,12 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Linux release identity shared by the cutter, the bootstrap installer contract and the
-//! native updater. Linux updates are raw ELF executables, not archives. An ELF header is a
-//! compatibility check, never an authenticity check: callers first verify the signed manifest
-//! and then the complete file's digest.
+//! Linux release identity and ELF64 header validation shared by `aterm-release` and `aterm-update`.
 
 /// A deliberately bounded native executable download (512 MiB).
 pub const LINUX_BINARY_MAX_BYTES: u64 = 512 * 1024 * 1024;
 
-/// The side-effect-free `aterm update identity` response. A candidate runs this probe only
-/// after its signed artifact digest is authenticated; it proves the loader and compiled
-/// identity agree with the signed metadata and replaces neither signature verification nor
-/// the ordinary-launch health trial.
+/// The side-effect-free `aterm update identity` response, verified against the signed [`crate::Manifest`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct BinaryIdentity {
     pub schema: u32,
@@ -88,8 +82,7 @@ impl LinuxTarget {
         format!("aterm-{version}-linux-{}", self.arch())
     }
 
-    /// Refuse truncated, foreign, 32-bit, big-endian, or non-executable ELF.
-    /// The 64-byte header may be supplied independently of the rest of a file.
+    /// Refuse truncated, foreign, 32-bit, big-endian, or non-executable ELF64 headers.
     pub fn validate_elf_header(self, bytes: &[u8]) -> Result<(), String> {
         if bytes.len() < 64 || bytes.get(..4) != Some(b"\x7fELF") {
             return Err("Linux artifact is not a complete ELF64 header".into());
@@ -118,8 +111,7 @@ impl LinuxTarget {
     }
 }
 
-/// A complete, validated target entry from a manifest. Its authentication is
-/// the caller's responsibility: parsing does not establish signing authority.
+/// A validated Linux target entry from a release manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LinuxArtifact<'a> {
     pub target: LinuxTarget,

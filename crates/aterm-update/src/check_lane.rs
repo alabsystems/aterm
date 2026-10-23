@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A join consumes only a check completed during that request, for its source/build.
-//! Holding the lane for a dedup decision does not manufacture a completed check.
+//! Update check lane deduplication and completion tracking.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, TryLockError};
@@ -60,8 +59,6 @@ impl Lane {
         poisoned: std::sync::PoisonError<MutexGuard<'a, Completion>>,
     ) -> MutexGuard<'a, Completion> {
         let mut guard = poisoned.into_inner();
-        // A panic cannot supply a completed-check answer. Invalidate before
-        // clearing poison, while no other caller can acquire the lane.
         *guard = Completion::default();
         self.state.clear_poison();
         guard
@@ -83,8 +80,6 @@ impl Lane {
             self.complete(&mut guard, build, source);
             return;
         }
-        // Another checker holds the lane: wait, then join its answer if it completed
-        // this request's source and build, else check.
         let mut guard = self
             .state
             .lock()
@@ -203,7 +198,6 @@ mod tests {
         let mut historical = model.init_state();
         historical.insert("poisoned", 1);
         historical.insert("recovered", 1);
-        // Negative control: taking and dropping the guard leaves the poison.
         let Err(TryLockError::Poisoned(poisoned)) = lane.state.try_lock() else {
             panic!("expected the historical poisoned-lock arm");
         };
@@ -211,7 +205,6 @@ mod tests {
         assert!(lane.state.is_poisoned());
         assert!(!model.check_invariant("RecoveryClearsPoison", &historical));
 
-        // The periodic loop's own entry, not a test-only repair.
         let mut guard = lane
             .try_lock()
             .expect("periodic check can acquire immediately");
@@ -231,7 +224,6 @@ mod tests {
         assert!(checked);
         assert!(!lane.state.is_poisoned());
 
-        // The blocking join may be the first observer of another worker's panic.
         let _ = std::panic::catch_unwind(|| {
             lane.run_or_join(42, &source, || panic!("second injected panic"));
         });
@@ -264,9 +256,6 @@ mod tests {
         after_skip(gate, guard, 30, || {
             waited = true;
             let lane_free = lane.try_lock().is_some();
-            // Sampled once: a dropped `FileLock` is free at once (`LOCK_UN`) even while a
-            // sibling test's fork holds a copy of its descriptor, so `WouldBlock` here
-            // means the lock is held across the sleep.
             let file_free =
                 aterm_update_core::FileLock::acquire_within(&file_path, std::time::Duration::ZERO)
                     .is_ok();

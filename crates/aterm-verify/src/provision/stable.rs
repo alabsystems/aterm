@@ -1,28 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `verify provision`'s rustup row: the stock exceptions (§6.1 rows 23 and 24), which
-//! `ship provision` acquired before this verb took them over: rustup itself (no default
-//! toolchain, auto-install off, laid by the pinned rustup-init the row hands [`run`]),
-//! upstream stable with the `x86_64-apple-darwin` slice, the foreign cells' std and the
-//! clippy that lints them (for `verify cells`, run by hand), and the wasm32 pin
-//! `publish/config.sh`'s wasm32 clause names, with its wasm32 target, in a tree that has
-//! `publish/` ([`wasm_pin_wanted`]). rustup's `trust` link stays `ship provision`'s
-//! (atpkg's seam, the pass `aterm pkg repair` runs), and the wasm-bindgen CLI is the
-//! `--record` row's.
-//!
-//! Stock stable builds only the x86_64 slice and lints the foreign cells, and the pin
-//! only type-checks the wasm32 clause, so each is installed by name with what its job
-//! needs past the minimal profile; a rustup installed here gets no default toolchain,
-//! so a bare `cargo` in an unpinned directory fails loudly instead of running stock
-//! stable.
+//! `verify provision`'s rustup row for stock stable and the wasm32 pin.
 
 use std::path::{Path, PathBuf};
 
 /// The std targets the `cells` check (`targo --unverified verify cells`, by hand)
-/// compiles the foreign cells for, on upstream stable (Trust has none of them). This row
-/// acquires them so the check can run here; no release needs them (`cells` is in no set),
-/// so `ship provision`'s audit does not ask for them.
+/// compiles the foreign cells for, on upstream stable.
 pub const FOREIGN_CELL_TARGETS: [&str; 4] = [
     "x86_64-pc-windows-msvc",
     "aarch64-pc-windows-msvc",
@@ -81,7 +65,7 @@ fn has(listed: &[String], name: &str) -> bool {
         .any(|t| t == name || t.starts_with(&format!("{name}-")))
 }
 
-/// What a machine that holds `seen` lacks, in order — pure. Empty: the row is in place.
+/// What a machine that holds `seen` lacks, in order.
 pub(crate) fn plan(seen: &Seen, pin: Option<&str>, stable_targets: &[&str]) -> Vec<Step> {
     let mut steps = Vec::new();
     let fresh = seen.rustup.is_none();
@@ -272,7 +256,6 @@ fn first_words(stdout: &str) -> Vec<String> {
 }
 
 /// What rustup holds on this machine; an answer it does not give reads as nothing held.
-/// Each toolchain is asked about only once rustup lists it, so no read auto-installs one.
 fn observe(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Seen {
     let Some(bin) = homes.find_rustup() else {
         return Seen::default();
@@ -321,8 +304,7 @@ pub fn lacks_rustup(homes: &Homes) -> bool {
     homes.find_rustup().is_none()
 }
 
-/// What this machine lacks of the row, read only: empty when it is in place. `pin` is
-/// the wasm32 pin ([`wasm_pin_wanted`]), `None` where the tree wants none.
+/// What this machine lacks of the row, read only: empty when it is in place.
 pub fn missing(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Vec<String> {
     plan(&observe(homes, rustup, pin), pin, &stable_targets())
         .iter()
@@ -332,13 +314,10 @@ pub fn missing(homes: &Homes, rustup: &dyn Rustup, pin: Option<&str>) -> Vec<Str
 }
 
 /// Acquire what this machine lacks; each step is said, and a step that fails is said with
-/// why. `init` is the rustup-init a machine with no rustup installs it with: fetched by the
-/// row at its pin and held to its sha256 before this runs it ([`super::provide`]), `None`
-/// where a rustup is installed. `Err` names every step that failed (or the unreadable
-/// pin); `Ok` holds what was acquired, empty when the row was in place.
+/// why.
 ///
 /// # Errors
-/// As above: the row is not in place.
+/// Returns an error naming every step that failed or the unreadable pin.
 pub fn run(
     repo: &Path,
     homes: &Homes,
@@ -368,7 +347,6 @@ pub fn run(
                         break 'steps;
                     }
                 },
-                // Found again per command: rustup-init has only just laid it.
                 _ => homes
                     .find_rustup()
                     .unwrap_or_else(|| homes.cargo_home.join("bin/rustup")),
@@ -452,15 +430,11 @@ mod tests {
                 Step::PinToolchain("1.97.1".into()),
             ]
         );
-        // No readable pin: nothing is guessed, and a provisioned machine lacks nothing.
         assert_eq!(plan(&provisioned(), None, TARGETS), []);
     }
 }
 
-/// `run` and `observe` over a stateful rustup: what it holds changes as it is asked, and a
-/// call naming a toolchain it lacks auto-installs it until `set auto-install disable`, then
-/// fails as rustup 1.29 does, so "every toolchain by name" and "auto-install off before
-/// any install" are observed, not assumed.
+/// Tests for `run` and `observe` over a stateful rustup.
 #[cfg(test)]
 mod stateful {
     use std::cell::RefCell;
@@ -560,7 +534,6 @@ mod stateful {
                     let t = Self::need(&mut s, toolchain.ok_or("no toolchain named")?)?;
                     Ok(s.toolchains[&t].iter().map(|x| format!("{x}\n")).collect())
                 }
-                // As rustup lists them: each with the triple it is for.
                 ["component", "list", "--installed"] => {
                     let t = Self::need(&mut s, toolchain.ok_or("no toolchain named")?)?;
                     let extra = s.components.get(&t).into_iter().flatten();
@@ -640,7 +613,6 @@ mod stateful {
         let homes = homes(tmp.path());
         let rustup = FakeRustup::default();
         assert!(lacks_rustup(&homes));
-        // Without the installer the row fetches, nothing is run and the row fails.
         let refused = run(&repo(), &homes, &rustup, None, &mut |_| {}).unwrap_err();
         assert!(
             refused.contains("no pinned rustup-init was fetched"),
@@ -679,7 +651,6 @@ mod stateful {
             "every toolchain is installed by name: {:?}",
             rustup.0.borrow().auto_installed
         );
-        // `pub stage`'s wasm32 clause asks for the pin's target with auto-install off: it answers.
         let bin = homes
             .find_rustup()
             .expect("rustup-init laid rustup where it is looked for");
@@ -687,7 +658,6 @@ mod stateful {
         rustup
             .run(&homes, &bin, &add, None)
             .expect("the pin was installed by name");
-        // A second pass acquires nothing: stable has the clippy `verify cells` lints with.
         assert_eq!(missing(&homes, &rustup, Some(&pin)), Vec::<String>::new());
         assert_eq!(
             run(&repo(), &homes, &rustup, None, &mut |_| {}),
@@ -737,7 +707,6 @@ mod stateful {
             &calls,
             &format!("rustup target add --toolchain {pin} wasm32-unknown-unknown"),
         );
-        // Stable had every std and no clippy: `verify cells` skipped each cell on it.
         position(&calls, "rustup component add --toolchain stable clippy");
         assert!(
             !calls
@@ -761,7 +730,6 @@ mod stateful {
         assert_eq!(h.find_rustup(), Some(tmp.path().join(".cargo/bin/rustup")));
         h.path = Some(on_path.clone().into_os_string());
         assert_eq!(h.find_rustup(), Some(on_path.join("rustup")));
-        // The keg is looked at only where the homes name one, and last.
         let keg = tmp.path().join("keg/bin/rustup");
         std::fs::create_dir_all(keg.parent().unwrap()).unwrap();
         std::fs::copy(on_path.join("rustup"), &keg).unwrap();

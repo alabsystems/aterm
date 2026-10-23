@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rollback-aware GC retention (§10.2).
+//! Rollback-aware GC retention.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -146,9 +146,7 @@ pub(crate) fn sweep_retired_channel_links(layout: &Layout) {
     let _ = std::fs::remove_dir(&root);
 }
 
-/// Every build the derived `bin/` shims point into, keyed by program. Unlike
-/// [`crate::ops::active_builds`] it keeps the whole set, so a program whose tools disagree is
-/// visibly contested.
+/// Every build the derived `bin/` shims point into, keyed by program.
 fn shim_claims(layout: &Layout) -> BTreeMap<String, BTreeSet<u64>> {
     let mut out: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
     let Ok(entries) = std::fs::read_dir(layout.bin_dir()) else {
@@ -257,8 +255,7 @@ pub fn discard_superseded(layout: &Layout, live: &LiveBuild, build: u64) -> Resu
     Ok(())
 }
 
-/// What an interrupted install left in `store/<program>/`. A partial tree is named by a build
-/// number, its stage scratch only by a directory name.
+/// What an interrupted install left in `store/<program>/`.
 #[derive(Default)]
 struct Debris {
     /// `(program, build, dir)` — numeric build dirs with no completeness marker.
@@ -363,17 +360,12 @@ fn interrupted_debris(
             let Some(name) = name.to_str() else { continue };
             if let Some(build) = crate::store::parse_build_name(name) {
                 if crate::store::build_is_complete(&entry.path()) {
-                    // an installed build — `reclaimable` owns it
                     continue;
                 }
                 if crate::store::build_marks_another_slice(&entry.path()) {
-                    // A complete install of the universal binary's other slice:
-                    // `build_is_complete` refuses it so this slice re-stages it, but it did
-                    // finish, and nothing claims a rollback tree.
                     continue;
                 }
                 if claimed.get(&program).is_some_and(|s| s.contains(&build)) {
-                    // something on disk points into it: not ours to delete
                     continue;
                 }
                 out.partial.push((program.clone(), build, entry.path()));
@@ -651,8 +643,7 @@ fn run_in(
     }
 }
 
-/// Whether `tree` is gone from disk, all a reclaim or sweep line may claim. Only `NotFound`
-/// says so: any other stat failure (no search bit, EIO) is a tree nobody could look at.
+/// Whether `tree` is gone from disk, all a reclaim or sweep line may claim.
 fn is_gone(tree: &Path) -> bool {
     matches!(std::fs::symlink_metadata(tree), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
 }
@@ -694,7 +685,6 @@ impl InUse<'_> {
     fn holds(&mut self, program: &str, build_dir: &Path, build: Option<u64>) -> bool {
         let enumerate = self.enumerate;
         let Some(running) = self.running.get_or_insert_with(enumerate) else {
-            // No process table: keep agent and trust builds.
             return crate::stub::is_agent_program(program) || program == crate::seam::SEAM_PROGRAM;
         };
         let root = build
@@ -707,7 +697,6 @@ impl InUse<'_> {
             .filter_map(|d| std::fs::canonicalize(d).ok())
             .collect();
         if resolved.is_empty() && std::fs::symlink_metadata(build_dir).is_ok() {
-            // there, but not resolvable: keep it
             return true;
         }
         running.iter().any(|exe| {
@@ -2058,10 +2047,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&l.prefix);
     }
 
-    /// A LEASED BUILD IS KEPT, AND SAID (gap #31). A release cut pinned to a
-    /// superseded trust build holds a lease on it between its steps, when no process runs
-    /// from it: gc keeps it, the report names who holds it, and the first pass after the run
-    /// reclaims it.
+    /// A leased build is kept until its run ends.
     #[test]
     fn a_leased_build_is_kept_until_its_run_ends() {
         let l = layout("leased");

@@ -1,16 +1,11 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-// Author: Andrew Yates
 
 //! Shared time utilities for pipeline timing.
 
 use core::time::Duration;
 
 /// Convert a [`Duration`] to nanoseconds as `u64`, saturating at `u64::MAX`.
-///
-/// Uses `as_secs()` + `subsec_nanos()` instead of `as_nanos() as u64` to
-/// avoid `clippy::cast_possible_truncation` on the `u128` → `u64` cast.
-/// Saturates at `u64::MAX` (~584 years) which is unreachable in practice.
 #[must_use]
 #[inline]
 // Skip: `Duration` is `core::time::Duration`, and the arithmetic below is

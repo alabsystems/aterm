@@ -214,7 +214,7 @@ pub(crate) fn tape_holds(read: &Recovered, secret: &str) -> bool {
 /// `git <args>` in `dir`, hermetic, asserted ok.
 fn git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command("git")
+        aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")

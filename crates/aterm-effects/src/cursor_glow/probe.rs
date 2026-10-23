@@ -211,12 +211,7 @@ impl CursorGlow {
     /// The row probe to v2's glyph probe (§5.4).
     #[inline]
     pub(super) fn v2_probe_row(&mut self, row: i32, cols: &[char]) {
-        self.v2_probe_scratch.clear();
-        self.v2_probe_scratch
-            .extend(cols.iter().map(|&c| rk::stardust::cell_ink(c)));
-        self.v2
-            .probe_mut()
-            .probe_row_ink(row, &self.v2_probe_scratch);
+        self.v2.probe_mut().probe_row_chars(row, cols);
     }
 
     /// The rows the content witness wants (`rk::witness`).

@@ -12,7 +12,7 @@
 // only those slots are typed. See ../LICENSE-MIT and ../LICENSE-APACHE for
 // the upstream licenses.
 
-//! DXGI, the slice aterm calls (WB.2 of docs/AUDIT-third-party-2026-10-15.md).
+//! DXGI bindings used by aterm.
 
 use crate::Win32::Foundation::RECT;
 use crate::Win32::Graphics::Gdi::HMONITOR;

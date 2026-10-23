@@ -1,14 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The native-Wayland clipboard route: the [`aterm_window::platform::wayland::WaylandClipboard`] handle
-//! the (vendored, patched) winit event loop hands out, installed once at launch and consulted by
-//! every Linux arm in [`crate::clipboard`] before the X11 backend. On Wayland the window's own
-//! seat is what the compositor trusts to set a selection; the X11 backend reaches the clipboard
-//! only through XWayland, and without XWayland not at all.
-//!
-//! Absent on X11 and headless launches, where [`install`] is never called and every arm falls
-//! through to the X11 backend.
+//! Native-Wayland clipboard handle from the event loop, installed once at launch and
+//! consulted by [`crate::clipboard`] before falling through to the X11 backend.
 
 use std::sync::OnceLock;
 

@@ -726,7 +726,7 @@ pub fn post_publish(
 
 /// `curl -I -L` HEAD status of a URL (follows GitHub's 302 to storage).
 fn head_status(url: &str) -> Result<String> {
-    let out = Command::new("curl")
+    let out = Command::new(aterm_uds::os_path!("curl"))
         .args(["-sS", "-o", "/dev/null", "-I", "-L", "-w", "%{http_code}"])
         .arg(url)
         .output()

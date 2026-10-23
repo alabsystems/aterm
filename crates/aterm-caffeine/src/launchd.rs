@@ -22,7 +22,7 @@ pub const EXIT_RESTART: u8 = 75;
 
 /// The launchctl binary.
 #[cfg(unix)]
-const LAUNCHCTL: &str = "/bin/launchctl";
+const LAUNCHCTL: &str = aterm_uds::os_path!("launchctl");
 
 /// How long one `launchctl` call may take before it is called hung, killed and refused.
 #[cfg(unix)]

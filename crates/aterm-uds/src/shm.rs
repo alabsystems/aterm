@@ -8,7 +8,6 @@ use std::os::fd::{AsFd as _, AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
-/// A header word's size and alignment.
 const WORD: usize = 8;
 const _: () = assert!(
     usize::BITS == 64 && std::mem::align_of::<AtomicU64>() == WORD,
@@ -19,12 +18,8 @@ const _: () = assert!(
 pub const PAGE: usize = 16 * 1024;
 /// Maximum region size accepted for mapping or custody (`64 MiB`).
 pub const MAX_LEN: usize = 64 * 1024 * 1024;
-/// The name's fixed head; [`NAME_RANDOM`] base32 characters follow it.
 const NAME_HEAD: &str = "/atrj.";
-/// Random base32 characters in a name: 125 bits, and with the head 31 bytes, macOS's
-/// `PSHMNAMLEN`.
 const NAME_RANDOM: usize = 25;
-/// How many fresh names [`Region::create`] tries when one already exists.
 const NAME_TRIES: usize = 8;
 
 /// Reason a mapped region access was refused.
@@ -70,9 +65,6 @@ pub struct Region {
 // whichever thread holds it.
 unsafe impl Send for Region {}
 
-/// `Region` must never be `Sync`: its copies are plain `memcpy`s, and two threads racing them on
-/// the same bytes would be undefined behaviour. Were it `Sync`, both impls below would apply and
-/// the item named in the closure would be ambiguous: the build fails here.
 trait AmbiguousIfSync<A> {
     fn named() {}
 }
@@ -82,12 +74,10 @@ const _: fn() = || {
     let _ = <Region as AmbiguousIfSync<_>>::named;
 };
 
-/// The last OS error, as an `io::Error`.
 fn last_os() -> io::Error {
     io::Error::last_os_error()
 }
 
-/// `len` as a region length: non-zero, a multiple of [`PAGE`], at most [`MAX_LEN`].
 fn check_len(len: usize) -> io::Result<()> {
     if len == 0 || !len.is_multiple_of(PAGE) || len > MAX_LEN {
         return Err(io::Error::new(
@@ -100,7 +90,6 @@ fn check_len(len: usize) -> io::Result<()> {
     Ok(())
 }
 
-/// A fresh random name: [`NAME_HEAD`] and [`NAME_RANDOM`] lowercase base32 characters.
 fn fresh_name() -> io::Result<std::ffi::CString> {
     const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut raw = [0u8; NAME_RANDOM];
@@ -108,7 +97,6 @@ fn fresh_name() -> io::Result<std::ffi::CString> {
     let mut name = String::with_capacity(NAME_HEAD.len() + NAME_RANDOM);
     name.push_str(NAME_HEAD);
     for b in raw {
-        // The low five bits: each character is 5 uniform bits of its byte.
         name.push(char::from(BASE32[usize::from(b & 0x1f)]));
     }
     std::ffi::CString::new(name).map_err(|_| io::Error::other("a region name held a NUL"))
@@ -242,7 +230,6 @@ impl Region {
         Ok((region, custody))
     }
 
-    /// `shm_open(O_CREAT | O_EXCL | O_RDWR)` under a fresh name, retried while the name exists.
     fn open_fresh() -> io::Result<(std::ffi::CString, OwnedFd)> {
         let mut last = io::Error::other("no region name was tried");
         for _ in 0..NAME_TRIES {
@@ -314,7 +301,6 @@ impl Region {
         self.writable
     }
 
-    /// `[at, at + len)` if it lies inside the region.
     const fn span(&self, at: usize, len: usize) -> Result<(), AccessError> {
         match at.checked_add(len) {
             Some(end) if end <= self.len => Ok(()),
@@ -322,7 +308,6 @@ impl Region {
         }
     }
 
-    /// The word at `at`, checked: 8-aligned and inside the region.
     fn word(&self, at: usize) -> Result<&AtomicU64, AccessError> {
         if !at.is_multiple_of(WORD) {
             return Err(AccessError::Misaligned { at });
@@ -381,10 +366,6 @@ impl Region {
     }
 
     /// Copy `out.len()` bytes from the region at `at` into `out`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AccessError::OutOfBounds`] if `[at, at + out.len())` exceeds the region.
     pub fn read_into(&self, at: usize, out: &mut [u8]) -> Result<(), AccessError> {
         self.span(at, out.len())?;
         // SAFETY: `[at, at + len)` is inside the mapping (checked above), and `out` is caller
@@ -491,9 +472,6 @@ mod tests {
         assert_eq!(again.load_u64_acquire(8), Ok(0x0102_0304_0506_0708));
     }
 
-    /// `map_readonly` refuses a writable descriptor, a size other than the offer's, and a length
-    /// that is no region's; a region is refused at a length that is not a whole number of
-    /// pages.
     #[test]
     fn map_readonly_refuses_a_writable_descriptor_and_a_wrong_size() {
         // SAFETY: this private writable descriptor is only inspected and refused below; neither it
@@ -527,7 +505,6 @@ mod tests {
         }
     }
 
-    /// Every access outside the region, or at a misaligned word, is refused, never a panic.
     #[test]
     fn accesses_are_bounds_and_alignment_checked() {
         // SAFETY: custody stays local and unused; only `region` accesses the private object, and
@@ -561,9 +538,6 @@ mod tests {
         assert_eq!(last, [7; 5]);
     }
 
-    /// Copies at every offset and length across word edges leave exactly the bytes a `Vec` would
-    /// hold, and the restorer's read-only mapping reads every span back the same, as do its
-    /// words (relaxed loads and a fence, on `PROT_READ` pages).
     #[test]
     fn copies_across_word_edges_are_plain_memory() {
         // SAFETY: custody is never reopened or used to change the object; every write goes through
@@ -605,7 +579,6 @@ mod tests {
         }
     }
 
-    /// A fresh name is 31 bytes (macOS's `PSHMNAMLEN`), of the head and base32 characters.
     #[test]
     fn a_region_name_is_31_bytes_of_base32() {
         for _ in 0..16 {

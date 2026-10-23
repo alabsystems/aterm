@@ -8,15 +8,10 @@ use super::super::*;
 
 #[test]
 fn write_char_wrap_marks_continuation_after_full_screen_scroll() {
-    // Autowrapping at the bottom of a full-screen scroll region recycles a
-    // bottom row that receives the continuation; it stays marked `wrapped`, or
-    // reflow/selection/copy would insert a hard break.
     let mut grid = Grid::new(2, 2);
     for c in "ABCDE".chars() {
         grid.write_char_wrap(c);
     }
-    // "AB" scrolled into scrollback; visible row 0 == "CD" (continuation of "AB"),
-    // visible row 1 == "E" (continuation of "CD") — both are soft-wrap rows.
     assert_eq!(grid.row(0).unwrap().to_string(), "CD");
     assert_eq!(grid.cell(1, 0).unwrap().char(), 'E');
     assert_eq!(grid.row_is_wrapped(0), Some(true));

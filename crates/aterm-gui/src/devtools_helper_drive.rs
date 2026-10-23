@@ -1,20 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Headless AppKit driver that renders and verifies the Developer Tools helper panel (`devtools_helper::live`).
-/// Exit code when every check passes.
+//! Headless AppKit driver that renders and verifies the Developer Tools helper panel.
 const PASS: i32 = 0;
-/// Exit code when at least one finding is recorded.
 const FINDING: i32 = 1;
-/// Exit code when the drive could not execute.
 const NOT_RUN: i32 = 2;
 
 /// Drives the Developer Tools helper panel views and returns the process exit code.
 #[must_use]
 pub fn run_devtools_helper_drive(snapshots: Option<&Path>) -> i32 {
-    // The drive is a windowed process of its own: it makes the application
-    // object and builds AppKit views, so it mints the proof a windowed launch
-    // carries and hands it to the body that sends `+sharedApplication`.
     run(crate::platform::Windowed::launch(), snapshots)
 }
 
@@ -38,16 +32,12 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
 }
 
-/// `RTLD_DEFAULT`, as dlfcn.h defines it on Darwin.
 const RTLD_DEFAULT: *mut c_void = (-2_isize) as *mut c_void;
 
-/// The bundle the previews' tiles show.
 const TILE_BUNDLE: &str = "/Applications/aterm.app";
 
-/// A bundle path a hand-formatted URL gets wrong (`targo --unverified ship dev-app` installs it).
 const AWKWARD_BUNDLE: &str = "/Applications/aterm (dev).app";
 
-/// The transcript's prefix.
 const ME: &str = "objc-devtools-helper-drive";
 
 /// The findings so far.
@@ -64,17 +54,13 @@ impl Findings {
     }
 }
 
-/// The body: the one function here that makes the application object, holding the
-/// windowed launch's proof (aterm-census's `shared-application` rule), and only with
-/// the Prohibited policy.
 fn run(_windowed: crate::platform::Windowed, out: Option<&Path>) -> i32 {
     let Some(mtm) = MainThread::new() else {
         println!("{ME}: NOT RUN — not on the process main thread");
         return NOT_RUN;
     };
-    // SAFETY: Main thread; `+sharedApplication` is `+(NSApplication *)`, +0 and
-    // process-lifetime; `-setActivationPolicy:` is `-(BOOL)(NSInteger)` and
-    // `-activationPolicy` `-(NSInteger)`.
+    // SAFETY: Main thread; `+sharedApplication` is `+(NSApplication *)`, +0 and process-lifetime;
+    // `-setActivationPolicy:` is `-(BOOL)(NSInteger)` and `-activationPolicy` `-(NSInteger)`.
     let policy = unsafe {
         let app = appkit::send_id(class(c"NSApplication").as_id(), sel!(sharedApplication));
         if app.is_null() {
@@ -109,7 +95,6 @@ fn run(_windowed: crate::platform::Windowed, out: Option<&Path>) -> i32 {
     }
 }
 
-/// A list row.
 const fn list(listing: DevToolListing, label: DevToolListLabel, rows: Option<u32>) -> DevToolList {
     DevToolList {
         listing,
@@ -119,7 +104,6 @@ const fn list(listing: DevToolListing, label: DevToolListLabel, rows: Option<u32
     }
 }
 
-/// A panel shown for `list`, after a `spctl` run that answered `listed`.
 fn shown_after(
     list: DevToolList,
     bundle: bool,
@@ -148,13 +132,10 @@ fn shown_after(
     )
 }
 
-/// A panel shown for `list`; `listed_terminal` when this hand-over's `spctl` run
-/// answered Ok.
 fn shown(list: DevToolList, bundle: bool, listed_terminal: bool, at: Instant) -> Panel {
     shown_after(list, bundle, listed_terminal.then_some(Ok(())), at)
 }
 
-/// Every state the panel's words take, by name.
 fn scenarios() -> Vec<(&'static str, Content)> {
     let t0 = Instant::now();
     let absent = list(DevToolListing::Absent, DevToolListLabel::Read, Some(2));
@@ -265,7 +246,6 @@ fn scenarios() -> Vec<(&'static str, Content)> {
     out
 }
 
-/// Check 1: every state, light and dark.
 fn states(mtm: MainThread, out: Option<&Path>, findings: &mut Findings) {
     for (name, content) in scenarios() {
         let wants_tile = content
@@ -302,10 +282,6 @@ fn states(mtm: MainThread, out: Option<&Path>, findings: &mut Findings) {
     }
 }
 
-/// Verifies the content view layout and subviews.
-///
-/// # Safety
-/// Must be called on the main thread while `preview`'s views are live.
 unsafe fn view_checks(
     preview: &Preview,
     blocks: usize,
@@ -313,9 +289,9 @@ unsafe fn view_checks(
     at: &str,
     findings: &mut Findings,
 ) {
-    // SAFETY: Main thread; `-bounds`/`-frame` are `-(NSRect)`; `-subviews`
-    // `-(NSArray *)`, +0, read with `-count`/`-objectAtIndex:`; `-isKindOfClass:` is
-    // `-(BOOL)(Class)`; `-cell` `-(id)` and `-cellSizeForBounds:` `-(NSSize)(NSRect)`.
+    // SAFETY: Main thread; `-bounds`/`-frame` are `-(NSRect)`; `-subviews` `-(NSArray *)`, +0, read
+    // with `-count`/`-objectAtIndex:`; `-isKindOfClass:` is `-(BOOL)(Class)`; `-cell` `-(id)` and
+    // `-cellSizeForBounds:` `-(NSSize)(NSRect)`.
     unsafe {
         let view = preview.view.as_id();
         let bounds = appkit::send_rect(view, sel!(bounds));
@@ -376,10 +352,6 @@ unsafe fn view_checks(
     }
 }
 
-/// Renders `view` in light or dark appearance to PNG bytes `(width, height, png, flat)`.
-///
-/// # Safety
-/// Must be called on the main thread while `view` is a live `NSView`.
 unsafe fn capture(view: Id, dark: bool) -> Option<(usize, usize, Vec<u8>, bool)> {
     // SAFETY: Main thread. `+appearanceNamed:` is `+(NSAppearance *)(NSString *)`,
     // +0, given AppKit's own name global; `-setAppearance:` `-(void)(id)`; the
@@ -439,7 +411,6 @@ unsafe fn capture(view: Id, dark: bool) -> Option<(usize, usize, Vec<u8>, bool)>
     }
 }
 
-/// Check 2: the panel window reads back as built, and is not shown.
 fn panel_window(mtm: MainThread, findings: &mut Findings) {
     let content = scenarios().swap_remove(0).1;
     let Some(preview) = live::preview(mtm, &content, true) else {
@@ -451,11 +422,10 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
         return;
     };
     let p = panel.id();
-    // SAFETY: Main thread; read-only `-(NSUInteger)`, `-(NSInteger)`, `-(BOOL)`,
-    // `-(NSRect)` and `-(id)` sends (`-contentRectForFrameRect:` takes an
-    // `NSRect`, `-objectAtIndex:` an `NSUInteger`) to the live, never-shown
-    // panel, the bare preview's view, the tile and its tracking areas; the
-    // tile's own `-mouseEntered:`/`-mouseExited:` read no event, so nil serves;
+    // SAFETY: Main thread; read-only `-(NSUInteger)`, `-(NSInteger)`, `-(BOOL)`, `-(NSRect)` and
+    // `-(id)` sends (`-contentRectForFrameRect:` takes an `NSRect`, `-objectAtIndex:` an
+    // `NSUInteger`) to the live, never-shown panel, the bare preview's view, the tile and its
+    // tracking areas; the tile's own `-mouseEntered:`/`-mouseExited:` read no event, so nil serves;
     // then `-setDelegate:` nil before the panel goes.
     unsafe {
         let mask = appkit::send_usize(p, sel!(styleMask));
@@ -548,10 +518,6 @@ fn panel_window(mtm: MainThread, findings: &mut Findings) {
     println!("{ME}: the panel window reads back as built, not shown");
 }
 
-/// Check 3: the drag's payload, for a path a hand-built URL would get wrong —
-/// written through AppKit's own pasteboard machinery (as a drag writes it) to a
-/// private, uniquely named pasteboard, never the owner's clipboard, and read
-/// back type by type.
 fn payload(findings: &mut Findings) {
     // SAFETY: Main thread; builds the pasteboard item for `AWKWARD_BUNDLE`.
     let Some(item) = (unsafe { live::pasteboard_item(Path::new(AWKWARD_BUNDLE)) }) else {
@@ -610,15 +576,13 @@ fn payload(findings: &mut Findings) {
     println!("{ME}: the drag payload is Finder's shape for {AWKWARD_BUNDLE:?}");
 }
 
-/// Check 4: the strings the panel spells are the SDK's symbols' values.
 fn symbols(findings: &mut Findings) {
     for name in live::WINDOW_KEYS.iter().chain(live::WORKSPACE_NAMES.iter()) {
         let Ok(symbol) = std::ffi::CString::new(*name) else {
             continue;
         };
-        // SAFETY: `dlsym` with `RTLD_DEFAULT` and a C string; a non-null answer
-        // is the address of an exported `CFStringRef`/`NSString *` constant,
-        // read once and only as a string.
+        // SAFETY: `dlsym` with `RTLD_DEFAULT` and a C string; a non-null answer is the address of
+        // an exported `CFStringRef`/`NSString *` constant, read once and only as a string.
         let value = unsafe {
             let at = dlsym(RTLD_DEFAULT, symbol.as_ptr()).cast::<Id>();
             if at.is_null() {
@@ -634,7 +598,6 @@ fn symbols(findings: &mut Findings) {
     println!("{ME}: the window-list keys and the activation names are the SDK's");
 }
 
-/// Check 5: the declared rows carry their protocols' encodings.
 fn encodings(findings: &mut Findings) {
     let rows: [(&CStr, aterm_objc::ClassPtr, aterm_objc::Sel); 5] = [
         (
@@ -664,8 +627,8 @@ fn encodings(findings: &mut Findings) {
         ),
     ];
     for (proto, cls, name) in rows {
-        // SAFETY: `cls` is a registered class and `name` is an interned selector;
-        // the protocol is looked up (live or nil), never registered here.
+        // SAFETY: `cls` is a registered class and `name` is an interned selector; the protocol is
+        // looked up (live or nil), never registered here.
         let (got, want) = unsafe {
             (
                 aterm_objc::method_types(cls, name).map(|t| aterm_objc::strip_method_offsets(&t)),

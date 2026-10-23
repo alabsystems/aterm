@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Serde corpus (docs/AUDIT-third-party-2026-10-15.md, SP.3) for the
-//! sparkle-words custom fragment and Toy Packs. Packs are third-party input
-//! and every pack table is `deny_unknown_fields`; the custom fragment is the
-//! opposite (container `default`, unknown keys ignored, an `untagged` ink).
-//! None of these models is `Serialize`, so an `Ok` is recorded as its `Debug`.
+//! Serde corpus for the sparkle-words custom fragment and Toy Packs.
 
 #[path = "../../aterm-json/test_support/serde_corpus.rs"]
 mod answers;
@@ -13,8 +9,6 @@ mod answers;
 use answers::Corpus;
 use aterm_effects::spec::{compile_toy_pack_toml, parse_custom_toml};
 
-/// `base` with each `(from, to)` applied; `from` must occur exactly once, so
-/// a mutation can never silently leave the document as it was.
 fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     let mut doc = base.to_string();
     for (from, to) in edits {
@@ -24,16 +18,10 @@ fn mutate(base: &str, edits: &[(&str, &str)]) -> String {
     doc
 }
 
-/// A bundled document as the repository holds it. A Windows checkout under
-/// `core.autocrlf` hands `include_str!` a CRLF copy, and the mutations below
-/// spell their anchors with `\n`.
 fn lf(text: &str) -> String {
     text.replace("\r\n", "\n")
 }
 
-/// `debug` with each `overrides: {..}` map in key order. The map is an
-/// `FxHashMap`, so its own order is the toolchain's hash table's, not the
-/// pack's, and a toolchain bump would move the answer with no serde change.
 fn sorted_overrides(debug: &str) -> String {
     const OPEN: &str = "overrides: {";
     let mut out = String::with_capacity(debug.len());
@@ -73,7 +61,6 @@ fn custom_word_fragments_answer_as_recorded() {
     corpus.record("base", read(CUSTOM));
     corpus.record("empty", read(""));
     let cases: &[(&str, &[(&str, &str)])] = &[
-        // The untagged ink: a string, a table, and what neither variant takes.
         (
             "ink/table",
             &[(
@@ -117,7 +104,6 @@ fn custom_word_fragments_answer_as_recorded() {
         ),
         ("ink/array-empty", &[("ink = \"rainbow\"", "ink = []")]),
         ("ink/empty-table", &[("ink = \"rainbow\"", "ink = {}")]),
-        // Container default: missing and unknown keys are fine, wrong types are not.
         (
             "missing/words",
             &[("words = [\"shipit\", \"deployed\"]\n", "")],

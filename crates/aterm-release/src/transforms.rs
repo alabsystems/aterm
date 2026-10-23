@@ -36,7 +36,7 @@ impl Inputs {
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let out = aterm_uds::spawnfd::command("git")
+    let out = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"))
         .arg("-C")
         .arg(dir)
         .args(args)

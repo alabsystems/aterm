@@ -61,9 +61,6 @@ pub(crate) fn attention(msg: &Message) -> Result<Attention, &'static str> {
             }
             Attention::Progress
         } else if msg.severity >= Severity::Warn {
-            // A live row blocked on the person persists without saying why:
-            // the door records it (`Message::admit`), so it is not a shape a
-            // reporter may build. What it asked is `.now(Ask)`.
             return Err("a blocked live row that names no ask");
         } else {
             return Err("progress with no indicator");
@@ -1776,7 +1773,6 @@ pub(crate) fn serious_mode_feedback(words: &str) -> Message {
         );
     }
     if overridden {
-        // What overrode it, first — the capsule is `Open aterm.toml`.
         lines.insert(0, "aterm.toml sets it".to_string());
     }
     gesture_failure_lines(
@@ -2521,7 +2517,6 @@ pub(crate) fn restored_agent_held(
             lift("Your hold came back on the tab: lift it")
         }))
     } else if agent.fleet || agent.lifted {
-        // Nothing would have relaunched it, and nothing stands to lift.
         return None;
     } else {
         Message::new(
@@ -3421,12 +3416,7 @@ pub(crate) fn occupancy_prompt_key() -> String {
     digest_key(Family::Occupancy, "aterm-toml", "prompt")
 }
 
-/// THE OWNER'S `occupancy = "prompt"` IN FORCE (docs/DESIGN-harness-occupancy-2026-10-20.md
-/// §1.1; the red-team's F14, R9): aterm.toml's root `[harness]` table now has the harness type
-/// occupancy lines into the agents' sessions. A fact for later, the owner's own choice: raised
-/// by the policy in force that says it, cleared by one that does not
-/// (`App::note_occupancy_mode`). The policy carries no line of the file, and the editor opens
-/// at its top whatever line an intent names.
+/// THE OWNER'S `occupancy = "prompt"` IN FORCE (docs/DESIGN-harness-occupancy-2026-10-20.md §1.1; the red-team's F14, R9).
 pub(crate) fn occupancy_prompt_entry() -> Entry {
     Entry::new(
         Family::Occupancy,
@@ -3454,9 +3444,7 @@ pub(crate) fn occupancy_hold_key(sid: &str) -> String {
     digest_key(Family::Occupancy, sid, "hold")
 }
 
-/// A TAB'S OCCUPANCY LINES SPENT FOR ITS HOLD, under `prompt` (design §6, `occupancy.hold`):
-/// `spent` names each rule whose cap is spent — 3 nudges today, 4 hold-room asks this hold —
-/// while the tab still waits. Raised and cleared from what its loop tells.
+/// A TAB'S OCCUPANCY LINES SPENT FOR ITS HOLD, under `prompt` (design §6, `occupancy.hold`): `spent` names each rule whose cap is spent.
 pub(crate) fn occupancy_hold_entry(
     sid: &str,
     spent: &[aterm_agent::supervise::occupancy::RuleId],
@@ -4803,7 +4791,6 @@ pub(crate) fn resume_exceptions(
                 who.map(|w| format!("Model limit stops {w}")),
                 "Model limit reached",
             ),
-            // `/goal` is Claude Code's alone.
             ExceptionKind::GoalCleared => (None, "Claude lost its goal"),
             ExceptionKind::Futile => (
                 who.map(|w| format!("Limit still holds {w}")),
@@ -4815,8 +4802,6 @@ pub(crate) fn resume_exceptions(
             | ExceptionKind::Context
             | ExceptionKind::Refused => continue,
         };
-        // The place first, the agent's name next: a title over the glass's
-        // six words drops the name before it drops where.
         let placed = |head: &str| {
             if n == 1 {
                 placed_title(head, &first_spot.place, "")
@@ -4982,10 +4967,6 @@ const fn resume_agent_word(agent: aterm_phase::Program) -> &'static str {
     }
 }
 
-/// The agent a limit's line of the digest names after its verb (`Limit still
-/// holds <who>`), for the tabs `group` holds: the agent every one of them
-/// runs, as [`resume_agent_word`] names it, and `None` where they run
-/// different ones or a program no reader names.
 fn resume_limit_agent(
     group: &[&(String, Exception, aterm_phase::Program, UpgradeSpot)],
 ) -> Option<&'static str> {

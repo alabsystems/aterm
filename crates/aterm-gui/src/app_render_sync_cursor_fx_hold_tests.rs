@@ -85,11 +85,6 @@ fn synchronized_hold_preserves_license_and_anchors_until_glass_release() {
     );
 }
 
-/// A torn present's hidden cursor reaches no motion engine: with a typed key
-/// in flight, one torn present parks the hidden cursor eight rows up and
-/// neither engine's anchor moves. The key's licence survives until the
-/// shown caret returns and lays its cell. Negative control: the same hidden
-/// cursor on a frame whose bracket has closed is taken as the anchor.
 #[test]
 fn a_torn_presents_hidden_cursor_moves_no_engine_and_spends_no_key() {
     let run = |hidden_withheld: bool| {
@@ -151,7 +146,6 @@ fn a_torn_presents_hidden_cursor_moves_no_engine_and_spends_no_key() {
         )
     };
 
-    // The torn present.
     let (mut app, wid, key_at, origin, write_cursor, before, after, anchors) = run(true);
     assert_eq!(
         anchors.0,
@@ -183,7 +177,6 @@ fn a_torn_presents_hidden_cursor_moves_no_engine_and_spends_no_key() {
     );
     assert!(ws.fx.cursor().glow.ribbon_segments() > 0);
 
-    // Negative control: the bracket closed, the hidden cursor is handed over.
     let (_app, _wid, _key_at, _origin, write_cursor_b, _before, _after, anchors) = run(false);
     assert_eq!(write_cursor_b, write_cursor);
     assert_eq!(
@@ -262,8 +255,6 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
         )
     };
 
-    // A synchronized episode opens after the preflight but before the exact
-    // snapshot authorizes effects.
     {
         let mut terminal = term_lock(&terminal);
         terminal.process(b"\x1b[?2026hpartial");
@@ -322,8 +313,6 @@ fn sync_opening_between_preflight_and_exact_capture_advances_nothing_off_glass()
         "the rejected off-glass candidate cannot reach the sound host"
     );
 
-    // Non-vacuity: once the episode closes the same prepared move advances
-    // and speaks.
     {
         let mut terminal = term_lock(&terminal);
         terminal.process(b"\x1b[?2026l");

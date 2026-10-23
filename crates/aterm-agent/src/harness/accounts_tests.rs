@@ -2391,9 +2391,10 @@ fn the_owners_pin_clears_the_walls_and_holds_the_compare_and_set() {
         None
     );
     assert_eq!(refused.active, before);
-    assert!(
-        refused.pending_pin.is_none(),
-        "a failed final pin consumes its request"
+    assert_eq!(
+        refused.pending_pin.as_ref(),
+        Some(&second),
+        "a refused pin keeps the request for a later eligible completion"
     );
 }
 

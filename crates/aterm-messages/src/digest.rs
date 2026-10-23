@@ -3,16 +3,6 @@
 
 //! The digest: exceptions that need the owner, but not now, batched into one item the
 //! owner can dismiss; the log keeps them for a later look.
-//!
-//! Its entries are [`crate::need::Need::Later`] messages, held in a store beside
-//! [`crate::MessageCenter`]'s live set, not in it, so nothing that lays out the band can
-//! seat one: `eligible()`, `wanted_rows()`, `rebalance`, `settle`, `reserved_progress`,
-//! `mark_seen` and eviction read only the live set. A seam somebody forgets to carve out
-//! fails quiet (an id-based call answers `false`), where a `Later` row in the live set
-//! would seat a band row and re-grid every tab of the window.
-//!
-//! This module is the store: order, cap, end times and the view. `center.rs` posts,
-//! dismisses and writes the log lines.
 
 use crate::model::{Glyph, Intent, Message, MessageId, Severity, WallStamp};
 use crate::need::{DIGEST_CAP, LaterAsk};
@@ -30,9 +20,7 @@ pub(crate) struct Entry {
     /// The wall clock at first ingress: the order and the expiry key on it.
     pub(crate) stamp: WallStamp,
     /// The instant this process first held the entry; with [`Self::anchor_wall`], the
-    /// pair the current wall clock is computed from. For an entry adopted after a
-    /// restart the anchor is the adoption's wall clock, not the old stamp, which would
-    /// date the end of an entry that stood for days as minutes after it began.
+    /// pair the current wall clock is computed from.
     pub(crate) posted_at: Instant,
     /// The wall clock (unix ms) at [`Self::posted_at`].
     pub(crate) anchor_wall: u64,
@@ -240,9 +228,7 @@ pub const RECENT_FILED: usize = 10;
 
 /// `aterm exceptions`: a replayed log's exceptions as plain lines, readable with aterm
 /// not running (the same file and decoder as `aterm ctl messages need=later`, in a
-/// person's words rather than `state=` words). `offset_s` is the local zone's offset
-/// from UTC and `now_unix_ms` the reader's clock; a time on an earlier day carries its
-/// date (`Fri, 18 Sep, 9:02 AM`).
+/// person's words rather than `state=` words).
 #[must_use]
 pub fn report(
     log: &crate::log::MessageLog,
@@ -272,10 +258,8 @@ pub fn report(
             .filter(|r| r.later && r.is_live() == open)
             .collect::<Vec<_>>();
         if open {
-            // Worst first, then longest waiting: the digest's own order.
             v.sort_by_key(|r| (std::cmp::Reverse(r.severity), r.stamp.unix_ms, r.id));
         } else {
-            // Newest filing first: a report read later starts at what happened last.
             v.sort_by_key(|r| std::cmp::Reverse((r.retired_unix_ms, r.id)));
         }
         v
@@ -305,14 +289,11 @@ pub fn report(
                         let at = r
                             .retired_unix_ms
                             .map_or_else(String::new, |ms| format!(" {}", said(ms)));
-                        // A person's words, not the codec's `state=` words.
                         let word = match how {
                             Retired::Resolved(Outcome::Ok) => "fixed".to_string(),
                             Retired::Resolved(Outcome::Warn) => "ended unfixed".to_string(),
                             Retired::Evicted => "filed (list full)".to_string(),
                             Retired::Superseded { .. } => "shown as a message".to_string(),
-                            // The log's `unseen`; the band queue's sense of the
-                            // word is not this entry's.
                             Retired::Unseen => "aged out".to_string(),
                             Retired::Answered { label } => format!("answered {label}"),
                             other => other.as_word().to_string(),
@@ -323,8 +304,6 @@ pub fn report(
                 if let Some(why) = r.detail.first() {
                     out.push(format!("      why    {why}"));
                 }
-                // The action only while the fact may still stand: open, filed or
-                // ended unfixed.
                 if let Some(then) = r.detail.get(1).filter(|_| {
                     r.is_live()
                         || r.filed_exception()

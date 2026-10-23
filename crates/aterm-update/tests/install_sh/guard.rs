@@ -361,7 +361,8 @@ fn a_piped_linux_run_installs_from_the_public_channel_and_says_what_it_lacks() {
     scratch.stand_in("piped-linux/curl", PUBLIC_NO_LINUX_STUB);
     scratch.stand_in("piped-linux/gh", NO_GH);
     scratch.stand_in("piped-linux/uname", AARCH64_UNAME);
-    let script = install_sh();
+    // The embedded verifier's run: a pinned aarch64 digest would fetch the static one.
+    let script = crate::support::unpinned_install_sh(&scratch, "piped-linux/install.sh");
     let piped = |name: &str, args: &str| {
         let home = scratch.home(name);
         let log = scratch.join(&format!("{name}/requests.log"));

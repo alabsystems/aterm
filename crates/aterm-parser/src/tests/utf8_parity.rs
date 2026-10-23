@@ -2,21 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Author: Andrew Yates
 
-//! UTF-8 fast-path PARITY (M2 SIMD-UTF8 verification).
-//!
-//! The ground-state hot loop decodes multi-byte UTF-8 in two ways: a BULK run
-//! decoder (`decode_multibyte_run`, batching consecutive non-ASCII chars) and a
-//! byte-by-byte CONTINUATION path (`process_utf8_byte`, used when a sequence
-//! straddles an `advance_fast()` boundary). These tests pin both against the `std`
-//! reference: for every valid UTF-8 input the chars the parser prints must EXACTLY
-//! equal `input.chars()`, whether fed whole or one byte at a time — and arbitrary
-//! bytes must never panic.
+//! UTF-8 fast-path parity between bulk decoding (`decode_multibyte_run`), byte-by-byte
+//! continuation decoding (`process_utf8_byte`), and `std`.
 
 use super::super::*;
 use super::RecordingSink;
 
-/// Feed `bytes` through a fresh parser in one `advance_fast` call (the bulk run
-/// decoder); return printed chars.
 fn print_whole(bytes: &[u8]) -> Vec<char> {
     let mut p = Parser::new();
     let mut s = RecordingSink::default();
@@ -24,9 +15,6 @@ fn print_whole(bytes: &[u8]) -> Vec<char> {
     s.prints
 }
 
-/// Feed `bytes` one byte per `advance_fast` call through ONE parser (state
-/// persists); return printed chars. Exercises the byte-by-byte continuation path
-/// (a multi-byte sequence straddling `advance_fast` boundaries).
 fn print_byte_by_byte(bytes: &[u8]) -> Vec<char> {
     let mut p = Parser::new();
     let mut s = RecordingSink::default();
@@ -38,7 +26,6 @@ fn print_byte_by_byte(bytes: &[u8]) -> Vec<char> {
 
 #[test]
 fn bulk_path_matches_continuation_path_for_sampled_codepoints() {
-    // One representative codepoint from every consequential UTF-8 boundary class.
     let cps: &[u32] = &[
         0x20, 0x7E, // printable ASCII edges (0x7F is DEL, a control — not printed)
         0x80, 0x7FF, // 2-byte edges
@@ -53,7 +40,6 @@ fn bulk_path_matches_continuation_path_for_sampled_codepoints() {
     assert_eq!(print_byte_by_byte(s.as_bytes()), expected);
 }
 
-/// Deterministic LCG, so failures reproduce.
 fn next(state: &mut u64) -> u32 {
     *state = state
         .wrapping_mul(6_364_136_223_846_793_005)
@@ -65,7 +51,6 @@ fn next(state: &mut u64) -> u32 {
 fn fuzz_random_valid_utf8_has_exact_parity() {
     let mut state = 0xC0FFEE_1234_5678u64;
     for _ in 0..3_000 {
-        // Random scalar values (`from_u32` refuses surrogates).
         let n = (next(&mut state) % 40) as usize;
         let mut s = String::new();
         while s.chars().count() < n {
@@ -87,9 +72,6 @@ fn fuzz_random_valid_utf8_has_exact_parity() {
     }
 }
 
-/// A chunk that ends mid-sequence after a complete multibyte char decodes as
-/// it does byte by byte: the bulk lane buffers the trailing incomplete lead
-/// for the next chunk instead of replacing it with U+FFFD.
 #[test]
 fn incomplete_trailing_lead_after_complete_char_matches_bytewise() {
     let straddles: &[&[u8]] = &[
@@ -106,23 +88,13 @@ fn incomplete_trailing_lead_after_complete_char_matches_bytewise() {
             "whole vs byte-by-byte diverged on {bytes:02x?}"
         );
     }
-    // Only 中 prints; the trailing lead is buffered.
     assert_eq!(print_whole(&[0xE4, 0xB8, 0xAD, 0xE4]), vec!['中']);
-    // A non-continuation after it: one U+FFFD, then the ASCII.
     assert_eq!(
         print_whole(&[0xE4, 0xB8, 0xAD, 0xE4, 0x41]),
         vec!['中', char::REPLACEMENT_CHARACTER, 'A']
     );
 }
 
-/// Ill-formed UTF-8 is replaced with one U+FFFD per maximal subpart (Unicode
-/// §3.9; WHATWG's decoder; `String::from_utf8_lossy`): a byte that begins no
-/// well-formed sequence (`C0`, `C1`, `F5..=FF`, a stray continuation) is a
-/// subpart alone, and a second byte outside its lead's range (`E0` takes
-/// `A0..=BF`, `ED` `80..=9F`, `F0` `90..=BF`, `F4` `80..=8F`) ends the subpart
-/// before it, so `E0 80 80` is three cells, as in every other decoder. The
-/// oracle is `from_utf8_lossy`, fed whole and one byte at a time (a trailing
-/// `Z` flushes a pending lead).
 #[test]
 fn ill_formed_utf8_is_replaced_per_maximal_subpart() {
     let cases: [&[u8]; 10] = [
@@ -150,8 +122,6 @@ fn ill_formed_utf8_is_replaced_per_maximal_subpart() {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
-            // Printable ASCII or a high byte: no C0 control and no DEL, which
-            // the parser executes or ignores rather than prints.
             let b = (state >> 24) as u8;
             bytes.push(if b < 0x20 || b == 0x7F { b | 0x80 } else { b });
         }

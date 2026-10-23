@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The real-time PUSH face (design P1.3) — the additive layer that turns the poll-only control socket into a server-PUSH face, so one agent watches its OWN and OTHER sessions LIVE without busy-polling.
+//! Real-time server-push layer over the control socket.
 
 use std::io::{IoSlice, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -692,7 +692,6 @@ fn drain_roster(
 ) {
     let high = g.roster_seq();
     if high == cursor.seq {
-        // The idle tick: nothing entered or left the registry; one compare.
         return;
     }
     let mark = |sid: &str| {
@@ -969,9 +968,6 @@ fn sample_engine_events(
     }
 }
 
-/// One wake's frames for one watched target. Content on an unfinished DEC 2026 frame is put off to
-/// its hang detector ([`Paces::frame`]), never waited for: a DELTA has no word for half a frame, and
-/// the connection's other targets wait behind this one. A closing watch reads it as it stands.
 fn frames_for_watch(watch: &mut Watch, streams: TargetStreams, woke: bool) -> Vec<Frame> {
     #[cfg(test)]
     crate::work_counts::watch_visited();
@@ -1424,10 +1420,8 @@ fn next_wait(watches: &[Watch], now: Instant, timed: bool) -> Option<Duration> {
 
 /// How a push loop learns that its client hung up.
 pub(crate) trait PeerLiveness {
-    /// Whether the client is gone.
     fn gone(&mut self) -> bool;
 
-    /// The list rung when the client goes, while that ring is how the loop learns it: the loop watches it with its sessions' lists and keeps no timer for its peer.
     fn rings(&self) -> Option<&Arc<Watchers>>;
 }
 
@@ -1737,7 +1731,6 @@ fn pick_adoptions(
     }
     let high = g.roster_seq();
     if high == *adopt_seq {
-        // The idle tick: nothing entered or left the registry.
         return Vec::new();
     }
     let unwatched = |h: &&crate::session_store::SessionHandle| {
@@ -3731,7 +3724,6 @@ mod tests {
                 .unwrap()
                 .record_hand_row("topic", format!("drop t{i}"));
         }
-        // The oracle is the log's own rows, not the digest's reading of them.
         let (low, held, high) = {
             let tl = timeline.lock().unwrap();
             let log = tl.slog().log();
@@ -3902,8 +3894,6 @@ mod tests {
 
     #[test]
     fn a_lifted_timeline_hold_is_drained_on_the_next_pass_with_no_ring() {
-        // Past the session log's record bound (the view's), so its
-        // batch evicts rows past the watch's watermark.
         const FLOOD: usize = aterm_slog::MAX_RECORDS;
         let streams = TargetStreams {
             events: true,
@@ -3958,9 +3948,6 @@ mod tests {
         };
 
         let (_sub, mut watches) = held_past_the_ring();
-        // The oracle is the log's own rows: past the seed's id, the ids it no
-        // longer holds are the GAP, then every row it holds, `x=<i>` at id
-        // seed + 2 + i.
         let (seed, low) = {
             let tl = watches[0]
                 .src
@@ -4156,8 +4143,6 @@ mod tests {
                 &mut sink,
                 peer,
             );
-            // The stall's rows the session log no longer holds, read off the
-            // log itself (the view's loss): the oracle for the GAP.
             let held = {
                 let tl = timeline.lock().unwrap_or_else(|p| p.into_inner());
                 tl.slog()
@@ -4205,8 +4190,6 @@ mod tests {
             format!("{before}{}", stalled(0..3)),
             "within the ring: every record made in the stall, after it"
         );
-        // Past the session log's record bound (the view's): its batch
-        // evicts the oldest of the stall's rows.
         let n = aterm_slog::MAX_RECORDS + 5;
         let (wire, lost) = stalled_wire(n);
         assert!(lost > 0, "the log evicted some of the stall's rows");
@@ -5308,7 +5291,6 @@ mod tests {
         );
     }
 
-    /// One target's unfinished frame holds up no other target's push, and none is pushed half.
     #[test]
     fn an_unfinished_frame_on_one_target_holds_up_no_other_targets_push() {
         let store = crate::session_store::new_store();
@@ -5329,7 +5311,6 @@ mod tests {
             g.register(b.clone());
         }
         let targets = [target_of(&a), target_of(&b)];
-        // Whether A's frame was still open at B's DELTA, and A's rows, in wire order.
         let mut b_while_a_unfinished = None;
         let mut order = Vec::new();
         let mut a_rows: Vec<String> = Vec::new();
@@ -5390,7 +5371,6 @@ mod tests {
         assert_eq!(a_rows.get(1).map(String::as_str), Some("full"));
     }
 
-    /// A put-off push comes due at its frame's hang detector, with no ring.
     #[test]
     fn a_put_off_push_comes_due_at_its_frames_hang_detector() {
         let term = Arc::new(Mutex::new(Terminal::new(4, 20)));
@@ -5433,7 +5413,6 @@ mod tests {
         );
     }
 
-    /// A closing watch's last pass pushes an unfinished frame as it stands: no burst will close it.
     #[test]
     fn a_closing_watchs_last_pass_pushes_an_unfinished_frame_as_it_stands() {
         let term = Arc::new(Mutex::new(Terminal::new(4, 20)));

@@ -9,7 +9,7 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn git_home(dir: &Path, args: &[&str], home: &Path) {
-    let mut cmd = aterm_uds::spawnfd::command("git");
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
     cmd.env_clear()
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home)

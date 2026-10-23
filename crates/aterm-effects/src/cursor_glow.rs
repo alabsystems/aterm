@@ -350,7 +350,6 @@ pub struct CursorGlow {
     dark_settled: bool,
     v2: rk::Engine,
     v2_beams: Vec<BeamVertex>,
-    v2_probe_scratch: Vec<rk::stardust::CellInk>,
     witness_rows: Vec<WitnessRowBuf>,
     witness_rows_n: usize,
     scroll_rows: u16,
@@ -1646,13 +1645,17 @@ impl CursorGlow {
                 self.v2_cues.reserve(Self::V2_CUE_SCRATCH);
             }
             let v2_cfg = rk::Config::from_glow(cfg, self.reduced_motion);
+            let witness_rows = std::mem::take(&mut self.witness_rows);
+            let witness = (witness_n > 0).then(|| witness_samples(&witness_rows, witness_n));
+            let witness_slice = witness
+                .as_ref()
+                .map_or(&[][..], |(samples, n)| &samples[..*n]);
             if witness_n > 0 {
-                let (samples, n) = witness_samples(&self.witness_rows, witness_n);
                 self.v2.carry_caret(caret_carry);
                 let park = self.held_park.filter(|p| !p.cross_row && p.fresh(now));
                 let pair = park.map(|p| ((p.row, p.origin), (p.landing_row, p.landing)));
                 let (_, proved) = self.v2.follow_rows_with_park(
-                    &samples[..n],
+                    witness_slice,
                     &asked[..asked_n],
                     now,
                     pair,
@@ -1676,9 +1679,8 @@ impl CursorGlow {
                 fp: 0,
             };
             if witness_n > 0 && !scroll_frame {
-                let (samples, n) = witness_samples(&self.witness_rows, witness_n);
                 self.v2
-                    .tick_with_restored_rows(now, geom, &v2_cfg, &mut frame, &samples[..n]);
+                    .tick_with_restored_rows(now, geom, &v2_cfg, &mut frame, witness_slice);
             } else {
                 self.v2.tick(now, geom, &v2_cfg, &mut frame);
             }
@@ -1694,9 +1696,9 @@ impl CursorGlow {
                 self.v2_stop = Some((self.v2_caret.field_t, cur));
             }
             if witness_n > 0 && !scroll_frame {
-                let (samples, n) = witness_samples(&self.witness_rows, witness_n);
-                self.v2.witness_rows(&samples[..n], now);
+                self.v2.witness_rows(witness_slice, now);
             }
+            self.witness_rows = witness_rows;
         } else {
             self.emit_crown(now, cfg, geom, cur, &mut halos, &mut under);
         }

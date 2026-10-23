@@ -6,7 +6,6 @@ use aterm_alloc::SmallVec;
 use aterm_rle::Rle;
 use std::sync::Arc;
 
-/// Inline storage for line content (no heap allocation for short lines).
 const INLINE_SIZE: usize = 32;
 
 /// Compact cell styling for RLE storage: packed foreground/background colors and visual flags.
@@ -20,9 +19,7 @@ pub struct CellAttrs {
     pub flags: u16,
 }
 
-/// Default fg color (0xFF_FFFFFF - default type marker + white placeholder).
 const DEFAULT_FG: u32 = 0xFF_FF_FF_FF;
-/// Default bg color (0xFF_000000 - default type marker + black placeholder).
 const DEFAULT_BG: u32 = 0xFF_00_00_00;
 
 impl CellAttrs {
@@ -47,7 +44,6 @@ impl CellAttrs {
         self.fg == DEFAULT_FG && self.bg == DEFAULT_BG && self.flags == 0
     }
 
-    /// Mask for visual flags and write-time width geometry preserved in scrollback.
     const VISUAL_FLAGS_MASK: u16 = 0x3BFF;
 
     /// Flag marking a character that opens a new cell ([`Self::OPENS_CELL`]).
@@ -96,15 +92,14 @@ fn attr_runs(attrs: Option<&Rle<CellAttrs>>) -> &[aterm_rle::Run<CellAttrs>] {
 mod line_codec;
 #[path = "line_codec_block.rs"]
 mod line_codec_block;
-#[cfg(test)]
-pub(crate) use line_codec_block::take_records_walked;
-// Re-exported wire codec for TerminalCheckpoint grid bodies.
 pub(crate) use line_codec::{MAX_DECODE_PAGE_LINES, count_page_lines, serialize_pages};
 pub use line_codec::{
     deserialize_lines, deserialize_lines_strict, deserialize_lines_strict_dropping_over_cap_links,
     deserialize_lines_tail_strict, deserialize_page_lines, max_linked_record_bytes,
     serialize_lines, serialize_lines_bounded,
 };
+#[cfg(test)]
+pub(crate) use line_codec_block::take_records_walked;
 
 #[path = "line_content.rs"]
 mod line_content;
@@ -188,8 +183,6 @@ impl Line {
         }
     }
 
-    /// Shared body of the text constructors: stores no all-default attrs or empty
-    /// hyperlinks, so the borrowing and owning forms cannot drift.
     fn from_parts(
         content: LineContent,
         attrs: Rle<CellAttrs>,
@@ -586,7 +579,6 @@ impl Line {
     #[must_use]
     #[cfg(test)]
     pub fn attr_run_count(&self) -> usize {
-        // `runs.len()` is `run_count()`, via the gate-provable access (see `attr_runs`).
         attr_runs(self.attrs.as_deref()).len()
     }
 }
@@ -639,8 +631,6 @@ impl From<&str> for Line {
 impl std::fmt::Display for Line {
     #[cfg_attr(trust_verify, trust::skip)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `write_str`, not `write!`: no `format_args!` expansion for the `ship
-        // trust` lane to fail closed on.
         f.write_str(&String::from_utf8_lossy(self.as_bytes()))
     }
 }

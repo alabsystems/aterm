@@ -1580,7 +1580,7 @@ fn spawn_live_fish_from(
     extra: &[(&str, &str)],
 ) -> LiveShell {
     std::fs::create_dir_all(fx.home.join("config").join("fish")).expect("config dir");
-    let mut cmd = pty_script(&[fish, "-i"]);
+    let mut cmd = pty_command(&[fish, "-i"]);
     let hermetic = shell_command(fish);
     for (key, value) in hermetic.get_envs() {
         match value {
@@ -1619,14 +1619,12 @@ fn spawn_live_fish_from(
     for (key, value) in extra {
         cmd.env(key, value);
     }
-    LiveShell::spawn("fish", &mut cmd).holding(hermetic.into_home())
+    LiveShell::spawn_on_pty("fish", &mut cmd).holding(hermetic.into_home())
 }
 
 #[cfg(unix)]
 fn live_fish() -> &'static str {
-    let fish = need_fish();
-    need_pty_script();
-    fish
+    need_fish()
 }
 
 #[cfg(unix)]
@@ -1794,7 +1792,6 @@ fn a_live_fish_keeps_the_users_key_bindings_across_a_newer_body() {
 #[test]
 fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
     let zsh = zsh_shell().expect("macOS ships /bin/zsh");
-    assert!(script_can_allocate_a_pty(), "macOS ships script(1)");
     let bf = BodyFixture::new();
     let old = preloader_folder(&bf.fx);
     std::fs::write(
@@ -1804,7 +1801,7 @@ fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
     )
     .expect(".zshrc");
     let InjectionEnv { env_add, .. } = injection_for(ShellType::Zsh, &old).expect("zsh");
-    let mut cmd = pty_script(&[zsh, "-i"]);
+    let mut cmd = pty_command(&[zsh, "-i"]);
     let hermetic = shell_command(zsh);
     for (key, value) in hermetic.get_envs() {
         match value {
@@ -1826,7 +1823,7 @@ fn a_live_zsh_with_a_line_init_hook_is_upgraded_without_a_widget_loop() {
     }
     cmd.env_remove("ATERM_UNSET_ZDOTDIR")
         .env("ATERM_ORIGINAL_ZDOTDIR", &bf.fx.home);
-    let mut sh = LiveShell::spawn("zsh", &mut cmd);
+    let mut sh = LiveShell::spawn_on_pty("zsh", &mut cmd);
     let b_mark = format!("133;B;id={REKEY_OLD}");
 
     sh.send("echo UP$((10 + 1))");

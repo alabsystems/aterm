@@ -6,15 +6,6 @@
 // See ../../LICENSE-MIT for the upstream MIT license.
 
 //! The two bit readers a frame needs (RFC 8878 §4.1).
-//!
-//! [`BitReader`] reads forward from the low bit of the first byte: FSE table
-//! descriptions. [`BitReaderReversed`] reads backward from the high bit of the
-//! last byte: the Huffman and FSE bitstreams, which an encoder writes forward
-//! and a decoder must consume in the opposite order.
-//!
-//! Neither reader panics. A reversed read past the start returns zero bits
-//! and counts them, so [`BitReaderReversed::bits_remaining`] goes negative and
-//! the callers' end-of-stream checks refuse the stream.
 
 use super::error::DecodeError;
 
@@ -35,7 +26,7 @@ impl<'s> BitReader<'s> {
         self.idx
     }
 
-    /// Un-reads the last bit read. A no-op before the first read.
+    /// Un-reads the last bit read.
     pub(crate) const fn return_bit(&mut self) {
         self.idx = self.idx.saturating_sub(1);
     }
@@ -49,7 +40,6 @@ impl<'s> BitReader<'s> {
         let mut value: u64 = 0;
         let mut shift = 0;
         let mut at = self.idx;
-        // At most 5 bytes hold any 32-bit field at any bit alignment.
         while at < end {
             let byte = self.source.get(at / 8).copied().unwrap_or(0);
             let skip = at % 8;
@@ -60,20 +50,18 @@ impl<'s> BitReader<'s> {
             at += take;
         }
         self.idx = end;
-        // `n <= 32`, so the value fits.
         Ok(value as u32)
     }
 }
 
 /// Reads bit fields backward: from the highest bit of the last byte toward
-/// the first byte. Zstandard's entropy streams are written so.
+/// the first byte.
 pub(crate) struct BitReaderReversed<'s> {
     /// The index of the last byte loaded into `bit_container`.
     index: usize,
     /// How many bits of `bit_container` have been consumed.
     bits_consumed: u8,
-    /// Bits consumed past the start of the input (read as zeros). Zero until
-    /// the input is exhausted.
+    /// Bits consumed past the start of the input (read as zeros).
     extra_bits: usize,
     source: &'s [u8],
     /// The bits not yet consumed sit in the high end, refilled byte-wise.
@@ -103,7 +91,7 @@ impl<'s> BitReaderReversed<'s> {
     }
 
     /// Skips the padding at the end of a stream: zero bits, then the one
-    /// marker bit. The last byte must hold the marker (at most 7 zeros first).
+    /// marker bit.
     pub(crate) fn skip_padding(&mut self) -> Result<(), DecodeError> {
         for _ in 0..8 {
             if self.get_bits(1) == 1 {
@@ -123,9 +111,6 @@ impl<'s> BitReaderReversed<'s> {
         if bytes_consumed == 0 {
             return;
         }
-        // The common case, inline: eight more bytes below the window. (The
-        // window starts at the last eight bytes and only moves down, so the
-        // load is in range whenever the index has room to move.)
         if self.index >= bytes_consumed {
             let at = self.index - bytes_consumed;
             if let Some(chunk) = self.source.get(at..).and_then(<[u8]>::first_chunk::<8>) {
@@ -142,8 +127,6 @@ impl<'s> BitReaderReversed<'s> {
     #[cold]
     fn refill_slow(&mut self, bytes_consumed: usize) {
         if self.index >= bytes_consumed {
-            // The window moves down by whole bytes; a partly read byte is now
-            // in the high bits of the container.
             self.index -= bytes_consumed;
             self.bits_consumed &= 7;
             if let Some(chunk) = self
@@ -154,22 +137,18 @@ impl<'s> BitReaderReversed<'s> {
                 self.bit_container = u64::from_le_bytes(*chunk);
             }
         } else if self.index > 0 {
-            // Fewer than 8 unread bytes: load the start of the input, then
-            // shift in zeros for the bytes that are not there.
             let mut value = [0u8; 8];
             let head = self.source.len().min(8);
             if let (Some(dst), Some(src)) = (value.get_mut(..head), self.source.get(..head)) {
                 dst.copy_from_slice(src);
             }
             self.bit_container = u64::from_le_bytes(value);
-            // `index < bytes_consumed <= 8`, so the product fits a u8.
             self.bits_consumed -= 8 * self.index as u8;
             self.index = 0;
             self.bit_container <<= self.bits_consumed;
             self.extra_bits += usize::from(self.bits_consumed);
             self.bits_consumed = 0;
         } else if self.bits_consumed < 64 {
-            // The input is exhausted: shift out the used bits, fill zeros.
             self.bit_container <<= self.bits_consumed;
             self.extra_bits += usize::from(self.bits_consumed);
             self.bits_consumed = 0;
@@ -208,7 +187,6 @@ impl<'s> BitReaderReversed<'s> {
         if sum == 0 {
             return (0, 0, 0);
         }
-        // |consumed..|n1 bits|n2 bits|n3 bits|, low bits to the right.
         let all = self.bit_container >> (64 - self.bits_consumed - sum);
         let val1 = (all >> (n3 + n2)) & ((1u64 << n1) - 1);
         let val2 = (all >> n3) & ((1u64 << n2) - 1);
@@ -249,7 +227,6 @@ mod tests {
         assert_eq!(br.get_bits(4), 0b1010);
         assert_eq!(br.get_bits(4), 0b1101);
         assert_eq!(br.get_bits(4), 0b0101);
-        // The last 0 of the input, then three zeros filled in.
         assert_eq!(br.get_bits(4), 0b0000);
         assert_eq!(br.get_bits(4), 0b0000);
         assert_eq!(br.bits_remaining(), -7);

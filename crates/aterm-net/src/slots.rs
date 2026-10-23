@@ -37,8 +37,8 @@ pub(crate) fn wait_listener_readable(
             events: libc::POLLIN,
             revents: 0,
         };
-        // SAFETY: `descriptor` is one initialized pollfd valid for the call;
-        // `listener` keeps its borrowed descriptor open for the whole wait.
+        // SAFETY: `descriptor` is one initialized pollfd valid for the call; `listener` keeps its
+        // borrowed descriptor open for the whole wait.
         let result = unsafe {
             libc::poll(
                 std::ptr::from_mut(&mut descriptor),
@@ -75,8 +75,8 @@ pub(crate) fn wait_listener_readable(
         events: POLLIN,
         revents: 0,
     };
-    // SAFETY: std initialized Winsock before it created `listener`;
-    // `descriptor` names that live borrowed socket for the duration of the call.
+    // SAFETY: std initialized Winsock before it created `listener`; `descriptor` names that live
+    // borrowed socket for the duration of the call.
     let result = unsafe {
         WSAPoll(
             std::ptr::from_mut(&mut descriptor),
@@ -119,8 +119,6 @@ struct Held {
     unauthenticated: bool,
 }
 
-/// Which held slot a newcomer from `source` may take at `now`, every slot being
-/// held: `None` refuses the newcomer.
 fn pick_displaced(held: &[Held], source: IpAddr, now: Instant, grace: Duration) -> Option<usize> {
     let pending = || held.iter().enumerate().filter(|(_, h)| h.unauthenticated);
     let count = |of: IpAddr| pending().filter(|(_, h)| h.source == of).count();
@@ -138,7 +136,6 @@ fn pick_displaced(held: &[Held], source: IpAddr, now: Instant, grace: Duration) 
     oldest(&|h| count(h.source) >= mine && now.saturating_duration_since(h.since) >= grace)
 }
 
-/// One connection a listener holds a slot for, handshaking or served.
 struct Slot {
     /// Which connection: its [`SlotTenure`] frees the slot by this.
     id: u64,
@@ -162,8 +159,8 @@ pub(crate) struct Slots {
 }
 
 impl Slots {
-    /// No slot held yet: at most `capacity` at once, an unauthenticated one
-    /// given up to a newcomer from a no-heavier address once `grace` old.
+    /// No slot held yet: at most `capacity` at once, an unauthenticated one given up to a newcomer
+    /// from a no-heavier address once `grace` old.
     pub(crate) const fn new(capacity: usize, grace: Duration) -> Self {
         Self {
             held: Mutex::new(Vec::new()),
@@ -301,7 +298,6 @@ pub(crate) struct Evictor {
 }
 
 impl Evictor {
-    /// Whether the connection has neither authenticated nor been cut off yet.
     fn unauthenticated(&self) -> bool {
         self.state.load(Ordering::Acquire) == WD_RUNNING
     }
@@ -452,12 +448,9 @@ pub(crate) mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-    /// The slots' production capacity and rule-2 grace: the fleet
-    /// listener's.
     const CAP: usize = crate::fleet::MAX_SLOTS;
     const GRACE: Duration = crate::fleet::PREAUTH_GRACE;
 
-    /// The deadline shape a socket read or write takes when its timer runs out.
     fn is_deadline(e: &io::Error) -> bool {
         matches!(
             e.kind(),
@@ -516,9 +509,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// The watchdog's wake, with no TLS and no second end: `finish` on a
-    /// handshake that authenticated early must not wait for the watchdog
-    /// thread to come round on its own.
     #[test]
     fn finishing_an_early_handshake_does_not_wait_out_a_wake_interval() {
         const MAX_FINISH: Duration = Duration::from_millis(20);
@@ -558,11 +548,7 @@ pub(crate) mod tests {
     #[test]
     fn spurious_wakes_neither_shorten_nor_starve_the_watchdog_deadline() {
         const DEADLINE: Duration = Duration::from_millis(150);
-        /// Must exceed `CEILING`, or a watchdog whose deadline restarts on every
-        /// wake would simply fire once the hammering stopped and escape the test.
         const HAMMER_BUDGET: Duration = Duration::from_secs(180);
-        /// A minute's hang detector (AGENTS.md), never a latency budget: far
-        /// under `HAMMER_BUDGET`, and out of reach of any scheduling noise.
         const CEILING: Duration = MUST_HAPPEN;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -724,14 +710,6 @@ pub(crate) mod tests {
         (listener, port)
     }
 
-    /// [`pick_displaced`]'s rule, case by case, on synthetic addresses: when the heaviest
-    /// address holds at least two more unauthenticated connections than the newcomer's, the
-    /// oldest of the heaviest goes at once (rule 1); otherwise the oldest unauthenticated one
-    /// past the grace goes, from an address no lighter than the newcomer's (rule 2). The
-    /// real-socket tests reach two sources through a dual-stack listener (127.0.0.1 and
-    /// ::1), which is enough for rule 1 and rule 2's address bound end to end;
-    /// the margin of two, ties, relays and ages are pinned here, where any
-    /// number of addresses is free.
     #[test]
     fn a_newcomer_takes_only_an_unauthenticated_slot_by_the_rule() {
         let t0 = Instant::now();
@@ -820,9 +798,6 @@ pub(crate) mod tests {
         assert_ne!(source_of(ip("198.51.100.7")), source_of(ip("198.51.100.8")));
     }
 
-    /// The listener's claim on a connection ([`Evictor::evict`]) cuts one that
-    /// has not authenticated — at once, not at its deadline — and never one
-    /// whose handshake claimed it first.
     #[test]
     fn an_eviction_cuts_only_a_connection_that_has_not_authenticated() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -874,9 +849,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// CONFORMANCE (Tier-1) of the REAL listener slots to
-    /// `aterm_models_core::net_slot_displacement_model` (`NetSlotDisplacement`)
-    /// at the production capacity (`Cap` overridden to [`CAP`]).
     #[test]
     fn slots_conform_to_net_slot_displacement() {
         use aterm_models_core::net_slot_displacement_model;
@@ -886,9 +858,6 @@ pub(crate) mod tests {
 
         type State = BTreeMap<&'static str, i64>;
 
-        /// One real connection: the listener's end (kept open, so only the
-        /// watchdog ever closes it), the dialer's end, the watchdog's claim,
-        /// and the slot its handler holds.
         struct Conn {
             _tcp: TcpStream,
             peer: TcpStream,
@@ -900,7 +869,6 @@ pub(crate) mod tests {
             fn claim(&self) -> u8 {
                 self.evictor.state.load(Ordering::Acquire)
             }
-            /// The dialer's end reads the listener's close.
             fn closed(&self) -> bool {
                 self.peer.set_nonblocking(true).unwrap();
                 let mut byte = [0u8; 1];

@@ -537,9 +537,7 @@ struct Cf(CFTypeRef);
 impl Cf {
     /// Adopt a +1 reference; `None` for NULL.
     fn adopt(object: CFTypeRef) -> Option<Self> {
-        // Lazy, never `then_some`: its argument is built before the test, so
-        // a NULL would become a `Cf(NULL)` dropped on the spot, and
-        // `CFRelease(NULL)` traps (an absent registry property is NULL).
+        // Lazy (`then`, not `then_some`) so a NULL pointer is never wrapped in `Cf` and passed to `CFRelease`.
         (!object.is_null()).then(|| Self(object))
     }
 
@@ -1122,7 +1120,7 @@ pub(crate) fn pid_counts(uid: u32) -> (Option<u64>, Option<u64>) {
     )
 }
 
-/// [`crate::caps`] on macOS: the public baseline of design §5.2 as this build reads it.
+/// [`crate::caps`] on macOS.
 pub(crate) fn caps() -> crate::Caps {
     use crate::{Cap, Why};
     crate::Caps {

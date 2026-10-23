@@ -2,9 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! The files `aterm machines init` writes once: the inventory and the lab baseline the owner
-//! asked for. Both are the owner's to edit afterwards; `init` never
-//! overwrites an existing file. The one exception is a starter baseline nobody edited
-//! ([`EARLIER_DEFAULT_BASELINES`]), which follows the starter shipped now.
+//! asked for.
 
 /// `machines.toml` as `init` writes it.
 pub const INVENTORY: &str = r#"# aterm machines: the Macs this controller manages (docs/DESIGN-machines-2026-10-16.md).
@@ -115,20 +113,11 @@ full_disk_access = ["aterm"]
 developer_tools = ["aterm"]
 "#;
 
-/// The SHA-256 of every earlier [`DEFAULT_BASELINE`], as `init` wrote it. A controller's
-/// `baselines/default.toml` that is one of these byte for byte is a starter nobody edited,
-/// so it follows the starter shipped now ([`super::commands::set_up_if_new`]): a fix to the
-/// starter (the 2026-10-19 rehearsal's `host_name = ""`) reaches a controller set up before
-/// it. A file anyone changed, even by a byte, is the owner's and is never rewritten.
+/// The SHA-256 of every earlier [`DEFAULT_BASELINE`], as `init` wrote it.
 pub const EARLIER_DEFAULT_BASELINES: &[&str] = &[
-    // 06ba4438d0: the first starter.
     "cde13089544c52e4e8746fe671b083d4483482637c84221d9539303b3fd74363",
-    // 97176941d2 and 031293a41b: Homebrew's release asset.
     "74dcb0817721f664b3a2b1d4c349e07cd110b6b76e5963f75a0fddc5586323e8",
-    // 6045a51374: [names] names each Mac for what it is, HostName left alone.
     "e38407721722b11a0faac79954f4906f57eb92d4760bae3f092a00737380a11a",
-    // 326cdca677: host_name = "" unsets a HostName set by hand, and the gh package.
     "80dbe78ab51b8dcf737a52074e4c1122c16bcdfa1310077001f2ca6a470ecb52",
-    // a6c1342e82: the gh package gone; Homebrew, its formulae, Emacs and Caffeine still in.
     "afbb8d95fe3570f560676006cc83f9276a6a21fb4d7c5c652ff6e28458d296d1",
 ];

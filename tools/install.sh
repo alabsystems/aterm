@@ -44,13 +44,16 @@
 #         Full Ed25519 verification lives in the installed updater.
 #         LINUX (aarch64 and x86_64): installs the elected release's raw ELF
 #         aterm-<version>-linux-<arch> into the cli store below, fetched from the
-#         same download host. Python 3.11+ and OpenSSL verify the pinned
+#         same download host. The bootstrap verifier verifies the pinned
 #         paper-master roster, live machine signature, signed target
 #         name/size/hash, existing rollback floors, and ELF architecture before
-#         any execution. A checksum-only legacy tarball is never an automatic
-#         fallback. The installed runtime then independently verifies the proof
-#         and enrolls this managed binary for signed updates. A source fallback
-#         is NOT automatically enrolled.
+#         any execution: the static aterm-bootstrap-verify asset of the release
+#         pinned below, held to its SHA-256 (sha256sum or shasum), or, until a
+#         release publishes it, the embedded one that Python 3.11+ and OpenSSL
+#         run. A checksum-only legacy tarball is never an automatic fallback.
+#         The installed runtime then independently verifies the proof and
+#         enrolls this managed binary for signed updates. A source fallback is
+#         NOT automatically enrolled.
 #   cli — the `aterm` command: one executable serves the terminal modes and
 #         dispatches product commands in-process. ONE name lands on PATH, per
 #         [workspace.metadata.atpkg]; compatibility argv0 aliases name the same
@@ -361,13 +364,15 @@ release_asset_url() { # <tag> <name>
 		# manifest's required `dmg` key binds (a pinned pre-lean release installs
 		# from it). The retired Intel `-x86_64.dmg` is not here: a manifest naming
 		# it names a foreign asset. The Linux rows are the released one binary, a
-		# raw ELF per architecture, and the retired checksum-only tarball pair,
-		# which stays recognizable for archive diagnostics; recognizing a name
-		# does not authorize installation. An explicit allowlist rather than a
-		# loosened pattern: each suffix is exactly as constrained as `.dmg`.
+		# raw ELF per architecture, the static bootstrap verifier beside it, and
+		# the retired checksum-only tarball pair, which stays recognizable for
+		# archive diagnostics; recognizing a name does not authorize
+		# installation. An explicit allowlist rather than a loosened pattern:
+		# each suffix is exactly as constrained as `.dmg`.
 		[[ "$name" =~ ^aterm-[0-9]+(\.[0-9]+)+\.dmg$ ||
 			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-mac\.zip$ ||
 			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-linux-(aarch64|x86_64)$ ||
+			"$name" =~ ^aterm-bootstrap-verify-[0-9]+(\.[0-9]+)+-linux-(aarch64|x86_64)$ ||
 			"$name" =~ ^aterm-[0-9]+(\.[0-9]+)+-linux-x86_64\.tar\.gz(\.sha256)?$ ]] || {
 			echo "install.sh: refusing asset lookup for noncanonical name $name" >&2
 			return 2
@@ -1016,18 +1021,22 @@ elect_install_lane() { # <toolchain01> <version> <dmg> <dmg_sha> <zip> <zip_sha>
 # that typed sudo, --uninstall's included, runs this file again as that account;
 # one over any other account's home, or piped (no file to run again), says how
 # to run it instead. A root run over a home root owns (its own, as under sudo -H,
-# the way to install into folders only root can write; an MDM's) is unchanged.
+# the way to install into folders only root can write; an MDM's) is unchanged,
+# and so is one over a home whose owner is no account here, or that is outside
+# its owner's own home (a CI container's HOME, owned by a host uid an image's
+# account may share): no aterm of that owner's works in it to be stopped by it.
 #
-# Pure: <euid> is `id -u`, <sudo_uid> $SUDO_UID, <home_uid> the owner of $HOME.
+# Pure: <euid> is `id -u`, <sudo_uid> $SUDO_UID, <home_uid> the owner of $HOME,
+# <home_account> 1 when HOME is in that account's own home (home_owner_named).
 # HOME_ACCOUNT is the uid to run as (digits only: it rides `-u "#<uid>"`), or
 # empty; HOME_REFUSED=1 when root must not act on this home at all.
-home_account() { # <euid> <sudo_uid> <home_uid>
+home_account() { # <euid> <sudo_uid> <home_uid> <home_account>
 	HOME_ACCOUNT=""
 	HOME_REFUSED=0
 	[[ "$1" == 0 && -n "$3" && "$3" != 0 ]] || return 0
 	if [[ "$2" =~ ^[1-9][0-9]*$ && "$2" == "$3" ]]; then
 		HOME_ACCOUNT="$2"
-	else
+	elif [[ "$4" == 1 ]]; then
 		HOME_REFUSED=1
 	fi
 }
@@ -1037,6 +1046,32 @@ home_account() { # <euid> <sudo_uid> <home_uid>
 # files land in the folder it names.
 home_owner_uid() {
 	/bin/ls -ndL -- "$HOME" 2>/dev/null | awk '{print $3}'
+}
+
+# The home of the account named <name> (getpwnam's, through ~name, which
+# Directory Services and NSS both answer); fails for a name it cannot vet or
+# look up (a test replaces it).
+account_home() { # <name>
+	local own
+	[[ "$1" =~ ^[A-Za-z0-9._][A-Za-z0-9._-]*$ ]] || return 1
+	eval "own=~$1"
+	[[ "$own" != "~$1" ]] && echo "$own"
+}
+
+# Whether HOME is in the home of an account here: `ls` prints its owner's name
+# (for a uid no account here has, the bare number `ls -n` prints), and HOME is
+# that account's own home or a folder in it. A uid an image's account happens
+# to share (a CI container's HOME, owned by the host runner's uid) is not one. A
+# name that cannot be looked up, or a HOME that cannot be entered, counts as
+# one, so the run refuses.
+home_owner_named() {
+	local name own here
+	name="$(/bin/ls -ldL -- "$HOME" 2>/dev/null | awk '{print $3}')"
+	[[ -n "$name" && "$name" != "$(home_owner_uid)" ]] || return 1
+	own="$(account_home "$name")" || return 0
+	here="$(cd -P -- "$HOME" 2>/dev/null && pwd)" || return 0
+	own="$(cd -P -- "$own" 2>/dev/null && pwd)" || return 1
+	[[ "$here" == "$own" || "$here" == "${own%/}"/* ]]
 }
 
 # The one call that runs as another account (a test replaces it): never
@@ -1101,6 +1136,74 @@ run_as_home_account() { # <arg>...
 	done
 	exec_as_account "$HOME_ACCOUNT" "$keep" /usr/bin/env "HOME=$HOME" "PATH=$PATH" /bin/bash "$script" "$@"
 	exit $?
+}
+
+# Whether this account owns <path> or can write it (a test replaces it).
+mine() { [[ -O "$1" || -w "$1" ]]; }
+
+# FOREIGN_FOLDERS: the folders aterm writes below HOME (the link and store, the
+# man page and completions, aterm.toml, atpkg's hooks, state and logs) that
+# exist and are not this account's, each the outermost such on its way down
+# from HOME, once. An install under sudo before a root run handed itself to
+# the account left them root's, and nothing this run does can change what is
+# in them. Read only. None for root, which changes anything (a root run
+# reaches here over its own home, or one no account here owns or that is
+# outside its owner's own home), nor over a HOME that is not this account's
+# (sudo -u keeps the invoker's): its folders are their owner's, not a sudo
+# install's. The walk stays inside HOME as written: an empty HOME, `/`, or a
+# path with a `..` component names nothing, and a symlink on the way ends
+# HOME's own folders on that path (chown -R would change only the link).
+foreign_home_folders() {
+	local p d top f cfg="${XDG_CONFIG_HOME:-$HOME/.config}"
+	FOREIGN_FOLDERS=()
+	[[ "$(id -u)" != 0 && "$HOME" == /*[!/]* ]] && mine "$HOME" || return 0
+	for p in "$BIN_DIR" "$STORE_DIR" "${ATERM_MAN_DIR:-$HOME/.local/share/man}/man1" \
+		"$HOME/.local/share/zsh/site-functions" "$HOME/.local/share/bash-completion/completions" \
+		"$cfg/fish/completions" "$cfg/aterm" "$HOME/.aterm" \
+		"$HOME/Library/Application Support/aterm" "$HOME/Library/Logs/aterm"; do
+		case "$p/" in */../*) continue ;; esac
+		top=""
+		d="$p"
+		while [[ "$d" == "$HOME"/* ]]; do
+			if [[ -L "$d" ]]; then
+				top=""
+			elif [[ -e "$d" ]] && ! mine "$d"; then
+				top="$d"
+			fi
+			d="${d%/*}"
+		done
+		[[ -n "$top" ]] || continue
+		for f in ${FOREIGN_FOLDERS[@]+"${FOREIGN_FOLDERS[@]}"}; do
+			[[ "$f" == "$top" ]] && continue 2
+		done
+		FOREIGN_FOLDERS+=("$top")
+	done
+}
+
+# The NOTE that names FOREIGN_FOLDERS and the one command that gives them back,
+# before any half tries to write into them; nothing when there are none.
+foreign_home_note() {
+	local list="" args="" it=them f
+	[[ ${#FOREIGN_FOLDERS[@]} -gt 0 ]] || return 0
+	[[ ${#FOREIGN_FOLDERS[@]} -gt 1 ]] || it=it
+	for f in "${FOREIGN_FOLDERS[@]}"; do
+		list+="${list:+, }$f"
+		args+=" $(printf '%q' "$f")"
+	done
+	echo "install.sh: NOTE: not yours, so aterm cannot change what is in $it: $list (an install under sudo makes such folders root's) — give $it back with: sudo chown -R $(id -un 2>/dev/null || id -u)$args" >&2
+}
+
+# The way out for a folder ensure_dirs_writable refused: the NOTE's when one
+# of FOREIGN_FOLDERS holds it, else the setting that moves it.
+unwritable_remedy() { # <dir> <setting>
+	local f
+	for f in ${FOREIGN_FOLDERS[@]+"${FOREIGN_FOLDERS[@]}"}; do
+		if [[ "$1" == "$f" || "$1" == "$f"/* ]]; then
+			echo "$f is not yours: the NOTE above gives it back"
+			return 0
+		fi
+	done
+	echo "set $2 to a writable dir"
 }
 
 # --- the cargo that honours the pin (source-build lane) ----------------------
@@ -1716,16 +1819,194 @@ linux_candidate_answers_tag() { # <exe> <tag>
 	esac
 }
 
-# Linux has no Apple bootstrap chain. Verify the same paper-master -> live
-# machine -> appcast chain as update-core before interpreting an artifact claim.
-# Kept inside the one-file installer so the curl|bash path never fetches an
-# unverified executable helper, and this heredoc is the verifier's only copy.
-# Python parses TOML; OpenSSL performs Ed25519; ctypes reads the two facts the
-# standard library lacks (statfs, getpwent_r).
+# --- the Linux bootstrap verifier ---------------------------------------------
+# Linux has no Apple bootstrap chain, so install.sh verifies the same
+# paper-master -> live machine -> appcast chain as update-core itself before it
+# reads an artifact claim. The verifier is crates/aterm-bootstrap-verify, a
+# static executable each release publishes per architecture as
+# aterm-bootstrap-verify-<version>-linux-<arch>. The four lines below pin the
+# repository and release it comes from and each architecture's SHA-256.
+# `targo --unverified ship pin-verifier` writes them from the release's own
+# receipts, with crates/aterm-bootstrap-verify/pinned.toml, and that crate's
+# tests hold the two to each other and to RELEASES.ledger. They stay empty
+# until a release publishes the asset; until then, and on an architecture with
+# no digest, the embedded Python verifier below runs. Once pinned, the fetched
+# file must match its digest before it runs, and nothing falls back to Python.
+LINUX_VERIFIER_REPO=""
+LINUX_VERIFIER_TAG=""
+LINUX_VERIFIER_SHA256_X86_64=""
+LINUX_VERIFIER_SHA256_AARCH64=""
+# The verifier executable linux_verifier_ready made ready (empty for the
+# embedded one), the private directory it was fetched into, why it is not
+# ready, and, in a dry run, the pinned asset a real install would fetch and its
+# size (nothing is fetched, so the store pre-flight waits for that install).
+LINUX_VERIFIER=""
+LINUX_VERIFIER_DIR=""
+LINUX_VERIFIER_WHY=""
+LINUX_VERIFIER_PLANNED=""
+LINUX_VERIFIER_PLANNED_SIZE=""
+
+# The test seam's verifier: ATERM_INSTALL_VERIFIER, a test's build held to
+# ATERM_INSTALL_VERIFIER_SHA256. It is read only when a suite sourced this file
+# (ATERM_INSTALL_LIBRARY_ONLY=1), so a whole run never reads it.
+linux_verifier_seam() {
+	[[ "${ATERM_INSTALL_LIBRARY_ONLY:-0}" == 1 ]] || return 0
+	printf '%s' "${ATERM_INSTALL_VERIFIER:-}"
+}
+
+# <arch>'s pinned verifier digest; empty when it has none.
+linux_verifier_pin() { # <arch>
+	case "$1" in
+	x86_64) printf '%s' "$LINUX_VERIFIER_SHA256_X86_64" ;;
+	aarch64) printf '%s' "$LINUX_VERIFIER_SHA256_AARCH64" ;;
+	esac
+}
+
+# Whether this host has a SHA-256 reader file_sha256 can use.
+sha256_reader_here() {
+	command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1
+}
+
+# The lowercase SHA-256 of <file>; status 1 when no tool here reads one.
+file_sha256() { # <file>
+	local out
+	if command -v sha256sum >/dev/null 2>&1; then
+		out="$(sha256sum -- "$1" 2>/dev/null)" || return 1
+	elif command -v shasum >/dev/null 2>&1; then
+		out="$(shasum -a 256 -- "$1" 2>/dev/null)" || return 1
+	else
+		return 1
+	fi
+	# GNU's escape mark, printed before the digest of a name it had to escape.
+	out="${out#\\}"
+	out="${out%% *}"
+	[[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+	printf '%s\n' "$out"
+}
+
+# Whether <file> is a regular file whose SHA-256 is <sha>, 64 lowercase hex
+# digits; LINUX_VERIFIER_WHY says why not.
+linux_verifier_pinned() { # <file> <sha>
+	local got
+	if ! [[ "$2" =~ ^[0-9a-f]{64}$ ]]; then
+		LINUX_VERIFIER_WHY="the bootstrap verifier $1 has no pinned SHA-256 to be held to — refusing to run it"
+		return 1
+	fi
+	if [[ -L "$1" || ! -f "$1" ]]; then
+		LINUX_VERIFIER_WHY="the bootstrap verifier $1 is not a regular file — refusing to run it"
+		return 1
+	fi
+	got="$(file_sha256 "$1")" || {
+		LINUX_VERIFIER_WHY="cannot read the SHA-256 of the bootstrap verifier $1 — refusing to run it"
+		return 1
+	}
+	[[ "$got" == "$2" ]] && return 0
+	LINUX_VERIFIER_WHY="the bootstrap verifier $1 has SHA-256 $got, not the pinned $2 — refusing to run it"
+	return 1
+}
+
+# Remove the directory the verifier was fetched into. Always safe to call.
+linux_verifier_cleanup() {
+	[[ -n "$LINUX_VERIFIER_DIR" ]] || return 0
+	rm -rf -- "$LINUX_VERIFIER_DIR"
+	LINUX_VERIFIER_DIR=""
+	LINUX_VERIFIER=""
+}
+
+# Make <arch>'s verifier ready. Under the test seam that is ATERM_INSTALL_VERIFIER,
+# a test's build of the verifier, held to ATERM_INSTALL_VERIFIER_SHA256 as the pin
+# holds a release's. Pinned, it is the release asset of the pin's own
+# repository, fetched into a private directory (removed on exit) and held to its
+# digest; a dry run only sizes it (LINUX_VERIFIER_PLANNED). Otherwise it is the
+# embedded Python verifier, when Python 3.11+ and OpenSSL are here. Status 0
+# ready (LINUX_VERIFIER names the executable, empty for the embedded one and in
+# a dry run); 1 the half is skipped (no tools, or no fetch); 2 the verifier is
+# refused (it is not the pinned file). LINUX_VERIFIER_WHY says why. Called
+# directly, never in $(…), so the globals reach the caller.
+linux_verifier_ready() { # <arch>
+	local seam pinned at size
+	LINUX_VERIFIER=""
+	LINUX_VERIFIER_WHY=""
+	LINUX_VERIFIER_PLANNED=""
+	LINUX_VERIFIER_PLANNED_SIZE=""
+	seam="$(linux_verifier_seam)"
+	pinned="$(linux_verifier_pin "$1")"
+	if [[ -n "$seam$pinned" ]] && ! sha256_reader_here; then
+		# The tool is an environment fact, as Python is for the embedded verifier:
+		# the half is skipped, never refused.
+		LINUX_VERIFIER_WHY="the pinned bootstrap verifier is held to its SHA-256, and this host has neither sha256sum nor shasum to read one — install coreutils and re-run"
+		return 1
+	fi
+	if [[ -n "$seam" ]]; then
+		linux_verifier_pinned "$seam" "${ATERM_INSTALL_VERIFIER_SHA256:-}" || return 2
+		LINUX_VERIFIER="$seam"
+		return 0
+	fi
+	if [[ -z "$pinned" ]]; then
+		if command -v openssl >/dev/null 2>&1 &&
+			python3 -I -c 'import tomllib, hashlib, os; assert hasattr(os, "memfd_create"); assert hasattr(hashlib, "file_digest")' >/dev/null 2>&1; then
+			return 0
+		fi
+		LINUX_VERIFIER_WHY="signed Linux bootstrap needs Python 3.11+ and OpenSSL with Ed25519 support — install them and re-run"
+		return 1
+	fi
+	# The release that minted the pin publishes the verifier, whichever
+	# repository this install reads; the digest, not the host, authenticates it.
+	at="aterm-bootstrap-verify-${LINUX_VERIFIER_TAG#v}-linux-$1"
+	size="$(REPO_SLUG="$LINUX_VERIFIER_REPO" release_asset_size "$LINUX_VERIFIER_TAG" "$at" 67108864)" || {
+		LINUX_VERIFIER_WHY="could not read the bootstrap verifier $at in release $LINUX_VERIFIER_TAG of $LINUX_VERIFIER_REPO; retry in a few minutes"
+		return 1
+	}
+	if [[ "${DRY_RUN:-0}" -eq 1 ]]; then
+		LINUX_VERIFIER_PLANNED="$at"
+		LINUX_VERIFIER_PLANNED_SIZE="$size"
+		return 0
+	fi
+	linux_verifier_cleanup
+	LINUX_VERIFIER_DIR="$(mktemp -d "${TMPDIR:-/tmp}/aterm-verifier.XXXXXX")" || {
+		LINUX_VERIFIER_DIR=""
+		LINUX_VERIFIER_WHY="cannot create a private directory for the bootstrap verifier under ${TMPDIR:-/tmp}"
+		return 1
+	}
+	trap linux_verifier_cleanup EXIT
+	(REPO_SLUG="$LINUX_VERIFIER_REPO" && download_release_asset "$LINUX_VERIFIER_TAG" "$at" "$size" "$LINUX_VERIFIER_DIR/$at") || {
+		LINUX_VERIFIER_WHY="could not download the bootstrap verifier $at from release $LINUX_VERIFIER_TAG of $LINUX_VERIFIER_REPO; retry in a few minutes"
+		return 1
+	}
+	linux_verifier_pinned "$LINUX_VERIFIER_DIR/$at" "$pinned" || return 2
+	chmod 700 "$LINUX_VERIFIER_DIR/$at" || {
+		LINUX_VERIFIER_WHY="cannot make the bootstrap verifier $LINUX_VERIFIER_DIR/$at executable"
+		return 1
+	}
+	LINUX_VERIFIER="$LINUX_VERIFIER_DIR/$at"
+}
+
+# The verifier's one interface: `--store-path <store>`, or
+# `<dir> <tag> <slug> <arch> <store> [<candidate>]`, which prints the signed
+# target's `name digest size build roster_seq` line. A refusal exits 1 with one
+# `install.sh: Linux verification refused: <why>` line on stderr. It runs what
+# linux_verifier_ready made ready. With a pin (or the seam) and nothing ready it
+# refuses, so it never falls back to the embedded verifier.
+linux_release_verify() {
+	if [[ -n "$LINUX_VERIFIER" ]]; then
+		"$LINUX_VERIFIER" "$@" </dev/null
+		return
+	fi
+	if [[ -n "$(linux_verifier_seam)$(linux_verifier_pin "${LINUX_ARCH:-}")" ]]; then
+		echo "install.sh: Linux verification refused: the pinned bootstrap verifier is not ready" >&2
+		return 1
+	fi
+	linux_release_verify_python "$@"
+}
+
+# The embedded verifier, until a release pins the static one. It lives in the
+# one-file installer so the curl|bash path fetches no executable helper; this
+# heredoc is its only copy. Python parses TOML, OpenSSL performs Ed25519, and
+# ctypes reads the two facts the standard library lacks (statfs, getpwent_r).
 # crates/aterm-update/tests/install_sh runs this interpreter over Rust-signed
 # synthetic releases (swapping only the pin, never through a production
 # override) and holds it to the updater's chain and to the committed root pin.
-linux_release_verify() {
+linux_release_verify_python() {
 	# -I: isolated, so neither the directory the installer runs in (a piped
 	# install's cwd is wherever the person typed it) nor PYTHON* variables nor
 	# user site-packages can put a module of their own ahead of the stdlib.
@@ -2726,6 +3007,8 @@ print_install_plan() {
 		echo "install.sh: app: $REPO_SLUG $TAG (linux-$LINUX_ARCH)"
 		echo "  download: $LINUX_ASSET — $((asset_size / 1000000)) MB -> $tmp_hint/ (deleted after install)"
 		echo "  verify:   aterm's release signatures, then the binary's size, SHA-256 and CPU architecture; never a build older than one already installed or below the latest release's minimum"
+		[[ -z "$LINUX_VERIFIER_PLANNED" ]] ||
+			echo "  verifier: $LINUX_VERIFIER_PLANNED from $LINUX_VERIFIER_REPO $LINUX_VERIFIER_TAG — $(((LINUX_VERIFIER_PLANNED_SIZE + 999) / 1000)) kB; a real install fetches it into a private temp dir, runs it only if its SHA-256 is the pinned one (first on $STORE_DIR), and removes it on exit"
 		echo "  note:     this dry-run reads sizes only; signatures are verified before a real install"
 		echo "  install:  aterm -> $STORE_DIR/aterm, linked as $BIN_DIR/aterm"
 	else
@@ -2934,7 +3217,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	esac
 done
-home_account "$(id -u)" "${SUDO_UID:-}" "$(home_owner_uid)"
+home_account "$(id -u)" "${SUDO_UID:-}" "$(home_owner_uid)" "$(home_owner_named && echo 1 || echo 0)"
 if [[ -n "$HOME_ACCOUNT" || "$HOME_REFUSED" -eq 1 ]]; then
 	run_as_home_account ${ARGV[@]+"${ARGV[@]}"}
 fi
@@ -2976,6 +3259,8 @@ BIN_DIR="${ATERM_BIN_DIR:-$HOME/.local/bin}"
 # Defined before the app pre-flight because on Linux the store IS the app
 # half's destination.
 STORE_DIR="${ATERM_STORE_DIR:-$HOME/.local/lib/aterm/bin}"
+foreign_home_folders
+foreign_home_note
 APP_SKIP=""
 APP_FATAL=""
 APP_ALREADY=""
@@ -3042,13 +3327,22 @@ if [[ "$DO_APP" -eq 1 ]]; then
 			# not exist (a release before the first Linux cut is macOS-only): both
 			# environment facts, so both skip the half before any download.
 			LINUX_ASSET="aterm-${TAG#v}-linux-$LINUX_ARCH"
-			# So are the verifier's tools.
-			if ! command -v openssl >/dev/null 2>&1 ||
-				! python3 -I -c 'import tomllib, hashlib, os; assert hasattr(os, "memfd_create"); assert hasattr(hashlib, "file_digest")' >/dev/null 2>&1; then
-				APP_SKIP="signed Linux bootstrap needs Python 3.11+ and OpenSSL with Ed25519 support — install them and re-run"
+			# So is the verifier: the pinned one fetched and held to its
+			# digest (one that is not is refused outright), or the embedded
+			# one's tools. A dry run only sizes a pinned one, so its store
+			# pre-flight waits for the real install, which runs it.
+			LINUX_VERIFIER_STATUS=0
+			linux_verifier_ready "$LINUX_ARCH" || LINUX_VERIFIER_STATUS=$?
+			if [[ "$LINUX_VERIFIER_STATUS" -eq 2 ]]; then
+				APP_FATAL="$LINUX_VERIFIER_WHY"
+			elif [[ "$LINUX_VERIFIER_STATUS" -ne 0 ]]; then
+				APP_SKIP="$LINUX_VERIFIER_WHY"
 			elif ! ensure_dirs_writable "$STORE_DIR" "$BIN_DIR"; then
-				APP_SKIP="cannot create/write $STORE_DIR or $BIN_DIR (set ATERM_STORE_DIR / ATERM_BIN_DIR to writable dirs)"
-			elif ! linux_store_preflight "$STORE_DIR"; then
+				LINUX_REMEDY="$(unwritable_remedy "$STORE_DIR" ATERM_STORE_DIR)"
+				[[ "$LINUX_REMEDY" != set* ]] || LINUX_REMEDY="$(unwritable_remedy "$BIN_DIR" ATERM_BIN_DIR)"
+				[[ "$LINUX_REMEDY" != set* ]] || LINUX_REMEDY="set ATERM_STORE_DIR / ATERM_BIN_DIR to writable dirs"
+				APP_SKIP="cannot create/write $STORE_DIR or $BIN_DIR ($LINUX_REMEDY)"
+			elif [[ -z "$LINUX_VERIFIER_PLANNED" ]] && ! linux_store_preflight "$STORE_DIR"; then
 				APP_SKIP="$LINUX_STORE_SKIP"
 			else
 				# At or below the head, this architecture's signed binary
@@ -3148,7 +3442,7 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 	# The destination gates both sources (symlink and build), so it is checked
 	# first.
 	if ! ensure_dirs_writable "$BIN_DIR"; then
-		CLI_SKIP="cannot create/write $BIN_DIR (set ATERM_BIN_DIR to a writable dir)"
+		CLI_SKIP="cannot create/write $BIN_DIR ($(unwritable_remedy "$BIN_DIR" ATERM_BIN_DIR))"
 	else
 		# Feasibility of the source fallback only. The preferred source, an
 		# installed bundle shipping the tools, is probed at install time
@@ -3204,7 +3498,7 @@ if [[ "$DO_CLI" -eq 1 ]]; then
 			CLI_CARGO_SKIP="$CARGO_RESOLVE_REASON"
 		elif ! ensure_dirs_writable "$STORE_DIR"; then
 			# Pre-flighted here, never discovered after the multi-minute build.
-			CLI_CARGO_SKIP="cannot create/write $STORE_DIR (set ATERM_STORE_DIR to a writable dir)"
+			CLI_CARGO_SKIP="cannot create/write $STORE_DIR ($(unwritable_remedy "$STORE_DIR" ATERM_STORE_DIR))"
 		fi
 	fi
 fi
@@ -3491,9 +3785,12 @@ install_app() {
 install_linux_app() {
 	echo "install.sh: installing $REPO_SLUG $TAG (linux-$LINUX_ARCH)"
 	TMP="$(mktemp -d "${TMPDIR:-/tmp}/aterm-install.XXXXXX")"
+	# This trap replaces the verifier's own, so it removes the verifier's
+	# directory too.
 	cleanup() {
 		set +e
 		rm -rf "$TMP"
+		linux_verifier_cleanup
 	}
 	trap cleanup EXIT
 

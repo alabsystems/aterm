@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The window's readers over lines a headless instance printed (
-//! exploration lab), each beside a line it must not read the
-//! same way.
+//! The window's readers over lines a headless instance printed, each beside a
+//! line it must not read the same way.
 
 use super::*;
 
@@ -50,7 +49,6 @@ fn the_strip_is_read_tab_by_tab_through_its_quoted_lists() {
         "index=1 selected=1 states=selected,busy,attention"
     );
     assert_eq!(tabs[0].words(), "index=0 selected=0 states=-");
-    // a quote and a bracket inside a label are the label's
     let odd = r#"toolbar-tabs count=1 selected=0 labels=["a \"b\" ]c"] icons=[None] states=[["done"]] tooltips=[None]"#;
     let t = strip_tabs(odd);
     assert_eq!(t[0].label, "a \"b\" ]c");
@@ -67,10 +65,8 @@ fn the_menu_is_read_row_by_row_under_its_sections() {
     assert_eq!(of("This Mac").section, "here");
     assert_eq!(of("✓ land-ab").section, "done");
     assert_eq!(of("Claude Code is not").section, "look");
-    // past a separator with no header, no section; a tip's words are no `at=`
     assert_eq!(of("Notify Me").section, "look");
     assert_eq!(of("Notify Me").at, "10");
-    // a row names its tab by the label whole, before ` — `
     assert!(row_names("◇ land-a — rotate the deploy key · 6s", "land-a"));
     assert!(!row_names("✓ land-ab — landed 2m", "land-a"));
     assert!(!row_names("◇ land-a — x", "land"));
@@ -92,8 +88,6 @@ fn a_tabs_menu_carries_its_sections_headers_and_their_rows() {
         "done-head|Done for you (1) rows=1\ndone|✓ land-ab — landed #"
     );
     assert_eq!(menu_of(&rows, "land"), "");
-    // two needs under one header: each tab's entry counts both rows; an
-    // `and N more` row is no need's
     let two = CHROME.replace(
         "statusmenu --- at=2",
         "statusmenu \"◇ cruise-n — grant it · 2s\" enabled=yes checked=no at=11\n\
@@ -104,7 +98,6 @@ fn a_tabs_menu_carries_its_sections_headers_and_their_rows() {
         menu_of(&rows, "cruise-n"),
         "needs-head|Needs you (1) rows=2\nneeds|◇ cruise-n — grant it · #"
     );
-    // the rows' own reader never takes a header for a row
     assert_eq!(
         rows_in(&menu_of(&rows, "land-a"), "needs"),
         ["◇ land-a — rotate the deploy key · #"]
@@ -186,9 +179,7 @@ fn a_landing_is_counted_once_a_land_act() {
         j(8, "DONE seq=7 rule=continue@v1 not a landing"),
     ];
     assert_eq!(landings_of(&journal, |_| true), 2);
-    // a session's first note counts (a cut may have dropped its act)
     assert_eq!(landings_of(&journal[1..3], |_| true), 1);
-    // only the day asked for counts
     assert_eq!(landings_of(&journal, |t| t >= 4), 1);
     assert_eq!(landings_of(&[], |_| true), 0);
 }
@@ -220,7 +211,6 @@ fn the_page_is_read_by_key_and_a_session_by_its_label() {
              today=today: 1 need told"
         )
     );
-    // another label's rows are never this one's, nor a button's
     assert_eq!(
         page_of(&rows, "land-ab").as_deref(),
         Some(
@@ -231,13 +221,9 @@ fn the_page_is_read_by_key_and_a_session_by_its_label() {
     assert_eq!(page_of(&rows, "Show land-a"), None);
 }
 
-/// A ROW CUT OFF BY THE PAGE'S BOTTOM EDGE (r5's Gemini CLI L2): the text
-/// lists only what the page's screen shows, so a head drawn with no state
-/// row and nothing of the page after its own rows is the screen's last line,
-/// and its state line is unread: the row reads as off the page's screen.
-/// NEGATIVE CONTROLS: a head with no state row and another session's row
-/// below it is a row the page drew with no state line; the last row with its
-/// state drawn is read whole.
+/// The text lists only what the page's screen shows, so a head drawn with no
+/// state row and nothing of the page after its own rows is the screen's last
+/// line, and its state line is unread: the row reads as off the page's screen.
 #[test]
 fn a_row_cut_off_by_the_pages_bottom_edge_is_off_its_screen() {
     let clipped = page_rows(
@@ -295,7 +281,6 @@ fn a_chip_line_is_read_and_its_cells_held_to_its_face() {
     );
     assert!(!drawn_is_face(&b), "no cells are no face");
     assert_eq!(chip_of(CHROME, "s-a"), None, "a sid is read whole");
-    // a stale frame: the face moved, the cells did not
     assert!(!drawn_is_face(&chip("face=landed drawn=\"⤓ land\"")));
     assert!(drawn_is_face(&chip("face=cruise-until drawn=\"∞ ⤓18:00\"")));
     assert!(drawn_is_face(&chip("face=unhosted drawn=\"⊘ off\"")));
@@ -315,7 +300,6 @@ fn quoted_values_read_their_escapes_back() {
         quoted(r#"label="a\nb\u{2014}c""#, "label").as_deref(),
         Some("a\nb\u{2014}c")
     );
-    // a key is a whole word: `drawn` is not `undrawn`'s
     assert_eq!(
         quoted(r#"undrawn="x" drawn="y""#, "drawn").as_deref(),
         Some("y")
@@ -363,9 +347,7 @@ window id=1 focused=true tabs=2 active=3
 
 /// `invoke NewWindow` answers before its window is made (the window's first
 /// shell spawns off the event loop): the window is waited for, read after
-/// read, and the one `before` lacks is named. NEGATIVE CONTROLS: windows
-/// that stood before are never the new one, and a window that never comes
-/// is none once the wait is over.
+/// read, and the one `before` lacks is named.
 #[test]
 fn a_new_window_is_waited_for_until_it_is_made() {
     let one = "app-inspection version=app/v1 revision=1 subject=tabs
@@ -376,7 +358,6 @@ window id=0 focused=true tabs=1 active=1
         "{one}\nwindow id=1 focused=true tabs=1 active=2\n  tab id=2 index=0 kind=terminal title=\"/p\" state=clean active=true"
     );
     let before = vec!["0".to_string()];
-    // the window comes on the third read, as on a loaded machine
     let mut reads = 0;
     let made = new_window(&before, STEP_WAIT, || {
         reads += 1;
@@ -388,12 +369,10 @@ window id=0 focused=true tabs=1 active=1
     });
     assert_eq!(made.as_deref(), Some("1"));
     assert_eq!(reads, 3, "read until it showed, and no more");
-    // from no window at all, the first one made is new
     assert_eq!(
         new_window(&[], Duration::ZERO, || one.to_string()).as_deref(),
         Some("0")
     );
-    // NEGATIVE CONTROLS: the windows that stood before, and one that never comes
     assert_eq!(
         new_window(&["0".to_string(), "1".to_string()], Duration::ZERO, || two
             .clone()),
@@ -455,16 +434,13 @@ fn the_next_act_is_the_last_wait_after_the_last_act() {
         "WAITING seq=2 until=2026-10-21T10:24:00Z 2 short turn(s) in a row: 4 min back-off";
     let took = "WAITING seq=2 until=2026-10-21T10:19:50Z the worker to take the act";
     let act = "CONTINUED seq=2 rule=continue@v1 x";
-    // a back-off standing: due at its until
     let t = tab_with(&[(now - 9000, act), (now - 8000, took), (now - 5000, waiting)]);
     assert_eq!(
         due_and_quiet(std::slice::from_ref(&t), now),
         (Some(now + 240_000), now - 5000)
     );
-    // the take window's wait before it is not the next act
     let t = tab_with(&[(now - 9000, act), (now - 8000, took)]);
     assert_eq!(due_and_quiet(std::slice::from_ref(&t), now).0, Some(now));
-    // an act after the wait spends it; a landing ends the ladder
     let t = tab_with(&[(now - 9000, waiting), (now - 8000, act)]);
     assert_eq!(due_and_quiet(std::slice::from_ref(&t), now).0, None);
     let t = tab_with(&[
@@ -475,10 +451,8 @@ fn the_next_act_is_the_last_wait_after_the_last_act() {
     assert_eq!(due_and_quiet(std::slice::from_ref(&t), now).0, None);
 }
 
-/// A journal line the same as the line before it (the loop writing one
-/// decision again: measured on Gemini CLI, a `WAITING` every 20 s) is no
-/// move and no news: the idle window's span and its quiet stand. NEGATIVE
-/// CONTROLS: the same line after another, a new seq, an act.
+/// A journal line the same as the line before it is no move and no news: the
+/// idle window's span and its quiet stand.
 #[test]
 fn a_line_written_again_is_no_move() {
     let now = unix_ms_of("2026-10-21T10:20:00Z").unwrap();
@@ -507,7 +481,6 @@ fn a_line_written_again_is_no_move() {
         (now, waiting),
     ]);
     assert_eq!(due_and_quiet(std::slice::from_ref(&t), now).1, now - 40_000);
-    // a new seq, an act, or the same line after another line: a move
     let next = waiting.replace("seq=2", "seq=3");
     let other = "EVENT idle seq=2 x";
     for (lines, n) in [
@@ -529,8 +502,7 @@ fn a_line_written_again_is_no_move() {
 
 /// The window is read where a chain of the run has a window want (the cover
 /// and cap modes' for their Off control), and END runs only with land-j's
-/// and land-k's ends to stand in it. NEGATIVE CONTROLS: `--no-surfaces`; the
-/// wall modes' chains; a run holding only one ending chain, or none.
+/// and land-k's ends to stand in it.
 #[test]
 fn the_window_is_read_for_the_main_pass_and_end_needs_both_ends() {
     use super::super::Mode;
@@ -558,6 +530,5 @@ fn the_window_is_read_for_the_main_pass_and_end_needs_both_ends() {
     assert!(end_runs(&Chain::of_mode(Mode::Land)));
     assert!(end_runs(&[Chain::LandK, Chain::LandJ]));
     assert!(!end_runs(&[Chain::LandJ, Chain::CruiseN]));
-    // one chain of the main pass beside a wall reads the window
     assert_eq!(unread_why(true, &[Chain::Wall, Chain::CruiseN]), None);
 }

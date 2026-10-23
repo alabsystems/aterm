@@ -16,7 +16,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// Whether this is a system prefix (the root-owned shape) rather than a `$HOME` one, decided by the on-disk chain ([`system_chain_trusted`]), not by location.
+    /// Whether this is a system prefix ([`system_chain_trusted`]).
     #[must_use]
     pub fn is_system_prefix(&self) -> bool {
         #[cfg(test)]
@@ -39,7 +39,7 @@ impl Layout {
         created
     }
 
-    /// Ensure `agents/` ([`Self::agents_dir`]) exists before a session puts it on `PATH` ([`crate::reroute::AGENTS_DIR_ENV`], [`crate::activate::reconcile_agents`]).
+    /// Ensure `agents/` exists ([`Self::agents_dir`], [`crate::activate::reconcile_agents`]).
     pub fn ensure_agents_dir(&self) -> Result<PathBuf, String> {
         let dir = self.agents_dir();
         match std::fs::symlink_metadata(&dir) {
@@ -67,7 +67,7 @@ impl Layout {
         }
     }
 
-    /// `store/<program>/<build>/` — the versioned, immutable extracted tree.
+    /// `store/<program>/<build>/`.
     #[inline]
     #[must_use]
     pub fn build_dir(&self, program: &str, build: u64) -> PathBuf {
@@ -81,35 +81,35 @@ impl Layout {
         self.prefix.join("bin")
     }
 
-    /// `reroute/`: session-scoped directory of upstream-name stubs ([`crate::reroute`], [`crate::hooks`]).
+    /// `reroute/`: session-scoped upstream-name stubs ([`crate::reroute`], [`crate::hooks`]).
     #[inline]
     #[must_use]
     pub fn reroute_dir(&self) -> PathBuf {
         crate::reroute::dir(self)
     }
 
-    /// `agents/`: the one managed directory that goes first on `PATH` (the shell hook prepends it, [`crate::hooks`]; the GUI's spawn seam front-inserts it beside `reroute/`).
+    /// `agents/`: the one managed directory that goes first on `PATH` ([`crate::hooks`]).
     #[inline]
     #[must_use]
     pub fn agents_dir(&self) -> PathBuf {
         self.prefix.join("agents")
     }
 
-    /// `agents/<tool>` — an agent program's front-of-`PATH` shim ([`Self::agents_dir`]); the same [`ToolName`] gate as [`Self::shim`].
+    /// `agents/<tool>` front-of-`PATH` shim ([`Self::agents_dir`], [`ToolName`], [`Self::shim`]).
     #[inline]
     #[must_use]
     pub fn agent_shim(&self, tool: &ToolName) -> PathBuf {
         self.agents_dir().join(tool.shim_file())
     }
 
-    /// `landing/`: where older passes wrote landing markers, which twins those clients laid still test for ([`crate::landing`]).
+    /// `landing/`: where older passes wrote landing markers ([`crate::landing`]).
     #[inline]
     #[must_use]
     pub fn landing_dir(&self) -> PathBuf {
         self.prefix.join("landing")
     }
 
-    /// `bin/<tool>`: a single shim, named by [`ToolName::shim_file`] (`bin/ay` on Unix, `bin/ay.cmd` on Windows).
+    /// `bin/<tool>`: a single shim ([`ToolName::shim_file`]).
     #[inline]
     #[must_use]
     pub fn shim(&self, tool: &ToolName) -> PathBuf {
@@ -123,7 +123,7 @@ impl Layout {
         self.prefix.join("store").join(program).join("current")
     }
 
-    /// `staging/<program>/` — the per-program download + stage scratch.
+    /// `staging/<program>/`.
     #[inline]
     #[must_use]
     pub fn staging_dir(&self, program: &str) -> PathBuf {
@@ -144,7 +144,7 @@ impl Layout {
         self.prefix.join("floor.gen")
     }
 
-    /// `roster.floor`: the `0600` durable high-water `roster_seq`, the replay ratchet for the master-signed machine roster that authorizes this store's index.
+    /// `roster.floor`: the `0600` durable high-water `roster_seq`.
     #[inline]
     #[must_use]
     pub fn roster_floor(&self) -> PathBuf {
@@ -179,7 +179,7 @@ impl Layout {
         self.prefix.join("session-pass.stamp")
     }
 
-    /// `progress.json` — the live install-progress snapshot ([`crate::progress`]), the in-flight complement to [`Self::status`]'s durable per-pass record.
+    /// `progress.json` ([`crate::progress`], [`Self::status`]).
     #[inline]
     #[must_use]
     pub fn progress_file(&self) -> PathBuf {
@@ -193,21 +193,21 @@ impl Layout {
         self.prefix.join("bump")
     }
 
-    /// `pass-owed.json` — the promise that a default-set pass is coming and has not planned yet ([`crate::progress::pass_owed`]).
+    /// `pass-owed.json` ([`crate::progress::pass_owed`]).
     #[inline]
     #[must_use]
     pub fn pass_owed_file(&self) -> PathBuf {
         self.prefix.join("pass-owed.json")
     }
 
-    /// `adopted`: the durable marker that this machine runs the ALab toolset as a set, not as a handful of individually chosen programs (§11).
+    /// `adopted`: the durable marker that this machine runs the ALab toolset as a set.
     #[inline]
     #[must_use]
     pub fn adopted(&self) -> PathBuf {
         self.prefix.join("adopted")
     }
 
-    /// `adopted-by-seed`: present only when `atpkg seed`, the first launch's bootstrap, created the [`Self::adopted`] marker itself.
+    /// `adopted-by-seed` ([`Self::adopted`]).
     #[inline]
     #[must_use]
     pub fn adopted_by_seed(&self) -> PathBuf {
@@ -235,7 +235,7 @@ impl Layout {
             .unwrap_or_default()
     }
 
-    /// `declined`: the durable "this machine does not want the bundled toolset" marker, written by `uninstall --all`.
+    /// `declined`: the durable "this machine does not want the bundled toolset" marker.
     #[inline]
     #[must_use]
     pub fn declined(&self) -> PathBuf {
@@ -249,14 +249,14 @@ impl Layout {
         self.prefix.join("retired")
     }
 
-    /// `retired/<program>`: one retirement marker; its callers gate the name by [`ToolName`].
+    /// `retired/<program>`: one retirement marker ([`ToolName`]).
     #[inline]
     #[must_use]
     pub fn retired_marker(&self, program: &str) -> PathBuf {
         self.retired_dir().join(program)
     }
 
-    /// The `YYYY-MM-DD` day a managed copy of `program` was retired for a system install, if recorded.
+    /// The `YYYY-MM-DD` day a managed copy of `program` was retired for a system install.
     #[must_use]
     pub fn retired_date(&self, program: &str) -> Option<String> {
         ToolName::new(program)?;
@@ -341,7 +341,7 @@ impl Layout {
         self.prefix.join("links")
     }
 
-    /// `links/<program>` — one dev-link marker.
+    /// `links/<program>`.
     #[inline]
     #[must_use]
     pub fn link_marker(&self, program: &str) -> PathBuf {
@@ -349,7 +349,7 @@ impl Layout {
     }
 }
 
-/// The one stderr line for a refused `agents/` ([`Layout::ensure_agents_dir`]), shared by the front door and the window.
+/// The one stderr line for a refused `agents/` ([`Layout::ensure_agents_dir`]).
 #[must_use]
 pub fn agents_dir_refusal_line(dir: &Path, error: &str, system: bool, reach: &str) -> String {
     let remedy = match std::fs::symlink_metadata(dir) {
@@ -461,7 +461,7 @@ fn first_line_is_ok(text: &str) -> bool {
     matches!(text.lines().next(), Some(first) if first.trim() == READY_OK_LINE)
 }
 
-/// What this process could learn about whether `path` is there: three answers.
+/// What this process could learn about whether `path` is there.
 #[derive(Debug)]
 pub enum Presence {
     Present,
@@ -508,7 +508,7 @@ pub fn build_is_complete(build_dir: &Path) -> bool {
     }
 }
 
-/// Whether `build_dir` carries a well-formed marker recording the other slice of the universal binary.
+/// Whether `build_dir` records the other slice of the universal binary.
 pub(crate) fn build_marks_another_slice(build_dir: &Path) -> bool {
     let Some(marker) = ready_marker_path(build_dir) else {
         return false;
@@ -520,7 +520,7 @@ pub(crate) fn build_marks_another_slice(build_dir: &Path) -> bool {
         && recorded_platform(&text).is_some_and(|p| p != running_platform().as_str())
 }
 
-/// Atomically and durably mark `build_dir` complete (temp + fsync + rename, so a crash leaves no marker rather than a half-written one).
+/// Atomically and durably mark `build_dir` complete.
 pub fn mark_build_ready(build_dir: &Path) -> std::io::Result<()> {
     let dest = ready_marker_path(build_dir).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "build dir has no name")
@@ -556,7 +556,7 @@ pub(crate) fn clear_build_ready(build_dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Take down the completeness marker of every build under `prog_store` (`<prefix>/store/<program>`), durably, before a caller removes the tree.
+/// Take down the completeness marker of every build under `prog_store`.
 pub(crate) fn unmark_program_builds(prog_store: &Path) {
     let Ok(entries) = std::fs::read_dir(prog_store) else {
         return;
@@ -578,13 +578,11 @@ pub(crate) fn unmark_program_builds(prog_store: &Path) {
         }
     }
     if unmarked {
-        // Ordered: every marker is gone before any tree goes; a lost removal leaves a
-        // marked tree for the next uninstall to unmark again.
         sync_dir_ordered(prog_store);
     }
 }
 
-/// The suffix of the declared-mode record beside a build dir: `store/<program>/<build>.modes`.
+/// The suffix of the declared-mode record beside a build dir.
 pub const DECLARED_MODES_SUFFIX: &str = ".modes";
 
 const DECLARED_MODES_HEADER: &str = "declared-modes v1";
@@ -655,8 +653,6 @@ fn parse_declared_modes(bytes: &[u8]) -> Option<crate::tree::DeclaredModes> {
     let mut modes = crate::tree::DeclaredModes::new();
     for line in lines {
         if line.is_empty() {
-            // The trailing newline's empty tail; an empty line anywhere else is
-            // equally content-free.
             continue;
         }
         let nul = line.iter().position(|&b| b == 0)?;
@@ -711,9 +707,9 @@ pub struct StageRefusal {
     pub at: i64,
     /// How many consecutive attempts have failed on these digests (>= 1).
     pub attempts: u32,
-    /// The platform signer check refused bytes that matched these digests ([`crate::install::StageError::SignerRefused`]).
+    /// Platform signer check refused ([`crate::install::StageError::SignerRefused`]).
     pub signer: bool,
-    /// Whether the row is held rather than cooled down: a `tree_root` mismatch.
+    /// Whether the row is held rather than cooled down.
     pub held: bool,
     /// The atpkg version that reached the verdict ([`aterm_types::version::app_version`]).
     pub client: String,
@@ -743,7 +739,7 @@ impl StageRefusal {
         self.at.saturating_add(self.cooldown_secs())
     }
 
-    /// Whether this record still stands in the way of re-staging an artifact with these signed digests at `now_unix`.
+    /// Whether this record blocks re-staging these signed digests at `now_unix`.
     #[inline]
     #[must_use]
     pub fn binds(&self, digest: (DigestAlg, &str), tree_root: &str, now_unix: i64) -> bool {
@@ -769,7 +765,7 @@ fn stage_refusal_path(build_dir: &Path) -> Option<PathBuf> {
     Some(build_dir.with_file_name(marker))
 }
 
-/// Record that staging `build_dir` failed on the signed digests (temp + rename, so a crash leaves no half-written memo).
+/// Record that staging `build_dir` failed on the signed digests.
 pub fn record_stage_refusal(
     build_dir: &Path,
     digest: (DigestAlg, &str),
@@ -983,7 +979,7 @@ pub(crate) fn sidecar_path(build_dir: &Path, suffix: &str) -> Option<PathBuf> {
     Some(build_dir.with_file_name(sidecar))
 }
 
-/// Write `<build><suffix>` durably: temp + fsync + rename, mode `0644` like `.ready` so a system prefix's readers can read it.
+/// Write `<build><suffix>` durably.
 pub(crate) fn write_sidecar_durably(
     build_dir: &Path,
     suffix: &str,
@@ -1061,19 +1057,19 @@ pub fn clear_all_stage_refusals(layout: &Layout) -> usize {
     forgotten
 }
 
-/// The sibling scratch directory a stage extracts into before it swaps: `<build>.incoming-<pid>`.
+/// The sibling scratch directory a stage extracts into before it swaps.
 pub(crate) fn incoming_dir(build_dir: &Path) -> Option<PathBuf> {
     scratch_sibling(build_dir, ".incoming-")
 }
 
-/// Write the temp of a small record renamed into place beside a build (the shim-environment sidecar, the stage-refusal memo), created `0644`, which the umask can only narrow.
+/// Write the temp of a small record renamed into place beside a build.
 pub(crate) fn write_record_temp(tmp: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     let _ = std::fs::remove_file(tmp);
     crate::platform::open_create_write(tmp, 0o644)?.write_all(bytes)
 }
 
-/// Create `store/<program>/` (and `store/`) if missing at mode `0755` ([`crate::extract::safe_mode`], [`crate::platform::make_dirs_born`]).
+/// Create `store/<program>/` ([`crate::extract::safe_mode`], [`crate::platform::make_dirs_born`]).
 pub(crate) fn make_build_parent(build_dir: &Path) -> std::io::Result<()> {
     match build_dir.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
@@ -1083,7 +1079,7 @@ pub(crate) fn make_build_parent(build_dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// The sibling the outgoing tree is moved to during a swap: `<build>.superseded-<pid>`.
+/// The sibling the outgoing tree is moved to during a swap.
 pub(crate) fn superseded_dir(build_dir: &Path) -> Option<PathBuf> {
     scratch_sibling(build_dir, ".superseded-")
 }
@@ -1148,7 +1144,7 @@ fn scratch_siblings(build_dir: &Path) -> Vec<(Scratch, PathBuf)> {
         .collect()
 }
 
-/// Recover the one crash window a swap cannot make atomic; `true` when a tree was moved back.
+/// Recover the one crash window a swap cannot make atomic.
 pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
     // `symlink_metadata`, not `exists()`: a dangling symlink at the build path is still
     // something there, and the window means nothing is.
@@ -1156,21 +1152,18 @@ pub(crate) fn recover_interrupted_swap(build_dir: &Path) -> bool {
         return false;
     }
     let mut superseded = scratch_siblings(build_dir).into_iter().filter(|(kind, p)| {
-        // A real directory, not a symlink to one: the outgoing tree the swap parked here is
-        // a directory, and anything else is not the state this recovers.
         *kind == Scratch::Superseded && std::fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
     });
     let Some((_, old)) = superseded.next() else {
         return false;
     };
     if superseded.next().is_some() {
-        // Distinct branch.
         return false;
     }
     std::fs::rename(&old, build_dir).is_ok()
 }
 
-/// Delete every stage-scratch sibling of `build_dir` an earlier run left, after recovering the swap window ([`recover_interrupted_swap`]).
+/// Delete stage-scratch siblings of `build_dir` ([`recover_interrupted_swap`]).
 pub(crate) fn sweep_stage_scratch(build_dir: &Path) {
     let recovered = recover_interrupted_swap(build_dir);
     let parked_only_copy = !recovered && std::fs::symlink_metadata(build_dir).is_err();
@@ -1234,7 +1227,7 @@ pub(crate) struct Synced {
     pub dirs: u64,
 }
 
-/// Flush a staged tree (every regular file's contents, then every directory's entries) so nothing that publishes the tree can become durable ahead of the bytes it publishes.
+/// Flush a staged tree.
 pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
     let mut counts = Synced::default();
     let mut stack = vec![root.to_path_buf()];
@@ -1266,12 +1259,12 @@ pub(crate) fn sync_tree(root: &Path) -> std::io::Result<Synced> {
 /// The mode of a single-binary build's `bin/` once its file is laid ([`seal_bin`]).
 pub(crate) const SEALED_BIN_MODE: u32 = 0o555;
 
-/// Seal a staged single-binary tree's `bin/` at [`SEALED_BIN_MODE`] ([`crate::install::verify_and_stage`], once every member has its final mode).
+/// Seal a staged tree's `bin/` at [`SEALED_BIN_MODE`] ([`crate::install::verify_and_stage`]).
 pub(crate) fn seal_bin(tree: &Path) -> std::io::Result<()> {
     crate::platform::set_mode(&tree.join("bin"), SEALED_BIN_MODE)
 }
 
-/// Give a sealed `<tree>/bin` ([`seal_bin`]) its owner's write bit back so the tree's removal can unlink what it holds.
+/// Give a sealed `<tree>/bin` ([`seal_bin`]).
 pub(crate) fn unseal_bin(tree: &Path) {
     let real_dir = |p: &Path| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir());
     let bin = tree.join("bin");
@@ -1283,7 +1276,7 @@ pub(crate) fn unseal_bin(tree: &Path) {
     }
 }
 
-/// Remove the store tree at `dir` (a build, or a stage's `.incoming`/`.superseded` scratch), unsealing its `bin/` first ([`unseal_bin`]). std's `remove_dir_all` never follows a link.
+/// Remove the store tree at `dir` ([`unseal_bin`]).
 pub(crate) fn remove_tree(dir: &Path) -> std::io::Result<()> {
     unseal_bin(dir);
     std::fs::remove_dir_all(dir)
@@ -1336,7 +1329,7 @@ pub fn resolve(configured: Option<&Path>) -> Option<Layout> {
     Some(Layout { prefix })
 }
 
-/// Resolve the layout the user configured: `[packages].prefix` when set, the default otherwise.
+/// Resolve the layout the user configured.
 #[must_use]
 pub fn resolve_configured() -> Option<Layout> {
     resolve_from(&crate::config::load())
@@ -1351,7 +1344,7 @@ pub fn resolve_from(cfg: &crate::config::PackagesConfig) -> Option<Layout> {
     )
 }
 
-/// Validate a configured prefix against `home`, returning it if safe or the trusted [`default_prefix`] otherwise.
+/// Validate a configured prefix against `home` ([`default_prefix`]).
 #[must_use]
 pub fn vet_prefix(configured: Option<&Path>, home: &Path) -> PathBuf {
     let default = default_prefix(home);
@@ -1421,7 +1414,7 @@ pub(crate) mod system_shape {
         static FORCED: RefCell<Vec<PathBuf>> = const { RefCell::new(Vec::new()) };
     }
 
-    /// Answer "system-shaped" for `prefix` on this thread from now on (the mode-bit tests that ask are unix).
+    /// Answer "system-shaped" for `prefix` on this thread from now on.
     #[cfg(unix)]
     pub(crate) fn force(prefix: &Path) {
         FORCED.with(|f| f.borrow_mut().push(prefix.to_path_buf()));
@@ -1567,7 +1560,7 @@ pub fn shim_allowed(name: &str) -> bool {
     }
 }
 
-/// A logical tool name: one entry of a manifest's `exposes` list, never a file name.
+/// A logical tool name.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ToolName(String);
 
@@ -1581,42 +1574,42 @@ fn without_suffix<'a>(name: &'a str, suffix: &str) -> &'a str {
 }
 
 impl ToolName {
-    /// Admit `raw` as a tool name, or `None` when it fails [`shim_allowed`] (a sensitive command or a malformed name).
+    /// Admit `raw` as a tool name ([`shim_allowed`]).
     #[inline]
     #[must_use]
     pub fn new(raw: &str) -> Option<Self> {
         shim_allowed(raw).then(|| Self(raw.to_string()))
     }
 
-    /// The `bin/` **shim** file name: `<tool><SHIM_SUFFIX>` — `ay` on Unix (a bare symlink), `ay.cmd` on Windows (a batch wrapper).
+    /// The `bin/` **shim** file name: `<tool><SHIM_SUFFIX>`.
     #[inline]
     #[must_use]
     pub fn shim_file(&self) -> String {
         with_suffix(&self.0, crate::platform::SHIM_SUFFIX)
     }
 
-    /// The **executable** file name inside a build's `bin/`: `<tool><EXE_SUFFIX>` — `ay` on Unix, `ay.exe` on Windows.
+    /// The **executable** file name inside a build's `bin/`: `<tool><EXE_SUFFIX>`.
     #[inline]
     #[must_use]
     pub fn exe_file(&self) -> String {
         with_suffix(&self.0, crate::platform::EXE_SUFFIX)
     }
 
-    /// Recover the logical name from a `bin/` entry, stripping the platform [`crate::platform::SHIM_SUFFIX`] (`ay.cmd` reads back as `ay` on Windows).
+    /// Recover the logical name from a `bin/` entry ([`crate::platform::SHIM_SUFFIX`]).
     #[inline]
     #[must_use]
     pub fn from_shim_file(name: &str) -> Option<Self> {
         Self::new(without_suffix(name, crate::platform::SHIM_SUFFIX))
     }
 
-    /// The logical name, for reporting (`status.toml`, refusal lists, log lines), not for building a path.
+    /// The logical name.
     #[inline]
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// Whether this is an [`ALIAS_PREFIX`]ed name (`alab-trust`), i.e. a shim that forwards to another tool's executable rather than to one of its own name.
+    /// Whether this is an [`ALIAS_PREFIX`]ed name.
     #[inline]
     #[must_use]
     pub fn is_alias(&self) -> bool {
@@ -1635,7 +1628,7 @@ impl ToolName {
         Self::new(&s)
     }
 
-    /// The tool an alias names: `alab-trust` → `trust`; `None` for a plain name.
+    /// The tool an alias names: `alab-trust` → `trust`.
     #[inline]
     #[must_use]
     pub fn alias_base(&self) -> Option<Self> {
@@ -1643,7 +1636,7 @@ impl ToolName {
     }
 }
 
-/// Split a manifest's raw `exposes` list into the names that may be shimmed and the raw names refused.
+/// Split raw `exposes` into allowed [`ToolName`]s and refused names.
 #[must_use]
 pub fn split_exposed(exposes: &[String]) -> (Vec<ToolName>, Vec<String>) {
     let mut tools = Vec::new();
@@ -2228,8 +2221,7 @@ mod tests {
             return;
         };
         let home = PathBuf::from(home);
-        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail; this
-        // process runs this one test (`--exact`), so no other create sees the mask.
+        // SAFETY: `umask(2)` swaps this process's file-creation mask and cannot fail.
         unsafe { libc::umask(0o002) };
         let mode = |rel: &str| {
             let meta = std::fs::symlink_metadata(home.join(rel)).unwrap();

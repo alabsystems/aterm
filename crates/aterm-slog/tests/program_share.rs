@@ -1,16 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE PROGRAM SHARE: a node's program marks
-//! (OSC 7501's reports, `mark <run|-> program state=…`) hold at most
-//! [`program_share`] of the ring, 64 a run at a session's bound, taken oldest
-//! first, never the newest record, never a fenced one, never another node's
-//! and never anything but a program mark, each counted lost. So a flapping
-//! program spends its own share and never the facts written beside it.
-//!
-//! NEGATIVE CONTROL (scratch, 6F-3's commit): the share removed from
-//! `Log::push` and from the fence's lift fails every test here: the mail mark
-//! is evicted by the 300 flaps' batch, and the counts pass the share.
+//! Each node's program marks hold at most [`program_share`] of the ring (`PROGRAM_SHARE_MAX`, 64 at a session's bound).
 
 use aterm_slog::{
     Actor, Conf, Fields, Key, Kind, Limits, Log, MAX_RECORDS, Mark, Node, Open, PROGRAM_SHARE_MAX,
@@ -19,7 +10,6 @@ use aterm_slog::{
 
 use crate::support::at;
 
-/// A session with one open run, the run returned.
 fn session_with_run(log: &mut Log) -> Node {
     log.open_session(
         Kind::Spawn,
@@ -34,7 +24,6 @@ fn session_with_run(log: &mut Log) -> Node {
         .expect("a run opens")
 }
 
-/// A program mark at `node`, saying `state`.
 fn program(log: &mut Log, node: Node, state: &str, ms: u64) -> u64 {
     log.mark(
         Mark::new(Kind::Program, Src::Engine, Conf::Claim)
@@ -45,7 +34,6 @@ fn program(log: &mut Log, node: Node, state: &str, ms: u64) -> u64 {
     .expect("a program mark")
 }
 
-/// The ring's program marks hanging from `node`, oldest first: (seq, state).
 fn programs(log: &Log, node: Node) -> Vec<(u64, String)> {
     log.window()
         .filter(|r| r.k == Kind::Program && r.node == node)
@@ -73,10 +61,6 @@ fn the_share_is_64_a_session_ring_and_a_32nd_of_a_smaller_one() {
     );
 }
 
-/// T6: A MAIL MARK WRITTEN BEFORE 300 FLAPS IS STILL IN THE LOG. The host's
-/// instance-wide cap has lowered the session's byte budget to 16 KiB, which
-/// 300 program marks overflow; the share keeps the run's newest 64, so the
-/// batch never runs and the mail stays.
 #[test]
 fn a_mail_mark_written_before_300_flaps_is_still_in_the_log() {
     let mut log = Log::new(3);
@@ -119,7 +103,6 @@ fn a_mail_mark_written_before_300_flaps_is_still_in_the_log() {
     let kept = programs(&log, run);
     assert_eq!(kept.len(), PROGRAM_SHARE_MAX, "the run's share");
     assert_eq!(log.programs_held(run), PROGRAM_SHARE_MAX);
-    // The newest 64, the last flap's state last.
     let first = log.last_seq() - PROGRAM_SHARE_MAX as u64 + 1;
     assert_eq!(
         kept.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
@@ -136,14 +119,9 @@ fn a_mail_mark_written_before_300_flaps_is_still_in_the_log() {
         300 - PROGRAM_SHARE_MAX as u64,
         "each counted lost"
     );
-    // Nothing else went: the session, the run and the mail.
     assert_eq!(log.len(), 3 + PROGRAM_SHARE_MAX);
 }
 
-/// The share is each node's own: the session's program marks (no run open)
-/// and a second run's are not the first run's; it never takes the newest
-/// record or a fenced one, and lifting the fence trims each node to its
-/// share. Nothing but program marks is ever taken.
 #[test]
 fn the_share_is_per_node_and_takes_neither_the_newest_nor_a_fenced_mark() {
     let mut log = Log::with_limits(0, Limits::new(64, 1 << 20).expect("a small ring"));
@@ -169,7 +147,6 @@ fn the_share_is_per_node_and_takes_neither_the_newest_nor_a_fenced_mark() {
     assert_eq!(log.window().filter(|r| r.k == Kind::Bell).count(), 5);
     assert_eq!(log.lost(), 6, "three of each node's five");
 
-    // A second run's marks are its own share.
     let other = log
         .open(Open::new(Kind::Cmd, Src::Shell, Conf::Strong), at(40))
         .expect("a second run");
@@ -180,8 +157,6 @@ fn the_share_is_per_node_and_takes_neither_the_newest_nor_a_fenced_mark() {
         "the first run's marks stay"
     );
 
-    // Fenced: the fence keeps its marks past the share; only the newest
-    // stands beside them.
     log.fence_reads();
     let fenced: Vec<u64> = programs(&log, run).into_iter().map(|(s, _)| s).collect();
     program(&mut log, run, "blocked", 50);

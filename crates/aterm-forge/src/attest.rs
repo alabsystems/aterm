@@ -567,7 +567,7 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
     if paths.is_empty() {
         return Some(Vec::new());
     }
-    let output = command("git")
+    let output = command(aterm_uds::os_path!("git"))
         .current_dir(root)
         .args(["check-ignore", "-v", "--no-index", "--"])
         .args(paths)
@@ -596,7 +596,7 @@ fn check_ignore(root: &Path, paths: &[String]) -> Option<Vec<IgnoreVerdict>> {
 /// The gitlinks (mode 160000 entries) the index records under `vendor/`,
 /// repo-relative: the submodules.
 fn vendor_gitlinks(root: &Path) -> Option<BTreeSet<String>> {
-    let output = command("git")
+    let output = command(aterm_uds::os_path!("git"))
         .current_dir(root)
         .args(["ls-files", "-s", "-z", "--", "vendor"])
         .output_owned()
@@ -2245,7 +2245,7 @@ mod tests {
     /// Run git in a fixture with a fixed identity and no inherited repository
     /// variables, so it needs no machine config and touches only the fixture.
     fn git(dir: &Path, args: &[&str]) -> String {
-        let out = command("git")
+        let out = command(aterm_uds::os_path!("git"))
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
             .env_remove("GIT_INDEX_FILE")

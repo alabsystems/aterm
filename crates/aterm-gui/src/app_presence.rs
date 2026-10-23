@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The App's side of presence ([`crate::presence`]): publishing each session's NEED VERDICT (`docs/DESIGN-owner-surfaces-2026-10-16.md` §2.3) and hosting the engine driver that draws it — the window's NEEDS BORDER, its titlebar PILL and the TAB MARKS (§5).
+//! The App's side of presence ([`crate::presence`]).
 
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use crate::{App, WindowId};
 /// The chip level the indicator bits spell (`aterm_messages::presence::chip_of_attention`).
 pub(crate) use aterm_messages::presence::chip_of_attention;
 
-/// The per-session presence state: the engine's table (the slots and each `ttl=` supervisor claim's lapse, `drive::Table`) and this host's herald.
+/// The per-session presence state.
 #[derive(Default, Debug)]
 pub(crate) struct PresenceTable {
     table: drive::Table<presence::Native>,
@@ -33,7 +33,7 @@ impl PresenceTable {
     }
 }
 
-/// WHAT ONE LOOK MOVED ([`App::see_front`]): a task's done rev seen (the menu bar's Done for you), and a task's end on the glass seen (the tab's `•`, wherever else the session is drawn).
+/// WHAT ONE LOOK MOVED ([`App::see_front`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Seen {
     pub(crate) task: bool,
@@ -66,7 +66,7 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
-/// Log an applied chrome re-grid of `wid` with its chrome rows (test-only; a headless window has no OS size to re-grid from).
+/// Log an applied chrome re-grid of `wid` with its chrome rows.
 #[cfg(test)]
 pub(crate) fn note_chrome_regrid_applied(app: &App, wid: WindowId) {
     let rows = app.chrome_rows(wid);
@@ -111,7 +111,7 @@ fn need_unix_now() -> i64 {
     aterm_time::unix_secs().map_or(0, |s| i64::try_from(s).unwrap_or(0))
 }
 
-/// Whether window `ws`'s grid re-grids when its chrome rows move: a real OS window, or a test's stand-in for one (a headless window keeps its inserted grid; its chrome caches are the whole re-grid).
+/// Whether window `ws`'s grid re-grids when its chrome rows move.
 pub(crate) const fn chrome_regrids_grid(ws: &crate::WindowState) -> bool {
     #[cfg(test)]
     if ws.chrome_regrids_for_test {
@@ -120,7 +120,7 @@ pub(crate) const fn chrome_regrids_grid(ws: &crate::WindowState) -> bool {
     ws.os_window.is_some()
 }
 
-/// What the macOS `NeedsPill` view (and the `chrome` reader) is handed with the strip: the pill's words as of the push, what lit it, and the session it names — which a click carries back, so a click on a pill that has since moved acts on nothing ([`App::on_pill_act`]).
+/// What the macOS `NeedsPill` view (and the `chrome` reader) is handed with the strip.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NeedsPillModel {
     pub(crate) kind: presence::PillKind,
@@ -138,7 +138,7 @@ impl App {
             .map(|h| h.local_id)
     }
 
-    /// Gather one session's facts: leaf locks only, each held for a copy; the agent reading is the status sweep's published one, and the NEED is the verdict [`Self::publish_need`] has just published on the session's timeline (`Desk::herald` runs before `Desk::sense`): the border, the pill and the mark draw it, never a classification of their own.
+    /// Gather one session's facts: leaf locks only, each held for a copy.
     pub(crate) fn presence_facts(&self, session: u64) -> Option<Facts> {
         let s = self.pool.get(session)?;
         let ctx = &s.ctx;
@@ -331,7 +331,7 @@ impl App {
         }
     }
 
-    /// ONE SESSION'S NEED FACTS ([`crate::needs::NeedFacts`], `docs/DESIGN-owner-surfaces-2026-10-16.md` §2.3), under the leaf locks the status glance already takes, each released before the next: the meta's (the attention entries with their kinds, the live claim), the timeline's (the agent publication, the stall's words, the task record, the resume line, the worker's told NEEDS YOU set), the fabric's (the holds); the sweep's reading, the host's word and `hosting` outside any lock.
+    /// ONE SESSION'S NEED FACTS ([`crate::needs::NeedFacts`], `docs/DESIGN-owner-surfaces-2026-10-16.md` §2.3), under the leaf locks the status glance already takes, each released before the next.
     pub(crate) fn need_facts(
         &self,
         h: &crate::session_store::SessionHandle,
@@ -455,7 +455,7 @@ impl App {
         }
     }
 
-    /// THE NEED PUBLICATION (§2.3): classify session `session` ([`crate::needs::of`] over [`Self::need_facts`]) and publish the verdict on its timeline, where every reader reads it.
+    /// THE NEED PUBLICATION (§2.3).
     pub(crate) fn publish_need(&mut self, session: u64) -> bool {
         let started = Instant::now();
         let moved = self.publish_need_timed(session);
@@ -534,7 +534,7 @@ impl App {
         }
     }
 
-    /// THE API OUTAGE'S WHOLE ANSWER (`Family::ApiOutage`, a level family): one entry counting the tabs that cannot reach their API, since the first of them; none when no tab waits on it, which sweeps the entry.
+    /// THE API OUTAGE'S WHOLE ANSWER (`Family::ApiOutage`, a level family).
     pub(crate) fn hand_api_outage(&mut self) {
         let entries: Vec<aterm_messages::exceptions::Entry> = match self.api_outage.values().min() {
             None => Vec::new(),
@@ -552,7 +552,7 @@ impl App {
         self.except_replace(aterm_messages::exceptions::Family::ApiOutage, &entries);
     }
 
-    /// Every session's need published again (and its herald and chrome refreshed): where an input every verdict reads moved at once — the harness policy in force, which decides whose boxes the host answers.
+    /// Every session's need published again (and its herald and chrome refreshed).
     pub(crate) fn publish_needs_all(&mut self) {
         let sessions: Vec<u64> = self.pool.iter().map(|session| session.id).collect();
         for session in sessions {
@@ -560,7 +560,7 @@ impl App {
         }
     }
 
-    /// The earliest need recheck (`need_rechecks`), for the presence timer, placed on `now`'s clock from the wall clock each time it is asked: a Mac that slept through a reset finds it due at the first turn after it wakes, never a sleep's length late.
+    /// The earliest need recheck (`need_rechecks`), for the presence timer, placed on `now`'s clock from the wall clock each time it is asked.
     pub(crate) fn need_recheck_deadline(&self, now: Instant) -> Option<Instant> {
         let at = *self.need_rechecks.values().min()?;
         let wait = u64::try_from(at.saturating_sub(need_unix_now())).unwrap_or(0);
@@ -618,12 +618,12 @@ impl App {
         })
     }
 
-    /// A fact about `session` changed: publish its need, re-read it, fold it in, and project every window that shows the session (`drive::refresh_session`).
+    /// A fact about `session` changed.
     pub(crate) fn refresh_presence_session(&mut self, session: u64) {
         drive::refresh_session(self, session);
     }
 
-    /// The harness loop's next try for `sid` ([`crate::Wake::HarnessWait`]): stored, and the tab's facts re-read where it changed.
+    /// The harness loop's next try for `sid` ([`crate::Wake::HarnessWait`]).
     pub(crate) fn apply_harness_wait(&mut self, sid: &str, plan: Option<presence::RetryPlan>) {
         let changed = match plan {
             Some(plan) => {
@@ -641,7 +641,7 @@ impl App {
         }
     }
 
-    /// What the harness loop of `sid` told the window ([`crate::Wake::HarnessFact`], `docs/DESIGN-harness-autopilot-2026-10-15.md` §9.2.3, §9.4.4): an ACT goes to the harness's glass ([`crate::harness_glass::on_act`]); the TASK'S FACE goes on the session's timeline, where `status task=` reads it under the lock it already takes, and into the glass the frame reads with none — and, where it moved, the session's footer is posted and the move goes past the glass (`App::harness_task_moved`: the page, and a record of a landing's end).
+    /// What the harness loop of `sid` told the window.
     pub(crate) fn apply_harness_fact(&mut self, sid: &str, fact: crate::HarnessFact) {
         let Some(session) = self.local_session_of(&SessionId::new(sid)) else {
             return;
@@ -753,7 +753,7 @@ impl App {
         }
     }
 
-    /// LAND'S HOLD OF SESSION `session` MOVED TO `held` on its glass (§12.3.3 item 3, [`crate::harness_glass::on_land_held`]): where the glass moved, what reads it follows — a chip's title someone is reading is built again (`redraw_autopilot_title_readers`: the trail's generation moved), Settings ▸ Harness is republished where shown (the SESSIONS state line), the menu bar's glance is dirtied (a worker's `landing` and its tip), and where the words `driven by aterm (…)` moved, the windows that show the session are stamped again ([`Self::restamp_for_hover`]): the tab's hover is composed only at a strip's refresh, so without it a hover kept the old hold.
+    /// LAND'S HOLD OF SESSION `session` MOVED TO `held` on its glass.
     pub(crate) fn show_land_held(
         &mut self,
         session: u64,
@@ -772,7 +772,7 @@ impl App {
         }
     }
 
-    /// A STALE HOLD GOES (§12.3.3 item 3): beside a proven self-claim, and at a person's own exchange — from the timeline (`status land_held=`) and the glass alike.
+    /// A STALE HOLD GOES (§12.3.3 item 3).
     pub(crate) fn clear_land_held(&mut self, session: u64) {
         if let Some(entry) = self.pool.get(session) {
             entry
@@ -799,7 +799,7 @@ impl App {
         }
     }
 
-    /// The `Wake::FabricChanged` arm: session `sid`'s fabric endpoint moved — a delivery, a post, `inbox seen`, a link report, or a HOLD on or off (`hold <sid> on|off`, Take Over, the fleet's).
+    /// The `Wake::FabricChanged` arm: session `sid`'s fabric endpoint moved.
     pub(crate) fn on_fabric_changed(&mut self, sid: &SessionId) {
         let Some(session) = self.local_session_of(sid) else {
             return;
@@ -814,19 +814,19 @@ impl App {
         drive::refresh_window(self, wid);
     }
 
-    /// Every window: a restore, a successor's commit, a handoff's release and a config adopt (`drive::refresh_all`).
+    /// Every window: a restore, a successor's commit, a handoff's release and a config adopt.
     pub(crate) fn refresh_presence_all_windows(&mut self) {
         self.rebuild_teams();
         drive::refresh_all(self);
     }
 
-    /// The story read (`drive::human_acted`): the human acted in `wid`; a calm session's story is read.
+    /// The story read (`drive::human_acted`): the human acted in `wid`.
     #[cfg(test)]
     pub(crate) fn note_human_acted(&mut self, wid: WindowId) {
         drive::human_acted(self, wid);
     }
 
-    /// One key from the winit `KeyboardInput` arm: the echo-probe bracket around [`Self::on_key`], and the story read.
+    /// One key from the winit `KeyboardInput` arm.
     pub(crate) fn dispatch_hw_key(&mut self, wid: WindowId, event: aterm_window::event::KeyEvent) {
         let pressed = event.state == aterm_window::event::ElementState::Pressed;
         let front = self.focused_session_id(wid);
@@ -841,12 +841,12 @@ impl App {
         }
     }
 
-    /// The story read for a press (`drive::human_acted_on`): the human acted in `wid` while `session` was front.
+    /// The story read for a press (`drive::human_acted_on`).
     pub(crate) fn note_human_acted_on(&mut self, wid: WindowId, session: u64) {
         drive::human_acted_on(self, wid, session);
     }
 
-    /// Re-read every pooled session's facts at a successor's Commit: a lease a seamless update carried was seeded before its session was registered, so no `meta set` wake armed its lapse; without this a dead holder's claim would never lapse and this instance's supervisor host would never take the session.
+    /// Re-read every pooled session's facts at a successor's Commit.
     #[cfg(unix)]
     pub(crate) fn arm_supervisor_expiries(&mut self) {
         let sessions: Vec<u64> = self.pool.iter().map(|session| session.id).collect();
@@ -865,7 +865,7 @@ impl App {
         drive::tick(self, now)
     }
 
-    /// The border as an [`OverlayGlow`] for the frame path — plain field reads and arithmetic, no lock, no allocation; `None` on a quiet window.
+    /// The border as an [`OverlayGlow`] for the frame path.
     pub(crate) fn presence_overlay(&self, wid: WindowId) -> Option<OverlayGlow> {
         let ws = self.windows.get(&wid)?;
         let glow = ws.presence.rim_glow(|| {
@@ -886,7 +886,7 @@ impl App {
         self.windows.get(&wid).map_or(0, |ws| ws.presence.fp())
     }
 
-    /// The projected pill window `wid` shows now, as the strip carries it ([`NeedsPillModel`]). Reported needs can light its border without a pill; the View switch hides both.
+    /// The projected pill window `wid` shows now, as the strip carries it ([`NeedsPillModel`]).
     pub(crate) fn presence_pill(&self, wid: WindowId) -> Option<NeedsPillModel> {
         let pill = self.windows.get(&wid)?.presence.pill.as_ref()?;
         Some(NeedsPillModel {
@@ -896,7 +896,7 @@ impl App {
         })
     }
 
-    /// Whether window `wid`'s IN-GRID strip carries its needs pill: every window but a macOS one on glass, whose titlebar strip draws it (`toolbar.rs`'s `NeedsPill`) — so a pill is drawn once, by whichever strip the window has.
+    /// Whether window `wid`'s IN-GRID strip carries its needs pill.
     pub(crate) fn strip_carries_pill(&self, wid: WindowId) -> bool {
         !(cfg!(target_os = "macos")
             && self
@@ -905,7 +905,7 @@ impl App {
                 .is_some_and(|ws| ws.os_window.is_some()))
     }
 
-    /// The in-grid strip's cache term for window `wid`'s pill: the view's seed (bumped on every change the painter can see) and, for a pill that prints an age (a background tab's), when that figure next moves (`aterm_messages::presence::pill_due`) — plain reads and arithmetic, no words composed.
+    /// The in-grid strip's cache term for window `wid`'s pill.
     pub(crate) fn presence_pill_key(&self, wid: WindowId) -> Option<(u64, Option<Instant>)> {
         let view = &self.windows.get(&wid)?.presence;
         let pill = view.pill.as_ref()?;
@@ -917,7 +917,7 @@ impl App {
         ))
     }
 
-    /// Stamp each tab's mark onto the strip metadata: the most pressing of its terminal leaves' marks — the published need's (`◆` stuck, `◇` decide), the person's hold (`✋`), a finished task whose done rev, or a program's own turn end, was not yet looked at (`•`, never on the front tab: [`Self::done_unseen`]) — folded over the tab's own indicator bit.
+    /// Stamp each tab's mark onto the strip metadata.
     pub(crate) fn stamp_presence_chips(
         &self,
         wid: WindowId,
@@ -971,7 +971,7 @@ impl App {
         }
     }
 
-    /// The pill's a11y message: the projected pill's words, a polite status with no bar row (the pill is titlebar chrome); `None` with no pill, including a report-only window.
+    /// The pill's a11y message: the projected pill's words, a polite status with no bar row.
     #[cfg(a11y_tree)]
     pub(crate) fn presence_a11y_message(
         &self,
@@ -1038,7 +1038,7 @@ impl App {
         self.frontmost_window == Some(wid) && (stood_in || Desk::pill_visible(self, wid))
     }
 
-    /// `aterm ctl person …` on the main thread (`docs/DESIGN-harness-autopilot-2026-10-15.md` §12.5.2): a look ([`Self::person_look`]) or a press on a menu-bar row ([`Self::person_menubar_press`]), each the reply's words; a release build refuses (the verb refuses before it hops there).
+    /// `aterm ctl person …` on the main thread.
     pub(crate) fn person_stand_in(
         &mut self,
         asked: crate::control::control_media::PersonAsked,
@@ -1066,7 +1066,7 @@ impl App {
         }
     }
 
-    /// A DEVELOPMENT BUILD'S STAND-IN FOR THE PERSON LOOKS AT `window` (`aterm ctl person look <window>|off`, §12.5.2): that headless window is on screen now ([`Self::window_looked_at`]), so someone looks at it while it is the frontmost window, or, `None`, at none.
+    /// A DEVELOPMENT BUILD'S STAND-IN FOR THE PERSON LOOKS AT `window`.
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn person_look(&mut self, window: Option<WindowId>) -> Result<String, String> {
         let Some(wid) = window else {
@@ -1084,19 +1084,17 @@ impl App {
         Ok(format!("person look window={}", wid.0))
     }
 
-    /// `wid`'s front tab is looked at — where someone can (§3: the owner focuses or looks at the tab), never in a window behind, minimized, occluded or headless: a finished task's done rev in any pane it shows is seen ([`Self::done_unseen`]), the focused one's and a split's others alike (a zoomed tab shows its focused pane alone).
+    /// `wid`'s front tab is looked at — where someone can (§3: the owner focuses or looks at the tab), never in a window behind, minimized, occluded or headless.
     pub(crate) fn note_done_seen(&mut self, wid: WindowId) {
         let seen = self.see_front(wid);
         if seen.end {
             self.restamp_for_end();
         } else if seen.task {
-            // The front tab wears no `•`, so only the menu bar's Done for
-            // you can have moved.
             self.mark_status_dirty();
         }
     }
 
-    /// THE LOOK ITSELF ([`Self::note_done_seen`]): where `wid` is looked at ([`Self::window_looked_at`]), every pane its front tab shows has its task's done rev, its program's turn ends and its task's end seen.
+    /// THE LOOK ITSELF ([`Self::note_done_seen`]).
     pub(crate) fn see_front(&mut self, wid: WindowId) -> Seen {
         let mut seen = Seen::default();
         if !self.window_looked_at(wid) {
@@ -1132,7 +1130,7 @@ impl App {
         seen
     }
 
-    /// THE ONE WRITE OF A DONE SEEN BY AN ACT (owner surfaces §3): the owner went to `session` from the menu bar, read its result, or a seamless update carried that they had (`SessionRecord::status_seen`, `App::adopt_status_carry`) — its done at entry rev `entered` is seen.
+    /// THE ONE WRITE OF A DONE SEEN BY AN ACT (owner surfaces §3).
     pub(crate) fn mark_done_seen(&mut self, session: u64, entered: u64) {
         if self.done_seen.insert(session, entered) == Some(entered) {
             return;
@@ -1145,7 +1143,7 @@ impl App {
         self.refresh_tab_chrome_windows(windows);
     }
 
-    /// A TASK'S END MOVED ON THE TAB'S `•` (§11.2.3, items 6 and 7): one told and standing unseen, one looked at, or one cleared by a move to a face that is no end.
+    /// A TASK'S END MOVED ON THE TAB'S `•` (§11.2.3, items 6 and 7).
     pub(crate) fn restamp_for_end(&mut self) {
         #[cfg(test)]
         crate::work_counts::end_restamped();
@@ -1157,7 +1155,7 @@ impl App {
         self.refresh_tab_chrome_windows(windows);
     }
 
-    /// THE TAB'S HOVER NAMES WHO DRIVES IN WORDS THAT MOVED for session `session` (§12.3.3 item 3, §12.4.3 item 1): its chip's face (`driven by aterm (land)` to `(land, landed)`) or its timer — or its harness's needs, a line each, where they moved and the pill's words did not (§12.2.1, `HarnessFact::Needs`).
+    /// THE TAB'S HOVER NAMES WHO DRIVES IN WORDS THAT MOVED for session `session`.
     pub(crate) fn restamp_for_hover(&mut self, session: u64) {
         for wid in self.windows_with_focused_session(session) {
             let (titles, metadata) = self.refresh_window_tabs(wid);
@@ -1177,7 +1175,7 @@ impl App {
         self.mark_status_dirty();
     }
 
-    /// What the tab's hover says after `driven by aterm` for session `session` ([`driven_words`]): where this host's harness holds the session's claim and its Autopilot moves the work, else `None`.
+    /// What the tab's hover says after `driven by aterm` for session `session` ([`driven_words`]).
     pub(crate) fn driven_by_aterm(&self, session: u64) -> Option<String> {
         let (_, view, supervised) = self.session_autopilot(session);
         if !supervised {
@@ -1195,7 +1193,7 @@ impl App {
         )
     }
 
-    /// WHO DRIVES (owner surfaces §5, S9): build the team table ([`crate::team::table`]) and the done revs the tab's `•` reads, from one row per live session — its sid, its name (as every Agents surface names its tab, [`Self::tab_label_of_session`]) and its task's `from=` and done rev — each session's leaf locks taken one at a time, the terminal's by a try-lock, and the registry's only for a session no live rung names.
+    /// WHO DRIVES (owner surfaces §5, S9).
     pub(crate) fn rebuild_teams(&mut self) {
         let handles: Vec<(u64, String, std::sync::Arc<crate::SessionCtx>)> = self
             .pool
@@ -1249,7 +1247,7 @@ impl App {
         self.refresh_tab_chrome_windows(windows);
     }
 
-    /// What `session`'s Team chip says ([`crate::claude_lights::TeamFace`]): the person's hold (the published `hold_by=person`, as the presence slot folded it) outranks its manager, which outranks its workers; `None` for none of them.
+    /// What `session`'s Team chip says ([`crate::claude_lights::TeamFace`]).
     pub(crate) fn team_face(&self, session: u64) -> Option<crate::claude_lights::TeamFace> {
         use crate::claude_lights::TeamFace;
         if self
@@ -1273,7 +1271,7 @@ impl App {
         })
     }
 
-    /// The footer's repaint term for `session`'s Team chip: moves with the person's hold and with anything the team table says of it.
+    /// The footer's repaint term for `session`'s Team chip.
     pub(crate) fn team_term(&self, session: u64) -> u64 {
         let held = self
             .presence
@@ -1283,7 +1281,7 @@ impl App {
             ^ u64::from(held).rotate_left(61)
     }
 
-    /// A tab's HOVER, with its presence lines (§5): the composed `tooltip` (identity, description, connections) keeps every line but its `Needs attention:` one, which says the session's PUBLISHED need — and is gone where none stands, so a wait the harness settles is no reason on the hover either; a harness's needs say themselves in the worker's words instead, a line each, and who carries on meanwhile ([`harness_need_hover`], §12.2.1) — then who drives it, then, for an identified agent, the state line (`claude · busy · ctx 61% left`, the engine's `state_line`: no age, since the hover is composed with the strip's push and shown long after), then who last typed into it and at what clock minute (`last typed into by lab-sweep at 14:02`).
+    /// A tab's HOVER, with its presence lines (§5).
     pub(crate) fn presence_hover(&self, session: u64, tooltip: Option<String>) -> Option<String> {
         let prefix = crate::session_chrome::NEEDS_ATTENTION_PREFIX;
         let mut lines: Vec<String> = tooltip
@@ -1368,14 +1366,14 @@ impl App {
         (!parts.is_empty()).then(|| parts.join(crate::native_ui::FACT_SEPARATOR))
     }
 
-    /// The native pill's click as its wake delivers it (`Wake::PillAct`): it crosses the move-licence fence and settles an open rename first, as a native tab select and the in-grid pill's press do, then acts ([`Self::on_pill_act`]).
+    /// The native pill's click as its wake delivers it (`Wake::PillAct`).
     pub(crate) fn on_pill_wake(&mut self, window: WindowId, session: u64, hit: presence::PillHit) {
         self.clear_tab_surface_move_license(Some(window));
         self.settle_rename_edit(window);
         self.on_pill_act(window, session, hit);
     }
 
-    /// A click on window `window`'s pill landed on `hit`, the pill naming `session` when it was drawn (`Wake::PillAct`).
+    /// A click on window `window`'s pill landed on `hit`, the pill naming `session` when it was drawn.
     pub(crate) fn on_pill_act(&mut self, window: WindowId, session: u64, hit: presence::PillHit) {
         let Some(pill) = self
             .windows
@@ -1457,7 +1455,7 @@ impl App {
         let _ = session;
     }
 
-    /// Re-project every window whose pill names `session`: its label moved (a `meta set role|title`, its program's title), which no fact the engine folds carries, so a quiet or frozen session would otherwise keep its old name on the pill for as long as nothing else moved.
+    /// Re-project every window whose pill names `session`.
     pub(crate) fn reproject_pill_of(&mut self, session: u64) {
         let windows: Vec<WindowId> = self
             .windows
@@ -1475,7 +1473,7 @@ impl App {
         }
     }
 
-    /// Hand Back (the pill's, the Team chip's `✋`): lift the person's hold on `session`, and only it — Take Over's own act (`App::hand_back_session`, S5), so a control client's pointer into the in-grid pill is refused under its gesture mark as the menu row's would be.
+    /// Hand Back (the pill's, the Team chip's `✋`).
     pub(crate) fn hand_back_person(&mut self, session: u64) {
         if let Err(why) = self.hand_back_session(session) {
             aterm_log::info!("hand back {session}: {why}");
@@ -1488,7 +1486,7 @@ impl App {
         self.windows.get(&wid).map(|ws| &ws.presence)
     }
 
-    /// `chrome`'s presence line for the front window (the frontmost, else the first): the engine's bytes ([`drive::chrome_line`]).
+    /// `chrome`'s presence line for the front window (the frontmost, else the first).
     pub(crate) fn presence_chrome_line(&self) -> String {
         let front = self
             .frontmost_window
@@ -1502,12 +1500,12 @@ impl App {
         drive::session_level(self, session)
     }
 
-    /// The additive presence `status` fields (`hand= hand_pid= level= story= why=`): the engine's bytes ([`drive::status_tail`]).
+    /// The additive presence `status` fields (`hand= hand_pid= level= story= why=`).
     pub(crate) fn presence_status_tail(&self, session: u64) -> String {
         drive::status_tail(self, session)
     }
 
-    /// `aterm ctl story <verb> [<text>]` for `session` (`drive::tell`): the slot is brought current and the point noted (`status story=`), a record.
+    /// `aterm ctl story <verb> [<text>]` for `session` (`drive::tell`).
     #[cfg(test)]
     pub(crate) fn tell_story(
         &mut self,
@@ -1517,7 +1515,7 @@ impl App {
         self.tell_story_by(session, verb, aterm_slog::Actor::Ctl)
     }
 
-    /// [`Self::tell_story`] told by `by` (the wire's `log_actor`, carried in `Wake::Story`): once the point is noted, the session log's `mark - story word=<verb>` (never a text) under the timeline alone, every other lock let go, and then the log's watchers.
+    /// [`Self::tell_story`] told by `by` (the wire's `log_actor`, carried in `Wake::Story`).
     pub(crate) fn tell_story_by(
         &mut self,
         session: u64,
@@ -1553,7 +1551,7 @@ impl App {
         out.unwrap_or_else(|panic| std::panic::resume_unwind(panic))
     }
 
-    /// The terminal rows window `wid` measures a chrome commit against, and whether it has glass ([`chrome_regrids_grid`]).
+    /// The terminal rows window `wid` measures a chrome commit against, and whether it has glass.
     pub(crate) fn chrome_commit_grid_rows(&self, wid: WindowId) -> Option<(u16, bool)> {
         let ws = self.windows.get(&wid)?;
         let size = self
@@ -1580,7 +1578,7 @@ impl App {
         }
     }
 
-    /// Lift an update handoff's park (`Wake::UpdateHandoffFinished`): `finish` settles the attempt (clearing the park on failure or abort), then every window's border and pill are projected again and the band commits what it owes in one re-grid ([`Self::with_chrome_regrid_batch`]).
+    /// Lift an update handoff's park (`Wake::UpdateHandoffFinished`).
     #[cfg(unix)]
     pub(crate) fn release_update_handoff_park(&mut self, finish: impl FnOnce(&mut Self)) {
         self.with_chrome_regrid_batch(|app| {
@@ -1590,7 +1588,7 @@ impl App {
         });
     }
 
-    /// Lift a successor's freeze (the Commit wake, once `incoming_handoff_pending` is false): every window's border and pill are projected again and the band commits what it owes (the landing's record, carried scrollback loss via [`Self::say_carried_history_loss`], the carried Settings drafts the restore could not put back via [`Self::say_carried_settings_drafts_loss`]) in one re-grid ([`Self::with_chrome_regrid_batch`]).
+    /// Lift a successor's freeze (the Commit wake, once `incoming_handoff_pending` is false).
     #[cfg(unix)]
     pub(crate) fn release_successor_commit_freeze(&mut self) {
         self.with_chrome_regrid_batch(|app| {
@@ -1610,14 +1608,14 @@ impl App {
         });
     }
 
-    /// Note a rise of the chrome rows every window shares (a band row reached the glass, the tab strip grew) on every window's regrow floor (`aterm_messages::chrome::RegrowFloor`); read only where the grid re-grids for its chrome ([`chrome_regrids_grid`]).
+    /// Note a rise of the chrome rows every window shares (a band row reached the glass, the tab strip grew) on every window's regrow floor.
     pub(crate) fn note_chrome_rise_everywhere(&mut self, now: Instant) {
         for ws in self.windows.values_mut() {
             ws.regrow_floor.rose(now);
         }
     }
 
-    /// Window `wid`'s chrome regrow floor (`RegrowFloor::floor`): `None` for a window whose grid never re-grids for its chrome, or with no rise noted.
+    /// Window `wid`'s chrome regrow floor (`RegrowFloor::floor`).
     #[cfg(test)]
     pub(crate) fn chrome_regrow_floor(&self, wid: WindowId) -> Option<Instant> {
         self.windows
@@ -1626,7 +1624,7 @@ impl App {
             .and_then(|ws| ws.regrow_floor.floor())
     }
 
-    /// The floor the band's quiet shrink and the tab strip's fall wait: the latest of every window their re-grid resizes (`aterm_messages::chrome::latest`).
+    /// The floor the band's quiet shrink and the tab strip's fall wait.
     pub(crate) fn band_regrow_floor(&self) -> Option<Instant> {
         aterm_messages::chrome::latest(
             self.windows
@@ -1636,7 +1634,7 @@ impl App {
         )
     }
 
-    /// Forget a retired session's slot, every window's watermark for it, its done-seen rev, and its need's recheck and part in the API outage (no publication runs for it again, so nothing else would).
+    /// Forget a retired session's slot, every window's watermark for it, its done-seen rev, and its need's recheck and part in the API outage.
     pub(crate) fn retire_presence(&mut self, session: u64) {
         self.presence.retire(session);
         self.consent_observer.retire_session(session);
@@ -1827,9 +1825,6 @@ impl Desk for App {
 
     fn herald(&mut self, session: u64) {
         if self.publish_need(session) {
-            // Settings ▸ Harness counts the sessions a harness's need stands
-            // on and leads a row's state line with it (§12.2.1): republished
-            // where the verdict moved, while a view shows the page.
             self.harness_screen_moved();
         }
         self.herald_session(session);
@@ -1861,7 +1856,7 @@ impl Desk for App {
     }
 }
 
-/// A HARNESS'S NEED ON THE TAB'S HOVER (§12.2.1): one `Needs you: <the need in the worker's words>` line for every need the window holds the words of, each whole (up to the policy's 160 characters), the first need first — then `Claude Code carries on meanwhile` in the program's product words.
+/// A HARNESS'S NEED ON THE TAB'S HOVER (§12.2.1).
 pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> {
     let prefix = crate::session_chrome::NEEDS_YOU_PREFIX;
     let mut lines: Vec<String> = std::iter::once(&ask.first)
@@ -1875,7 +1870,7 @@ pub(crate) fn harness_need_hover(ask: &crate::needs::HarnessAsk) -> Vec<String> 
     lines
 }
 
-/// WHO DRIVES, IN THE CHIP'S OWN WORDS (§12.4.1; §12.4.3, item 1): what the tab's hover and the Overview say after `driven by aterm`, from the face the chip wears ([`crate::claude_lights::ChipFace::of`]) without its `autopilot: ` head — `cruise`, `cruise, lands at 18:00` (`lands Sat 16:00` where it lands on another day, as the SESSIONS row's state line says it), `land`, `land, landed`, `land, quiet` — and no clock but the timer's own: both are composed at a push and read long after (the hover's own rule, [`App::presence_hover`]), so a `landed 17:42` there would read as today's after midnight.
+/// WHO DRIVES, IN THE CHIP'S OWN WORDS (§12.4.1; §12.4.3, item 1).
 #[must_use]
 pub(crate) fn driven_words(
     face: crate::claude_lights::ChipFace,
@@ -1915,7 +1910,7 @@ fn pack(c: [u8; 3]) -> u32 {
     (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2])
 }
 
-/// THE PILL'S RESUME, fenced ([`App::pill_resume`]): the `signal cont` verb ([`crate::control::signal_verb`]) to `master`'s foreground job only while that job is stopped (`input_stall::fg_stopped`); otherwise `ERR not-stopped`, and nothing is sent.
+/// THE PILL'S RESUME, fenced ([`App::pill_resume`]).
 #[cfg(unix)]
 pub(crate) fn resume_if_stopped(master: i32, ctx: &crate::SessionCtx) -> String {
     if !crate::input_stall::fg_stopped(master) {

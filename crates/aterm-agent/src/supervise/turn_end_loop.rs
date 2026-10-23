@@ -40,7 +40,8 @@ pub(super) struct WallTap {
     carried: Option<i64>,
 }
 
-/// Whether `composer` holds the point `action` was decided at with nothing due ([`Session::draft_held`]).
+/// Whether `composer` holds the point `action` was decided at with nothing due
+/// ([`Session::draft_held`]).
 fn draft_holds(composer: &Composer, action: &TurnEndAction) -> bool {
     let told = |why: &str| matches!(action, TurnEndAction::Escalate { reason } if reason == why);
     match composer {
@@ -51,47 +52,36 @@ fn draft_holds(composer: &Composer, action: &TurnEndAction) -> bool {
     }
 }
 
-/// The furthest a wall's reset may jump on a reprint of the same words before the jump is
-/// doubted: the last rung of `TurnEndTiming::limit_backoff` (30 minutes).
+/// The furthest a wall's reset may jump on a reprint of the same words before the jump is doubted.
 const REPRINT_JUMP_MAX_S: i64 = 30 * 60;
 
 /// How many reprints a doubted jump is kept back for ([`REPRINT_JUMP_MAX_S`]).
 pub(super) const REPRINT_JUMPS_MAX: u32 = 4;
 
-/// How long past its placement a reset is doubted at all: two hours, room for the four ladder
-/// tries of [`REPRINT_JUMPS_MAX`] (10, 30, 30, 30 minutes).
+/// How long past its placement a reset is doubted at all ([`REPRINT_JUMPS_MAX`]).
 const REPRINT_HOLD_WINDOW_S: i64 = 2 * 3600;
 
-/// The longest text the cursor-row guard names whole, as `^❯ <text>`: it
-/// sits on the caret row of any composer 43 columns wide or more.
+/// The longest text the cursor-row guard names whole, as `^❯ <text>`.
 const GUARD_TAIL_CHARS: usize = 40;
 
-/// The most of the text's last word a longer text's guard names: the tail
-/// of a word too long for the composer's width is what its last row holds.
+/// The most of the text's last word a longer text's guard names.
 const GUARD_WORD_CHARS: usize = 16;
 
-/// `yield=<floor>` on every `turn` this policy types: the verb parks before
-/// typing until the target's typing momentum has fallen to the floor, so a
-/// person typing is not pasted over.
+/// `yield=<floor>` on every `turn` this policy types.
 const TURN_YIELD: &str = "yield=0.2";
 
-/// The standing rules ride in the continuation cut to this many characters (at a word, `…` after).
+/// The standing rules ride in the continuation cut to this many characters.
 pub(super) const RULES_CAP: usize = 400;
 
 /// Maximum duration the loop waits for the worker to react to a supervisor write.
 pub(super) const REACTION_WAIT: Duration = Duration::from_secs(10);
 
-/// How long the echo of a fenced write must hold still before its Enter, for
-/// a program whose paste guard takes an Enter in the same burst as the text
-/// as a newline ([`aterm_phase::ScreenReader::paste_guard`]). The program
-/// must have read the text's last key at least this long before it reads the
-/// Enter ([`Session::await_echo`]).
+/// How long the echo of a fenced write must hold still before its Enter
+/// ([`aterm_phase::ScreenReader::paste_guard`], [`Session::await_echo`]).
 pub(super) const PASTE_GUARD_HOLD: Duration = Duration::from_millis(600);
 
-/// How long the echo of a fenced write may take to show whole in the
-/// composer before the text is escalated as typed and not submitted: a hang
-/// detector, never a latency budget. A starved worker draws what it read
-/// seconds late, and in pieces ([`Session::await_echo`]).
+/// How long the echo of a fenced write may take to show whole in the composer before the text is
+/// escalated as typed and not submitted ([`Session::await_echo`]).
 pub(super) const ECHO_HANG: Duration = Duration::from_secs(60);
 
 /// Collapse multi-line text into a single line for a turn write.
@@ -135,11 +125,11 @@ pub(crate) fn composer_guard_at(caret: char, column: usize, text: &str) -> Strin
 
 /// Post-wake settle window before typing into an agent session.
 pub(super) const WAKE_SETTLE: Duration = Duration::from_secs(30);
-/// Each session's own share of the wake's settle, added past [`WAKE_SETTLE`], is below this,
-/// so one account's sessions do not all type in the same second.
+/// Each session's own share of the wake's settle ([`WAKE_SETTLE`]).
 pub(super) const WAKE_SPREAD: Duration = Duration::from_secs(60);
 
-/// How long the session repository's last answer stands for the same done words, no turn run since ([`Session::repo_read`]).
+/// How long the session repository's last answer stands for the same done words
+/// ([`Session::repo_read`]).
 pub(super) const REPO_REPROBE: Duration = Duration::from_secs(20);
 
 /// The reason of the due the wake's settle places.
@@ -148,7 +138,8 @@ pub(super) const WOKE: &str = "the Mac woke";
 /// Why the point is decided again after the hour's typing budget held its act.
 pub(super) const BUDGET_FREES: &str = "the hour's typing budget (continue_per_hour) frees";
 
-/// Hang detector timeout after the worker's input queue was last seen unread ([`Session::input_unread`]).
+/// Hang detector timeout after the worker's input queue was last seen unread
+/// ([`Session::input_unread`]).
 pub(super) const UNDRAWN_INPUT_HANG: Duration = Duration::from_secs(60);
 
 /// Whether the `tries`-th deferred restart attempt is journaled.
@@ -166,15 +157,14 @@ fn caret_row(reader: &dyn ScreenReader, rows: &[String]) -> Option<usize> {
 pub(super) enum Echo {
     /// The composer holds the text whole, however it wrapped.
     Whole,
-    /// The echo is on its way: the composer is empty, shows its placeholder or
-    /// a start of the text, or the frame was caught mid-redraw.
+    /// The echo is on its way.
     Arriving,
     /// Anything else: another text, no composer, a prompt.
     Other,
 }
 
-/// What [`Session::await_echo`] came to: the read the Enter is fenced on, or
-/// the read the text was left on and why (`left_typed`'s words).
+/// What [`Session::await_echo`] came to: the read the Enter is fenced on, or the read the text was
+/// left on and why.
 #[derive(Debug)]
 pub(super) enum Echoed {
     Whole(Screen),
@@ -186,10 +176,9 @@ pub(super) enum Echoed {
 pub(super) enum Written {
     /// Written and submitted.
     Submitted,
-    /// Nothing written: refused, skipped at its fence, or a read with no person count.
+    /// Nothing written.
     Not,
-    /// Written, not submitted: the text stands in the composer, escalated
-    /// ([`Session::left_typed`]).
+    /// Written, not submitted ([`Session::left_typed`]).
     Left,
 }
 
@@ -226,12 +215,7 @@ pub(super) fn echo_of(reader: &dyn ScreenReader, screen: &Screen, text: &str) ->
     }
 }
 
-/// Whether `screen` has not moved since a write at content seq `at` on the
-/// grid of epoch `epoch` (the generation the write was fenced on): the same
-/// grid, its content seq no later than the write's, so it shows what the
-/// write found. A grid entered since (an alternate screen, a reset) has
-/// moved, however low its own seq restarted; a read with no generation, or
-/// a write whose epoch is unknown, is never taken as unmoved.
+/// Whether `screen` has not moved since a write at content seq `at` on the grid of epoch `epoch`.
 pub(super) fn unmoved_since(screen: &Screen, at: u64, epoch: Option<u64>) -> bool {
     screen
         .generation
@@ -240,16 +224,14 @@ pub(super) fn unmoved_since(screen: &Screen, at: u64, epoch: Option<u64>) -> boo
         .is_some_and(|now| Some(now.epoch) == epoch && now.seq <= at)
 }
 
-/// The text on the composer's caret row as `reader` reads it, the caret
-/// stripped — typed, or the placeholder ([`typed_draft`] tells which).
+/// The text on the composer's caret row as `reader` reads it ([`typed_draft`]).
 fn caret_text(reader: &dyn ScreenReader, rows: &[String]) -> Option<String> {
     reader
         .composer(rows)
         .and_then(|(_, lines)| lines.into_iter().next())
 }
 
-/// A wall the host's measure of the API's reach answers: an API error that never reached the API,
-/// a reply cut off, or a certificate or proxy refused ([`aterm_phase::ApiCause`]).
+/// A wall the host's measure of the API's reach answers ([`aterm_phase::ApiCause`]).
 const fn answered_by_the_network(kind: aterm_phase::WallKind) -> bool {
     matches!(
         kind,
@@ -285,14 +267,14 @@ pub(super) fn resume_jitter(sid: &str, reset_unix: i64, span: Duration) -> Durat
     Duration::from_secs(h % span_s)
 }
 
-/// The standing rules of `policy` (`rules_file`), read now so an edit since launch counts, as one line of at most [`RULES_CAP`] characters.
+/// The standing rules of `policy` ([`RULES_CAP`]).
 #[must_use]
 pub fn standing_rules(policy: &crate::supervise::SupervisorConfig) -> Option<String> {
     let path = policy.rules_file.as_ref()?;
     standing_rules_in(&std::fs::read_to_string(path).ok()?)
 }
 
-/// [`standing_rules`] of the rules file's text `text`, read by the caller: `None` when it is empty.
+/// [`standing_rules`] of the rules file's text `text`, read by the caller.
 #[must_use]
 pub fn standing_rules_in(text: &str) -> Option<String> {
     let line = capped_rules(&limit::one_line(text));
@@ -319,7 +301,7 @@ pub(super) fn nearest_s(now_ms: i64, ahead_ms: i64) -> i64 {
 }
 
 impl<C: Ctl> Session<'_, C> {
-    /// `t` on the loop's clock as unix seconds, the nearest, against the clock to the millisecond.
+    /// `t` on the loop's clock as unix seconds.
     pub(super) fn unix_of(&self, t: Instant) -> i64 {
         let (now_ms, ahead) = self.ms_ahead(t);
         nearest_s(now_ms, ahead)
@@ -331,8 +313,7 @@ impl<C: Ctl> Session<'_, C> {
         now_ms.saturating_add(ahead)
     }
 
-    /// The wall clock now (unix milliseconds) and how many milliseconds
-    /// `t` lies ahead of now on the monotonic clock (negative: behind).
+    /// The wall clock now.
     fn ms_ahead(&self, t: Instant) -> (i64, i64) {
         let now = self.fx.mono();
         let ms = |d: Duration| i64::try_from(d.as_millis()).unwrap_or(i64::MAX);
@@ -340,7 +321,8 @@ impl<C: Ctl> Session<'_, C> {
         (self.now_unix_ms(), ahead)
     }
 
-    /// Stand `at` (on the loop's clock) as the policy's deadline at the point still showing ([`Self::turn_end_due`]), and why.
+    /// Stand `at` (on the loop's clock) as the policy's deadline at the point still showing
+    /// ([`Self::turn_end_due`]).
     pub(super) fn set_due(&mut self, at: Instant, why: impl Into<String>) {
         self.set_wait(at, why, WaitKind::Other);
     }
@@ -391,12 +373,12 @@ impl<C: Ctl> Session<'_, C> {
         utc_stamp(u64::try_from(secs).unwrap_or(0))
     }
 
-    /// `unix` (epoch seconds) on the loop's clock, placed to the millisecond ([`Self::now_unix_ms`]).
+    /// `unix` (epoch seconds) on the loop's clock ([`Self::now_unix_ms`]).
     pub(super) fn instant_of(&self, unix: i64) -> Instant {
         self.instant_of_ms(unix.saturating_mul(1000))
     }
 
-    /// WHETHER THE CREDITS HOLD STANDS FOR A TURN THE HOST WOULD TYPE on `rows` (`Guard::Credits`).
+    /// WHETHER THE CREDITS HOLD STANDS FOR A TURN THE HOST WOULD TYPE on `rows`.
     pub(super) fn credits_hold_here(&self, cfg: &SupervisorConfig, rows: &[String]) -> bool {
         let reader = self.reader(rows);
         let read = self.credits_carry(reader.credits(rows).as_ref());
@@ -404,7 +386,7 @@ impl<C: Ctl> Session<'_, C> {
             .credits_hold_stands(read.as_ref(), reader.program(), cfg, self.fx.mono())
     }
 
-    /// Usage credits carry the session, a read's notice says (`drawn`), or the loop keeps one that stands without it ([`Self::note_credits`]).
+    /// Usage credits carry the session ([`Self::note_credits`]).
     pub(super) fn credits_carry(
         &self,
         drawn: Option<&aterm_phase::credits::Credits>,
@@ -439,7 +421,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The model switch an earlier loop left open, its reset placed on this loop's clock at the second the earlier row named.
+    /// The model switch an earlier loop left open.
     pub(super) fn carried_model_switch(&self, open: approvals::OpenSwitch) -> ModelSwitch {
         ModelSwitch {
             from: open.from,
@@ -448,7 +430,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// THE MODEL SWITCH AN EARLIER LOOP MADE, taken up from the ledger at `path` ([`approvals::open_model_switch`], `drive_loop`'s seed).
+    /// THE MODEL SWITCH AN EARLIER LOOP MADE ([`approvals::open_model_switch`]).
     #[cfg(test)]
     pub(super) fn seed_model_switch(&mut self, path: &std::path::Path) {
         let body = self.fx.read_text(path).unwrap_or_default();
@@ -485,7 +467,7 @@ impl<C: Ctl> Session<'_, C> {
         standing_rules_in(&self.fx.read_text(path)?)
     }
 
-    /// A wall's `reset=` text on the loop's clock, read once per text and kind (the same text is the same reset, [`Self::refresh_reset`]).
+    /// A wall's `reset=` text on the loop's clock ([`Self::refresh_reset`]).
     #[allow(clippy::too_many_arguments)]
     pub(super) fn wall_reset_at(
         &mut self,
@@ -586,7 +568,7 @@ impl<C: Ctl> Session<'_, C> {
         self.tap_timing(seq).map(|(at, _)| at)
     }
 
-    /// Reconcile the notice's reset and the usage tap's clock ([`timed`]) and record any disagreement.
+    /// Reconcile the notice's reset and the usage tap's clock ([`timed`]).
     fn tap_timing(&mut self, seq: u64) -> Option<(Option<i64>, bool)> {
         let notice = self.wall_reset.clone();
         let tap = self.wall_tap.as_mut()?;
@@ -619,7 +601,7 @@ impl<C: Ctl> Session<'_, C> {
         Some((t.at, moved))
     }
 
-    /// The reset unix timestamp the standing wall is waited to (tap timing if present, else notice placement).
+    /// The reset unix timestamp the standing wall is waited to.
     pub(super) fn wall_reset_unix(&self) -> Option<i64> {
         let (key, notice) = self.wall_reset.as_ref()?;
         self.wall_tap
@@ -703,8 +685,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// `at`, the placement of the reset `text` names, as an undated one is kept
-    /// ([`Self::wall_reset_at`]): a bare clock placed more than [`limit::SESSION_AHEAD_MAX`] ahead
-    /// is the day before's, passed.
+    /// ([`Self::wall_reset_at`], [`limit::SESSION_AHEAD_MAX`]).
     fn within_a_session_window(&self, text: Option<&str>, at: i64) -> i64 {
         text.and_then(limit::parse_reset).map_or(at, |spec| {
             limit::within_a_session_window(&spec, at, self.now_unix())
@@ -1153,9 +1134,7 @@ impl<C: Ctl> Session<'_, C> {
         reading
     }
 
-    /// The limit a cancel left, read in `reading`'s place where it answered a turn
-    /// ([`TurnEndState::left_answer`]) and the reader reads no wall: the reading takes that wall
-    /// and the `limited` phase.
+    /// The limit a cancel left ([`TurnEndState::left_answer`]).
     fn read_left_answer(
         &mut self,
         reading: &mut aterm_phase::Reading,
@@ -1316,8 +1295,8 @@ impl<C: Ctl> Session<'_, C> {
         self.tell_ran(seq);
     }
 
-    /// The ledger's record that the worker worked since the point recorded
-    /// last, written once ([`TurnEndState::take_ran`]).
+    /// The ledger's record that the worker worked since the point recorded last
+    /// ([`TurnEndState::take_ran`]).
     fn tell_ran(&mut self, seq: u64) {
         if self.turn_end.take_ran() {
             self.ledger_row(
@@ -1330,7 +1309,8 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The point folded in, then the host asked ([`Self::observe_point`], [`Self::account_advise`]).
+    /// The point folded in, then the host asked ([`Self::observe_point`],
+    /// [`Self::account_advise`]).
     pub(super) fn fold_point(
         &mut self,
         r: &mut TurnEndReading,
@@ -1453,7 +1433,8 @@ impl<C: Ctl> Session<'_, C> {
         found
     }
 
-    /// Short-turn streak and API-error retry state persisted for subsequent loops ([`approvals::Carried`]).
+    /// Short-turn streak and API-error retry state persisted for subsequent loops
+    /// ([`approvals::Carried`]).
     fn carried(&self) -> approvals::Carried {
         approvals::Carried {
             short: self.turn_end.short_streak(),
@@ -1469,7 +1450,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// THE TASK'S FACE, told to the window's host where it moved since the loop last told it ([`TurnEndState::face_moved`]).
+    /// THE TASK'S FACE ([`TurnEndState::face_moved`]).
     pub(super) fn tell_face(&mut self) {
         if let Some(face) = self.turn_end.face_moved()
             && let Some(host) = &self.stall_host
@@ -1479,7 +1460,7 @@ impl<C: Ctl> Session<'_, C> {
         self.tell_hold();
     }
 
-    /// THE TASK'S FACE AT THE LOOP'S START ([`TurnEndState::face_start`]), told to the window's host whatever it is.
+    /// THE TASK'S FACE AT THE LOOP'S START ([`TurnEndState::face_start`]).
     pub(super) fn tell_start_face(&mut self) {
         let face = self.turn_end.face_start();
         if let Some(host) = &self.stall_host {
@@ -1561,10 +1542,8 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// What the loop reads of the composer's cells on `screen`, read by
-    /// `reading`: whether its text was typed ([`Self::composer_draft`]) and,
-    /// over Claude Code's completion menu, its selection's colours
-    /// ([`Self::menu_colours`]).
+    /// What the loop reads of the composer's cells on `screen` ([`Self::composer_draft`],
+    /// [`Self::menu_colours`]).
     fn composer_read(&mut self, reading: &aterm_phase::Reading, screen: &Screen) -> ComposerRead {
         let typed = self.composer_draft(
             reading.composer.as_ref(),
@@ -1584,7 +1563,7 @@ impl<C: Ctl> Session<'_, C> {
         ComposerRead { typed, menu_fg }
     }
 
-    /// A DRAFT THAT HELD THE POINT ([`Self::draft_held`]), read again at a look at the point already handed over.
+    /// A DRAFT THAT HELD THE POINT ([`Self::draft_held`]).
     pub(super) fn draft_look(
         &mut self,
         seen: &Turn,
@@ -1710,7 +1689,8 @@ impl<C: Ctl> Session<'_, C> {
         self.limit_retry_back();
     }
 
-    /// Infer turn work from a Claude Code done row when no intermediate busy read was seen ([`act_turn_work`]).
+    /// Infer turn work from a Claude Code done row when no intermediate busy read was seen
+    /// ([`act_turn_work`]).
     fn unseen_act_work(&mut self, rows: &[String]) -> Option<Duration> {
         let at = self.turn_end.untaken_act_typed()?;
         match self.reader(rows).program() {
@@ -1759,7 +1739,8 @@ impl<C: Ctl> Session<'_, C> {
         self.sleeps.in_turn(work, lo, hi)
     }
 
-    /// Date an unread limit-try answer from the transcript notice or Claude Code's done row ([`TurnEndState::date_unread_try`]).
+    /// Date an unread limit-try answer from the transcript notice or Claude Code's done row
+    /// ([`TurnEndState::date_unread_try`]).
     fn date_unread_try(&mut self, reading: &aterm_phase::Reading, rows: &[String], seq: u64) {
         let Some(at) = self.turn_end.unread_try() else {
             return;
@@ -1820,9 +1801,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// [`decide_turn_end`] on `r`; where it says to type, the session's program and a person's
-    /// last keystroke are read fresh ([`Self::foreground_program`]) and the point decided again,
-    /// so a `status` is paid only where there is something to type.
+    /// [`decide_turn_end`] on `r` ([`Self::foreground_program`]).
     fn decide_to_act(
         &mut self,
         r: TurnEndReading,
@@ -1941,7 +1920,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok((action, limit_draft_holds))
     }
 
-    /// Run [`decide_turn_end`] on `r` under `cfg` at `now`, appending rule trace steps when `trace` is `Some`.
+    /// Run [`decide_turn_end`] on `r` under `cfg` at `now`.
     fn turn_end_decision(
         &self,
         r: &TurnEndReading,
@@ -1961,7 +1940,8 @@ impl<C: Ctl> Session<'_, C> {
         decide_turn_end_traced(&self.turn_end, r, cfg, now, steps)
     }
 
-    /// Build a prose-question policy override when the session's `questions` word sets a priority ([`Self::question_policy`]).
+    /// Build a prose-question policy override when the session's `questions` word sets a priority
+    /// ([`Self::question_policy`]).
     fn prose_policy(&mut self, opts: &SuperviseOpts) -> Result<Option<SupervisorConfig>, Fail> {
         let policy = self.question_policy(opts)?;
         Ok(match policy.answer {
@@ -1983,19 +1963,51 @@ impl<C: Ctl> Session<'_, C> {
         allow: &[String],
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        self.turn_end_due = None;
-        self.end_told_wait(opts);
-        if self.claim.watching_behind().is_some() {
+        let standing = self.turn_end_due.take();
+        let decided = self.turn_end_again(seen, opts, review);
+        let same = match (&decided, &standing) {
+            (Ok(Some((_, TurnEndAction::WaitUntil { until, wait, .. }))), Some(due)) => {
+                due.at == *until && due.wait == *wait
+            }
+            _ => false,
+        };
+        if same {
+            self.turn_end_due = standing;
+        } else {
+            self.end_told_wait(opts);
+        }
+        let Some((turn, action)) = decided? else {
             return Ok(());
+        };
+        if let TurnEndAction::Escalate { reason } = &action
+            && self.escalates_here(&turn.phase)
+        {
+            self.escalate_point(&turn, Some(reason), review)?;
+            if self.memory_wall {
+                self.mark_memory_badge();
+            }
+        }
+        self.turn_end_execute(&turn, action, opts, allow, review)
+    }
+
+    /// [`Self::turn_end_now`]'s decision of the point `seen`, the due already taken.
+    fn turn_end_again(
+        &mut self,
+        seen: &Turn,
+        opts: &SuperviseOpts,
+        review: &mut dyn Review,
+    ) -> Result<Option<(Turn, TurnEndAction)>, Fail> {
+        if self.claim.watching_behind().is_some() {
+            return Ok(None);
         }
         if std::mem::take(&mut self.held) {
             self.rejudge = true;
-            return Ok(());
+            return Ok(None);
         }
         let screen = self.screen()?;
         let mut turn = self.point_of(screen);
         if self.review_key(&turn) != self.review_key(seen) {
-            return Ok(());
+            return Ok(None);
         }
         self.account_round();
         let mut r = self.turn_end_reading(&turn.screen, None, opts);
@@ -2010,15 +2022,7 @@ impl<C: Ctl> Session<'_, C> {
         self.task_seed(opts)?;
         self.probe_shut(&turn, ProbeGate::NotNew, None, review)?;
         let action = self.decide_to_act(r, opts, now, &turn.screen)?;
-        if let TurnEndAction::Escalate { reason } = &action
-            && self.escalates_here(&turn.phase)
-        {
-            self.escalate_point(&turn, Some(reason), review)?;
-            if self.memory_wall {
-                self.mark_memory_badge();
-            }
-        }
-        self.turn_end_execute(&turn, action, opts, allow, review)
+        Ok(Some((turn, action)))
     }
 
     /// Identify the conversation's last turn from the host transcript or hashed screen tail.
@@ -2066,7 +2070,8 @@ impl<C: Ctl> Session<'_, C> {
         self.left_keys.push(key);
     }
 
-    /// Record a `skipped` ledger row under [`RULE_LEFT`] for a person's own exchange answered by a wall.
+    /// Record a `skipped` ledger row under [`RULE_LEFT`] for a person's own exchange answered by a
+    /// wall.
     fn ledger_left_at_wall(&mut self, screen: &Screen, opts: &SuperviseOpts, seq: u64) {
         if self.left_at_wall_seq.replace(seq) == Some(seq) {
             return;
@@ -2092,7 +2097,8 @@ impl<C: Ctl> Session<'_, C> {
         self.left_keys.push(key);
     }
 
-    /// Whether the policy's escalation at a point of `phase` is the point's own ([`Self::escalate_point`]).
+    /// Whether the policy's escalation at a point of `phase` is the point's own
+    /// ([`Self::escalate_point`]).
     pub(super) const fn escalates_here(&self, phase: &Phase) -> bool {
         match phase {
             Phase::Idle | Phase::Question => true,
@@ -2121,14 +2127,14 @@ impl<C: Ctl> Session<'_, C> {
         self.task_edge_with(screen, opts, review, false)
     }
 
-    /// THE TASK'S END NOTE OWED ([`Self::task_note`]), written now, with the time the end it restates was first noted.
+    /// THE TASK'S END NOTE OWED ([`Self::task_note`]).
     pub(super) fn say_task_note(&mut self, review: &mut dyn Review) {
         if let Some((note, ended)) = self.task_note.take() {
             review.note_ended(&note, ended);
         }
     }
 
-    /// A NEW POINT'S OWN LINE, journaled with the mark of the worker's last words there ([`said_mark`]; a box says none).
+    /// A NEW POINT'S OWN LINE ([`said_mark`]).
     pub(super) fn say_point(
         &mut self,
         point: &Turn,
@@ -2145,7 +2151,7 @@ impl<C: Ctl> Session<'_, C> {
         go_on
     }
 
-    /// A STEP BETWEEN A POINT'S FOLD AND ITS OWN LINE (`step`: the fold's own publish, a limit's episode closed, the point's badge raised).
+    /// A STEP BETWEEN A POINT'S FOLD AND ITS OWN LINE.
     pub(super) fn said_before_fail<T>(
         &mut self,
         point: &Turn,
@@ -2158,8 +2164,7 @@ impl<C: Ctl> Session<'_, C> {
         step
     }
 
-    /// [`Self::task_edge`]; `say`: the note is written now (and any owed
-    /// before it), else owed.
+    /// [`Self::task_edge`].
     fn task_edge_with(
         &mut self,
         screen: &Screen,
@@ -2246,6 +2251,7 @@ impl<C: Ctl> Session<'_, C> {
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
         let seq = point.screen.seq;
+        self.decision_owed = false;
         self.nothing_decided = matches!(action, TurnEndAction::Nothing);
         let withheld = std::mem::take(&mut self.decided_withheld);
         self.say_wall_refused(review);
@@ -2393,7 +2399,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Publish any change in the standing exception (`EXCEPTION` / `CLEARED`) to the journal and host ([`exception_for`]).
+    /// Publish any change in the standing exception ([`exception_for`]).
     fn sync_exception(&mut self, seq: u64, review: &mut dyn Review) {
         self.stuck_over(seq, "the screen reached a point", review);
         let Some(now) = self.exception_now.clone() else {
@@ -2450,7 +2456,8 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The restart the policy asked for, made by the host and journaled `HOST seq=<n> restart:<why> step=<word>`.
+    /// The restart the policy asked for, made by the host and journaled `HOST seq=<n> restart:<why>
+    /// step=<word>`.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn restart_agent(
         &mut self,
@@ -2682,7 +2689,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// The Mac woke, as the sleep watch measured it at `at` (monotonic) and `wall_now` (unix seconds) ([`Self::watch_sleep`]).
+    /// The Mac woke ([`Self::watch_sleep`]).
     pub(super) fn settle_wake(&mut self, wall_now: i64, at: Instant) {
         let share = self.setup.sid.as_deref().map_or(Duration::ZERO, |sid| {
             resume_jitter(sid, wall_now.div_euclid(60), WAKE_SPREAD)
@@ -2697,7 +2704,7 @@ impl<C: Ctl> Session<'_, C> {
         self.wake_settle = Some((settle, false));
     }
 
-    /// The wake the watch measured at `wall_now` (unix seconds), at a step of the wait on `seq` ([`Self::check_slept`]).
+    /// The wake the watch measured at `wall_now` ([`Self::check_slept`]).
     pub(super) fn woke(&mut self, seq: u64, wall_now: i64, review: &mut dyn Review) {
         let carried = self
             .turn_end_due
@@ -2712,9 +2719,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// `WAITING seq=<seq> until=<the settle> the Mac woke: deciding again`,
-    /// once a settle ([`Self::settle_wake`]): said by whichever comes first,
-    /// a due the sleep carried past or an act held inside it.
+    /// `WAITING seq=<seq> until=<the settle> the Mac woke: deciding again` ([`Self::settle_wake`]).
     fn settle_said(&mut self, seq: u64, at: Instant, review: &mut dyn Review) {
         if let Some((_, said)) = &mut self.wake_settle
             && !*said
@@ -2727,9 +2732,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// A restart that must wait: decided again after the next pause of
-    /// [`TurnEndTiming::restart_backoff`], `WAITING … until=<t>
-    /// restart:<why> waits: <step>`.
+    /// A restart that must wait ([`TurnEndTiming::restart_backoff`]).
     fn restart_later(
         &mut self,
         seq: u64,
@@ -2757,7 +2760,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Whether the session's foreground program is a supervisable agent ([`aterm_phase::Program::supervisable`]).
+    /// Whether the session's foreground program is a supervisable agent
+    /// ([`aterm_phase::Program::supervisable`]).
     fn speaks_to_its_agent(&mut self, seq: u64, rule: &str, review: &mut dyn Review) -> bool {
         let rows = self
             .last
@@ -2857,7 +2861,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(false)
     }
 
-    /// Journal and escalate a fenced write skipped because the guard matched no row on the unchanged screen.
+    /// Journal and escalate a fenced write skipped because the guard matched no row on the
+    /// unchanged screen.
     fn not_written(
         &mut self,
         point: &Turn,
@@ -2892,27 +2897,8 @@ impl<C: Ctl> Session<'_, C> {
         self.set_due(self.fx.mono() + self.setup.redecide_after_skip, why);
     }
 
-    /// INPUT THE WORKER HAS NOT READ STANDS BEFORE ANY ACT: the `status` that
-    /// named the program for this decision ([`Self::foreground_program`])
-    /// says `input=pending|typeahead`, bytes queued to the program that its
-    /// screen does not show yet. Nothing is written behind them: journaled
-    /// `SKIPPED`, and the point decided again shortly
-    /// ([`Self::redecide_soon`]) on the screen the worker draws once it has
-    /// read them (the launch's own rule, [`LaunchCall::Again`]). A host that
-    /// does not measure the queue (`input=-`, no field) says nothing here.
-    ///
-    /// READ IS NOT DRAWN: the queue reads `clear` the moment the worker's
-    /// `read(2)` drains it, and the worker paints what it read later (seconds
-    /// later, starved). The screen at the content seq the queue was last seen
-    /// unread at is still the one the input has not reached, its composer
-    /// empty, and the send's fences pass on it (`if-gen=` is that seq, `if=`
-    /// matches the empty composer). So the hold lasts until the screen moves
-    /// past that seq, and the point is decided on what the worker drew; or,
-    /// a worker that read its input and drew nothing, until
-    /// [`UNDRAWN_INPUT_HANG`] after the queue was last seen unread, a hang
-    /// detector, after which the screen as it stands is decided on.
-    ///
-    /// [`LaunchCall::Again`]: super::approval_loop::LaunchCall::Again
+    /// INPUT THE WORKER HAS NOT READ STANDS BEFORE ANY ACT ([`Self::foreground_program`],
+    /// [`Self::redecide_soon`], [`LaunchCall::Again`], [`UNDRAWN_INPUT_HANG`]).
     pub(super) fn input_unread(&mut self, seq: u64, rule: &str, review: &mut dyn Review) -> bool {
         let now = self.fx.mono();
         let unread = self
@@ -2945,7 +2931,7 @@ impl<C: Ctl> Session<'_, C> {
         true
     }
 
-    /// Park or back off when the server refuses a write (`ERR halted`, `ERR busy`, `ERR rate`) and schedule a re-decision.
+    /// Park or back off when the server refuses a write.
     fn write_refused(
         &mut self,
         halted: bool,
@@ -2983,7 +2969,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Type and submit `text` via [`Self::type_fenced`] when supported, falling back to [`Self::type_guarded`].
+    /// Type and submit `text` via [`Self::type_fenced`] when supported ([`Self::type_guarded`]).
     pub(super) fn type_text(
         &mut self,
         point: &Turn,
@@ -2997,7 +2983,8 @@ impl<C: Ctl> Session<'_, C> {
         })
     }
 
-    /// Type an occupancy-door line at a break using [`Self::type_fenced`] under [`Self::under_hand`].
+    /// Type an occupancy-door line at a break using [`Self::type_fenced`] under
+    /// [`Self::under_hand`].
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::refines(
@@ -3045,7 +3032,7 @@ impl<C: Ctl> Session<'_, C> {
         out
     }
 
-    /// [`Self::under_hand`]'s take: whether the hand is now held.
+    /// [`Self::under_hand`]'s take.
     fn take_hand(&mut self) -> Result<bool, Fail> {
         if !self.setup.types_under_hand || self.stopped() || self.claim_refuses(&["send"]).is_some()
         {
@@ -3057,12 +3044,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(r.ok() && r.stdout.starts_with("OK lease acquired"))
     }
 
-    /// THE HAND OUTLASTS THE ACT: the hand [`Self::under_hand`] took,
-    /// renewed once [`HAND_RENEW`] has passed since it was taken or last
-    /// renewed. An act that waits out a starved echo ([`ECHO_HANG`]) can take
-    /// longer than the hand's TTL, and the hand must not lapse before the
-    /// act's Enter. A renewal the host refuses leaves the act to its fences
-    /// (`if-gen=`, `if=`, `if-human=`), as an act typed with no hand is.
+    /// THE HAND OUTLASTS THE ACT ([`Self::under_hand`], [`HAND_RENEW`], [`ECHO_HANG`]).
     fn keep_hand(&mut self) -> Result<(), Fail> {
         let Some(taken) = self.hand_taken else {
             return Ok(());
@@ -3078,9 +3060,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// How long one wait inside a typed act may last, of the `left` it has:
-    /// no longer than [`HAND_RENEW`] while the act holds the hand, so
-    /// [`Self::keep_hand`] renews it in time.
+    /// How long one wait inside a typed act may last ([`HAND_RENEW`], [`Self::keep_hand`]).
     fn hand_step(&self, left: Duration) -> Duration {
         if self.hand_taken.is_some() {
             left.min(HAND_RENEW)
@@ -3103,40 +3083,8 @@ impl<C: Ctl> Session<'_, C> {
         Ok(known)
     }
 
-    /// THE ECHO OF A FENCED WRITE, WAITED FOR AS A HANG DETECTOR: the read the
-    /// write's Enter is fenced on, once the composer shows `text` whole, or
-    /// why it never will. `at` is the write's content seq and `epoch` the
-    /// grid epoch it was fenced on (`if-gen=`), `human` the person count the
-    /// write was fenced on, `guarded` whether the program's paste guard takes
-    /// an Enter close behind typed text as a newline.
-    ///
-    /// Each read follows a settle (`await idle`, [`SETTLE_CAP`] at most), and
-    /// a settle that ran out says nothing of the echo. A read is judged by
-    /// what it shows ([`echo_of`]):
-    ///
-    /// * the text whole: the echo is done. Behind a paste guard, Enter waits
-    ///   until the read shows the screen the settle latched on, after it held
-    ///   still [`PASTE_GUARD_HOLD`] (the host's `OK idle <seq>` is the read's
-    ///   own seq, on the write's grid), or until that long has passed since a
-    ///   read first showed the text whole. Either way the program drew the
-    ///   last key at least that long before the Enter, however starved it is.
-    ///   A settle that latched before the last of the echo was drawn is no
-    ///   hold: the read after it shows a later seq;
-    /// * a start of the text, an empty composer or its placeholder, a frame
-    ///   caught mid-redraw, or a screen that has not moved since the write
-    ///   ([`unmoved_since`]: the same grid, its content seq no later than the
-    ///   write's, so it shows what the write found): the echo is still on its
-    ///   way. The loop waits for the screen to move past that read and reads
-    ///   again, until [`ECHO_HANG`] after the write. Only then is it
-    ///   escalated, as a hang. A read that is not whole sets the guard's
-    ///   clock back: the next whole read starts it again;
-    /// * anything else (another text, no composer, a prompt, a person's key,
-    ///   another grid): escalated at once, as before.
-    ///
-    /// Nothing is written while it waits. The text is written once and its
-    /// Enter at most once. A hand the act holds is renewed while it waits
-    /// ([`Self::keep_hand`]). Measured under load in
-    /// `docs/measured/typing-under-load-2026-10-22.md`.
+    /// THE ECHO OF A FENCED WRITE ([`SETTLE_CAP`], [`echo_of`], [`PASTE_GUARD_HOLD`],
+    /// [`unmoved_since`], [`ECHO_HANG`], [`Self::keep_hand`]).
     fn await_echo(
         &mut self,
         at: u64,
@@ -3158,14 +3106,10 @@ impl<C: Ctl> Session<'_, C> {
                 return Ok(Echoed::Not(now, ECHO_PERSON));
             }
             let read_at = self.fx.mono();
-            // The screen held still through the settle, and this read shows
-            // what the settle latched on, on the write's grid.
             let grid = now.generation.as_deref().and_then(ScreenGen::parse);
             let still = matches!(settled, Wait::Latched)
                 && grid.is_some_and(|g| Some(g.epoch) == epoch && latched == Some(g.seq));
             let echo = match echo_of(self.reader(&now.rows), &now, text) {
-                // The screen has not moved since the write: it shows what the
-                // write found, and says nothing of the echo.
                 Echo::Other if unmoved_since(&now, at, epoch) => Echo::Arriving,
                 echo => echo,
             };
@@ -3196,8 +3140,7 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Type and submit `text` using `if-gen=` and `if-human=` fenced `send` and `key` calls: what
-    /// the write came to, `None` for a read it cannot fence.
+    /// Type and submit `text` using `if-gen=` and `if-human=` fenced `send` and `key` calls.
     fn type_fenced(
         &mut self,
         point: &Turn,
@@ -3270,14 +3213,6 @@ impl<C: Ctl> Session<'_, C> {
             Echoed::Whole(now) => now,
             Echoed::Not(now, why) => {
                 if unmoved_since(&now, at, epoch) {
-                    // The screen has not moved since the write: the text is
-                    // input the worker has not drawn, and no act goes behind
-                    // it on this screen ([`Self::input_unread`]). Measured
-                    // (`t4-attr-r1`, `t4-diag-r3`, the loop before
-                    // [`Self::await_echo`]): escalated on the unmoved screen,
-                    // the point decided again 0.5 s later on the same seq
-                    // typed the continuation a second time, and the worker
-                    // submitted both as one prompt.
                     self.input_unread_at = Some((now.seq, self.fx.mono()));
                 }
                 let turn = self.turn_of(now);
@@ -3408,13 +3343,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(None)
     }
 
-    /// THE ACCEPT KEY IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY A
-    /// BUDGET: the read after `right` that shows what the key did, waited past
-    /// every read whose composer still shows the suggestion as a placeholder
-    /// (the worker has not taken the key yet), up to [`ECHO_HANG`] after the
-    /// press. Only a composer that still shows the placeholder then (a build
-    /// without the accept key) has its words typed. Each read is settled as
-    /// before, and a read with no composer is settled and read once more.
+    /// THE ACCEPT KEY IS WAITED FOR AS A HANG DETECTOR, NEVER JUDGED BY A BUDGET ([`ECHO_HANG`]).
     fn await_accept(&mut self, at: u64, text: &str) -> Result<Screen, Fail> {
         let began = self.fx.mono();
         self.wait(&["seq", &at.to_string()], REACTION_WAIT)?;
@@ -3568,8 +3497,7 @@ enum ProbeTyped {
     },
 }
 
-/// A percentage as the journal's `PROBED` line carries it: `7%`, or `?%`
-/// for a figure nobody read.
+/// A percentage as the journal's `PROBED` line carries it.
 fn pct_word(pct: Option<u32>) -> String {
     pct.map_or_else(|| "?%".to_string(), |p| format!("{p}%"))
 }
@@ -3651,7 +3579,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// Evaluate the probe gates in order and return the first gate that shuts (`None` when all open).
+    /// Evaluate the probe gates in order and return the first gate that shuts.
     fn probe_gates(
         &mut self,
         point: &Turn,
@@ -3753,7 +3681,7 @@ impl<C: Ctl> Session<'_, C> {
         );
     }
 
-    /// Clear `self.probe` once the `/usage` panel is gone, record a `waiting` row, and redecide soon.
+    /// Clear `self.probe` once the `/usage` panel is gone.
     fn probe_closed(&mut self, seq: u64, review: &mut dyn Review) {
         let was = std::mem::replace(&mut self.probe, UsageProbe::Idle);
         self.probe_hold = None;
@@ -3773,7 +3701,7 @@ impl<C: Ctl> Session<'_, C> {
         self.redecide_soon("the usage panel closed");
     }
 
-    /// Return `true` when a composer is drawn on `screen`, closing any owed probe unless `/usage` remains unsent.
+    /// Return `true` when a composer is drawn on `screen`.
     fn composer_settles(&mut self, screen: &Screen, review: &mut dyn Review) -> bool {
         if self.reader(&screen.rows).composer(&screen.rows).is_none() {
             return false;
@@ -3784,8 +3712,7 @@ impl<C: Ctl> Session<'_, C> {
         true
     }
 
-    /// The pause between two of the probe's reads: the screen holding still [`PROBE_STILL_MS`],
-    /// or [`ProbeWaits::step`] at most, never past `until`.
+    /// The pause between two of the probe's reads ([`PROBE_STILL_MS`], [`ProbeWaits::step`]).
     fn probe_pace(&mut self, until: Instant) -> Result<(), Fail> {
         let left = until.saturating_duration_since(self.fx.mono());
         self.wait(
@@ -3795,8 +3722,7 @@ impl<C: Ctl> Session<'_, C> {
         Ok(())
     }
 
-    /// The step past the claim ([`Self::usage_probe`]): type, await the
-    /// panel, read it settled, tell the host, close.
+    /// The step past the claim ([`Self::usage_probe`]).
     fn probe_step(
         &mut self,
         point: &Turn,
@@ -4060,14 +3986,12 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
-    /// Whether the probe's own `/usage` stands typed and unsent on `screen`: a panel is owed (by
-    /// this loop or, by the ledger, one before it) and the composer holds exactly the command.
+    /// Whether the probe's own `/usage` stands typed and unsent on `screen`.
     fn probe_left_stands(&self, screen: &Screen) -> bool {
         self.probe != UsageProbe::Idle && self.holds_probe_draft(screen)
     }
 
-    /// The probe's own `/usage`, left typed ([`Self::probe_type`]), sent where the turn-end policy
-    /// would send the draft in an act's place ([`TurnEndAction::Submit`]).
+    /// The probe's own `/usage` ([`Self::probe_type`], [`TurnEndAction::Submit`]).
     fn probe_left_enter(&mut self, point: &Turn, review: &mut dyn Review) -> Result<(), Fail> {
         let seq = point.screen.seq;
         let rows = &point.screen.rows;
@@ -4399,8 +4323,7 @@ pub(super) fn turn_end_outcome(action: &TurnEndAction, at: &dyn Fn(Instant) -> S
 }
 
 /// Whether the table's `action` at a point that asks a question in prose is one the session's
-/// priority word can change ([`Session::decide_to_act`]): an answer, or the escalation
-/// `answer_questions = false` makes ([`ANSWERS_OFF`]).
+/// priority word can change ([`Session::decide_to_act`], [`ANSWERS_OFF`]).
 fn session_word_can_decide(action: &TurnEndAction) -> bool {
     match action {
         TurnEndAction::Escalate { reason } => reason.ends_with(ANSWERS_OFF),
@@ -4410,8 +4333,7 @@ fn session_word_can_decide(action: &TurnEndAction) -> bool {
     }
 }
 
-/// The words a wall's reset is placed and remembered under ([`Session::wall_reset_at`]): its kind
-/// and its `reset=` text.
+/// The words a wall's reset is placed and remembered under ([`Session::wall_reset_at`]).
 fn reset_key(kind: aterm_phase::WallKind, text: Option<&str>) -> String {
     format!("{}|{}", kind.name(), text.unwrap_or("-"))
 }
@@ -4427,8 +4349,7 @@ fn host_withholds(opts: &SuperviseOpts) -> bool {
 /// THE FALLBACK'S RELAUNCH AS A LOOP JOURNALED IT, in unix seconds.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) struct JournaledRelaunch {
-    /// When the last relaunch made was first asked: its run's first host
-    /// step, or its own line where none was journaled.
+    /// When the last relaunch made was first asked.
     pub(super) made: Option<i64>,
     /// When the run of a relaunch asked and not made yet was first asked.
     pub(super) waiting: Option<i64>,

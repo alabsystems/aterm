@@ -1,6 +1,6 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-//! Owned compiler/inspection probes. Unavailable evidence is never a mismatch.
+//! Owned compiler/inspection probes.
 use crate::model::Model;
 use crate::plants::PLANTS;
 use crate::{Result, TRIPLES, Tools, read, run_status};
@@ -62,8 +62,7 @@ pub fn required(out: Output, label: &str) -> Result<Output> {
 }
 /// The flags every oracle Cargo command carries, the clean before a build
 /// included: the reference workspace answers from its committed `Cargo.lock`
-/// and the local cache, so lock drift is could-not-run. An unlocked clean
-/// re-resolves and rewrites the lock, and the `--locked` build after it passes.
+/// and the local cache, so lock drift is could-not-run.
 pub const FROZEN: [&str; 2] = ["--locked", "--offline"];
 pub fn cargo(
     runner: &mut impl Runner,
@@ -194,8 +193,6 @@ pub fn import_table(
     let conformance = libs
         .get("conformance")
         .ok_or("probe did not report conformance rlib")?;
-    // Upstream is two crates: windows-sys for the generated declarations, and
-    // `windows` 0.62.2 for the hand-written DXGI slice (src/dxgi.rs).
     let subjects: &[&str] = if side == "facade" {
         &["facade"]
     } else {
@@ -232,8 +229,7 @@ pub fn import_table(
         })
         .collect())
 }
-/// Only two successfully inspected tables can differ. A failed build, clean,
-/// inspector or artifact extraction propagates as could-not-run.
+/// Only two successfully inspected tables can differ.
 pub fn caught_import(
     want: &BTreeMap<String, String>,
     got: Result<BTreeMap<String, String>>,
@@ -298,8 +294,6 @@ fn checked(
     if out.status.success() {
         return Ok(true);
     }
-    // A compiler/process/dependency failure is not a conformance rejection. The
-    // rejecting diagnostic must come from the named subject's own compiler unit.
     let target_name = if package == "aterm-win32-conformance" {
         "conformance"
     } else {
@@ -653,8 +647,6 @@ mod tests {
         assert_eq!(got["__imp_CreateDXGIFactory1"], "dxgi.dll");
         assert_eq!(got["__imp_PeekMessageW"], "user32.dll");
         assert!(both.0.is_empty());
-        // Without `windows`' rlib the DXGI import is uninspected:
-        // could-not-run, never a table that silently lacks it.
         let mut missing = Fake(VecDeque::from([
             answer(0, ""),
             answer(0, &rlibs(&["conformance", "windows_sys"])),
@@ -713,8 +705,6 @@ mod tests {
             "refuse vacuous or ambiguous plant"
         );
     }
-    // The oracle plants only on a host with both Windows targets; an edit that loses a
-    // plant's text fails here, on any host, rather than there as a NOT RUN.
     #[test]
     fn every_plant_finds_its_one_spot_in_aterm_win32() {
         let krate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../aterm-win32");

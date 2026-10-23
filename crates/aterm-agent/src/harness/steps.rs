@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE STEP FOLD: tool calls, turn ends and walls from Claude Code's transcript, for the session log, with no text kept (plan §2.2-§2.8; addendum A8-A11, A19, A20) .
+//! The step fold: tool calls, turn ends and walls from Claude Code's transcript, for the session log, with no text kept.
 
 use std::collections::VecDeque;
 
@@ -48,7 +48,7 @@ const LOCAL_COMMAND: [&str; 4] = [
 /// A compaction's own command row.
 pub const COMPACT: &str = "/compact";
 
-/// THE WORDS A USER ROW OPENS WITH THAT THE SHAPE TEST READS (S3, A10).
+/// The words a user row opens with that the shape test reads.
 pub const USER_MARKERS: [&str; 10] = [
     TASK_NOTIFICATION,
     BASH_INPUT,
@@ -165,7 +165,7 @@ impl std::fmt::Debug for ToolName {
     }
 }
 
-/// The class of a vendor tool, by its NAME (addendum A11: never by the box the screen drew, which can draw a Bash `sed -i` as an Edit), and whether it starts a subagent.
+/// The class of a vendor tool by its name, and whether it starts a subagent.
 #[must_use]
 pub fn tool_class(name: &str) -> (&'static str, bool) {
     match name {
@@ -206,7 +206,7 @@ pub struct StepMark {
     pub off: u64,
 }
 
-/// Whether a step's build was measured (S9).
+/// Whether a step's build was measured.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum StepState {
     /// A build [`MEASURED_BUILDS`] names: exact.
@@ -225,7 +225,7 @@ pub enum StepEvent {
         /// (none of it, but a watermark the log held).
         len: u64,
     },
-    /// A user row that starts a vendor turn (S3).
+    /// A user row that starts a vendor turn.
     Prompt {
         /// The vendor turn's id.
         vref: StepId,
@@ -276,7 +276,7 @@ pub enum StepEvent {
         /// The build that wrote the row.
         ver: Option<StepId>,
     },
-    /// The fold latched off for this path (plan §2.8).
+    /// The fold latched off for this path.
     Off {
         /// Why (`unknown`: a discriminant of the wrong shape).
         why: &'static str,
@@ -321,7 +321,7 @@ pub enum EndClass {
     Input,
     /// The model's words or call.
     Reply,
-    /// A `system` `local_command` row, whose content is not read (A9).
+    /// A `system` `local_command` row, whose content is not read.
     Opaque,
 }
 
@@ -394,7 +394,7 @@ pub enum Judge {
     Wait,
 }
 
-/// THE WALL JUDGE (plan §2.6): the harness's own rule, so the log and the harness never disagree on a wall.
+/// The wall judge: the harness's own rule, so the log and the harness never disagree on a wall.
 #[must_use]
 pub fn judge_wall(screen: WallKind, end: &End, turn_opened_ms: u64) -> Judge {
     if screen == WallKind::Memory || end.last == EndClass::Opaque {
@@ -409,7 +409,7 @@ pub fn judge_wall(screen: WallKind, end: &End, turn_opened_ms: u64) -> Judge {
     Judge::Refute
 }
 
-/// The incremental `transcript_ends_on` (A9): the same loop, row by row.
+/// The incremental `transcript_ends_on`: the same loop, row by row.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct EndFold {
     end: End,
@@ -457,7 +457,7 @@ fn notice_of(line: &str) -> (Option<WallKind>, u8) {
     })
 }
 
-/// WHAT THE HARNESS READS OF ONE NOTICE ROW.
+/// What the harness reads of one notice row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoticeRead {
     /// Its words: every text part joined, or the command's output in its tags.
@@ -704,7 +704,7 @@ pub(super) fn number(v: Option<&Value>) -> Option<u64> {
     })
 }
 
-/// A vendor turn's tokens, by the usage fold's dedupe (A11).
+/// A vendor turn's tokens, by the usage fold's dedupe.
 #[derive(Clone, Debug, Default)]
 struct TurnTokens {
     seen: SeenIds,
@@ -763,7 +763,7 @@ struct Pending {
 /// A local command's output, which says the command before it ran no turn.
 const LOCAL_OUTPUT: &str = "<local-command-";
 
-/// What a user row that is no local command's asks (S3, by its shape).
+/// What a user row that is no local command's asks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Ask {
     /// A vendor turn's prompt.
@@ -791,11 +791,7 @@ const fn fingerprint(id: &str) -> u64 {
     aterm_hash::fnv1a_64(id.as_bytes())
 }
 
-/// THE OPENING HOLD: the steps of the bound file's first conversation rows,
-/// read before any prompt of theirs — the first turn's prompt row Claude
-/// Code writes after its turn's first rows (2.1.294 after the session
-/// limit's notice and `turn_duration`, 2.1.300 after the first call, each
-/// dated before them).
+/// The steps of the bound file's first conversation rows, read before any prompt of theirs.
 #[derive(Clone, Debug)]
 struct Hold {
     /// Where the held steps start in the queue (those before are not held).
@@ -808,7 +804,7 @@ struct Hold {
     taken: bool,
 }
 
-/// THE STEP FOLD of one session's main transcript (module docs).
+/// The step fold of one session's main transcript.
 #[derive(Clone, Debug)]
 pub struct StepFold {
     /// The process's start (wall ms): older rows are history.
@@ -819,10 +815,7 @@ pub struct StepFold {
     bound: Option<(u64, Option<(u64, u64)>)>,
     /// Rows ending at or below this are history.
     seed: u64,
-    /// THE VACANCY: the session the registry named while no transcript
-    /// existed for it, and once a read found its file, that file's
-    /// fingerprint ([`Self::note_vacant`], [`Self::note_found`]): only that
-    /// file, bound next, is bound from its first byte.
+    /// The session the registry named while no transcript existed for it ([`Self::note_vacant`], [`Self::note_found`]).
     vacant: Option<Vacancy>,
     /// The highest offset queued.
     through: u64,
@@ -1190,7 +1183,7 @@ impl StepFold {
         self.through = self.through.max(end);
     }
 
-    /// The state of the rows now (S9, A19).
+    /// The state of the rows now.
     fn state(&self) -> StepState {
         state_for(MEASURED_BUILDS, self.version.as_ref().map(StepId::as_str))
     }
@@ -1200,17 +1193,13 @@ impl StepFold {
         self.enqueue_as(pos, state, ev);
     }
 
-    /// Queue one step; a full queue drops its oldest step that is no
-    /// [`StepEvent::Bind`] or [`StepEvent::Off`] (those say which file the
-    /// rest came from and whether it is read at all, so the log never
-    /// loses them to a burst of rows), counting it in [`StepBatch::overflow`].
+    /// Queue one step, dropping the oldest non-`Bind`/non-`Off` step when full.
     fn enqueue_as(&mut self, pos: StepPos, state: StepState, ev: StepEvent) {
         self.queue.push_back(Step { pos, state, ev });
         self.trim();
     }
 
-    /// Bound the queue to [`STEP_QUEUE`] as [`Self::enqueue_as`] says; the
-    /// opening hold's start moves with a step dropped before it.
+    /// Bound the queue to [`STEP_QUEUE`] as [`Self::enqueue_as`] says.
     fn trim(&mut self) {
         while self.queue.len() > STEP_QUEUE {
             let pinned = |s: &Step| matches!(s.ev, StepEvent::Bind { .. } | StepEvent::Off { .. });
@@ -1340,10 +1329,6 @@ impl StepFold {
             if someone {
                 self.prompt(obj, out);
             } else if anew {
-                // Claude Code's own row that begins a turn (a `/loop`'s
-                // wake, a missed task's notice) waits as a wake does; one
-                // under the running turn's `promptId`, or under none (a
-                // Stop hook's feedback, `/goal`'s check-in), goes on it.
                 self.pending = Some(waits(true));
             }
             return (EndRow::None, None);
@@ -1454,7 +1439,7 @@ impl StepFold {
     }
 }
 
-/// The state of a row written by build `version` when the builds the lab measured are `measured` (S9, T8).
+/// The state of a row written by build `version` when the builds the lab measured are `measured`.
 pub(super) fn state_for(measured: &[&str], version: Option<&str>) -> StepState {
     match version {
         Some(v) if measured.contains(&v) => StepState::On,

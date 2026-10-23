@@ -1,19 +1,12 @@
 // Copyright 2026 Andrew Yates
-// Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
-
 //! Tests for `scroll_display` targeted damage patterns and
 //! `content_scroll_delta` consumption.
 
 use super::*;
 
-/// `scroll_display` damages exactly the rows the move exposes: the top rows
-/// scrolling into history, the bottom rows scrolling back toward live, the
-/// whole screen once the move covers it, and nothing when the offset does not
-/// change (a zero delta, or a clamp at the top of history).
 #[test]
 fn scroll_display_damages_exactly_the_exposed_rows() {
-    // (name, offset before, delta, offset after, damaged rows; None = full)
     #[expect(clippy::type_complexity, reason = "a test's case table")]
     let cases: &[(&str, usize, i32, usize, Option<&[u16]>)] = &[
         ("up 3", 0, 3, 3, Some(&[0, 1, 2])),
@@ -47,7 +40,6 @@ fn scroll_display_damages_exactly_the_exposed_rows() {
     }
 }
 
-/// content_scroll_delta is set by scroll_up and consumed by take.
 #[test]
 fn content_scroll_delta_set_by_scroll_up_and_consumed() {
     let mut grid = Grid::with_scrollback(5, 10, 50);
@@ -61,7 +53,6 @@ fn content_scroll_delta_set_by_scroll_up_and_consumed() {
     grid.set_cursor(4, 0);
     grid.line_feed();
 
-    // content_scroll_delta accumulates the shift, then take resets it.
     let content_delta = grid.take_content_scroll_delta();
     assert_eq!(
         content_delta, 1,

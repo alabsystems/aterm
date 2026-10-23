@@ -15,7 +15,7 @@ use super::{
 use crate::rainbow_kitty::meteor::tri;
 use crate::rainbow_kitty::timing;
 
-/// The identity lane: a voice tagged 0 bypasses lane bookkeeping entirely (every voice the nine pinned palettes build); `claim_lane` returns early.
+/// The identity lane: a voice tagged 0 bypasses lane bookkeeping entirely (every voice the nine pinned palettes build).
 pub(super) const LANE_NONE: u8 = 0;
 /// The verse: steps, re-strikes, the nav tick, the meteor bell, the cadence's pickup and resolution.
 pub(super) const LANE_TUNE: u8 = 1;
@@ -48,7 +48,7 @@ const TAIL_DUR_PER_TAU: f32 = 2.7;
 const SAME_PITCH_HZ: f32 = 0.5;
 const SAME_PITCH_CENTS: f32 = 1.0;
 
-/// The age guard, seconds (§14): a voice younger than this has not delivered its attack and is never stolen; [`lane_drops_the_newcomer`] decides who loses instead.
+/// The age guard, seconds (§14): a voice younger than this has not delivered its attack and is never stolen.
 pub(super) const LANE_AGE_GUARD_S: f32 = 0.040;
 
 /// §14's cap table.
@@ -63,7 +63,7 @@ pub(super) const fn lane_cap(lane: u8) -> usize {
     }
 }
 
-/// Who loses when a full lane's oldest voice is younger than [`LANE_AGE_GUARD_S`]: `true` drops the newcomer, `false` steals anyway.
+/// Who loses when a full lane's oldest voice is younger than [`LANE_AGE_GUARD_S`].
 #[inline]
 pub(super) const fn lane_drops_the_newcomer(lane: u8) -> bool {
     matches!(lane, LANE_GLINT | LANE_BLOOM)
@@ -99,14 +99,14 @@ const AUTOREPEAT_JITTER_MS: u32 = 2;
 const AUTOREPEAT_RUN: u8 = 3;
 const AUTOREPEAT_FLOOR_MS: u32 = 25;
 
-/// A typing gap this long is a rest, and a rest resolves the line (§3.1): the walk resolves onto the live chord, contour bias and run clear, and the motif re-latches.
+/// A typing gap this long is a rest, and a rest resolves the line (§3.1).
 pub(super) const PHRASE_PAUSE_MS: u32 = timing::PHRASE_PAUSE_MS;
 
 const IOI_DEFAULT_MS: f32 = timing::IOI_DEFAULT_MS;
 
 const UNDO_N: usize = 8;
 
-/// The PTY cascade's exclusivity window: one 4-note brrrring per 180 ms, however many line feeds arrive.
+/// The PTY cascade's exclusivity window.
 pub(super) const CASCADE_EXCLUSIVE_MS: u32 = 180;
 const CASCADE_RESTRIKE_MS: u32 = 60;
 const CASCADE_RUN_MS: u32 = PHRASE_PAUSE_MS;
@@ -334,7 +334,7 @@ const SKY_BED_TARGETS: [[f32; 3]; SKY_BED_CHORDS] = {
     table
 };
 
-/// The sky's voicing for one chord of [`CHORD_LOOP`]: the chord's three lit verse degrees (`Chord::lit`, bits 0..5 = C D E G A), ascending, on the untransposed lattice.
+/// The sky's voicing for one chord of [`CHORD_LOOP`].
 #[inline]
 pub(super) const fn sky_bed_degrees(chord: usize) -> [i32; 3] {
     SKY_BED_DEGREES_TABLE[chord % SKY_BED_CHORDS]
@@ -729,7 +729,7 @@ const CAD_BELL_TWINKLE_DEPTH: f32 = 0.3;
 const CAD_BELL_LP_HZ: f32 = 3600.0;
 const CAD_BELL_LEVEL: f32 = 0.199_526_2;
 
-/// The ice bell at `delay` and its level trim: the bell `v2_enter` rings on a full cadence, shared with the sing-along's outro (`TrailSynth::design_celebration_outro`, RAINBOW-KITTY-V2.md §27).
+/// The ice bell at `delay` and its level trim.
 #[inline]
 pub(super) fn cad_bell_voice(delay: f32) -> (Voice, f32) {
     let bell = Voice {
@@ -839,7 +839,7 @@ impl Undo {
     };
 }
 
-/// The melody engine (§10): `Copy`, alloc-free, deterministic, driven entirely by `EventMeta::at_ms` from the host's input clock, never by audio-thread arrival gaps, so the keyed and frame paths agree on phrase boundaries (§10.1).
+/// The melody engine (§10): `Copy`, alloc-free, deterministic, driven entirely by `EventMeta::at_ms` from the host's input clock, never by audio-thread arrival gaps.
 #[derive(Clone, Copy, Debug)]
 pub struct MelodyV2 {
     text: Undo,
@@ -949,7 +949,7 @@ impl MelodyV2 {
         self.text.word_pos
     }
 
-    /// Whether the line is answering its own subject: the next key replays a latched interval rather than deriving its own (test / introspection hook).
+    /// Whether the line is answering its own subject.
     #[must_use]
     #[cfg(test)]
     pub const fn motif_answering(&self) -> bool {
@@ -1049,7 +1049,7 @@ impl MelodyV2 {
         self.text.aside_keys = 0;
     }
 
-    /// Whether an aside is open (test / introspection hook): between an opening bracket and whatever closes it ([`ASIDE_GAIN`]).
+    /// Whether an aside is open (test / introspection hook).
     #[must_use]
     #[cfg(test)]
     pub const fn in_aside(&self) -> bool {
@@ -1063,7 +1063,7 @@ impl MelodyV2 {
         self.text.quote_deg >= 0
     }
 
-    /// The mark the next Space will confirm (test / introspection hook): 0 none, 1 `.`, 2 `!`, 3 `?`, 4 `,`, 5 `;`, 6 `:`; 0 for a doubled mark ([`MARK_DOUBLED`]).
+    /// The mark the next Space will confirm (test / introspection hook): 0 none, 1 `.`, 2 `!`, 3 `?`, 4 `,`, 5 `;`, 6 `:`.
     #[inline]
     #[must_use]
     pub const fn pending_mark(&self) -> u8 {
@@ -1101,7 +1101,7 @@ struct TypedPlan {
     quote: u8,
 }
 
-/// Which of §3.3's additions this synth voices: the timbre ladder's stops (`plain` / `bloom` / `hue` / `room`).
+/// Which of §3.3's additions this synth voices.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimbreStops {
     /// The 3f/4f/6f bloom behind every lit key.
@@ -1386,8 +1386,6 @@ impl MelodyV2 {
             let d = i32::from(rank) - i32::from(self.text.prev_rank);
             (d, d == 0)
         } else {
-            // The gap is a magnitude, never a repeat: two keys at the same
-            // millisecond are the host's stamp failing, not a doubled letter.
             (gap as i32, false)
         };
         let r = fold_signed13(raw);
@@ -1541,9 +1539,6 @@ impl MelodyV2 {
             .cascade_at
             .is_some_and(|c| at.saturating_sub(c) < CASCADE_RUN_MS);
         if in_run {
-            // The run walks the theme: later lines of one program's output take
-            // its phrase edges in turn. Only the base moves; the rate law below
-            // is unchanged.
             self.text.walk = self.run_theme_step();
         } else {
             let here = i32::from(self.text.walk);
@@ -2040,7 +2035,7 @@ fn bloom(deg: i32, roof: f32, tau_v: f32) -> Voice {
 }
 
 impl TrailSynth {
-    /// The timbre ladder's seam (test hook): pull one of §3.3's stops and the synth renders that rung.
+    /// The timbre ladder's seam (test hook).
     #[cfg(test)]
     pub const fn set_v2_timbre_stops(&mut self, stops: TimbreStops) {
         self.v2.stops = stops;
@@ -2395,9 +2390,6 @@ impl TrailSynth {
             plan.opens_shift,
         );
         if plan.repeat {
-            // §9.5 law 5: a same-pitch note damps the old voice first; two
-            // independently phased voices at one frequency comb. A word head's
-            // common tone is as much the same pitch as a doubled letter.
             self.v2_damp(self.v2.lead, LANE_FADE_STEAL_S);
         }
         if !plan.mallet_only && self.v2_live_ting_at(f) {
@@ -2406,9 +2398,6 @@ impl TrailSynth {
         if hammer.ring {
             self.v2_duck_ting(TING_DUCK);
         } else if ev.shifted && classed {
-            // Under a shifted mark it yields further ([`TING_DUCK_MARK`]):
-            // in code a bell every few keys would make it louder than prose
-            // (the design's C1).
             self.v2_duck_ting(TING_DUCK_MARK);
         }
         let vel_db = if plan.touch == Touch::Step {
@@ -3066,7 +3055,6 @@ impl TrailSynth {
             }
             v.arm_ttl = 0.0;
             if v.p[0].lvl <= 0.0 {
-                // Nothing to re-aim; it simply keeps its ttl-free life.
                 continue;
             }
             let now = v.t.max(0.0);
@@ -3221,7 +3209,7 @@ impl TrailSynth {
     }
 }
 
-/// The music box as a [`Palette`] roster entry: its bed and register, which the bed mixer and kind-level gestures read through `palette_for`.
+/// The music box as a [`Palette`] roster entry.
 pub struct RainbowKittyV2Palette;
 
 impl Palette for RainbowKittyV2Palette {
@@ -3246,7 +3234,7 @@ impl Palette for RainbowKittyV2Palette {
 }
 
 impl TrailSynth {
-    /// One stereo sample `(mid, side)` of the sky pad, behind the music box's palette bed; the caller has floored `bed.level` and folded level × gain into `lvl`.
+    /// One stereo sample `(mid, side)` of the sky pad, behind the music box's palette bed.
     pub(super) fn bed_rainbow_sky(&mut self, dt: f32, lvl: f32) -> (f32, f32) {
         let tgt = SKY_BED_TARGETS[usize::from(self.v2.text.chord) % SKY_BED_CHORDS];
         let b = &mut self.bed;
@@ -3263,8 +3251,6 @@ impl TrailSynth {
         let mut m = 0.0;
         for i in 0..3 {
             if b.var_f[i] <= 0.0 {
-                // First sample: seed at target so the pad enters on the
-                // chord instead of sweeping up from 0 Hz.
                 b.var_f[i] = tgt[i];
             }
             b.var_f[i] += (tgt[i] - b.var_f[i]) * glide;
@@ -5565,8 +5551,6 @@ for it up front.\n\
             let at = prose_prelude(&mut s);
             let mark = s.born_seq;
             if secret {
-                // The pan moves with the key, as a caret would — the tone
-                // must not.
                 push_secret(&mut s, at, ch, (ch as u32 % 7) as f32 / 7.0 - 0.4);
             } else {
                 let kind = if ch == ' ' {
@@ -7583,9 +7567,6 @@ for it up front.\n\
                         "{ch:?} at flow {flow} acquired a long hang"
                     );
                     if flow > 0.0 && plan.lit && plan.touch == Touch::Step && !plan.mallet_only {
-                        // A gate without the pluck check would admit this real
-                        // key and create the forbidden octave; the control is
-                        // tied to a reachable lit step, not a synthetic flag.
                         caught_old_gate += 1;
                     }
                 }

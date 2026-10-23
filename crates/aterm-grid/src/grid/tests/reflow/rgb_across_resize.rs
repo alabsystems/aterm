@@ -2,13 +2,7 @@
 // Author: Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! 24-bit colour across a resize that does not reflow columns (same size, rows only, every
-//! alternate-screen resize). The renderer reads ring-stored truecolor from the dense RGB ring,
-//! which `invalidate_rings` drops; `migrate_rgb_ring_to_extras` must harvest it first, or the
-//! cell keeps its RGB-overflow flag but falls to the theme default.
-//!
-//! Row `n` is labelled `R<n>` and painted in a colour that names `n`, so a row keeps its colour
-//! only if its own colour follows it wherever the resize moved it.
+//! 24-bit colour preservation across non-reflowing resizes.
 
 use crate::test_counters::take_rgb_harvest_cells;
 use crate::{Cell, CellFlags, Grid, PackedColor};
@@ -23,8 +17,6 @@ fn bg_of(n: u16) -> [u8; 3] {
     [10, (n + 1) as u8, 30]
 }
 
-/// `rows` rows labelled `R0`, `R1`, ..., every cell truecolor in the dense ring.
-/// `max_scrollback` 0 is the alternate screen's shape.
 fn painted(rows: u16, cols: u16, cursor_row: u16, max_scrollback: usize) -> Grid {
     let mut grid = Grid::with_scrollback(rows, cols, max_scrollback);
     for r in 0..rows {
@@ -69,7 +61,6 @@ fn colours(grid: &Grid, row: u16, cols: u16) -> Vec<(Rgb, Rgb)> {
         .collect()
 }
 
-/// Every labelled row on screen carries its own label's colour across `cols`.
 fn assert_every_row_keeps_its_colour(grid: &Grid, cols: u16, what: &str) {
     let mut seen = 0;
     for r in 0..grid.rows() {
@@ -120,7 +111,6 @@ fn alt_width_change_keeps_truecolor() {
 
 #[test]
 fn two_resizes_keep_truecolor() {
-    // The first resize harvests the ring into the map and drops it; the second reads the map.
     for max_scrollback in [0, 100] {
         let mut grid = painted(6, 10, 5, max_scrollback);
         grid.resize_no_reflow(5, 10);
@@ -133,7 +123,6 @@ fn two_resizes_keep_truecolor() {
 
 #[test]
 fn main_width_change_keeps_truecolor() {
-    // The control: the column-reflow path reads the ring itself.
     let mut grid = painted(6, 10, 5, 100);
     grid.resize(6, 8);
     let mut seen = 0;

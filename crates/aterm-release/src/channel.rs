@@ -192,14 +192,9 @@ pub fn validate_channel_asset_set(
     linux: &[String],
 ) -> Result<()> {
     let mut required = required_asset_names(version, signed, rostered);
+    let canonical = linux_asset_names(version);
     for name in linux {
-        if !aterm_update_core::linux::LinuxTarget::X86_64
-            .asset_name(version)
-            .eq(name)
-            && !aterm_update_core::linux::LinuxTarget::Aarch64
-                .asset_name(version)
-                .eq(name)
-        {
+        if !canonical.contains(name) {
             return Err(Error::new(
                 "noncanonical Linux asset requested for the channel",
             ));
@@ -323,13 +318,26 @@ pub fn is_source_shape(name: &str) -> bool {
 #[must_use]
 pub fn publishable_asset_names(version: &str) -> Vec<String> {
     let mut names = required_asset_names(version, true, true);
+    names.extend(linux_asset_names(version));
+    names.sort();
+    names
+}
+
+/// The Linux assets a cut of `version` can publish: each architecture's executable and
+/// its static bootstrap verifier (`aterm_bootstrap_verify::pin::asset_name`).
+#[must_use]
+pub fn linux_asset_names(version: &str) -> Vec<String> {
+    let mut names = Vec::new();
     for target in [
         aterm_update_core::linux::LinuxTarget::X86_64,
         aterm_update_core::linux::LinuxTarget::Aarch64,
     ] {
         names.push(target.asset_name(version));
+        names.push(aterm_bootstrap_verify::pin::asset_name(
+            version,
+            target.arch(),
+        ));
     }
-    names.sort();
     names
 }
 

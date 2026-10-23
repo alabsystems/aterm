@@ -1,16 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `gen_cat_glyphs` — regenerate the checked-in cat-glyph const drawlists.
-//!
-//! Reads every roster asset TOML under `crates/aterm-effects/art/glyphs/` and writes
-//! `crates/aterm-effects/src/cat_glyphs_gen.rs` (docs/cat-art-v4-design.md §1). Run it
-//! after touching any glyph asset; the `cat_glyphs_gen_matches_assets` drift test fails
-//! until the checked-in file matches.
-//!
-//! ```text
-//! targo --unverified run -p aterm-effects --example gen_cat_glyphs
-//! ```
+//! Regenerates `crates/aterm-effects/src/cat_glyphs_gen.rs` from `art/glyphs/` TOML assets.
 
 use std::path::Path;
 use std::process::ExitCode;
