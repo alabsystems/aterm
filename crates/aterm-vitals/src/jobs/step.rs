@@ -100,6 +100,8 @@ pub enum Fault {
     UnnamedReachesStuck,
     /// A named stuck-capable wait is never raised to stuck.
     NeverRaiseNamed,
+    /// A process macOS's program check holds is not named: its wait reads unnamed.
+    IgnoreProgramCheck,
 }
 
 /// The evidence one tick of one job hands the step.
@@ -417,10 +419,14 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     };
     out.class = class;
 
+    // A held reading is no flicker: the host reads one only 20 s past a fork, and a normal start
+    // reads held for under 0.3 ms (leftover M2). So the wait shows and counts at the reading
+    // that names it, with neither debounce below.
+    let held = class == Class::Waiting && ev.wait.name == WaitName::ProgramCheck;
     if class == Class::Waiting {
         let cand = ev.wait.clone();
         match &t.shown {
-            Some(s) if s.name != cand.name => {
+            Some(s) if s.name != cand.name && !held => {
                 if t.cand == Some(cand.name) {
                     t.cand_streak += 1;
                 } else {
@@ -512,7 +518,7 @@ pub fn classify_tick(t: &mut Track, ev: &Evidence, cx: &Cx) -> Out {
     let was_suspect = matches!(t.effective, Some(Effective::Capable | Effective::Capped));
     let eff = if raw == Effective::Legit {
         t.legit_streak += 1;
-        if was_suspect && t.legit_streak < 2 {
+        if was_suspect && t.legit_streak < 2 && !held {
             if t.capable {
                 Effective::Capable
             } else {

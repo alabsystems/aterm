@@ -110,9 +110,8 @@ fn the_per_model_notice_names_its_model_and_its_reset() {
 /// credits-only model whose consent Claude Code stored, or on a tier an admin
 /// bills, goes onto usage credits with no box, the footer's item never
 /// drawn), and lower-priority mode's end as credits take over, each in place
-/// of the measured lasting notice on its mode row: credits in use, the
-/// model's named. Probe P1 of the review of 2026-10-19: these read as no
-/// credits before, so nothing held. NEGATIVE CONTROLS: the measured notice
+/// of the measured lasting notice on its mode row: credits in use, with the
+/// model where the notice names one. NEGATIVE CONTROLS: the measured notice
 /// (the account's window, no model); the same words short of the edge, in
 /// the model's reply, or under no model's name; the row with no notice.
 #[test]

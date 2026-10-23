@@ -223,6 +223,10 @@ pub struct Core {
     pub frames: Vec<u64>,
     /// `rainbow kitty pet`: the resident pet's own frame demand.
     pub pet: Option<PetBrain>,
+    /// The caret row's flanks (the rows above and below it, `None` off the
+    /// grid) go with its probe, as `app_render.rs`'s frame hold sends them
+    /// (`observe_neighbor_rows`).
+    pub flanks: bool,
 }
 
 impl Core {
@@ -260,6 +264,7 @@ impl Core {
             drop_far_frames: 0,
             frames: Vec::new(),
             pet: None,
+            flanks: false,
         }
     }
 
@@ -325,6 +330,20 @@ impl Core {
                 .row_cols_into(usize::from(c.row), &mut self.row_buf);
             if !changed {
                 self.glow.observe_row(c.row, c.col, &self.row_buf, self.now);
+                if self.flanks {
+                    let rows = self.g.rows as u16;
+                    let read = |term: &Terminal, row: Option<u16>| {
+                        row.filter(|&r| r < rows).map(|r| {
+                            let mut cols = Vec::new();
+                            term.row_cols_into(usize::from(r), &mut cols);
+                            cols
+                        })
+                    };
+                    let above = read(&self.term, c.row.checked_sub(1));
+                    let below = read(&self.term, c.row.checked_add(1));
+                    self.glow
+                        .observe_neighbor_rows(above.as_deref(), below.as_deref());
+                }
             }
             self.glow.observe_ribbon_row(c.row, &self.row_buf);
             let mut rows = [0u16; CURSOR_WITNESS_ROWS];

@@ -423,6 +423,10 @@ fn emit_halo(
 /// How much of a fire's ember a dark page's typing halo takes ([`warm_halo`]).
 pub const MOMENTUM_FIRE_WARMTH: f32 = 0.8;
 
+/// The ember a fire's dark typing halo is warmed toward ([`warm_halo`]): a deep
+/// orange-red (hue 20 degrees); the rod's amber read tan and khaki round the caret.
+pub const MOMENTUM_FIRE_EMBER: u32 = 0x00E0_4A00;
+
 /// Warm a dark page's additive halo (`quads`) toward `hue` by `share`.
 pub fn warm_halo(quads: &mut [GlowQuad], hue: u32, share: f32) {
     let share = share.clamp(0.0, 1.0);

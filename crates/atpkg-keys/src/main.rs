@@ -14,8 +14,8 @@ fn main() {
     std::process::exit(2);
 }
 
-/// Maximum tokens after the verb (`setup`/`join` take up to 8; bounded so argument parsing
-/// uses a fixed array rather than `collect()`).
+/// Most tokens read after the verb (`setup` and `join` take up to 8), held in a fixed
+/// [`Argv`] array.
 #[cfg(unix)]
 const MAX_ARGS: usize = 14;
 
@@ -92,7 +92,7 @@ fn vet_args(
                 tok,
                 "' does not exist: the master phrase is read only from /dev/tty. If you \
                  typed your real phrase on this command line, TREAT THAT MASTER AS \
-                 COMPROMISED (it is in shell history and was visible via `ps`): destroy \
+                 COMPROMISED (it may be in shell history and was visible to `ps`): destroy \
                  the paper and generate a new master on a tree whose anchor is not armed.",
             ]));
         }
@@ -221,7 +221,7 @@ fn print_line(line: &str) {
     }
 }
 
-/// `eprintln!`-equivalent without the fmt machinery (see `print_line`).
+/// `eprintln!` without the fmt machinery.
 #[cfg(unix)]
 fn eprint_line(line: &str) {
     use std::io::Write as _;
@@ -246,7 +246,7 @@ fn pubkey(key: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-/// `verify-signed`.
+/// `verify-signed`: check a file's signature against a roster that verifies under the master.
 #[cfg(unix)]
 fn verify_signed(argv: &Argv) -> Result<(), String> {
     const USAGE: &str = "usage: atpkg-keys verify-signed <master-pubkey-b64> <file> <file.sig> \
@@ -319,9 +319,7 @@ use atpkg_keys::provision::{DEFAULT_ROSTER, MACHINE_KEY_REL, MACHINE_PUB_REL, ho
 /// Current unix seconds, or an error.
 #[cfg(unix)]
 fn now_unix() -> Result<u64, String> {
-    aterm_time::unix_secs().ok_or_else(|| {
-        "the system clock is before the unix epoch; refusing to stamp a roster".into()
-    })
+    aterm_time::unix_secs().ok_or_else(|| "the system clock reads before the unix epoch".into())
 }
 
 /// Print the master's public identity.
@@ -335,7 +333,7 @@ fn announce_master(seed: &atpkg_keys::master::MasterSeed) -> Result<(), String> 
 /// The heading that must land on the same surface as the phrase itself.
 #[cfg(unix)]
 const PHRASE_HEADING: &str = "atpkg-keys: MASTER PHRASE — write it on paper, twice, in two \
-     places. Shown once. Stored nowhere. Unrecoverable.";
+     places. Shown only in this run. Stored nowhere. Unrecoverable.";
 
 /// The rule that isolates the two lines the paper must carry from everything else on the screen.
 #[cfg(unix)]
@@ -361,7 +359,7 @@ fn show_phrase(
     Ok(())
 }
 
-/// The transcription gate.
+/// The transcription gate: ask until the retyped paper derives the master just shown.
 #[cfg(unix)]
 fn confirm_transcription(
     tty: &mut atpkg_keys::master::Tty,
@@ -410,8 +408,8 @@ fn master_check() -> Result<(), String> {
     )?;
     announce_master(&phrase.seed())?;
     eprint_line(
-        "atpkg-keys: compare that fingerprint with the one you wrote down. If they \
-         differ, you transcribed a character wrong — the phrase itself is fine.",
+        "atpkg-keys: compare that fingerprint with the one on your paper. If they \
+         differ, a character is wrong in what you typed or on the paper.",
     );
     Ok(())
 }
@@ -433,7 +431,8 @@ const SETUP_PAPER_ARMS_NOTHING: &str = "atpkg-keys: THE PHRASE ABOVE ARMS NOTHIN
      and never will be. DESTROY that paper, fix the problem above, and run `atpkg-keys \
      setup` again — it will generate a different master.";
 
-/// `setup` / `join`: provision the paper master and a machine's signing key.
+/// `setup` mints the paper master and `join` checks it; both mint this machine's signing key
+/// and add it to the roster.
 #[cfg(unix)]
 fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), String> {
     use atpkg_keys::provision as prov;
@@ -512,7 +511,7 @@ fn provision(verb: atpkg_keys::provision::Verb, argv: &Argv) -> Result<(), Strin
     Ok(())
 }
 
-/// Read, verify under `master_pubkey` ([`aterm_update_core::roster::Roster`]).
+/// Read the roster at `path`, which must exist, and verify it under `master_pubkey`.
 #[cfg(unix)]
 fn load_roster(
     path: &str,
@@ -609,9 +608,9 @@ fn machine_revoke(argv: &Argv) -> Result<(), String> {
         "atpkg-keys: '",
         id,
         "' is revoked. Publish the roster and its .sig with the next release; a running \
-         aterm refuses that machine at its first update check after that (every 10 \
-         minutes on macOS). A fresh install can still be served an older master-signed \
-         roster that lists it — if that matters for this theft, re-key entirely.",
+         aterm refuses that machine from its next update check after that. A fresh install \
+         can still be served an older master-signed roster that lists it — if that \
+         matters, re-key under a new master.",
     ]));
     Ok(())
 }

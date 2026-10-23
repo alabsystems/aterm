@@ -6,8 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-/// The Chrome for Testing release the lane pins (the Stable channel's on 2026-10-16, published
-/// 2026-10-14).
+/// The Chrome for Testing release the lane pins, a Stable-channel build.
 pub(crate) const PIN_VERSION: &str = "155.0.8059.84";
 
 /// One platform's pinned `chrome-headless-shell-<platform>.zip`: its sha256 and size, measured on
@@ -204,7 +203,7 @@ pub(crate) fn pinned_product() -> String {
 /// `ATERM_BROWSER` when it is set, else the pinned chrome-headless-shell exactly as
 /// `verify provision` placed it on this machine (its stamp admits the pin). Never an
 /// installed Chrome or a copy laid by hand: what the checks and the bench run in is the
-/// `chrome-headless-shell` row's (docs/DESIGN-init-system-2026-10-20.md §8).
+/// `chrome-headless-shell` row of `aterm_uds::host::TOOLS`.
 pub(crate) fn pinned() -> Result<Browser, String> {
     pinned_from(
         std::env::var_os(BROWSER_ENV),

@@ -116,6 +116,10 @@ pub struct CursorDroplet {
     surge: f32,
     /// Cached `(ground, (lo, hi))` from [`ramp_band_on`].
     band_memo: Option<(u32, (f32, f32))>,
+    /// A test's negative control: the ripples and drips run past the row's
+    /// foot as they did before [`cut_at_surface`].
+    #[cfg(test)]
+    uncut: bool,
 }
 
 impl CursorDroplet {
@@ -269,6 +273,13 @@ impl CursorDroplet {
             glint_cov * 0.5,
         );
 
+        // The ripples and drips stay in the caret's row: a ring rolled out
+        // under the bead, and a drop falling off it, reached into the row
+        // below (round 2's judge, 2026-10-23: the ripple on the selected
+        // line under the prompt), so both are cut at the row's foot, the
+        // water's surface: the near side of a ring is under it, and a drop
+        // falls through it.
+        let surface_from = out.len();
         if e > 0.0 {
             let ring_rgb = water_ramp(0.74 + 0.10 * e);
             let y0 = cy + radius * 0.88;
@@ -310,7 +321,32 @@ impl CursorDroplet {
             };
             push_soft_disc(out, geom, (x, y), (r, r * stretch), body, cov.min(COV_CAP));
         }
+        let foot = i32::from(geom.origin_y) + (i32::from(cr) + 1) * ch as i32;
+        #[cfg(test)]
+        if self.uncut {
+            return;
+        }
+        cut_at_surface(out, surface_from, foot);
     }
+}
+
+/// Cut the quads `out[from..]` at window row `foot`: a quad wholly at or below
+/// it is dropped, one that crosses it ends there.
+fn cut_at_surface(out: &mut Vec<GlowQuad>, from: usize, foot: i32) {
+    let mut keep = from;
+    for i in from..out.len() {
+        let mut q = out[i];
+        let (y, h) = (i32::from(q.y), i32::from(q.h));
+        if y >= foot || h == 0 {
+            continue;
+        }
+        if y + h > foot {
+            q.h = (foot - y) as u16;
+        }
+        out[keep] = q;
+        keep += 1;
+    }
+    out.truncate(keep);
 }
 
 #[cfg(test)]
@@ -409,6 +445,52 @@ mod tests {
         assert!(
             surge_ink > still_ink * 2,
             "full surge far outshines still water ({surge_ink} vs {still_ink})"
+        );
+    }
+
+    /// Round 2's judge (2026-10-23, the trail gallery's `context` on dark):
+    /// the ripple reached the selected line under the prompt. Through two whole
+    /// ripple and drip cycles at full surge, nothing the droplet draws lies
+    /// lower than its bead's own foot (the bead overhangs the cell, the rest
+    /// is cut at the row's foot). The negative control, uncut, runs rings and
+    /// drops into the row below, past the bead.
+    #[test]
+    fn ripples_and_drips_stay_in_the_caret_s_row() {
+        let g = geom();
+        let lowest = |uncut: bool| {
+            let mut d = CursorDroplet {
+                uncut,
+                ..CursorDroplet::default()
+            };
+            let t = Instant::now();
+            let mut low = 0i32;
+            for i in 0..400u64 {
+                let mut out = Vec::new();
+                d.tick(
+                    Some((2, 5)),
+                    t + Duration::from_millis(16 * i),
+                    1.0,
+                    g,
+                    &cfg(),
+                    &mut out,
+                );
+                for q in &out {
+                    low = low.max(i32::from(q.y) + i32::from(q.h));
+                }
+            }
+            low
+        };
+        let ch = g.ch as f32;
+        let bead_foot = ((2.0 + 0.46) * ch + RADIUS_MAX * ch).ceil() as i32 + 1;
+        let cut = lowest(false);
+        assert!(
+            cut <= bead_foot,
+            "a ring or a drop reached pixel row {cut}, under the bead's foot {bead_foot}"
+        );
+        let uncut = lowest(true);
+        assert!(
+            uncut > bead_foot + 2,
+            "the negative control stays at pixel row {uncut}: the law above reads nothing"
         );
     }
 

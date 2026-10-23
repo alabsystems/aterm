@@ -14,8 +14,7 @@
 //
 // Cite a pass as evidence beside the Tier-1 test
 // (`config_watcher::tests::the_watcher_is_the_policys_one_writer`), never as proof: the census is
-// a pointer analysis with known false passes (`docs/DESIGN-trust-temporal-models-2026-09-29.md`
-// §5 and open questions 12, 13 and 16).
+// a pointer analysis with known false passes.
 //
 // Mounted only under `--cfg clean_islands --cfg trust_seals --cfg trust_binding`
 // (config_watcher.rs): a declared binding runs Trust's spawn census, about 25 minutes on this

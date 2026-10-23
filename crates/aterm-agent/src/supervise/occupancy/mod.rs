@@ -3,9 +3,11 @@
 
 //! HARNESS OCCUPANCY (`docs/DESIGN-harness-occupancy-2026-10-20.md`).
 
+pub mod declarer;
 pub mod door;
 #[cfg(any(test, debug_assertions))]
 mod door_environment;
+pub mod due;
 pub mod fact_word;
 pub mod hold;
 pub mod reading;
@@ -14,16 +16,21 @@ pub mod ring;
 pub mod rules;
 pub mod said;
 pub mod templates;
+pub mod wake_atoms;
+pub mod wakes;
 pub mod wakes_seen;
 
-pub use door::{AtWrite, PaceGrant, PaceRefusal, StatusSeen, write_held};
+pub use door::{
+    AtWrite, BreakLine, PaceGrant, PaceRefusal, StatusSeen, StuckVerdict, stuck_at_break,
+    write_held,
+};
 pub use fact_word::{FactWord, NoteOutcome};
 pub use hold::{Close, HoldChange, HoldClock, HoldEvent, waiting_declared};
 pub use reading::{OccupancyReading, SlotsSeen};
 pub use rules::{Books, Guards, HoldSeen, RuleId, Verdict, decide};
 pub use said::{OccupancySaid, SaidHold, SaidRule, SaidVerdict};
 pub use templates::FactLine;
-pub use wakes_seen::{WakeClaim, WakeDoor, WakesSeen};
+pub use wakes_seen::{WakeClaim, WakeDoor, WakeSeen, WakesSeen};
 
 #[cfg(any(test, debug_assertions))]
 pub use door_environment::occupancy_door_environment;
@@ -85,6 +92,38 @@ pub mod fault {
         UntoldOnReturnOnly,
         /// The door keeps the held verdicts it booked past a change of hold.
         HeldAcrossHolds,
+        /// [`write_held`](super::write_held) lets the stuck fact go while the upgrade's notice
+        /// is due (§2.1's ranks 3 and 4 turned).
+        StuckOverNotice,
+        /// [`stuck_at_break`](super::door::stuck_at_break) judges the stuck fact with no
+        /// `[harness] stuck_break_note` grant, as if the key were on.
+        StuckWithoutKey,
+        /// [`DueClock::observe`](super::due::DueClock::observe) restarts a key's clock at each
+        /// change of the guard that holds it, as a clock from the rule's last word would.
+        KFromLastWord,
+        /// [`DueClock::seed`](super::due::DueClock::seed) drops a successor's seed: its clock
+        /// starts at its first look.
+        KUnseeded,
+        /// [`DueClock::sample`](super::due::DueClock::sample) raises a look past K.
+        LateRaise,
+        /// [`WakeBook::on_source`](super::wakes::WakeBook::on_source) ignores an edge: only a
+        /// level a look reads makes a wake ready.
+        LevelOnly,
+        /// [`WakeBook::claim`](super::wakes::WakeBook::claim) grants a told wake again.
+        ClaimTwice,
+        /// [`ParkBook::park`](super::wakes::ParkBook::park) admits a second park.
+        ParkSecond,
+        /// [`WakeBook::answer_done`](super::wakes::WakeBook::answer_done) keeps a wake answered
+        /// whose reply was never written.
+        ToldBeforeWrite,
+        /// [`reconcile_claim`](super::wakes::reconcile_claim) releases a claim whose last row
+        /// says typed.
+        ReleaseAfterTyped,
+        /// [`declarer::prove`](super::declarer::prove) admits a peer whose ancestry never meets
+        /// the session's tab: a wake declared, awaited or taken from anyone.
+        AwaitFromAnyone,
+        /// [`wake_atoms::admit`](super::wake_atoms::admit) probes the path before it judges it.
+        CanonicalizeAtRead,
     }
 
     thread_local! {
@@ -136,6 +175,18 @@ pub(crate) mod fault {
         HeldEachChange,
         UntoldOnReturnOnly,
         HeldAcrossHolds,
+        StuckOverNotice,
+        StuckWithoutKey,
+        KFromLastWord,
+        KUnseeded,
+        LateRaise,
+        LevelOnly,
+        ClaimTwice,
+        ParkSecond,
+        ToldBeforeWrite,
+        ReleaseAfterTyped,
+        AwaitFromAnyone,
+        CanonicalizeAtRead,
     }
 
     /// The shipped build: never armed.

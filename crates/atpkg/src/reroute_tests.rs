@@ -2084,7 +2084,7 @@ fn run_stub(stub: &Path, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::p
 
 /// A long-lived session shell whose PATH is `reroute, ~/.local/bin, /opt/homebrew/bin,
 /// pkg/bin` with no `pkg/agents` runs the managed copy the moment the stub decides, inside
-/// aterm, on any one of the four markers.
+/// aterm, on any one of [`crate::hooks::AGENTS_MARKERS`].
 #[cfg(unix)]
 #[test]
 fn an_agents_stub_runs_the_twin_inside_aterm_and_the_users_own_copy_outside() {

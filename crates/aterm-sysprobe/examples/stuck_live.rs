@@ -7,12 +7,12 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use aterm_sysprobe::jobs::{self as probe, JobsReader, ProcFacts, ReadReq};
+use aterm_sysprobe::jobs::{self as probe, AtStart, JobsReader, ProcFacts, ReadReq};
 use aterm_sysprobe::{ProcessReading, processes};
 use aterm_uds::spawnfd::{Child, Stdio, command};
 use aterm_vitals::jobs::{
-    Fd, FdKind, JobCounters, JobProc, JobTab, JobTick, Jobs, JobsView, Knote, KnoteFilter,
-    LanesSeen, Machine, ProcState, SweepProc, TcpState, ThreadState, Verdict,
+    Fd, FdKind, HeldProc, JobCounters, JobProc, JobTab, JobTick, Jobs, JobsView, Knote,
+    KnoteFilter, LanesSeen, Machine, ProcState, SweepProc, TcpState, ThreadState, Verdict,
 };
 
 const TICK: Duration = Duration::from_secs(2);
@@ -241,7 +241,17 @@ impl Host {
                 fds: w.fds,
             })
             .collect();
-        let procs = self.reader.read_all(&reqs).iter().map(job_proc).collect();
+        let procs: Vec<JobProc> = self.reader.read_all(&reqs).iter().map(job_proc).collect();
+        let held = procs
+            .iter()
+            .filter(|p| p.program_check)
+            .map(|p| HeldProc {
+                pid: p.pid,
+                exec: p.start.unwrap_or(0),
+                name: p.exe.clone().unwrap_or_else(|| p.name.clone()),
+                aterm: true,
+            })
+            .collect();
         let lanes = self.reader.lanes();
         Ok(JobTick {
             at_ms,
@@ -258,6 +268,7 @@ impl Host {
                 pipe_flags: lanes.pipe_flags.is_on(),
             },
             process_limit: self.process_limit,
+            held,
         })
     }
 }
@@ -431,5 +442,6 @@ fn job_proc(p: &ProcFacts) -> JobProc {
         }),
         wchan: p.wchan.clone(),
         fds: p.fds.as_ref().map(|fs| fs.iter().map(fd).collect()),
+        program_check: p.program_check() == Some(AtStart::Held),
     }
 }

@@ -277,7 +277,7 @@ fn run(opts: &Opts) -> Result<Reply, String> {
     }
     if let Some(instead) = gone_to(verb) {
         return Err(format!(
-            "`{verb}` is no longer an `aterm drive` command; use {instead}"
+            "`{verb}` is not an `aterm drive` command; use {instead}"
         ));
     }
     if !matches!(verb, "phase" | "answer" | "ledger" | "tape" | "replay") {
@@ -422,7 +422,7 @@ fn clock_anchor(sid: &str) -> Result<ClockAnchor, String> {
         .iter()
         .find(|(p, _)| *p == pid)
         .map(|(_, sock)| sock.clone())
-        .ok_or_else(|| format!("instance {pid} has no control socket to date"))?;
+        .ok_or_else(|| format!("instance {pid} has no control socket"))?;
     let meta = std::fs::metadata(&sock).map_err(|e| format!("{sock}: {e}"))?;
     let when = meta
         .created()
@@ -467,7 +467,8 @@ fn replay_verb(args: &[String]) -> Reply {
     })
 }
 
-/// [`replay_verb`]'s answer: a replay's report and its verdict's exit code, with `--why` one decision explained (exit 0), with `--shadow` each tape's shadow (a batch's every tape said, its refusals among them).
+/// [`replay_verb`]'s answer for every form (plain, counterfactual, `--why`, `--shadow`,
+/// `--check`): the report and its exit code.
 pub(crate) fn replay_reply(args: &[String]) -> Result<Reply, String> {
     replay_reply_with_limit(args, supervise::tape::recover::HELD_MAX as u64)
 }
@@ -571,12 +572,8 @@ fn worst_shadow_code(codes: &[u8]) -> u8 {
         .unwrap_or(0)
 }
 
-/// What `replay`'s arguments name: the tape (and, with `--shadow` or
-/// `--check`, more tapes — with `--check`, directories of them), how to
-/// replay it — strictly, or as a counterfactual under the candidate policy
-/// `--set`/`--policy` name — with `--why` the decision to explain and how to
-/// render it, with `--shadow` every decision decided again, and with
-/// `--check` every tape replayed as a corpus replays it.
+/// `replay`'s parsed arguments: the tape (more under `--shadow` and `--check`, directories
+/// too under `--check`), the options with any `--set`/`--policy` candidate, and `--why`'s point.
 #[derive(Debug)]
 struct ReplayArgs {
     file: PathBuf,
@@ -1061,7 +1058,7 @@ mod tests {
             };
             let err = run(&o).expect_err(verb);
             assert!(
-                err.starts_with(&format!("`{verb}` is no longer an `aterm drive` command")),
+                err.starts_with(&format!("`{verb}` is not an `aterm drive` command; use ")),
                 "{err}"
             );
             assert!(gone_to(verb).is_some());

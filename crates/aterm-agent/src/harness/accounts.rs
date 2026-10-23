@@ -882,16 +882,24 @@ pub fn lone_login_at(path: Option<&Path>, store: &Store, now: i64) -> Option<Str
         .map(str::to_owned)
 }
 
-/// Every login the roster at `path` names as `store` binds it at `now` (the roster as written
-/// where the store's logins cannot be read): a row's `dir`, and each login a renewal bound a row
-/// away from ([`Row::was`]), so [`Roster::row_for_login`] or [`Roster::row_left`] finds a row
-/// for each. The usage tap's logins where the machine has no lone one ([`lone_login_at`]).
+/// Every login a roster of two or more rows at `path` names as `store` binds it at `now`: a
+/// row's `dir`, and each login a renewal bound a row away from ([`Row::was`]), so
+/// [`Roster::row_for_login`] or [`Roster::row_left`] finds a row for each. The usage tap's
+/// logins where the machine has no lone one ([`lone_login_at`]). None where the roster lists
+/// fewer than two rows (one row follows only its current login), and none where the store's
+/// logins cannot be read, since every reader of a reading (the host's [`tap_roster`], the
+/// footer's account gate) refuses that roster too.
 #[must_use]
 pub fn listed_logins_at(path: Option<&Path>, store: &Store, now: i64) -> Vec<String> {
-    let Some(roster) = path.and_then(|path| Roster::load(path).ok()) else {
+    let Some(roster) = path
+        .and_then(|path| Roster::load(path).ok())
+        .filter(Roster::several)
+    else {
         return Vec::new();
     };
-    let roster = store.bound(&roster, now).unwrap_or(roster);
+    let Ok(roster) = store.bound(&roster, now) else {
+        return Vec::new();
+    };
     roster
         .rows
         .iter()

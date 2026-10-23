@@ -1,40 +1,27 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-png: spec recovery from its 25 unit tests
+# aterm-png: the specs its 32 tests sample
 
-> Status 2026-10-20: `src/checksum.rs` no longer builds CRC tables. `Crc32` wraps astream-wire's
-> `hash::crc32_ieee_update` (the same slicing-by-8 tables, built at compile time, every index proved
-> in bounds there), and its state is the finished CRC, starting at `0`. The tables' code moved, but
-> their proof did not, because there is none on either side: astream-wire proves the Level-0
-> obligations of its tables and fold (bounds, arithmetic; astream's
-> `evidence/verify/trust-wire.md`), pins the CRC's value with tests (`wire.hash.crc32-table-equiv`),
-> and has no functional contract on `crc32_ieee_update`. So `crc32-table-generation` stays on this
-> worklist, as the lemma under that missing contract, and `crc32-denotation` cites the contract
-> once astream lands it (astream first: its `docs/ROADMAP.md`, "Functional contracts aterm cites", astream e45b103).
-> Two tests joined: `crc32_known_answers_and_the_seed_convention` and
-> `encoded_chunk_crcs_match_an_independent_crc_and_a_flipped_one_is_refused`.
+This file is the crate's migration worklist. Each of the 20 specs below is to be proved through
+Trust/Clean about the compiled Rust fn, and then the tests it subsumes are deleted; no spec has
+retired a test yet. The specs come from reading every `#[test]` (`src/checksum.rs` 5,
+`src/deflate.rs` 7, `src/encode.rs` 1, `tests/decode_encode.rs` 18, `tests/encode_memory.rs` 1)
+and the code they reach (`checksum.rs`, `deflate.rs`, `decode.rs`, `encode.rs`, `rgba.rs`,
+`lib.rs`, with `aterm_codec::inflate` as an external callee), not from running them.
 
-> Status 2026-10-17: this file is the crate's migration worklist. Each of the 20 specs below is
-> proved through Trust/Clean about the compiled Rust fn, and then the tests it subsumes are
-> deleted. No spec has retired a test yet; the tests-and-gates audit deleted two
-> (`crc32_check_vector`, `indexed_with_trns_expands_to_rgba`), and no row cites them. The
-> 2026-10-17 streaming encoder (rows in, `IDAT` chunks out, a bounded compressor window) added
-> `zlib-stream-split-invariant` and `encode-bounds` and the seven tests they and the reworded rows
-> subsume. Two tests also carry a compression-ratio or
-> repository-corpus assertion that samples no spec; that part moves to a bench when the specs
-> retire the rest of the test (§4).
+Result: **20 specs**, covering **all 32 tests**. **No test is a pure non-spec**, but 2 tests keep a
+quality-metric part that samples no spec (§4, action `move-to-bench`).
 
-Source: `crates/aterm-png` (read only). I read every `#[test]`: `src/checksum.rs` 4,
-`src/deflate.rs` 5 and `tests/decode_encode.rs` 16, for 25 in total, and the code they reach
-(`checksum.rs`, `deflate.rs`, `decode.rs`, `encode.rs`, `rgba.rs`, `lib.rs`, with
-`aterm_codec::inflate` as an external callee). Nothing was compiled or run. The claims below come
-from reading the code.
-
-Result: **20 specs**, covering **all 32 tests** (the 25 first read less the 2 the tests-and-gates
-audit deleted, the seven the streaming encoder added, and the two that came with astream-wire's
-CRC-32). **No test is a pure non-spec**, but 2
-tests keep a quality-metric part that samples no spec (§4, action `move-to-bench`).
+CRC-32 is astream-wire's. `Crc32` wraps `astream_wire::hash::crc32_ieee_update` (slicing-by-8
+tables built at compile time, every index proved in bounds there), and its state is the finished
+CRC, starting at `0`. astream's Lean island `Astream.Wire.TlaSlicingCrc32` kernel-checks the
+tables' recurrence (`crc32_table_row_eq_zero_run`) and the fold's refinement
+(`crc32_update_ref_append`) over its model of the code, but no `ensures` binds them to the
+compiled `crc32_ieee_update`, and aterm cannot cite a theorem across crates (gap 12).
+`vendor/astream/docs/ROADMAP.md`, "Functional contracts aterm cites", lists both as open on
+Trust's side. So `crc32-table-generation` stays on this worklist as the lemma under that
+contract, and `crc32-denotation` cites the contract once it exists.
 
 Gap numbers are the rows of `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (the
 installed seal publishes no Lean-discharged row) blocks every spec, so it is listed first on every
@@ -76,8 +63,8 @@ Columns: `id`, `kind`, `functions`, `statement`, `subsumes` (primary tests; all 
 
 ```tsv
 id	kind	functions	statement	subsumes	rust features	blocking gaps
-crc32-table-generation	table-property	astream_wire::hash::{crc32_row0,crc32_next_row,crc32_tables} (moved 2026-10-20; was checksum::tables)	∀ n<256: T[0][n] == crc_step*(n, []) after 8 bit-steps of n. ∀ 1≤k<8: T[k][n] == (T[k-1][n] >> 8) ^ T[0][T[k-1][n] as u8]. Hence T[k][n] is the CRC state after folding byte n then k zero bytes from state 0 (the slice-by-8 lemma). Unproved anywhere: the code is astream-wire's (a const evaluation, every index a u8, so its bounds are proved there), but astream proves no functional fact about it. It is the lemma under the refinement contract astream-wire has to land on crc32_ieee_update, and is proved there, in astream first; it stays on this worklist until then.	(none; lemma for crc32-denotation, through astream-wire's missing contract)	const fn loops over [u32;256] rows indexed by u8, shifts, xor; no runtime init (gap 8 left with the OnceLock)	0,3,5,7 (on astream-wire's side)
-crc32-denotation	refinement	checksum::Crc32::{new,update,finish,of}	A state is the finished CRC of the bytes folded so far: new() == crc_ref([]) == 0, and s == crc_ref(p) ⇒ after s.update(bytes), s' == crc_ref(p ++ bytes), citing a refinement ensures on astream-wire's hash::crc32_ieee_update (crc32_ieee_update(crc_ref(p), d) == crc_ref(p ++ d)) that does not exist yet: it is the slicing loop's invariant over crc32-table-generation, astream's to land first. So update is a monoid action: update(a++b) == update(a);update(b) for every split. ∀ parts: &[&[u8]]: Crc32::of(parts) == crc_ref(concat(parts)). Corollaries by decide: crc_ref("123456789") == 0xCBF4_3926, crc_ref("IEND") == 0xAE42_6082.	src/checksum.rs::crc32_is_associative_over_splits, slicing_agrees_with_the_byte_at_a_time_definition_at_every_alignment, crc32_known_answers_and_the_seed_convention	&mut self two-state update, a cross-crate const fn call, for over a slice of slices	0,1,2,3,5,7,12 + the astream-wire contract
+crc32-table-generation	table-property	astream_wire::hash::{crc32_row0,crc32_next_row,crc32_tables}	∀ n<256: T[0][n] == crc_step*(n, []) after 8 bit-steps of n. ∀ 1≤k<8: T[k][n] == (T[k-1][n] >> 8) ^ T[0][T[k-1][n] as u8]. Hence T[k][n] is the CRC state after folding byte n then k zero bytes from state 0 (the slice-by-8 lemma). The code is astream-wire's (a const evaluation, every index a u8, so its bounds are proved there); astream's Lean island proves the lemma over its model (crc32_table_row_eq_zero_run), but no contract binds it to the compiled tables. It is the lemma under the refinement ensures crc32_ieee_update lacks, and stays on this worklist until astream lands that.	(none; lemma for crc32-denotation, through astream-wire's missing contract)	const fn loops over [u32;256] rows indexed by u8, shifts, xor; no runtime init, so no gap 8	0,3,5,7 (on astream-wire's side)
+crc32-denotation	refinement	checksum::Crc32::{new,update,finish,of}	A state is the finished CRC of the bytes folded so far: new() == crc_ref([]) == 0, and s == crc_ref(p) ⇒ after s.update(bytes), s' == crc_ref(p ++ bytes), citing a refinement ensures on astream-wire's hash::crc32_ieee_update (crc32_ieee_update(crc_ref(p), d) == crc_ref(p ++ d)) that does not exist yet: it is the slicing loop's invariant over crc32-table-generation, astream's to land once Trust admits slice-fold specs (astream's Lean model already proves it, crc32_update_ref_append). So update is a monoid action: update(a++b) == update(a);update(b) for every split. ∀ parts: &[&[u8]]: Crc32::of(parts) == crc_ref(concat(parts)). Corollaries by decide: crc_ref("123456789") == 0xCBF4_3926, crc_ref("IEND") == 0xAE42_6082.	src/checksum.rs::crc32_is_associative_over_splits, slicing_agrees_with_the_byte_at_a_time_definition_at_every_alignment, crc32_known_answers_and_the_seed_convention	&mut self two-state update, a cross-crate const fn call, for over a slice of slices	0,1,2,3,5,7,12 + the astream-wire contract
 adler32-no-overflow	no-panic	checksum::Adler32::update	∀ data of any length and every state reached by earlier updates, no += in Adler32::update overflows u32. Invariant: at the start of each NMAX=5552 chunk a<65521 ∧ b<65521; inside a chunk of n≤5552 bytes a ≤ 65520+255n and b ≤ 65520 + Σ_{k=1..n}(65520+255k) < 2^32. With overflow checks on, it never panics.	(none; lemma for adler32-denotation)	nested for over data.chunks(NMAX) and chunk bytes, u32 arithmetic, %; loop invariant with a nonlinear bound	0,1,3,7
 adler32-denotation	refinement	checksum::Adler32::{new,update,finish}	∀ splits d1..dn of data: new(), update(d1)..update(dn), finish() == adler_ref(data): both sums are reduced at the end of every update, so a split anywhere folds the same. Reducing once per NMAX bytes equals reducing per byte, since mod 65521 is a ring homomorphism and the sums never overflow (adler32-no-overflow). Corollaries by decide: adler32("") == 1, adler32("Wikipedia") == 0x11E6_0398.	src/checksum.rs::adler32_check_vectors, adler32_is_associative_over_splits	slice content, chunks iterator, nested loops, modular arithmetic, shift/or	0,1,3,5,7
 deflate-code-tables	table-property	deflate::{fixed_litlen,length_code,distance_code,BitWriter::huffman}	(a) requires s ≤ 287: fixed_litlen(s) == the RFC 1951 §3.2.6 fixed code (0x30+s/8 bits for 0..=143; 0x190+(s-144)/9 for 144..=255; s-256/7 for 256..=279; 0xC0+(s-280)/8 for 280..=287), a prefix-free canonical code. (b) ∀ 3≤len≤258: length_code(len) == (c,e,n) with 257≤c≤285, n == LENGTH_EXTRA[c-257], e < 2^n, LENGTH_BASE[c-257]+e == len. (c) requires 1≤d≤32768: distance_code(d) == (c,e,n) with c≤29, n == DIST_EXTRA[c], e < 2^n, DIST_BASE[c]+e == d. (d) in (b) and (c), c is the unique RFC 1951 §3.2.5 code for the value.	(none directly; covers the d=32768 case roundtrips_extreme_match_geometry claims but misses, §5.1)	match on ranges, while loop down a const array, u16/u32 casts, bit-reversal loop in huffman	0,3,5,7
@@ -85,7 +72,7 @@ bitwriter-denotation	refinement	deflate::BitWriter::{new,bits,huffman,finish}	In
 lz77-tokens-reconstruct	invariant	deflate::{ZlibStream::compress,hash3}	∀ data, with Tok the emitted tokens: (a) every Match(len,dist) at position i has 3≤len≤258, 1≤dist≤32768=WINDOW, dist≤i, i+len≤data.len(), and data[i-dist+j] == data[i+j] ∀ j<len. (b) expand(Tok) == data. (c) no index is out of bounds and no arithmetic overflows, via head[h], prev[k & (WINDOW−1)] ∈ {usize::MAX} ∪ [0,i), candidate < i whenever ≠ usize::MAX, and base ≤ i − WINDOW ≤ candidate for every candidate read (window[p − base] is input byte p).	(none; lemma for zlib-compress-roundtrip)	Vec<usize> hash heads and a WINDOW-entry chain ring, nested while with break/continue, slice indexing, iter_mut().enumerate().skip().take(); ghost token list	0,1,3,5,7
 zlib-compress-roundtrip	round-trip	deflate::ZlibStream::{new,write,compress,finish}	∀ data: Inflate(Z(write(data))) == Some(data): the stream is one final fixed-Huffman block encoding Tok(data) then end-of-block. Composes bitwriter-denotation, deflate-code-tables and lz77-tokens-reconstruct. Corollary once aterm_codec::inflate has its own refinement spec (gap 12): ∀ cap ≥ data.len(), zlib_decompress(&Z(write(data)), cap) == Ok(data).	src/deflate.rs::roundtrips_edge_shapes, roundtrips_extreme_match_geometry, roundtrips_incompressible_noise, roundtrips_image_like_input (round-trip half)	Vec<u8> content, composition of callee ensures, Lean RFC 1951 inflate model bound to Rust bytes	0,1,4,5,7,10,12
 zlib-framing	contract	deflate::ZlibStream::{new,finish}	∀ data, z = Z(write(data)): z.len() ≥ 6; z[0] == 0x78 (CM=8, CINFO=7); z[1] == 0x01 (FDICT=0, FLEVEL=0); (z[0]*256+z[1]) % 31 == 0; the last four bytes of z == adler_ref(data).to_be_bytes() (by adler32-denotation).	src/deflate.rs::zlib_header_is_well_formed	Vec content (prefix/suffix), extend_from_slice, to_be_bytes	0,1,4
-zlib-stream-split-invariant	equivalence	deflate::ZlibStream::{new,write,output,compress,finish}, encode::{RowFilter::filter,stream_rows}	(a) ∀ data, ∀ splits d1..dn of data: Z(write(d1)..write(dn)) == Z(write(data)) == the whole-buffer stream (one prev link per input position, the 2026-10-16 compressor): with LOOKAHEAD = MAX_MATCH+MIN_MATCH bytes past every decided position, each comparison with the window end answers as against the whole input's length, and a ring link read for a candidate within WINDOW was never overwritten. (b) ∀ w,h,color,px: the concatenated IDAT payloads of enc8(color,w,h,px) == Z(write(F)) where F is the whole-image filtered stream (the per-row min-|residual| heuristic); every IDAT but the last is IDAT_CHUNK = 65536 bytes.	src/deflate.rs::streaming_output_is_byte_identical_to_the_whole_buffer_compressor, src/encode.rs::the_streamed_idat_is_the_whole_image_encoders_stream	Vec drain/extend over a bounded window, absolute positions with base offset, ring index pos & (WINDOW−1), ghost whole-buffer compressor	0,1,3,5,7
+zlib-stream-split-invariant	equivalence	deflate::ZlibStream::{new,write,output,compress,finish}, encode::{RowFilter::filter,stream_rows}	(a) ∀ data, ∀ splits d1..dn of data: Z(write(d1)..write(dn)) == Z(write(data)) == the whole-buffer stream (one prev link per input position): with LOOKAHEAD = MAX_MATCH+MIN_MATCH bytes past every decided position, each comparison with the window end answers as against the whole input's length, and a ring link read for a candidate within WINDOW was never overwritten. (b) ∀ w,h,color,px: the concatenated IDAT payloads of enc8(color,w,h,px) == Z(write(F)) where F is the whole-image filtered stream (the per-row min-|residual| heuristic); every IDAT but the last is IDAT_CHUNK = 65536 bytes.	src/deflate.rs::streaming_output_is_byte_identical_to_the_whole_buffer_compressor, src/encode.rs::the_streamed_idat_is_the_whole_image_encoders_stream	Vec drain/extend over a bounded window, absolute positions with base offset, ring index pos & (WINDOW−1), ghost whole-buffer compressor	0,1,3,5,7
 encode-bounds	contract	encode::{max_encoded_len,encoder_scratch_len,pending_capacity,stream_rows,write_full_idat_chunks}, deflate::{STATE_BYTES,ZlibStream::with_output_capacity,ZlibStream::write}	∀ w,h,color,px: |enc8(color,w,h,px)| ≤ max_encoded_len(w,h,color) (every filtered byte at most 9 bits; a match costs ≤ 9 bits per byte it covers). While it encodes, a Writer holds at most encoder_scratch_len(w,color) bytes beside its input and its sink: two scanlines, the filter rows, the pending output (one allocation of IDAT_CHUNK plus one row's worst case and the stream's tail, reserved before the first row and never reallocated: each flush leaves < IDAT_CHUNK), and STATE_BYTES (hash heads, chain ring, a window of capacity 2·WINDOW + PIECE + LOOKAHEAD that never reallocates).	tests/decode_encode.rs::max_encoded_len_bounds_every_encode, tests/encode_memory.rs::an_encode_holds_no_copy_of_the_image, src/deflate.rs::the_window_never_outgrows_its_capacity	checked usize arithmetic, Vec capacity, global-allocator accounting (test only)	0,1,3,7,8
 decode-total	no-panic	decode::{Decoder::read_info,Reader::parse,read_chunk,Reader::next_frame,unfilter,read_sample,Reader::transform_pixel,write_pixel}, rgba::{decode_rgba8,to_rgba8}	∀ bytes, T, L: read_info returns Ok or Err without panicking. ∀ Reader r it returns and buf with len ≥ r.output_buffer_size(): r.next_frame(buf) returns Ok or Err without panicking and allocates at most O(L.bytes) beyond the input. ∀ max_dimension: decode_rgba8(bytes, max_dimension) returns Some or None without panicking.	tests/decode_encode.rs::the_repository_corpus_decodes_and_round_trips (decode half)	slices, Vec, loops over chunks/rows/passes, &mut self, io::Read over &[u8], Option/Result, bit packing at depths 1/2/4/8/16	0,1,2,3,5,7,8,11
 decode-denotation	refinement	decode::{Decoder::read_info,Reader::next_frame,output_info,Reader::transform_pixel,build_palette_lut,mask_trns_key,read_sample,unfilter,paeth_predictor,adam7_pass_size,Reader::place_row,Reader::place_interlaced_row}	∀ PngFile F, T, and L with L.bytes ≥ |PngSem(F,T)| and len(bytes(F)) ≤ L.encoded_bytes(): Dec(bytes(F),T,L) == Ok(PngSem(F,T)), where PngSem includes: (i) output (colour, depth, line_size) is output_info's table: EXPAND makes Indexed → Rgb (Rgba with tRNS), Grayscale<8 → 8 bits (GrayscaleAlpha with tRNS), Rgb → Rgba with tRNS; STRIP_16 takes the high byte of depth 16. (ii) an index ≥ the palette entry count reads RGB (0,0,0), alpha 255 when tRNS is present. (iii) an indexed tRNS longer than the palette is present but empty: every alpha is 255. (iv) a grey/RGB colour key at depth < 16 is masked with 0x00FF and compared to the raw sample. (v) a zero-length ancillary chunk is absent and does not change the output shape. (vi) a sub-8-bit grey sample under EXPAND scales as v*255/(2^d-1).	tests/decode_encode.rs::decodes_the_whole_format_matrix_to_its_pinned_digest, an_index_past_the_palette_renders_black, a_trns_longer_than_the_palette_is_ignored, an_out_of_range_trns_key_still_matches_its_low_byte, a_zero_length_trns_is_absent	enums (ColorType/BitDepth), Option<Vec<u8>> palette/tRNS, packed bit reads, nested Adam7 loops, &mut [u8] output, Lean PNG model with list/inductive carriers, cross-crate inflate stream	0,1,2,3,4,5,7,10,12
@@ -155,7 +142,7 @@ No test is a pure non-spec. Two mixed tests keep an assertion no spec covers.
 | test | why | action |
 |---|---|---|
 | `src/deflate.rs::roundtrips_image_like_input` | `zlib-compress-roundtrip` covers its round-trip half. What is left is that filtered scanlines compress at least 20x: a compression-ratio quality metric on one fixed input, not a correctness property. | **move-to-bench** (the ratio); delete the test once the spec is proved |
-| `tests/decode_encode.rs::the_repository_corpus_decodes_and_round_trips` | `decode-total` and `encode-decode-roundtrip` cover its decode and round-trip halves. What is left is the `encoded_total < raw_total` ratio; the ≥24 tracked-file and ≥10 image count floors (repository contents pinned through a filesystem walk) are dropped. | **move-to-bench** (corpus ratio); delete the test once the specs are proved |
+| `tests/decode_encode.rs::the_repository_corpus_decodes_and_round_trips` | `decode-total` and `encode-decode-roundtrip` cover its decode and round-trip halves. What is left is the `encoded_total < raw_total` ratio. | **move-to-bench** (corpus ratio); delete the test once the specs are proved |
 
 Count by action: move-to-bench 2, delete 0, become-spec 0.
 
@@ -167,22 +154,17 @@ Count by action: move-to-bench 2, delete 0, become-spec 0.
    the candidate at position 0 (distance 32768) lies past `MAX_CHAIN=32`, and `GOOD_ENOUGH=32`
    stops the search early anyway. Distance code 29 with 13 extra bits is never produced.
    `deflate-code-tables` (c) covers it for every d; the test's claim should be corrected or dropped.
-2. **`distance_code`'s precondition is vacuous for 0.**
-   `debug_assert!((1..=32768).contains(&u32::from(dist).max(1)))` lifts `dist == 0` into range. The
-   intended precondition `1 ≤ dist ≤ 32768` should become the `requires` of `distance_code`.
-3. **`fixed_litlen` has an unstated precondition.** Its `_` arm silently maps symbols > 287 to
-   `0xC0+(s-280)`, and the comment says such symbols cannot be produced. That is
-   `requires symbol ≤ 287`, and it belongs on the function.
+2. **`distance_code`'s precondition is only a `debug_assert!`.** `1 ≤ dist ≤ 32768` should become
+   the `requires` of `distance_code`, as `3 ≤ len ≤ 258` should of `length_code`.
+3. **`fixed_litlen` has an unstated precondition.** Its `_` arm maps symbols > 287 to
+   `0xC0+(s-280)` without complaint. That is `requires symbol ≤ 287`, and it belongs on the
+   function.
 4. **`decodes_the_whole_format_matrix_to_its_pinned_digest` is a golden digest with no reference.**
-   `MATRIX_DIGEST` (FNV) was checked against the `png` crate once, when that crate was replaced; the
-   reference is gone, so the digest detects change but cannot show correctness.
-   `decode-denotation` (the `PngSem` model) is the spec that replaces it.
+   No reference decoder stands behind `MATRIX_DIGEST` (FNV), so the digest detects change but
+   cannot show correctness. `decode-denotation` (the `PngSem` model) is the spec that replaces it.
 5. **`encoded_input_cannot_bypass_the_pixel_budget` over-pins the implementation.** It asserts
    `consumed == encoded_limit + 1` exactly, which pins `read_to_end(take(limit+1))`. The spec is
    only "consumes at most `encoded_bytes()+1`".
-6. **`an_index_past_the_palette_renders_black` says "opaque black".** Without tRNS the output is RGB
-   with no alpha, so "opaque" holds only trivially; the tRNS case (alpha 255) is the one where it
-   means something, and `decode-denotation` (ii) states both.
 
 ## 6. Proof order (easiest high-value first)
 
@@ -193,9 +175,9 @@ remaining gap set and by what each proof unlocks.
    evaluation once the loops and casts are admitted (gap 3). It forces the two missing `requires`
    (§5.2, §5.3) and is a lemma of `zlib-compress-roundtrip`.
 2. **`crc32-table-generation`** (0,3,5,7) and the slicing loop's refinement contract on
-   `crc32_ieee_update`, both in astream-wire and landing in astream first (since 2026-10-20 the
-   tables are its code, compile-time with no `OnceLock`, so gap 8 is gone; neither proof exists on
-   either side yet). Then **`crc32-denotation`** (0,1,2,3,5,7,12): the wrapper's `of` loop plus
+   `crc32_ieee_update`, both astream-wire's: its Lean model proves both, and binding them to the
+   Rust code waits on Trust admitting slice-fold specs (the tables are built at compile time, so
+   gap 8 does not apply). Then **`crc32-denotation`** (0,1,2,3,5,7,12): the wrapper's `of` loop plus
    one cross-crate citation (gap 12) of that contract. It retires 3 tests and feeds
    `chunk-structure`.
 3. **`adler32-no-overflow`** (0,1,3,7) then **`adler32-denotation`** (0,1,3,5,7). One nonlinear

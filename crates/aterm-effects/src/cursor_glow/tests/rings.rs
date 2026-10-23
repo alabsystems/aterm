@@ -116,12 +116,15 @@ fn every_style_lands_a_veil_ring_on_light() {
     }
 }
 
+/// On dark a capped-impact landing's light reaches at least 1.8 times as far
+/// as a hop's, every style: the round blooms (Fire, Water) by their radius,
+/// the veil held to its row by its reach along it.
 #[test]
 fn classic_landing_ring_expands_wider_with_the_jump() {
     let g = geom();
     let born = Instant::now();
-    let extent = |style: GlowStyle, dark: bool, scale: f32| -> i32 {
-        let c = cfg(style, dark);
+    let extent = |style: GlowStyle, scale: f32| -> i32 {
+        let c = cfg(style, true);
         let glow = CursorGlow {
             ring: Some(Ring {
                 cx: 100.0,
@@ -154,23 +157,28 @@ fn classic_landing_ring_expands_wider_with_the_jump() {
             .unwrap_or(0);
         quads.max(halos)
     };
-    for (style, dark) in [
-        (GlowStyle::Phaser, true),
-        (GlowStyle::Phaser, false),
-        (GlowStyle::Fire, true),
+    for style in [
+        GlowStyle::Phaser,
+        GlowStyle::Comet,
+        GlowStyle::Sparkle,
+        GlowStyle::Laser,
+        GlowStyle::Lumen,
+        GlowStyle::Beam,
+        GlowStyle::Fire,
+        GlowStyle::Water,
     ] {
-        let hop = extent(style, dark, 1.0);
-        let leap = extent(style, dark, 3.5);
-        assert!(hop > 0, "{style:?} dark={dark}: the hop ring draws");
+        let hop = extent(style, 1.0);
+        let leap = extent(style, 3.5);
+        assert!(hop > 0, "{style:?}: the hop ring draws");
         assert!(
             leap as f32 >= hop as f32 * 1.8,
-            "{style:?} dark={dark}: a capped-impact ring reaches {leap} px, a hop {hop} px"
+            "{style:?}: a capped-impact ring reaches {leap} px, a hop {hop} px"
         );
     }
 }
 
 #[test]
-fn the_dark_landing_ring_is_a_soft_round_bloom() {
+fn the_dark_landing_ring_is_a_soft_bloom_in_its_row() {
     let g = geom();
     let born = Instant::now();
     let c = cfg(GlowStyle::Phaser, true);
@@ -226,9 +234,10 @@ fn the_dark_landing_ring_is_a_soft_round_bloom() {
             steepest(&across)
         );
         let (w, h) = (span(&across), span(&down));
+        let reach = (CursorGlow::LIGHT_VEIL_REACH_CELLS * g.cw as f32) as usize;
         assert!(
-            (h as f32) >= 0.7 * w as f32 && (h as f32) <= 1.05 * w as f32,
-            "round at {ms}ms: {w} px across, {h} down"
+            h > 0 && h <= g.ch && w <= 2 * reach + 2,
+            "in its row at {ms}ms: {w} px across, {h} down"
         );
         let s = ((0.6 + 1.0 * (ms as f32 / 300.0)) * g.ch as f32) as i32;
         let premul = aterm_render::premul_rgb(c.accent, 160);
@@ -385,6 +394,100 @@ fn a_landing_at_the_grids_edge_fades_before_the_edge() {
             "control: {style:?} unfitted lights the edge at only {edge} of {peak}"
         );
     }
+}
+
+/// A DARK FIRE'S LANDING FLASH BURNS AS AN EMBER TO ITS RIM: every pixel
+/// its bloom lights over a dark page, through its life, is lit an
+/// orange-red (the light it adds at most 30 degrees of hue, saturated),
+/// never the khaki a thin amber lays over the dark where a bloom thins out
+/// (a dim `#352b1c` disc stood around a jump's landing, 2026-10-22).
+/// Negative control: the same blooms in the white-hot flash cooling to
+/// amber that it was light khaki pixels.
+#[test]
+fn a_dark_fire_landing_flash_burns_as_an_ember_to_its_rim() {
+    let g = tall_geom();
+    let caret = (3u16, 12u16);
+    let (cx, cy) = g.cell_center(caret.0, caret.1);
+    let c = cfg(GlowStyle::Fire, true);
+    // The light a pixel adds over the page, read when it shows (the
+    // largest channel at least 10, past the halo's rounding): warm when it
+    // is an orange-red.
+    let warm = |p: u32, bg: u32| {
+        let ch = |sh: u32| ((p >> sh) & 0xff).saturating_sub((bg >> sh) & 0xff);
+        let most = ch(16).max(ch(8)).max(ch(0));
+        let (hue, sat, _) = crate::color_math::rgb2hsv((ch(16) << 16) | (ch(8) << 8) | ch(0));
+        (most >= 10).then_some(hue <= 30.0 && sat >= 0.6)
+    };
+    let (mut lit, mut cold, mut control) = (0usize, Vec::new(), 0usize);
+    for bg in [0x0011_1318u32, 0x001A_1B26] {
+        let born = Instant::now();
+        let glow = CursorGlow {
+            ring: Some(Ring {
+                cx,
+                cy,
+                born,
+                life: 0.30,
+                scale: 1.6,
+                caret: Some(caret),
+            }),
+            ..Default::default()
+        };
+        for ms in [10u64, 50, 120, 200, 270] {
+            let (mut out, mut halos) = (Vec::new(), Vec::new());
+            glow.emit_ring(
+                born + Duration::from_millis(ms),
+                &c,
+                g,
+                Some(caret),
+                &mut out,
+                &mut halos,
+            );
+            let t = ms as f32 / 300.0;
+            let flash = CursorGlow::fire_dark_flash(t);
+            let hot = fire_ramp(0.95 - 0.55 * t);
+            let was: Vec<RainHalo> = halos
+                .iter()
+                .map(|h| {
+                    let a = ((h.color >> 16) & 0xff) * 255 / ((flash >> 16) & 0xff).max(1);
+                    RainHalo {
+                        color: aterm_render::premul_rgb(hot, a.min(255) as u8),
+                        ..*h
+                    }
+                })
+                .collect();
+            for (halos, is_control) in [(&halos, false), (&was, true)] {
+                let mut glass = Glass::new(g, bg);
+                glass.add_halos(halos);
+                glass.add_quads(&out);
+                for y in 0..i32::from(g.win_h) {
+                    for x in 0..i32::from(g.win_w) {
+                        let Some(ok) = warm(glass.at(y, x) & 0x00FF_FFFF, bg) else {
+                            continue;
+                        };
+                        if is_control {
+                            control += usize::from(!ok);
+                            continue;
+                        }
+                        lit += 1;
+                        if !ok {
+                            cold.push((bg, ms, x, y, glass.at(y, x) & 0x00FF_FFFF));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(lit > 200, "fixture: the flash lights {lit} px");
+    assert!(
+        cold.is_empty(),
+        "{} of {lit} lit px are no ember's colour, first (bg, ms, x, y, px) {:x?}",
+        cold.len(),
+        cold.first()
+    );
+    assert!(
+        control > 50,
+        "control: the white-hot flash cooling to amber lights only {control} khaki px"
+    );
 }
 
 #[test]
@@ -660,6 +763,171 @@ fn a_paper_landing_veil_keeps_the_caret_row_through_a_hidden_caret() {
     assert!(lit_hidden > 0, "the hidden-caret frame lays no veil at all");
 }
 
+/// THE DARK LANDING VEIL STAYS IN THE CARET'S CELL AND ROW, IN ITS STYLE'S
+/// HUE (2026-10-22, the trail gallery's `enter-bottom` at 120 ms: after an
+/// Enter at the bottom row the bloom, carried up with the scrolled text,
+/// stood as a round grey haze two rows over the caret on `$ echo` and `the
+/// qu`: sparkle `#303236`, comet `#2d3237`, phaser and lumen `#1f322f`,
+/// laser `#272437`). The dark twin of the paper tests above, on two dark
+/// themes, each veiled style with its own colour and the accent a window
+/// derives from it (brightened 1.5x, near white). Through the whole frame
+/// step (a jump lays the landing on the bottom row, the Enter's two scrolls
+/// carry it two rows up with the text, and one frame the host withholds the
+/// caret) the landing's light lies over none of the rows above the caret's. And the ring
+/// itself, landed two rows up where the scroll left it: every pixel it lays
+/// lies in the caret's row within [`CursorGlow::LIGHT_VEIL_REACH_CELLS`] of
+/// its centre (graded by the landing's impact, [`classic_ring_radius_factor`]), the theme's text over it keeps 4.5:1, and its light is its
+/// style's hue (its lift over the page saturated 0.6 or more). NEGATIVE
+/// CONTROL: the veil as it was ([`CursorGlow::veil_unbound`]) lies over the
+/// rows above, leaves the caret's row, and its light is grey.
+#[test]
+fn a_dark_landing_veil_stays_in_the_caret_row_in_its_hue() {
+    let g = tall_geom();
+    let (cw, ch) = (g.cw as i32, g.ch as i32);
+    let bottom = g.rows as u16 - 1;
+    let caret = (bottom, 2u16);
+    let (ccx, _) = g.cell_center(caret.0, caret.1);
+    let (lx, ly) = g.cell_center(caret.0 - 2, caret.1);
+    let reach = (CursorGlow::LIGHT_VEIL_REACH_CELLS * cw as f32 * classic_ring_radius_factor(1.6))
+        as i32
+        + 1;
+    // A pixel's light over the page: its saturation, and its largest channel.
+    let lift = |p: u32, bg: u32| {
+        let ch = |sh: u32| ((p >> sh) & 0xff).saturating_sub((bg >> sh) & 0xff);
+        let rgb = (ch(16) << 16) | (ch(8) << 8) | ch(0);
+        (
+            crate::color_math::rgb2hsv(rgb).1,
+            ch(16).max(ch(8)).max(ch(0)),
+        )
+    };
+    let (mut drawn, mut above, mut escapes, mut grey) = (0usize, 0usize, 0usize, 0usize);
+    for (fg, bg) in [(0x00D0_D0D0, 0x0011_1318), (0x00C8_D3F5, 0x001A_1B26)] {
+        for style in [
+            GlowStyle::Sparkle,
+            GlowStyle::Comet,
+            GlowStyle::Lumen,
+            GlowStyle::Phaser,
+            GlowStyle::Laser,
+        ] {
+            let mut c = cfg(style, true);
+            (c.theme_fg, c.theme_bg) = (fg, bg);
+            c.color = crate::cursor_fx::canonical_glow_color(style).unwrap_or(0x00C8_F0D0);
+            c.accent = crate::cursor_fx::brighten(c.color, 1.5);
+            for unbound in [false, true] {
+                let mut glow = CursorGlow {
+                    veil_unbound: unbound,
+                    ..Default::default()
+                };
+                let mut out = Vec::new();
+                let t0 = Instant::now();
+                glow.tick(Some((bottom, 24)), t0, &c, g, &mut out);
+                let t1 = t0 + Duration::from_millis(16);
+                glow.note_synthetic_move(t1);
+                glow.tick(Some(caret), t1, &c, g, &mut out);
+                assert!(
+                    glow.ring.is_some(),
+                    "{style:?}: fixture: the jump lays a landing"
+                );
+                glow.note_scroll(1);
+                glow.note_scroll(1);
+                for (ms, cur) in [(32u64, Some(caret)), (48, None), (120, Some(caret))] {
+                    let now = t1 + Duration::from_millis(ms);
+                    glow.tick(cur, now, &c, g, &mut out);
+                    // The landing's own light, as the frame laid it (the
+                    // frame's other halos, a sparkle's stars, fly free).
+                    let (mut ring_out, mut halos) = (Vec::new(), Vec::new());
+                    glow.emit_ring(now, &c, g, cur, &mut ring_out, &mut halos);
+                    let mut glass = Glass::new(g, bg);
+                    glass.add_halos(&halos);
+                    for y in 0..i32::from(bottom) * ch {
+                        for x in 0..i32::from(g.win_w) {
+                            if glass.at(y, x) & 0x00FF_FFFF == bg {
+                                continue;
+                            }
+                            assert!(
+                                unbound,
+                                "{style:?} on {bg:06x} +{ms} ms, caret {cur:?}: the landing \
+                                 lights ({x}, {y}), over the rows above the caret's"
+                            );
+                            above += 1;
+                        }
+                    }
+                }
+                let born = Instant::now();
+                let ring = CursorGlow {
+                    ring: Some(Ring {
+                        cx: lx,
+                        cy: ly,
+                        born,
+                        life: 0.40,
+                        scale: 1.6,
+                        caret: Some(caret),
+                    }),
+                    veil_unbound: unbound,
+                    ..Default::default()
+                };
+                for ms in [30u64, 120] {
+                    let (mut out, mut halos) = (Vec::new(), Vec::new());
+                    ring.emit_ring(
+                        born + Duration::from_millis(ms),
+                        &c,
+                        g,
+                        Some(caret),
+                        &mut out,
+                        &mut halos,
+                    );
+                    let mut glass = Glass::new(g, bg);
+                    glass.add_halos(&halos);
+                    glass.add_quads(&out);
+                    for y in 0..i32::from(g.win_h) {
+                        for x in 0..i32::from(g.win_w) {
+                            let p = glass.at(y, x) & 0x00FF_FFFF;
+                            if p == bg {
+                                continue;
+                            }
+                            let inside =
+                                y / ch == i32::from(caret.0) && (x - ccx as i32).abs() <= reach;
+                            let (sat, most) = lift(p, bg);
+                            if unbound {
+                                escapes += usize::from(!inside);
+                                grey += usize::from(most >= 8 && sat < 0.4);
+                                continue;
+                            }
+                            drawn += 1;
+                            assert!(
+                                inside,
+                                "{style:?} on {bg:06x}, {ms} ms: the veil at ({x}, {y}) \
+                                 leaves the caret's cell and row"
+                            );
+                            let k = crate::color_math::contrast_ratio(fg, p);
+                            assert!(
+                                k >= 4.5,
+                                "{style:?} on {bg:06x}, {ms} ms: the text over the veil at \
+                                 ({x}, {y}) reads {k:.2}:1"
+                            );
+                            assert!(
+                                most < 8 || sat >= 0.6,
+                                "{style:?} on {bg:06x}, {ms} ms: the veil at ({x}, {y}) is \
+                                 {p:06x}, its light saturated only {sat:.2}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(drawn > 0, "the dark landing lays no veil");
+    assert!(
+        above > 0,
+        "control: the unbound veil lies over no row above the caret's"
+    );
+    assert!(
+        escapes > 0,
+        "control: the unbound veil stays in the caret's row"
+    );
+    assert!(grey > 0, "control: the unbound veil's light is never grey");
+}
+
 #[test]
 fn the_dark_fire_landing_is_a_brief_flash() {
     let g = geom();
@@ -768,4 +1036,87 @@ fn a_ring_on_the_last_row_melts_into_the_box_edge() {
         twin > 0,
         "control: mid-grid the ring lays nothing at that offset"
     );
+}
+
+/// A COLOUR THE USER CHOSE LANDS AS ITSELF (2026-10-23, review): the dark
+/// landing veil re-hued a near-grey ring colour to the trail's and pushed
+/// every colour to full value and a clean chroma, so a pinned white accent
+/// landed green and a pinned `#8040c0` Laser `#9f40ff`. With the colour chosen ([`ColourPins`]),
+/// the veil's light keeps the chosen colour's hue and saturation (a grey
+/// stays grey), held legible by its coverage alone. Negative control: the
+/// same colours unchosen are re-hued or saturated.
+#[test]
+fn a_chosen_colour_lands_as_itself_on_dark() {
+    let g = geom();
+    let born = Instant::now();
+    let pinned_trail = ColourPins {
+        trail: true,
+        accent: false,
+    };
+    let pinned_accent = ColourPins {
+        trail: false,
+        accent: true,
+    };
+    let cases = [
+        (
+            GlowStyle::Laser,
+            0x0090_70B0u32,
+            0x0090_70B0u32,
+            pinned_trail,
+        ),
+        (GlowStyle::Comet, 0x0050_FA7B, 0x00FF_FFFF, pinned_accent),
+        (GlowStyle::Phaser, 0x0050_FA7B, 0x0060_6060, pinned_accent),
+    ];
+    // The veil's colour: the strongest halo's light unpremultiplied.
+    let veil = |style: GlowStyle, color: u32, accent: u32, pins: ColourPins| -> u32 {
+        let mut c = cfg(style, true);
+        (c.color, c.accent) = (color, accent);
+        let glow = CursorGlow {
+            ring: Some(Ring {
+                cx: 100.0,
+                cy: 40.0,
+                born,
+                life: 0.30,
+                scale: 1.0,
+                caret: Some((2, 12)),
+            }),
+            colour_pins: pins,
+            ..Default::default()
+        };
+        let (mut out, mut halos) = (Vec::new(), Vec::new());
+        glow.emit_ring(
+            born + Duration::from_millis(60),
+            &c,
+            g,
+            Some((2, 12)),
+            &mut out,
+            &mut halos,
+        );
+        let h = halos
+            .iter()
+            .max_by_key(|h| h.color & 0x00FF_FFFF)
+            .expect("the landing lays a veil");
+        h.color & 0x00FF_FFFF
+    };
+    let hsv = |c: u32| crate::color_math::rgb2hsv(c);
+    for (style, color, accent, pins) in cases {
+        let worn = if style == GlowStyle::Laser {
+            color
+        } else {
+            accent
+        };
+        let (h0, s0, _) = hsv(worn);
+        let (h, s, _) = hsv(veil(style, color, accent, pins));
+        let off = (h - h0).abs().min(360.0 - (h - h0).abs());
+        assert!(
+            (s - s0).abs() <= 0.06 && (s0 < 0.05 || off <= 4.0),
+            "{style:?}: the chosen #{worn:06x} ({h0:.0}°, {s0:.2}) lands as {h:.0}°, {s:.2}"
+        );
+        let (ch, cs, _) = hsv(veil(style, color, accent, ColourPins::default()));
+        let c_off = (ch - h0).abs().min(360.0 - (ch - h0).abs());
+        assert!(
+            (cs - s0).abs() > 0.1 || c_off > 10.0,
+            "control, {style:?}: unchosen, #{worn:06x} still lands as itself ({ch:.0}°, {cs:.2})"
+        );
+    }
 }

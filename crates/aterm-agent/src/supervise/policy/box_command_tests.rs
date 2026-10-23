@@ -53,10 +53,9 @@ pub(crate) const TWIN_SCREEN: &str =
 pub(crate) const TABS: &str = include_str!("fixtures/claude-2.1.307-box-bash-wrap-tabs.txt");
 
 /// Each 2.1.308 capture's name and screen: `Probe <name>`'s box, under its
-/// call's row (MEASURED 2026-10-22,
-/// `docs/measured/breaker-transcript-and-zsh-2026-10-22.md` §H and §W): the
-/// call's row's width, cut and trim (`h-…`), tabs, CJK, kana, Hangul and
-/// fullwidth forms, and both ends of every wide block, in the box
+/// call's row (`docs/measured/breaker-transcript-and-zsh-2026-10-22.md` §H
+/// and §W): the call's row's width, cut and trim (`h-…`), tabs, CJK, kana,
+/// Hangul and fullwidth forms, and both ends of every wide block, in the box
 /// (`w-ranges`) and in the call's row (`w-ranges` for the two CJK blocks,
 /// `hr-…` for the other five).
 pub(crate) const SCREENS_308: &[(&str, &str)] = &[

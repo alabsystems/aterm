@@ -37,6 +37,7 @@ const ORACLE_TARGET: &str = "libc-oracle/target.noindex";
 
 const USAGE: &str = "\
 aterm-libc-oracle — check crates/aterm-libc against reference libc 0.2.186 on the native ABI cell
+(`targo --unverified verify libc` runs this gate)
 
 usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>]
        aterm-libc-oracle regen [--root <checkout>] [--out <dir>] [--work <dir>]
@@ -48,18 +49,19 @@ usage: aterm-libc-oracle [--root <checkout>] [--target-dir <dir>]
   --target-dir <dir>  gate build dir (default: <checkout>/libc-oracle/target.noindex)
   -h, --help          print this help
 
-regen: rewrite crates/aterm-libc/src/<cell>.rs and libc-oracle/conformance/src/cell_<cell>.rs
-for all four cells from reference libc rustdoc and const-eval probes, then trustfmt.
-The native cell compiles under Trust; non-host cells use stock rustup with target std
-installed (STOCK EXCEPTION: Trust ships std for its host only).
+regen: rewrite all four cells' modules, crates/aterm-libc/src/{darwin,linux_gnu}_<arch>.rs and
+libc-oracle/conformance/src/cell_<key>.rs, from reference libc rustdoc and const-eval probes,
+then trustfmt and seal them. The native cell compiles under Trust; non-host cells use stock
+rustup with target std installed (STOCK EXCEPTION: Trust ships std for its host only).
   --out <dir>         write into this checkout-shaped directory instead of --root
   --work <dir>        scratch dir (default: <checkout>/libc-oracle/target.noindex/regen)
   --docs <dir>        use prebuilt libc-0.2.186-<triple>.json rustdoc dumps from <dir>
   --stock <toolchain> rustup toolchain for non-host cells (default: stable)
   --no-format         skip trustfmt on emitted files
 
-harvest: parse a `--message-format short` check log for `--cell <key>`, list missing symbols
-exported by reference libc on that cell, and with `--write` add them to libc-oracle/union.json.
+harvest: parse a `--message-format short` check log for `--cell <key>` (mac, macx, linux,
+linuxa), list missing symbols exported by reference libc on that cell, and with `--write` add
+them to libc-oracle/union.json.
 
 Exit: 0 pass, 1 finding (even if the run then stopped), 2 usage, 3 could not run.";
 

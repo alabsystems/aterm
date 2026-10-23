@@ -3559,7 +3559,7 @@ impl Prover {
     }
 }
 
-/// Reads `tools/trust-ratchet.toml` from `commit`, returning `Ok(None)` if absent.
+/// Reads the ratchet ([`RATCHET`]) as of `commit`, returning `Ok(None)` if absent.
 pub fn ratchet_at(git: &dyn GitRunner, commit: &str) -> Result<Option<String>> {
     let listed = git_ok(git, &["ls-tree", commit, "--", RATCHET])?.stdout_utf8();
     if listed.trim().is_empty() {

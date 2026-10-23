@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Pure decision helpers for typing a due fact line at a drawn break under `prompt`.
+//! Pure decision helpers for typing a due fact line at a drawn break under `prompt`, and the hung-call stuck fact under `[harness] stuck_break_note` ([`BreakLine::Stuck`], [`stuck_at_break`]).
 
 use super::reading::OccupancyReading;
-use super::rules::{self, HoldSeen, RuleId};
+use super::rules::{self, Books, Guards, HoldSeen, RuleId};
 use super::templates::FactLine;
 use crate::supervise::Guard;
+use crate::supervise::config::{Autopilot, StuckBreakGrant};
 use crate::supervise::facts::{EpisodeKey, FactKind, SeedOutcome};
 use crate::supervise::screen::HumanInput;
 
@@ -58,26 +59,132 @@ pub struct AtWrite {
     pub upgrade_due: bool,
 }
 
-/// Returns the first write-time hold on a due line of `rule`, if any.
+/// A line at a break (§2.1's order): a built-in rule's (rank 5), or the hung-call stuck fact (rank 4: after the upgrade's notice, before the nudges).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BreakLine {
+    /// A built-in rule's line under `prompt`.
+    Rule(RuleId),
+    /// The stuck fact under `[harness] stuck_break_note`.
+    Stuck,
+}
+
+impl From<RuleId> for BreakLine {
+    fn from(rule: RuleId) -> Self {
+        BreakLine::Rule(rule)
+    }
+}
+
+impl BreakLine {
+    /// The autopilots its lines are for: a rule's ([`rules::modes`]); the stuck fact's, every one but Off (system awareness §14.4).
+    #[must_use]
+    pub const fn modes(self) -> &'static [Autopilot] {
+        match self {
+            BreakLine::Rule(rule) => rules::modes(rule),
+            BreakLine::Stuck => &[Autopilot::Cruise, Autopilot::Land],
+        }
+    }
+}
+
+/// Returns the first write-time hold on a due `line`, if any: the break's line gone, the host's withhold, then the upgrade's notice due (rank 3, which every nudge and the stuck fact wait for).
 #[must_use]
-pub fn write_held(rule: RuleId, w: AtWrite) -> Option<Guard> {
-    let nudge = match rule {
-        RuleId::WaitNudge | RuleId::HoldRoom => true,
-    };
+pub fn write_held(line: impl Into<BreakLine>, w: AtWrite) -> Option<Guard> {
     use super::fault::{Fault, armed};
+    let waits = match line.into() {
+        BreakLine::Rule(RuleId::WaitNudge | RuleId::HoldRoom) => !armed(Fault::NudgeOverNotice),
+        BreakLine::Stuck => !armed(Fault::StuckOverNotice),
+    };
     [
         (
             w.host_line && !armed(Fault::StackOnHostLine),
             Guard::HostLine,
         ),
         (w.withheld, Guard::HostWithheld),
-        (
-            nudge && w.upgrade_due && !armed(Fault::NudgeOverNotice),
-            Guard::UpgradeDue,
-        ),
+        (waits && w.upgrade_due, Guard::UpgradeDue),
     ]
     .into_iter()
     .find_map(|(holds, guard)| holds.then_some(guard))
+}
+
+/// What the stuck fact's line comes to at a break ([`stuck_at_break`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StuckVerdict {
+    /// The owner's key is off (`[harness] stuck_break_note`, or `facts = false`): nothing.
+    Ungranted,
+    /// This guard holds it.
+    Held(Guard),
+    /// The session's pace holds it until `next_ms` (the clock's).
+    Paced {
+        /// When the pace lets a line go.
+        next_ms: i64,
+    },
+    /// It goes: its intent row, then the fenced write.
+    Due,
+}
+
+/// Judges the stuck fact at a break (§2.1's rank 4; its episode untold, its reading fresh): ungranted without the key, else held by `g` for its autopilots ([`BreakLine::modes`]), then by `w` ([`write_held`]), then by the session's pace ([`rules::pace_next`]); else due. Asked at the decider and again at the write.
+#[must_use]
+pub fn stuck_at_break(
+    grant: Option<&StuckBreakGrant>,
+    g: &Guards,
+    w: AtWrite,
+    books: &Books,
+    now_ms: i64,
+) -> StuckVerdict {
+    use super::fault::{Fault, armed};
+    if grant.is_none() && !armed(Fault::StuckWithoutKey) {
+        return StuckVerdict::Ungranted;
+    }
+    if let Some(guard) = g
+        .held_for(BreakLine::Stuck)
+        .or_else(|| write_held(BreakLine::Stuck, w))
+    {
+        return StuckVerdict::Held(guard);
+    }
+    match rules::pace_next(books, now_ms) {
+        Some(next_ms) => StuckVerdict::Paced { next_ms },
+        None => StuckVerdict::Due,
+    }
+}
+
+/// The door a fact of a kind other than the hold was told at, as its rows name it (`door=`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FactDoor {
+    /// A line of its own at a break (`[harness] stuck_break_note`).
+    Break,
+    /// Riding a prompt typed at a turn end (`policy::turn_end::FACT_RIDES`).
+    TurnEnd,
+}
+
+impl FactDoor {
+    /// Its word.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            FactDoor::Break => "break",
+            FactDoor::TurnEnd => "turn-end",
+        }
+    }
+}
+
+/// The `fact-intent@v1` reason for an episode of a kind other than the hold: `kind=<word> episode=<hex> door=<word>`, which [`seed_rows_in`] reads back.
+#[must_use]
+pub fn fact_intent_reason(key: EpisodeKey, door: FactDoor) -> String {
+    format!(
+        "kind={} episode={:016x} door={}",
+        key.kind.word(),
+        key.id,
+        door.word()
+    )
+}
+
+/// The outcome row's reason (`fact-<kind>@v1`): the intent's words, and for a skip `why=<word>`.
+#[must_use]
+pub fn fact_outcome_reason(key: EpisodeKey, door: FactDoor, told: Told) -> String {
+    let words = fact_intent_reason(key, door);
+    match told {
+        Told::Typed => words,
+        Told::Skipped(why) => format!("{words} why={why}"),
+    }
 }
 
 /// Why a host refuses the door its line.
@@ -236,16 +343,15 @@ pub fn outcome_reason(
     }
 }
 
-/// Extracts the door's fact rows for `sid` from ledger `body`, oldest first, for [`FactsState::seed`](crate::supervise::facts::FactsState::seed).
+/// Extracts the fact rows for `sid` from ledger `body`, oldest first, for [`FactsState::seed`](crate::supervise::facts::FactsState::seed): an intent of the kind its `kind=` word names (the hold where none), and each kind's `typed` or `skipped` row.
 #[must_use]
 pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, SeedOutcome)> {
-    let hold = FactKind::Hold.rule();
     let want = sid.map(|s| s.trim_start_matches('@').to_string());
     let mut rows = Vec::new();
     for line in body.lines() {
-        if !(line.contains(INTENT_RULE) || line.contains(hold))
-            || want.as_deref().is_some_and(|sid| !line.contains(sid))
-        {
+        let ours =
+            line.contains(INTENT_RULE) || FactKind::ALL.iter().any(|k| line.contains(k.rule()));
+        if !ours || want.as_deref().is_some_and(|sid| !line.contains(sid)) {
             continue;
         }
         let Ok(v) = aterm_json::from_str::<aterm_json::Value>(line) else {
@@ -255,31 +361,58 @@ pub fn seed_rows_in(body: &str, sid: Option<&str>) -> Vec<(EpisodeKey, i64, Seed
         if text("sid").map(str::to_string) != want {
             continue;
         }
-        let outcome = match (text("rule_id"), text("decision")) {
-            (Some(INTENT_RULE), Some("waiting")) => SeedOutcome::Intent,
-            (Some(rule), Some("typed")) if rule == hold => SeedOutcome::Typed,
-            (Some(rule), Some("skipped")) if rule == hold => SeedOutcome::Skipped,
-            _ => continue,
-        };
         let (Some(at_ms), Some(reason)) = (
             v.get("ts").and_then(aterm_json::Value::as_i64),
             text("reason"),
         ) else {
             continue;
         };
-        let id = reason
-            .split(' ')
-            .find_map(|w| w.strip_prefix("episode="))
-            .and_then(|hex| u64::from_str_radix(hex, 16).ok());
-        if let Some(id) = id {
-            let key = EpisodeKey {
-                kind: FactKind::Hold,
-                id,
-            };
-            rows.push((key, at_ms, outcome));
+        let word = |key: &str| reason.split(' ').find_map(|w| w.strip_prefix(key));
+        let (kind, outcome) = match (text("rule_id"), text("decision")) {
+            (Some(INTENT_RULE), Some("waiting")) => match word("kind=") {
+                None => (FactKind::Hold, SeedOutcome::Intent),
+                Some(kind) => match FactKind::of_word(kind) {
+                    Some(kind) => (kind, SeedOutcome::Intent),
+                    None => continue,
+                },
+            },
+            (Some(rule), Some(decision)) => match (FactKind::of_rule(rule), decision) {
+                (Some(kind), "typed") => (kind, SeedOutcome::Typed),
+                (Some(kind), "skipped") => (kind, SeedOutcome::Skipped),
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if let Some(id) = word("episode=").and_then(|hex| u64::from_str_radix(hex, 16).ok()) {
+            rows.push((EpisodeKey { kind, id }, at_ms, outcome));
         }
     }
     rows
+}
+
+/// When (unix ms, oldest first) each stuck line a loop before this one typed at a break went,
+/// from ledger `body`: session `sid`'s `fact-no-progress@v1` rows `typed` at `door=break` (a
+/// rider's `door=turn-end` row is no line of its own). A successor counts them toward the
+/// session's pace, as [`super::rules::would_rows_in`] carries the door's own lines.
+#[must_use]
+pub fn stuck_lines_in(body: &str, sid: Option<&str>) -> Vec<i64> {
+    let rule = FactKind::NoProgress.rule();
+    let want = sid.map(|s| s.trim_start_matches('@'));
+    body.lines()
+        .filter(|line| line.contains(rule) && want.is_none_or(|sid| line.contains(sid)))
+        .filter_map(|line| aterm_json::from_str::<aterm_json::Value>(line).ok())
+        .filter(|v| {
+            let text = |k: &str| v.get(k).and_then(aterm_json::Value::as_str);
+            text("sid") == want
+                && text("rule_id") == Some(rule)
+                && text("decision") == Some("typed")
+                && text("reason").is_some_and(|r| {
+                    r.split(' ')
+                        .any(|w| w.strip_prefix("door=") == Some(FactDoor::Break.word()))
+                })
+        })
+        .filter_map(|v| v.get("ts").and_then(aterm_json::Value::as_i64))
+        .collect()
 }
 
 #[cfg(test)]

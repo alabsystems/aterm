@@ -6,8 +6,8 @@
 //! commit, not from a signed release, so a pin ahead of the newest signed release can
 //! still be far behind main. A report only: it holds no group and packs nothing. The cut
 //! is a run of its own ([`trust_cut_commands`]), which the agent running it performs on a
-//! release-credential machine, the release and the uploads included (Trust DECISION_QUEUE
-//! D27, amended 2026-10-16).
+//! release-credential machine, the release and the uploads included (Trust's
+//! DECISION_QUEUE D27).
 //!
 //! A build number counts a commit's whole ancestry, so `main's build - the pin's` is what
 //! the pin lacks only when the pin is on main. When the clone has the pin's commit (its

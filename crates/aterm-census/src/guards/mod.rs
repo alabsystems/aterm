@@ -381,7 +381,7 @@ fn skipped_dir(name: &str) -> bool {
         || name == "node_modules"
 }
 
-/// Is `rel` under a dot directory (`.cargo/…`, `crates/x/.scratch/…`)?
+/// Is `rel` under a dot directory (`.cargo/…`, `crates/<name>/.scratch/…`)?
 fn in_dot_dir(rel: &str) -> bool {
     rel.rsplit_once('/')
         .is_some_and(|(dirs, _)| dirs.split('/').any(|d| d.starts_with('.')))

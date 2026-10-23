@@ -800,6 +800,7 @@ fn turn_end(worked: Option<Duration>) -> TurnEndReading {
         record_turn: None,
         credits: None,
         repo: None,
+        fact: None,
     }
 }
 

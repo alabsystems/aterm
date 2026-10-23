@@ -644,6 +644,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         screen_mark: None,
         worked,
         rules: None,
+        fact: None,
         pending_input: false,
         interrupted: false,
         restartable: true,

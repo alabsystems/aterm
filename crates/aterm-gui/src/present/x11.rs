@@ -8,6 +8,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use aterm_types::native_window::{HasNativeWindow, NativeWindow};
+use aterm_window::platform::x11::WindowExtX11;
 use aterm_window::window::Window;
 use aterm_x11::Connection;
 use aterm_x11::proto::xproto::{
@@ -87,8 +88,9 @@ pub(crate) struct X11Presenter {
     store: Store,
     size: Option<(u16, u16)>,
     presented: bool,
-    /// Holds the winit window, and with it the Xlib display `conn` borrows; dropped last.
-    _window: Arc<Window>,
+    /// The winit window, which holds the Xlib display `conn` borrows (so it is dropped last) and
+    /// takes the note of each post of the whole frame (`WindowExtX11::x11_area_posted`).
+    owner: Arc<Window>,
 }
 
 // SAFETY: the connection is libxcb's, which is thread-safe; the segment is
@@ -181,7 +183,7 @@ impl X11Presenter {
         if xid == 0 {
             return Err(X11PresentError::NotX11);
         }
-        // SAFETY: Winit's live `Display *`, which `_window` keeps open for as long as this
+        // SAFETY: Winit's live `Display *`, which `owner` keeps open for as long as this
         // presenter (and so this connection) lives.
         let conn = unsafe { Connection::from_xlib_display(display) }?;
         let geometry = conn.send(xproto::get_geometry(xid))?;
@@ -223,7 +225,7 @@ impl X11Presenter {
             store,
             size: None,
             presented: false,
-            _window: window,
+            owner: window,
         })
     }
 
@@ -293,6 +295,7 @@ impl X11Presenter {
         let Some((w, h)) = self.size else {
             return Ok(());
         };
+        let mut whole = None;
         match &mut self.store {
             Store::Wire(buf) => {
                 let row_bytes = usize::from(w) * 4;
@@ -302,7 +305,7 @@ impl X11Presenter {
                     let y = band * rows;
                     let band_rows = chunk.len() / usize::from(w).max(1);
                     let bytes: Vec<u8> = chunk.iter().flat_map(|p| p.to_ne_bytes()).collect();
-                    drop(self.conn.send_void(xproto::put_image(
+                    let posted = self.conn.send_void(xproto::put_image(
                         image_format::Z_PIXMAP,
                         self.window,
                         self.gc,
@@ -313,7 +316,10 @@ impl X11Presenter {
                         0,
                         self.depth,
                         &bytes,
-                    ))?);
+                    ))?;
+                    // The bands draw the whole frame: an `Expose` sent before the first band's
+                    // request is drawn again by every band.
+                    whole.get_or_insert(posted.sequence());
                 }
             }
             Store::Shm {
@@ -328,7 +334,7 @@ impl X11Presenter {
                     return Err(X11PresentError::Damage(*bad));
                 }
                 for (x, y, rw, rh, dx, dy) in damage.iter().filter_map(shm_rect) {
-                    drop(self.conn.send_void(shm::put_image(
+                    let posted = self.conn.send_void(shm::put_image(
                         *major,
                         self.window,
                         self.gc,
@@ -345,13 +351,20 @@ impl X11Presenter {
                         false,
                         seg.id,
                         0,
-                    ))?);
+                    ))?;
+                    if (x, y, rw, rh) == (0, 0, w, h) {
+                        whole = Some(posted.sequence());
+                    }
                 }
                 *pending = Some(self.conn.send(xproto::get_input_focus())?.detach());
             }
         }
         self.conn.flush()?;
         self.presented = true;
+        if let Some(sequence) = whole {
+            self.owner
+                .x11_area_posted(sequence, [0, 0, u32::from(w), u32::from(h)]);
+        }
         Ok(())
     }
 }

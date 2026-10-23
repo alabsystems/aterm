@@ -2459,7 +2459,7 @@ impl LiveShell {
         )
     }
 
-    /// [`Self::spawn`] on a new pty of its own (aterm-pty's pair, §6.1 row 7), as a tab's
+    /// [`Self::spawn`] on a new pty of its own (aterm-pty's pair), as a tab's
     /// shell runs: its stdin, stdout and stderr the slave, its controlling terminal in a
     /// session it leads; the test writes to and reads the master. Its stderr reaches the
     /// master with its stdout, so [`Self::stderr`] reads a pipe nothing holds. The master's
@@ -3162,7 +3162,7 @@ const BASH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' \"$PATH\"; printf 'LIVERR
 #[cfg(unix)]
 const FISH_PRINT_PATH: &str = "printf 'LIVEPATH=%s\\n' (string join : -- $PATH); printf 'LIVERR=%s\\n' \"$ATERM_REROUTE_DIR\"; echo MARK(math 40 + 2)";
 
-/// `argv` on a new pty of its own ([`LiveShell::spawn_on_pty`]: aterm-pty's pair, never `script(1)`, whose BSD and util-linux forms differ; §6.1 row 7).
+/// The command for `argv`, to run on a pty of its own with [`LiveShell::spawn_on_pty`] (aterm-pty's pair, never `script(1)`, whose BSD and util-linux forms differ).
 #[cfg(unix)]
 fn pty_command(argv: &[&str]) -> Command {
     let (program, args) = argv.split_first().expect("a program to run");
@@ -3172,13 +3172,12 @@ fn pty_command(argv: &[&str]) -> Command {
 }
 
 /// A shell [`LiveShell::spawn_on_pty`] starts has the pty as its controlling terminal on all
-/// three of its standard descriptors, leading its process group, as `script(1)` gave it:
-/// `/dev/tty` opens, and `ps` names the pty as its terminal. A non-interactive `sh`, which
-/// opens no terminal of its own (an interactive one does, and a session leader's open
-/// takes the terminal), opens `/dev/tty` too: the spawn made it the controlling terminal.
-/// That guards the spawn's `TIOCSCTTY` where Linux runs it, since Linux hands a session a
-/// terminal only on that ioctl or an open; on macOS the session had the pty without it
-/// (measured 2026-10-22: the probe passes with the ioctl removed).
+/// three of its standard descriptors, leading its process group: `/dev/tty` opens, and `ps`
+/// names the pty as its terminal. A non-interactive `sh`, which opens no terminal of its own
+/// (an interactive one does, and a session leader's open takes the terminal), opens
+/// `/dev/tty` too: the spawn made it the controlling terminal. On Linux that guards the
+/// spawn's `TIOCSCTTY`, since Linux hands a session a terminal only on that ioctl or an open;
+/// on macOS the session has the pty without it (the probe passes with the ioctl removed).
 /// It runs in a scratch `HOME` ([`shell_command`]), so the history an interactive `sh`
 /// writes at its exit (macOS's `~/.bash_history`) lands there. NEGATIVE CONTROL: the same
 /// shell [`LiveShell::spawn`] starts on pipes has no terminal at all.

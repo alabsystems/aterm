@@ -1,59 +1,50 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-census: spec recovery from its 188 unit tests
+# aterm-census: the specs its unit tests stand for
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 66 specs below is to be
-> proved through Trust/Clean about the compiled Rust function, and the tests it subsumes are then
-> deleted. Nothing has been proved or deleted yet. The 7 tests in §4 sample no spec; they are to be
-> deleted, and none has been deleted yet.
+> This is the crate's migration worklist. Each of the 66 specs below is to be proved through
+> Trust/Clean about the compiled Rust function, and the tests it subsumes are then deleted. No spec
+> is proved yet. A test of the crate that the §2 map does not list has no spec here yet.
 >
-> **Re-measured on seal `150efe4a`, 2026-10-16: `census-key-file-name` and
-> `census-launcher-source` are still blocked** (§6 item 1 has the errors). Each was written as a
-> `trust_contract_fn!` contract citing a Clean theorem over `trust_import_aterm_census__<fn>` for
-> every input, and checked with `targo trust check -p aterm-census`. Trust minted no kernel import
-> for either `&str` body, could not lower either `ensures`, and refused the citation because `&str`
-> has no clause type. The code is unchanged and both tests stay.
+> **On seal `150efe4a`, `census-key-file-name` and `census-launcher-source` are blocked** (§6
+> item 1 has the errors). Each was written as a `trust_contract_fn!` contract citing a Clean
+> theorem over `trust_import_aterm_census__<fn>` for every input, and checked with
+> `targo trust check -p aterm-census`. Trust minted no kernel import for either `&str` body, could
+> not lower either `ensures`, and refused the citation because `&str` has no clause type. The code
+> and both tests stay as they are.
 
-> Status 2026-10-17, after the census came back from main into the tests-and-gates audit: the
-> censuses, the guards and their tests are main's again, but the 25 tests the audit deleted as weak
-> and main never changed stay deleted, and their rows are gone: main.rs's six argv tests, and
-> nineteen lazy_init.rs cases (eighteen folded into the one table `every_reentry_shape_is_judged`,
-> which has a row, and `the_depth_rule_still_treats_a_real_declaration_as_bodyless`). The rows of
-> the retired `watch-hands` rule, its input-verb table and their five tests, and of the six deleted
-> `live_tree_*` tests, are gone too; the §3 gap histogram counts the 65 specs left. Counts
-> elsewhere in this file were taken before.
+Source: `crates/aterm-census` (read only). The claims come from reading each mapped test and the
+code it reaches; nothing was compiled or run.
 
-Source: `crates/aterm-census` (read only). Every real `#[test]` fn was read, together with the code
-it reaches. Nothing was compiled or run; the claims come from reading the code.
-
-| file (under `crates/aterm-census/src/`) | tests |
+| file (under `crates/aterm-census/src/`) | mapped tests |
 |---|---|
-| guards/doors.rs | 4 |
-| guards/graph.rs | 9 |
+| guards/doors.rs | 5 |
+| guards/graph.rs | 6 |
 | guards/installer.rs | 1 |
 | guards/keys.rs | 4 |
 | guards/lifeline.rs | 5 |
 | guards/mktemp.rs | 1 |
 | guards/mod.rs | 6 |
-| guards/rules.rs | 16 |
+| guards/rules.rs | 21 |
 | held_guard.rs | 3 |
-| lazy_init.rs | 22 |
+| lazy_init.rs | 3 |
 | lex.rs | 3 |
 | lib.rs | 22 |
-| lock_order.rs | 47 |
+| lock_order.rs | 45 |
 | main.rs | 6 |
-| scan_set.rs | 19 |
-| scope_census.rs | 10 |
-| wasm_census.rs | 10 |
-| **total** | **188** |
+| scan_set.rs | 22 |
+| scope_census.rs | 9 |
+| wasm_census.rs | 11 |
+| wasm_cfg.rs | 8 |
+| **total** | **181** |
 
-A plain text count of `#[test]` gives 218, because 31 copies sit inside string fixtures and doc
-text (the held_guard MUST_FIRE/MUST_SILENT raw strings, the cfg-predicate list in lib.rs, and the
+A plain text count of `#[test]` over-counts: copies sit inside string fixtures and doc text (the
+held_guard MUST_FIRE/MUST_SILENT raw strings, the cfg-predicate list in lib.rs, and the
 wasm_census, lifeline and graph fixtures). A test counter should read the crate's own `lex::lex`
-code view rather than the raw text (§5.6).
+code view rather than the raw text.
 
-Result: **66 specs**, covering **181 tests**. **7 tests are not spec samples** (§4).
+Result: **66 specs**, covering the **181 tests** of §2.
 
 ## 0. Notation used in the statements
 
@@ -103,11 +94,11 @@ Result: **66 specs**, covering **181 tests**. **7 tests are not spec samples** (
   other upper-case names are the crate's own const tables, quantified as they stand.
 - `CENSUSES`: the 6-row table (mainloop, locks, wasm, scope, lazy-init, guards) in declaration order.
 - **Gaps.** `blocking_gaps` lists rows of the gap table in
-  `AUDIT-trust-for-test-migration-2026-10-15.md` §7 (historical internal audit). Gap 0 (a seal that publishes
+  `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7. Gap 0 (a seal that publishes
   Clean-discharged rows) is a prerequisite of every row, so it is left out of the column. Seal
-  `150efe4a`, built locally, closes it off the machine's `trust` channel
-  (`PLAN-tests-to-specs-2026-10-15.md` (historical internal plan)). No spec here is blocked by gap 0 alone:
-  every one carries `&str`, `String`, `Vec` or slice data (gap 1) and a non-straight-line body (gap 3).
+  `150efe4a`, built locally rather than taken from the machine's `trust` channel, closes it
+  (`docs/PLAN-tests-to-specs-2026-10-15.md`). No spec here is blocked by gap 0 alone: every one
+  carries `&str`, `String`, `Vec` or slice data (gap 1) and a non-straight-line body (gap 3).
 
 ## 1. Specs (TSV)
 
@@ -147,8 +138,8 @@ census-scope-ctor-discovery	contract	scope_census::{closed_token_ctors,impl_bodi
 census-scope-returns-token	contract	scope_census::returns_token	∀ before (the text preceding a token occurrence): returns_token(before) ⇔ before.trim_end() ends with `->`, optionally followed by `&`, `&mut`, `&'a` or `&'a mut`, i.e. the occurrence is a return type, not a construction. Field ascriptions, let bindings and call arguments give false.	scope_census.rs::a_return_type_is_not_a_construction	&str strip_suffix/trim_end chain	1,3,5
 census-wasm-term-hops	contract	wasm_census::wasm_term_hops	∀ body: &[String]: wasm_term_hops(body) lists, in order, every code (not literal) call site `term.m(` on the literal-masked line where the ident ending at the dot is exactly `term` (a field self.term or a local; subterm does not count) and m is a maximal ident ∈ UNBOUNDED_TERM_METHODS (resize_surface ≠ resize). Other receivers (self.rgba, t) and other methods (process) give no hop.	wasm_census.rs::wasm_term_hop_flags_the_field_and_rebind_shapes, wasm_census.rs::wasm_term_hop_ignores_other_receivers_and_methods	&[String], mask_literals, ident_ending_at byte scans, Vec of structs	1,3,5,7
 census-wasm-verdict	contract	wasm_census::{run_wasm_census,crate_source_files,spawn_sites,unloaded_files}, wasm_cfg::{unloaded_on_wasm32,mod_decl_name,include_arg,path_attr}	∀ T, with W = the derive_linked_scan_set(T, WASM_ROOT_CRATES, wasm_cfg::target_links_on_wasm32) closure (its unlinked edges printed): run_wasm_census(T).ok ⇔ [OB-8] W derives (else "[OB-8] SCAN-SET DERIVATION FAILED") and the engine crates are in W with their marked sinks ∧ [OB-10] no fn reachable from a public wasm export, in the name-merged graph over Mask_{wasm_cfg::attr_never_on_wasm32} sources, has a wasm_term_hops hazard or calls a registered sink directly ("DIRECT call"); the log prints the export -> … -> fn path and file:line ∧ [OB-12] no SPAWN_TOKENS occurrence lies on a W-crate line kept by that mask (so #[test] fns and items or blocks under a one-line #[cfg(p)] with p false on wasm32-unknown-unknown, e.g. cfg(not(target_arch = "wasm32")) or cfg(windows), are excluded; an unknown p keeps them), and none lies in a file U = wasm_cfg::unloaded_on_wasm32 leaves out, which OB-10's sources skip too: a file is left out ⇔ it is no crate root (src/lib.rs, src/main.rs, a manifest `path`) and it has a loader, and every loader (a body-less `mod` resolved as rustc resolves it, `#[path]` and `include!` paths from the loading file's directory, a #[path]-loaded or root file read both ways; an `include!` of a plain path) is masked by that mask or sits in a file left out; a crate with a live loader the reader cannot place (a `mod` inside an inline item, an `include!` of a computed path, a `mod` in an included file, a `cfg_attr` or unreadable `path`) leaves nothing out and its tree is named; the log counts the files left out, the test-only cuts, and names every other cut with its gate. On green the log states the threading posture.	wasm_census.rs::synthetic_wasm_tree_with_offloaded_resize_is_green_with_zero_findings, wasm_census.rs::synthetic_reintroduced_sync_resize_is_red_ob10, wasm_census.rs::synthetic_new_unregistered_reach_is_red_ob10_with_path, wasm_census.rs::synthetic_direct_sink_call_is_red_ob10, wasm_census.rs::synthetic_unmasked_spawn_in_closure_is_red_ob12_and_gated_spawn_is_not, wasm_census.rs::synthetic_spawn_behind_a_native_target_table_is_not_in_the_closure, wasm_census.rs::synthetic_spawn_in_a_file_only_a_false_mod_loads_is_not_swept, wasm_census.rs::synthetic_missing_root_crate_fails_closed_ob8, wasm_cfg.rs::a_module_only_a_false_gate_loads_is_no_wasm32_file, wasm_cfg.rs::a_crate_root_is_never_left_out, wasm_cfg.rs::a_module_tree_this_reader_cannot_place_leaves_every_file_in, wasm_cfg.rs::an_include_is_a_loader_like_a_mod	fs walk, BTreeMap call-graph BFS, String log	1,3,4,5,7,8
-census-cli-parse	contract	main::parse	∀ argument lists A, scanned left to right: the first -h/--help before any error gives Ok(None). An error is a `--x` with x ∉ {all, verbose} ∪ CENSUSES names, any other `-x` except -v, or a second positional; the first error gives Err. Otherwise Ok(Some(inv)) with inv.verbose ⇔ some a ∈ {-v, --verbose}, inv.root = the unique positional if any, and, with N = the names given as `--name` plus every name if --all occurs, inv.selected = [c ∈ CENSUSES | N = ∅ ∨ c.name ∈ N] in CENSUSES order, each census once.	-	impl IntoIterator<Item=String>, Vec<&'static Census>, sort_by_key/dedup_by_key, Option<PathBuf>, Result<Option<_>, String>	1,3,5,7,11
-census-shell-word	round-trip	main::shell_word	∀ path p, s = p.display().to_string(): shell_word(p) = s if s is nonempty and every char is ASCII alphanumeric or one of /._-+:@; otherwise "'" ++ s.replace("'", "'\\''") ++ "'". Either way, POSIX sh word splitting and quote removal of shell_word(p) yields exactly the one word [s].	-	String, chars().all, str::replace, format!	1,3,5
+census-cli-parse	contract	main::parse	∀ argument lists A, scanned left to right: the first -h/--help before any error gives Ok(None). An error is a `--x` with x ∉ {all, verbose} ∪ CENSUSES names, any other `-x` except -v, or a second positional; the first error gives Err. Otherwise Ok(Some(inv)) with inv.verbose ⇔ some a ∈ {-v, --verbose}, inv.root = the unique positional if any, and, with N = the names given as `--name` plus every name if --all occurs, inv.selected = [c ∈ CENSUSES | N = ∅ ∨ c.name ∈ N] in CENSUSES order, each census once.	main.rs::a_root_and_flags_mix_in_any_order, main.rs::bare_and_all_select_every_census_once_in_table_order, main.rs::census_flags_combine_instead_of_the_last_one_winning, main.rs::unknown_flags_and_a_second_root_are_usage_errors, main.rs::verbose_is_a_flag_not_a_root	impl IntoIterator<Item=String>, Vec<&'static Census>, sort_by_key/dedup_by_key, Option<PathBuf>, Result<Option<_>, String>	1,3,5,7,11
+census-shell-word	round-trip	main::shell_word	∀ path p, s = p.display().to_string(): shell_word(p) = s if s is nonempty and every char is ASCII alphanumeric or one of /._-+:@; otherwise "'" ++ s.replace("'", "'\\''") ++ "'". Either way, POSIX sh word splitting and quote removal of shell_word(p) yields exactly the one word [s].	main.rs::a_root_with_shell_metacharacters_is_quoted_for_the_rerun_line	String, chars().all, str::replace, format!	1,3,5
 census-guard-calls	contract	guards::{calls,is_word}	∀ code: calls(code) = in order of '(' occurrence, the identifiers w where w is the maximal run of word bytes ending right before the '(' (spaces and tabs skipped), leading ASCII digits removed, w nonempty. A '(' after a non-word byte (`(1, 2)`, `f[0](`) contributes nothing.	guards/mod.rs::calls_are_the_identifiers_before_each_paren	&str match_indices loop, byte backward scans, Vec<&str>	1,3,5,7
 census-guard-hits	contract	guards::{hits,has}	∀ hay, needle: hits(hay, needle, Sub) = the offsets of str::match_indices(needle), in order; hits(hay, needle, Word) = the subsequence of offsets i that are word-boundary hits (§0). has(…) ⇔ hits(…) ≠ [].	guards/mod.rs::word_hits_respect_identifier_edges	iterator adaptors with closures capturing slices, impl Iterator return	1,3,5,7,13
 census-guard-run-rules	contract	guards::{run_rules,scope_findings,run_guards,run_guard_census,Corpus::under}	∀ C, Rs: run_rules(tree, Rs) = concat over R ∈ Rs in order of R.check's findings sorted by (path, line) if R.check returns, or the single finding {R.id, "", 0, "the rule could not run: …"} if it panics. scope_findings(C, Rs) has exactly one finding {R.id, prefix, 0} for each R and each prefix ∈ R.scope under which no file of C lies. run_guard_census is ok ⇔ run_guards yields no finding ∧ the floors hold (≥ 1500 Rust files and ≥ 17 scripts read).	guards/mod.rs::a_panicking_rule_is_one_finding_not_a_crash, guards/mod.rs::a_scope_no_file_lies_under_is_a_finding	std::thread::scope + spawn_scoped + join panic capture, fn pointers, Vec<Finding> sort_by	1,3,4,5,8,13
@@ -158,7 +149,7 @@ census-test-file	contract	lib::is_test_file	∀ path, with s = path.to_string_lo
 census-rule-renderer-terminal	contract	guards::rules::{renderer_terminal,names_terminal}	∀ C: spots(Run(RENDERER_TERMINAL, C)) = sorted {f.rel:l | f under RENDERERS ∧ ¬test_path(f.rel) ∧ l Shipped ∧ names_terminal(Code(l)) ≠ None}, where names_terminal(code) ≠ None ⇔ code has a word-bounded `Terminal` that is the type aterm_core::Terminal (a use, a parameter or a return type). Terminal-prefixed identifiers (TerminalFrame) and prose do not count.	guards/rules.rs::the_renderers_never_name_terminal	corpus iteration, Bound::Word hits	1,3,5,7
 census-rule-dev-read	contract	guards::rules::{dev_read,reads_a_device}	∀ C: spots(Run(DEV_READ, C)) = sorted {f.rel:l | f ∈ PRODUCT (tests included) ∧ reads_a_device(l)}, where reads_a_device(l) ⇔ Code(l) has a call to fs::read, read_to_string or read_dir (any path qualification) whose first argument, in Text(l) after optional whitespace, is a string literal starting with "/dev/". A /dev/ literal elsewhere, a comment, or a call inside a string literal does not count.	guards/rules.rs::a_device_read_to_eof_is_found_in_code_only	aligned two-view line scan, Line<'_> struct	1,3,5,7
 census-rule-input-probe	contract	guards::rules::input_probe	∀ C: spots(Run(INPUT_PROBE, C)) = sorted {f.rel:l | f ∈ PRODUCT outside the census crate ∧ Text(l) contains an INPUT_PROBES name (CGEventSourceFlagsState, CGEventSourceSecondsSince, SLSInputModifierKeyState, +[NSEvent modifierFlags], …)}. Since Text keeps literals and drops comments, a declaration or string fires and a comment does not.	guards/rules.rs::an_input_probe_is_found_in_code_and_strings_not_prose	corpus iteration, substring search	1,3,5,7
-census-rule-protected-folder	contract	guards::rules::{protected_folder,protected_path}	∀ C: spots(Run(PROTECTED_FOLDER, C)) = sorted {f.rel:l | f under PROTECTED_SCOPE ∧ ¬test_path(f.rel) ∧ l Shipped ∧ protected_path(Text(l)) ≠ None}, where protected_path(t) ≠ None ⇔ some string literal in t is, starts with, or has as a whole path component a TCC-protected location: a PROTECTED_HOME_DIRS name (Documents, Downloads, Desktop, …), ~/<dir>, /Volumes/… (not macOS's own /System/Volumes/<volume>, though /System/Volumes/Data/Volumes/… counts), or Library/CloudStorage. Identifiers (DocumentsView) and comments do not count.	guards/rules.rs::a_protected_folder_literal_is_found_in_gui_and_cli_shipped_code	literal extraction from the Text view, path-component matching	1,3,5,7
+census-rule-protected-folder	contract	guards::rules::{protected_folder,protected_path}	∀ C: spots(Run(PROTECTED_FOLDER, C)) = sorted {f.rel:l | f under PROTECTED_SCOPE ∧ ¬test_path(f.rel) ∧ l Shipped ∧ protected_path(Text(l)) ≠ None}, where protected_path(t) ≠ None ⇔ some string literal in t is, starts with, or has as a whole path component a TCC-protected location: a PROTECTED_HOME_DIRS name (Documents, Downloads, Desktop, …), ~/<dir>, /Volumes/… (not macOS's own /System/Volumes/<volume>, though /System/Volumes/Data/Volumes/… counts), or Library/CloudStorage. Identifiers (DocumentsView) and comments do not count.	guards/rules.rs::a_protected_folder_literal_is_found_in_gui_cli_and_amacs_host_shipped_code	literal extraction from the Text view, path-component matching	1,3,5,7
 census-rule-runloop-timer	contract	guards::rules::{runloop_timer,runloop_scope}	∀ C: spots(Run(RUNLOOP_TIMER, C)) = sorted {f.rel:l | runloop_scope(f.rel) ∧ Text(l) contains a RUNLOOP_TIMERS needle (CFRunLoopTimerCreate, scheduledTimerWithTimeInterval:, …)}, where runloop_scope(rel) ⇔ rel ∈ PRODUCT ∧ rel is not aterm-objc's wake_timer.rs ∧ (¬test_path(rel) ∨ rel under WINIT_SOURCE = crates/aterm-window/src/).	guards/rules.rs::a_runloop_timer_lives_only_in_wake_timer	corpus iteration, prefix predicates	1,3,5,7
 census-rule-keeper-gui	contract	guards::rules::{keeper_gui,links_gui}	∀ C: spots(Run(KEEPER_GUI, C)) = sorted {f.rel:l | f under KEEPER_SOURCE ∧ links_gui(Text(l)) ≠ None}, where links_gui(t) ≠ None ⇔ t (comments dropped) names a GUI_FRAMEWORKS framework (AppKit, …) in a link attribute, or a word-bounded GUI_NAMES token (objc_msgSend, winit, …). Non-GUI frameworks (Security) do not count.	guards/rules.rs::the_keeper_links_no_gui_framework	corpus iteration, const tables	1,3,5,7
 census-rule-keeper-gui-deps	contract	guards::rules::{keeper_gui_deps,is_external_gui}, scan_set::{external_dependency_names,member_patch_targets,read_lock}	∀ T: keeper_gui_deps yields one finding per crate manifest M in the keeper's normal-dependency closure that either (a) declares an external GUI dependency d with is_external_gui(d) (objc2, winit, …), at M's Cargo.toml with detail naming `d`, or (b) is a workspace GUI crate in GUI_CRATES (aterm-render, …), at that crate's Cargo.toml with detail "in the keeper's process closure"; plus, walking Cargo.lock breadth-first from M's external normal dependencies (a [patch] member reached through the lock is read by its manifest's closure, never its lock entry, which lists dev-dependencies), one finding per GUI package reached, at M's Cargo.toml, "reaches `p` through a -> … -> p"; an external dependency the lock lacks is a finding; an unreadable lock is a finding.	guards/rules.rs::the_keepers_closure_holds_no_gui_crate, guards/rules.rs::the_keepers_closure_is_walked_through_cargo_lock	fs manifest reads, BTreeSet worklist	1,3,4,5,7,8
@@ -173,7 +164,7 @@ census-rule-boot-id-door	contract	guards::doors::boot_id_door	∀ C: spots(Run(B
 census-rule-handoff-name	contract	guards::doors::handoff_name	∀ C: spots(Run(HANDOFF_NAME, C)) = sorted {f.rel:l | f under HANDOFF_SCOPE ∧ f.rel ≠ HANDOFF_HOME ∧ ¬test_path ∧ l Shipped ∧ Text(l) has a literal starting with a HANDOFF_PREFIXES prefix ("ATERM_SEAMLESS_, "ATERM_HANDOFF_) that is not the argument of a HANDOFF_DOORS call (HandoffName::new(, dev_seam!() opened on this line or the line before}.	guards/doors.rs::a_handoff_name_is_spelled_only_as_a_handoff_name	one-line look-back, substring search	1,3,5,7
 census-rule-core-signal	contract	guards::doors::{core_signal,core_shape,core_at,aborts,spaced,signal_call,arguments,shell_kill,argv_signal}	∀ C, outside the census crate, a line is a finding ⇔ it ends a process by a core-dump signal (CORE_SIGNALS: ABRT/6, SEGV/11, QUIT/3, ILL/4, TRAP/5, FPE/8, BUS/7), read per language. Rust (Code): a SENDERS call (kill, killpg, raise, pthread_kill) with a core name or number, or a kill/timeout argv or shell string with -SIG, -s SIG or --signal=SIG naming one. Shell (comment lines skipped): kill, pkill, killall or [g]timeout naming one (skill does not count). Python: os.abort, abort() after `from os import`, ctypes abort, faulthandler._sig*, ctypes.string_at(0), or os.kill/signal.raise_signal/pthread_kill with a core signal or number. JS: process.abort() or process.kill(.., 'SIG<core>'). A signal stored but not sent (let quit = SIGQUIT), SIGKILL/SIGTERM/9, os._exit, and numbers passed to unrelated programs (head -n 5) never count.	guards/doors.rs::a_kill_never_names_a_core_signal	per-language line classifiers over Script and SourceFile, const tables, Option<String>	1,3,5,7
 census-rule-test-appkit-door	contract	guards::graph::{test_appkit_door,appkit_door_findings,attribute,appkit_door,sends,sel_at,builds_class,reach,walk,fn_name,fn_name_at}	∀ aterm-gui source f: attribute(f) assigns each Code line to its innermost fn by brace depth over Code (string braces do not count) and marks fns inside cfg(test) modules, nested modules included. A door line sends separatorItem or setToolTip:, or builds an NSToolbarItem; selectors match exactly (toolbar:itemForItemIdentifier:… does not). With G = f's name-merged call graph (free calls, method calls, super:: paths), appkit_door_findings(f) has exactly one finding per #[test] fn t (ignored or not) such that t, or a test-only helper it calls, reaches a door line in G; its detail ends with the shortest chain t' -> … -> door, or "<door>, directly". Tests reaching no door, door names in prose or strings, and production fns are silent.	guards/graph.rs::every_test_that_reaches_a_door_is_found_with_its_chain, guards/graph.rs::production_doors_and_tests_that_touch_none_are_silent	BTreeMap<&str, Option<&str>> BFS parent links, per-line fn attribution with a depth stack, lifetimes on borrowed views	1,3,5,7
-census-rule-shared-application	contract	guards::graph::{shared_application,shared_application_sends,answers_without_proof,takes_proof,param_list,top_level,is_self_receiver,is_proof_type,impl_of_proof}	∀ C over GUI_SOURCE, ∀ sites: shared_application(C, sites) has one finding per Code-line send of sel!(sharedApplication) whose innermost fn neither holds the `Windowed` proof nor is a sites pair (file, fn), detail "in `<innermost fn>`". A fn holds the proof for its whole body when a parameter's type is `Windowed` or a reference to it (any path; `Option<Windowed>` and a return type do not count), or when it is a `self` method of an impl whose self type is `Windowed`; and from a body statement on, to the end of that statement's block, when the statement is `…Windowed::get()?`, `let Some(..) = …Windowed::get() else`, or `if …Windowed::get().is_none() { return`. Naming the proof otherwise (`let _ = Windowed::get();`, an assertion, `if a && …is_none()`, a block that goes on) holds nothing. A send in an inner fn is judged by the inner fn; a nested listed fn does not cover a later send in the outer fn; a listed name in another file is not listed. Prose and strings never fire. SHARED_APPLICATION runs it over APP_SITES.	guards/graph.rs::a_send_outside_the_windowed_functions_is_found, guards/graph.rs::sends_in_the_listed_functions_prose_and_strings_are_silent, guards/graph.rs::a_proof_taken_or_answered_for_before_the_send_holds_it, guards/graph.rs::a_proof_named_but_not_answered_for_holds_nothing	fn attribution, Vec<AppSend>, header slicing	1,3,5,7
+census-rule-shared-application	contract	guards::graph::{shared_application,shared_application_sends,answers_without_proof,takes_proof,param_list,top_level,is_self_receiver,is_proof_type,impl_of_proof}	∀ C over GUI_SOURCE: Run(SHARED_APPLICATION, C) has one finding per Code-line send of sel!(sharedApplication) whose innermost fn does not hold the `Windowed` proof, detail "sends +[NSApplication sharedApplication] in `<innermost fn>`, which does not hold the `Windowed` proof" (`-` outside any fn). A fn holds the proof for its whole body when a parameter's type is `Windowed` or a reference to it (any path; `Option<Windowed>` and a return type do not count), or when it is a `self` method of an impl whose self type is `Windowed`; and from a body statement on, to the end of that statement's block, when the statement is `…Windowed::get()?`, `let Some(..) = …Windowed::get() else`, or `if …Windowed::get().is_none() { return`. Naming the proof otherwise (`let _ = Windowed::get();`, an assertion, `if a && …is_none()`, a block that goes on) holds nothing. A send in an inner fn is judged by the inner fn. Prose and strings never fire. No fn is exempt.	guards/graph.rs::a_send_outside_the_windowed_functions_is_found, guards/graph.rs::prose_and_strings_are_silent, guards/graph.rs::a_proof_taken_or_answered_for_before_the_send_holds_it, guards/graph.rs::a_proof_named_but_not_answered_for_holds_nothing	fn attribution, Vec<AppSend>, header slicing	1,3,5,7
 census-rule-installer-network	contract	guards::installer::{installer_network,fences,command_of,gh_call}	∀ C: Run(INSTALLER_NETWORK, C) depends only on tools/install.sh. If it is absent or defines no web_curl transport, the result is the single finding tools/install.sh:0. Otherwise one finding per non-comment line l outside the web_curl body with command_of(l) (the first command after an optional if and !) = curl without --proto, or l containing api.github.com, or gh_call(l) finding `gh api|auth|release` anywhere on the line (after $( or | included). Other scripts are never read.	guards/installer.rs::the_installer_fetches_only_through_its_transport	Script line iteration, &str prefix stripping	1,3,5,7
 census-key-phrases	contract	guards::keys::{phrases,symbol}	∀ line, with R = its maximal ASCII-alphanumeric runs in order and sym(c) = the index of lower(c) in PHRASE_ALPHABET: phrases(line) = [map sym r | r ∈ R, |r| = 52, all chars in the alphabet] ++ [concat(map sym g) | g a window of 13 consecutive runs of R, each of length 4 and in the alphabet, consecutive runs separated by exactly one byte, ' ' or '-']. So a run of 51 or 53, an ill-placed i/l/o/u, an underscore or double-space separator, or a prefix character gives nothing.	guards/keys.rs::a_phrase_is_52_bounded_symbols_bare_or_grouped, guards/keys.rs::an_alphabet_in_order_reversed_or_repeated_is_a_fixture	byte loop collecting Vec<(usize,usize)>, slice windows, Option<Vec<u8>> collect, concat	1,3,5,7
 census-key-synthetic	contract	guards::keys::synthetic	∀ p: &[u8] with every p[i] < 32, b = p[..|p|−1], step(x, y) = (y + 32 − x) mod 32: synthetic(p) ⇔ |b| < 2 ∨ ∃ s ∈ {0, 1, 31}, ∀ i < |b|−1: step(b[i], b[i+1]) = s. The arithmetic never overflows u8.	guards/keys.rs::an_alphabet_in_order_reversed_or_repeated_is_a_fixture, guards/keys.rs::a_phrase_is_52_bounded_symbols_bare_or_grouped	slice windows, u8 modular arithmetic, closures	1,3,5,7
@@ -184,10 +175,9 @@ census-launcher-source	contract	guards::lifeline::launcher_source	∀ rel: launc
 census-rule-checked-mktemp	contract	guards::mktemp::{checked_mktemp,fused_mktemp}	∀ C: spots(Run(CHECKED_MKTEMP, C)) = sorted {s.rel:l | s a script or Rust file outside the census crate ∧ raw line l satisfies fused_mktemp ∧ l is not a Rust comment line}. Lines are raw, so a shell script inside a Rust raw string is read too. fused_mktemp(l) ⇔ in l before its first '#', some "$(cd" is followed by ≥ 1 space or tab, an optional '"', then "$(mktemp".	guards/mktemp.rs::a_scratch_directory_comes_from_a_checked_mktemp	match_indices, trim_start_matches, strip_prefix	1,3,5,7
 ```
 
-## 2. Test → spec map (TSV; all 188)
+## 2. Test → spec map (TSV)
 
 `primary` is the spec whose proof retires the test. `also` lists the other specs the same test samples.
-`-` in `primary` marks a test with no spec (§4).
 
 ```tsv
 file	test	primary	also
@@ -201,7 +191,7 @@ guards/graph.rs	a_proof_taken_or_answered_for_before_the_send_holds_it	census-ru
 guards/graph.rs	a_send_outside_the_windowed_functions_is_found	census-rule-shared-application	
 guards/graph.rs	every_test_that_reaches_a_door_is_found_with_its_chain	census-rule-test-appkit-door	
 guards/graph.rs	production_doors_and_tests_that_touch_none_are_silent	census-rule-test-appkit-door	
-guards/graph.rs	sends_in_the_listed_functions_prose_and_strings_are_silent	census-rule-shared-application	
+guards/graph.rs	prose_and_strings_are_silent	census-rule-shared-application	
 guards/installer.rs	the_installer_fetches_only_through_its_transport	census-rule-installer-network	
 guards/keys.rs	a_phrase_is_52_bounded_symbols_bare_or_grouped	census-key-phrases	census-key-synthetic
 guards/keys.rs	an_alphabet_in_order_reversed_or_repeated_is_a_fixture	census-key-synthetic	census-key-phrases
@@ -221,7 +211,7 @@ guards/mod.rs	shipped_lines_drop_test_items_in_both_views	census-mask-gated-item
 guards/mod.rs	word_hits_respect_identifier_edges	census-guard-hits	
 guards/rules.rs	a_device_read_to_eof_is_found_in_code_only	census-rule-dev-read	
 guards/rules.rs	a_header_needs_both_lines_in_either_order	census-rule-licence-header	
-guards/rules.rs	a_protected_folder_literal_is_found_in_gui_and_cli_shipped_code	census-rule-protected-folder	
+guards/rules.rs	a_protected_folder_literal_is_found_in_gui_cli_and_amacs_host_shipped_code	census-rule-protected-folder	
 guards/rules.rs	a_runloop_timer_lives_only_in_wake_timer	census-rule-runloop-timer	
 guards/rules.rs	a_store_current_path_is_resolved_within_six_lines	census-rule-store-current	
 guards/rules.rs	a_test_path_is_named_by_a_word_not_a_substring	census-test-path	
@@ -316,6 +306,12 @@ lock_order.rs	synthetic_unregistered_guard_returning_helper_is_red	census-lock-o
 lock_order.rs	synthetic_vendored_identities_are_namespaced_and_never_merge	census-lock-hold-edges	
 lock_order.rs	synthetic_vendored_unknown_is_summarized_per_crate	census-lock-site-classification	
 lock_order.rs	synthetic_vocabulary_interior_is_audited_not_unknown	census-lock-site-classification	
+main.rs	a_root_and_flags_mix_in_any_order	census-cli-parse	
+main.rs	a_root_with_shell_metacharacters_is_quoted_for_the_rerun_line	census-shell-word	
+main.rs	bare_and_all_select_every_census_once_in_table_order	census-cli-parse	
+main.rs	census_flags_combine_instead_of_the_last_one_winning	census-cli-parse	
+main.rs	unknown_flags_and_a_second_root_are_usage_errors	census-cli-parse	
+main.rs	verbose_is_a_flag_not_a_root	census-cli-parse	
 scan_set.rs	a_first_party_patch_target_is_recorded_and_never_review_registered	census-scan-set-patch-registry	
 scan_set.rs	a_target_table_the_target_cannot_link_is_left_out_of_its_closure	census-scan-set-closure	
 scan_set.rs	a_genuine_first_party_crate_is_not_mistaken_for_a_redistribution	census-classify-patch-target	
@@ -370,31 +366,24 @@ wasm_cfg.rs	what_the_target_does_not_settle_is_unknown	census-wasm-verdict
 
 ## 3. Coverage
 
-- 188 tests read. 181 map to one of the 66 specs; 7 sample no spec (§4).
-- 40 specs are the primary spec of exactly one test, and two (`census-blank-non-code`,
-  `census-run-censuses`) are primary for none: they only share tests (`also` in §2). Several of these
-  are lemmas the larger specs build on (`census-test-path`, `census-guard-hits`, `census-cfg-entails`,
+- 181 tests map to the 66 specs.
+- 40 specs are the primary spec of exactly one test, and one (`census-blank-non-code`) is primary
+  for none: it only shares a test (`also` in §2). Several of the one-test specs are lemmas the
+  larger specs build on (`census-test-path`, `census-guard-hits`, `census-cfg-entails`,
   `census-split-commas`), so their value is above their test count.
-- The biggest collapses (primary tests): `census-lazy-init-verdict` (18), `census-lock-hold-edges` (15), `census-lock-site-classification` (11), `census-lock-order-verdict` (10), `census-mainloop-verdict` (10), `census-scan-set-closure` (9), `census-scan-set-patch-registry` (8).
-- Five tests sample two specs each (`also` in §2): the lex code-view test, the missed-floor test,
-  the renamed-patch-row test and the two keys phrase tests.
-- Gap histogram (specs blocked by each gap): gap 1: 65, gap 2: 6, gap 3: 65, gap 4: 11, gap 5: 61, gap 7: 54, gap 8: 14, gap 11: 1, gap 13: 6.
+- The biggest collapses (primary tests): `census-wasm-verdict` (16), `census-lock-hold-edges` (15), `census-lock-site-classification` (11), `census-lock-order-verdict` (10), `census-mainloop-verdict` (10), `census-scan-set-closure` (10), `census-scan-set-patch-registry` (10).
+- Seven tests sample two specs each (`also` in §2): the lex code-view test, the missed-floor test,
+  the renamed-patch-row test, the two keys phrase tests, the lazy-init re-entry table and the
+  body-less declaration test.
+- Gap histogram (specs blocked by each gap): gap 1: 66, gap 2: 6, gap 3: 66, gap 4: 11, gap 5: 62, gap 7: 55, gap 8: 14, gap 11: 1, gap 13: 6.
 
 ## 4. Tests that are not spec samples
 
-Status 2026-10-16: the six `live_tree_*` tests are deleted (with the now-unused `test_fixtures::live`).
-
-Status 2026-10-20: `every_registry_entry_is_mirrored_in_the_synthetic_fixture` is deleted. The
-fixture it policed (`synth_helper_files`, with `synth_helper_crates`) is now written out from
-`GUARD_HELPERS`/`VOCABULARY_INTERIORS` themselves, so there is one list and nothing to keep in
-step: a new registry entry no longer turns the synthetic lock tests red.
-
-No test is listed here any more. The six `live_tree_*` tests this section listed are deleted,
-since `verify` already runs the same census on the checkout.
+None: every test in §2 samples a spec.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
-1. **The scope tests sample today's tree, not the census.** Seven tests in `scope_census.rs`
+1. **The scope tests sample the live tree, not the census.** Seven tests in `scope_census.rs`
    (`a_per_pane_word_decorations_map_fails_the_flash_limiter_chain`, `a_new_per_pane_owner_fails_the_closure`,
    `a_per_pane_constructor_fails_the_closure`, `a_per_pane_named_constructor_fails_the_closure`,
    `a_renamed_field_or_owner_fails_stale_rather_than_silently_passing`,
@@ -406,26 +395,19 @@ since `verify` already runs the same census on the checkout.
    `census-scope-verdict` has to be stated and proved over synthetic claim/tree pairs before they can go.
 2. **End-to-end census tests assert prose.** Many assert repair or explanation text in the log:
    "HOW TO REPAIR", "NO waiver channel", "WCAG 2.3.1", "COOPERATIVE OFFLOAD", "VACUOUS",
-   "EXCLUDED from the mutex order graph", and "the DERIVED GUI-process closure (4 workspace crates"
-   in `lib.rs::synthetic_offloaded_tree_is_green`. `CensusOutcome` exposes only `(ok, verdict, log)`,
-   so a spec has nothing structured to quantify over except parsed log text. Recommendation: return
-   typed findings (obligation, path, line, edge) beside the log, so the `census-*-verdict` specs speak
-   about data. None of the prose asserts is carried into a spec.
+   "EXCLUDED from the mutex order graph", and "the DERIVED GUI-process closure (5 workspace crates"
+   in `lib.rs::synthetic_offloaded_tree_is_green`. `CensusOutcome` carries `ok`, `verdict`, `log`
+   and `floors` and no findings, so a spec has nothing structured to quantify over except parsed
+   log text. Recommendation: return typed findings (obligation, path, line, edge) beside the log,
+   so the `census-*-verdict` specs speak about data. None of the prose asserts is carried into a
+   spec.
 3. **A tautology.** The first assert of
    `lock_order.rs::a_return_type_must_name_a_guard_not_merely_contain_the_letters`,
    `"GuardedInput".contains("Guard")`, is about `str::contains` and involves no aterm code. The rest of
    the test samples `census-return-type-guard`.
 4. **A fixture chosen by position.** `held_guard.rs::a_finding_is_the_line_of_the_work` takes
-   `MUST_FIRE[14]` (today the rustfmt-wrapped chain). Reordering `MUST_FIRE` silently changes what it
+   `MUST_FIRE[14]` (the rustfmt-wrapped chain). Reordering `MUST_FIRE` silently changes what it
    checks. `census-held-guard-scan` states that the hit is the work's line for every shape.
-5. **A stale or unintended exclusion (code, not a test).** Settled: `crates/xtask` is gone and
-   `lib::marker_sweep_file` excludes only test files and this crate.
-6. **The migration manifest over-counts this crate.** The chunk manifest counted 216 tests; there are
-   187 (see the header). Its counter should ignore literal contents.
-7. **`census-launcher-source` named a tree the code does not read.** Its first statement listed
-   `crates/xtask/` as a launcher source. `launcher_source` has no such arm: `crates/xtask/src/x.rs`
-   gives `in_crate = "src/x.rs"` and so false. The row now states what the code does. Whether
-   xtask belongs in the scope is a question about the code, not about the spec.
 
 ## 6. Proof order (easiest high-value first)
 
@@ -436,7 +418,7 @@ specs are built on.
 1. **`census-key-file-name`** and **`census-launcher-source`** (gaps 1, 3). Equality against string
    literals, `ends_with`, `starts_with` and `split_once`, with no loops. They are the first `&str`
    specs Trust can certify once gap 1 lands, and each retires one test.
-   **Re-measured on seal `150efe4a` (2026-10-16): both still blocked.** Each fn was wrapped in
+   **On seal `150efe4a` both are blocked.** Each fn was wrapped in
    `trust_contract_fn!` with `ensures result == (<spec>) by <thm>`. Each `<thm>` was a
    `verify_island! { clean { … } }` theorem `∀ s : String, trust_import_aterm_census__<fn> s = <spec>`.
    The seal reported three refusals for each fn, the same for both:
@@ -471,8 +453,8 @@ specs are built on.
    (gaps 1, 3, 5). Short straight-line string predicates, one test each.
 5. **`census-guard-hits`** and **`census-guard-calls`**. The word-bound and call-site lemmas behind
    every rule spec's `Match`.
-   **`census-guard-calls` measured on seal `150efe4a` (2026-10-19): blocked, code unchanged, no
-   test deleted.** `calls` is `&str -> Vec<&str>` (gap 1). `trust_contract_fn!`'s `-> $ret:ident`
+   **On seal `150efe4a`, `census-guard-calls` is blocked; the code and its test stay as they are.**
+   `calls` is `&str -> Vec<&str>` (gap 1). `trust_contract_fn!`'s `-> $ret:ident`
    arm cannot even spell its result type, and `&str` has no clause type (item 1). So the spec's main
    statement was not contracted. Its scalar half, `is_word(b: u8) -> bool`, was contracted with
    `ensures result == ((b >= 48 && b <= 57) || ((b >= 65 && b <= 90) || ((b >= 97 && b <= 122) ||
@@ -484,12 +466,11 @@ specs are built on.
    That is gap 3 (a call): a single-file probe of the same body shows `Alloca without an internally
    bound extent` for the `&self` receiver. Without an import, the fn row was 2 of 2 proved by
    `trust-full-verifier` (PDR, smt-backed), not by `clean-kernel-citation`. The PM-1 boundary did
-   not refuse the crate. The probe (`$HOME/trust-land/seal-aterm-probe/isword/g`) gives a route for
-   the scalar half: write the body as `matches!(b, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_')`,
+   not refuse the crate. A probe gives a route for the scalar half: write the body as `matches!(b, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | b'_')`,
    with no behaviour change. E6 imports that body as
    `decide (48 <= b) && decide (b <= 57) || (… || decide (b = 95))`. The theorem stated in exactly
    that `<=` form closes with `simp only [import]`, and the row is Verified with every postcondition
-   `clean-kernel-citation`. Mutating `b'z'` to `b'y'` makes the island fail (`h/`). The `<` form does
+   `clean-kernel-citation`. Mutating `b'z'` to `b'y'` makes the island fail. The `<` form does
    not unify with the import, and rustc's lexer refuses `≤` inside `verify_island!`. The spec stays
    blocked on `calls` (gaps 1, 3, 5, 7) until `&str`/`Vec` carriers and loops land.
 6. **`census-lex-spans-refine`**, then **`census-lex-views`** and **`census-blank-non-code`**. These

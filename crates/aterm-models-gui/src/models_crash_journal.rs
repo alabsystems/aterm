@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE CRASH JOURNAL'S CLAIM (P1 of `docs/DESIGN-pty-keeper-2026-09-26.md`, §5.5 and §6.3): who may take a dead window's layout, and when.
+//! THE CRASH JOURNAL'S CLAIM (`docs/DESIGN-pty-keeper-2026-09-26.md` §5.5, §6.3): who may take a dead window's layout, and when.
 
 use aterm_spec::derive::Model;
 
-/// One journal and every launch that comes after its owner (`aterm-gui/src/crash_journal.rs`: `JournalOwner::create`/`publish`/ `retire` on the owner's side, `claim_at_boot` on the reader's).
+/// One journal and every launch that comes after its owner (`aterm-gui/src/crash_journal.rs`: `JournalOwner::create`/`publish`/`retire` on the owner's side, `claim_at_boot` on the reader's).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn crash_journal_claim_model() -> Model {

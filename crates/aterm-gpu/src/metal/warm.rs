@@ -388,7 +388,7 @@ fn bench_compile(
     }
 }
 
-/// THE FIRST-FRAME COMPILE MEASUREMENT's warm half (`benches/first_frame_compile.rs`, which runs the job on a thread of its own): begin the warm — with the launch's default knobs, or with the aurora off, the text frame and the blit alone, as the warm was before 2026-10-17 — and hand back its job, which answers how long the warm took.
+/// THE FIRST-FRAME COMPILE MEASUREMENT's warm half (`benches/first_frame_compile.rs`, which runs the job on a thread of its own): begin the warm — with the launch's default knobs, or with the aurora off, the text frame and the blit alone — and hand back its job, which answers how long the warm took.
 /// # Errors
 /// A second call in one process.
 #[doc(hidden)]

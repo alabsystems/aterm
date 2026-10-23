@@ -1773,7 +1773,12 @@ mod tests {
                 a.since
             );
         }
-        for build in [ALAB_BUILD, FOREVER_BUILD] {
+        let builds = committed_alab_builds();
+        assert!(
+            builds.iter().any(|b| b == ALAB_BUILD),
+            "the codex-alab reductions are read: {builds:?}"
+        );
+        for build in &builds {
             let alab = committed_rollouts(build);
             for key in [
                 "rollout.session_meta",
@@ -1806,7 +1811,25 @@ mod tests {
 
     const ALAB_BUILD: &str = "0.164.0-dev.12521+g3d3eb12d8";
 
-    const FOREVER_BUILD: &str = "0.164.0-dev.12672+g089291d37";
+    /// Every codex-alab build a committed reduction's header names, so a build is held to the keys the
+    /// fold reads the moment its reductions are committed, with no list to keep beside them.
+    fn committed_alab_builds() -> Vec<String> {
+        let mut builds: Vec<String> = std::fs::read_dir(ROLLOUTS)
+            .expect("the step testdata")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("codex-"))
+            .filter_map(|e| {
+                let text = std::fs::read_to_string(e.path()).ok()?;
+                let build = text.strip_prefix("# codex ")?.split(' ').next()?.to_owned();
+                rollout_reduction_stem(&build)
+                    .starts_with("codex-alab-")
+                    .then_some(build)
+            })
+            .collect();
+        builds.sort();
+        builds.dedup();
+        builds
+    }
 
     #[test]
     fn a_rollout_reduction_is_named_by_its_build() {

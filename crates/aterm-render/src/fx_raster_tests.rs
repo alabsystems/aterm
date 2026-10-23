@@ -1769,11 +1769,10 @@ fn the_budget_rules_once_per_set_of_contents() {
     let mut budget = FxBudget::default();
     let mut rule = |layers: &[FxLayer]| {
         crate::test_counters::take_budget_rulings();
-        budget.rule(layers);
-        (
-            crate::test_counters::take_budget_rulings(),
-            budget.refused_items(),
-        )
+        let afresh = budget.rule(layers);
+        let walked = crate::test_counters::take_budget_rulings();
+        assert_eq!(afresh, walked == 1, "a ruling says whether it walked");
+        (walked, budget.refused_items())
     };
     let under = |c: &Arc<FxContent>| vec![layer(c, FxSlot::Under)];
     assert_eq!(rule(&under(&over)), (1, 1), "the third art is refused");

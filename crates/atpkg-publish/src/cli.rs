@@ -41,7 +41,7 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "build-local",
         synopsis: "build-local <program> <checkout> [--plan] [--policy repository|unverified] [--profile release|dev] [--jobs N] [--toolchain BIN] [--out DIR] [--link]",
-        does: "development build of a program, unsigned and unpacked",
+        does: "development build of a program: unsigned, never packed or uploaded",
     },
     Verb {
         name: "sign",
@@ -51,22 +51,22 @@ pub const VERBS: &[Verb] = &[
     Verb {
         name: "upload",
         synopsis: "upload <staging|public> <repo> <tag> <file>…",
-        does: "replace assets of a standing release, as that owner's token (the signing ceremony's re-upload)",
+        does: "replace or add assets on a standing release with that owner's token (the signing ceremony's re-upload)",
     },
     Verb {
         name: "index",
         synopsis: "index [--baseline QUAD-DIR | --first CHANNEL --index-build N] [--pin P=B]… [--target-pin T:P=B[,…]]… [--yank …] [--unyank …] [--min-build N [--lower-min-build]] [--retire P]… [--retire-target T[:P]]… [--allow-triple-drop P=T --reason …] [--valid-until TS] [--out DIR] [--pack-dir DIR | --upload]",
-        does: "publish the next signed index as a typed delta over the verified head",
+        does: "sign the next index as a delta over the verified head; --upload publishes it",
     },
     Verb {
         name: "mirror",
-        synopsis: "mirror <quad-dir> | --quad DIR [--dry-run]",
-        does: "make public the signed packs an index pins",
+        synopsis: "mirror <quad-dir | --quad DIR> [--dry-run]",
+        does: "copy the staged packs a verified index pins to the public owner",
     },
     Verb {
         name: "publish-group",
         synopsis: "publish-group rustc --seal <dir> [--trust-repo DIR] [--checkout NAME=DIR]… [--out DIR] [--dry-run | --upload] [--force-same-build] [--allow-build-tree-seal]",
-        does: "publish the rustc coherence group from one seal",
+        does: "pack, sign and index the rustc coherence group from one seal; --upload publishes it",
     },
     Verb {
         name: "status",
@@ -80,7 +80,7 @@ pub const VERBS: &[Verb] = &[
     },
 ];
 
-/// Binary entry point (`0` pass, `1` finding/refused, `2` usage, `3` could not run).
+/// Binary entry point: exits `0` ok, `1` refused, `2` usage, `3` could not run.
 pub fn main_entry(args: impl IntoIterator<Item = String>) -> ExitCode {
     let args: Vec<String> = args.into_iter().skip(1).collect();
     match run(&args) {
@@ -136,6 +136,6 @@ pub fn usage() -> String {
     for v in VERBS {
         s.push_str(&format!("  {}\n      {}\n", v.synopsis, v.does));
     }
-    s.push_str("\nExit: 0 pass, 1 finding (refused), 2 usage, 3 could not run.\n");
+    s.push_str("\nExit: 0 ok, 1 refused, 2 usage, 3 could not run.\n");
     s
 }

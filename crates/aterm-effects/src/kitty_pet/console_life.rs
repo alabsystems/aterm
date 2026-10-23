@@ -2108,6 +2108,12 @@ impl PetBrain {
             .is_some_and(|(at, now)| now.saturating_duration_since(at).as_secs_f32() < secs)
     }
 
+    /// The sequence number of the last key the app noted ([`Self::note_console_input`]), when it was an Enter: one Enter, told from the next.
+    #[inline]
+    pub(super) fn last_submit_seq(&self) -> Option<u64> {
+        (self.console.typed_kind == Some(PetInputKind::Submit)).then_some(self.console.seq)
+    }
+
     /// The kind of the last key the app noted ([`Self::note_console_input`]), when it was pressed within `secs`: a letter typed is writing that goes forward before its echo has moved the caret.
     #[inline]
     pub(super) fn key_within(&self, secs: f32) -> Option<PetInputKind> {

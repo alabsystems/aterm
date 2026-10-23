@@ -98,6 +98,8 @@ pub struct CursorComet {
     blaze: f32,
     /// Cached `(color, theme_fg, theme_bg)` ink for the light-page coma.
     light_ink_memo: Option<((u32, u32, u32), u32)>,
+    /// Cached `(color, theme_bg, e.to_bits())` fill for the light-page nucleus.
+    light_fill_memo: Option<((u32, u32, u32), u32)>,
 }
 
 impl CursorComet {
@@ -144,11 +146,24 @@ impl CursorComet {
         let styled = if cfg.dark_theme {
             ice_ramp(cfg.color, 0.34 + 0.40 * e + 0.05 * (breathe - 0.5))
         } else {
-            crate::color_math::floor_contrast_keeping_hue(
-                crate::color_math::light_body_fill(cfg.color, e),
+            let key = (
+                cfg.color & 0x00FF_FFFF,
                 cfg.theme_bg & 0x00FF_FFFF,
-                LIGHT_NUCLEUS_CONTRAST,
-            )
+                e.to_bits(),
+            );
+            if let Some((prev_key, fill)) = self.light_fill_memo
+                && prev_key == key
+            {
+                fill
+            } else {
+                let fill = crate::color_math::floor_contrast_keeping_hue(
+                    crate::color_math::light_body_fill(cfg.color, e),
+                    cfg.theme_bg & 0x00FF_FFFF,
+                    LIGHT_NUCLEUS_CONTRAST,
+                );
+                self.light_fill_memo = Some((key, fill));
+                fill
+            }
         };
         let fill = if cfg.pinned {
             crate::color_math::wear_pinned(cfg.color, styled, e, SETTLED_BLAZE)

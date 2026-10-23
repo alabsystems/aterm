@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The canonical per-program states: one spelling each, used verbatim by `status.toml`, the pass log, `atpkg doctor`, `atpkg which` and the Packages rows (`docs/DESIGN-which-copy-runs-2026-08-27.md` §2).
+//! The canonical per-program states: one spelling each, used verbatim by `status.toml`, the pass log, `atpkg doctor`, `atpkg which` and the Packages rows.
 
 use std::path::Path;
 
@@ -734,8 +734,8 @@ mod tests {
         assert_eq!(shadowed_by(&row), Some((muse, "/p/muse")));
     }
 
-    /// The agent programs' shell-local shadow row (2026-09-16) is a managed row, and NOT a
-    /// `SHADOWED by` row to the parser, because it is one shell's state, not the machine's.
+    /// The agent programs' shell-local shadow row is a managed row, and NOT a `SHADOWED by`
+    /// row to the parser, because it is one shell's state, not the machine's.
     #[test]
     fn the_agent_shadow_row_is_never_the_machine_state() {
         let agents = Path::new("/Users//dev/Library/Application Support/aterm/pkg/agents");

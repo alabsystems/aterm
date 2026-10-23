@@ -99,6 +99,9 @@ pub struct CursorStep<'a> {
     pub row_probe: Option<RowProbe<'a>>,
     /// The cells of the frame about to be presented (window rows), whose text tells the dark streak where it crosses air ([`crate::cursor_glow::CursorGlow::observe_frame_text`]).
     pub frame_cells: Option<&'a [Vec<RenderCell>]>,
+    /// The window cell `(row, col)` of `frame_cells`' first cell: `(0, 0)`
+    /// for the window's own cells, a split's offset for its focused pane's.
+    pub frame_cells_at: (u16, u16),
     /// Keystrokes the host batched since its last step, replayed at this frame's instant after the history fence (a page's straggler keys; a native window notes each key at its press and passes `0`).
     pub pending_keys: u32,
     /// The echo anchor `(row, col, seq)` and the glyph its run ended on.
@@ -865,12 +868,7 @@ impl EffectsPipeline {
             self.flying_sky_row = None;
             return FlyingSeat::default();
         };
-        let ink = |row: u16, col: u16| -> Option<bool> {
-            cells
-                .get(usize::from(row))
-                .and_then(|line| line.get(usize::from(col)))
-                .map(|cell| !matches!(cell.ch, ' ' | '\0'))
-        };
+        let ink = |row: u16, col: u16| companion::cell_ink(cells, row, col, geom.cols);
         let seat = companion::placement(
             cell,
             &SeatQuery {
@@ -969,18 +967,27 @@ impl EffectsPipeline {
         pane_off: (u16, u16),
         now: Instant,
     ) {
-        let on_glass = if self.cursor.glow.v2_status().is_some() && pet_frame.alpha > 0 {
-            if pane_off == (0, 0) {
-                crate::rainbow_kitty::companion::PetOnGlass::of(pet_frame, geom)
-            } else {
-                let mut frame = *pet_frame;
-                frame.row += f32::from(pane_off.0);
-                frame.col += f32::from(pane_off.1);
-                crate::rainbow_kitty::companion::PetOnGlass::of(&frame, geom)
-            }
+        let mut frame = *pet_frame;
+        frame.row += f32::from(pane_off.0);
+        frame.col += f32::from(pane_off.1);
+        let on_glass = if self.cursor.glow.v2_status().is_some() && frame.alpha > 0 {
+            crate::rainbow_kitty::companion::PetOnGlass::of(&frame, geom)
         } else {
             None
         };
+        // The body the sky draws no star on: the box `PetOnGlass` reads, in
+        // window pixels.
+        let body = on_glass.and_then(|_| {
+            let (cw, ch) = (u16::try_from(geom.cw).ok()?, u16::try_from(geom.ch).ok()?);
+            let (cols, rows) = (
+                u16::try_from(geom.cols).ok()?,
+                u16::try_from(geom.rows).ok()?,
+            );
+            let (x0, x1, y0, y1) = frame.body_px(cw, ch, cols, rows)?;
+            let (ox, oy) = (i32::from(geom.origin_x), i32::from(geom.origin_y));
+            Some((x0 + ox, x1 + ox, y0 + oy, y1 + oy))
+        });
+        self.cursor.glow.note_pet_body(body);
         let offer = self.cursor.glow.pet_offer(geom, on_glass);
         if let Some(star) = self.companion.note_v2_offer(&offer) {
             self.cursor.glow.catch_star(star, now);
@@ -1256,7 +1263,9 @@ pub(super) fn step_cursor_family(
         .observe_print_anchor_glyph(step.print_anchor, step.print_anchor_glyph);
     cursor.glow.observe_caret_drawn(step.caret_drawn);
     if let Some(cells) = step.frame_cells {
-        cursor.glow.observe_frame_text(step.input.cur, cells, now);
+        cursor
+            .glow
+            .observe_frame_text_at(step.input.cur, cells, step.frame_cells_at, now);
     }
     let frame = cursor.tick(&step.input, step.glow, step.trail);
     CursorStepOut {

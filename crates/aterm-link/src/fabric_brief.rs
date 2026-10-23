@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm fabric brief` (`docs/DESIGN-session-log-2026-10-15.md` §5.5).
+//! `aterm fabric brief`: the fold of the bus mirror (`docs/DESIGN-session-log-2026-10-15.md` §5.5, §7.1).
 
 use std::collections::BTreeMap;
 use std::io;

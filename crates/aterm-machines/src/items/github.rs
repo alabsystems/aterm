@@ -32,7 +32,7 @@ pub const BLOCK_BEGIN: &str = "# >>> aterm-machines github";
 /// The last line of every block this family writes.
 pub const BLOCK_END: &str = "# <<< aterm-machines github";
 
-/// GitHub's published SSH host keys (`gh api meta --jq .ssh_keys`, 2026-10-16).
+/// GitHub's published SSH host keys (`ssh_keys` of `https://api.github.com/meta`, read 2026-10-16).
 pub const GITHUB_HOST_KEYS: [&str; 3] = [
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
     "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBEmKSENjQEezOmxkZMy7opKgwFB9nkt5YRrYMjNuG5N87uRgg6CLrbo5wAdT/y6v0mKV0U2w0WZ2YB/++Tpockg=",

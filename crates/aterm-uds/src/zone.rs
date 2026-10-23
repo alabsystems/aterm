@@ -2,14 +2,13 @@
 // Copyright 2026 Andrew Yates
 
 //! A zone's offset from UTC at an instant, read in this process: the offset daylight saving
-//! gives that instant, in seconds east of UTC. It replaces `date +%z`, a child per question
-//! (docs/DESIGN-init-system-2026-10-20.md §6.1 row 9).
+//! gives that instant, in seconds east of UTC, with no `date +%z` child per question.
 //!
 //! * The local clock's ([`local_offset_at`](crate::zone::local_offset_at)) is `localtime_r`'s
 //!   `tm_gmtoff`, after a `tzset` so a replaced system zone is followed (glibc keeps its first
-//!   zone otherwise). This process's `TZ` wins, as it did for the `date` it inherited.
+//!   zone otherwise). This process's `TZ` wins, as it would for a `date` child.
 //! * A named zone's ([`zone_offset_at`](crate::zone::zone_offset_at)) is read from its TZif file
-//!   under `/usr/share/zoneinfo` (RFC 8536), the file `TZ=<zone> date` read: the transition in
+//!   under `/usr/share/zoneinfo` (RFC 8536), the file `TZ=<zone> date` reads: the transition in
 //!   force at the instant, and past the last transition the file's footer rule (a POSIX `TZ`
 //!   string, [`posix_offset_at`](crate::zone::posix_offset_at)). No `TZ` is set: a process's
 //!   `TZ` is shared by every thread, and setting it beside a reader is undefined.

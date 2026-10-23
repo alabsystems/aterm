@@ -239,7 +239,7 @@ pub fn unread_told_words() -> String {
 /// The latest the notice may leave the screen: this long before the reset, so the loop reads and decides the screen without it while the wait stands.
 pub const HIDE_BEFORE_RESET_MS: i64 = 120_000;
 const HIDE_TRIES: usize = 32;
-/// The local command whose output scrolls the notice away: Muse Code prints `  Rules loaded this session (in precedence order):`, `  user: none`, `  project: none` under the turn's end and sends no request (measured on 1.4.10, 2026-10-21).
+/// The local command whose output scrolls the notice away: Muse Code prints `  Rules loaded this session (in precedence order):`, `  user: none`, `  project: none` under the turn's end and sends no request (measured on 1.4.10).
 pub const HIDE_COMMAND: &str = "/rules";
 /// The words of Muse Code's usage wall (`◆ Usage limit reached · /upgrade (…) …`): a screen holding none of them has lost the notice.
 pub const WALL_WORDS: &str = "Usage limit reached";
@@ -251,7 +251,7 @@ pub const AGY_WALL_WORDS: [&str; 2] = ["exceeded your current quota", "Error ID:
 pub const GEMINI_HIDE_OPTION: &str = "2. Stop";
 /// The words of Gemini CLI's usage-limit dialog: its title, and the reset row a Google account's spent quota draws under it.
 pub const GEMINI_WALL_WORDS: [&str; 2] = ["Usage limit reached", "Access resets at"];
-/// Claude Code's local command whose output scrolls the notice away once its countdown is cancelled ([`CLAUDE_CANCEL`]): `/rename <name>` prints `  ⎿ Session renamed to: <name>` under its own `❯ /rename <name>` row and sends no request; the composer's top rule carries the name from then on (`──── <name> ─`), and with an argument typed no command menu is drawn (measured on 2.1.307, 2026-10-21, the stub's five-hour limit standing: twelve of them took the notice off a 50-row tab; the stub read no request).
+/// Claude Code's local command whose output scrolls the notice away once its countdown is cancelled ([`CLAUDE_CANCEL`]): `/rename <name>` prints `  ⎿ Session renamed to: <name>` under its own `❯ /rename <name>` row and sends no request; the composer's top rule carries the name from then on (`──── <name> ─`), and with an argument typed no command menu is drawn (measured on 2.1.307 under the stub's five-hour limit: twelve of them take the notice off a 50-row tab, and the stub reads no request).
 pub const CLAUDE_HIDE_COMMAND: &str = "/rename forever-w2";
 /// The words of Claude Code's usage limit: the turn's `⎿  You've hit your session limit · resets …`, its `⏺ Usage limit reached · continuing automatically at …` row, and the footer's `⚠ Usage limit reached · limit resets …` banner.
 pub const CLAUDE_WALL_WORDS: [&str; 4] = [
@@ -260,14 +260,14 @@ pub const CLAUDE_WALL_WORDS: [&str; 4] = [
     "usage limit",
     "limit resets",
 ];
-/// Claude Code's countdown, cancelled before the notice can be scrolled away ([`Hide::cancel`]): while it is armed its footer draws `⚠ Usage limit reached · limit resets …` and `Continuing automatically at … · esc to cancel` under every local command's rows; Esc cancels it — `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` — and the banner leaves the footer (measured on 2.1.307, 2026-10-21).
+/// Claude Code's countdown, cancelled before the notice can be scrolled away ([`Hide::cancel`]): while it is armed its footer draws `⚠ Usage limit reached · limit resets …` and `Continuing automatically at … · esc to cancel` under every local command's rows; Esc cancels it — `⏺ Automatic continue cancelled · /rate-limit-options to re-arm` — and the banner leaves the footer (measured on 2.1.307).
 pub const CLAUDE_CANCEL: Cancel = Cancel {
     key: "escape",
     armed: "esc to cancel",
     cancelled: "Automatic continue cancelled",
 };
 
-/// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`): what the review's fix pass and `b9/resid3` left to their unit tests.
+/// THE RESIDUALS, LIVE (`--mode resid`, `--mode ladder`): cases otherwise held only by unit tests. `same-words`' first prompt carries this path, one word with no space.
 pub const LONG_TOKEN: &str = "lab/parser-module-parser-module-parser.rs";
 /// The size `same-words`' tab is resized to once its first point is decided (`resize <rows> <cols>`): narrower, so the opener re-wraps, and taller, so more of the conversation above the reply comes into sight.
 pub const RESIZED: (u16, u16) = (104, 62);
@@ -3330,7 +3330,7 @@ fn p3_faults(seen: &Seen, t0: i64) -> Vec<String> {
     out
 }
 
-/// What fails every scenario of a chain, whatever each scenario's own judge says (the review of `b9/forever-gaps`, F10–F12): an act typed before the due its back-off named ([`early_acts`]), an act typed twice with no point judged between ([`doubled_acts`]), a point before the first prompt or a first point that closed other than one short turn ([`p3_faults`]).
+/// What fails every scenario of a chain, whatever each scenario's own judge says: an act typed before the due its back-off named ([`early_acts`]), an act typed twice with no point judged between ([`doubled_acts`]), a point before the first prompt or a first point that closed other than one short turn ([`p3_faults`]).
 #[must_use]
 pub fn chain_faults(seen: &Seen, t0: i64) -> Vec<String> {
     let mut out = early_acts(seen, t0);
@@ -4727,7 +4727,7 @@ fn dumps(run: &Run) -> Vec<(i64, Vec<u8>)> {
     dumps_in(&run.w.join("dump"))
 }
 
-/// The stub's dumps of the conversations' TURNS in `dir`, `(modified ms, body)` each: `req-<n>.json` alone ([`crate::stub::turn_dumps`]), never a side call's `side-<n>.json`, whose copy of a conversation is no request of its turns' — Muse Code's reminder observer renders the whole conversation into one text with line breaks, which C4 read as the owner's words reaching the agent so (the lab's `r10-cv`, 2026-10-22).
+/// The stub's dumps of the conversations' TURNS in `dir`, `(modified ms, body)` each: `req-<n>.json` alone ([`crate::stub::turn_dumps`]), never a side call's `side-<n>.json`, whose copy of a conversation is no request of its turns' — Muse Code's reminder observer renders the whole conversation into one text with line breaks, which C4 would read as the owner's words reaching the agent so.
 #[must_use]
 pub fn dumps_in(dir: &Path) -> Vec<(i64, Vec<u8>)> {
     crate::stub::turn_dumps(dir)
@@ -5342,7 +5342,7 @@ fn choose_option(
     Ok(Ok(enter))
 }
 
-/// The agent W5 starts in harness `h`'s tab under `h`'s remembered limit ([`switch_step`]): one whose limits the loop reads and decides on too (`turn_end.rs`'s `met_under_another`), on another account: Muse Code after Claude Code, Gemini CLI or agy, Claude Code after Muse Code — the pairs measured on 2026-10-21, where each held the other.
+/// The agent W5 starts in harness `h`'s tab under `h`'s remembered limit ([`switch_step`]): one whose limits the loop reads and decides on too (`turn_end.rs`'s `met_under_another`), on another account: Muse Code after Claude Code, Gemini CLI or agy, Claude Code after Muse Code — the measured pairs, in which each holds the other.
 #[must_use]
 pub fn switch_to(h: Harness) -> Harness {
     match h {

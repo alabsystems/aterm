@@ -103,6 +103,7 @@ fn base_reading() -> TurnEndReading {
         record_turn: None,
         credits: None,
         repo: None,
+        fact: None,
     }
 }
 

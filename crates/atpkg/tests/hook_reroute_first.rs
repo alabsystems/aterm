@@ -152,13 +152,10 @@ struct Shell {
     args: &'static [&'static str],
 }
 
-/// The POSIX shells a test runs, each found by the one tool resolver
-/// (`aterm_spec::host::test_shell`); bash must be found. Iterated by reference only, and
-/// held for the whole test: when the test ends, a shell the host lacks ends it COULD NOT
-/// RUN naming its provider, once every loop has run the shells it has, so a missing zsh
-/// is never a pass that ran one dialect, and never stops a later loop's bash. (Iterated
-/// by value, the guard dropped at its first loop's end: a test with two loops never ran
-/// its second.)
+/// The POSIX shells a test runs, each found by `aterm_spec::host::test_shell`; bash must be
+/// found. Held for the whole test and iterated by reference (by value, the guard would drop
+/// at the first loop's end): when the test ends, after every loop has run the shells the
+/// host has, a missing one makes it COULD NOT RUN, never a pass that ran one dialect.
 struct Lanes {
     shells: Vec<Shell>,
     absent: Vec<&'static str>,
@@ -534,8 +531,8 @@ fn inside_aterm_a_bare_cargo_is_announced_and_then_runs_upstream_with_its_exit_c
 /// Every stub runs something, through the real `atpkg __reroute` and the real stubs:
 /// `rustfmt` with no trustfmt installed runs the upstream copy after one line naming
 /// `aterm pkg install trust`, and `z3` runs upstream after one line naming `ay` — each with
-/// the fake's own exit code. `[reroute] strict = true` in the temp `aterm.toml` puts the
-/// refusals back: 127 with the install line, and z3's exit 2 naming its path.
+/// the fake's own exit code. `[reroute] strict = true` in the temp `aterm.toml` refuses
+/// instead: 127 with the install line, and z3's exit 2 naming its path.
 #[test]
 fn a_missing_trust_tool_and_z3_run_upstream_and_strict_restores_the_refusals() {
     let fx = Fixture::new("never-refuse");

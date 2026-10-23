@@ -4936,6 +4936,24 @@ fn a_flowing_card_costs_one_clock_read_and_a_copy_between_steps() {
         "a step is a new palette on the arts its height registered: no art built"
     );
     assert_ne!(card_pic(&app, wid), pic, "CONTROL: a new step's glass");
+    // The kept step's contents go back to the card's ring, as a renderer
+    // lets go of a frame it has drawn past.
+    drop(layers);
+    for step in 2..=6 {
+        set_now(Some(
+            t0 + Duration::from_millis((k + step) * FLOW_STEP_MS + 1),
+        ));
+        let floor = pass_cost(&mut bare, bare_wid);
+        let drawn = pass_cost(&mut app, wid);
+        assert_eq!(drawn.ticks, 1, "step {step}: drawn");
+        if step >= 3 {
+            assert_eq!(
+                drawn.allocations, floor.allocations,
+                "step {step}: each of the ring's three pairs has held a step, so a drawn step \
+                 refills one in place and allocates nothing"
+            );
+        }
+    }
     set_now(None);
     host.shutdown_and_join();
 }

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError, Weak};
 
 use aterm_core::render::{
     FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxRamps, FxRect, FxSlot, FxSpace, FxSprite,
-    PxRect,
+    FxTexels, PxRect,
 };
 use aterm_render::fx::{self as fx_art, PieceArt};
 use aterm_render::{add_sat, premul_rgb};
@@ -281,12 +281,13 @@ impl CardFrames {
     }
 }
 
-/// Refill `content` in place through `f`, re-sealed; a pair some frame still
-/// holds (the renderer kept it longer than the ring's depth) is replaced by
-/// a fresh one, the one allocation a miss costs.
+/// Refill `content` in place through `f`, re-sealed; a content some frame
+/// still holds (the renderer kept it longer than the ring's depth) is
+/// replaced by a fresh one with its room ([`FxContent::empty_like`]), so a
+/// miss costs the content and its two vectors, never their growth.
 fn refill(content: &mut Arc<FxContent>, f: impl FnOnce(&mut Vec<FxItem>, &mut Vec<FxInk>)) {
     if Arc::get_mut(content).is_none() {
-        *content = Arc::new(FxContent::default());
+        *content = Arc::new(content.empty_like());
     }
     let Some(c) = Arc::get_mut(content) else {
         return;
@@ -304,18 +305,10 @@ const fn fx_ink(p: Paint) -> FxInk {
     FxInk::over(p.color, p.alpha)
 }
 
-/// Validate a producer's dimensions before allocating any texels.
+/// [`fx_art::art_dimensions`] of a `w × h` art in the card's pixels.
 #[inline]
 fn art_size(w: i64, h: i64) -> Option<(u16, u16, usize)> {
-    let (w, h) = (u16::try_from(w).ok()?, u16::try_from(h).ok()?);
-    if w == 0
-        || h == 0
-        || w > aterm_core::render::FX_ART_MAX_SIDE
-        || h > aterm_core::render::FX_ART_MAX_SIDE
-    {
-        return None;
-    }
-    Some((w, h, usize::from(w).checked_mul(usize::from(h))?))
+    fx_art::art_dimensions(usize::try_from(w).ok()?, usize::try_from(h).ok()?)
 }
 
 /// The rim's strip-id art for one frame of the kitty at one pixel size: the
@@ -379,7 +372,7 @@ impl RimArt {
         if !ok {
             return None;
         }
-        let art = FxArt::new(w16, h16, aterm_core::render::FxTexels::Index8, data)?;
+        let art = fx_art::bitmap(FxTexels::Index8, w16, h16, data)?;
         let cover = fx_art::cover(&art, RIM_COVER_MAX)
             .iter()
             .map(|t| {
@@ -393,7 +386,7 @@ impl RimArt {
             })
             .collect();
         Some(Self {
-            art: fx_art::registry().intern(art),
+            art,
             origin: (-rim, -rim),
             mids: mids.into_boxed_slice(),
             cover,

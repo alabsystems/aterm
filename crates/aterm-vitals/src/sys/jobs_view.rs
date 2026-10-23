@@ -175,6 +175,15 @@ pub fn findings_in(f: &Findings, keys: &[u64], all: bool) -> Findings {
             .filter(|n| mine(n.tab))
             .cloned()
             .collect(),
+        program_check: f
+            .program_check
+            .iter()
+            .filter(|n| mine(n.tab))
+            .cloned()
+            .collect(),
+        program_check_aterm: f.program_check_aterm,
+        program_check_episode: f.program_check_episode,
+        program_check_drained: f.program_check_drained,
         own_procs: f.own_procs,
         process_limit: f.process_limit,
     }
@@ -386,6 +395,7 @@ pub fn findings_json(f: &Findings) -> Jv {
     }));
     items.extend(f.d_state.iter().map(|n| named("d_state", n)));
     items.extend(f.busy_orphans.iter().map(|n| named("busy_orphan", n)));
+    items.extend(f.program_check.iter().map(|n| named("program_check", n)));
     Jv::obj([
         ("items", Jv::Arr(items)),
         ("own_procs", Jv::u(f.own_procs)),
@@ -577,6 +587,20 @@ mod tests {
                     for_ms: 0,
                 },
             ],
+            program_check: vec![
+                Named {
+                    pid: 63454,
+                    name: "git-remote-https".into(),
+                    tab: Some(7),
+                    for_ms: 1_139_000,
+                },
+                Named {
+                    pid: 25311,
+                    name: "gh".into(),
+                    tab: None,
+                    for_ms: 35_940_000,
+                },
+            ],
             own_procs: 300,
             process_limit: Some(5_000),
             ..Findings::default()
@@ -584,9 +608,22 @@ mod tests {
         let mine = findings_in(&f, &[7], false);
         assert_eq!(mine.stopped.len(), 1);
         assert_eq!(mine.stopped[0].pid, 10);
+        assert_eq!(
+            mine.program_check.iter().map(|n| n.pid).collect::<Vec<_>>(),
+            [63454],
+            "a held program no tab holds prints only at scope=global"
+        );
         assert_eq!(findings_in(&f, &[7], true).stopped.len(), 2);
+        assert_eq!(findings_in(&f, &[7], true).program_check.len(), 2);
         let j = findings_json(&mine);
         assert!(contract_violations(&j).is_empty(), "{}", j.to_text());
+        assert!(
+            j.to_text().contains(
+                r#"{"kind":"program_check","pid":63454,"exe":"git-remote-https","for_ms":1139000}"#
+            ),
+            "{}",
+            j.to_text()
+        );
         let odd = Findings {
             stopped: vec![Named {
                 pid: 12,

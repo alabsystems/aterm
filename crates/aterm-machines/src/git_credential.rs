@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! GitHub credentials through git's own credential protocol, so neither `aterm init` nor the machines controller needs gh (docs/DESIGN-init-system-2026-10-20.md §1.18, §6.1 row 22, S14).
+//! GitHub credentials through git's own credential protocol, so neither `aterm init` nor the machines controller needs gh (docs/DESIGN-init-system-2026-10-20.md §1.18, §6.1 row 22).
 
 use crate::model::User;
 use crate::port::{Cmd, Secret, System};

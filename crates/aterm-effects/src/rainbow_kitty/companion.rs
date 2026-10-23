@@ -515,6 +515,53 @@ impl PetOnGlass {
     }
 }
 
+/// The share of a cell the pet tile's transparent border takes at each side (`kitty_pet`'s `INK_PAD`): no fur stands there.
+const SHADE_BORDER_CELLS: f32 = 0.30;
+
+/// The pet's body as the sky draws around it: a star whose centre lies on the
+/// body is not drawn, so the cat flies in front of the sky and no star sits
+/// on its fur. The pet ticks after the sky emits, so the shade is the body's
+/// last box joined with that box carried on by its last frame's move (the
+/// box it is about to be drawn at), each shaved of the tile's transparent
+/// border at the sides. Round 2's judge, 2026-10-23: purple sky stars on a
+/// flying companion's face and back on paper (`burst` t0).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PetShade {
+    /// The last two drawn boxes, `(x0, x1, y0, y1)` in window pixels, newest first.
+    boxes: [Option<(i32, i32, i32, i32)>; 2],
+}
+
+impl PetShade {
+    /// Note the body's drawn box this frame (`None`: off glass), window pixels.
+    #[inline]
+    pub const fn note(&mut self, body: Option<(i32, i32, i32, i32)>) {
+        self.boxes = [body, if body.is_some() { self.boxes[0] } else { None }];
+    }
+
+    /// The body box noted last (`None`: off glass, or never noted), window pixels.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn body(&self) -> Option<(i32, i32, i32, i32)> {
+        self.boxes[0]
+    }
+
+    /// Whether a star centred at `(x, y)` (window pixels) lies on the body.
+    #[must_use]
+    pub fn hides(&self, (x, y): (i32, i32), cell_w: usize) -> bool {
+        let Some(last) = self.boxes[0] else {
+            return false;
+        };
+        let ahead = self.boxes[1].map_or(last, |prev| {
+            let (dx, dy) = (last.0 - prev.0, last.2 - prev.2);
+            (last.0 + dx, last.1 + dx, last.2 + dy, last.3 + dy)
+        });
+        let border = (SHADE_BORDER_CELLS * cell_w as f32).round() as i32;
+        [last, ahead]
+            .iter()
+            .any(|&(x0, x1, y0, y1)| x >= x0 + border && x < x1 - border && y >= y0 && y < y1)
+    }
+}
+
 /// One star offered to a contented cat, named by the triple that identifies it in the sky's pool.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct StarCatch {
@@ -548,6 +595,36 @@ impl PetOffer {
     pub const fn is_empty(&self) -> bool {
         self.perk_at.is_none() && self.catch.is_none() && self.mote_t.is_none()
     }
+}
+
+/// The seat law's ink probe ([`placement`]) over a frame's cells: whether
+/// (`row`, `col`) holds a letter. A row the frame carries holds only its
+/// written columns; the columns past them, inside the grid's `cols`, are the
+/// frame's implicit blank (unwritten glass), not unknown. Read as unknown,
+/// they made every probe of a head that sat past a line's last letter blind,
+/// and the blind seat put it behind the caret, on the letters: a kitten-size
+/// nyan head at the end of `... the kitty flies` typed to two cells short of
+/// the margin sat on `flies` from the last key through its landing
+/// (2026-10-22, the trail gallery's `burst` on GitHub Light, 1.1 to 2.6:1
+/// under the head) where a larger head, reaching back over a letter, rose
+/// into the row above. A row the frame does not carry, or a column past the
+/// grid, is unknown.
+#[inline]
+#[must_use]
+pub fn cell_ink(
+    cells: &[Vec<aterm_core::terminal::RenderCell>],
+    row: u16,
+    col: u16,
+    cols: u16,
+) -> Option<bool> {
+    if col >= cols {
+        return None;
+    }
+    let line = cells.get(usize::from(row))?;
+    Some(
+        line.get(usize::from(col))
+            .is_some_and(|cell| !matches!(cell.ch, ' ' | '\0')),
+    )
 }
 
 /// `at + ms`, saturating. The module's one ms-to-`Instant` conversion, so nothing rounds to
@@ -682,6 +759,54 @@ mod tests {
             mid(false).windows(2).any(|w| w[0] != w[1]),
             "negative control: unheld, the head goes down and up with the keys"
         );
+    }
+
+    /// A head past a line's last letter, over the row's unwritten columns,
+    /// rises into the row above when the line is written up to the caret:
+    /// the frame's trimmed row reads blank past its written cells
+    /// ([`cell_ink`]), so the probe is not blind. Negative control: read as
+    /// unknown (the probe before 2026-10-22), the columns blind the probe and
+    /// the head sits behind the caret on the letters.
+    #[test]
+    fn a_head_past_the_last_letter_reads_the_unwritten_columns_blank() {
+        use aterm_core::terminal::RenderCell;
+        let cols = 120_u16;
+        let caret = (7_u16, 114_u16);
+        let letter = RenderCell {
+            ch: 'x',
+            ..RenderCell::default()
+        };
+        // Row 7 written up to the caret and no further; the rows above carry no cells.
+        let mut cells: Vec<Vec<RenderCell>> = vec![Vec::new(); 12];
+        cells[7] = vec![letter; usize::from(caret.1)];
+        let query = seat_query(caret, usize::from(cols));
+        let (first, _) = cell_span(query.rest.x, i32::from(query.rest.w), CW, cols);
+        assert_eq!(
+            first, caret.1,
+            "fixture: the head's rest seat starts at the caret, past the last letter"
+        );
+        let seat = placement(caret, &query, |r, c| cell_ink(&cells, r, c, cols));
+        assert_eq!(
+            (seat.lift_rows, seat.over_ink, seat.row),
+            (1, false, caret.0 - 1),
+            "the head must rise clear into the row above: {seat:?}"
+        );
+        let blind = placement(caret, &query, |r, c| {
+            cells
+                .get(usize::from(r))
+                .and_then(|line| line.get(usize::from(c)))
+                .map(|cell| cell.ch != ' ')
+        });
+        let (a, b) = covered(&blind);
+        assert!(
+            blind.lift_rows == 0 && blind.side == Side::Behind && b < caret.1 && a < b,
+            "negative control: read as unknown, the unwritten columns must blind the probe and \
+             seat the head behind the caret on the letters: {blind:?}"
+        );
+        assert_eq!(cell_ink(&cells, 7, 113, cols), Some(true));
+        assert_eq!(cell_ink(&cells, 7, 119, cols), Some(false));
+        assert_eq!(cell_ink(&cells, 7, 120, cols), None, "past the grid");
+        assert_eq!(cell_ink(&cells, 12, 0, cols), None, "a row the frame lacks");
     }
 
     fn seat_query(caret: (u16, u16), cols: usize) -> SeatQuery {

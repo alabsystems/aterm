@@ -23,8 +23,8 @@ const SED_PENDING: &str =
     include_str!("../fixtures/claude-2.1.300-transcript-box-bash-sed-pending.jsonl");
 /// The same two calls under a PreToolUse hook on every tool (`*`, `exit 0`)
 /// in manual mode, each transcript as it stood 350 ms after its box was
-/// drawn — past the loop's 300 ms settle (MEASURED 2026-10-15 on 2.1.300,
-/// the lab's stub; `api-request` rows cut, attachment rows cut to their
+/// drawn — past the loop's 300 ms settle (captured on 2.1.300 under the
+/// lab's stub; `api-request` rows cut, attachment rows cut to their
 /// type). The stub answers at once, so the prompt row lands after the Read's
 /// call: the prompt clears the Read, its result clears nothing more.
 const EDIT_STAR_HOOK: &str =
@@ -314,8 +314,8 @@ fn a_box_path_names_the_file_whose_components_it_ends() {
     }
 }
 
-/// A fresh session's first turn as 2.1.308 wrote it (the real-Claude lab
-/// `b3p1`, 2026-10-22): the Edit call of notes.txt waiting on its box, its
+/// A fresh session's first turn as 2.1.308 wrote it (captured in the real-Claude
+/// lab): the Edit call of notes.txt waiting on its box, its
 /// assistant row written BEFORE the prompt row `toolstart @notes.txt` and
 /// the attachment rows its `parentUuid` chain runs up through.
 const FIRST_EDIT: &str =

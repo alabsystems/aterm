@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Self-update intercept for managed vendor binaries ([`crate::platform::sh_selfupdate_prelude`]).
+//! The self-update intercept: a managed agent's own updater (`claude update`) runs
+//! `aterm pkg update <program>` instead ([`crate::platform::sh_selfupdate_prelude`]).
 use std::ffi::OsStr;
 use std::io;
 use std::path::Path;
@@ -11,7 +12,9 @@ use crate::vendor_direct::VendorSpec;
 /// Hidden verb executed by the twin prelude (`atpkg __selfupdate <program> [<abs prefix>] -- [args…]`, [`crate::platform::sh_selfupdate_prelude`]).
 pub const HIDDEN_VERB: &str = "__selfupdate";
 
-/// Re-entry guard environment variable (`__ATPKG_SELFUPDATE_PID`).
+/// The twin's re-entry guard: set to the shell's `$$` before it execs [`HIDDEN_VERB`], so a
+/// forwarded call that re-enters the twin under the same PID runs the store build instead of
+/// looping.
 pub const REENTRY_VAR: &str = "__ATPKG_SELFUPDATE_PID";
 
 /// Child `--wait-lock` bound in seconds ([`aterm_update_core::pkg_check::PASS_WAIT_LOCK_SECS`]).
@@ -67,7 +70,10 @@ pub enum Decline<'a> {
     Shape { verb: &'a str, rest: &'a [String] },
 }
 
-/// Classifies the user's argv (after the twin's `--`) against `row`.
+/// Classifies the user's argv (after the twin's `--`) against `row`: `-h`/`--help` before any
+/// `--` is [`Verdict::Help`]; a first word outside the row's verbs passes through; a verb
+/// other than `install` takes no arguments; `install` takes `latest` and `--force`, each at
+/// most once; `install stable` and a version target are declined by name.
 #[must_use]
 pub fn classify<'a>(row: &VendorSpec, args: &'a [String]) -> Verdict<'a> {
     if args
@@ -420,8 +426,8 @@ mod tests {
         row_for("codex").unwrap()
     }
 
-    /// THE SHELL-WORD RULE the twin renderer enforces (a verb lands in a `case` pattern):
-    /// a non-member has no verbs.
+    /// A verb lands in the twin's `case` pattern, so only a shell-safe word qualifies; a
+    /// program with no vendor row has no verbs.
     #[test]
     fn the_shell_word_rule_refuses_what_breaks_a_case_pattern() {
         assert_eq!(verbs_of("ay"), &[] as &[&str], "a non-member has no verbs");

@@ -20,7 +20,7 @@ use crate::{Fail, LAB, Res};
 /// The VM's name (QEMU's `-name`).
 pub const VM: &str = "aterm-windows";
 
-/// What the VM runs with: the owner's sizing (2026-10-20).
+/// What the VM runs with: the owner's sizing.
 pub const CPUS: u32 = 6;
 pub const MEMORY_GIB: u32 = 8;
 /// The disk is a qcow2 file that grows to what the guest has written.

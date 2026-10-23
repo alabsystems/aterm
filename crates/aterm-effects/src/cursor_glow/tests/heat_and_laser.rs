@@ -402,11 +402,10 @@ fn lightning_flashes(unlimited: bool) -> (usize, usize) {
     (meter.worst_per_second(), forged)
 }
 
-/// Lightning keeps its flash and counts it (WCAG 2.3.1; the owner asked for
-/// "a lightning bolt or flashing yellow", 2026-07-14): a bolt is born at full
-/// strength and only burns out, and strikes and crackles together are born
-/// at most three a second, so no pixel flashes more than three times in any
-/// second however the cursor jumps or however hot the typing.
+/// Lightning keeps its flash and counts it (WCAG 2.3.1): a bolt is born at
+/// full strength and only burns out, and strikes and crackles together are
+/// born at most three a second, so no pixel flashes more than three times in
+/// any second however the cursor jumps or however hot the typing.
 #[test]
 fn lightning_flashes_no_pixel_more_than_three_times_a_second() {
     let mut last = bolt_flash(0.0);

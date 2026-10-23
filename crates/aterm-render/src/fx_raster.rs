@@ -261,8 +261,8 @@ pub struct FxBudget {
 }
 
 impl FxBudget {
-    /// Rule on `layers`: walk the drawn sprites ([`for_each_drawn_sprite`]) and refuse each distinct art that would take its width's total of distinct texels past [`FX_FRAME_ART_TEXELS`]; a refused art's sprites draw nothing.
-    pub fn rule(&mut self, layers: &[FxLayer]) {
+    /// Rule on `layers`: walk the drawn sprites ([`for_each_drawn_sprite`]) and refuse each distinct art that would take its width's total of distinct texels past [`FX_FRAME_ART_TEXELS`]; a refused art's sprites draw nothing. Returns whether it ruled afresh: `false` when `layers` are the ones the last ruling was for (identity), whose ruling stands.
+    pub fn rule(&mut self, layers: &[FxLayer]) -> bool {
         if self.ruled.len() == layers.len()
             && self
                 .ruled
@@ -272,7 +272,7 @@ impl FxBudget {
                     Arc::ptr_eq(content, &l.content) && *slot == l.slot && *blend == l.blend
                 })
         {
-            return;
+            return false;
         }
         self.ruled.clear();
         self.ruled.extend(
@@ -289,7 +289,7 @@ impl FxBudget {
             sum[budget_width(sp.art.texels())] += area(&sp.art);
         });
         if sum.iter().all(|&s| s <= FX_FRAME_ART_TEXELS) {
-            return;
+            return true;
         }
         self.seen.clear();
         let mut used = [0u64; 2];
@@ -313,6 +313,7 @@ impl FxBudget {
                 *refused_items += 1;
             }
         });
+        true
     }
 
     /// Whether the last ruling refused `art`.
@@ -337,11 +338,17 @@ fn area(art: &FxArt) -> u64 {
 }
 
 impl FxSlicer {
-    /// The frame art budget the last [`slice_layers`] ruled by.
+    /// The frame art budget the last ruling ([`Self::rule`], [`slice_layers`]) ruled by.
     #[inline]
     #[must_use]
     pub const fn budget(&self) -> &FxBudget {
         &self.budget
+    }
+
+    /// Rule the frame art budget on `layers` ahead of slicing them, so a caller that reads the ruling first (the GPU's atlas admission) and the slice share one ([`FxBudget::rule`]): whether it ruled afresh.
+    #[inline]
+    pub fn rule(&mut self, layers: &[FxLayer]) -> bool {
+        self.budget.rule(layers)
     }
 }
 

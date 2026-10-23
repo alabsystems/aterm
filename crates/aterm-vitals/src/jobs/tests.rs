@@ -142,6 +142,7 @@ fn name_of(
         lanes,
         d_age: &d,
         elsewhere: &elsewhere,
+        program_check: true,
     };
     let job = JobFacts {
         consumer,
@@ -406,6 +407,7 @@ fn the_tty_names_read_the_fresh_mode_word_only_for_the_foreground_job() {
         lanes: LanesSeen::default(),
         d_age: &d,
         elsewhere: &e,
+        program_check: true,
     };
     let leaves = vec![(9, "ssh".to_owned())];
     let mode = |canonical, echo| TtyMode {

@@ -1148,10 +1148,26 @@ pub(crate) static PIPELINES: [PipelineSpec; PIPELINE_COUNT] = [
         #[cfg(any(target_os = "macos", gl_arm))]
         binds: BindSpec::FX,
     },
+    PipelineSpec {
+        label: "aterm-gpu knock-over pipeline",
+        library: ShaderLibrary::Cell,
+        vs: "vs_glyph",
+        fs: "fs_deco_over",
+        target: TargetRole::OffscreenSrgb,
+        blend: Some(Blend::ALPHA_BLENDING),
+        // The page's colour, never its opacity: on a translucent window the
+        // knock-out keeps the glass the body left (the CPU `knock_blend`).
+        write_mask: WriteMask::Color,
+        vertex: VertexLayout::Glyph,
+        #[cfg(any(wgpu_arm, gl_arm, test))]
+        topology: Topology::TriangleList,
+        #[cfg(any(target_os = "macos", gl_arm))]
+        binds: BindSpec::CELL_ATLAS,
+    },
 ];
 
 /// Total number of entries in [`PIPELINES`].
-pub(crate) const PIPELINE_COUNT: usize = 20;
+pub(crate) const PIPELINE_COUNT: usize = 21;
 
 /// Identifier and index into [`PIPELINES`] for each render pipeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1201,6 +1217,8 @@ pub(crate) enum Pipeline {
     Fx = 18,
     /// Linear-light fx layers.
     FxLinear = 19,
+    /// The knock-out: the deco-over blend onto RGB only, the page's alpha kept.
+    KnockOver = 20,
 }
 
 /// All [`Pipeline`] variants in row order.
@@ -1226,6 +1244,7 @@ pub(crate) const ALL_PIPELINES: [Pipeline; PIPELINE_COUNT] = [
     Pipeline::Tray,
     Pipeline::Fx,
     Pipeline::FxLinear,
+    Pipeline::KnockOver,
 ];
 
 impl Pipeline {
@@ -1260,6 +1279,7 @@ impl Pipeline {
             Self::Tray => "tray",
             Self::Fx => "fx",
             Self::FxLinear => "fx_linear",
+            Self::KnockOver => "knock_over",
         }
     }
 }

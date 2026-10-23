@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! FLEET MEMBERSHIP (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): what a machine keeps about its fleet beside the secret ([`KEY_FILE`]), and the one exchange `aterm fleet join` makes with the fleet's issuer once the handshake ([`crate::fleet`]) has proved both ends.
+//! FLEET MEMBERSHIP (`docs/DESIGN-sessions-as-subagents-2026-10-15.md` §5): what a machine keeps about its fleet beside the secret ([`KEY_FILE`]) — its node id and key, its book of peers, an issuer's join code, a member's copy of its issuer's book — and the exchanges it makes once the handshake ([`crate::fleet`]) has proved both ends: `aterm fleet join`'s registration with the issuer, the book read, the fleet survey, and a drive of a peer's session.
 
 use std::fmt;
 use std::io::{self, Read, Write};

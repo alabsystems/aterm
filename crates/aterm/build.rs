@@ -191,8 +191,8 @@ fn env_num(key: &str) -> u16 {
 /// there.
 const GIT: &str = if cfg!(unix) { "/usr/bin/git" } else { "git" };
 
-/// `unix` seconds as RFC 3339 UTC (`2026-10-22T00:00:00Z`): what `date -u +%Y-%m-%dT%H:%M:%SZ`
-/// printed, computed here (the civil calendar of Hinnant's `civil_from_days`, as
+/// `unix` seconds as RFC 3339 UTC (`2026-10-22T00:00:00Z`), as `date -u +%Y-%m-%dT%H:%M:%SZ`
+/// prints it, computed here (the civil calendar of Hinnant's `civil_from_days`, as
 /// `aterm_types::rfc3339` has it), so no `date` runs.
 fn rfc3339_utc(unix: i64) -> String {
     let (days, secs) = (unix.div_euclid(86_400), unix.rem_euclid(86_400));

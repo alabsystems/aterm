@@ -2,6 +2,17 @@
 // Copyright 2026 Andrew Yates
 
 //! THE OCCUPANCY DOOR (`docs/DESIGN-harness-occupancy-2026-10-20.md` §7, as the red-team corrects it: F6's fairness, dials and bound, F7's hold clock, F11's upgrade input).
+//!
+//! THE STUCK FACT (§2.1's rank 4; `docs/DESIGN-hung-background-call-2026-10-20.md` R3): `Key` is
+//! the owner's `[harness] stuck_break_note`, off as it ships. On, a hung call's fact is an episode
+//! of its own (`due == 3`), opened where a fresh reading names it untold, for Cruise and Land
+//! alike; it waits for the upgrade's notice as a nudge does (`UpgradeTypes` goes over everything
+//! but a wake), and it shares the nudges' door, pace, untaken act and rows; typed in a hold of
+//! any age, its answer is owed as any harness line's is (`HoldEvent::HarnessLine`). The key-on scenarios
+//! leave the wake's episodes out (one due line at a time either way), and `Buggy = 1`'s two
+//! liveness mutants walk the key-off ones only, so each configuration stays within the checker's
+//! cap; the model is silent on the stuck line against a due nudge at the
+//! same break, which the loop orders (the stuck line's first) and its tests pin.
 
 use aterm_spec::derive::{Liveness, Model};
 
@@ -14,8 +25,11 @@ pub fn occupancy_door_model() -> Model {
             const Buggy = 0;
             const K = 2;
             const Mode = 1;
+            const Key = 0;
             scenario Mode = 0;
             scenario Mode = 2;
+            scenario Key = 1;
+            scenario Mode = 2, Key = 1;
             var door = 0;
             var person = 0;
             var task = 1;
@@ -51,6 +65,7 @@ pub fn occupancy_door_model() -> Model {
             var hown = 0;
             var hanswer = 0;
             var restarted = 0;
+            var skey = 1;
 
             action Turn when (door > 0) {
                 door = 0;
@@ -96,8 +111,13 @@ pub fn occupancy_door_model() -> Model {
                 age = 0;
                 armed = 1;
             }
-            action OpenWake when (cond == 1 && due == 0 && told == 0) {
+            action OpenWake when (Key == 0 && cond == 1 && due == 0 && told == 0) {
                 due = 2;
+                age = 0;
+                armed = 1;
+            }
+            action OpenStuck when (Key == 1 && cond == 1 && due == 0 && told == 0) {
+                due = 3;
                 age = 0;
                 armed = 1;
             }
@@ -107,18 +127,19 @@ pub fn occupancy_door_model() -> Model {
             action Type when (
                 intent == 1 && cond == 1 && door > 0 && person == 0 && task == 1 && brake == 0
                     && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
                 srow = intent;
                 scond = cond;
                 snotice = if (due == 2 || upg == 0) { 1 } else { 0 };
+                skey = if (3 > due || Key == 1) { 1 } else { 0 };
                 told = told + 1;
                 wrote = wrote + 1;
                 due = 0;
@@ -126,7 +147,7 @@ pub fn occupancy_door_model() -> Model {
                 lines = lines + 1;
                 paced = 1;
                 untaken = 1;
-                owed = held;
+                owed = if (due == 3) { 1 } else { held };
                 age = 0;
                 esc = 0;
             }
@@ -141,7 +162,7 @@ pub fn occupancy_door_model() -> Model {
                 told = 0;
                 wrote = 0;
             }
-            action UpgradeTypes when (upg == 1 && door == 1 && person == 0 && lines == 0 && 2 > due) {
+            action UpgradeTypes when (upg == 1 && door == 1 && person == 0 && lines == 0 && (2 > due || due > 2)) {
                 uwake = if (due == 2) { 1 } else { 0 };
                 upg = 0;
                 lines = lines + 1;
@@ -157,12 +178,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeAtAnyDoor when (
                 Buggy == 2 && intent == 1 && cond == 1 && person == 0 && task == 1
                     && brake == 0 && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -183,12 +204,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeUnderPerson when (
                 Buggy == 3 && intent == 1 && cond == 1 && door > 0 && task == 1
                     && brake == 0 && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -209,12 +230,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeWithoutAJob when (
                 Buggy == 4 && intent == 1 && cond == 1 && door > 0 && person == 0
                     && brake == 0 && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -240,7 +261,7 @@ pub fn occupancy_door_model() -> Model {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -261,12 +282,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeThroughBrake when (
                 Buggy == 6 && intent == 1 && cond == 1 && door > 0 && person == 0 && task == 1
                     && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -287,12 +308,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeOverUntaken when (
                 Buggy == 7 && intent == 1 && cond == 1 && door > 0 && person == 0 && task == 1
                     && brake == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -313,12 +334,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeUnpaced when (
                 Buggy == 8 && intent == 1 && cond == 1 && door > 0 && person == 0 && task == 1
                     && brake == 0 && untaken == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -339,12 +360,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeWithoutRow when (
                 Buggy == 9 && due > 0 && cond == 1 && door > 0 && person == 0 && task == 1
                     && brake == 0 && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -365,12 +386,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeStale when (
                 Buggy == 10 && intent == 1 && door > 0 && person == 0 && task == 1
                     && brake == 0 && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -391,12 +412,12 @@ pub fn occupancy_door_model() -> Model {
             action StackSecond when (
                 Buggy == 11 && intent == 1 && cond == 1 && door > 0 && person == 0 && task == 1
                     && brake == 0 && untaken == 0 && paced == 0 && lines <= 1
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -417,12 +438,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeKeepsDue when (
                 Buggy == 12 && wrote <= 1 && intent == 1 && cond == 1 && door > 0 && person == 0
                     && task == 1 && brake == 0 && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2)) && (due == 2 || upg == 0)
+                    && (Mode == 1 || (Mode == 2 && due > 1)) && (due == 2 || upg == 0)
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -482,12 +503,12 @@ pub fn occupancy_door_model() -> Model {
             action TypeOverNotice when (
                 Buggy == 20 && intent == 1 && cond == 1 && door > 0 && person == 0 && task == 1
                     && brake == 0 && untaken == 0 && paced == 0 && lines == 0
-                    && (Mode == 1 || (Mode == 2 && due == 2))
+                    && (Mode == 1 || (Mode == 2 && due > 1))
             ) {
                 sdoor = if (door > 0) { 1 } else { 0 };
                 sperson = person;
                 stask = task;
-                smode = if (Mode == 1 || (Mode == 2 && due == 2)) { 1 } else { 0 };
+                smode = if (Mode == 1 || (Mode == 2 && due > 1)) { 1 } else { 0 };
                 sbrake = brake;
                 suntaken = untaken;
                 spaced = paced;
@@ -511,11 +532,16 @@ pub fn occupancy_door_model() -> Model {
                 age = 0;
                 armed = 1;
             }
-            action RestartClock when (Buggy == 1 && due > 0 && esc == 0 && age > 0) {
+            action StuckWithoutKey when (Buggy == 22 && Key == 0 && cond == 1 && due == 0 && told == 0) {
+                due = 3;
+                age = 0;
+                armed = 1;
+            }
+            action RestartClock when (Buggy == 1 && Key == 0 && due > 0 && esc == 0 && age > 0) {
                 age = 0;
                 restarted = 1;
             }
-            action LoseDeadline when (Buggy == 1 && due > 0 && armed == 1) { armed = 0; }
+            action LoseDeadline when (Buggy == 1 && Key == 0 && due > 0 && armed == 1) { armed = 0; }
 
             invariant NoLineIntoATurn: wrote == 0 || sdoor == 1;
             invariant NoLineOverAPerson: wrote == 0 || sperson == 0;
@@ -539,6 +565,7 @@ pub fn occupancy_door_model() -> Model {
             invariant TheAnswersPointKeepsTheHold: hanswer == 0;
             invariant TheClockNeverRestarts: restarted == 0;
             invariant TheDeadlineStaysArmed: due == 0 || esc == 1 || armed == 1;
+            invariant TheStuckLineNeedsItsKey: wrote == 0 || skey == 1;
             bound LooksBox: age <= K;
         }
     }

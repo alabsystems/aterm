@@ -9,9 +9,10 @@ use super::step::{self, Cx, Evidence, Fault, Progress, Track};
 use super::wait::{self, JobFacts, Scene};
 use super::{
     BUSY_ORPHAN_MS, Class, ClassTable, Consumer, Demand, EXITED_KEEP_MS, Findings, GateWord,
-    Holder, InputGate, JobCounters, JobKind, JobProc, JobRow, JobTab, JobTick, JobsView,
-    KERNEL_WAIT_MS, MemberMap, Named, NamedRow, NamedWait, ProcState, Standing, Stop, SweepProc,
-    TierB, Verdict, WaitName, Want, ZOMBIE_AGE_MS, ZombieParent, Zombies, command_class,
+    HeldEpisode, HeldProc, Holder, InputGate, JobCounters, JobKind, JobProc, JobRow, JobTab,
+    JobTick, JobsView, KERNEL_WAIT_MS, MemberMap, Named, NamedRow, NamedWait, ProcState, Standing,
+    Stop, SweepProc, TierB, Verdict, WaitName, Want, ZOMBIE_AGE_MS, ZombieParent, Zombies,
+    command_class,
 };
 
 /// Descendants walked per tab at most.
@@ -135,8 +136,36 @@ pub struct Jobs {
     zombies: HashMap<u32, (u64, u32)>,
     zombie_parents: HashMap<u32, u64>,
     d_since: HashMap<u32, u64>,
+    /// The first reading that saw each held `(pid, exec)`, kept for the keys the last reading held.
+    held_since: HashMap<(u32, u64), u64>,
+    /// The backed-up episode, while one is open.
+    held_episode: Option<Backlog>,
+    /// The episode the last reading closed.
+    held_drained: Option<HeldEpisode>,
     #[cfg(any(test, debug_assertions))]
     fault: Option<Fault>,
+}
+
+/// An open backed-up episode as the engine keeps it ([`HeldEpisode`] is what a view says).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Backlog {
+    opened_ms: u64,
+    last_held_ms: u64,
+    peak: u32,
+    oldest_ms: u64,
+    /// Readings in a row that found nothing held.
+    empty: u8,
+}
+
+impl Backlog {
+    const fn view(self) -> HeldEpisode {
+        HeldEpisode {
+            opened_ms: self.opened_ms,
+            for_ms: self.last_held_ms.saturating_sub(self.opened_ms),
+            peak: self.peak,
+            oldest_ms: self.oldest_ms,
+        }
+    }
 }
 
 impl Jobs {
@@ -232,6 +261,7 @@ impl Jobs {
         let children = children_of(&tick.sweep);
         self.note_zombies(at, &tick.sweep);
         self.note_d_state(at, &tick.sweep, &facts);
+        self.note_held(at, &tick.held);
 
         let alive = |pid: u32, start: Option<u64>| -> bool {
             sweep.contains_key(&pid)
@@ -638,6 +668,7 @@ impl Jobs {
                 lanes,
                 d_age: &d_age,
                 elsewhere: &elsewhere,
+                program_check: fault != Some(Fault::IgnoreProgramCheck),
             };
             let wait = wait::name_job(&scene, &jf, &leaves, (shell_pid, shell_name));
             job.person_read = matches!(wait.name, WaitName::TtyRaw | WaitName::TtyPassword);
@@ -830,6 +861,49 @@ impl Jobs {
         }
     }
 
+    /// Folds this reading's held programs into their first sightings and the backed-up episode: backed up when a key held now was held at the reading before (its first sighting is kept) or three are held at once (a normal exec reads held for under 0.3 ms, M2); the episode opens at the first backed-up reading and closes at the second reading in a row with nothing held.
+    fn note_held(&mut self, at: u64, held: &[HeldProc]) {
+        let keys: BTreeSet<(u32, u64)> = held.iter().map(held_key).collect();
+        let backed_up = keys.len() >= 3 || keys.iter().any(|k| self.held_since.contains_key(k));
+        self.held_since.retain(|k, _| keys.contains(k));
+        for k in &keys {
+            self.held_since.entry(*k).or_insert(at);
+        }
+        let count = u32::try_from(keys.len()).unwrap_or(u32::MAX);
+        let oldest = self
+            .held_since
+            .values()
+            .map(|s| at.saturating_sub(*s))
+            .max()
+            .unwrap_or(0);
+        self.held_drained = None;
+        match self.held_episode.as_mut() {
+            None if backed_up => {
+                self.held_episode = Some(Backlog {
+                    opened_ms: at,
+                    last_held_ms: at,
+                    peak: count,
+                    oldest_ms: oldest,
+                    empty: 0,
+                });
+            }
+            None => {}
+            Some(e) if keys.is_empty() => {
+                e.empty = e.empty.saturating_add(1);
+                if e.empty >= 2 {
+                    self.held_drained = Some(e.view());
+                    self.held_episode = None;
+                }
+            }
+            Some(e) => {
+                e.empty = 0;
+                e.last_held_ms = at;
+                e.peak = e.peak.max(count);
+                e.oldest_ms = e.oldest_ms.max(oldest);
+            }
+        }
+    }
+
     fn findings(&self, tick: &JobTick, sweep: &HashMap<u32, &SweepProc>) -> Findings {
         let at = tick.at_ms;
         let tab_of: HashMap<u32, u64> = self
@@ -908,6 +982,29 @@ impl Jobs {
                 }
             }
         }
+        let mut seen: BTreeSet<(u32, u64)> = BTreeSet::new();
+        for h in &tick.held {
+            let Some(since) = self.held_since.get(&held_key(h)) else {
+                continue;
+            };
+            if !seen.insert(held_key(h)) {
+                continue;
+            }
+            let for_ms = at.saturating_sub(*since);
+            if h.aterm {
+                f.program_check_aterm.0 += 1;
+                f.program_check_aterm.1 = f.program_check_aterm.1.max(for_ms);
+            }
+            f.program_check.push(Named {
+                pid: h.pid,
+                name: h.name.clone(),
+                tab: tab_of.get(&h.pid).copied(),
+                for_ms,
+            });
+        }
+        f.program_check.sort_by_key(|n| n.pid);
+        f.program_check_episode = self.held_episode.map(Backlog::view);
+        f.program_check_drained = self.held_drained;
         f
     }
 }
@@ -980,6 +1077,11 @@ impl Job {
             row: None,
         }
     }
+}
+
+/// What a held time is kept by: the pid and the program it runs, so an exec starts a new one.
+const fn held_key(h: &HeldProc) -> (u32, u64) {
+    (h.pid, h.exec)
 }
 
 fn delta(now: Option<u64>, then: Option<u64>) -> u64 {

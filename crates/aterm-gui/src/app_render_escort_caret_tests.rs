@@ -180,11 +180,10 @@ fn a_torn_repaint_keeps_the_flying_head_at_the_caret() {
 /// The same head over a program that never brackets its frames (an Ink app
 /// without synchronized output, a TUI under tmux), in each arm: the cursor
 /// hidden throughout, each spinner repaint moves it to [`WRITE`], writes, and
-/// puts it back, and a present lands mid-write once a repaint. The head took
-/// the write position as the caret and flew seventeen rows up and back, one
-/// present each way (review of `fix/kitty-jitter`, 2026-10-20). A hidden
-/// cursor's move is taken once it has rested (`companion::HIDDEN_REST`): every
-/// present keeps the head at the caret's row. Negative control: the hidden
+/// puts it back, and a present lands mid-write once a repaint. A hidden
+/// cursor's move is taken only once it has rested (`aterm_effects::companion`'s
+/// `HIDDEN_REST`), so the head never takes the write position for the caret:
+/// every present keeps it at the caret's row. Negative control: the hidden
 /// cursor left at [`WRITE`] rests there, and the head goes to it.
 #[test]
 fn an_unbracketed_repaint_keeps_the_flying_head_at_the_caret() {

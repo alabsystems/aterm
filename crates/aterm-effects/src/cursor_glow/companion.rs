@@ -99,6 +99,21 @@ impl CursorGlow {
         self.v2.engaged() && self.v2.catch_star(star, at)
     }
 
+    /// The pet's drawn box this frame, window pixels (`None`: off glass), so
+    /// the sky draws no star on its body ([`rk::companion::PetShade`]).
+    #[inline]
+    pub const fn note_pet_body(&mut self, body: Option<(i32, i32, i32, i32)>) {
+        self.v2.note_pet_body(body);
+    }
+
+    /// The pet's body box the sky last drew no star on, window pixels
+    /// (`None`: off glass, or no frame offered one).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn pet_shade(&self) -> Option<(i32, i32, i32, i32)> {
+        self.v2.pet_shade()
+    }
+
     /// Mint [`CompanionImpulse::Delight`] and buffer the earned m1 hero at `(row, col)`.
     #[inline]
     pub fn earn_hero(&mut self, now: Instant, row: u16, col: u16) {

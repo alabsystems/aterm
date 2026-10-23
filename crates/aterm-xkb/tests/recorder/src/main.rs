@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The keysym oracle's recorder (LW.6 of docs/AUDIT-third-party-2026-10-15.md),
-//! built outside the aterm workspace (see Cargo.toml): xkeysym 0.2.1's value
-//! of every keysym aterm-xkb names, `<name>\t<value>`, one per line.
+//! The keysym oracle's recorder, built outside the aterm workspace (see Cargo.toml): xkeysym
+//! 0.2.1's value of every keysym aterm-xkb names, `<name>\t<value>`, one per line.
 
 fn main() {
     for (name, value) in [

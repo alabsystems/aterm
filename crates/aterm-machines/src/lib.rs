@@ -19,7 +19,7 @@ pub mod engine;
 pub mod envelope;
 pub mod facts;
 pub(crate) mod git_credential;
-/// GitHub's REST pagination, shared with the publishers' REST lane (init-system S15).
+/// GitHub's REST pagination, shared with the publishers' REST lane.
 pub(crate) use aterm_update_core::github_pages;
 pub mod hardware;
 pub mod init;

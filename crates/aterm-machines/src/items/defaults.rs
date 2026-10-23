@@ -503,11 +503,11 @@ pub fn disrupts(process: &str, user: &User, ctx: &Ctx) -> Option<String> {
 }
 
 /// The one relaunch of a process in a user's session that makes felt the writes of every
-/// row it activates (design §3.3 of docs/DESIGN-init-system-2026-10-20.md): the engine
-/// applies each of those rows, runs it once after the last, and reads them back only once
-/// the process is up again and what it reads of their keys is still
-/// ([`crate::init_activation::relaunch_reading`]). Relaunching after each row's write
-/// relaunched it once per row, and read each row back while the process was starting.
+/// row it activates (docs/DESIGN-init-system-2026-10-20.md §3.3): the engine applies each
+/// of those rows, runs it once after the last, and reads them back only once the process is
+/// up again and what it reads of their keys is still
+/// ([`crate::init_activation::relaunch_reading`]). A relaunch after each row's write would
+/// relaunch it once per row and read each row back while the process was still starting.
 #[derive(Debug)]
 pub struct Relaunch {
     id: String,

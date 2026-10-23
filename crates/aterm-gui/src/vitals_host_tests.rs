@@ -2227,12 +2227,12 @@ fn a_parked_screens_redraw_is_read_once_a_floor_and_never_on_a_deadline() {
 }
 
 /// THE THREAD HANDS BACK THE WORDS IT READ WITH, AND THE LOOP PARKS FROM
-/// THEM (review 2026-10-22): the real probe thread ([`run`], started as the
-/// product starts it) reads a raw program at the person's read on a real
-/// terminal through the engine's own step over this machine's process table,
-/// and hands its view back beside the words of the request it read; the
-/// loop names the park from them: the job's group, the word's raw mode and
-/// the driven input before it.
+/// THEM: the real probe thread ([`run`], started as the product starts it)
+/// reads a raw program at the person's read on a real terminal through the
+/// engine's own step over this machine's process table, and hands its view
+/// back beside the words of the request it read; the loop names the park
+/// from them: the job's group, the word's raw mode and the driven input
+/// before it.
 #[cfg(target_os = "macos")]
 #[test]
 fn the_thread_hands_back_the_words_it_read_with_and_the_loop_parks_from_them() {
@@ -2525,11 +2525,10 @@ fn the_readers_whole_reading_names_a_raw_program_from_the_loops_word() {
 }
 
 /// A WRITE THAT MOVES NO CELL LEAVES THE WORD STANDING (`docs/measured/vitals-3-2026-10-22.md`,
-/// V1). Muse Code at rest writes its colour reset every ~9 s a tab; with 16 tabs under load, one
-/// landed between a reading's word and its tick at nearly every reading, voided that tab's word,
-/// named its wait `unnamed` and asked the next reading in 2 s (`Demand::Fast`). That kept
-/// `system_vitals` armed and firing for as long as the race kept being won: 52 arms and 6 fires in
-/// 20 s, nothing else moving, on this branch before the word followed the reader's moving feeds.
+/// V1): Muse Code at rest writes a colour reset every ~9 s a tab, and the output stamp moves with
+/// it. A word voided by it would name the raw program's wait `unnamed` and ask the next reading in
+/// 2 s (`Demand::Fast`), keeping `system_vitals` armed at rest; the word follows the reader's
+/// moving feeds instead, so three resets leave it standing and a write that draws voids it.
 #[cfg(target_os = "macos")]
 #[test]
 fn a_write_that_moves_no_cell_leaves_the_word_standing() {
@@ -2808,4 +2807,57 @@ fn the_test_reader_never_reads_the_thermal_state() {
     if !cfg!(target_os = "linux") {
         assert!(snap.thermal.is_none());
     }
+}
+
+/// A HELD PROGRAM KEEPS THE READING WITH NO WINDOW GOING (leftover §5.1):
+/// a view with no job (the engine idle) but one program of this user held at
+/// macOS's program check is read again after 30 s, and so is one whose
+/// backed-up episode still owes its closing reading; a live job's own faster
+/// cadence stands beside it, and with neither nothing is due before the disk
+/// watch's next look.
+#[test]
+fn a_held_finding_keeps_the_windowless_reading_going() {
+    use aterm_vitals::jobs::{Findings, HeldEpisode, Named};
+    let view = |demand, rows, findings| JobsView {
+        demand,
+        rows,
+        findings,
+        ..JobsView::default()
+    };
+    let held = Findings {
+        program_check: vec![Named {
+            pid: 25311,
+            name: "gh".into(),
+            tab: None,
+            for_ms: 35_940_000,
+        }],
+        ..Findings::default()
+    };
+    assert_eq!(
+        job_demand_after(&view(Demand::Idle, Vec::new(), held.clone())),
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(
+        job_demand_after(&view(Demand::Fast, vec![hung_call()], held)),
+        Some(Duration::from_secs(2)),
+        "a live job's own cadence"
+    );
+    let closing = Findings {
+        program_check_episode: Some(HeldEpisode {
+            opened_ms: 1,
+            for_ms: 60_000,
+            peak: 1,
+            oldest_ms: 35_940_000,
+        }),
+        ..Findings::default()
+    };
+    assert_eq!(
+        job_demand_after(&view(Demand::Idle, Vec::new(), closing)),
+        Some(Duration::from_secs(30)),
+        "the episode's closing reading"
+    );
+    assert_eq!(
+        job_demand_after(&view(Demand::Idle, Vec::new(), Findings::default())),
+        None
+    );
 }

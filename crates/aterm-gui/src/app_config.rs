@@ -1748,7 +1748,7 @@ pub(crate) const PRIVACY_WARMUP_HOLD_MS_MAX: u64 = 600_000;
 /// Default `[privacy] probe_interval_ms`.
 pub(crate) const PRIVACY_PROBE_INTERVAL_MS_DEFAULT: u64 = 5_000;
 
-/// `[privacy] warmup`: whether aterm asks macOS for each configured folder at the first quiet moment of a launch that reads Full Disk Access off (owner ask 2026-10-16: file access is asked for by default on a new Mac; `crate::consent_launch`), and whether the "Ask for folder access now" gesture on the Security panel is offered.
+/// `[privacy] warmup`: whether aterm asks macOS for each configured folder at the first quiet moment of a launch that reads Full Disk Access off (the default, so a new Mac is asked for file access; `crate::consent_launch`), and whether the "Ask for folder access now" gesture on the Security panel is offered.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PrivacyWarmup {
     /// Never offered, never automatic.
@@ -1843,7 +1843,7 @@ pub(crate) struct SessionLogConfig {
 }
 
 impl Config {
-    /// Whether the session journal is asked for (`[session_log] journal`, default `true`: D3, ruled 2026-10-19; `journal = false` opts out).
+    /// Whether the session journal is asked for (`[session_log] journal`, default `true`; `journal = false` opts out).
     pub(crate) fn session_log_journal(&self) -> bool {
         self.session_log
             .as_ref()
@@ -1851,7 +1851,7 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// Whether a tab's tooltip and menu show its session log clause (`[session_log] clause`, default `true`: D6, ruled 2026-10-19; `clause = false` opts out).
+    /// Whether a tab's tooltip and menu show its session log clause (`[session_log] clause`, default `true`; `clause = false` opts out).
     pub(crate) fn session_log_clause(&self) -> bool {
         self.session_log
             .as_ref()

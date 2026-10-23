@@ -670,11 +670,12 @@ impl CursorRainbow {
                     Self::apply_equalised_rings(&mut out[rings_from..], &rings[..n_rings], &best);
                 }
             } else {
-                let best = self.equalise_rim_light(&mut out[rings_from..], &rings[..n_rings], page);
+                let (best, peak_dark_no_twinkle) =
+                    self.equalise_rim_light(&mut out[rings_from..], &rings[..n_rings], page);
                 self.rim_memo = Some(RimMemo {
                     key,
                     best,
-                    peak_dark_no_twinkle: None,
+                    peak_dark_no_twinkle,
                 });
             }
         }
@@ -836,9 +837,9 @@ impl CursorRainbow {
         quads: &mut [GlowQuad],
         rings: &[(usize, u8, u32, u32)],
         page: u32,
-    ) -> Option<[u32; HALO_LAYERS as usize]> {
+    ) -> (Option<[u32; HALO_LAYERS as usize]>, Option<f32>) {
         if rings.len() < 2 {
-            return None;
+            return (None, None);
         }
         let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0u32, 0u32);
         for q in quads.iter() {
@@ -852,7 +853,7 @@ impl CursorRainbow {
             (y1.saturating_sub(y0)) as usize,
         );
         if w == 0 || h == 0 || w * h > Self::CARET_RASTER_MAX {
-            return None;
+            return (None, None);
         }
         let table = crate::color_math::relative_luminance_table();
         let base = light_on_glass(page, 0);
@@ -882,6 +883,7 @@ impl CursorRainbow {
         }
         let mut buckets = [(0u32, 0u32); 32];
         let mut n_buckets = 0usize;
+        let mut buckets_complete = true;
         for &mask in &scratch {
             if mask == 0 {
                 continue;
@@ -891,8 +893,31 @@ impl CursorRainbow {
             } else if n_buckets < buckets.len() {
                 buckets[n_buckets] = (mask, 1);
                 n_buckets += 1;
+            } else {
+                buckets_complete = false;
             }
         }
+        let peak_of = |cols: &[u32; HALO_LAYERS as usize]| -> Option<f32> {
+            if !buckets_complete {
+                return None;
+            }
+            let level = RAINBOW_FIELD_LEVEL.round() as u32;
+            let field = (level << 16) | (level << 8) | level;
+            let mut peak = crate::color_math::relative_luminance_with(table, field) * 255.0;
+            for &(mask, _) in &buckets[..n_buckets] {
+                let mut px = field;
+                for (i, &c) in cols[..rings.len()].iter().enumerate() {
+                    let hits = (mask >> (i * 8)) & 0xff;
+                    for _ in 0..hits {
+                        px = crate::spectrum::compose_on_glass(px, c, 0);
+                    }
+                }
+                if px != field {
+                    peak = peak.max(crate::color_math::relative_luminance_with(table, px) * 255.0);
+                }
+            }
+            Some(peak)
+        };
         let pile_light = |quads: &[GlowQuad], colour: &dyn Fn(usize) -> u32| -> f32 {
             let _ = quads;
             let mut cols = [0u32; HALO_LAYERS as usize];
@@ -920,11 +945,14 @@ impl CursorRainbow {
         };
         let grey_rings: [u32; HALO_LAYERS as usize] =
             std::array::from_fn(|i| rings.get(i).map_or(0, |r| premul_rgb(RIM_LIGHT_GREY, r.1)));
+        let init_cols: [u32; HALO_LAYERS as usize] =
+            std::array::from_fn(|i| rings.get(i).map_or(0, |r| r.3));
         let target = pile_light(quads, &|i| grey_rings[i]);
-        let have = pile_light(quads, &|i| rings[i].3);
+        let have = pile_light(quads, &|i| init_cols[i]);
         if target <= 0.0 || (have - target).abs() <= target * Self::RIM_LIGHT_SLACK {
+            let peak = peak_of(&init_cols);
             self.rim_scratch = scratch;
-            return None;
+            return (None, peak);
         }
         let solve = |scale: f32| -> [u32; HALO_LAYERS as usize] {
             let mut c = [0u32; HALO_LAYERS as usize];
@@ -934,9 +962,14 @@ impl CursorRainbow {
             c
         };
         let (mut lo, mut hi) = (0.5f32, 1.5f32);
-        let mut lo_solved: Option<([u32; HALO_LAYERS as usize], f32)> = None;
-        let mut hi_solved: Option<([u32; HALO_LAYERS as usize], f32)> = None;
-        for _ in 0..8 {
+        let (mut lo_solved, mut hi_solved) = if have < target {
+            lo = 1.0;
+            (Some((init_cols, have)), None)
+        } else {
+            hi = 1.0;
+            (None, Some((init_cols, have)))
+        };
+        for _ in 1..8 {
             let mid = 0.5 * (lo + hi);
             let c = solve(mid);
             let l = pile_light(quads, &|i| c[i]);
@@ -964,8 +997,9 @@ impl CursorRainbow {
             b
         };
         Self::apply_equalised_rings(quads, rings, &best);
+        let peak = peak_of(&best);
         self.rim_scratch = scratch;
-        Some(best)
+        (Some(best), peak)
     }
 
     /// Relative tolerance before [`Self::equalise_rim_light`] re-solves ring light.

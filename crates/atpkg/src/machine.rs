@@ -13,7 +13,7 @@ pub const UNIVERSAL_CONTROL_REVERT: &str = "defaults -currentHost delete \
 /// The `machine-settings:` entry for a Universal Control change (contract string).
 pub const UNIVERSAL_CONTROL_ENTRY: &str = "universal-control disabled";
 
-/// What one `defaults -currentHost read` answered about one key: the converge engine's tri-state read (docs/DESIGN-init-system-2026-10-20.md §3.1), which the machines families keep too.
+/// What one `defaults -currentHost read` answered about one key: the converge engine's tri-state read, which the machines families keep too.
 pub use aterm_converge::Read;
 
 /// Universal Control's two per-host switches, as read.

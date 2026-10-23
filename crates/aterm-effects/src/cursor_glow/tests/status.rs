@@ -713,3 +713,35 @@ fn classic_spawns_reach_the_count_and_the_ring() {
     assert_eq!(glow.spawns(), spawns + 1);
     assert_eq!(glow.admission_tally().licensed, licensed + 1);
 }
+
+/// A SPLIT PANE'S TEXT IS READ AT ITS WINDOW OFFSET: a split composes the
+/// window's cells only after the cursor's step, so the host hands the
+/// focused pane's own cells and where they sit; the frame's text (the dark
+/// streak's air, the letter guard's letters) is then where the window draws
+/// it. Negative control: the same cells read at the window's origin put the
+/// letter three rows and ten columns off and leave its window cell blank.
+#[test]
+fn a_split_pane_s_text_is_read_at_its_window_offset() {
+    use aterm_core::terminal::RenderCell;
+    let mut cells = vec![vec![RenderCell::default(); 20]; 6];
+    cells[1][3].ch = 'x';
+    cells[1][3].fg = [0xD0, 0xD0, 0xD0];
+    let t0 = Instant::now();
+    let lettered = |glow: &CursorGlow, row: i32, col: i32| {
+        matches!(glow.frame_text.pair(row, col), Some((Some(_), _)))
+    };
+    let mut glow = CursorGlow::default();
+    glow.observe_frame_text_at(Some((3, 15)), &cells, (2, 10), t0);
+    assert!(
+        lettered(&glow, 3, 13),
+        "the pane's letter at pane cell (1, 3) reads at window cell (3, 13)"
+    );
+    let span = glow.frame_text.rows[(3 - glow.frame_text.lo) as usize];
+    assert_eq!(span, Some((13, 14)), "the row's text spans window columns");
+    let mut control = CursorGlow::default();
+    control.observe_frame_text(Some((3, 15)), &cells, t0);
+    assert!(
+        !lettered(&control, 3, 13),
+        "control: read at the window's origin, window cell (3, 13) is blank"
+    );
+}

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHY: who uses the machine's CPU, read per resource coalition (`docs/DESIGN-resource-details-2026-10-20.md`, "RD"; SA below is `docs/DESIGN-system-awareness-2026-10-16.md`), the facts the cause engine and `sys why` read.
+//! WHY: who uses the machine's CPU, read per resource coalition: the facts the cause engine and `sys why` read. RD is `docs/DESIGN-resource-details-2026-10-20.md`, SA `docs/DESIGN-system-awareness-2026-10-16.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -44,7 +44,7 @@ impl CoalLane {
         self == Self::On
     }
 
-    /// The unavailable word a reply prints for the coalitions: `lane_off:coalitions` on every OS whose lane does not read (the built views' word, D39), or `None` while it reads.
+    /// The unavailable word a reply prints for the coalitions: `lane_off:coalitions`, the other views' `lane_off:<lane>` form, on every OS whose lane does not read, or `None` while it reads.
     #[must_use]
     pub fn word(self) -> Option<&'static str> {
         (!self.on()).then_some("lane_off:coalitions")
@@ -721,8 +721,8 @@ fn misread(s: &Sample) -> bool {
     mem.total > 0 && held > room.saturating_mul(MISREAD_X)
 }
 
-/// The facts of the built split by subtraction, for snapshot `snap` (of
-/// sample `s`) with the lane `lane`; `None` without a split.
+/// The facts of the snapshot's own split by subtraction, for snapshot `snap`
+/// (of sample `s`) with the lane `lane`; `None` without a split.
 fn by_subtraction(s: &Sample, snap: &Snapshot, lane: CoalLane) -> Option<WhyFacts> {
     let built = snap.split?;
     Some(WhyFacts {

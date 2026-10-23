@@ -56,13 +56,6 @@ impl FxRegistry {
         t.by_id.insert(id, Arc::downgrade(&art));
         art
     }
-
-    /// How many interned arts some producer still holds.
-    #[must_use]
-    pub fn live(&self) -> usize {
-        let t = self.arts.lock().unwrap_or_else(PoisonError::into_inner);
-        t.by_id.values().filter(|w| w.strong_count() > 0).count()
-    }
 }
 
 /// Whether `a` and `b` are the same picture: kind, size and bytes.
@@ -78,11 +71,16 @@ fn count_build() {
     crate::test_counters::count_art_build();
 }
 
-/// Validate the art's dimensions before a builder allocates its texels.
+/// The sides and texel count of a `w × h` art the registry holds, checked before a producer allocates its texels: `None` for a side of zero or past [`aterm_core::render::FX_ART_MAX_SIDE`].
 #[inline]
-fn art_dimensions(w: usize, h: usize) -> Option<(u16, u16, usize)> {
+#[must_use]
+pub fn art_dimensions(w: usize, h: usize) -> Option<(u16, u16, usize)> {
     let (w, h) = (u16::try_from(w).ok()?, u16::try_from(h).ok()?);
-    if w > aterm_core::render::FX_ART_MAX_SIDE || h > aterm_core::render::FX_ART_MAX_SIDE {
+    if w == 0
+        || h == 0
+        || w > aterm_core::render::FX_ART_MAX_SIDE
+        || h > aterm_core::render::FX_ART_MAX_SIDE
+    {
         return None;
     }
     Some((w, h, usize::from(w).checked_mul(usize::from(h))?))
@@ -117,11 +115,12 @@ pub fn indexed(rows: &[&str], chars: &[u8]) -> Option<Arc<FxArt>> {
     Some(registry().intern(art))
 }
 
-/// An Rgba8Premul art of `w × h` texels (`R, G, B, A` bytes, premultiplied, row-major).
+/// An art of `w × h` texels of kind `texels` from their bytes (row-major, top row first: one index a texel for Index8, `R, G, B, A` for the RGBA kinds), interned; `None` for a side of zero or too long ([`art_dimensions`]) or bytes that are not that many texels.
 #[must_use]
-pub fn rgba(w: u16, h: u16, premul: impl Into<Box<[u8]>>) -> Option<Arc<FxArt>> {
+pub fn bitmap(texels: FxTexels, w: u16, h: u16, data: impl Into<Box<[u8]>>) -> Option<Arc<FxArt>> {
     count_build();
-    let art = FxArt::new(w, h, FxTexels::Rgba8Premul, premul)?;
+    art_dimensions(usize::from(w), usize::from(h))?;
+    let art = FxArt::new(w, h, texels, data)?;
     Some(registry().intern(art))
 }
 
@@ -598,6 +597,125 @@ mod tests {
         assert!(weak.upgrade().is_none(), "the registry holds arts weakly");
         let again = indexed(&["ab.", ".ba"], b"ab").expect("an art");
         assert_eq!(again.id(), id, "the same picture, the same id");
+        let glow: [u8; 8] = [0x40, 0x20, 0x10, 0x00, 0x80, 0x40, 0x20, 0x80];
+        let _ = crate::test_counters::take_art_builds();
+        let a = bitmap(FxTexels::Rgba8Premul, 2, 1, glow).expect("an art");
+        let b = bitmap(FxTexels::Rgba8Premul, 2, 1, glow).expect("an art");
+        assert!(Arc::ptr_eq(&a, &b), "one premultiplied picture, one Arc");
+        assert_eq!(
+            crate::test_counters::take_art_builds(),
+            2,
+            "each build is counted"
+        );
+        let straight = bitmap(FxTexels::Rgba8Straight, 2, 1, glow).expect("an art");
+        assert!(!Arc::ptr_eq(&a, &straight), "CONTROL: another kind");
+        let index = bitmap(FxTexels::Index8, 3, 2, [1u8, 0, 2, 2, 3, 1]).expect("an art");
+        let named = indexed(&["o.c", "cko"], b"ock").expect("an art");
+        assert!(
+            Arc::ptr_eq(&index, &named),
+            "a bitmap is the picture its bytes name"
+        );
+        assert!(
+            bitmap(FxTexels::Rgba8Premul, 2, 1, [0u8; 4]).is_none(),
+            "short bytes"
+        );
+        assert!(
+            bitmap(FxTexels::Index8, 0, 0, [0u8; 0]).is_none(),
+            "no texels"
+        );
+    }
+
+    /// A registry of its own, so a test reads the table no other test's arts reach.
+    fn private_registry() -> FxRegistry {
+        FxRegistry {
+            arts: Mutex::new(Interned::default()),
+        }
+    }
+
+    /// An 8 × 1 Index8 picture named by `name`: one picture a name.
+    fn named_art(name: u64) -> FxArt {
+        FxArt::new(8, 1, FxTexels::Index8, name.to_le_bytes()).expect("an art")
+    }
+
+    /// ONE PICTURE, ONE ARC, WHATEVER THE THREADS: eight threads let loose
+    /// together on a picture no earlier round made all get the one `Arc`,
+    /// round after round, while each also interns a picture of its own and
+    /// drops it, so the table sweeps under them.
+    #[test]
+    fn concurrent_interning_gives_one_arc_a_picture() {
+        const THREADS: u64 = 8;
+        const ROUNDS: u64 = 400;
+        let reg = private_registry();
+        let start = std::sync::Barrier::new(THREADS as usize);
+        let rounds: Vec<Vec<Arc<FxArt>>> = std::thread::scope(|s| {
+            let workers: Vec<_> = (0..THREADS)
+                .map(|t| {
+                    let (reg, start) = (&reg, &start);
+                    s.spawn(move || {
+                        (0..ROUNDS)
+                            .map(|round| {
+                                start.wait();
+                                let shared = reg.intern(named_art(round));
+                                drop(reg.intern(named_art((t + 1) << 32 | round)));
+                                shared
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("an interning thread"))
+                .collect()
+        });
+        let split = (0..ROUNDS as usize)
+            .filter(|&r| !rounds.iter().all(|got| Arc::ptr_eq(&got[r], &rounds[0][r])))
+            .count();
+        assert_eq!(
+            split, 0,
+            "{split} of {ROUNDS} rounds gave one picture two Arcs"
+        );
+        let t = reg.arts.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(
+            t.by_id.len() < (ROUNDS * (THREADS + 1)) as usize,
+            "CONTROL: the dropped pictures were swept ({} entries)",
+            t.by_id.len()
+        );
+    }
+
+    /// THE REGISTRY NEVER GROWS WITH PICTURES SEEN ONCE (§4.7): a thousand
+    /// pictures interned and dropped, at most three held at once, leave a
+    /// table of at most `SWEEP_FLOOR` entries; a held picture is never swept
+    /// (interning it again is its `Arc`).
+    #[test]
+    fn the_registry_sweeps_what_nobody_holds() {
+        let reg = private_registry();
+        let kept = reg.intern(named_art(u64::MAX));
+        let mut held = std::collections::VecDeque::new();
+        let mut most = 0;
+        for name in 0..1000u64 {
+            held.push_back(reg.intern(named_art(name)));
+            if held.len() > 2 {
+                held.pop_front();
+            }
+            most = most.max(
+                reg.arts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .by_id
+                    .len(),
+            );
+        }
+        assert!(
+            most <= SWEEP_FLOOR,
+            "a table of {most} entries for at most 3 pictures held"
+        );
+        assert!(
+            Arc::ptr_eq(&reg.intern(named_art(u64::MAX)), &kept),
+            "a held picture is never swept"
+        );
+        let back = reg.intern(named_art(999));
+        assert!(Arc::ptr_eq(&back, &held[1]), "nor is the newest");
     }
 
     /// `indexed` reads `'.'` as transparent and `chars[k]` as texel `k + 1`,
@@ -609,6 +727,8 @@ mod tests {
         assert_eq!(art.data(), &[1, 0, 2, 2, 3, 1]);
         assert!(indexed(&["o.c", "ck"], b"ock").is_none(), "a ragged row");
         assert!(indexed(&["o.x"], b"ock").is_none(), "an unknown byte");
+        assert!(indexed(&[], b"ock").is_none(), "no rows");
+        assert!(indexed(&["", ""], b"ock").is_none(), "empty rows");
         let max = usize::from(aterm_core::render::FX_ART_MAX_SIDE);
         let edge = ".".repeat(max);
         assert!(indexed(&[&edge], b"o").is_some(), "the longest legal row");

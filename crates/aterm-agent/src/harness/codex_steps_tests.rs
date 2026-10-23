@@ -635,9 +635,26 @@ fn no_step_holds_text() {
     }
 }
 
-const ALAB_BUILDS: [&str; 2] = [ALAB, "0.164.0-dev.12479+g07a25d86a"];
-
 const ALAB: &str = "0.164.0-dev.12521+g3d3eb12d8";
+
+const ALAB_MANAGED: &str = "0.164.0-dev.12479+g07a25d86a";
+
+/// A golden of a measured build's legs: the build, its legs' steps, and whether they are its own (the
+/// managed 12479 is held to 12521's shapes).
+type Golden = (
+    &'static str,
+    &'static [(&'static str, &'static [&'static str])],
+    bool,
+);
+
+/// The goldens written for measured builds. A golden is an extra: every measured build is held to its
+/// rollout's own account whether one is written or not.
+const GOLDENS: [Golden; 4] = [
+    (ALAB, &ALAB_LEGS, true),
+    (ALAB_MANAGED, &ALAB_LEGS, false),
+    (FOREVER, &FOREVER_LEGS, true),
+    (EXCHANGE, &EXCHANGE_LEGS, true),
+];
 
 const ALAB_LEGS: [(&str, &[&str]); 6] = [
     (
@@ -791,6 +808,96 @@ const FOREVER_LEGS: [(&str, &[&str]); 6] = [
     ),
 ];
 
+/// The build that records `left-to-person@v1`, which the proof's exchange legs need (codex-alab `32a73bca2`).
+const EXCHANGE: &str = "0.164.0-dev.13172+g32a73bca2";
+
+const EXCHANGE_LEGS: [(&str, &[&str]); 6] = [
+    (
+        "first",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.13172",
+            "end 52 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000b",
+            "end 12 1 1",
+            "prompt 00000000-0000-4000-8000-000000000010",
+            "end 20 1 1",
+        ],
+    ),
+    (
+        "continue",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.13172",
+            "end 31 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000b",
+            "end 23 1 1",
+            "prompt 00000000-0000-4000-8000-000000000010",
+            "end 11 1 1",
+        ],
+    ),
+    (
+        "approval",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.13172",
+            "call call_r0010 exec_command shell",
+            "result call_r0010",
+            "end 5107 2 2",
+            "prompt 00000000-0000-4000-8000-00000000000f",
+            "end 25 1 1",
+            "prompt 00000000-0000-4000-8000-000000000014",
+            "end 27 1 1",
+        ],
+    ),
+    (
+        "question",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.13172",
+            "call call_r0010 request_user_input other",
+            "result call_r0010",
+            "end 5060 2 2",
+            "prompt 00000000-0000-4000-8000-00000000000f",
+            "end 24 1 1",
+            "prompt 00000000-0000-4000-8000-000000000014",
+            "end 25 1 1",
+        ],
+    ),
+    (
+        "usage",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.13172",
+            "end 29 0 0",
+            "wall UsageSession",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 28 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000e",
+            "end 20 1 1",
+            "prompt 00000000-0000-4000-8000-000000000013",
+            "end 20 1 1",
+            "prompt 00000000-0000-4000-8000-000000000018",
+            "end 24 1 1",
+        ],
+    ),
+    (
+        "carry",
+        &[
+            "prompt 00000000-0000-4000-8000-000000000003",
+            "model gpt-5.5 - 0.164.0-dev.13172",
+            "prompt 00000000-0000-4000-8000-000000000009",
+            "end 29 1 1",
+            "prompt 00000000-0000-4000-8000-00000000000e",
+            "end 13 1 1",
+            "prompt 00000000-0000-4000-8000-000000000013",
+            "end 14 1 1",
+            "prompt 00000000-0000-4000-8000-000000000018",
+            "end 14 1 1",
+        ],
+    ),
+];
+
 fn alab_leg(leg: &str) -> String {
     alab_leg_of(ALAB, leg)
 }
@@ -809,9 +916,11 @@ fn shape(said: &str) -> String {
     }
 }
 
-fn rollout_says(text: &str) -> Result<Vec<String>, String> {
+/// The steps the rollout `text` of a build said as `release` gives by its own rows, read apart from the fold.
+fn rollout_says(text: &str, release: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut opened: Vec<String> = Vec::new();
+    let mut model: Option<(String, String)> = None;
     let mut tokens: std::collections::HashMap<String, (u64, u64)> = Default::default();
     for row in rows(text) {
         let v: Value = aterm_json::from_str(row).map_err(|e| format!("{e}: {row}"))?;
@@ -823,6 +932,13 @@ fn rollout_says(text: &str) -> Result<Vec<String>, String> {
                 if !opened.iter().any(|o| o == t) {
                     opened.push(t.to_string());
                     out.push(format!("prompt {t}"));
+                }
+                if let Some(m) = s("model") {
+                    let now = (m.to_string(), s("effort").unwrap_or("-").to_string());
+                    if model.as_ref() != Some(&now) {
+                        out.push(format!("model {} {} {release}", now.0, now.1));
+                        model = Some(now);
+                    }
                 }
             }
             (Some("token_usage_record"), _) => {
@@ -876,43 +992,68 @@ fn rollout_says(text: &str) -> Result<Vec<String>, String> {
 #[test]
 fn the_codex_alab_legs_fold_exact() {
     let mut kinds = std::collections::BTreeSet::new();
-    let builds = ALAB_BUILDS
-        .iter()
-        .map(|b| (*b, &ALAB_LEGS, *b == ALAB))
-        .chain([(FOREVER, &FOREVER_LEGS, true)]);
-    for (build, legs, own) in builds {
-        assert!(CODEX_MEASURED_BUILDS.contains(&build), "{build}");
+    for build in CODEX_MEASURED_BUILDS.iter().copied() {
+        let legs = committed_of(build);
+        assert!(
+            !legs.is_empty(),
+            "{build} is named, and no reduction of it is"
+        );
         let release = log_build(build).expect("an id");
-        for (leg, want) in legs.iter().copied() {
-            let text = alab_leg_of(build, leg);
-            let batch = fold(&text);
+        let stem = format!("{}-", rollout_reduction_stem(build));
+        let golden = GOLDENS.iter().find(|(b, ..)| *b == build);
+        for (name, text) in &legs {
+            let batch = fold(text);
             let read = saids(&batch);
-            assert_eq!(read[0], "bind 0", "{build} {leg}");
-            if own {
-                assert_eq!(read[1..], *want, "{build} {leg}");
-            }
-            let wanted: Vec<String> = want.iter().map(|s| shape(s)).collect();
-            let shapes: Vec<String> = read[1..].iter().map(|s| shape(s)).collect();
-            assert_eq!(shapes, wanted, "{build} {leg}");
-            assert!(
-                read.contains(&format!("model gpt-5.5 - {}", release.as_str())),
-                "{build} {leg}"
-            );
-            assert_eq!((batch.lost, batch.overflow), (0, 0), "{build} {leg}");
+            assert_eq!(read[0], "bind 0", "{name}");
+            assert_eq!((batch.lost, batch.overflow), (0, 0), "{name}");
             assert!(
                 batch.steps[1..].iter().all(|s| s.state == StepState::On),
-                "{build} {leg}"
+                "{name}: a step of a measured build is not On"
             );
-            let own: Vec<String> = read[1..]
-                .iter()
-                .filter(|s| !s.starts_with("model"))
-                .cloned()
-                .collect();
-            assert_eq!(rollout_says(&text).expect("read"), own, "{build} {leg}");
+            let own = rollout_says(text, release.as_str()).expect("read");
+            assert!(
+                own.iter().any(|s| s.starts_with("model ")),
+                "{name}: the rollout names its model"
+            );
+            assert_eq!(
+                read[1..],
+                own,
+                "{name}: the fold is not the rollout's own account"
+            );
+            if let Some((_, goldens, exact)) = golden {
+                let leg = name
+                    .strip_prefix(&stem)
+                    .and_then(|r| r.strip_suffix(".jsonl"))
+                    .unwrap_or_else(|| panic!("{name} is a leg of {build}"));
+                let want = goldens
+                    .iter()
+                    .find(|(l, _)| *l == leg)
+                    .map(|(_, w)| *w)
+                    .unwrap_or_else(|| panic!("{name}: {build}'s golden has no leg {leg}"));
+                if *exact {
+                    assert_eq!(read[1..], *want, "{name}");
+                }
+                let wanted: Vec<String> = want.iter().map(|s| shape(s)).collect();
+                let shapes: Vec<String> = read[1..].iter().map(|s| shape(s)).collect();
+                assert_eq!(shapes, wanted, "{name}");
+            }
             for s in &read[1..] {
                 kinds.insert(s.split(' ').next().unwrap_or("").to_string());
             }
         }
+        if let Some((_, goldens, _)) = golden {
+            assert_eq!(
+                goldens.len(),
+                legs.len(),
+                "{build}: a golden leg is not committed"
+            );
+        }
+    }
+    for (build, ..) in GOLDENS {
+        assert!(
+            CODEX_MEASURED_BUILDS.contains(&build),
+            "{build} has a golden and is not measured"
+        );
     }
     assert_eq!(
         kinds.into_iter().collect::<Vec<_>>(),
@@ -925,12 +1066,16 @@ fn the_codex_alab_legs_fold_exact() {
         1,
     );
     assert_ne!(off, approval, "the plant took");
-    let folded: Vec<String> = saids(&fold(&off))[1..]
-        .iter()
-        .filter(|s| !s.starts_with("model"))
-        .cloned()
-        .collect();
-    assert_ne!(rollout_says(&off).expect("read"), folded);
+    let folded = saids(&fold(&off));
+    assert_eq!(
+        saids(&fold(&approval)),
+        folded,
+        "a golden cannot see the plant: only the rollout's own account does"
+    );
+    assert_ne!(
+        rollout_says(&off, "0.164.0-dev.12521").expect("read"),
+        folded[1..]
+    );
     let next = alab_leg("first").replace(
         "\"cli_version\":\"0.164.0-dev.12521+g3d3eb12d8\"",
         "\"cli_version\":\"0.164.0-dev.12522+g3d3eb12d9\"",
@@ -966,8 +1111,6 @@ fn a_build_is_said_as_its_release_and_matched_whole() {
         assert_eq!(fold.take().steps[0].state, StepState::Partial, "{build:?}");
     }
 }
-
-const ALAB_MANAGED: &str = "0.164.0-dev.12479+g07a25d86a";
 
 #[test]
 fn the_writer_holds_the_rows_to_its_build() {

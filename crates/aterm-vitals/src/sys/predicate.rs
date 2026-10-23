@@ -258,6 +258,18 @@ impl Op {
         None
     }
 
+    /// Its spelling.
+    const fn word(self) -> &'static str {
+        match self {
+            Self::Lt => "<",
+            Self::Le => "<=",
+            Self::Gt => ">",
+            Self::Ge => ">=",
+            Self::Eq => "=",
+            Self::Ne => "!=",
+        }
+    }
+
     fn holds<T: PartialOrd>(self, a: T, b: T) -> bool {
         match self {
             Self::Lt => a < b,
@@ -304,6 +316,47 @@ pub struct Term {
     pub want: Want,
     /// From the `quiet` preset (drops out where unmeasurable).
     pub preset: bool,
+}
+
+impl Term {
+    /// The term as [`AwaitSys::canonical`] spells it: a number in its metric's base unit, levels
+    /// by their words, a job's verdicts or classes by theirs.
+    fn canonical(&self) -> String {
+        let words = |ws: Vec<&str>| ws.join(",");
+        match (&self.metric, &self.want) {
+            (Metric::Job(job), Want::Verdicts(vs)) => {
+                format!(
+                    "{} {}",
+                    job.word(),
+                    words(vs.iter().map(|v| v.word()).collect())
+                )
+            }
+            (Metric::Job(job), Want::Classes(cs)) => format!(
+                "{} class={}",
+                job.word(),
+                words(cs.iter().map(|c| c.word()).collect())
+            ),
+            (metric, Want::Num { op, v, cores }) => {
+                let unit = match metric.kind() {
+                    Kind::CpuPct if *cores => "c",
+                    Kind::CpuPct | Kind::Pct => "%",
+                    Kind::Bytes => "B",
+                    Kind::Bps => "B/s",
+                    _ => "",
+                };
+                format!("{}{}{v}{unit}", metric.name(), op.word())
+            }
+            (metric, Want::Levels { op, ranks }) => {
+                let levels = metric.levels();
+                let named = ranks
+                    .iter()
+                    .map(|r| levels.get(*r).copied().unwrap_or("-"))
+                    .collect();
+                format!("{}{}{}", metric.name(), op.word(), words(named))
+            }
+            (metric, Want::Verdicts(_) | Want::Classes(_)) => metric.name(),
+        }
+    }
 }
 
 /// A parsed machine wait.
@@ -802,6 +855,29 @@ impl AwaitSys {
             timeout_ms,
             scope_aterm,
         }))
+    }
+
+    /// THE WAIT'S ONE SPELLING, which [`Self::parse`] reads back as this wait: `sys`, `quiet`
+    /// where the preset's terms are in it, each explicit term `and`-joined (a number in its
+    /// metric's base unit), then `for=` and `scope=aterm` where set. Two spellings of one wait
+    /// spell it one way (`avail>=8GiB` and `avail>=8589934592B`). The timeout is the caller's
+    /// patience, not the wait, and is left out. Of a wait `parse` made: a wait built by hand may
+    /// not read back.
+    #[must_use]
+    pub fn canonical(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.terms.iter().any(|t| t.preset) {
+            parts.push("quiet".to_owned());
+        }
+        parts.extend(self.terms.iter().filter(|t| !t.preset).map(Term::canonical));
+        let mut out = format!("sys {}", parts.join(" and "));
+        if self.for_ms > 0 {
+            out.push_str(&format!(" for={}ms", self.for_ms));
+        }
+        if self.scope_aterm {
+            out.push_str(" scope=aterm");
+        }
+        out
     }
 }
 
@@ -1701,6 +1777,58 @@ mod tests {
             assert_eq!(AwaitSys::parse(mixed), Err(MIXED.to_owned()), "{mixed}");
         }
         assert_eq!(AwaitSys::parse("sys cpu<50% vol=/x"), Err(USAGE.to_owned()));
+    }
+
+    /// ONE SPELLING A WAIT: each wait reads back from its canonical spelling as itself, the
+    /// spelling is its own (a fixed point), and two spellings of one wait spell it one way.
+    /// NEGATIVE CONTROL: waits that differ spell apart.
+    #[test]
+    fn a_wait_reads_back_from_its_one_spelling() {
+        for text in [
+            "sys cpu<25%",
+            "sys cpu<2.5c",
+            "sys cpu.l0>50%",
+            "sys cpu.super<=80%",
+            "sys aterm<1c and tab<0.5c for=10s",
+            "sys wait<0.25",
+            "sys mem=normal,warn",
+            "sys mem<critical and throttle!=severe",
+            "sys swap<1.5MB/s for=30s scope=aterm",
+            "sys decompress<100/s and thrash=no",
+            "sys tab.mem<2GB and aterm.mem<4GiB",
+            "sys quiet",
+            "sys quiet cpu<30% for=20s",
+            "sys quiet and mem=normal",
+            "sys job=a40977 done,stuck",
+            "sys task=b4u3h4kc3 class=waiting,exited and jobs.stuck=0",
+            "sys slots>=1 for=20m",
+            "sys slots>=1 and avail>=8GiB and load<0.5 and cores_idle>=4c",
+        ] {
+            let wait = machine(text);
+            let spelled = wait.canonical();
+            assert_eq!(machine(&spelled), wait, "{text} spelled {spelled}");
+            assert_eq!(machine(&spelled).canonical(), spelled, "{text}");
+        }
+        for (a, b) in [
+            ("sys avail>=8GiB", "sys avail>=8589934592B"),
+            ("sys cores_idle>=4c", "sys cores_idle>=4"),
+            ("sys slots>=1 for=20m", "sys slots>=1 for=1200s"),
+            ("sys job=a1 done", "sys job=a1 exited"),
+        ] {
+            assert_eq!(machine(a).canonical(), machine(b).canonical(), "{a} | {b}");
+        }
+        assert_eq!(
+            machine("sys avail>=8GiB").canonical(),
+            "sys avail>=8589934592B"
+        );
+        for (a, b) in [
+            ("sys slots>=1", "sys slots>1"),
+            ("sys slots>=1", "sys slots>=1 for=1s"),
+            ("sys tab<1c", "sys tab<1c scope=aterm"),
+            ("sys quiet", "sys quiet cpu<25%"),
+        ] {
+            assert_ne!(machine(a).canonical(), machine(b).canonical(), "{a} | {b}");
+        }
     }
 
     #[test]

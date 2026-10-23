@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The recorded-frame differential (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.8):
-//! every frame the GPU page presents, held to the frame the wgpu-WebGL module presented for the
-//! same content in the same browser.
+//! The recorded-frame differential: every frame the GPU page presents, held to the frame the
+//! wgpu-WebGL module presented for the same content in the same browser.
 
 use std::path::{Path, PathBuf};
 

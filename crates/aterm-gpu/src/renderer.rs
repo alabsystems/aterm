@@ -1967,6 +1967,7 @@ pub(crate) enum DrawPipe {
     FireOver,
     DecoOver,
     DecoAdd,
+    KnockOver,
     RainUnder,
     CatOver,
     FreeUnder,
@@ -1992,6 +1993,7 @@ impl DrawPipe {
             Self::FireOver => Pipeline::FireOver,
             Self::DecoOver => Pipeline::DecoOver,
             Self::DecoAdd => Pipeline::DecoAdd,
+            Self::KnockOver => Pipeline::KnockOver,
             Self::Wallpaper
             | Self::RainUnder
             | Self::CatOver
@@ -2031,6 +2033,7 @@ pub(crate) enum StreamId {
     RainUnder,
     CatOver,
     FreeUnder,
+    GlyphKnock,
     FxLinearUnder,
     Trail,
     GlowUnder,
@@ -2075,6 +2078,7 @@ impl StreamId {
         Self::RainUnder,
         Self::CatOver,
         Self::FreeUnder,
+        Self::GlyphKnock,
         Self::FxLinearUnder,
         Self::Trail,
         Self::GlowUnder,
@@ -2134,6 +2138,7 @@ impl StreamId {
             Self::FireOver => "fire_over",
             Self::ImageUnder => "image_under",
             Self::GlyphHalo => "glyph_halo",
+            Self::GlyphKnock => "glyph_knock",
             Self::Glyph => "glyph",
             Self::Color => "color",
             Self::Image => "image",
@@ -2348,6 +2353,15 @@ pub(crate) fn build_frame_plan(
         StreamId::FreeUnder,
         DrawPipe::FreeUnder,
         ctx.has_free.then_some(DrawAtlas::Free),
+    );
+    // The knock-out (`aterm_render::KNOCK_DILATE_OFFSETS`): the letters on a
+    // body drawn under the text cut it to the page, before any trail draws,
+    // recolouring the body and keeping the page's alpha (glass stays glass).
+    push(
+        G_BASE_BG,
+        StreamId::GlyphKnock,
+        DrawPipe::KnockOver,
+        Some(DrawAtlas::Mono),
     );
     push(
         G_BASE_BG,
@@ -2570,6 +2584,7 @@ impl FrameRes<'_> {
                 DrawPipe::FireOver => r.effects.get(EffectPipeline::FireOver),
                 DrawPipe::DecoOver => r.effects.get(EffectPipeline::DecoOver),
                 DrawPipe::DecoAdd => r.effects.get(EffectPipeline::DecoAdd),
+                DrawPipe::KnockOver => r.effects.get(EffectPipeline::KnockOver),
                 DrawPipe::Wallpaper
                 | DrawPipe::RainUnder
                 | DrawPipe::CatOver
@@ -5503,6 +5518,7 @@ struct Instances {
     image: Vec<GlyphInstance>,
     glyph: Vec<GlyphInstance>,
     glyph_halo: Vec<GlyphInstance>,
+    glyph_knock: Vec<GlyphInstance>,
     color: Vec<GlyphInstance>,
     cursor: Vec<BgInstance>,
     deco: Vec<BgInstance>,
@@ -5550,6 +5566,7 @@ impl Instances {
             StreamId::RainUnder => stream!(rain_under),
             StreamId::CatOver => stream!(cat_over),
             StreamId::FreeUnder => stream!(free_under),
+            StreamId::GlyphKnock => stream!(glyph_knock),
             StreamId::FxLinearUnder => self.fx_stream(fx_gpu::FxStream::LinearUnder),
             StreamId::Trail => stream!(trail),
             StreamId::GlowUnder => stream!(glow_under),
@@ -5603,6 +5620,7 @@ impl Instances {
         self.image.clear();
         self.glyph.clear();
         self.glyph_halo.clear();
+        self.glyph_knock.clear();
         self.color.clear();
         self.cursor.clear();
         self.deco.clear();
@@ -5659,6 +5677,7 @@ impl VertexBuffers {
             "aterm-gpu rain under instances",
             "aterm-gpu cat over instances",
             "aterm-gpu free under-text instances",
+            "aterm-gpu glyph knock-out instances",
             "aterm-gpu fx linear under instances",
             "aterm-gpu cursor trail instances",
             "aterm-gpu emberforge glow-under instances",
@@ -6262,10 +6281,11 @@ pub enum EffectPipeline {
     SpriteOver = 8,
     Fx = 9,
     FxLinear = 10,
+    KnockOver = 11,
 }
 
 /// How many effect pipelines exist.
-pub const EFFECT_PIPELINE_COUNT: usize = 11;
+pub const EFFECT_PIPELINE_COUNT: usize = 12;
 
 /// Names of the [`EFFECT_PIPELINE_COUNT`] slots, in [`EffectPipeline`] order.
 pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
@@ -6280,6 +6300,7 @@ pub const EFFECT_PIPELINE_NAMES: [&str; EFFECT_PIPELINE_COUNT] = [
     "sprite_over",
     "fx",
     "fx_linear",
+    "knock_over",
 ];
 
 /// Every [`EffectPipeline`], in slot order.
@@ -6295,6 +6316,7 @@ pub const EFFECT_PIPELINES: [EffectPipeline; EFFECT_PIPELINE_COUNT] = [
     EffectPipeline::SpriteOver,
     EffectPipeline::Fx,
     EffectPipeline::FxLinear,
+    EffectPipeline::KnockOver,
 ];
 
 /// Demand-driven cache of the effect-only cell pipelines.
@@ -6439,6 +6461,7 @@ fn frame_effect_pipelines(
     want[EffectPipeline::DecoOver as usize] =
         !inst.glyph_halo.is_empty() || !inst.curl.is_empty() || !inst.wdeco_over.is_empty();
     want[EffectPipeline::DecoAdd as usize] = !inst.wdeco_add.is_empty();
+    want[EffectPipeline::KnockOver as usize] = !inst.glyph_knock.is_empty();
     want[EffectPipeline::SpriteOver as usize] = !inst.wallpaper.is_empty()
         || !inst.rain_under.is_empty()
         || !inst.cat_over.is_empty()
@@ -6474,6 +6497,7 @@ fn build_effect_pipeline(
         EffectPipeline::SpriteOver => (Pipeline::SpriteOver, &layouts.glyph),
         EffectPipeline::Fx => (Pipeline::Fx, fx()),
         EffectPipeline::FxLinear => (Pipeline::FxLinear, fx()),
+        EffectPipeline::KnockOver => (Pipeline::KnockOver, &layouts.glyph),
     };
     crate::pipeline_table::build_wgpu(row.spec(), device, shader, layout, targets)
 }
@@ -6962,6 +6986,15 @@ impl GpuRenderer {
     #[inline]
     pub fn debug_block_on_lazy_fallbacks(&mut self) {
         self.cpu.debug_block_on_lazy_fallbacks();
+    }
+
+    /// A test's negative control: draw companions under the text without the
+    /// knock-out (`aterm_render::Renderer::set_knock_out`), on this renderer's
+    /// glyph-knock stream as on its CPU twin.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_knock_out(&mut self, on: bool) {
+        self.cpu.set_knock_out(on);
     }
 
     /// Swap in an already-built CPU face and theme in place.
@@ -13561,6 +13594,42 @@ impl GpuRenderer {
             .unwrap_or_else(|| self.shimmer_epoch.elapsed().as_secs_f32() % SHIMMER_PHASE_WRAP_S)
     }
 
+    /// The foot (frame px) of the lowest row holding a glyph in columns
+    /// `x0..x1` that reaches into the band `y0..y1`, or `0` when every such
+    /// row is blank. A row in a smooth scroll reaches its offset further each
+    /// way.
+    fn lettered_foot(
+        &self,
+        input: &RenderInput,
+        (x0, x1): (u32, u32),
+        (y0, y1): (u32, u32),
+        (cw, ch): (u32, u32),
+    ) -> u32 {
+        if cw == 0 || ch == 0 {
+            return 0;
+        }
+        let top = self.cpu.grid_top() as i64;
+        let pad = self.cpu.pad() as u32;
+        let slack = i64::from(input.scroll_frac_px).abs();
+        let c0 = (x0.saturating_sub(pad) / cw) as usize;
+        let c1 = (x1.saturating_sub(pad)).div_ceil(cw) as usize;
+        let mut foot = 0u32;
+        for (r, line) in input.cells.iter().enumerate().take(input.rows) {
+            let r_top = top + r as i64 * i64::from(ch) - slack;
+            let r_foot = r_top + i64::from(ch) + 2 * slack;
+            if r_foot <= i64::from(y0) || r_top >= i64::from(y1) {
+                continue;
+            }
+            let lettered = line
+                .get(c0.min(line.len())..c1.min(line.len()))
+                .is_some_and(|cells| cells.iter().any(|c| c.ch != ' ' && c.ch != '\0'));
+            if lettered {
+                foot = foot.max(u32::try_from(r_foot.max(0)).unwrap_or(u32::MAX));
+            }
+        }
+        foot
+    }
+
     fn shimmer_region(&self, input: &RenderInput, w: u32, h: u32) -> Option<ShimmerRegion> {
         let (cw, ch) = self.cpu.cell_size();
         let (cw, ch) = (cw as u32, ch as u32);
@@ -13591,6 +13660,16 @@ impl GpuRenderer {
         let x1 = (hx1.saturating_add(cw)).min(w);
         let y1 = hot_top.min(h);
         let y0 = hot_top.saturating_sub(rise.ceil() as u32).min(y1);
+        // The haze never bends a letter: it rises through the blank rows over
+        // the hot band and fades out at the foot of the first lettered row
+        // (resampled by up to `SHIMMER_AMP_PX`, an echo's `e` over an Enter's
+        // flames fell to 2.84:1).
+        let foot = self.lettered_foot(input, (x0, x1), (y0, y1), (cw, ch));
+        let (y0, rise) = if foot > y0 {
+            (foot.min(y1), y1.saturating_sub(foot) as f32)
+        } else {
+            (y0, rise)
+        };
         if x0 >= x1 || y0 >= y1 {
             return None;
         }
@@ -15515,6 +15594,14 @@ impl GpuRenderer {
         let bg_inst = &mut self.inst.bg;
         let glyph_inst = &mut self.inst.glyph;
         let glyph_halo_inst = &mut self.inst.glyph_halo;
+        let glyph_knock_inst = &mut self.inst.glyph_knock;
+        // The knock-out's bodies (`aterm_render::knock_rects`), as the CPU
+        // composite cuts them: only when the free atlas draws them.
+        let knocks: Vec<[i32; 4]> = if win.free_atlas.is_some() && self.cpu.knock_out_on() {
+            aterm_render::knock_rects(&input.free_sprites, pad as i32, grid_top as i32).collect()
+        } else {
+            Vec::new()
+        };
         let fire_present = !input.fire_patch.is_empty();
         let halo_rgb = {
             let rgb = aterm_render::HALO_IN_FIRE_RGB;
@@ -16019,6 +16106,50 @@ impl GpuRenderer {
                     }
                 };
                 let quad = slot.quad((pad + cx) as f32, anchor_y, baseline, scale, (aw, ah));
+                if !knocks.is_empty() {
+                    let (x0, x1) = ((pad + cx) as i32 - 1, (pad + cx + ccw) as i32 + 1);
+                    let (y0, y1) = (
+                        (grid_top + r * ch) as i32 - 1,
+                        (grid_top + (r + 1) * ch) as i32 + 1,
+                    );
+                    let on_body = knocks
+                        .iter()
+                        .any(|k| k[0] < x1 && k[2] > x0 && k[1] < y1 && k[3] > y0);
+                    let page = || {
+                        if cell_selected {
+                            return Some(bg_under);
+                        }
+                        let cell_bg = aterm_render::rgb_to_u32(cell.bg);
+                        let default_bg = if input
+                            .default_bg_spans
+                            .get(r)
+                            .is_some_and(|spans| !spans.is_empty())
+                        {
+                            aterm_render::resolved_default_bg_at(input, r, c, self.theme.bg)
+                        } else {
+                            frame_bg
+                        };
+                        (!(wallpaper_on && cell_bg == default_bg)).then_some(bg_under)
+                    };
+                    if on_body && let Some(page) = page() {
+                        for &(dx, dy) in &aterm_render::KNOCK_DILATE_OFFSETS {
+                            if let Some((rect, uv)) = slot.quad(
+                                (pad + cx) as f32 + dx as f32,
+                                anchor_y + dy,
+                                baseline,
+                                scale,
+                                (aw, ah),
+                            ) {
+                                glyph_knock_inst.push(GlyphInstance {
+                                    rect,
+                                    uv,
+                                    color: [page[0], page[1], page[2], 255],
+                                    bg: [0, 0, 0, 0],
+                                });
+                            }
+                        }
+                    }
+                }
                 if quad.is_none() && !windowed {
                     continue;
                 }

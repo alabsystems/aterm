@@ -106,6 +106,7 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
                 body_allowed: false,
                 momentum_glow: false,
                 user_tinted: false,
+                accent_pinned: false,
             },
             glow: gl.cfg,
             trail: TrailConfig {
@@ -123,6 +124,7 @@ fn present(term: &Terminal, now: Instant, gl: Glass<'_>) {
             print_anchor_glyph: glyph,
             caret_drawn: visible,
             frame_cells: None,
+            frame_cells_at: (0, 0),
         },
         std::iter::empty(),
     );

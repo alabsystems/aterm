@@ -99,7 +99,6 @@ impl Stamp {
 
     /// The day it fell on as a builder names it against `today` (§10.2.3, item 3): nothing on `today` itself, or with no day read for the build (`None`: the clock stands alone); its weekday within the six days before (`Fri`), the one stretch where a weekday cannot be read as another; else its date (`9 Oct`, `9 Oct 2025` from another year) — a week or more back, where a weekday would name a later day (today's own, on the seventh), or after `today` (a clock set back).
     #[must_use]
-    /// Relative or calendar day label against `today`, or `None` on `today` itself.
     pub(crate) fn day_words(self, today: Option<i64>, long: bool) -> Option<String> {
         const MONTHS: [&str; 12] = [
             "January",

@@ -838,8 +838,8 @@ fn a_stopped_child_and_a_zombie_child_read_their_states() {
 /// the sum of its threads each within 2x of what `wait4` reports for it. The
 /// two come in different units: `proc_pid_rusage` counts the kernel's Mach
 /// ticks, and `PROC_PIDTHREADINFO` gives nanoseconds. Thread times scaled as
-/// ticks read 125/3 too large, natively and under Rosetta (measured
-/// 2026-10-20, `docs/measured/rosetta-mac-2026-10-20.md`).
+/// ticks read 125/3 too large, natively and under Rosetta
+/// (`docs/measured/rosetta-mac-2026-10-20.md` §3 (b)).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() {

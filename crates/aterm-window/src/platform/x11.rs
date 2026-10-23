@@ -15,9 +15,11 @@
 //! backends read. aterm adds the key event's server time ([`key_event_server_time`]), the newest
 //! press's ([`user_time`]), the window's background ([`WindowAttributesExtX11`],
 //! [`WindowExtX11`]), whether a redraw is the server's ([`redraw_is_exposure`]), the
-//! application's word that a frame is on the window ([`WindowExtX11::x11_frame_presented`]),
-//! which the window manager's resize sync request waits for, and its bell
-//! ([`WindowExtX11::ring_x11_bell`]).
+//! application's word that a request drew an area of the window
+//! ([`WindowExtX11::x11_area_posted`]), which makes an `Expose` the server sent before it no
+//! exposure, the application's word that a frame is on the window
+//! ([`WindowExtX11::x11_frame_presented`]), which the window manager's resize sync request waits
+//! for, and its bell ([`WindowExtX11::ring_x11_bell`]).
 
 /// The X server timestamp (milliseconds) of the key event currently being dispatched.
 pub fn key_event_server_time() -> Option<u32> {
@@ -64,7 +66,8 @@ pub fn note_user_time_for_test(time: u32) {
     note_user_time(time);
 }
 
-/// Whether the current `WindowEvent::RedrawRequested` dispatch is from an X server `Expose`.
+/// Whether the current `WindowEvent::RedrawRequested` dispatch is from an X server `Expose` that
+/// no request the application noted ([`WindowExtX11::x11_area_posted`]) drew again.
 pub fn redraw_is_exposure() -> bool {
     EXPOSURE.with(std::cell::Cell::get)
 }
@@ -114,6 +117,13 @@ pub trait WindowExtX11 {
 
     /// Notify the window manager's `_NET_WM_SYNC_REQUEST` that a frame was presented.
     fn x11_frame_presented(&self);
+
+    /// Note that the application's request `sequence` on the window's Xlib connection (a
+    /// `PutImage` or `ShmPutImage`) drew all of `area` (`[x0, y0, x1, y1]`, half-open) of the
+    /// window. An `Expose` the server sent before it processed that request, all of whose
+    /// rectangles lie in `area`, was drawn again by it: its redraw is no exposure
+    /// ([`redraw_is_exposure`]). Only the newest note counts.
+    fn x11_area_posted(&self, sequence: u64, area: [u32; 4]);
 }
 
 impl WindowExtX11 for Window {
@@ -139,6 +149,15 @@ impl WindowExtX11 for Window {
     fn x11_frame_presented(&self) {
         match &self.window {
             crate::platform_impl::Window::X(window) => window.frame_presented(),
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(_) => {},
+        }
+    }
+
+    #[inline]
+    fn x11_area_posted(&self, sequence: u64, area: [u32; 4]) {
+        match &self.window {
+            crate::platform_impl::Window::X(window) => window.area_posted(sequence, area),
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(_) => {},
         }

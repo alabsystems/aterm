@@ -89,19 +89,20 @@ pub fn map_leaf_frame(frame: &str) -> TierB {
 #[must_use]
 pub const fn rank(name: WaitName) -> u8 {
     match name {
-        WaitName::TtyPassword => 0,
-        WaitName::TtyBuiltinRead => 1,
-        WaitName::TtyRaw => 2,
-        WaitName::Serves => 3,
-        WaitName::Pipe => 4,
-        WaitName::PipeFull => 5,
-        WaitName::Tcp => 6,
-        WaitName::Follow => 7,
-        WaitName::Listen => 8,
-        WaitName::Timer => 9,
-        WaitName::EventLoop => 10,
-        WaitName::Kernel => 11,
-        _ => 12,
+        WaitName::ProgramCheck => 0,
+        WaitName::TtyPassword => 1,
+        WaitName::TtyBuiltinRead => 2,
+        WaitName::TtyRaw => 3,
+        WaitName::Serves => 4,
+        WaitName::Pipe => 5,
+        WaitName::PipeFull => 6,
+        WaitName::Tcp => 7,
+        WaitName::Follow => 8,
+        WaitName::Listen => 9,
+        WaitName::Timer => 10,
+        WaitName::EventLoop => 11,
+        WaitName::Kernel => 12,
+        _ => 13,
     }
 }
 
@@ -109,7 +110,8 @@ pub const fn rank(name: WaitName) -> u8 {
 #[must_use]
 pub const fn standing_of(name: WaitName) -> Standing {
     match name {
-        WaitName::TtyPassword
+        WaitName::ProgramCheck
+        | WaitName::TtyPassword
         | WaitName::TtyBuiltinRead
         | WaitName::TtyRaw
         | WaitName::Serves
@@ -133,6 +135,8 @@ pub struct Scene<'a> {
     pub d_age: &'a HashMap<u32, u64>,
     /// How a process outside this job counts (its job's standing).
     pub elsewhere: &'a HashMap<u32, Standing>,
+    /// Whether a process macOS's program check holds names its wait ([`WaitName::ProgramCheck`]); off only under the conformance test's `Fault::IgnoreProgramCheck`.
+    pub program_check: bool,
 }
 
 /// The job-level facts the tty names read.
@@ -164,6 +168,19 @@ pub fn name_job(
     let first = leaves
         .first()
         .map_or((shell.0, shell.1.to_owned()), |(p, n)| (*p, n.clone()));
+    let mut best: Option<Wait> = None;
+    for (pid, name) in leaves {
+        let Some(w) = leaf_wait(scene, job.consumer, *pid, name, 0) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|b| rank(w.name) < rank(b.name)) {
+            best = Some(w);
+        }
+    }
+    if let Some(w) = best.as_ref().filter(|w| w.name == WaitName::ProgramCheck) {
+        // A held leaf is not reading the terminal, whatever mode its program left it in.
+        return w.clone();
+    }
     if job.holds_fg
         && job.queue_empty
         && let Some(t) = job.tty
@@ -173,15 +190,6 @@ pub fn name_job(
         }
         if !t.canonical {
             return Wait::bare(WaitName::TtyRaw, Standing::Legit, first.0, &first.1);
-        }
-    }
-    let mut best: Option<Wait> = None;
-    for (pid, name) in leaves {
-        let Some(w) = leaf_wait(scene, job.consumer, *pid, name, 0) else {
-            continue;
-        };
-        if best.as_ref().is_none_or(|b| rank(w.name) < rank(b.name)) {
-            best = Some(w);
         }
     }
     best.unwrap_or_else(|| Wait::bare(WaitName::Unnamed, Standing::Capped, first.0, &first.1))
@@ -199,6 +207,9 @@ fn leaf_wait(
     let wchan = p.wchan.as_deref().unwrap_or("");
     let fds: &[Fd] = p.fds.as_deref().unwrap_or(&[]);
     let mk = |n: WaitName| Wait::bare(n, standing_of(n), pid, name);
+    if scene.program_check && p.program_check {
+        return Some(mk(WaitName::ProgramCheck));
+    }
 
     let linux_reading =
         wchan.starts_with("pipe_read") || wchan == "pipe_wait" || wchan == "wait_for_partner";

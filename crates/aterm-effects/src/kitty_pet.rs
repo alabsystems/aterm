@@ -153,7 +153,8 @@ const LETTER_VEIL_FLOOR: f32 = 0.22;
 const LETTER_VEIL_ON_S: f32 = 0.08;
 const LETTER_VEIL_OFF_S: f32 = 0.20;
 const LETTER_VEIL_DWELL: f32 = 0.20;
-/// How long (s) the rest veil takes to go fully on ([`PetBrain::veil_over_letters`]).
+/// How long (s) the rest veil takes to go fully on ([`PetBrain::veil_over_letters`]): one ease, never a
+/// blink; letters an Enter printed step it on at once.
 const LETTER_VEIL_REST_ON_S: f32 = 0.35;
 /// How far (rows) a body may reach into a lettered row from below
 /// ([`PetBrain::arc_under_letters`]).
@@ -1500,12 +1501,27 @@ pub struct PetBrain {
     letter_cover_since: Option<Instant>,
     /// Since when a body at rest has lain on letters unbroken ([`PetBrain::veil_over_letters`]).
     letter_rest_since: Option<Instant>,
+    /// The rest on letters an Enter's own letters stepped the veil on for
+    /// ([`PetBrain::veil_over_letters`]).
+    letter_rest_stepped: bool,
+    /// The key sequence of the Enter whose letters stepped the veil on: one
+    /// step an Enter ([`PetBrain::veil_over_letters`]).
+    letter_step_seq: u64,
+    /// Since when the letters a stepped rest lay on have been gone
+    /// ([`PetBrain::veil_over_letters`]).
+    letter_gone_since: Option<Instant>,
     /// A gather on letters for a landing on letters whose rest veil is still going on
     /// ([`PetBrain::veil_over_letters`], [`PetBrain::gather_owes_veil`]).
     veil_gather: bool,
     /// A test's negative control ([`Self::set_letters_unseen`]).
     #[cfg(any(test, debug_assertions))]
     letters_unseen: bool,
+    /// A test's negative control ([`Self::set_letter_arrival_dwells`]).
+    #[cfg(any(test, debug_assertions))]
+    letter_arrival_dwells: bool,
+    /// A test's negative control ([`Self::set_letter_step_rearms`]).
+    #[cfg(any(test, debug_assertions))]
+    letter_step_rearms: bool,
     /// The host is presenting a frame the program has not finished ([`Self::note_repainting`]).
     repainting: bool,
     last_drawn: [f32; PET_DEPARTURES_MAX],
@@ -1739,9 +1755,16 @@ impl Default for PetBrain {
             letter_veil: (1.0, None, 1.0),
             letter_cover_since: None,
             letter_rest_since: None,
+            letter_rest_stepped: false,
+            letter_step_seq: 0,
+            letter_gone_since: None,
             veil_gather: false,
             #[cfg(any(test, debug_assertions))]
             letters_unseen: false,
+            #[cfg(any(test, debug_assertions))]
+            letter_arrival_dwells: false,
+            #[cfg(any(test, debug_assertions))]
+            letter_step_rearms: false,
             repainting: false,
             last_drawn: [0.0; PET_DEPARTURES_MAX],
             last_grid: (0, 0),
@@ -2023,7 +2046,11 @@ impl PetBrain {
                     .console_station((col, row), (rows, cols), width)
                     .is_none()
             {
-                return Some((col, row));
+                let seat = self.wrap_rest_row(col, row, cr, (rows, cols), width);
+                if seat != row {
+                    self.wrap_ahead = Some(WrapAhead::Launched(col, seat));
+                }
+                return Some((col, seat));
             }
             self.wrap_ahead = None;
             return None;
@@ -2054,10 +2081,53 @@ impl PetBrain {
         if due {
             self.wrap_ahead = Some(WrapAhead::Due);
             self.quiet_leap = true;
-            return Some((aim, next));
+            return Some((aim, self.wrap_rest_row(aim, next, cr, (rows, cols), width)));
         }
         self.wrap_ahead = Some(WrapAhead::Approach);
         Some(wall)
+    }
+
+    /// THE HEAD LAW AT THE WRAP: the seat a cat leaps ahead to, on the row
+    /// under a line typed to the margin, stands its 1.7-row body 0.7 of a row
+    /// into that line, so a typing that stops short of the wrap left it at
+    /// rest with its head behind the line's letters, cut away by them (the
+    /// trail gallery's `burst` on every theme, 2026-10-23: under `he` of the
+    /// echo from the burst's end on). Once the typing has stopped, the seat
+    /// steps one row further down where the line's letters lie over the body
+    /// and that row is clear: the whole body then stands on blank rows, its
+    /// head in the row the wrap would fill. While the typing runs the wrap is
+    /// coming and the row under the line is where its next letter lands: the
+    /// leap keeps it. Inert where the letter reader certifies nothing
+    /// ([`Self::observed_last_letter`]) and on the screen's last row.
+    fn wrap_rest_row(
+        &self,
+        col: f32,
+        row: f32,
+        caret_row: u16,
+        (rows, cols): (u16, u16),
+        width: f32,
+    ) -> f32 {
+        let lower = row + 1.0;
+        if self.typing_on()
+            || (row - f32::from(caret_row) - 1.0).abs() >= 0.5
+            || lower >= f32::from(rows)
+            || !width.is_finite()
+            || width <= 0.0
+        {
+            return row;
+        }
+        let (a, b) = (col + INK_PAD - INK_GAP, col + width - INK_PAD);
+        match self.observed_last_letter(f32::from(caret_row), a, b) {
+            Some(Some(_))
+                if self.observed_ink_overlaps(col, lower, width) == Some(false)
+                    && self
+                        .console_station((col, lower), (rows, cols), width)
+                        .is_none() =>
+            {
+                lower
+            }
+            _ => row,
+        }
     }
 
     #[inline]
@@ -3157,6 +3227,26 @@ impl PetBrain {
     #[inline]
     pub const fn set_letters_unseen(&mut self, unseen: bool) {
         self.letters_unseen = unseen;
+    }
+
+    /// A test's negative control: the rest veil ([`Self::veil_over_letters`])
+    /// waits [`LETTER_VEIL_DWELL`] on letters an Enter printed and then eases
+    /// on over [`LETTER_VEIL_REST_ON_S`], as it did before it stepped on at
+    /// once for them.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_letter_arrival_dwells(&mut self, dwells: bool) {
+        self.letter_arrival_dwells = dwells;
+    }
+
+    /// A test's negative control: the rest veil ([`Self::veil_over_letters`])
+    /// steps on for letters under a body at rest whenever the hand's last
+    /// key was an Enter, however long ago and however often they come back,
+    /// with no hold, as it did before it stepped once an Enter.
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_letter_step_rearms(&mut self, rearms: bool) {
+        self.letter_step_rearms = rearms;
     }
 
     /// Whether a cheer is latched and not yet played or wiped.
@@ -5308,7 +5398,9 @@ impl PetBrain {
                 self.tend_motes(width);
             }
         } else if stand_held {
-            self.gait_pace *= (-dt / GAIT_REST_TAU).exp();
+            if self.gait_pace != 0.0 && dt > 0.0 {
+                self.gait_pace *= (-dt / GAIT_REST_TAU).exp();
+            }
             self.gait_rest += dt;
             if matches!(
                 self.action,
@@ -5625,7 +5717,9 @@ impl PetBrain {
             self.quiet = SIT_AFTER + SIT_FOLD;
         }
         self.speed = 0.0;
-        self.gait_pace *= (-dt / GAIT_REST_TAU).exp();
+        if self.gait_pace != 0.0 && dt > 0.0 {
+            self.gait_pace *= (-dt / GAIT_REST_TAU).exp();
+        }
         self.gait_rest += dt;
         self.plant_stride(dt);
         self.quiet_leap = false;
@@ -6920,6 +7014,9 @@ impl PetBrain {
 
     #[inline]
     fn age_gesture_windows(&mut self, secs: f32) {
+        if secs <= 0.0 {
+            return;
+        }
         self.reversal_t += secs;
         if self.reversal_t > FROLIC_WINDOW {
             self.reversals = 0;
@@ -8030,6 +8127,8 @@ impl PetBrain {
             self.letter_veil = (1.0, None, 1.0);
             self.letter_cover_since = None;
             self.letter_rest_since = None;
+            self.letter_rest_stepped = false;
+            self.letter_gone_since = None;
             self.veil_gather = false;
             return;
         }
@@ -8119,18 +8218,60 @@ impl PetBrain {
             None if frame.action.settled() => None,
             _ => Some(false),
         };
+        // The letters an Enter prints under a body at rest are under its
+        // fur in the frame that shows them: the veil steps on there (below),
+        // once for that Enter, and holds while they come and go within
+        // [`LETTER_VEIL_DWELL`] (output streaming in under the body). Any
+        // other arrival, and letters back after the hold let the veil go,
+        // yield by the dwell and the ease, never a cut: an Enter's step
+        // left armed until the next key dropped the veil in one frame each
+        // time streamed lines brought letters back under a resting cat after
+        // it had eased up, 3.7 times a second (2026-10-23, review).
+        #[cfg(any(test, debug_assertions))]
+        let dwells = self.letter_arrival_dwells;
+        #[cfg(not(any(test, debug_assertions)))]
+        let dwells = false;
+        #[cfg(any(test, debug_assertions))]
+        let rearms = self.letter_step_rearms;
+        #[cfg(not(any(test, debug_assertions)))]
+        let rearms = false;
+        let enter = if !dwells && self.key_within(f32::INFINITY) == Some(PetInputKind::Submit) {
+            self.last_submit_seq()
+        } else {
+            None
+        };
+        let holding = on_letters == Some(false)
+            && !rearms
+            && self.letter_rest_stepped
+            && self.letter_rest_since.is_some()
+            && {
+                let gone = *self.letter_gone_since.get_or_insert(sense.now);
+                sense.now.saturating_duration_since(gone).as_secs_f32() < LETTER_VEIL_DWELL
+            };
         let rest_target = match on_letters {
             Some(true) => {
+                self.letter_gone_since = None;
                 let since = *self.letter_rest_since.get_or_insert(sense.now);
-                if sense.now.saturating_duration_since(since).as_secs_f32() >= LETTER_VEIL_DWELL {
+                if let Some(seq) = enter
+                    && (seq != self.letter_step_seq || rearms)
+                {
+                    self.letter_step_seq = seq;
+                    self.letter_rest_stepped = true;
+                }
+                if self.letter_rest_stepped
+                    || sense.now.saturating_duration_since(since).as_secs_f32() >= LETTER_VEIL_DWELL
+                {
                     LETTER_VEIL_FLOOR
                 } else {
                     1.0
                 }
             }
+            Some(false) if holding => level,
             None if keep || self.letter_rest_since.is_some() => level,
             _ => {
                 self.letter_rest_since = None;
+                self.letter_rest_stepped = false;
+                self.letter_gone_since = None;
                 1.0
             }
         };
@@ -8142,6 +8283,14 @@ impl PetBrain {
         let level = if self.repainting && at.is_some() {
             level
         } else if dt > LETTER_VEIL_OFF_S && !resting {
+            target
+        } else if resting && self.letter_rest_stepped {
+            // Letters an Enter printed under a body at rest are under its fur
+            // now: the veil steps on in the frame that shows them, as the
+            // screen itself jumps, one fall that never comes back while they
+            // stay. Dwelt on and eased in, the letters an Enter at the bottom
+            // row scrolled in under a resting cat read under 4.5:1 for 384 ms
+            // (352 on paper; 2026-10-22, `enter-bottom`).
             target
         } else if target < level {
             let on = if resting {
@@ -8552,8 +8701,8 @@ impl PetBrain {
         if self.letter_veil.0 != self.letter_veil.2 && self.alpha > 0.0 && !self.repainting {
             return true;
         }
-        if self.letter_rest_since.is_some()
-            && self.letter_veil.0 > LETTER_VEIL_FLOOR
+        if (self.letter_gone_since.is_some()
+            || (self.letter_rest_since.is_some() && self.letter_veil.0 > LETTER_VEIL_FLOOR))
             && self.alpha > 0.0
             && !self.repainting
         {

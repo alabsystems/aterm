@@ -45,6 +45,10 @@ pub struct CursorFx {
     /// Test-only: skip momentum halo warming on dark fire and light sparkle.
     #[cfg(test)]
     pub(crate) momentum_unwarmed: bool,
+    /// Test-only: the hue a dark fire's typing halo is warmed toward, in
+    /// place of [`crate::cursor_momentum::MOMENTUM_FIRE_EMBER`].
+    #[cfg(test)]
+    pub(crate) momentum_fire_ember: Option<u32>,
     /// The comet cells this tick produced, projected through load shedding, brightness, and legibility.
     pub trail_scratch: Vec<TrailCell>,
     /// Memoised [`bed_legible_share`] for the last `(color, ground, ink)` triple.
@@ -86,6 +90,8 @@ pub struct CursorFxInput {
     pub momentum_glow: bool,
     /// The user pinned an explicit trail colour (`cursor_trail_color`): the rod then wears it instead of the style's signature shade.
     pub user_tinted: bool,
+    /// The user pinned an explicit accent (`cursor_trail_accent`): the lights that wear it draw it as itself.
+    pub accent_pinned: bool,
 }
 
 /// What one [`CursorFx::tick`] produced for the host's frame.
@@ -357,7 +363,7 @@ pub fn floor_block_fill(
     }
 }
 
-/// The page floor [`floor_block_fill`] holds `owner`'s caret to: [`CARET_PAGE_MIN_CONTRAST`], except the rainbow kitty's.
+/// The page floor [`floor_block_fill`] holds `owner`'s caret to: [`CARET_PAGE_MIN_CONTRAST`], the rainbow kitty's paper caret's too.
 #[inline]
 #[must_use]
 pub const fn caret_page_floor(owner: BlockFillOwner) -> f32 {
@@ -921,6 +927,10 @@ impl CursorFx {
         let bed_brightness = finite_clamp_or_off(f.trail_brightness, 0.0, 1.0);
         trail_cfg.enabled &= bed_brightness > 0.0;
         let dark = aterm_render::theme_is_dark(f.default_bg);
+        self.glow.set_colour_pins(crate::cursor_glow::ColourPins {
+            trail: f.user_tinted,
+            accent: f.accent_pinned,
+        });
         let glow_fp = self
             .glow
             .tick(cur, now, glow_cfg, geom, &mut self.glow_scratch);
@@ -1071,9 +1081,15 @@ impl CursorFx {
         let momentum_to = self.glow_scratch.len();
         if warm && dark && glow_cfg.enabled && !tinted && matches!(glow_cfg.style, GlowStyle::Fire)
         {
+            #[cfg(test)]
+            let ember = self
+                .momentum_fire_ember
+                .unwrap_or(crate::cursor_momentum::MOMENTUM_FIRE_EMBER);
+            #[cfg(not(test))]
+            let ember = crate::cursor_momentum::MOMENTUM_FIRE_EMBER;
             crate::cursor_momentum::warm_halo(
                 &mut self.glow_scratch[momentum_from..momentum_to],
-                rod_color,
+                ember,
                 crate::cursor_momentum::MOMENTUM_FIRE_WARMTH,
             );
         }
@@ -1187,6 +1203,11 @@ impl CursorFx {
         let glow_fp =
             glow_fp ^ shares.0.rotate_left(41) ^ self.glow.over_ink_print().rotate_left(13);
         let glow_fp = glow_fp ^ beamrod_frame.fp.rotate_left(17);
+        // Every light is in: the letter guard has the last word.
+        let guarded = self
+            .glow
+            .guard_letters(&mut self.glow_scratch, cur, geom, glow_cfg.style);
+        let glow_fp = glow_fp ^ guarded.rotate_left(37);
         let bolt_cursor = rainbow_block
             && glow_cfg.enabled
             && glow_cfg.intensity > 0.0
@@ -1390,6 +1411,7 @@ mod tests {
             body_allowed: true,
             momentum_glow: true,
             user_tinted: false,
+            accent_pinned: false,
         }
     }
 
@@ -1679,11 +1701,7 @@ mod tests {
                     base: None,
                 };
                 let floored = floor_block_fill(candidate, ground, live, None);
-                let bar = if owner == BlockFillOwner::Rainbow {
-                    3.0
-                } else {
-                    CARET_PAGE_MIN_CONTRAST
-                };
+                let bar = CARET_PAGE_MIN_CONTRAST;
                 assert_eq!(caret_page_floor(owner), bar, "{}", owner.label());
                 assert!(
                     contrast_ratio(floored.fill, ground) >= bar,
@@ -1969,6 +1987,7 @@ mod tests {
                     live_cursor: CARET,
                     default_bg: PAGE,
                     user_tinted: style.is_some(),
+                    accent_pinned: false,
                     ..frame_input(now)
                 },
                 &glow,
@@ -2026,6 +2045,7 @@ mod tests {
                         live_cursor: PINNED,
                         cursor_color_pinned: pinned,
                         user_tinted: !pinned,
+                        accent_pinned: false,
                         default_bg: page,
                         momentum_glow: false,
                         ..frame_input(now)

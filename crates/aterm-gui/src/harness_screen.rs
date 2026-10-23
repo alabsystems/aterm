@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Settings ▸ Harness read projection (`docs/DESIGN-harness-autopilot- 2026-10-15.md` §4) — the harness analogue of [`crate::packages_screen`].
+//! The Settings ▸ Harness read projection (`docs/DESIGN-harness-autopilot-2026-10-15.md` §4) — the harness analogue of [`crate::packages_screen`].
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -165,7 +165,7 @@ pub(crate) fn read_harness_stats(
     })
 }
 
-/// WHAT A RUNNING READING SWEEPS OF THE FLEET, RAISED WHILE IT RUNS (the review of perf-1's fix): a reading begun for Settings ▸ Harness alone asks nothing of the fleet; a Tab Control page that comes while it reads the ledgers raises the ask ([`Self::raise`]) and the reading sweeps the fleet once they are read ([`Self::take`]), so that page's fleet lands with it — never a second reading of every ledger to fetch it.
+/// WHAT A RUNNING READING SWEEPS OF THE FLEET, RAISED WHILE IT RUNS: a reading begun for Settings ▸ Harness alone asks nothing of the fleet; a Tab Control page that comes while it reads the ledgers raises the ask ([`Self::raise`]) and the reading sweeps the fleet once they are read ([`Self::take`]), so that page's fleet lands with it — never a second reading of every ledger to fetch it.
 #[derive(Debug, Default)]
 pub(crate) struct FleetSlot(std::sync::atomic::AtomicU8);
 
@@ -1149,7 +1149,7 @@ impl CountWords {
 /// Boxes the harness approved.
 pub(crate) const APPROVED: CountWords =
     CountWords::act("Approved", aterm_agent::harness::acts::Act::Approved);
-/// THE PRESSES NO SAFE RULE PROVED (the ledger's `unproven:` approvals, the review of v3/polish-page's fixes): of the approved, those full power made where no safe rule proved the box.
+/// THE PRESSES NO SAFE RULE PROVED (the ledger's `unproven:` approvals): of the approved, those full power made where no safe rule proved the box.
 pub(crate) const NO_SAFE_RULE_PROVED: &str = "no safe rule proved";
 /// WHAT THE HARNESS DID's label for [`NO_SAFE_RULE_PROVED`]'s row: a part of the Approved row over it.
 pub(crate) const UNPROVEN_OF_APPROVED: &str = "of those";
@@ -2775,7 +2775,7 @@ impl App {
         self.publish_native_harness_state();
     }
 
-    /// AN UPDATE'S SUCCESSOR READS AT ITS COMMIT (the post-landing check's behaviour-2, and its review): before the Commit (`Wake::ActivateCommittedHandoff`) a reading's wake is dropped (`drops_wake_before_commit`), so a restored Settings ▸ Harness read nothing (`App::restore_native_leaf`) and drew this process's book alone — `Ends: none yet` over the predecessor's landing — until a Refresh.
+    /// AN UPDATE'S SUCCESSOR READS AT ITS COMMIT: before the Commit (`Wake::ActivateCommittedHandoff`) a reading's wake is dropped (`drops_wake_before_commit`), so a restored Settings ▸ Harness (`App::restore_native_leaf`) starts its reading here; without it the page would draw this process's book alone — `Ends: none yet` over the predecessor's landing — until a Refresh.
     #[cfg(unix)]
     pub(crate) fn settle_harness_reading_at_commit(&mut self) {
         self.harness_screen.stats.collecting = false;

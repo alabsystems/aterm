@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! agy's screen grammar — Google's Antigravity CLI — MEASURED on agy 1.4.0 (2026-10-16, a private headless aterm at 120×40 and 100×30, the vendor's build under a signed-in account and under a scratch HOME; fixtures in [`fixtures`], each naming its provenance, colours and cursor on line 1).
+//! agy's screen grammar — Google's Antigravity CLI — MEASURED on agy 1.4.0 in private headless aterms, the vendor's build under a signed-in account and under a scratch HOME; fixtures in [`fixtures`], each naming its provenance on line 1.
 
 use crate::anchors::{anchor_text, guard_regex};
 use crate::phase::{Phase, leading_spaces, plain_rule_width};
@@ -991,7 +991,7 @@ pub fn prompt(rows: &[String]) -> Option<PromptV2> {
     }
 }
 
-/// WHAT ESC DOES on `p`, a box [`prompt`] read: the Esc it names ([`PromptV2::cancel`]), else what agy's Esc does on the boxes that name none, MEASURED in the lab on 1.4.0 (2026-10-16): on the trust box it quits agy (back at the shell within two seconds; left alone, the box stood); on the terms screen it goes back to the colour scheme, as its `[Previous]` button does.
+/// WHAT ESC DOES on `p`, a box [`prompt`] read: the Esc it names ([`PromptV2::cancel`]), else what agy's Esc does on the boxes that name none, MEASURED in the lab on 1.4.0: on the trust box it quits agy (back at the shell within two seconds; left alone, the box stands); on the terms screen it goes back to the colour scheme, as its `[Previous]` button does.
 #[must_use]
 pub fn esc(p: &PromptV2) -> Option<CancelEffect> {
     if let Some(c) = &p.cancel {
@@ -1725,7 +1725,7 @@ pub mod fixtures {
         pub const BG_TASK_ENDED: &str = include_str!("fixtures/agy-1.4.0-lab-bg-task-ended.txt");
         /// agy ended by SIGTERM with work running: its last frame, the panel rows in it, under them its resume line and the shell.
         pub const BG_EXITED: &str = include_str!("fixtures/agy-1.4.0-lab-bg-exited.txt");
-        /// The panel turned off (`"hideActiveItems": true`, measured 2026-10-18): a command task running after its turn ended, no panel, the footer still counting `1 task(s)`.
+        /// The panel turned off (`"hideActiveItems": true`): a command task running after its turn ended, no panel, the footer still counting `1 task(s)`.
         pub const BG_PANEL_OFF_TASK: &str =
             include_str!("fixtures/agy-1.4.0-lab-bg-panel-off-task.txt");
         /// The panel turned off: a subagent working, the footer counting `1 subagent(s)`.
@@ -1734,7 +1734,7 @@ pub mod fixtures {
         /// The panel turned off: a daemon command task (`IsDaemon`), the footer counting `1 task(s)`.
         pub const BG_PANEL_OFF_DAEMON: &str =
             include_str!("fixtures/agy-1.4.0-lab-bg-panel-off-daemon.txt");
-        /// A redraw split by one 1024-byte PTY read, three tabs at once (measured 2026-10-22, `docs/measured/half-drawn-frame-2026-10-22.md`), read at the split: the frame's erase-below took the spinner row and the composer, its list cut mid-word.
+        /// A redraw split by one 1024-byte PTY read, three tabs at once (`docs/measured/half-drawn-frame-2026-10-22.md`), read at the split: the frame's erase-below took the spinner row and the composer, its list cut mid-word.
         pub const SPLIT_HALF: &str = include_str!("fixtures/agy-1.4.0-lab-split-half.txt");
         /// [`SPLIT_HALF`]'s frame whole, 1.2 ms on: the spinner over the composer.
         pub const SPLIT_WHOLE: &str = include_str!("fixtures/agy-1.4.0-lab-split-whole.txt");

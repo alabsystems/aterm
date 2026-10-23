@@ -134,6 +134,7 @@ fn point(
         record_turn: None,
         credits: None,
         repo: dirty.then(finding),
+        fact: None,
     }
 }
 

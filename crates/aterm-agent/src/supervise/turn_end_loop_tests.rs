@@ -10223,6 +10223,7 @@ fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_excep
         worst: BackgroundCall {
             pid: 27098,
             pgid: 27090,
+            birth: None,
             exe: "aterm_gui-e0964a".to_string(),
             task: Some("bplle5dxj".to_string()),
             quiet_ms: 31 * 60_000 + 59_000,
@@ -10265,6 +10266,7 @@ fn a_background_call_that_makes_no_progress_is_named_at_stalled_and_in_the_excep
         worst: BackgroundCall {
             pid: 31000,
             pgid: 31000,
+            birth: None,
             exe: "sleep".to_string(),
             task: None,
             quiet_ms: 20 * 60_000,

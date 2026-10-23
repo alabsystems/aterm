@@ -205,9 +205,8 @@ fn the_rounding_rows_reject_every_plausible_wrong_rounding() {
         .all(|&((w, h), sf, want)| ((w * sf).round() as u32, (h * sf).round() as u32) == want));
 }
 
-/// The icons aterm sets: six from winit-core step 5, and the eight edge-resize icons of
-/// aterm's own Wayland frame (LW.5, 2026-10-17), recorded from cursor-icon 1.2.0's `name` and
-/// `alt_names` by a scratch crate outside the workspace.
+/// The icons aterm sets: six its GUI sets and the eight edge-resize icons of its Wayland frame,
+/// with the `name` and `alt_names` cursor-icon 1.2.0 answers for each.
 const CURSOR_ICONS: [IconRow; 14] = [
     (
         CursorIcon::Default,
@@ -293,8 +292,7 @@ fn flag_types_answer_as_recorded() {
     assert!(mods.intersects(ModifiersState::ALT | ModifiersState::SHIFT));
 }
 
-/// `WindowButtons` left macOS with `set_enabled_buttons` (winit-core step 5, 2026-10-16) and
-/// Linux (WC.8, 2026-10-21); the Windows backend still reads it.
+/// `WindowButtons` exists only on Windows, the one backend that reads it.
 #[cfg(windows)]
 #[test]
 fn window_buttons_answer_as_recorded() {

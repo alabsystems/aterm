@@ -63,8 +63,7 @@ const PAYLOADS: [&[u8]; 9] = [
 /// bare — the same prints, dispatches, hooks, puts and ends, the DCS ended
 /// at ST complete — with text before and after, however the bytes are cut,
 /// in both C1 modes. tmux 3.5a, given these wrappers with `allow-passthrough
-/// on`, wrote exactly the bare payloads to its own terminal (measured
-/// 2026-10-19).
+/// on`, writes exactly the bare payloads to its own terminal.
 #[test]
 fn a_wrapped_sequence_reads_as_it_reads_bare() {
     for c1 in [false, true] {

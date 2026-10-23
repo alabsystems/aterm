@@ -56,6 +56,12 @@ pub struct Proc {
     pub wchan: Option<String>,
     /// A thread in an uninterruptible wait.
     pub d_state: bool,
+    /// Held at macOS's program check (one thread that never ran).
+    pub held: bool,
+    /// Which program the pid runs (the host reads its pid version, which moves on exec).
+    pub exec: u64,
+    /// Started under aterm though no tab's tree holds it (its resource coalition).
+    pub aterm: bool,
 }
 
 impl Proc {
@@ -95,6 +101,9 @@ impl Proc {
             out: None,
             wchan: None,
             d_state: false,
+            held: false,
+            exec: 1,
+            aterm: false,
         }
     }
 }
@@ -392,6 +401,7 @@ impl World {
             machine: self.machine,
             lanes: self.lanes,
             process_limit: self.limit,
+            held: self.held(),
         };
         let view = self.jobs.absorb(&tick);
         for t in &mut self.tabs {
@@ -465,7 +475,39 @@ impl World {
             }),
             wchan: p.wchan.clone(),
             fds: (want_fds && !zombie).then_some(fds),
+            program_check: p.held && !zombie,
         }
+    }
+
+    /// aterm's user's held processes, as the host lists them: a tab's member (it descends from aterm, pid 100) or one aterm's coalition holds is aterm's.
+    fn held(&self) -> Vec<aterm_vitals::jobs::HeldProc> {
+        self.procs
+            .values()
+            .filter(|p| p.held && p.uid == UID && p.state != ProcState::Zombie)
+            .map(|p| aterm_vitals::jobs::HeldProc {
+                pid: p.pid,
+                exec: p.exec,
+                name: p.exe.clone().unwrap_or_else(|| p.name.clone()),
+                aterm: p.aterm || self.descends_from(p.pid, 100),
+            })
+            .collect()
+    }
+
+    fn descends_from(&self, pid: u32, root: u32) -> bool {
+        let mut cur = pid;
+        for _ in 0..64 {
+            let Some(p) = self.procs.get(&cur) else {
+                return false;
+            };
+            if p.ppid == root {
+                return true;
+            }
+            if p.ppid <= 1 || p.ppid == cur {
+                return false;
+            }
+            cur = p.ppid;
+        }
+        false
     }
 
     fn session_of(&self, pid: u32) -> Option<u32> {

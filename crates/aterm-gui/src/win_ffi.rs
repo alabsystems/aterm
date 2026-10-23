@@ -6,10 +6,9 @@
 //! list, and the `advapi32` registry half behind the Explorer verb and the
 //! DefTerm registration.
 //!
-//! The COM half is aterm-win32's (`aterm_win32::com`, moved there by WB.2 of
-//! docs/AUDIT-third-party-2026-10-15.md, where DXGI shares it); the registry
-//! half is hand-rolled flat-C FFI, the house style. The interface vtables stay
-//! beside the module that calls them.
+//! The COM half is aterm-win32's (`aterm_win32::com`, which DXGI shares); the
+//! registry half is hand-rolled flat-C FFI, the house style. The interface
+//! vtables stay beside the module that calls them.
 #![cfg(windows)]
 
 use std::ffi::c_void;

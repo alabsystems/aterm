@@ -60,7 +60,7 @@ impl Config {
     }
 }
 
-/// STOCK EXCEPTION: no Linux build of the Trust toolchain is published (the atpkg `trust` releases carry the aarch64-apple-darwin asset alone, checked 2026-10-16), and Trust ships only its host's std, so the guest compiles with rustup's stock toolchain at this version, plus the x86_64 std.
+/// STOCK EXCEPTION: no Linux build of the Trust toolchain is published (the atpkg `trust` releases carry the aarch64-apple-darwin asset alone), and Trust ships only its host's std, so the guest compiles with rustup's stock toolchain at this version, plus the x86_64 std.
 pub const RUST: &str = "1.99.1";
 
 /// A CPU architecture the lane tests.
@@ -320,7 +320,7 @@ pub fn packages() -> Vec<String> {
 /// Where the guest records the plan it was provisioned with.
 pub const STAMP: &str = "/var/lib/aterm-lane/provisioned";
 
-/// PowerShell 7, the fourth shell aterm integrates: aterm-shell-integration's pwsh tests answer COULD NOT RUN without one, and Ubuntu packages none for arm64 (Microsoft's apt repository carries amd64 alone), so the guest gets the release's own linux-arm64 archive, held to the digest GitHub publishes for it ([`PWSH_INSTALL`]). 7.6.6 (2026-09-08): the newest release older than two weeks when it was pinned (2026-10-20); the host's is 7.6.7.
+/// PowerShell 7, the fourth shell aterm integrates: aterm-shell-integration's pwsh tests answer COULD NOT RUN without one, and Ubuntu packages none for arm64 (Microsoft's apt repository carries amd64 alone), so the guest gets the release's own linux-arm64 archive, held to the digest GitHub publishes for it ([`PWSH_INSTALL`]). The pin is a release at least two weeks old.
 pub const PWSH: (&str, &str) = (
     "7.6.6",
     "924829e54c983648f6f1419a2dc7f9433c861b2fb5bd57736ff096c24f133729",

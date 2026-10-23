@@ -780,6 +780,14 @@ impl EffectsPipeline {
         }
     }
 
+    /// A test's negative control: the cursor lights drawn without the letter
+    /// guard (`CursorGlow::set_letter_guard`).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_letter_guard(&mut self, on: bool) {
+        self.cursor.glow.set_letter_guard(on);
+    }
+
     /// Opt the resident pet in (or out).
     #[inline]
     pub fn set_cursor_pet(&mut self, enabled: bool, seed: u64) {
@@ -1420,11 +1428,13 @@ impl EffectsPipeline {
                     body_allowed: !self.serious,
                     momentum_glow: self.glow_cfg.enabled,
                     user_tinted: self.glow_trail_color.chosen(),
+                    accent_pinned: self.glow_explicit_accent,
                 },
                 glow: &self.glow_cfg,
                 trail: trail_cfg,
                 animate,
                 frame_cells: Some(&input.cells),
+                frame_cells_at: (0, 0),
                 row_probe: probe_row.map(|(row, caret)| native::RowProbe {
                     row,
                     caret,

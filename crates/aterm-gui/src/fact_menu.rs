@@ -173,10 +173,10 @@ pub(crate) fn weekly_gap_why(gap: WeeklyGap) -> &'static [&'static str] {
             "its own: open /usage for the figure.",
         ],
         WeeklyGap::Unoffered(Refusal::Login) => &[
-            "aterm's usage tap rides only on the",
-            "machine's own login or one accounts.toml",
-            "lists, and this Claude Code is signed in",
-            "to another: open /usage for the figure.",
+            "aterm's usage tap rides on this account's",
+            "current login, and a renewal moved it on",
+            "from the login this Claude Code still runs",
+            "on: open /usage for the figure.",
         ],
         WeeklyGap::Unoffered(Refusal::Line) => &[
             "aterm's usage tap never rides beside a",

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The X11 oracle's recorder (LW.6 of docs/AUDIT-third-party-2026-10-15.md), built outside the
-//! aterm workspace (see Cargo.toml): registry x11rb-protocol 0.13.2 and x11rb 0.13.2 write the
-//! bytes and answers, and aterm-x11 is held to the committed recordings with no x11rb in its graph.
+//! The X11 oracle's recorder, built outside the aterm workspace (see Cargo.toml): registry
+//! x11rb-protocol 0.13.2 and x11rb 0.13.2 write the bytes and answers, and aterm-x11 is held to
+//! the committed recordings with no x11rb in its graph.
 
 use std::borrow::Cow;
 use std::fs::File;

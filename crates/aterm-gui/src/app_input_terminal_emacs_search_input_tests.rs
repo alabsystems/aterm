@@ -409,12 +409,11 @@ fn drain(reader: &std::os::fd::OwnedFd) -> Vec<u8> {
     }
 }
 
-/// The owner's ask (2026-10-20): "control-r for bash should prioritize the
-/// emacs-style navigation". At a bash prompt a bare Ctrl-R and Ctrl-S are
-/// readline's reverse-i-search and forward-search-history: 0x12 and 0x13 reach
-/// the program, a held Ctrl-R steps the search with each repeat, the press,
-/// repeat and release follow the press to the program under Kitty event-type
-/// reporting, and aterm's find bar never opens.
+/// At a bash prompt a bare Ctrl-R and Ctrl-S are readline's reverse-i-search
+/// and forward-search-history: 0x12 and 0x13 reach the program, a held Ctrl-R
+/// steps the search with each repeat, the press, repeat and release follow the
+/// press to the program under Kitty event-type reporting, and aterm's find bar
+/// never opens.
 #[cfg(unix)]
 #[test]
 fn bare_ctrl_r_and_ctrl_s_at_a_shell_prompt_reach_the_shell_and_open_no_find_bar() {
@@ -511,11 +510,11 @@ fn a_departed_agents_publication_leaves_ctrl_r_to_the_shell_in_front() {
     assert_eq!(drain(&pty), [], "nothing more reached the program");
 }
 
-/// The review of 2026-10-20: Claude Code runs `$EDITOR` with inherited stdio
-/// and no group of its own, so while vim reads the keys the group in front
-/// and its leader's name are still Claude's. The agent has handed the
-/// terminal off (`SessionFactory::handed_terminal`, asked of the agent's
-/// group), so vim gets its C-r (redo) and its repeat, and no find bar opens.
+/// Claude Code runs `$EDITOR` with inherited stdio and no group of its own,
+/// so while vim reads the keys the group in front and its leader's name are
+/// still Claude's. The agent has handed the terminal off
+/// (`SessionFactory::handed_terminal`, asked of the agent's group), so vim
+/// gets its C-r (redo) and its repeat, and no find bar opens.
 #[cfg(unix)]
 #[test]
 fn an_editor_the_agent_handed_the_terminal_to_gets_ctrl_r() {

@@ -660,6 +660,16 @@ impl FxContent {
         content
     }
 
+    /// An empty content with this one's room: what a producer refills in place of a content some frame still holds, so the new frame grows no vector the held one already grew.
+    #[must_use]
+    pub fn empty_like(&self) -> Self {
+        Self {
+            items: Vec::with_capacity(self.items.capacity()),
+            palette: Vec::with_capacity(self.palette.capacity()),
+            ..Self::default()
+        }
+    }
+
     /// Change the items and the palette in place, then re-seal.
     ///
     /// # Panics (debug)

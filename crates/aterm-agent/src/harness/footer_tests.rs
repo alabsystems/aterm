@@ -3380,13 +3380,12 @@ fn subscription_account_and_weekly_outlast_workspace_details_without_overflow() 
     assert!(shown.iter().any(|s| s.text == "weekly unavailable"));
 }
 
-/// A WEEKLY FIGURE THE FOOTER HAS NOT GOT SAYS WHY (owner, 2026-10-22: *"you also need to
-/// fix the weekly budget reporting for claude code harness"*): one word per reason where the
-/// read told one, `weekly unavailable` where none was told (a refused profile read), and a
+/// A WEEKLY FIGURE THE FOOTER HAS NOT GOT SAYS WHY: a few words per reason where the read
+/// told one, `weekly unavailable` where none was told (a refused profile read), and a
 /// standing 7d wall over every reason. Each reason, like an aged figure, stays beside the
 /// account and the controls on an 80-column pane, in its narrow form (`weekly ?`, an aged
-/// figure's `61.5% left · 59m`) where the controls take the room; and on any rule the old
-/// widest pair (`weekly unavailable` beside the shortest account) fitted, the week stays.
+/// figure's `61.5% left · 59m`) where the controls take the room; and on any rule where
+/// `weekly unavailable` beside the shortest account fits, the week stays.
 #[test]
 fn a_missing_weekly_figure_names_its_reason_beside_the_controls() {
     use super::super::profile::{SubscriptionDisplay, WeeklyGap};

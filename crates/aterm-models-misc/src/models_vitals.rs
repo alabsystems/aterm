@@ -6,6 +6,11 @@
 use aterm_spec::derive::*;
 
 /// One job's verdict machine, scalar.
+///
+/// `held` is an input: macOS's program check holds the program the job waits in
+/// (`docs/DESIGN-leftover-processes-2026-10-16.md` §5.1). `Hold` puts the job in the
+/// legitimate class (φ 0) and `BecomeSuspect` waits for its `Release`. Law `HeldWaitNeverQuiet`
+/// (Buggy 7: `Hold` leaves the class as it was, so a held job accrues and reads quiet).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn stuck_verdict_model() -> Model {
@@ -27,6 +32,8 @@ pub fn stuck_verdict_model() -> Model {
             var flapped = 0;
             var late = 0;
             var faked = 0;
+            var held = 0;
+            var held_quiet = 0;
 
             action Progress when (cls <= 3) {
                 stuck_while_progressing = if (Buggy == 1 && v == 2) { 1 } else { stuck_while_progressing };
@@ -37,6 +44,7 @@ pub fn stuck_verdict_model() -> Model {
             }
             action QuietTick when (2 <= cls && cls <= 3 && q <= QMax - 1) {
                 capped_stuck = if (cls == 3 && T8 <= q + 1 && Buggy == 4) { 1 } else { capped_stuck };
+                held_quiet = if (held == 1 && T3 <= q + 1) { 1 } else { held_quiet };
                 v = if (T8 <= q + 1 && cls == 2) {
                     if (Buggy == 6) { if (v == 0) { 1 } else { v } } else { 2 }
                 } else {
@@ -74,10 +82,20 @@ pub fn stuck_verdict_model() -> Model {
                 q = 0;
                 grows = 0;
             }
-            action BecomeSuspect when (cls <= 1) {
+            action BecomeSuspect when (cls <= 1 && held == 0) {
                 cls = 2;
                 q = 0;
                 grows = 0;
+            }
+            action Hold when (cls <= 3 && held == 0) {
+                held = 1;
+                cls = if (Buggy == 7) { cls } else { 1 };
+                v = if (Buggy == 7) { v } else { 0 };
+                q = if (Buggy == 7) { q } else { 0 };
+                grows = 0;
+            }
+            action Release when (held == 1) {
+                held = 0;
             }
             action Relabel when (2 <= cls && cls <= 3) {
                 v = if (cls == 3 && T8 <= q) { if (Buggy == 6) { v } else { 2 } } else { v };
@@ -113,6 +131,7 @@ pub fn stuck_verdict_model() -> Model {
             invariant NoFlap: flapped == 0;
             invariant FlaggedOnTime: late == 0;
             invariant AgeResetsOnlyOnProgress: faked == 0;
+            invariant HeldWaitNeverQuiet: held_quiet == 0;
         }
     }
 }

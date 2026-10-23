@@ -2,9 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! A compositor that stops reading: the client's socket fills, and `Display::try_flush`, the flush
-//! aterm-window's event loop makes, says `Flushed::Queued` (LW.7's delta: upstream's loop exited
-//! with errno 11, aterm-window's keeps the rest queued and waits for the socket to take it,
-//! `docs/measured/linux-lw7-2026-10-17.md`).
+//! aterm-window's event loop makes, says `Flushed::Queued` where libwayland's flush says EAGAIN, so
+//! the loop keeps the rest queued and waits for the socket to take it.
 
 #![cfg(target_os = "linux")]
 

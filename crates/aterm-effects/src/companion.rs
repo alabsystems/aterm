@@ -1496,6 +1496,22 @@ impl CompanionOwner {
         self.pet.set_letters_unseen(unseen);
     }
 
+    /// A test's negative control: the pet's rest veil dwells and eases on
+    /// ([`PetBrain::set_letter_arrival_dwells`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_pet_letter_arrival_dwells(&mut self, dwells: bool) {
+        self.pet.set_letter_arrival_dwells(dwells);
+    }
+
+    /// A test's negative control: the pet's rest veil steps on whenever the
+    /// last key was an Enter ([`PetBrain::set_letter_step_rearms`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_pet_letter_step_rearms(&mut self, rearms: bool) {
+        self.pet.set_letter_step_rearms(rearms);
+    }
+
     /// Read-only access to the pet brain for host projections.
     #[inline]
     #[must_use]

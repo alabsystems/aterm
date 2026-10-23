@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The headless reports.
+//! The window binary's text reports: `--diagnose`, `--validate-config`, `--show-config`,
+//! `--show-face`, `--list-fonts`, `--list-keybinds` and the theme list.
 
 use std::fmt::Write as _;
 
@@ -15,7 +16,7 @@ pub(crate) struct DiagInfo {
     pub profile: &'static str,
     /// Compiler provenance line.
     pub compiler: String,
-    /// SHA-256 of the raw 32-byte paper master (the anchor that authorizes a release).
+    /// SHA-256 of the raw 32-byte paper-master public key (the anchor that authorizes a release).
     pub update_pin_sha256: String,
     pub renderer_default: &'static str,
     /// What shell-integration preparation did for the configured shell.
@@ -89,7 +90,7 @@ fn config_line(label: &str, path: &str, presence: &ConfigPresence) -> String {
 fn report_config_target(launch_failure: Option<&str>) -> (String, ConfigPresence) {
     let Some(path) = crate::app_config::config_path() else {
         return (
-            "(no HOME / XDG_CONFIG_HOME)".to_string(),
+            format!("(unresolved: {} unset)", crate::cli::CONFIG_PATH_VARS),
             ConfigPresence::Absent,
         );
     };
@@ -1142,7 +1143,7 @@ fn shell_config_warning(shell: &str) -> Option<String> {
     }
 }
 
-/// Windows.
+/// Why the authored `shell` value cannot spawn, or `None` when it can.
 #[cfg(windows)]
 fn shell_config_warning(shell: &str) -> Option<String> {
     // A quoted value reaches `lpApplicationName` as a filename containing `"` whatever is
@@ -1291,7 +1292,7 @@ fn package_capability_warnings(
         vec![ConfigSemanticWarning {
             key,
             message: format!(
-                "{key}: package install/update operations are currently inert because {reason}; atpkg fails closed and performs no install or update"
+                "{key}: package install/update operations are inert because {reason}; atpkg fails closed and performs no install or update"
             ),
         }]
     })
@@ -1480,7 +1481,7 @@ pub(crate) fn config_backend_capability_warnings(
                 warnings.push(ConfigSemanticWarning {
                     key,
                     message: format!(
-                        "{key} is parsed and preserved but has no effect on this platform; cursor-trail audio is currently implemented only on macOS"
+                        "{key} is parsed and preserved but has no effect on this platform; cursor-trail audio is implemented only on macOS"
                     ),
                 });
             }
@@ -1718,7 +1719,10 @@ pub(crate) fn validate_config_text(text: &str) -> Result<Vec<String>, String> {
 pub(crate) fn validate_config() -> (String, bool) {
     match crate::app_config::config_path() {
         None => (
-            "no config path (HOME / XDG_CONFIG_HOME unset); built-in defaults in use".to_string(),
+            format!(
+                "no config path ({} unset); built-in defaults in use",
+                crate::cli::CONFIG_PATH_VARS
+            ),
             true,
         ),
         Some(p) => validate_config_path(&p),
@@ -1970,7 +1974,7 @@ fn listing_field(raw: &str) -> String {
     out
 }
 
-/// `aterm theme list`.
+/// `aterm theme list` and `--list-themes`.
 #[must_use]
 pub fn theme_list_report(
     appearance: Option<aterm_types::Appearance>,
@@ -2643,7 +2647,7 @@ fn appearance_colours(dark: aterm_types::Rgb, light: aterm_types::Rgb) -> String
     }
 }
 
-/// `--show-face`: the resolved font FACE for `family`.
+/// `--show-face`: the face `family` resolves to (the configured or default font when empty).
 pub(crate) fn show_face(family: &str) -> (String, bool) {
     let family = family.trim();
     let mut side_note = "";

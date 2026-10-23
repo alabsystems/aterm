@@ -840,6 +840,77 @@ fn the_rim_never_lies_on_the_trail() {
     );
 }
 
+#[test]
+fn the_trail_holds_from_a_rims_width_before_the_kitty() {
+    let mut frames = CardFrames::default();
+    let law = scenes().into_iter().chain(scenes().into_iter().map(aired));
+    let waves = |s: CardScene| {
+        (0..WAVE_END_MS)
+            .step_by(170)
+            .flat_map(move |t| [(s, Clock::riding(t)), (s, Clock::seated(t))])
+    };
+    let tall = CardScene {
+        kitty_rows: 3,
+        ..scene()
+    };
+    let ride = [scene(), tall]
+        .into_iter()
+        .flat_map(|s| (0..RIDE_MS).map(move |t| (s, Clock::riding(t))));
+    let random = (0..300u64).map(|seed| {
+        let (s, _) = random_frame(seed);
+        (s, Clock::seated(seed * 37 % WAVE_END_MS))
+    });
+    let (mut checked, mut held, mut stepped, mut at_edge, mut over_edge) = (0, 0, 0, 0, 0);
+    for (s, clock) in law.flat_map(waves).chain(ride).chain(random) {
+        if s.serious {
+            continue;
+        }
+        let Some(frame) = fx_frame(&mut frames, &s, clock, 7) else {
+            continue;
+        };
+        let m = marks(&frames, &frame, &s, clock, 7);
+        let Some(edge) = m.rims.iter().map(|sp| i64::from(sp.x)).min() else {
+            continue;
+        };
+        let (shape, _) = CardShape::of(&s);
+        let local = shape.scene();
+        let geo = Geo::new(local).expect("a drawn frame's scene");
+        let cx = Emit::new(local, geo, clock, 7);
+        let Some(lay) = cx.trail_lay().filter(|l| l.amp > 0) else {
+            continue;
+        };
+        let what = format!("{}x{}, {clock:?}, rim edge {edge}", s.cw, s.ch);
+        let mut k = 0;
+        while lay.tx0 + k * lay.seg < lay.drawn {
+            let end = (lay.tx0 + (k + 1) * lay.seg).min(lay.drawn);
+            let d = cx.wave(&lay, k);
+            if end > edge {
+                assert_eq!(d, 0, "{what}: segment {k} ends at {end}, on the rim: held");
+                held += 1;
+                over_edge += usize::from(end == edge + 1);
+            } else {
+                assert_eq!(
+                    d.abs(),
+                    lay.amp,
+                    "{what}: segment {k} ends at {end}: it steps"
+                );
+                stepped += 1;
+                at_edge += usize::from(end == edge);
+            }
+            k += 1;
+        }
+        checked += 1;
+    }
+    eprintln!(
+        "held boundary: {checked} frames, {held} held and {stepped} stepping segments, \
+         {at_edge} ending at the rim's edge, {over_edge} a pixel over it"
+    );
+    assert!(
+        checked > 500 && held > 0 && stepped > 0 && at_edge > 0 && over_edge > 0,
+        "CONTROL: segments either side of the rim's edge, to the pixel"
+    );
+}
+
 fn family_geom(ch: u16) -> Geom {
     Geom {
         cw: 1,

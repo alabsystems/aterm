@@ -39,8 +39,8 @@ pub mod harness;
 /// The launcher's half of `aterm --headless --ready-fd <n>`.
 #[cfg(unix)]
 pub mod ready;
-/// The supervisor: read-only classification and the loop the window's own host runs on every
-/// agent session.
+/// The supervisor: the loop the window's own host runs on every agent session, its policy,
+/// command classifier, journal, ledger and tapes.
 pub mod supervise;
 
 /// The verb the one binary answers a control request on: `aterm ctl …`.
@@ -91,8 +91,7 @@ impl CtlClient {
         }
     }
 
-    /// Run `aterm-ctl [--sock S] <args...>`, returning stdout, or why it failed
-    /// ([`failure_words`]).
+    /// Run `<ctl> [--sock S] <args...>`: its stdout on exit 0, else [`failure_words`].
     pub fn run(&self, args: &[&str]) -> Result<String, String> {
         let reply = self.run_raw(args)?;
         if reply.code == 0 {
@@ -102,7 +101,7 @@ impl CtlClient {
         }
     }
 
-    /// Run `aterm-ctl [--sock S] <args...>` and return the exit code with both streams.
+    /// Run `<ctl> [--sock S] <args...>` and return the exit code with both streams.
     pub fn run_raw(&self, args: &[&str]) -> Result<supervise::CtlReply, String> {
         let mut cmd = aterm_uds::spawnfd::command(&self.ctl);
         cmd.args(&self.lead);
@@ -447,169 +446,149 @@ pub const DRIVE_HELP: &str = "\
 aterm drive — the window harness's readers, run by hand.
 
 MENTAL MODEL
-    Every Claude Code, agy, Muse Code and Gemini CLI session in an aterm window is
-    supervised by default (`status supervisor=aterm-harness@<pid>`) under `[harness]`
-    in `aterm.toml` (`aterm help harness`). `aterm drive` exposes that host's readers
-    and tape tools from a terminal: `classify`, `phase`, `answer`, `ledger`, `tape`,
-    and `replay`. Vendor `codex` publishes `status program_state=` and is not read
-    here; `codex-alab` supervises itself.
-    Driving a session goes through `aterm ctl` (`aterm ctl help`): spawn a worker with
-    `aterm ctl @self spawn agent=claude -`, wait with `aterm ctl await task @<sid>,… since=0`,
-    and read its report with `aterm ctl @<sid> result`; or use `text`, `turn`, `image`,
-    and `await` (`await agent idle,prompt,question,wall`).
-    `aterm ctl @sid meta set questions ask|recommended|long-term|short-term` sets a
-    session's question policy (`ask` hands dialogs to a person or `aterm drive answer`;
-    `meta unset questions` resumes window answering within 2 s).
+    An aterm window supervises every Claude Code, agy, Muse Code and Gemini CLI
+    session by default (`status supervisor=aterm-harness@<pid>`), under `[harness]`
+    in `aterm.toml` (`aterm help harness`). `aterm drive` runs that supervisor's
+    readers and tape tools from a terminal. Vendor `codex` reports through
+    `status program_state=` and has no reader here; `codex-alab` supervises itself.
+    Driving a session is `aterm ctl` (`aterm ctl help`): `aterm ctl @self spawn
+    agent=claude -` starts a worker, `aterm ctl await task @<sid>,… since=0` waits
+    for it, `aterm ctl @<sid> result` reads its report; `turn`, `text`, `image` and
+    `await agent idle,prompt,question,wall` drive and watch it.
+    `aterm ctl @sid meta set questions ask|recommended|long-term|short-term` sets how
+    the window answers that session's questions (`ask` leaves them to a person or
+    `aterm drive answer`); `meta unset questions` hands them back to `[harness]`
+    within 2 s.
 
 USAGE
-    aterm drive [--socket PATH] <command>
-    aterm drive classify [--allow-python GLOB]... <cmd...>
-              | phase [@sid] [--allow-python GLOB]...
-              | answer @sid [--box TOKEN] <answer...>
-              | ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
-                       [--source anchor|log]
-              | tape cat FILE [--text] [--salvage] | tape show FILE --decisions [--salvage]
-              | tape stats FILE [--salvage]
-              | tape ls [@sid] | tape forget FILE|@sid...
-              | replay FILE [--until door=N]
-              | replay FILE --set k=v... | --policy FILE [--set k=v...] [--until door=N]
-              | replay FILE... --shadow [--set k=v...] [--policy FILE]
-              | replay --check FILE|DIR... [--set k=v...] [--policy FILE]
-              | replay FILE --why --at seq=N|door=N|[YYYY-MM-DDT]HH:MM[:SS]|\"<line>\"
-                       [--format text|md|html]
-              | help
+    aterm drive [--socket PATH] classify | phase | answer | ledger | tape | replay | help
+    `aterm drive`, `aterm drive help` and `aterm drive <command> --help` print this page.
 
 COMMANDS
     classify [--allow-python GLOB]... <cmd...>
-                       Judge whether <cmd...> is read-only: prints `read-only` (exit 0)
-                       or `not-read-only <reason>` (exit 1). Flags precede the command
-                       (`--` also ends flags). Parses shell syntax first (comments,
-                       heredocs, quotes, expansions, segments) and requires every
-                       segment head (looking through `env`/`xargs` wrappers) to be a
-                       known read-only program in `/bin` or `/usr/bin` (or a matching
-                       `--allow-python GLOB` script without `..`). Refuses file
-                       redirects, mutating flags/subcommands (`git push/reset/commit`,
-                       `git -c/--output/--ext-diff`, `git grep -O`, `git <cmd> --help`,
-                       `sed -i`, `awk` `system(`/redirects/pipes, `sed` `w`/`e`/`-f`,
-                       `python3 -c`, `sort -o/--compress-program`, `rg --pre`,
-                       `printf -v`, `less +cmd`, `date -s`, `uniq IN OUT`,
-                       `find -fprint`), and unsafe env assignments (`PATH`, `HOME`,
-                       `GIT_*`, `LD_*/DYLD_*`, pager/editor). `aterm ctl` and
-                       `aterm drive` are judged by verb and form (`meta`/`task`/
-                       `await task`/`result`/`survey`/`ledger` without `--out` read;
-                       `meta set`/`task mark`/`spawn`/`answer` write).
+                       Judge a shell command line by the supervisor's read-only rules:
+                       prints `read-only` (exit 0) or `not-read-only <reason>` (exit 1).
+                       Flags come first; `--` ends them. Every segment's head, seen
+                       through `env` and `xargs`, must be a known read-only program
+                       (bare, or by path under /bin, /usr/bin, /sbin or /usr/sbin) or a
+                       `python3` script matching an `--allow-python GLOB` (none by
+                       default; no `..`). Refuses file redirects, forms that write or run
+                       (`git pull`, `git -c`, `sed -i`, `find -delete`, `python3 -c`,
+                       `sort -o`) and assignments that change what runs (`PATH`, `HOME`,
+                       `GIT_*`, `LD_*`/`DYLD_*`, pager, editor). `aterm ctl` and
+                       `aterm drive` are judged by verb: ctl's reads (`status`, `text`,
+                       `await`, `result`, `survey`, …), bare `meta` and `task`, and
+                       drive's `phase`, `classify` and `ledger` without `--out` read;
+                       `meta set`, `task mark`, `spawn` and `answer` write.
     phase [@sid] [--allow-python GLOB]...
-                       Read @sid once using its foreground program's reader (`status
-                       program=`, else screen detection) and print:
+                       Read @sid (default: the active tab) once with its program's reader
+                       (`status program=`, else the screen) and print its phase,
                          busy | prompt | limited | idle | question
-                       Followed by details for that phase:
+                       then that phase's details:
                          prompt:   `kind`, `command`, `description`, `note <text>`,
-                                   `classify` (Bash), `option N …`, and `cancel esc`
-                                   or `exit esc`
-                         question: `box <token>` (for `answer --box`) and options
-                         busy:     `reason <where>: <rule>` (from the live zone/footer)
+                                   `classify` (a Bash box), `option N <label>`,
+                                   `cancel esc` | `exit esc` | `interrupt esc`, and
+                                   `box <token>` on a question dialog (for `answer --box`)
+                         busy:     `reason <where>: <rule>`
                          limited:  `message <text>` and `reset <text|->`
-                       Appends `survey 0` when a dismissible feedback survey is open
-                       (`survey withheld (<why>)` when withheld) and `context <n>%`
-                       when the context indicator (`<n>% until auto-compact`) is shown.
-                       Codex tabs always read `idle`.
+                       `question` means the last thing said ends in `?`. Then come
+                       `survey 0` when a rating survey that `0` dismisses is open (`survey
+                       withheld (<why>)` when it must not be pressed) and `context <n>%`
+                       when the screen shows the context left before auto-compact. A Codex
+                       tab always reads `idle`.
     answer @sid [--box TOKEN] <answer...>
-                       Send a choice to @sid's open question dialog under its program's
-                       grammar (`status program=`, else screen detection) and fences:
-                         Claude Code: option number or exact label; `, `-joined options
-                           for multi-select; `submit` on the review tab; `recommended`;
-                           or `human` (no keys sent). Moves focus row by row and presses
-                           Enter fenced on the target row (never digits, Esc, free-text,
-                           chat, or cancel).
-                         agy: option number, exact label, `recommended`, or `human`;
-                           sends the option digit fenced on the title row.
-                         Muse Code: option number, exact label, `recommended`, or
-                           `human`; moves focus and presses Enter under screen/person
-                           fences.
-                       `None of the above`, free-text rows, and policy words
-                       (`long-term`, `short-term` when not option labels; use
-                       `aterm ctl @sid meta set questions <word>`) are refused.
-                       `--box TOKEN` requires `phase`'s current `box` token.
-                       Prints:
+                       Choose in @sid's open question dialog by its program's grammar:
+                         Claude Code: an option number or exact label; comma-separated
+                           options on a multi-select; `submit` on the review tab. Moves
+                           the focus to each and presses Enter, fenced on that row (never
+                           a digit, Esc, typed text or the chat row).
+                         agy, Gemini CLI: an option number or exact label; types the
+                           option's digit, fenced on the title row.
+                         Muse Code: an option number or exact label; moves the focus and
+                           presses Enter, fenced on the question row.
+                       Each also takes `recommended` (the window's own choice) and `human`
+                       (types nothing). Refused: a free-text row (Muse's `None of the
+                       above` too) and a policy word that names no option (`long-term`,
+                       `short-term`; `meta set questions <word>` sets one). `--box TOKEN`
+                       (`phase`'s `box`) refuses when the dialog on screen is another box.
+                       A person's input within `[harness] human_grace_s` leaves the dialog
+                       to them. Prints one line:
                          `ANSWERED @sid enters=<k> answer=<what> next=<question|review|none>` (exit 0)
-                         `LEFT` (person typed, or `human`; exit 0)
-                         `NO-BOX` (exit 1)
-                         `REFUSED <why>` (exit 2, nothing typed)
-                         `NOT-SERVED <why> (enters=<k>)` (exit 3)
+                         `LEFT @sid <why>` (a person's input, or `human`; exit 0)
+                         `NO-BOX @sid <why>` (exit 1)
+                         `REFUSED @sid <why>` (exit 2, nothing typed)
+                         `NOT-SERVED @sid <why> (enters=<k>)` (exit 3)
     ledger [@sid] [--journal FILE] [--since TIME] [--format text|md|html] [--out PATH]
            [--source anchor|log]
-                       Replay @sid's run on one time axis by joining:
-                         * `history` (every `turn` and settlement time)
-                         * reply row counts from `offscreen tail=20000 max=20000 screen=1`
-                         * `--journal FILE` (`<aterm state>/drive/<sid>.journal.jsonl`:
-                           `EVENT`, `APPROVED`, `DISMISSED`, `RECONNECT`, `TIMEOUT`, `EXIT`)
-                         * fabric mail (`inbox --peek --meta` and `@self` `timeline` `post` rows)
-                       Prints `SUMMARY` and `TIMELINE` (`manager | worker | watcher | fabric`).
-                       `--format text|md|html` selects column text (default), Markdown tables,
-                       or a self-contained swimlane HTML page (`--out PATH` writes mode 0600
-                       and prints PATH; bound to `open_ledger`, ⇧⌘L / Ctrl+Shift+L).
-                       `--since TIME` filters by Unix ms or timestamp (`YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]`).
-                       `--source anchor` (default) anchors process clocks via the control
-                       socket's birth time (`~` when unknown; `carried=1` turns omit time);
-                       `--source log` joins turns and mail via session log records
-                       (`log class=turn` `ledger=` and `log kinds=mail` `inbox=`).
-                       With no `@sid`, uses the single session named in `--journal`. Exit 0.
+                       @sid's run on one time axis, joined from its `history` (turns),
+                       reply sizes (`offscreen`), the window's journal (`--journal FILE`:
+                       `<state>/drive/<sid>.journal.jsonl`) and fabric mail (`@self`'s
+                       `inbox --peek --meta` and `timeline`). Prints SOURCES, SUMMARY and
+                       a TIMELINE in `manager`, `worker`, `watcher` and `fabric` lanes as
+                       text columns (default), Markdown tables (`md`) or one swimlane
+                       HTML page (`html`). `--out PATH` writes it there (mode 0600) and
+                       prints `wrote PATH`; `open_ledger` (⇧⌘L, Ctrl+Shift+L) opens the
+                       focused tab's HTML page.
+                       `--since TIME` keeps what happened from TIME on: Unix ms or
+                       `YYYY-MM-DD[THH:MM[:SS]][Z|±HH:MM]`.
+                       `--source anchor` (default) places turns by the instance's clock,
+                       anchored at its control socket's birth (`~` marks a time it could
+                       not place; turns carried from an earlier aterm have none);
+                       `--source log` places turns and mail by the session log's records.
+                       No @sid: the one session `--journal` names.
     tape cat FILE [--text] [--salvage] | tape show FILE --decisions [--salvage]
     tape stats FILE [--salvage]
-                       Read a recorded `.atape` (binary or `atape-text 1`) without
-                       contacting aterm. `cat` lists numbered items (`--text` emits
-                       round-trippable text form); `show --decisions` prints each
-                       decision's screen, rule, outcome, act, reply, and journal line;
-                       `stats` prints byte size, item/decision counts, span, and kB/h.
-                       Damaged tapes exit 2 unless `--salvage` keeps valid frames
-                       before the damage (torn tails are read up to the tear and noted
-                       on stderr).
+                       Read a recorded `.atape` (binary, or `atape-text 1`) offline.
+                       `cat` lists its numbered items (`--text`: the round-trippable text
+                       form); `show --decisions` prints each decision's screen, rule,
+                       outcome, act, reply and journal line; `stats` prints its bytes,
+                       span, kB/h, item, effect and decision counts. A damaged tape exits
+                       2 unless `--salvage` keeps the whole frames before the damage; a
+                       torn tail is read up to the tear and noted on stderr.
     tape ls [@sid] | tape forget FILE|@sid...
-                       Manage hosted tapes in `<state>/drive/tapes/<sid>/` (recorded by
-                       dev builds when `ATERM_HARNESS_TAPE` is set, bounded to 256 MiB
-                       and 72 h; `tapes/kept/` and active tapes are preserved). `ls`
-                       lists tapes newest first (filtered to `@sid` plus `kept/` when
-                       given); `forget` deletes named FILEs or all unkept tapes for
-                       `@sid` (failing before any deletion if a target has no tape).
+                       The hosted tapes in `<state>/drive/tapes/<sid>/`, recorded when a
+                       dev build runs with `ATERM_HARNESS_TAPE` set and swept past
+                       256 MiB or 72 h (`tapes/kept/` and tapes being written stay).
+                       `ls` lists them newest first (with @sid: its tapes and `kept/`);
+                       `forget` deletes the FILEs named, or every unkept tape of an @sid,
+                       refusing before deleting anything when an @sid has none.
     replay FILE [--until door=N]
-                       Deterministically replay FILE's loop offline against its
-                       recorded observations and compare every request and output.
-                       Prints `REPRODUCED`, `ENDED`, `REACHED` (`--until door=N`),
-                       `DIVERGED` at `#N` (`decision`, `output`, or `drift`), or
-                       `PANICKED`, plus request counts, acts (`> …`), and lines (`| …`).
-                       Exit 0 (reproduced/ended/reached), 1 (diverged), 4 (panicked),
-                       or 2 (unreplayable/usage error).
+                       Replay FILE's loop offline against its recorded observations,
+                       comparing every request and output. Prints `REPRODUCED`, `ENDED`,
+                       `REACHED` (`--until door=N`), `DIVERGED at #N` (`decision`,
+                       `output` or `drift`) or `PANICKED`, then request counts, acts
+                       (`> …`) and lines (`| …`).
     replay FILE --set k=v... | --policy FILE [--set k=v...] [--until door=N]
-                       Counterfactual replay in ACTS MODE under `--policy FILE`
-                       (`[harness]` TOML) and/or `--set k=v` overrides (unknown or
-                       invalid keys/values are refused). Compares only acts up to the
-                       first divergence. Prints `REPRODUCED` (0), `ENDED` (0),
-                       `DIVERGED` (1), `STALE` (3, candidate requested an unrecorded
-                       read), or `PANICKED` (4); exit 2 on usage/read error.
+                       Counterfactual, in acts mode: replay under a candidate `[harness]`
+                       policy (`--policy FILE`, `--set k=v` overrides; unknown keys and
+                       bad values are refused), comparing only acts, up to the first
+                       divergence. Adds `STALE`: the candidate asked a read the tape
+                       never answered.
+                       Both forms exit 0 (REPRODUCED, ENDED, REACHED), 1 (DIVERGED),
+                       3 (STALE), 4 (PANICKED) or 2 (unreplayable tape, usage error).
     replay FILE... --shadow [--set k=v...] [--policy FILE]
-                       Re-evaluate every recorded decision on each FILE under this
-                       build and the candidate policy (or recorded policy), marking
-                       missing inputs under `needs:` and rows after the first difference
-                       as `TAINT`. Exit 0 (all matched), 1 (diverged), 2 (unshadowable
-                       tape or usage error), or 3 (undecidable point).
+                       Decide every recorded decision again under this build and the
+                       candidate (else the recorded) policy; `needs:` names missing
+                       inputs and `TAINT` marks rows after the first difference. Exit 0
+                       (all matched), 1 (diverged), 2 (unshadowable tape, usage error)
+                       or 3 (undecidable point).
     replay --check FILE|DIR... [--set k=v...] [--policy FILE]
-                       Corpus check: replay every named tape and `*.atape`/`*.atape.txt`
-                       under each DIR in acts mode, printing per-tape verdicts
-                       (`REPRODUCED`, `NOT REPLAYED`, etc.) and summary counts.
-                       Exit 0, 1 (diverged), 2 (not replayed / no tapes / usage error),
-                       3 (stale), or 4 (panicked).
+                       Replay every tape named, and every `*.atape`/`*.atape.txt` under
+                       each DIR, in acts mode: a verdict per tape and a count of each.
+                       Exit 1 (any diverged), else 2 (one not replayed, no tapes, usage
+                       error), else 3 (stale), else 4 (panicked), else 0.
     replay FILE --why --at seq=N|door=N|[YYYY-MM-DDT]HH:MM[:SS]|\"<journal line>\"
                        [--format text|md|html]
-                       Explain one decision at `--at` (by screen `seq=N`, effect
-                       `door=N`, local timestamp, or journal line): the screen, parsed
-                       box, input facts with source records, rule trace, act, reply,
-                       journal line, ledger row, and `needs:` gaps. Exit 0, or 2 if no
-                       decision matches or FILE cannot be read.
+                       Explain the decision at a screen `seq=N`, an effect `door=N`, a
+                       local time or a journal line: its screen, parsed box, inputs with
+                       their source records, rule trace, act, reply, journal line, ledger
+                       row and `needs:` gaps. Exit 0, or 2 when no decision matches or
+                       FILE cannot be read.
     help               Show this text.
 
 OPTIONS
-    --socket PATH   Target aterm control socket (defaults to the hosting instance,
-                    else the newest local instance).
+    --socket PATH   Target aterm control socket (default: the instance hosting this
+                    shell, else the newest local instance).
 
 EXAMPLES
     aterm drive classify 'git status --short && git pull | tail'

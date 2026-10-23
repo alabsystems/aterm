@@ -6,24 +6,23 @@
 //!
 //! A doc comment whose last line ends on a joining word (`and`, `the`, `of`, …) or a comma
 //! was cut short: a prune that keeps only each paragraph's first line leaves exactly that,
-//! and rustdoc shows the fragment as the item's summary. One such prune left about 17,000
-//! across the workspace on 2026-10-22, every one passing fmt, lint and doc. Read over
-//! every Rust file's `///` and `//!` blocks, at each block's last line and, outside a code
-//! fence, at the line before a heading (`# Errors`): markdown lets a heading interrupt a
-//! paragraph, so a paragraph cut above one runs straight into it. A last line ending on
-//! `e.g.` or `i.e.` was cut at the abbreviation's period. A heading names a section, not a
-//! sentence. A doc's last line ending on a colon introduced a list or an example that a prune
-//! deleted (33 on 2026-10-23); a plain `//` comment may end on one to introduce the code below.
+//! rustdoc shows the fragment as the item's summary, and fmt, lint and doc all pass it. Read
+//! over the `///` and `//!` blocks of every Rust file under `crates/` and `apps/`, at each
+//! block's last line and, outside a code fence, at the line before a heading (`# Errors`):
+//! markdown lets a heading interrupt a paragraph, so a paragraph cut above one runs straight
+//! into it. A last line ending on `e.g.` or `i.e.` was cut at the abbreviation's period. A
+//! heading names a section, not a sentence. A doc's last line ending on a colon introduced a
+//! list or an example that a prune deleted; a plain `//` comment may end on one to introduce
+//! the code below.
 //!
 //! A cut at a period inside parentheses, a code span or a quote (`(its journal.`) leaves
 //! what it opened open, and a cut that adds its own period leaves an article or conjunction
 //! before it (`…, or.`), so every paragraph is also read whole at its end for either. A
-//! `// SAFETY:` note is read the same way: it is the proof its `unsafe` block stands on, and
-//! the same prunes cut it, once down to the name of what it was about
-//! (``SAFETY: `-setContentMinSize:`.``), so a note with no word outside its code spans is cut
-//! too. So is every other `//` comment on lines of its own: the prunes cut those as well,
-//! and one took the `//` of a URL in a string for a comment and copied the URL's tail above
-//! it as one (`// 127.0.0.1:9".into()`).
+//! `// SAFETY:` note, the proof its `unsafe` block stands on, is read the same way, and so is
+//! every other `//` comment on lines of its own (a URL's tail copied out of a string,
+//! `// 127.0.0.1:9".into()`, is one). A SAFETY note with no word outside its code spans
+//! (``SAFETY: `-setContentMinSize:`.``) is cut too: it names what it is about and states
+//! nothing of it.
 
 use super::rules::PRODUCT;
 use super::{Finding, Rule, Tree};

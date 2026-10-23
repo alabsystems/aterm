@@ -67,8 +67,8 @@ static CHECKS_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 /// start there — the control socket's `spawn cwd=` checks before the spawn
 /// does, a person presses New Tab again — is answered at once ([`within`]),
 /// instead of waiting out the budget again beside it: half the wait for a
-/// `spawn cwd=` into a hung share (515 ms, both checks, measured on the Linux
-/// lane, 2026-10-17), and none for every New Tab after the first.
+/// `spawn cwd=` into a hung share (515 ms for both checks, measured on the
+/// Linux lane), and none for every New Tab after the first.
 #[cfg(unix)]
 static CHECKS_RUNNING: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
 
@@ -738,7 +738,10 @@ pub(crate) fn inherited_in(
     }
 }
 
-/// THE PARKED SPARE'S RETARGET (2026-10-18).
+/// THE PARKED SPARE'S RETARGET: the kernel path of `dir` for a parked spare
+/// shell to move to, or `None` where it cannot: a folder judged not local, a
+/// read that ran past `CHECK_BUDGET`, or a folder the inherited `$HOME` or
+/// `$PWD` spells otherwise (`retarget_in`). `None` on other platforms.
 pub(crate) fn retarget_folder(dir: &str) -> Option<String> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {

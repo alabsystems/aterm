@@ -2085,6 +2085,7 @@ pub struct Session<'a, C: Ctl> {
     withheld: Option<Guard>,
     hold_said: Option<HoldSaid>,
     hold: occupancy_loop::HoldWatch,
+    facts: facts_loop::FactsWatch,
     stall_suspect: bool,
     stall_termed: bool,
     stall_grace_s: u32,
@@ -2327,6 +2328,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             withheld: None,
             hold_said: None,
             hold: occupancy_loop::HoldWatch::default(),
+            facts: facts_loop::FactsWatch::default(),
             stall_suspect: false,
             stall_termed: false,
             stall_grace_s: SupervisorConfig::default().human_grace_s,
@@ -5763,7 +5765,7 @@ impl<C: Ctl> Session<'_, C> {
         Some(words)
     }
 
-    /// Offers a settled background-work break to [`IdleHost::at_background`] and updates occupancy state.
+    /// Offers a settled background-work break to [`IdleHost::at_background`] and updates occupancy state; then the stuck fact's line under `[harness] stuck_break_note`, then the door's write (§2.1).
     fn host_steps_in_background(
         &mut self,
         screen: &Screen,
@@ -5817,7 +5819,13 @@ impl<C: Ctl> Session<'_, C> {
                 self.say_hold(screen.seq, Some(HoldSaid::NoHostStep), review);
             }
             self.hold_background(screen, at, waited, settled, cfg, review);
-            if self.occupancy_write(screen, None, cfg, review)? {
+            // §2.1's rank 4, before the nudges: the stuck fact's own line.
+            let stuck = self.stuck_break(screen, (at, waited), false, cfg, review)?;
+            if stuck {
+                *since = None;
+            }
+            let line_gone = stuck.then_some(Guard::HostLine);
+            if self.occupancy_write(screen, line_gone, cfg, review)? {
                 *since = None;
             }
             return Ok(());
@@ -5860,6 +5868,11 @@ impl<C: Ctl> Session<'_, C> {
             review.note(&format!("HOST seq={} background {line}", screen.seq));
             self.host_turn(kind, screen.seq);
             self.hold_line(screen.seq, cfg, review);
+            *since = None;
+            line_gone = Some(Guard::HostLine);
+        }
+        // §2.1's rank 4, after the host's line and before the nudges: the stuck fact's own.
+        if self.stuck_break(screen, (at, waited), line_gone.is_some(), cfg, review)? {
             *since = None;
             line_gone = Some(Guard::HostLine);
         }
@@ -6689,6 +6702,8 @@ mod escalate;
 #[path = "host_door.rs"]
 pub(crate) mod host_door;
 pub use host_door::IdleHost;
+#[path = "facts_loop.rs"]
+mod facts_loop;
 #[path = "lifecycle.rs"]
 mod lifecycle;
 #[path = "occupancy_loop.rs"]

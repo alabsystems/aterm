@@ -168,10 +168,9 @@ pub(crate) fn active_builds_in(scan: &BinScan) -> BTreeMap<String, u64> {
     let mut out = BTreeMap::new();
     for target in scan.targets() {
         // A shim that names a build is not a build that is there, so the target is stat'd
-        // and `list`, `which` and `doctor` agree
-        // (docs/AUDIT-nux-first-open-toolchain-2026-08-31.md). Only proved absence drops
-        // it: a store this user may execute but not stat (EACCES, EPERM, EIO) is still
-        // there ([`crate::store::Presence`]).
+        // and `list`, `which` and `doctor` agree. Only proved absence drops it: a store this
+        // user may execute but not stat (EACCES, EPERM, EIO) is still there
+        // ([`crate::store::Presence`]).
         if crate::store::presence(target).is_absent() {
             continue;
         }

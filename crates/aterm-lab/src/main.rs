@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The real-agent lab: launches the real Claude Code, Codex ([`codex`]), Gemini CLI / Antigravity CLI (`agy`, [`gemini`]; screens in [`gemini_captures`]), or Muse Code ([`muse`]; proof in [`muse_proof`]) TUI by path inside a private headless `aterm` against a local API stub (Anthropic, OpenAI Responses, Gemini, or Meta).
+//! The real-agent lab: launches the real Claude Code, Codex ([`codex`]), Gemini CLI / Antigravity CLI (`agy`, [`gemini`]; screens in [`gemini_captures`]), or Muse Code ([`muse`]; proof in [`muse_proof`]) TUI by path inside a private headless `aterm` against a local API stub (Anthropic, OpenAI Responses, Gemini, or Meta), and runs private aterm instances for checking a change. [`USAGE`] lists the verbs.
 
 #![deny(unsafe_code)]
 
@@ -134,7 +134,6 @@ mod resource_attribution;
 #[cfg(target_os = "macos")]
 mod restore;
 #[cfg(target_os = "macos")]
-#[cfg(target_os = "macos")]
 mod run;
 #[cfg(target_os = "macos")]
 mod runtime_dirs;
@@ -213,81 +212,88 @@ pub fn wait_until(within: std::time::Duration, mut pred: impl FnMut() -> bool) -
 
 /// The verbs, as `help` prints them.
 pub const USAGE: &str = "\
-aterm-lab — real Claude Code, Codex, Gemini CLI, agy, or Muse Code TUI in a private headless aterm
-against a local API stub (Anthropic, Responses, Gemini, or Meta). Fully local; no tokens, login, or egress.
+aterm-lab — the real Claude Code, Codex, Gemini CLI, agy or Muse Code TUI in a jailed private headless aterm
+against a local API stub (Anthropic, Responses, Gemini or Meta). Fully local: no real account, token or egress.
 
-usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG or \"lab\")
-  up [tag]                       start stub + black-hole proxy + jailed private headless aterm
+usage: targo --unverified lab <command> [tag] [args]
+       (tag defaults to $LAB_TAG or \"lab\"; a verb that brings up its own lab defaults to a tag of its own)
+  up [tag]                       start the stub, a black-hole proxy, the egress witness and a jailed private headless aterm
                                  (env: LAB_SURVEY=1 LAB_TRUST=1 LAB_FIRST_RUN=1 LAB_RESTORE=1 LAB_CLOCK=1
                                  LAB_HARNESS_KEYS='continue = false' LAB_ATERM_TOML LAB_COLS LAB_LINES LAB_SCALE
                                  LAB_PROXY=dead LAB_CLAUDE LAB_CODEX LAB_CODEX_MODEL LAB_GEMINI LAB_AGY LAB_MUSE
                                  LAB_ATERM=/physical/path LAB_STATE=/abs/outside/homes
                                  LAB_INSTANCE_ENV='TMPDIR=/abs ATERM_DEBUG_<NAME>=V ATERM_DEV_<NAME>=V')
   claude [tag] [-e K=V]... [--no-wait] [--relay] [--subscriber] [--debug-log] [-- claude args]
-                                 launch managed Claude Code in tab 1 (--relay: behind PTY relay; --subscriber: fake
-                                 claude.ai OAuth token for `limit` headers; --debug-log: write scratch debug log)
+                                 launch the managed Claude Code in tab 1 (--relay: behind the PTY relay; --subscriber: a
+                                 fake claude.ai OAuth token, for `limit` headers; --debug-log: a scratch debug log)
   codex [tag] [--signed-out|--chatgpt[=PLAN]] [-e K=V]... [--no-wait] [-- codex args]
-                                 launch managed Codex in tab 1 (CODEX_HOME=<scratch>/codex-home; --chatgpt: composed
-                                 fake ChatGPT auth.json + stub refresh; --signed-out: default provider, no auth)
+                                 launch the managed Codex in tab 1 (CODEX_HOME=<scratch>/codex-home; --chatgpt: a fake
+                                 ChatGPT auth.json, plan plus by default, and stub refresh; --signed-out: the default
+                                 provider, no auth)
   codex-run [tag] [--lab|--chatgpt|--signed-out] -- <args>
                                  run non-interactive Codex in the jail (--help, exec, `login status`, `login --help`;
-                                 login/logout/app/app-server/cloud/update refused)
+                                 any other login, logout, app, app-server, remote-control, agents, exec-server, cloud
+                                 and update are refused)
   codex-auth [tag] [LABEL [ACCOUNT [PLAN]]]
-                                 write composed fake auth.json (default B, acct-lab-1, plus) into live CODEX_HOME
+                                 write a fake auth.json (default B, acct-lab-1, plus) into the live CODEX_HOME
   ratelimits [tag] off | PRIMARY SECONDARY [credits=yes|no|unlimited] [balance=N] [reached=TYPE] [promo=TEXT] [active=ID]
-                                 set x-codex-* rate-limit headers (5h and weekly %) and --chatgpt usage payload
-  rollout [tag] [all]            print token_count lines (all: every line) of tab's newest scratch rollout
+                                 set the x-codex-* rate-limit headers (5h and weekly used %) and the --chatgpt usage payload
+  rollout [tag] [all]            print token_count lines (all: every line) of the tab's newest scratch rollout
   codex-selftest [tag] [--keep]  end-to-end Codex isolation and stub proof (~20 s)
   gemini [tag] [-e K=V]... [--no-wait] [--untrusted] [-- gemini args]
-                                 launch Gemini CLI in tab 1 against stub Gemini API (--untrusted: show folder trust dialog)
+                                 launch Gemini CLI in tab 1 against the stub Gemini API (--untrusted: the folder trust dialog)
   agy [tag] [-e K=V]... [--no-wait] [--untrusted] [--onboarding] [--setting KEY=VALUE]... [-- agy args]
-                                 launch agy in tab 1 against stub Gemini API (--untrusted, --onboarding, --setting)
+                                 launch agy in tab 1 against the stub Gemini API (--onboarding: the first-run screens and
+                                 the trust dialog; --setting: one settings.json key)
   gemini-selftest|agy-selftest [tag] [--keep]
                                  end-to-end Gemini CLI or agy isolation and stub proof (~30 s)
   gemini-captures|agy-captures [--only <regex>]
                                  capture every Gemini CLI or agy fixture screen (~16 min; --only narrows)
   muse [tag] [-e K=V]... [--no-wait] [-- muse args]
-                                 launch Muse Code in tab 1 against stub Meta routes with scratch HOME
+                                 launch Muse Code in tab 1 against the stub's Meta routes with a scratch HOME
   muse-selftest [tag] [--keep]   end-to-end Muse Code isolation and stub proof (~30 s)
   muse-captures [--only <regex>] capture every Muse Code fixture screen (~10 min; --only narrows)
   turn|send|enter|key [tag] ...  type prompt+Enter | text | Enter | named key (0, escape, ctrl-c, ...); turn exits 1
                                  unless the composer accepted the prompt
-  mode [tag] [name ['<spec>']]   set/show stub mode: ok long numbered overloaded too-long compact-fails slow rate-limit
-                                 401 500 bad-key bg[:SLEEP[:SLOW]] tool limit:CLAIM:RESET[:PLAN] <custom>
+  mode [tag] [name ['<spec>']]   show or set the stub mode: ok long numbered overloaded too-long compact-fails slow
+                                 rate-limit 401 500 bad-key bg[:SLEEP[:SLOW]] tool limit:CLAIM:RESET[:PLAN], or a
+                                 custom name whose '<spec>' JSON object is written to modes/<name>.json
   limit [tag] CLAIM SECONDS [PLAN]
                                  answer with a 429 subscription usage limit (CLAIM: five_hour|seven_day|...|code_assist)
                                  that resets SECONDS from now
-  tool [tag] '<json>'            script stub tool mode ({\"name\":\"Bash\",\"input\":...} or list; \"@PROJ@\", \"@PORT@\");
-                                 trigger with `turn TAG toolstart`
+  tool [tag] '<json>'            script the stub's tool mode ({\"name\":\"Bash\",\"input\":...} or a list; \"@PROJ@\", \"@PORT@\");
+                                 trigger it with `turn TAG toolstart`
   headers [tag] ['<json>']       set extra /v1/messages headers {\"on200\":{...},\"on429\":{...}} (\"@SEQ:BASE:STEP@\"; '{}' clears)
   account [tag] composed|off|show|'<json>'
-                                 configure stub claude.ai oauth/usage, profile, and bootstrap route bodies (\"@ISO+N@\")
+                                 set the stub's claude.ai oauth/usage, profile and bootstrap route bodies (\"@ISO+N@\")
   claude-json [tag] [KEY ...] | --set KEY '<json>'|composed
                                  read or set keys in the scratch .claude.json (never the owner's file)
   statusline [tag] on [SECS]|off|show
-                                 record or show what Claude Code pipes to its statusLine command
-  transcript [tag]               print newest scratch transcript rows (type/subtype and system/user text)
+                                 record (every SECS, default 5) or show what Claude Code pipes to its statusLine command
+  transcript [tag]               print the newest scratch transcript's rows (type/subtype and system/user text)
   debuglog [tag] [egrep]         print lines from `claude TAG --debug-log` (default: request/account/telemetry lines)
-  settings [tag] '<json>'        deep-merge JSON into scratch settings.json (null removes a key; live re-read)
-  survey [tag] on|off [--reread] toggle CLAUDE_FORCE_DISPLAY_SURVEY in scratch settings env (--reread: retry every 3 s)
-  setenv [tag] KEY [VALUE]       set or remove KEY in scratch settings.json env block
-  harness [tag] key=value ...    set [harness] keys in scratch aterm.toml live (e.g. continue=false, approve=none)
-  text|image|status|sid [tag]    read tab: ctl text | PNG | ls+status | session id
+  settings [tag] '<json>'        deep-merge JSON into the scratch settings.json (null removes a key; read live)
+  survey [tag] on|off [--reread] toggle CLAUDE_FORCE_DISPLAY_SURVEY in the scratch settings env (--reread: rewrite every
+                                 3 s until Claude Code reports a re-read)
+  setenv [tag] KEY [VALUE]       set KEY in the scratch settings.json env block (no VALUE: remove it)
+  harness [tag] key=value ...    set [harness] keys in the scratch aterm.toml live (e.g. continue=false, approve=none)
+  text|image|status|sid [tag]    read the tab: ctl text | PNG | ls+status | session id
   phase [tag]                    run `aterm drive phase` on the tab
   prices [<claude-bin>] [--codex <codex-bin>]
                                  check prices.toml against Claude Code's embedded price catalog and Codex's model ids
   abrew-admission [--json] [--indexes DIR] [--this-machine | --arch A --macos V --xcode V|none --no-clt]
                                  evaluate abrew admission across Homebrew's formula.json and cask.json
-  wait [tag] <egrep> [secs]      wait until a screen row matches <egrep> (default 60 s; `await match`)
-  ps [tag]                       list pids for [tag], or every live lab under $LAB_STATE/runs
-  journal [tag]                  print harness journal and ledger
+  wait [tag] <egrep> [secs]      wait until a screen row matches <egrep> (default 60 s; `await match`); exit 1 if none did
+  ps [tag]                       list pids for [tag], or for every lab with a run directory under $LAB_STATE/runs
+  journal [tag]                  print the harness journal and ledger
   watch [tag] [secs]             stream screen diffs and journal lines on one clock (default 30 s)
-  stublog|security|egress|lsof [tag]
-                                 inspect stub request log | keychain tripwire | egress witness | jailed process sockets
+  stublog [tag] [N] | security [tag] | egress [tag] [MIN] | lsof [tag]
+                                 the stub's log (last N lines, 40) | the keychain tripwire's log | egress witness, proxy
+                                 refusals and sandbox denials (last MIN minutes, 30) | the lab's network sockets
   capture [tag] <name> \"<what>\"  write $LAB_STATE/captures/<agent>-<version>-<name>.txt (+png)
   catch [tag] <egrep> <name> \"<what>\" [secs]
-                                 capture fixture the instant <egrep> matches on screen
-  header [tag] \"<what>\"          print one-line `# ...` fixture header for [tag]
+                                 capture a fixture the instant <egrep> matches on screen (default 60 s)
+  header [tag] \"<what>\"          print the one-line `# ...` fixture header for [tag]
   footers [--out DIR] [--subscriber] [--settings '<json>'] [--no-turn] [--no-bypass] [--columns N] [--lines N]
                                  capture managed Claude Code footer screens across modes on a fresh lab
   halfdraw scan <cast> --program claude|agy|muse|gemini [--show N] [--event I]
@@ -301,20 +307,22 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
   probe [tag] [--replica]        run jail and replica-home isolation probes (--replica: replica home only)
   selftest [tag] [--keep]        end-to-end Claude Code proof (~25 s: turn, survey, harness, egress, tripwire, probes, twin)
   nudge-trial [tag] [--mode on|log|off] [--trials N] [--expect on|log|off] [--via mode|key] [--no-hold]
-                                 force N<=3 PTY displacements on real Claude Code and verify repaint nudge (~2.5 min)
+                                 force N (1-3) PTY displacements on real Claude Code and verify the repaint nudge (~2.5 min)
   restore [tag] quit|crash [--keep] [--hold] [--clear] [--land|--land-open]
-                                 cold-restore proof (~1 min; LAB_RESTORE=1): Claude Code takes a turn, aterm quits or is
-                                 SIGKILLed, and the relaunched instance must resume the conversation with the expected
-                                 Autopilot carry-on (default Cruise `step=continued`; --hold: held tab stays held until
-                                 lifted; --clear: `/clear` settles `step=done:taskless`; --land: landed tab stays
-                                 `task=landed` with `step=done:said-done`; --land-open: mid-work Land settles
-                                 `step=done:landing` without typing Cruise nudges)
+                                 cold-restore proof on a lab of its own under LAB_RESTORE=1 (~1 min): Claude Code takes
+                                 a turn, aterm quits or is SIGKILLed, and the relaunched instance must resume the
+                                 conversation with the expected Autopilot carry-on (default Cruise `step=continued`;
+                                 --hold, crash only: the held tab stays held until lifted; --clear: `/clear` settles
+                                 `step=done:taskless`; --land: the landed tab stays `task=landed` with
+                                 `step=done:said-done`; --land-open: mid-work Land settles `step=done:landing` without
+                                 typing Cruise nudges)
   forever --harness <claude|gemini|agy|muse|all> [--mode land|cruise|both|cover|cap|wall|wall-hid|wall-day|wall-climb|wall-shift|wall-redraw|wall-switch|wall-unread|wall-day-stop|wall-cruise|wall-relaunch|wall-bucket|resid|ladder] [--chains a,b] [--no-surfaces] [--window] [tag] [--keep]
                                  supervised Autopilot Land and Cruise scenario chains against real TUIs in scratch git
                                  repos (~15-30 min/harness):
                                  - land / cruise / both: L1-L11, L16-L17, C1-C2, P4, N1-N4, Off control, plus Settings >
                                    Harness window & 20 s idle wake/render checks (--no-surfaces skips window checks)
-                                 - cover: L12 prose question, L13 person turn (task=theirs), L14/C3 P2 reads, P5, L15 worker
+                                 - cover: L12 prose question, L13 person turn (task=theirs), L14/C3 P2 reads, P5, L15
+                                   worker, C4, Off control
                                  - cap: continue_per_hour = 1 escalation and post-hour recovery (~72 min)
                                  - wall / wall-hid / wall-day / wall-climb: usage walls (W1 visible, W2 scrolled/dismissed,
                                    Gemini per-day quota rung 30m and climbed 2h)
@@ -325,11 +333,11 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
                                    answered Stop, W8 Cruise at a wall, W9 a relaunch under a wall, W10 Gemini per-model
                                    bucket (Stop then resume, never the switch)
                                  - resid / ladder: residual and backoff-ladder scenario slices
-                                 - --window (with land-p; refused under LAB_RESTORE=1): opens a real window and types L13's
-                                   person prompt via NSEvent `hwkey` (`human_seq=` verified)
+                                 - --window (needs the land-p chain; refused under LAB_RESTORE=1): opens a real window and
+                                   types L13's person prompt via NSEvent `hwkey` (`human_seq=` verified)
   crash [tag] [--gap SECS] [--keep-tree]
-                                 SIGKILL the lab's own aterm instance and relaunch on the same state after SECS (default 0;
-                                 --keep-tree leaves child processes for PTY keeper testing; refused on windowed labs)
+                                 SIGKILL the lab's own aterm instance and relaunch it on the same state after SECS (default
+                                 0; --keep-tree leaves its child processes, for PTY keeper testing; refused on windowed labs)
   sleep [tag] --for SECS [--hold SECS] [--at-act [--rule RULE] [--within SECS]]
                                  emulate macOS sleep on a LAB_CLOCK=1 lab: SIGSTOP aterm, advance clock offset by SECS,
                                  hold --hold SECS, and SIGCONT (--at-act waits for first CONTINUED journal act)
@@ -343,23 +351,25 @@ usage: targo --unverified lab <command> [tag] [args]   (tag defaults to $LAB_TAG
   twin [tag] <claude-bin>|--crashing [ver]
                                  stage <claude-bin> (or a crashing stand-in) as a newer managed store build to wake live upgrade
   fleet-sim [--n N] [--runs R] [--keep] [--record]
-                                 run N (default 30, >=4) private headless aterms on loopback fleet ports and verify
-                                 `aterm ctl survey --fleet` across R runs under `ulimit -n 256` (--record writes docs/measured/)
+                                 run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
+                                 `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
+                                 a passing run's record goes to docs/measured/)
   scn list|run|show|agg ...      survey scenario runner (`scn run <scenario> [--n N] [--start K]`, `show <run>`, `agg [<scenario>]`)
   tape promote <results-run|dir|tape> [--as NAME] [--fewer] | tape lint [FILE|DIR...] | tape replay-jailed [FILE|DIR...] | tape rerecord NAME [--fewer]
                                  promote, scrub, lint, sandbox-replay, or rerecord harness tapes in crates/aterm-agent/tests/testdata/tapes/
   ctl [tag] <verb> ...           run raw `aterm ctl` against [tag]'s control socket
   protected HOME CCSOCKS         print owner paths denied by the jail as \"<kind> TAB <path>\" lines
   paths                          print LAB_STATE and resolved LAB_ATERM
-  down [tag]                     terminate all jailed processes for [tag], clean scratch/shared runtime state, and archive logs
+  down [tag] [--keep-dumps]      end everything in [tag]'s jail, remove its scratch and runtime state, and keep its logs
+                                 (--keep-dumps: its scratch dumps too)
 
 Outside any lab (no jail, no stub):
   instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--keep] [-- PROGRAM ARGS]
-                                 run a private aterm in a scratch HOME/XDG world and print its `--sock` path
-                                 (--window: open a real window; --band app|agent; --image PNG: capture one settled frame;
-                                 --pages cold: evict binary pages first to measure cold page-ins)
+                                 run a private aterm in a scratch HOME/XDG world, print its socket and hold it until
+                                 Ctrl-C (--window: a real window; --image PNG: capture one settled frame, run --post, and
+                                 end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   slot-capture [--watch DUR [--dir DIR]]
@@ -382,18 +392,21 @@ Outside any lab (no jail, no stub):
                                  OPENS A WINDOW (with --window): verify Option chords and dead keys across U.S., German, and French layouts (~1 min)
   predict-live --window|--headless [--aterm PATH] [--shell zsh|bash]... [--rtt MS]... [--mode on|off]...
                [--rounds N] [--no-split] [--out DIR]
-                                 verify predictive editing over a simulated RTT `link` in single and split panes
+                                 OPENS A WINDOW (with --window): verify predictive editing over a simulated RTT `link` in
+                                 single and split panes (defaults: both shells, 100 ms, both modes, 2 rounds)
   codex-alab-proof [--package DIR] [--upgrade-package DIR] [--aterm PATH] [--keep]
                    [--policy-only|--upgrade-only|--raw-upgrade-only]
-                                 end-to-end native harness proof on the real codex-alab package against a loopback fake model
-                                 (~11 min; --policy-only runs cybersecurity refusal; --upgrade-only checks one live handoff;
-                                  --raw-upgrade-only checks automatic crash repair then live handoff after starting
-                                  through the produced primary with its managed entry absent)
+                                 end-to-end native harness proof on the real codex-alab package against a loopback fake
+                                 model (~11 min; --policy-only: the cybersecurity-refusal leg alone; --upgrade-only: one
+                                 live handoff; --raw-upgrade-only: started through the produced primary with its managed
+                                 entry absent, automatic crash repair, then a live handoff)
   seamless --baseline PATH [--aterm PATH] [--runs N] [--keep]
-                                 OPENS A WINDOW, one at a time: one dev-seams instance across a real seamless update (QA seam), legs gap,
-                                 topics, gaptopic, redial, redial75, latch and hwkey; then present: N (default 4) fresh instances each of
-                                 the tested aterm and the baseline (built from 6B-6's tree), alternating, judged same-day (~1-2 min, plus
-                                 about 1 min a present run)
+                                 OPENS A WINDOW, one at a time: one instance of a debug or dev-seams aterm across a real
+                                 seamless update (ATERM_DEBUG_SEAMLESS_REEXEC=1, `update apply`), legs gap, topics,
+                                 gaptopic, redial, redial75, latch and hwkey; then present: N (default 4, at least 2)
+                                 fresh instances each of the tested and the baseline aterm, alternating, the tested
+                                 medians judged against the baseline runs (n_present inside their range,
+                                 present_p50/p95/p99_ms at most their highest) (~1-2 min, plus ~1 min a run)
   reduce <transcript|rollout> --program claude|codex [--out FILE]
                                  key-only transcript/rollout reducer for harness step fixtures (verifies reader equivalence before writing)
   ptyrec <log> -- <cmd> [args...]
@@ -402,13 +415,12 @@ Outside any lab (no jail, no stub):
                                  run <cmd> behind a PTY delaying chunks by RTT/2 each way (default 100 ms)
   mac dmg [--image REF] [--fda] [--keep]
                                  run dmg_acceptance benches inside a fresh SIP-enabled macOS tart VM (`mac help`)
-  linux up|down|status|exec|proof|clean|destroy
+  linux up|down|status|exec|proof|baseline|gone|cpu|a11y|edges|deck|browser|clean|destroy
                                  manage and run the Ubuntu 24.04 Lima VM runtime lane on aarch64 and Rosetta x86_64 (`linux help`)
   windows up|down|status|exec|smoke|window|destroy
                                  manage and run the Windows 11 arm64 QEMU VM runtime lane on aarch64 and Prism x86_64 (`windows help`)
 
-Exit: 0 pass, 1 finding (failed check), 2 usage, 3 could not run.
-Operator guide: `targo --unverified doc -p aterm-lab --open` (crates/aterm-lab/src/main.rs).
+Exit: 0 pass, 1 a finding or a refusal, 2 usage, 3 could not run, 128+N cut short by signal N (INT, TERM, HUP).
 ";
 
 /// Why a verb ended: a message for stderr (when there is one), its exit status, and the interrupt that cut it short (when one did).
@@ -583,13 +595,11 @@ fn dispatch(cmd: &str, args: &[String]) -> Res {
     }
 }
 
-/// Before anything is made: the owner's home must be known (the account's,
-/// or `HOME`'s), and the state dir must be quotable in a sandbox profile,
-/// must sit outside every home the jail guards (whose fence its runs'
-/// tapes could not get through: [`paths::Paths::need_state_outside`]), and,
-/// when it is the default one, is made this user's private directory
-/// ([`paths::Paths::need_state`], which every verb that makes something in
-/// the state dir goes through, one this check skips among them).
+/// Before anything is made: the owner's home must be known (the account's or
+/// `HOME`'s), and the state dir must sit outside every home the jail guards
+/// ([`paths::Paths::need_state_outside`]) and the owner's data, be quotable in
+/// a sandbox profile, and, when it is the default one, be this user's private
+/// directory ([`paths::Paths::need_state`]).
 #[cfg(target_os = "macos")]
 fn check_state_dir() -> Result<(), Fail> {
     let p = paths::paths();

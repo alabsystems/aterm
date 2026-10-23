@@ -47,7 +47,7 @@ pub const DONE_CHECK: &str = concat!(
      looking."
 );
 
-/// Retired done-check prompt from the 2026-10-19 wording.
+/// RETIRED: the done check of `4bff4848b4`.
 pub const DONE_CHECK_COMMITTED_BEFORE: &str = "Before you stop: do every open item, skipped \
      check, follow-up and next step, and verify it (build, test, measure where numbers were \
      asked for), then commit and push it (merged to main where this repository lands work). \
@@ -65,7 +65,7 @@ pub const DONE_CHECK_ORDINARY_BEFORE: &str = "Before you stop: do every open ite
      credential, a decision, physical access) or cannot be done on this host, each item named \
      with its blocker; a slow check is not a blocker. Otherwise continue.";
 
-/// RETIRED: the done check of `0b1abdabf3` (2026-10-19 12:24, "a job ends in words").
+/// RETIRED: the done check of `0b1abdabf3`.
 pub const DONE_CHECK_WORDS_BEFORE: &str = "Before you stop: do every open item, skipped check, \
      follow-up and next step you can still do yourself now, and verify it (build, test, measure \
      where numbers were asked for, commit and land where this repository lands work). Close \
@@ -94,7 +94,7 @@ pub const DONE_CHECK_OPEN_BEFORE: &str = "Before you stop: do every open item, s
 pub const DONE_CHECK_LAST_BEFORE: &str = "If the task is finished and verified, end your reply \
      with ATERM-TASK-DONE on a line by itself and stop; otherwise continue.";
 
-/// RETIRED: the done check's words from 2026-09-29 until the check asked for the token as the reply's LAST line.
+/// RETIRED: the done check's words from `3e34e2f6d` until the check asked for the token as the reply's LAST line.
 pub const DONE_CHECK_TOKEN_BEFORE: &str = "If the task is finished and verified, reply with \
      ATERM-TASK-DONE on a line by itself and stop; otherwise continue.";
 
@@ -103,7 +103,7 @@ pub const DONE_CHECK_NOTHING_OPEN_BEFORE: &str = "If the task is finished, verif
      nothing left open, reply with ATERM-TASK-DONE on a line by itself and stop; otherwise \
      continue with what is open.";
 
-/// RETIRED: the done check's words before 2026-09-29 (`3e34e2f6d`).
+/// RETIRED: the done check's words before `3e34e2f6d`.
 pub const DONE_CHECK_BEFORE: &str =
     "If the task is finished and verified, reply DONE and stop; otherwise continue.";
 
@@ -8031,7 +8031,7 @@ fn wake_words_open(reading: &TurnEndReading) -> bool {
         })
 }
 
-/// RETIRED WORDS.
+/// RETIRED: [`LAND`]'s words of `4bff4848b4`, as [`DONE_CHECK_COMMITTED_BEFORE`].
 pub const LAND_COMMITTED_BEFORE: &str = concat!(
     harness_mark!(),
     " Autopilot is set to Land: wrap up this work cleanly. Finish only the step in hand and \
@@ -8042,7 +8042,7 @@ pub const LAND_COMMITTED_BEFORE: &str = concat!(
      is done."
 );
 
-/// RETIRED: [`LAND`]'s words from `69a8f68178` until the owner's rule of 2026-10-19.
+/// RETIRED: [`LAND`]'s words from `69a8f68178` until `4bff4848b4`.
 pub const LAND_ORDINARY_BEFORE: &str = concat!(
     harness_mark!(),
     " Autopilot is set to Land: wrap up this work cleanly. Finish only the step in hand and \
@@ -8077,14 +8077,14 @@ pub const RETIRED_LANDS: [&str; 4] = [
     LAND_MARKER_BEFORE,
 ];
 
-/// RETIRED: [`LAND_NUDGE`]'s words from the owner's rule of 2026-10-19 until Autopilot Land, as [`LAND_COMMITTED_BEFORE`].
+/// RETIRED: [`LAND_NUDGE`]'s words of `4bff4848b4`, as [`LAND_COMMITTED_BEFORE`].
 pub const LAND_NUDGE_COMMITTED_BEFORE: &str = concat!(
     harness_mark!(),
     " Still landing: finish only what leaves the work clean, write down what is left in the \
      repository and commit it, then summarize whether the work is complete and what is done."
 );
 
-/// RETIRED: [`LAND_NUDGE`]'s words from `69a8f68178` until the owner's rule of 2026-10-19, as [`LAND_ORDINARY_BEFORE`].
+/// RETIRED: [`LAND_NUDGE`]'s words from `69a8f68178` until `4bff4848b4`, as [`LAND_ORDINARY_BEFORE`].
 pub const LAND_NUDGE_ORDINARY_BEFORE: &str = concat!(
     harness_mark!(),
     " Still landing: finish only what leaves the work clean, then summarize whether the work \
@@ -9637,6 +9637,10 @@ pub struct TurnEndReading {
     pub worked: Option<Duration>,
     pub worked_doubt: Duration,
     pub rules: Option<String>,
+    /// The `aterm:` fact the act typed here may carry ([`FACT_RIDES`],
+    /// [`crate::supervise::facts`]): the session's untold one, filled by the loop only at the
+    /// final pass of an act it rides, with `[harness] facts` on; `None` everywhere else.
+    pub fact: Option<crate::supervise::facts::Fact>,
     pub pending_input: bool,
     pub background: bool,
     pub interrupted: bool,
@@ -9934,6 +9938,7 @@ impl TurnEndReading {
                 less(w, asleep.least).saturating_sub(less(w, asleep.most))
             }),
             rules,
+            fact: None,
             pending_input: claude
                 && last_said_row(rows).is_some_and(|r| r.trim_start().starts_with('❯')),
             background: reading.phase == Phase::Busy
@@ -12100,6 +12105,30 @@ impl TurnEndState {
         }
     }
 
+    /// Whether an act under `rule` typed now would be typed IN A LIMIT'S PLACE ([`Self::acted`]
+    /// records it so): the done check, an answer or a land act while the track of a usage window
+    /// or a model bucket stands that no loop before this one only seeded.
+    #[must_use]
+    pub fn in_limits_place(&self, rule: &str) -> bool {
+        (rule == RULE_DONE_CHECK || is_answer_rule(rule) || is_land_rule(rule))
+            && self
+                .wall
+                .as_ref()
+                .is_some_and(|t| named_class(t.class) && !t.seeded)
+    }
+
+    /// THE FACT `fact` RODE THE ACT [`Self::acted`] LAST RECORDED ([`FACT_RIDES`]): the act's
+    /// own text, kept for a `/compact`'s continuation to type again, is kept without it, so a
+    /// fact told once never rides a retyped act.
+    pub fn fact_rode(&mut self, fact: &crate::supervise::facts::Fact) {
+        let suffix = fact_suffix(fact);
+        if let Some(text) = &mut self.cut_text
+            && let Some(kept) = text.strip_suffix(&suffix)
+        {
+            *text = kept.to_string();
+        }
+    }
+
     fn compact_owed_text(&self, rule: &str, rules: Option<&str>) -> Option<String> {
         let owes = self.compact_owes.filter(|_| rule == RULE_COMPACT)?;
         Some(self.cut_text.clone().unwrap_or_else(|| {
@@ -13138,7 +13167,7 @@ impl TurnEndState {
         self.seed_answered = false;
         let met = self.awaiting.is_some_and(|a| a.met);
         // The door's line, where no act was awaited before it: its answer is judged as the line's
-        // ([`HostTurn::Fact`]); with one, as that act's (the red-team's F12).
+        // ([`HostTurn::Fact`]); with one, as that act's.
         let fact = self.fact.take();
         let host = self
             .awaiting
@@ -14073,12 +14102,7 @@ impl TurnEndState {
         self.account_startup = false;
         self.account_resume = false;
         self.reset_resume = None;
-        let in_limits_place =
-            (rule == RULE_DONE_CHECK || is_answer_rule(rule) || is_land_rule(rule))
-                && self
-                    .wall
-                    .as_ref()
-                    .is_some_and(|t| named_class(t.class) && !t.seeded);
+        let in_limits_place = self.in_limits_place(rule);
         if (rule == RULE_LIMIT_RESUME || in_limits_place)
             && let Some(AccountAdvice::Resume { cleared_at }) = reading.advised()
         {
@@ -15148,6 +15172,77 @@ fn fit_units(s: &str, room: usize) -> Cow<'_, str> {
 
 const RULES_OPEN: &str = " (standing rules: ";
 
+/// THE ACTS AN `aterm:` FACT RIDES ([`crate::supervise::facts`]; system awareness §14.4): prompts
+/// this policy types anyway, in its own words — the continuation, the done check, Land's
+/// instruction and its nudge. Never an answer (a fact beside it could steer the choice), a
+/// wall's retry or an act typed in a limit's place ([`TurnEndState::in_limits_place`]), an
+/// accepted suggestion (the vendor's words), the person's draft, a command, or a line of the
+/// upgrade's or a relaunch's.
+pub const FACT_RIDES: [&str; 4] = [RULE_CONTINUE, RULE_DONE_CHECK, RULE_LAND, RULE_LAND_NUDGE];
+
+/// How a fact opens after the text it rides and its standing rules.
+const FACT_OPEN: &str = " (aterm: ";
+
+/// The words a fact adds to the act it rides: ` (aterm: {text})`.
+#[must_use]
+pub fn fact_suffix(fact: &crate::supervise::facts::Fact) -> String {
+    format!("{FACT_OPEN}{})", fact.text)
+}
+
+/// Whether `action` is an act a fact may ride in `state` ([`FACT_RIDES`]).
+#[must_use]
+pub fn fact_may_ride(state: &TurnEndState, action: &TurnEndAction) -> bool {
+    matches!(action, TurnEndAction::Type { rule_id, .. }
+        if FACT_RIDES.contains(rule_id) && !state.in_limits_place(rule_id))
+}
+
+/// Whether `action` carries `fact` ([`fact_rides`]): the act whose taking tells it.
+#[must_use]
+pub fn carries_fact(action: &TurnEndAction, fact: &crate::supervise::facts::Fact) -> bool {
+    matches!(action, TurnEndAction::Type { text, rule_id }
+        if FACT_RIDES.contains(rule_id) && text.ends_with(&fact_suffix(fact)))
+}
+
+/// `action` with `fact` after its text and standing rules, where it is an act the fact rides
+/// ([`fact_may_ride`]) and the whole still fits [`VERBATIM_UNITS`]. ALL OR NOTHING: a fact that
+/// does not fit is left off whole (the rules are never cut further for it, and the fact is never
+/// cut) and stays untold for a later act.
+fn fact_rides(
+    state: &TurnEndState,
+    action: TurnEndAction,
+    fact: Option<&crate::supervise::facts::Fact>,
+    trace: &mut dyn Trace,
+) -> TurnEndAction {
+    let Some(fact) = fact.filter(|_| fact_may_ride(state, &action)) else {
+        return action;
+    };
+    let TurnEndAction::Type { text, rule_id } = action else {
+        return action;
+    };
+    let said = format!("{text}{}", fact_suffix(fact));
+    if said.encode_utf16().count() > VERBATIM_UNITS {
+        note(trace, "fact", Some(rule_id), || {
+            Outcome::Unproven(format!(
+                "{} {:016x} would pass {VERBATIM_UNITS} units: typed without it",
+                fact.key.kind.word(),
+                fact.key.id
+            ))
+        });
+        return TurnEndAction::Type { text, rule_id };
+    }
+    note(trace, "fact", Some(rule_id), || {
+        Outcome::Decided(format!(
+            "{} {:016x} rides",
+            fact.key.kind.word(),
+            fact.key.id
+        ))
+    });
+    TurnEndAction::Type {
+        text: said,
+        rule_id,
+    }
+}
+
 fn later(at: Instant, d: Duration) -> Instant {
     at.checked_add(d).unwrap_or(at)
 }
@@ -15171,8 +15266,24 @@ fn ended_at(trace: &mut dyn Trace, check: &'static str, action: TurnEndAction) -
 }
 
 /// [`decide_turn_end`], each check it consults written to `trace` as it is consulted ([`super::trace`]).
+/// The reading's fact rides the act decided last ([`fact_rides`]), once.
 #[must_use]
 pub fn decide_turn_end_traced(
+    state: &TurnEndState,
+    reading: &TurnEndReading,
+    cfg: &SupervisorConfig,
+    now: Instant,
+    trace: &mut dyn Trace,
+) -> TurnEndAction {
+    let action = decide_unridden(state, reading, cfg, now, trace);
+    // `[harness] facts = false` limits wherever the policy decides, a shadow's candidate too.
+    let fact = reading.fact.as_ref().filter(|_| cfg.facts);
+    fact_rides(state, action, fact, trace)
+}
+
+/// [`decide_turn_end_traced`] before the reading's fact rides the act: the readings it decides
+/// again on come back here, so a fact rides once.
+fn decide_unridden(
     state: &TurnEndState,
     reading: &TurnEndReading,
     cfg: &SupervisorConfig,
@@ -15193,7 +15304,7 @@ pub fn decide_turn_end_traced(
             ..reading.clone()
         };
         note(trace, "login-left", None, || Outcome::Passed);
-        return decide_turn_end_traced(state, &plain, cfg, now, trace);
+        return decide_unridden(state, &plain, cfg, now, trace);
     }
     if state.bucket_left(reading) {
         let plain = TurnEndReading {
@@ -15202,7 +15313,7 @@ pub fn decide_turn_end_traced(
             ..reading.clone()
         };
         note(trace, "bucket-left", None, || Outcome::Passed);
-        return decide_turn_end_traced(state, &plain, cfg, now, trace);
+        return decide_unridden(state, &plain, cfg, now, trace);
     }
     if reading.upgrading {
         match reading.wall {
@@ -15217,7 +15328,7 @@ pub fn decide_turn_end_traced(
                     ..reading.clone()
                 };
                 note(trace, "upgrading", None, || Outcome::Passed);
-                return decide_turn_end_traced(state, &unrestartable, cfg, now, trace);
+                return decide_unridden(state, &unrestartable, cfg, now, trace);
             }
             Some(_) => {}
         }

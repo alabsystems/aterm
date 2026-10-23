@@ -188,10 +188,17 @@ impl Guards {
     /// The first guard that holds a line of `rule`, or `None`.
     #[must_use]
     pub fn held(&self, rule: RuleId) -> Option<Guard> {
+        self.held_for(rule.into())
+    }
+
+    /// The first guard that holds `line` ([`super::door::BreakLine`]: a rule's, or the stuck
+    /// fact's), or `None`.
+    #[must_use]
+    pub fn held_for(&self, line: super::door::BreakLine) -> Option<Guard> {
         if let Some(brake) = self.brake {
             return Some(brake);
         }
-        self.each(rule)
+        self.each_for(line)
             .into_iter()
             .find_map(|(guard, holds)| holds.then_some(guard))
     }
@@ -200,6 +207,12 @@ impl Guards {
     /// `rule`: what `occupancy why`'s guards line marks (design §6).
     #[must_use]
     pub fn each(&self, rule: RuleId) -> [(Guard, bool); 9] {
+        self.each_for(rule.into())
+    }
+
+    /// [`Self::each`] for any line at a break.
+    #[must_use]
+    pub fn each_for(&self, line: super::door::BreakLine) -> [(Guard, bool); 9] {
         [
             (Guard::Person, self.person),
             (Guard::Halted, self.halted),
@@ -209,7 +222,7 @@ impl Guards {
             (Guard::Managed, self.managed),
             (Guard::Memory, self.memory),
             (Guard::Reach, self.reach_down),
-            (Guard::Autopilot, !modes(rule).contains(&self.mode)),
+            (Guard::Autopilot, !line.modes().contains(&self.mode)),
         ]
     }
 }
@@ -276,6 +289,12 @@ impl Books {
                 }
             }
         }
+        self.last_ms = Some(self.last_ms.map_or(at_ms, |last| last.max(at_ms)));
+    }
+
+    /// A line that is no rule's went at `at_ms` (the stuck fact's, §2.1's rank 4): it counts
+    /// toward the session's pace alone.
+    pub fn lined(&mut self, at_ms: i64) {
         self.last_ms = Some(self.last_ms.map_or(at_ms, |last| last.max(at_ms)));
     }
 
@@ -449,6 +468,12 @@ fn spent(rule: RuleId, books: &Books, now_ms: i64) -> bool {
         RuleId::WaitNudge => books.nudges_today(now_ms) >= NUDGES_PER_DAY,
         RuleId::HoldRoom => books.rooms.len() >= HOLD_ROOM_PER_HOLD,
     }
+}
+
+/// When the session's pace next lets a line go, if after `now_ms`; every door's lines share it ([`super::door::stuck_at_break`]).
+#[must_use]
+pub fn pace_next(books: &Books, now_ms: i64) -> Option<i64> {
+    paced(books, now_ms, false)
 }
 
 fn paced(books: &Books, now_ms: i64, due_seen: bool) -> Option<i64> {

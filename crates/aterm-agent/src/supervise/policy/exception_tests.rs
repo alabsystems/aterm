@@ -46,6 +46,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         screen_mark: None,
         worked: Some(3 * MIN),
         rules: None,
+        fact: None,
         pending_input: false,
         interrupted: false,
         restartable: true,
@@ -134,10 +135,9 @@ fn typed_login(t: Instant) -> TurnEndState {
     st
 }
 
-/// THE NOTICE SAYS WHAT THE POINT DECIDES (the review of 2026-10-19:
-/// claims-login-ran, F5, F3''): a lost login's notice is chosen with the
-/// point's own decision, so none says `/login` ran, or that a browser
-/// opened, where nothing was typed.
+/// THE NOTICE SAYS WHAT THE POINT DECIDES: a lost login's notice is chosen with
+/// the point's own decision, so none says `/login` ran, or that a browser opened,
+/// where nothing was typed.
 #[test]
 fn a_lost_logins_notice_is_what_the_point_decides() {
     let t = t0();
@@ -228,7 +228,7 @@ fn a_lost_logins_notice_is_what_the_point_decides() {
     not_run(&mut st, &met, &budget, notice::WHY_BUDGET);
 }
 
-/// THE SIGN-IN IS TOLD WHERE IT IS THE OWNER'S (F6, LW-2, LW-4): the browser
+/// THE SIGN-IN IS TOLD WHERE IT IS THE OWNER'S: the browser
 /// hand-off of the `/login` aterm typed is the one step only they can take,
 /// named for the roster row the session's login is; the picker aterm answers
 /// is aterm's, one it does not answer the owner's; a `/login` left or stopped
@@ -331,12 +331,11 @@ fn the_sign_in_is_told_where_it_is_the_owners() {
     );
 }
 
-/// A PERSON'S OWN `/login` (the review's F2, F3', voluntary-login-false-alarm,
-/// LW-3): on a working session it is no lost login — nothing told, its picker
-/// theirs; at a lost login they are going through it — nothing told — and
-/// one they left is told as theirs (`login-left`, never "aterm ran /login"),
-/// with no `/login` of aterm's after it, their next prompt answered by the
-/// wall again included.
+/// A PERSON'S OWN `/login`: on a working session it is no lost login —
+/// nothing told, its picker theirs; at a lost login they are going through
+/// it — nothing told — and one they left is told as theirs (`login-left`,
+/// never "aterm ran /login"), with no `/login` of aterm's after it, their
+/// next prompt answered by the wall again included.
 #[test]
 fn a_persons_own_login_is_theirs() {
     use aterm_phase::prompt::fixtures::{

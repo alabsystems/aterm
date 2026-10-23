@@ -1,24 +1,26 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-verify: spec recovery from its 280 unit tests
+# aterm-verify: the specs its tests stand for
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 227 tests
-> it deleted and 33 specs whose functions it deleted are gone, and the spec rows no longer cite
-> those tests. Counts elsewhere in this file were taken before.
+> Status: this is the crate's migration worklist (`docs/PLAN-tests-to-specs-2026-10-15.md`). Each
+> spec below is to be proved through Trust/Clean against the compiled Rust function, and the tests
+> it subsumes then deleted; none is proved yet. A test no map row names has no spec recovered yet.
 
-> Status: this is the crate's migration worklist. Each spec below is to be proved through
-> Trust/Clean against the compiled Rust function, and the tests it subsumes then deleted; none is
-> proved yet. The rows name the code and the tests as they stand; the counts in the next paragraph
-> and in §3 are those of the reading that produced the list.
+The statements come from reading the code, not from running it. Re-read the functions a row names
+before proving it. These rows name functions the crate no longer has:
+`exec-ceiling-diagnostic` and `libtest-note` (`libtest::note`), `exec-group-ceiling-kill`
+(`exec::group::KILL_ROUNDS`), `exec-group-leader-safety` (`exec::reap`, `exec::group::Live::reap`),
+`ladder-stage-load` (`ladder::StageLoad`), `smoke-effect-lane-verdict`
+(`smoke_stages::effect_lane_verdict`), `smoke-lane-latency` (`smoke_stages::lane_latency`,
+`smoke_stages::lane_comparison`), `lib-run-streaming` (`report::json_check`, `report::json_summary`),
+`stages-driven-binary-handoff` (`stages::sealed_lane_cmd`, `stages::codex_live_upgrade_cmd`) and
+`libtest-ansi-invariance` (`libtest::scan`, `libtest::timed_verdicts`).
 
-Source: `crates/aterm-verify` (read only). Every `#[test]` was read, together with the code it reaches:
-(src/changed.rs 38, src/checks.rs 3, src/cli.rs 8, src/exec.rs 44, src/findings.rs 6, src/first_exec.rs 2, src/glob.rs 6, src/ladder.rs 7, src/lib.rs 7, src/libtest.rs 26, src/plan.rs 7, src/report.rs 4, src/sched.rs 10, src/scope.rs 4, src/smoke.rs 9, src/smoke_stages.rs 21, src/stages.rs 39, src/testrun.rs 17, tests/gate_contract.rs 22 = 280).
-A naive `grep '#[test]'` counts 281: the extra hit is a doc comment in `src/stages.rs` (~line 497,
-"every `#[test]` body runs off the main thread"), not a test. Nothing was compiled or run; the claims below
-come from reading the code. Paths in this file are relative to `crates/aterm-verify/` unless they start with `crates/`.
+Paths in this file are relative to `crates/aterm-verify/` unless they start with `crates/`.
 
-Result: **116 specs**, covering **279 tests**. **1 test is not a spec sample** (§4).
+Result: **95 specs**, covering **102 tests**. The perf lanes, the cells reader and the wasm glue
+have their own part at the end.
 
 ## 0. Notation used in the statements
 
@@ -32,7 +34,7 @@ Result: **116 specs**, covering **279 tests**. **1 test is not a spec sample** (
 - `Run{ok, output, code, spawn_error}`. `EnvFail(r)` = `Run::environment_failure(r)`.
 - Outcome tags: `Ok`, `Skip`, `GF` = `Fail(GateFailed)`, `CNR` = `Fail(CouldNotRun)`.
 - POSIX process model: a child started by `exec::run` leads its own process group. "Group" means that group's members; "leader reaped" means `waitpid` has collected the leader. Signals act as POSIX specifies.
-- `DEV`, `RELEASE`, `CHECKS`, `BUILDS_BESIDE_TESTS`, `WEDGED`, `OBJC_DRIVES` are the crate's constant tables of those names.
+- `DEV`, `RELEASE`, `CHECKS`, `OBJC_DRIVES` are the crate's constant tables of those names.
 
 **Blocking gaps** are the row numbers of the gap table in `docs/AUDIT-trust-for-test-migration-2026-10-15.md` §7.
 Gap 0 (the installed seal publishes no Lean-discharged row) is a prerequisite for every spec, so every row lists it;
@@ -68,7 +70,7 @@ exec-group-ceiling-kill	refinement	exec::kill_and_reap, exec::group::Live::kill,
 exec-interrupt-handler	refinement	exec::group::kill_on_interrupt, exec::group::Spawning, exec::group::stopping, exec::finish	For every gate process that has installed kill_on_interrupt and receives SIGINT, SIGTERM or SIGHUP s1: (a) stopping() becomes true before any signal is sent, and every later spawn is refused (no child starts, and the in-flight count returns to 0). (b) The handler waits, with a bound, for spawns already in flight. It then sends each live graced group exactly ONE SIGTERM and SIGKILLs every other live group. (c) It waits ≤ TERM_GRACE for the graced groups to empty, or less: it stops when they are empty or when a second distinct interrupt s2 arrives. A SIGHUP that follows a SIGHUP is not a second interrupt. It then SIGKILLs everything it sent SIGTERM, survivors that left the live list included, with repeated kill rounds bounded as in exec-group-ceiling-kill. (d) It restores SIG_DFL and re-raises the last signal, so the gate dies of it within a bounded time, even when a group never empties or the signal landed on the spawning thread. (e) A child caught mid-spawn is killed once it reaches the live list. After death, no member of any stage group is alive.	src/exec.rs::an_interrupted_gate_kills_every_live_stage_group	0,8,10,13	unsafe signal handler restricted to async-signal-safe atomics, killpg, nanosleep, raise; static atomics shared between threads; needs a concurrent ty_model! of handler × spawner × reaper
 exec-group-leader-safety	invariant	exec::group::Live, exec::reap, exec::group::Live::reap	Invariant over every execution: a group signal (killpg, including the 'anyone there?' probe) is sent to group g only while g's leader is a child of the gate that has not been reaped, so the pgid cannot have been recycled. Corollaries: (a) the wait that detects an exit uses WNOWAIT and does not reap. A stopped child (SIGTTIN/SIGSTOP) is not an exit, whether it is asked once or waited for. (b) Once Live has reaped, term/kill/alive/gone send nothing and answer from state. (c) A leader that an interrupted gate may have read off the live list is never reaped by the stage, whose group left the list before stopping was read.	-	0,2,8,10,13	FFI waitid with WNOWAIT/WEXITED, a state machine in a struct with &mut self, atomics shared with the handler
 findings-test-findings	contract	findings::test_findings, findings::rerun_env, findings::test_message, findings::row_finding	For every label, output and env, with plain = Strip(output): if plain contains CEILING_KILL or libtest::failed_tests(plain) = None, then test_findings = [row_finding(label, output)], with id = one_line(label), rerun = None and message = excerpt(output, 12). Otherwise it is the list, in order over the failed tests t, of Finding{id = one_line(t.spec ++ " -- " ++ t.name), rerun = Some(concat(k ++ "=" ++ shell_word(v) ++ " " for (k, v) ∈ env) ++ "targo --unverified test " ++ t.spec ++ " -- " ++ shell_word(t.name) ++ " --exact"), message = test_message(t.block)}, except that when some t carry the sentinel (t.refused) and some do not, the refused ones are left out of the list and returned beside it by split_test_findings, their names sorted and deduplicated (a log whose every failure is refused leaves nothing out: it fails closed). test_message drops blank lines, `note: run with RUST_BACKTRACE` lines and the frames after a `stack backtrace:` line, and keeps at most 12 lines. rerun_env(cmd, n) = [(k, v) ∈ cmd.envs | k ∉ {CARGO_TARGET_DIR, CARGO_BUILD_JOBS, RUSTDOC, ATERM_VERIFY_DOC_DRIVER, ATERM_VERIFY_DOC_SKIP, RUST_TEST_THREADS}] ++ (n = Some(m) ? [(RUST_TEST_THREADS, m)] : []).	src/findings.rs::a_failed_test_is_its_own_finding_with_the_command_that_reruns_it, src/findings.rs::a_log_that_cannot_account_for_its_failures_is_one_row_finding, src/findings.rs::a_rerun_sets_what_the_test_child_ran_under, src/findings.rs::a_refusal_beside_a_failure_is_no_finding	0,1,3,4,5,7	Cow<str>, OsString lossy, Vec map/collect, calls into libtest
-findings-shell-word-roundtrip	round-trip	findings::shell_word, libtest::shell_word	For every string s: Sh(shell_word(s)) = [s], so a shell reads the word back as exactly s, with no split and no expansion. shell_word(s) = s when s ≠ "" and every char is in its safe set. Otherwise it is s single-quoted, with each ' written as '\''. The same holds for libtest::shell_word over its own safe set.	-	0,1,3,5,7	char predicate all, replace, format!; needs a Lean model of POSIX quote removal
+findings-shell-word-roundtrip	round-trip	findings::shell_word	For every string s: Sh(shell_word(s)) = [s], so a shell reads the word back as exactly s, with no split and no expansion. shell_word(s) = s when s ≠ "" and every char is in its safe set. Otherwise it is s single-quoted, with each ' written as '\''.	-	0,1,3,5,7	char predicate all, replace, format!; needs a Lean model of POSIX quote removal
 findings-excerpt	contract	findings::excerpt, findings::is_error, findings::is_progress, findings::is_banner	For every output o and max m, let L = the lines of Strip(o) that are non-blank, not progress (trimmed start = PROGRESS_VERB ++ ' ' ...) and not lane banners. Let pick(hit) scan L in order and stop once |picked| ≥ m (counted with duplicates). For each i with hit(L[i]) whose key (trim(L[i]), trim(L[i+1])) has not been seen, it adds [i−2, i+2] ∩ [0, |L|). The result is then sorted, deduplicated and truncated to m. excerpt(o, m) = L at pick(is_error) if that is non-empty; else L at pick(starts_with "warning:") if that is non-empty; else the last min(m, |L|) lines of L. The result has length ≤ m, and an error repeated word for word with the same next line is shown once.	src/findings.rs::an_excerpt_is_the_errors_first_never_the_progress	0,1,3,5,7,13	closure over &dyn Fn, Vec<(&str, Option<&str>)> seen set, sort_unstable/dedup/truncate, saturating_sub
 ladder-render	contract	ladder::Report::render, ladder::Outcome::tag, ladder::Report::raw	For every report r: render(r) = "\n=== " ++ r.title ++ " ===\n" ++ concat over r.entries of (Ladder{o, l} ↦ tag(o) ++ l ++ "\n"; Raw(t) ↦ t ++ "\n"). tag maps Ok/Skip/GF/CNR to "  ok    "/"  skip  "/"  FAIL  "/"  NOT RUN ". raw(t) pushes Raw(t with trailing '\n's removed) only when that is non-empty.	-	0,1,2,3,5	&mut self push, String building over a Vec of enums
 ladder-tally	contract	ladder::tally, ladder::Tally::record, ladder::Tally::failed, ladder::Report::outcomes	For every list of reports rs: tally(rs).skips = [l | (Skip, l) ∈ concat(outcomes(r) for r ∈ rs)], in order. gate_failures and could_not_run are the same filter for GF and CNR. Raw entries contribute nothing. failed() ⇔ gate_failures ≠ [] ∨ could_not_run ≠ []. skipped() = |skips|.	src/ladder.rs::every_skip_is_counted_and_named	0,1,2,3,5,7	iterator filter_map over enum entries, &mut self
@@ -147,10 +149,9 @@ changed-parse-graph	contract	changed::parse_graph_entries, changed::parse_graph_
 changed-resolve-fail-wide	contract	changed::resolve	For every root, tools, path and base: ¬tools.have_targo() ⇒ resolve(...) = Widened("targo is absent, so the dependency graph cannot be read"), before any git or targo call. Any Err from changed_paths or with_shared_inputs is returned as Widened(that reason). Otherwise the result is select over the fetched inputs.	-	0,4,8	early return on a Toolchain predicate, Result→enum mapping, subprocesses
 ```
 
-## 2. Test → spec map (TSV; all 280)
+## 2. Test → spec map (TSV)
 
-`primary` is the spec that retires the test. `also` lists other specs the same test samples. `-` marks the one
-test that samples no spec (§4).
+`primary` is the spec that retires the test. `also` lists other specs the same test samples.
 
 ```tsv
 file	test	primary	also
@@ -217,7 +218,7 @@ src/smoke_stages.rs	an_unparsable_hardware_reply_fails_closed	smoke-hardware-key
 src/smoke_stages.rs	the_sandbox_is_private_and_short_enough_for_a_unix_socket	smoke-sandbox-lifecycle	smoke-socket-path-bound
 src/stages.rs	a_callers_cargo_build_jobs_is_a_ceiling_for_the_side_lanes	stages-lane-placement	
 src/stages.rs	a_machine_with_no_doc_driver_anywhere_is_diagnosed_on_the_doctests_row	stages-run-stage-preconditions	stages-doc-driver, changed-lib-target
-src/stages.rs	a_measuring_child_requires_complete_decided_matrices	stages-measuring-decision
+src/stages.rs	a_measuring_child_requires_complete_decided_matrices	stages-measuring-decision	
 src/stages.rs	a_redraw_gate_that_could_not_run_is_never_a_pass_and_never_a_skip	stages-exit-code-tables	
 src/stages.rs	an_empty_change_selection_compiles_nothing_in_any_of_those_stages	stages-run-stage-preconditions	
 src/stages.rs	compile_only_children_yield_and_children_that_run_code_do_not	stages-demotion-policy	
@@ -260,25 +261,19 @@ tests/gate_contract.rs	the_test_binaries_run_as_cargo_recorded_them_two_at_a_tim
 
 ## 3. Coverage
 
-- 280 tests read. 279 map to one of the 116 specs; 1 is not a spec sample (§4).
-- The biggest collapses: `changed-select` (12), `exec-interrupt-handler` (11), `smoke-hardware-key-verdict` (10), `stages-exit-code-tables` (10), `exec-run-process` (9), `libtest-scan` (9), `exec-group-ceiling-kill` (8), `stages-argv-builders` (7).
-- 22 of the tests are the end-to-end `tests/gate_contract.rs` suite. Each is mapped to the spec whose end-to-end clause it samples; it retires only once that clause (usually gap 8) is proved, not with the pure core.
-- Gap histogram (gap → specs it blocks): 0 (stale installed seal) → 116, 1 (non-scalar carriers) → 93, 2 (&self/&mut self views) → 20, 3 (E6 body widening) → 93, 4 (callee-ensures composition) → 40, 5 (quantified clauses) → 72, 6 (plain-Rust clause publication) → 1, 7 (loops) → 52, 8 (effects) → 35, 10 (model→code refinement) → 4, 11 (generics) → 4, 12 (cross-crate citation) → 1, 13 (threads/closures/higher-order) → 22.
+- The map holds 102 tests, each the primary sample of one of the 95 specs; 36 specs are the primary of no mapped test.
+- The biggest collapses: `smoke-hardware-key-verdict` (7), `stages-exit-code-tables` (6), `stages-run-stage-preconditions` (5), `findings-test-findings` (4), `stages-doctest-split` (4).
+- 10 of the tests are the end-to-end `tests/gate_contract.rs` suite. Each is mapped to the spec whose end-to-end clause it samples; it retires only once that clause (usually gap 8) is proved, not with the pure core.
+- Gap histogram (gap → specs it blocks): 0 (stale installed seal) → 95, 1 (non-scalar carriers) → 75, 2 (&self/&mut self views) → 16, 3 (E6 body widening) → 74, 4 (callee-ensures composition) → 34, 5 (quantified clauses) → 56, 6 (plain-Rust clause publication) → 1, 7 (loops) → 39, 8 (effects) → 30, 10 (model→code refinement) → 4, 11 (generics) → 4, 12 (cross-crate citation) → 1, 13 (threads/closures/higher-order) → 17.
 
 ## 4. Tests that are not spec samples
 
-| test | why | recommendation |
-|---|---|---|
-
-No test is a pure regression of a removed bug with no general property; every regression-shaped test found is an
-instance of one of the specs above.
+None: every test the map holds samples a spec, the regression-shaped ones included.
 
 ## 5. Implied specs that look wrong, or disagree with the code
 
 1. **`testrun-record-codec`: the test's doc overclaims.** `testrun.rs::a_record_round_trips_and_a_torn_one_is_refused` says "anything that is not a whole record is refused rather than read short". That is false: `Record::decode` accepts any prefix of `encode(r)` that ends exactly at a token-group boundary, so dropping the last whole `env\0K\0V\0` triple decodes to a SHORTER valid record. The test only samples cuts 1 and 3 bytes from the end, both mid-token. The true spec is canonicity (`decode(b) = Some(r) ⇒ encode(r) = b`), as stated in §1. **Action:** to make torn files refusable, add an end marker or a length to the format, then strengthen the spec to `decode(b) = Some(r) ⇒ b = encode(r)` for whole files only.
 2. **`cli-parse-values`: `-p=X` is not accepted.** The implied spec "every spelling of `-p` is accepted" fails for `-p=X`. Inline values are split only for flags that start with `--`, so `-p=aterm-grid` falls into the `-pX` arm and selects a package literally named `=aterm-grid`. cargo and clap accept `-p=X`. No test covers it. **Action:** strip a leading `=` in the `-pX` arm (the safe, cargo-compatible fix), then state (a) with `-p=X` included.
-3. **`stages-gated-features`: one assertion tests the tree, not the function.** The last assertion of `stages.rs::the_gated_features_are_read_from_the_manifests`, `gated_lint_features(<the real repo>) ≠ []`, checks a fact about the current checkout (via `CARGO_MANIFEST_DIR/../..`). It goes red if the repo stops having gated targets. **Action:** drop that assertion when the test is retired; it is not part of the spec.
-4. **Metadata.** The wave-2 chunk file counts 281 tests for aterm-verify; there are 280 `#[test]` attributes. The 281st is the doc-comment hit in `src/stages.rs` (~line 497).
 
 ## 6. Proof order (easiest high-value first)
 
@@ -288,32 +283,20 @@ No spec is blocked by gap 0 alone, so the order prefers the fewest and cheapest 
 2. **`smoke-reads-locked`** (0, 1). One `str::contains`; it is the smallest exercise of the gap-1 `&str` carrier.
 3. **The table properties by evaluation**: `checks-table-wellformed`, `plan-lane-dir` (0, 1, 3). Finite constant tables or a single enum match; each is decided by evaluating the table. `plan-declared-shape` (adds 4) follows once `sched::awaited` has a contract.
 4. **`exec-parse-ceiling`** (0, 1, 3, 5, 6). Pure, straight-line, and it carries a real no-panic obligation (`Duration::from_secs_f64` outside its range), so it is the first proof that would catch a bug rather than restate a table.
-5. **`scope-args-label` → `stages-argv-builders`** (1, 3, 5 then 4). The scope lemma is a simple enum/`Vec` proof; composing it (gap 4) retires the 7 argv tests and the end-to-end narrowing test.
-6. **`smoke-hardware-key-verdict`** (1, 3, 4, 5, 13) and **`stages-exit-code-tables`** (1, 3, 4, 5): 10 tests each, pure verdict functions over parsed fields or `(code, transcript)`; they need `smoke-metric-u64`/`smoke-metric-ms-whole` first.
-7. **`changed-owning-member` → `changed-seeds` → `changed-select` → `changed-cone-scope`** (1, 3, 4, 5, 7, 13): 22 tests together; `select` takes `&dyn Fn` and so waits on gap 13's higher-order specs.
-8. **`libtest-ansi-invariance`, then `libtest-scan`, `libtest-environment-refusals`, `libtest-failed-tests`** (1, 3, 5, 7): line state machines over `&str`; together with `findings-*` and `ladder-*` (adds 2, 4) they make every failure-itemization test free.
+5. **`scope-args-label` → `stages-argv-builders`** (1, 3, 5 then 4). The scope lemma is a simple enum/`Vec` proof; composing it (gap 4) retires the 3 argv tests, the end-to-end narrowing test among them.
+6. **`smoke-hardware-key-verdict`** (1, 3, 4, 5, 13) and **`stages-exit-code-tables`** (1, 3, 4, 5): 7 and 6 tests, pure verdict functions over parsed fields or `(code, transcript)`; they need `smoke-metric-u64`/`smoke-metric-ms-whole` first.
+7. **`changed-owning-member` → `changed-seeds` → `changed-select` → `changed-cone-scope`** (1, 3, 4, 5, 7, 13): `select` takes `&dyn Fn` and so waits on gap 13's higher-order specs.
+8. **`libtest-ansi-invariance`, then `libtest-environment-refusals`, `libtest-failed-tests`** (1, 3, 5, 7): line state machines over `&str`; together with `findings-*` and `ladder-*` (adds 2, 4) they make every failure-itemization test free.
 9. **`sched-no-deadlock` and `sched-check-waits`** (1, 3, 5, 7): a well-founded induction on the lowest unfinished index (Lean, over a model of `ready`/`awaited`); then `plan-selection` (adds 4). `sched-safety` and `sched-maximal-concurrency`'s liveness half wait on gaps 10 and 13.
-10. **Effectful last** (gap 8, often 10 and 13): `exec-run-process`, `exec-group-ceiling-kill`, `exec-interrupt-handler`, `exec-group-leader-safety`, `testrun-pool`, `testrun-run-tests`, `changed-paths-git`, and the end-to-end `tests/gate_contract.rs` clauses. These retire 40-odd process tests but need the platform model and concurrent `ty_model!` refinement; the pure cores above should already be proved when they start.
+10. **Effectful last** (gap 8, often 10 and 13): `exec-run-process`, `exec-group-ceiling-kill`, `exec-interrupt-handler`, `exec-group-leader-safety`, `testrun-pool`, `testrun-run-tests`, `changed-paths-git`, and the end-to-end `tests/gate_contract.rs` clauses. These retire the process tests but need the platform model and concurrent `ty_model!` refinement; the pure cores above should already be proved when they start.
 
-## Folded in: xtask — the perf lanes, the cells reader and the perf driver
+## The perf lanes, the cells reader and the perf driver
 
-> These specs were recovered from `crates/xtask`, which this crate absorbed. Their functions
-> and tests are under `crates/aterm-verify` (`src/perf`, `src/cells.rs`, `src/wasm_glue`,
-> `tests/arena_interrupt.rs`), and the rows name them there. The xtask `gate` and `driver`
-> modules the reading also covered are gone: the cells reader is `src/cells.rs`, the perf
-> lanes' driver `src/perf/driver.rs`, and the specs whose functions went with them are gone
-> too. Each spec is proved through Trust/Clean about the compiled Rust functions, and then
-> the tests it subsumes are deleted; nothing is proved yet. The counts in the next two
-> paragraphs and in §3 are the reading's.
+> These specs cover `src/perf`, `src/cells.rs`, `src/wasm_glue` and `tests/arena_interrupt.rs`.
+> Each is to be proved through Trust/Clean about the compiled Rust functions, and the tests it
+> subsumes then deleted; none is proved yet.
 
-Source: `crates/xtask` (read only). I read every `#[test]` in src/driver.rs 6, src/gate.rs 48
-(4 in `cell_cache_root_tests`, 44 in `tests`), src/perf/mod.rs 6, src/perf/stats.rs 5,
-src/perf/floors.rs 13, src/perf/trend.rs 19, src/perf/wasm.rs 3, src/perf/arena/{mod.rs 8,
-live.rs 1, cat.rs 3, scroll.rs 2, vte.rs 3, start.rs 15, compare.rs 12} and tests/arena_interrupt.rs 1.
-That is 145 tests. src/perf/arena/inner.rs has none. The chunk metadata said 142; a direct count gives
-145. Nothing was compiled or run. The claims below come from reading the code.
-
-Result: **89 specs**, covering **142 tests**. **3 tests are not spec samples** (§4).
+Result: **60 specs**, covering **100 tests**.
 
 ### 0. Notation used in the statements
 
@@ -328,18 +311,17 @@ Result: **89 specs**, covering **142 tests**. **3 tests are not spec samples** (
   filtered to finite values. `round3(x)` = the f64 parsed back from `format!("{x:.3}")`.
 - `≈` means `|x − y| ≤ ROUNDING_MS` (0.06 ms), as in start.rs.
 - In stats.rs, `s` = the copy of `v` sorted by `f64::total_cmp`, and `n = |v|`.
-- `PIN` is the wasm-bindgen version the wasm-glue oracle row (wasm_glue/oracle.rs) pins.
+- `BINDGEN` is the wasm-bindgen version the wasm-glue oracle (wasm_glue/oracle.rs) pins.
 - **Effect specs** (fs, process, signal, socket, clock) state the observable postcondition. Each one
-  first needs its pure decision factored out (PLAN, "Order of work", step 4). The pure half is
-  provable once gaps 1/3/5/7 land; the effectful shell waits on gap 8.
+  first needs its pure decision factored out (`docs/PLAN-tests-to-specs-2026-10-15.md`, "Order of
+  work", step 4). The pure half is provable once gaps 1/3/5/7 land; the effectful shell waits on gap 8.
 - **Floats.** Many specs use f64 arithmetic. The audit §7 table has no float-model row, so specs that
   need IEEE-754 reasoning (NaN, ordering, rounding) are listed under gap 3 (E6 refuses floats), the
-  nearest row. That missing row is a gap in the audit itself.
+  nearest row.
 - **Gap 0** (the installed seal publishes no Lean-discharged row) blocks every spec. It is listed in
   every row so that the histogram is honest. No spec here is blocked by gap 0 alone.
-- `hash-fnv1a-64-reference` belongs in `crates/aterm-hash/SPECS.md`, because the function is
-  `aterm_hash::fnv1a_64`. It is listed here because its only test lives in src/perf/trend.rs. Move
-  it when aterm-hash gets its worklist.
+- `hash-fnv1a-64-reference` is about `aterm_hash::fnv1a_64`, which `crates/aterm-hash/SPECS.md`
+  states as HASH-FNV-1. It is listed here because its only test lives in src/perf/trend.rs.
 
 ### 1. Specs (TSV)
 
@@ -358,7 +340,7 @@ cells-parse-member-names	contract	cells::parse_member_names	∀ json: parse_memb
 cells-test-selection	contract	cells::test_selection	∀ BTreeSets M (members), G (graph), P (patched): test_selection(M, G, P) = (sorted(M ∩ G), sorted((M \ G) \ P)). Corollaries: selected ∩ excluded = ∅; excluded ⊆ M, so a non-member is never handed to --exclude; excluded ∩ P = ∅, so a patch target is never excluded; selected does not depend on P.	0,1,7	BTreeSet intersection/difference iterators, filter, Vec<String> collect
 cells-patched-crates	contract	cells::{patched_crates,renamed_package}	∀ root: root/Cargo.toml unreadable ⇒ patched_crates(root) = Err(m) with m containing "could not read". Otherwise Ok(K), where K takes each trimmed line inside a section headed by a line starting with [patch.crates-io] or [patch."crates-io"] (up to the next '['-led line) that is non-empty, not '#'-led and of the form key '=' spec, and contributes renamed_package(spec) or else key.trim().trim_matches('"').trim(); empty names are dropped. ∀ spec: renamed_package(spec) = Some(v) for the first "package" followed by ws* '=' ws* '"' v '"' with v ≠ "", else None. So a renamed row patches the package it names, not its key. A manifest without the section gives Ok(∅). The live-manifest names in the test are data instances.	0,1,7,8	fs read, line loop with section state, split_once, match_indices/find_map, borrowed &str result
 perf-parse-cli	contract	perf::parse, perf::Lane::{from_name,kind}	∀ args: [String]: parse(args) = Ok(cli) iff (i) every arg outside {--list, -h, --help, --record} that starts with '-' is an OPTIONS flag, each flag appears at most once, and a valued flag is followed by a value not starting with "--"; (ii) every other arg is a Lane name; (iii) if --record appears, at least one Floor lane is named after its first occurrence; (iv) Compare ∈ lanes ⇒ both --baseline and --candidate are given; (v) every given option has some lane of its spec in cli.lanes. When Ok: cli.lanes = sorted-dedup(named lanes) under the enum order, or all Floor lanes in ALL order if none is named; cli.record = sorted-dedup(Floor lanes named after the first --record), while arena lanes named there just run; cli.options maps each flag to its value ("" for a switch); list and help reflect --list and -h/--help.	0,1,3,5,7	manual next() over &[String], match on &str with guards, BTreeMap insert, sort_unstable/dedup, static OPTIONS table
-perf-verdict-ladder	contract	perf::verdict	∀ rows: [(name, &LaneRun, secs)]: verdict(rows) = (text, failed) with failed ⇔ some row has status Fail. Text: the header, then per row "{tag:<5} {name:<13} {secs:>7.1}s  {detail}", tag = ok (Pass), meas (NotJudged, Measured), rec (Recorded), skip (Skip), FAIL (Fail). Let U = the concatenation over rows of Skip ↦ "{n} (skipped)", Recorded ↦ "{n} (recorded, not compared)", Measured ↦ "{n} (measured; no floor)", NotJudged(w) ↦ "{n} ({w})", Pass ↦ run.unjudged; J = #rows with status Pass. The last line is: failed ⇒ "xtask perf: FAILED — " ++ join(", ", failed names); else U = [] ⇒ "…GREEN — every lane that ran was judged and held"; else J = 0 ⇒ "…NOTHING JUDGED — " ++ join(", ", U); else "…GREEN for what was judged; NOT JUDGED: " ++ join(", ", U). A Measured or NotJudged lane never makes the run read as fully judged.	0,1,3,7	enum match with guards over a String-carrying enum, Vec<String> accumulation, format! widths, f64 formatting
+perf-verdict-ladder	contract	perf::verdict	∀ rows: [(name, &LaneRun, secs)]: verdict(rows) = (text, code). Text: the header "== verify perf ==", then per row "{tag:<5} {name:<13} {secs:>7.1}s  {detail}", tag = ok (Pass), meas (NotJudged, Measured), rec (Recorded), skip (Skip), NRUN (CouldNotRun), FAIL (Fail). Let F = the Fail rows' names, R = the CouldNotRun rows' names, U = the concatenation over rows of Skip ↦ "{n} (skipped)", Recorded ↦ "{n} (recorded, not compared)", Measured ↦ "{n} (measured; no floor)", NotJudged(w) ↦ "{n} ({w})", Pass ↦ run.unjudged; J = #rows with status Pass. The last line and the code: F ≠ [] ⇒ "verify perf: FAILED — " ++ join(", ", F) (then "; " ++ join(", ", R) ++ " could not run" when R ≠ []), exit::FAILED; else R ≠ [] ⇒ "…COULD NOT RUN — " ++ join(", ", R) ++ " could not run", exit::COULD_NOT_RUN; else exit::PASS, with U = [] ⇒ "…GREEN — every lane that ran was judged and held"; else J = 0 ⇒ "…NOTHING JUDGED — " ++ join(", ", U); else "…GREEN for what was judged; NOT JUDGED: " ++ join(", ", U). A Measured or NotJudged lane never makes the run read as fully judged.	0,1,3,7	enum match with guards over a String-carrying enum, Vec<String> accumulation, format! widths, f64 formatting
 perf-lanerun-fold	contract	perf::LaneRun::{add_failure,fence_held,pass,fail,not_judged,measured,skip,failed}	∀ run, finding f: after run.add_failure(f), status' = Fail(fs ++ [f]) if status was Fail(fs), else Fail([f]); unjudged and samples unchanged. ∀ lane l: after run.fence_held(l), if status was NotJudged(w) then status' = Pass and unjudged' = unjudged ++ ["{l} floors ({w})"]; otherwise run is unchanged. Each constructor sets exactly its status with empty unjudged and samples. failed() ⇔ status is Fail(_).	0,1,2,3	&mut self two-state update on an enum with a Vec<String> payload
 stats-median-percentile-tail	contract	perf::stats::{median,percentile_nearest_rank,tail_summary,distribution}	median([]) is NaN. n ≥ 1 ⇒ median(v) = s[n/2] for odd n and (s[n/2 − 1] + s[n/2]) / 2 for even n. percentile_nearest_rank requires n ≥ 1 (it indexes and panics on []); for p ∈ [0, 1] it is s[min(max(⌈p·n⌉, 1) − 1, n − 1)]. tail_summary(v) starts with "max={max:.2} (p95 omitted…" when n < P95_MIN_N = 20, and with "p95_nearest_rank={pnr(v, 0.95):.2}" otherwise. distribution(v).p95_nearest_rank is null iff n < 20.	0,1,3,7	Vec<f64> clone + sort_by(total_cmp), f64 ceil cast to usize, saturating_sub/min; IEEE-754
 stats-fold-rounds	contract	perf::stats::{fold_rounds,rounds}	∀ d: [f64]: fold_rounds(d) = [(d[2k] + d[2k + 1]) / 2 | 0 ≤ k < ⌊|d|/2⌋]; a trailing odd delta is dropped. rounds(d) = None ⇔ |d| < 2; otherwise Some(R) with R.values = fold_rounds(d), R.median = median(values), R.mean = mean(values), (R.faster, R.ties, R.slower) = the counts of values > 0, = 0, < 0, R.median_interval = median_sign_interval(values), R.mean_interval = mean_interval(values). ABBA corollary: if d[2k] = −d[2k + 1] for every k, every value is 0 and (faster, ties, slower) = (0, |values|, 0).	0,1,3,7	slice as_chunks::<2>, array-pattern closure, f64 arithmetic, struct of Options
@@ -390,7 +372,7 @@ arena-scratch-lifecycle	contract	perf::arena::live::{make_dir,remove_dir}, perf:
 arena-sha256-file	equivalence	perf::arena::sha256_file, aterm_digest::Sha256	∀ readable file p: sha256_file(p) = Ok(lower-hex(SHA-256(contents(p)))). The 1 MiB chunked update loop equals one-shot hashing of the whole content, because SHA-256 update is associative over concatenation. Err if open or read fails.	0,1,2,7,8,12	fs read loop into a Vec<u8> buffer, hasher with &mut state (cross-crate), hex formatting
 arena-inbox-report	contract	perf::arena::Inbox::{bind,path,wait,drop}, perf::arena::report	∀ i = Inbox::bind(), line x: if report(i.path(), x) succeeds, then i.wait(c) = Ok(trim(x)) for every ceiling c longer than the delivery time. If nothing ever connects, i.wait(c) = Err naming the socket path. Drop wakes the acceptor thread so it ends.	0,8,13	UnixListener/UnixStream, spawned thread, mpsc recv_timeout
 arena-group-retire	contract	perf::arena::live::Group::{spawn,exited,retire}	∀ spawnable command c: after g = Group::spawn(c), g.pgid ∈ LIVE.groups and the child leads its own process group. g.retire() returns Ok only after the leader has exited: SIGTERM to the group, then SIGKILL when TERM_GRACE runs out, with KILL_CEILING as the hang bound. Afterwards g.pgid ∉ LIVE.groups and the leader pid is not alive. exited() is None while the leader runs.	0,8,13	process_group spawn, unsafe libc::killpg, thread + mpsc timeout, static Mutex table
-arena-interrupt-guard	contract	perf::arena::live::{guard,interrupted}, perf::main	For an xtask perf process that installed guard() before starting any thread, and every sig ∈ {SIGINT, SIGTERM, SIGHUP} not inherited as ignored that is delivered while lanes run: the process exits with status 128 + sig, and before it exits every group in LIVE.groups has been SIGKILLed and reaped (bounded by KILL_CEILING), every registered app has been stopped, and every registered directory removed. So an arena run leaves no terminal process and no scratch or socket directory behind. Proof route: model the signal mask, sigwait and LIVE.	0,8,13	unsafe pthread_sigmask/sigwait/killpg, dedicated signal thread, Mutex-held table, process::exit; integration test of a spawned binary
+arena-interrupt-guard	contract	perf::arena::live::{guard,interrupted}, perf::main	For a `verify perf` process that installed guard() before starting any thread, and every sig ∈ {SIGINT, SIGTERM, SIGHUP} not inherited as ignored that is delivered while lanes run: the process exits with status 128 + sig, and before it exits every group in LIVE.groups has been SIGKILLed and reaped (bounded by KILL_CEILING), every registered app has been stopped, and every registered directory removed. So an arena run leaves no terminal process and no scratch or socket directory behind. Proof route: model the signal mask, sigwait and LIVE.	0,8,13	unsafe pthread_sigmask/sigwait/killpg, dedicated signal thread, Mutex-held table, process::exit; integration test of a spawned binary
 cat-corpus-generate	contract	perf::arena::cat::generate, perf::arena::cat::Corpus::unit	requires mb·2^20 does not overflow u64. ∀ corpus c, mb ≥ 1: let u = c.unit().as_bytes(), T = mb·2^20, k = ⌈T/|u|⌉. With an infallible writer, generate(c, mb, out) writes exactly u repeated k times and returns Ok(k·|u|). Hence T ≤ n < T + |u|, n mod |u| = 0, and the output is valid UTF-8 (u is a &str and whole units concatenate).	0,1,7,11	generic impl io::Write, Vec<u8> block-build loop, div_ceil, write_all; loop invariant written = j·|u|
 cat-abba-order	contract	perf::arena::cat::order	∀ t: u32: order(t) = [Aterm, Ghostty] if t is odd, else [Ghostty, Aterm]. compare::schedule uses the same parity rule for (Baseline, Candidate) (see compare-schedule-protocol).	0,3	integer rem, Copy enum array
 cat-parse-drain	contract	perf::arena::cat::parse_drain	∀ report r: parse_drain(r) = Ok(x) iff ws(r) = ["drain", s] with s parsing as an f64 x that is finite and > 0; otherwise Err.	0,1,7	split_whitespace into Vec, slice pattern match, f64 parse
@@ -411,8 +393,7 @@ compare-eligibility-and-thermal	contract	perf::arena::compare::classify_thermal,
 compare-result-json	contract	perf::arena::compare::result_json, perf::stats::Rounds::to_json, perf::stats::paired_json	∀ comparison c, provenance: result_json(c, provenance) has reported_unit = "round", processes = 2·pairs and warm = plan.warm. records has |c.records| entries, each sample.to_json() plus pair, order_in_pair and arm. For each total name, summary has rounds_candidate_faster_ms = rounds.to_json() (whose values have length c.rounds) or null, and paired_candidate_faster_ms.order_contaminated = true. automated_rule_zero_inputs.negative_control.eligible = ¬plan.negative_control and automated_rule_zero_eligible = eligibility.all().	0,1,7,12	json! macro trees, closures, BTreeMap→Object, cross-crate JSON
 ```
 
-Dedup and unification notes. The chunk's specs were already one per property; the merge made these choices:
-`resize_fences` (floors.rs) and `wasm_module_fences` (wasm.rs) are one spec, `floors-absolute-fences`,
+Shared and separate specs: `resize_fences` (floors.rs) and `wasm_module_fences` (wasm.rs) are one spec, `floors-absolute-fences`,
 because both are "a missing key is a breach and the cap is inclusive". `cat-abba-order` and the slot
 rule inside `compare-schedule-protocol` are the same parity rule; the first is the lemma and the second
 cites it. `stats-fold-rounds`'s ABBA corollary and `compare-deltas-and-round-cancellation`'s theorem are
@@ -469,7 +450,7 @@ src/perf/trend.rs	a_true_slowdown_at_the_same_operating_point_still_fails	trend-
 src/perf/trend.rs	a_rename_no_longer_forks_a_box_from_its_own_history	trend-judge	trend-resolve-ledger-box
 src/perf/trend.rs	an_unclaimed_identity_stands_alone_and_is_never_merged	trend-judge	trend-resolve-ledger-box
 src/perf/trend.rs	trend_rows_round_trip_through_breach_parser	trend-ledger-round-trip	
-src/perf/trend.rs	trend_rows_record_the_wasm_stable_toolchain_lane	trend-ledger-round-trip	
+src/perf/trend.rs	trend_rows_record_the_wasm_lanes_toolchain_and_engine	trend-ledger-round-trip	
 src/perf/trend.rs	a_seven_column_row_round_trips_with_its_shape	trend-ledger-round-trip	
 src/perf/trend.rs	a_rows_operating_point_round_trips_beside_its_re_record_mark	trend-ledger-round-trip	
 src/perf/trend.rs	naming_a_box_adopts_the_rows_it_wrote_before_it_had_a_name	trend-resolve-ledger-box	
@@ -529,8 +510,8 @@ src/perf/arena/compare.rs	the_result_records_the_round_unit_and_every_raw_trial	
 
 ### 3. Coverage
 
-- 60 specs; the map holds 97 tests, each the sample of one of them.
-- The biggest collapses are `trend-judge` (8 tests, two of them shared with `trend-resolve-ledger-box`),
+- 60 specs; the map holds 100 tests, each the primary sample of one of them.
+- The biggest collapses are `trend-judge` (10 tests, two of them shared with `trend-resolve-ledger-box`),
   `floors-judge-against-baseline` (5), `start-sample-totals-and-observer` (5), `perf-parse-cli` (4),
   `start-sample-partitions-reconcile` (4) and `compare-shape-gating-and-errors` (4).
 - 42 of the 60 specs retire exactly one test, and `cells-path-is-inside` has none. Most of these
@@ -567,22 +548,15 @@ None: every test the map holds samples a spec.
 
 ### 5. Implied specs that look wrong, or disagree with the code
 
-1. **Doc says widest, code is narrowest.** The doc on `median_sign_interval` says it returns "the widest
-   symmetric pair whose exact binomial coverage is still at least 95%". The code scans the rank downward
-   from (n−1)/2 and returns the first rank that reaches 95%, which gives the NARROWEST such interval. The
-   test `the_median_interval_has_textbook_coverage` pins that narrowest answer, (1, 8) for n = 10. The code
-   is the standard construction, so the doc is what is wrong. `stats-median-sign-interval` states the code.
-2. **Unguarded arithmetic.** `fill_line`'s `n + c` has an overflow precondition, recorded as a `requires`
+1. **Unguarded arithmetic.** `fill_line`'s `n + c` has an overflow precondition, recorded as a `requires`
    in `scroll-fill-and-depth`. It should either be proved unreachable from the callers or replaced by a
    saturating or checked form.
-3. **A substring check that adds nothing.** In `a_schema_is_the_integer_one_never_a_bool_or_a_float`, the 1.0
+2. **A substring check that adds nothing.** In `a_schema_is_the_integer_one_never_a_bool_or_a_float`, the 1.0
    case asserts the error contains "startup_phase_schema=1", which is also a prefix of the real
    "startup_phase_schema=1.0" message. Only `expect_err` carries the property.
-4. **A wall-clock test.** `utc_date_is_iso_shaped` reads the clock and asserts the date starts with "20". It
+3. **A wall-clock test.** `utc_date_is_iso_shaped` reads the clock and asserts the date starts with "20". It
    fails on a box whose clock is unset (1970) or after 2099. Its shape part is subsumed by
    `trend-civil-date-rfc3339`.
-5. **Chunk metadata.** The chunk list reported 142 tests for xtask, but the files held 145 `#[test]` fns.
-   `oracle.rs::only_a_bindgen_answering_exactly_the_pin_is_found` is `#[cfg(unix)]`.
 
 ### 6. Proof order (easiest high-value first)
 
@@ -595,10 +569,10 @@ integer body widening) or 1 (struct carriers). They come first.
 2. **`cat-abba-order`** (gaps 0, 3). Integer parity only. It retires 1 test and is the parity lemma that
    `compare-schedule-protocol` and the ABBA cancellation theorem cite.
 3. **`trend-civil-date-rfc3339`** (gaps 0, 1, 3). Pure integer arithmetic (Hinnant's algorithm) with a
-   round-trip characterisation. It retires the wall-clock test (§5.4) along with the exact one.
+   round-trip characterisation. It retires the wall-clock test (§5.3) along with the exact one.
 4. The remaining **gaps 0, 1, 3** rows, each a straight-line pure function: `cells-package-id-name`,
    `trend-chip-of` and `arena-socket-path-bound`.
-5. Once gaps 5 and 7 land, the big collapse: **`trend-judge`** with `trend-resolve-ledger-box` (9 tests
+5. Once gaps 5 and 7 land, the big collapse: **`trend-judge`** with `trend-resolve-ledger-box` (11 tests
    between them).
 6. Effect specs last. For each one, prove the factored pure decision as soon as its carriers allow.
    The shell waits on gap 8, and the thread-based ones on gap 13.

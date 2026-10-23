@@ -1066,8 +1066,8 @@ const CASE_PRESSES: &[(&str, &str)] = &[
 
 /// Alt+U/L/C pressed at a real prompt in an aterm tab case the word from the caret,
 /// as readline's do, on every PSReadLine: 2.4.5's own UpcaseWord, DowncaseWord and
-/// CapitalizeWord, and the layer's script blocks on 5.1's 2.0.0, where Windows mode
-/// typed a bare u, l or c (`# uXalpha beta gamma`, measured 2026-10-18).
+/// CapitalizeWord, and the layer's script blocks on 5.1's 2.0.0, whose Windows mode
+/// types a bare u, l or c without them (`# uXalpha beta gamma`).
 #[cfg(windows)]
 #[test]
 fn test_powershell_alt_u_l_c_case_the_word_on_every_psreadline() {

@@ -1347,7 +1347,7 @@ pub(crate) fn current_event_queue_age_ns() -> Option<u64> {
     None
 }
 
-/// Whether the `RedrawRequested` being handled is one the X server asked for with an `Expose` (`aterm_window::platform::x11::redraw_is_exposure`).
+/// Whether the `RedrawRequested` being handled is one the X server asked for with an `Expose` that no whole-frame post of the window's (`present::x11`) drew again since (`aterm_window::platform::x11::redraw_is_exposure`).
 #[cfg(target_os = "linux")]
 pub(crate) fn redraw_is_exposure() -> bool {
     aterm_window::platform::x11::redraw_is_exposure()

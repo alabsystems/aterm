@@ -108,7 +108,7 @@ enum Contract {
     /// force-clears mid-frame.
     ModeLevel,
     /// [`Contract::SinglePane`]'s caret with the echo anchor handed over
-    /// raw: the single-pane present before the anchor law.
+    /// raw, without the anchor law.
     CaretOnly,
 }
 
@@ -566,9 +566,8 @@ fn every_bracket_length_keeps_the_line_whole_under_the_shipping_contract() {
 
 const BS: char = '\u{8}';
 
-/// Claude Code's mid-line insert (the owner's 2026-10-16 screenshot: `all
-/// the▯subtrees`, typed before ` carefully and ultrathink design this.`),
-/// one key every 110 ms, a Backspace among them as [`BS`].
+/// Claude Code's mid-line insert: keys typed in front of [`TAIL`], one key
+/// every 110 ms, a Backspace among them as [`BS`].
 #[derive(Clone, Copy)]
 struct MidLine<'a> {
     keys: &'a str,

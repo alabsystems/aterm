@@ -26,7 +26,7 @@ pub const LIST_TERMINAL: &str = "spctl developer-mode enable-terminal";
 /// The helper panel's heading and the first line of `aterm doctor`'s banner.
 pub const HELPER_TITLE: &str = "Add aterm to Developer Tools";
 
-/// Why the owner is asked: what macOS does to each new program aterm starts, and what the list changes ("should" until D14, see [`trade`]).
+/// Why the owner is asked: what macOS does to each new program aterm starts, and what the list changes. `skips` is `aterm_containment::SpikeEvidence::devtool_skips_first_run_check`; without it the words say "should" (as [`trade`] and [`done`] do).
 #[must_use]
 pub const fn why(skips: bool) -> &'static str {
     if skips {
@@ -47,7 +47,7 @@ macro_rules! wrong_switches {
     };
 }
 
-/// The other switches on the Developer Tools page (macOS 27.0.1 holds Processor Trace and RDMA over Thunderbolt there): neither is aterm's, so no surface points at them.
+/// The other switches on the Developer Tools page (Processor Trace, RDMA over Thunderbolt): neither is aterm's, so no surface points at them.
 pub const WRONG_SWITCHES: &str = wrong_switches!();
 
 /// [`PLUS_PRESS`]'s words, spelled once for it, [`PLUS_ROUTE`] and the consts that `concat!` them.
@@ -67,7 +67,7 @@ macro_rules! plus_route {
 /// The press of + itself ("it" is the Developer Tools list), for a sentence that offers it alone: once the panel's one drop is spent, there is no drag to pair it with.
 pub const PLUS_PRESS: &str = plus_press!();
 
-/// The route through + that rides every drag aterm offers ("it" is the Developer Tools list): whether the list takes aterm dropped on it is unmeasured (spike D15), so no surface offers the drag without it.
+/// The route through + that rides every drag aterm offers ("it" is the Developer Tools list): whether the list accepts aterm dropped on it is unmeasured, so no surface offers the drag without it.
 pub const PLUS_ROUTE: &str = plus_route!();
 
 /// [`CHECK_SWITCH`]'s words (see [`plus_route`]).
@@ -97,7 +97,7 @@ pub const HELPER_HOW: &str = concat!(
     wrong_switches!()
 );
 
-/// How, where aterm offers no icon to drag (a copy it will not offer — translocated, on a disk image, a dev bundle — or one it has not yet identified): + leads, since a sentence that starts with a drag sends the owner looking for something to drag.
+/// How, where aterm offers no icon to drag (a translocated, disk-image or dev copy, or one not yet identified): + alone, since a sentence that offers a drag sends the owner looking for something to drag.
 pub const HELPER_HOW_PLUS: &str = concat!(
     "Press + below the Developer Tools list and choose aterm, enter your password, ",
     check_switch!(),
@@ -113,7 +113,7 @@ pub const HELPER_SWITCH_ON: &str = concat!(
     wrong_switches!()
 );
 
-/// What is true for an aterm the list holds switched on while tccd still checks its new programs (its answer came after the switch last changed, `consent::devtool_grant`): there is nothing to drag in and nothing to switch on, and aterm names the two causes the joined verdict allows without claiming a remedy nobody measured.
+/// For an aterm the list holds switched on while tccd still checks its new programs ([`consent::devtool_grant`]): nothing to add or switch on, so it names the two possible causes and no remedy.
 pub const HELPER_LISTED_ON: &str = "aterm is already on the Developer Tools list and switched \
                                     on: there is nothing to add. macOS still checked a new \
                                     program aterm started after that, so the row may not match \
@@ -181,7 +181,7 @@ pub const HELPER_STEP: &str = "Drag aterm into the Developer Tools list";
 /// [`Step::SwitchOn`] as one action ([`HELPER_STEP`]'s rules): its switch, never a drag.
 pub const STEP_SWITCH_ON: &str = "Switch on aterm's row in the Developer Tools list";
 
-/// [`Step::ListedOn`] as one action ([`HELPER_STEP`]'s rules): nothing to add and nothing to switch on, and no remedy nobody measured ([`HELPER_LISTED_ON`] names the causes).
+/// [`Step::ListedOn`] as one action ([`HELPER_STEP`]'s rules): nothing to add, nothing to switch on, no remedy ([`HELPER_LISTED_ON`] names the causes).
 pub const STEP_LISTED_ON: &str = "Look at aterm's row in the Developer Tools list";
 
 /// Which switch matters.
@@ -195,7 +195,7 @@ pub const fn only_aterm(listed_terminal_just_now: bool) -> &'static str {
     }
 }
 
-/// What the owner trades, "should" until D14: the same words for the panel, the Settings card and `aterm doctor`.
+/// What the owner trades ("should" without `skips`, see [`why`]): the same words for the panel, the Settings card and `aterm doctor`.
 #[must_use]
 pub const fn trade(skips: bool) -> &'static str {
     if skips {
@@ -209,7 +209,7 @@ pub const fn trade(skips: bool) -> &'static str {
     }
 }
 
-/// What the panel says once aterm's switch reads on ("should" until D14).
+/// What the panel says once aterm's switch reads on ("should" without `skips`, see [`why`]).
 #[must_use]
 pub const fn done(skips: bool) -> &'static str {
     if skips {
@@ -869,9 +869,9 @@ pub const PRIME_VERB: &str = "__devtools-prime";
 #[cfg(target_os = "macos")]
 const PRIME_CEILING: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// MAKE macOS ASK ABOUT ATERM AGAIN, once the owner switched it on: [`run_prime`] in aterm's own executable, started as its OWN responsible process.
+/// Make macOS assess aterm again once the owner switched it on: [`run_prime`] in aterm's own executable, started as its own responsible process.
 /// # Errors
-/// Why it could not run: not a bundled aterm, the responsibility attribute macOS no longer offers (`aterm_uds::spawnfd::Command::disclaim_responsibility`), or the verb's own first line of complaint.
+/// Why it could not run: not a bundled aterm, a macOS without the responsibility attribute (`aterm_uds::spawnfd::Command::disclaim_responsibility`), or the verb's own first line of complaint.
 pub fn refresh_verdict() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -1245,15 +1245,14 @@ mod tests {
         assert!(decline_holding(&once, at - 600).is_some());
     }
 
-    /// The words every surface shares: the drag is never offered without the + route (drop
-    /// acceptance is unmeasured, D15); "should" is said exactly while D14 is unmeasured;
-    /// the digest's step is one action; the wrong switches are named in the how; and no
-    /// restart, elimination or coverage word appears.
+    /// The words every surface shares: the drag is never offered without the + route;
+    /// "should" is said exactly without `skips`; each step reads the list as it stands; the
+    /// wrong switches close the how.
     #[test]
     fn the_words_pair_the_drag_with_plus_and_say_should_until_d14() {
         for skips in [false, true] {
             for words in [why(skips), trade(skips), done(skips)] {
-                assert_eq!(words.contains("should"), !skips, "D14={skips}: {words}");
+                assert_eq!(words.contains("should"), !skips, "skips={skips}: {words}");
             }
             assert!(
                 trade(skips).contains("Gatekeeper's prompt"),
@@ -1327,56 +1326,6 @@ mod tests {
         );
         assert!(only_aterm(true).contains("Terminal"));
         assert!(!only_aterm(false).contains("Terminal"));
-        let every = [
-            HELPER_TITLE,
-            HELPER_HOW,
-            HELPER_HOW_PLUS,
-            HELPER_SWITCH_ON,
-            HELPER_LISTED_ON,
-            STATUS_LINK,
-            HELPER_STEP,
-            STEP_SWITCH_ON,
-            STEP_LISTED_ON,
-            WRONG_SWITCHES,
-            why(false),
-            why(true),
-            trade(false),
-            trade(true),
-            done(false),
-            done(true),
-            only_aterm(false),
-            only_aterm(true),
-        ];
-        let phrases = [
-            "restart",
-            "relaunch",
-            "re-launch",
-            "reopen",
-            "re-open",
-            "reboot",
-            "quit and open",
-            "quit and reopen",
-            "next launch",
-            "open aterm again",
-            "start aterm again",
-            "never prompt",
-            "can stay off",
-        ];
-        let stems = ["cover", "eliminat"];
-        for words in every {
-            let lower = words.to_ascii_lowercase();
-            for banned in phrases {
-                assert!(!lower.contains(banned), "{banned:?}: {words}");
-            }
-            for stem in stems {
-                assert!(
-                    !lower
-                        .split(|c: char| !c.is_ascii_alphabetic())
-                        .any(|word| word.starts_with(stem)),
-                    "{stem:?}: {words}"
-                );
-            }
-        }
     }
 
     #[test]

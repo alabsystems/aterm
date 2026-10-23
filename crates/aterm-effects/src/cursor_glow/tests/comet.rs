@@ -261,6 +261,7 @@ fn comet_newest_letter(gap_ms: u64, unbudgeted: bool) -> f32 {
             body_allowed: true,
             momentum_glow: true,
             user_tinted: false,
+            accent_pinned: false,
         };
         let frame = fx.tick(&input, &glow_cfg, trail);
         if k < 10 {

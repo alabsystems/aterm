@@ -88,7 +88,7 @@ fn over(a: u32, b: u32, alpha: f32) -> u32 {
 }
 
 impl Host {
-    fn new(seed: u64, theme: Theme, letters_unseen: bool) -> Self {
+    fn new(seed: u64, theme: Theme, setup: &dyn Fn(&mut CompanionOwner)) -> Self {
         let mut term = Terminal::new(ROWS, COLS);
         term.process(
             format!(
@@ -99,7 +99,7 @@ impl Host {
         );
         let mut owner = CompanionOwner::default();
         owner.set_enabled_seed(true, seed);
-        owner.set_pet_letters_unseen(letters_unseen);
+        setup(&mut owner);
         let now = Instant::now();
         Self {
             term,
@@ -243,7 +243,22 @@ impl Host {
         events: &[(u64, Rec, Option<PetInputKind>)],
         tail: u64,
     ) -> Self {
-        let mut h = Self::new(0x5EED, theme, unseen);
+        Self::replay_with(
+            theme,
+            &|owner| owner.set_pet_letters_unseen(unseen),
+            events,
+            tail,
+        )
+    }
+
+    /// [`Self::replay`] with the owner set up by `setup` first.
+    fn replay_with(
+        theme: Theme,
+        setup: &dyn Fn(&mut CompanionOwner),
+        events: &[(u64, Rec, Option<PetInputKind>)],
+        tail: u64,
+    ) -> Self {
+        let mut h = Self::new(0x5EED, theme, setup);
         for (ms, ev, kind) in events {
             h.run_to(*ms);
             if let Some(kind) = kind {
@@ -319,8 +334,8 @@ fn returns(shots: &[&Shot]) -> usize {
 /// it, its whole body on blank cells, and the bound there flies under no
 /// letter's body. Its body stays whole throughout (no fade, no return), so
 /// every letter near it keeps the theme's full contrast. The negative
-/// control (the letter reader blinded, the code before the head law) rests
-/// on the printed words at full body, under the bar on both themes.
+/// control (the letter reader blinded) rests on the printed words, under the
+/// bar, on both themes.
 #[test]
 fn a_cat_rests_beside_the_line_an_enter_at_the_bottom_prints() {
     let (ev, enter) = enter_bottom("echo the quick brown fox", "the quick brown fox");
@@ -412,15 +427,14 @@ fn flights(shots: &[&Shot]) -> Vec<(u64, u8, u8, u8, u8)> {
 /// body that dips and returns blinks), through a program's moves of the
 /// caret along the row, a step, a hop and a bound away and back: a flight
 /// keeps the presence it left with, from its gather to its landing, never
-/// above it and never under it. Judged at every frame from the Enter: the
-/// bound to the new prompt gathers on the letters for a landing on them, so
-/// the veil goes on in the gather and the flight leaves veiled; the letters
-/// under the bar are the veil's one dwell and ease at the start, falling
-/// and never rising. Negative controls: the letters unseen rest on them at
-/// full body; and as run on 2026-10-22 against the code before the gather
-/// took the veil, 1,200 ms of each Enter lay a letter under the bar (dark,
-/// 1,168 light) and every move along the row lifted the veil from 56 to
-/// 255 in the gather and brought it back after the landing.
+/// above it and never under it. Judged at every frame from the Enter: no
+/// letter under the cat reads under the bar in any of them (the veil steps
+/// on in the frame that scrolls the letters in under the resting cat), and
+/// the bound to the new prompt gathers on the letters for a landing on them,
+/// so the flight leaves veiled. Negative controls: with the letters unseen,
+/// the cat rests on them under the bar; the rest veil dwelt on and eased in
+/// ([`CompanionOwner::set_pet_letter_arrival_dwells`]) lays a letter under
+/// the bar in at least 20 frames after the Enter.
 #[test]
 fn a_cat_under_a_line_lettered_to_the_margin_is_veiled_once() {
     let words: String = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod"
@@ -436,36 +450,17 @@ fn a_cat_under_a_line_lettered_to_the_margin_is_veiled_once() {
     for theme in [DARK, LIGHT] {
         let h = Host::replay(theme, false, &ev, 3_000);
         let shots: Vec<&Shot> = after(&h, enter).collect();
-        let under: Vec<&Shot> = shots
+        let under: Vec<_> = shots
             .iter()
-            .copied()
             .filter(|s| s.worst.is_some_and(|(c, ..)| c < BAR))
+            .map(|s| (s.ms - enter, s.frame.alpha, s.worst))
             .collect();
-        if let Some(last) = under.last() {
-            let run = shots
-                .iter()
-                .take_while(|s| s.ms <= last.ms)
-                .collect::<Vec<_>>();
-            assert!(
-                run.windows(2).all(|w| w[1].frame.alpha <= w[0].frame.alpha),
-                "{}: the letters under the bar are one fall of the veil from the Enter, \
-                 never a return: {:?}",
-                theme.name,
-                run.iter()
-                    .map(|s| (s.ms - enter, s.frame.action, s.frame.alpha))
-                    .collect::<Vec<_>>()
-            );
-            assert!(
-                last.ms - enter < 600,
-                "{}: {} ms after Enter the cat ({:?}, alpha {}) still lays a letter under \
-                 the bar ({:?}); the veil's dwell and ease are over well before",
-                theme.name,
-                last.ms - enter,
-                last.frame.action,
-                last.frame.alpha,
-                last.worst
-            );
-        }
+        assert!(
+            under.is_empty(),
+            "{}: frames after Enter lay a letter under the bar (ms after Enter, alpha, \
+             worst): {under:?}",
+            theme.name
+        );
         let settled = shots.iter().filter(|s| s.frame.action.settled()).count();
         assert!(
             settled > 300,
@@ -507,6 +502,186 @@ fn a_cat_under_a_line_lettered_to_the_margin_is_veiled_once() {
              above reads nothing",
             theme.name,
             last.worst
+        );
+        let dwelt = Host::replay_with(
+            theme,
+            &|owner| owner.set_pet_letter_arrival_dwells(true),
+            &ev,
+            3_000,
+        );
+        let washed = after(&dwelt, enter)
+            .filter(|s| s.worst.is_some_and(|(c, ..)| c < BAR))
+            .count();
+        assert!(
+            washed >= 20,
+            "{}: the negative control (the rest veil dwelt on and eased in) lays a letter \
+             under the bar in only {washed} frames after Enter",
+            theme.name
+        );
+    }
+}
+
+/// Where the body's silhouette (its drawn box, shaved of the tile's
+/// transparent border at the sides) meets a cell with a glyph on it, by any
+/// part of a pixel row: the first such cell.
+fn meets_glyphs(input: &RenderInput, frame: &PetFrame) -> Option<(u16, u16)> {
+    let (x0, x1, y0, y1) = frame.body_px(CELL_W, CELL_H, COLS, ROWS)?;
+    let border = (TILE_BORDER * f32::from(CELL_W)).round() as i32;
+    let (x0, x1) = (x0 + border, x1 - border);
+    let (cw, ch) = (i32::from(CELL_W), i32::from(CELL_H));
+    for row in y0.div_euclid(ch).max(0)..=((y1 - 1).div_euclid(ch)).min(i32::from(ROWS) - 1) {
+        for col in x0.div_euclid(cw).max(0)..=((x1 - 1).div_euclid(cw)).min(i32::from(COLS) - 1) {
+            let glyph = input.cells[row as usize]
+                .get(col as usize)
+                .is_some_and(|c| c.ch != ' ' && c.ch != '\0');
+            if glyph {
+                return Some((row as u16, col as u16));
+            }
+        }
+    }
+    None
+}
+
+/// THE HEAD LAW AT THE WRAP, end to end: the trail gallery's `burst` (a line
+/// typed at 50 ms a key to three cells short of the margin, then quiet). The
+/// cat leaps ahead to the row under the line for the wrap that never comes,
+/// and rests there: every rest frame's silhouette stands off every glyph,
+/// on dark and on paper, the whole body on blank rows (its top under the
+/// line's cells, so no letter cuts its head away). The negative control (the
+/// letter reader blinded: the stand as it was) rests on the row under the
+/// line with its head 0.7 of a row up among the letters.
+#[test]
+fn a_cat_waiting_on_a_wrap_that_never_comes_rests_off_the_line() {
+    let text = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
+    let mut ev = vec![(300u64, Rec::Out(b"\x1b[2J\x1b[5H$ ".to_vec()), None)];
+    let mut t = 1_000u64;
+    for c in text.bytes() {
+        ev.push((t, Rec::In(vec![c]), Some(PetInputKind::Text)));
+        ev.push((t + 2, Rec::Out(vec![c]), None));
+        t += 50;
+    }
+    let quiet = t;
+    let line =
+        |h: &mut Host| -> RenderInput { h.term.cell_frame(usize::from(ROWS), usize::from(COLS)) };
+    for theme in [DARK, LIGHT] {
+        let mut h = Host::replay(theme, false, &ev, 4_600);
+        let input = line(&mut h);
+        let rests: Vec<&Shot> = h
+            .shots
+            .iter()
+            .filter(|s| s.ms >= quiet && s.frame.action.settled() && s.frame.alpha > 0)
+            .collect();
+        assert!(
+            rests.len() > 100,
+            "{}: the cat rests after the burst ({} frames)",
+            theme.name,
+            rests.len()
+        );
+        for s in &rests {
+            assert_eq!(
+                meets_glyphs(&input, &s.frame),
+                None,
+                "{}: {} ms after the burst the resting cat ({:?} at col {:.2} row {:.2}, box \
+                 {:?}) meets a glyph",
+                theme.name,
+                s.ms - quiet,
+                s.frame.action,
+                s.frame.col,
+                s.frame.row,
+                s.frame.body_px(CELL_W, CELL_H, COLS, ROWS)
+            );
+        }
+
+        let mut blind = Host::replay(theme, true, &ev, 4_600);
+        let input = line(&mut blind);
+        let last = blind.shots.last().expect("frames");
+        assert!(
+            last.frame.action.settled()
+                && meets_glyphs(&input, &last.frame).is_some_and(|(row, _)| row == 4),
+            "{}: the negative control rests with its head among the line's letters ({:?} at \
+             col {:.2} row {:.2})",
+            theme.name,
+            last.frame.action,
+            last.frame.col,
+            last.frame.row
+        );
+    }
+}
+
+/// THE ENTER'S STEP FIRES ONCE (2026-10-23, review): output that keeps
+/// streaming in under a resting cat after the hand's last key, an Enter, is
+/// no Enter's letters. From two seconds after the Enter, lines that alternate
+/// between lettered to the margin and a lone `.` scroll up under the body
+/// eight a second. Judged from the stream's first line: the cat's presence
+/// never falls more than 60 levels in one frame and never comes back up
+/// once it fell (a body that dips and returns blinks), and no letter under
+/// it reads under the bar (the veil the Enter's letters stepped on holds
+/// while they come and go within the dwell). Negative control: the step left
+/// armed while the Enter was the last key
+/// ([`CompanionOwner::set_pet_letter_step_rearms`]) drops the veil in one
+/// frame each time the letters come back after it eased up.
+#[test]
+fn output_streaming_after_an_enter_never_blinks_the_veiled_cat() {
+    let words: String = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod"
+        .chars()
+        .chain(std::iter::repeat('x'))
+        .take(usize::from(COLS))
+        .collect();
+    let (mut ev, enter) = enter_bottom("cat lorem.txt", &words);
+    let start = enter + 2_000;
+    for k in 0..24u64 {
+        let line = if k % 2 == 0 { words.as_str() } else { "." };
+        ev.push((
+            start + 125 * k,
+            Rec::Out(format!("\r\x1b[K{line}\r\n$ ").into_bytes()),
+            None,
+        ));
+    }
+    let end = start + 125 * 24;
+    let judge = |h: &Host| -> (usize, usize, usize, usize) {
+        let span: Vec<&Shot> = h
+            .shots
+            .iter()
+            .filter(|s| s.ms >= start && s.ms <= end)
+            .collect();
+        let settled = span.iter().filter(|s| s.frame.action.settled()).count();
+        let falls = span
+            .windows(2)
+            .filter(|w| u32::from(w[1].frame.alpha) + 60 < u32::from(w[0].frame.alpha))
+            .count();
+        let under = span
+            .iter()
+            .filter(|s| s.worst.is_some_and(|(c, ..)| c < BAR))
+            .count();
+        (settled, returns(&span), falls, under)
+    };
+    for theme in [DARK, LIGHT] {
+        let h = Host::replay(theme, false, &ev, 1_000);
+        let (settled, back, falls, under) = judge(&h);
+        assert!(
+            settled > 150,
+            "{}: fixture: the cat rests through the stream ({settled} frames)",
+            theme.name
+        );
+        assert_eq!(
+            (back, falls, under),
+            (0, 0, 0),
+            "{}: through the stream the cat came back {back} times, fell over 60 levels in one \
+             frame {falls} times, and lay on a letter under the bar in {under} frames",
+            theme.name
+        );
+        let armed = Host::replay_with(
+            theme,
+            &|owner| owner.set_pet_letter_step_rearms(true),
+            &ev,
+            1_000,
+        );
+        let (_, a_back, a_falls, _) = judge(&armed);
+        assert!(
+            a_back >= 5 && a_falls >= 5,
+            "{}: the negative control (the step left armed) came back {a_back} times and fell \
+             in one frame {a_falls} times",
+            theme.name
         );
     }
 }

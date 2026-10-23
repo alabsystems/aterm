@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Bounded models for the aterm wrapper's harness core (`docs/DESIGN-aterm-wrapper-2026-09-17.md` §11 item 7): the bounded child runner's worker lifecycle (`align::capture_bounded`), the Claude Code upgrade ladder and its notice/drain/limit/work-end laws, the login wall, the usage tap, and the model priority/ladder/switch, all in `aterm_agent::harness`.
+//! Bounded models for the harness core (`docs/DESIGN-aterm-wrapper-2026-09-17.md` §11): the bounded child runner's worker lifecycle (`align::capture_bounded`), the Claude Code upgrade ladder and its notice, drain, never-strands, work-end and limit-queue laws, the login wall, the usage tap, and the model priority, ladder and switch, all in `aterm_agent::harness`.
 
 use aterm_spec::derive::*;
 

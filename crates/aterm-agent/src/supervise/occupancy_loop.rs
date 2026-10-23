@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use super::super::config::{Occupancy, SupervisorConfig};
-use super::super::facts::{EpisodeKey, FactKind, FactsState};
+use super::super::facts::{EpisodeKey, FactKind};
 use super::super::memory;
 use super::super::occupancy::door::{self, AtWrite, PaceGrant, StatusSeen, Told};
 use super::super::occupancy::fault::{Fault, armed};
@@ -64,8 +64,6 @@ struct DoorWatch {
     /// Under `prompt`, this break's due line, for the write at the same break
     /// ([`Session::occupancy_write`]).
     due: Option<DueLine>,
-    /// Which episodes the session was told, seeded from the ledger's fact rows.
-    facts: FactsState,
     /// The episode whose write last made its reads and wrote nothing, with when it may be tried
     /// again (the clock's).
     again: Option<(u64, i64)>,
@@ -184,7 +182,7 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// `at` on the clock's milliseconds.
-    fn hold_ms(&mut self, at: Instant) -> i64 {
+    pub(super) fn hold_ms(&mut self, at: Instant) -> i64 {
         let origin = *self.hold.origin.get_or_insert(at);
         signed_ms(origin, at)
     }
@@ -200,13 +198,18 @@ impl<C: Ctl> Session<'_, C> {
         cfg: &SupervisorConfig,
         review: &dyn Review,
     ) {
+        // The facts told, of every kind: the stuck fact and the turn-end rider tell under any
+        // `occupancy`, and a successor must not tell them twice.
+        let facts = door::seed_rows_in(body, self.setup.sid.as_deref());
+        self.facts.state.seed(&facts, now_ms);
+        // And the stuck lines' place in the session's pace, under any key: a line typed before
+        // a restart still spaces the next one, the stuck fact's or the door's.
+        let start_ms = self.hold_ms(start);
+        self.stuck_lines_seed(body, start_ms, now_ms);
         if !self.occupancy_observes(Some(cfg), review) {
             return;
         }
-        let start_ms = self.hold_ms(start);
         self.hold.door.wall = Some((start_ms, now_ms));
-        let facts = door::seed_rows_in(body, self.setup.sid.as_deref());
-        self.hold.door.facts.seed(&facts, now_ms);
         let would = rules::would_rows_in(body, self.setup.sid.as_deref());
         let held = rules::held_rows_in(body, self.setup.sid.as_deref());
         let booked = (&would[..], &held[..]);
@@ -539,7 +542,7 @@ impl<C: Ctl> Session<'_, C> {
             Wrote::Held(guard)
         } else if let Some(guard) = door::write_held(due.rule, gone) {
             Wrote::Held(guard)
-        } else if self.hold.door.facts.is_told(key) {
+        } else if self.facts.state.is_told(key) {
             Wrote::Told
         } else {
             let wrote = if let Some(guard) = self.door_holds(screen, &due, cfg, host.as_ref())? {
@@ -576,6 +579,28 @@ impl<C: Ctl> Session<'_, C> {
         cfg: &SupervisorConfig,
         host: &dyn IdleHost,
     ) -> Result<Option<Guard>, Fail> {
+        let guards = match self.write_guards(screen, due.now, cfg, host)? {
+            Ok(guards) => guards,
+            Err(guard) => return Ok(Some(guard)),
+        };
+        if let Some(guard) = guards.held(due.rule) {
+            return Ok(Some(guard));
+        }
+        Ok(door::write_held(due.rule, Self::write_at(host)))
+    }
+
+    /// THE WRITE'S GUARDS, judged again on the one `status` read just before it (whose hands
+    /// are on the session, the halt, unread input), the composer's read (a composer the read
+    /// cannot judge is a draft) and the host's `taskless`; `Err` with the guard that holds where
+    /// the read itself says nothing (`Guard::Person`). Every line at a break goes through it: the
+    /// door's ([`Self::door_holds`]) and the stuck fact's (`Session::stuck_break`, through `door::stuck_at_break`).
+    pub(super) fn write_guards(
+        &mut self,
+        screen: &Screen,
+        now: Instant,
+        cfg: &SupervisorConfig,
+        host: &dyn IdleHost,
+    ) -> Result<Result<Guards, Guard>, Fail> {
         let seen = if armed(Fault::DoorSkipsStatus) {
             StatusSeen {
                 human: super::super::screen::HumanInput::Never,
@@ -589,11 +614,11 @@ impl<C: Ctl> Session<'_, C> {
                 return Err(Fail::Lost(format!("status failed: {}", r.stderr.trim())));
             }
             let Some(seen) = r.ok().then(|| StatusSeen::of(&r.stdout)).flatten() else {
-                return Ok(Some(Guard::Person));
+                return Ok(Err(Guard::Person));
             };
             seen
         };
-        let mut guards = self.occupancy_guards(due.now, cfg, &screen.rows);
+        let mut guards = self.occupancy_guards(now, cfg, &screen.rows);
         guards.person |= seen.person(cfg.human_grace_s);
         guards.halted |= seen.halted;
         guards.draft |= seen.input_unread || self.door_draft(screen) != Some(false);
@@ -605,27 +630,29 @@ impl<C: Ctl> Session<'_, C> {
         if armed(Fault::DoorIgnoresDraft) {
             guards.draft = false;
         }
-        let brakes = !armed(Fault::DoorIgnoresBrakes);
-        if !brakes {
+        if armed(Fault::DoorIgnoresBrakes) {
             guards.brake = None;
             guards.memory = false;
             guards.reach_down = false;
         }
-        if let Some(guard) = guards.held(due.rule) {
-            return Ok(Some(guard));
-        }
+        Ok(Ok(guards))
+    }
+
+    /// What the host says at the write, its guards passed: its withhold or wind-down, and
+    /// whether the upgrade's notice is due (asked only where nothing withholds).
+    pub(super) fn write_at(host: &dyn IdleHost) -> AtWrite {
+        let brakes = !armed(Fault::DoorIgnoresBrakes);
         let withheld = brakes && (host.withholds_turn_end() || host.owns_turn_end());
-        let at = AtWrite {
+        AtWrite {
             host_line: false,
             withheld,
             upgrade_due: !withheld && host.upgrade_due(),
-        };
-        Ok(door::write_held(due.rule, at))
+        }
     }
 
     /// Whether the composer the break's screen draws holds a draft: `Some(true)` a draft,
     /// `None` unknown — which the door reads as a draft.
-    fn door_draft(&mut self, screen: &Screen) -> Option<bool> {
+    pub(super) fn door_draft(&mut self, screen: &Screen) -> Option<bool> {
         let reader = self.reader(&screen.rows);
         let reading = reader.read(&screen.rows, Some(screen.cursor_col));
         let (placeholder, hint_fg) = (
@@ -676,6 +703,7 @@ impl<C: Ctl> Session<'_, C> {
             outcome_row(self, Told::Typed);
         }
         let point = self.turn_of(screen.clone());
+        let grant = super::super::config::BreakGrant::Occupancy(grant);
         let why = match self.type_fact(grant, &point, text, rule.name(), review)? {
             Some(Written::Submitted) => None,
             None => Some("unfenced"),
@@ -691,10 +719,8 @@ impl<C: Ctl> Session<'_, C> {
         } else {
             self.turn_end.fact_typed();
         }
-        self.hold
-            .door
-            .facts
-            .told(key, self.hold_wall_ms(due.now_ms));
+        let told_ms = self.hold_wall_ms(due.now_ms);
+        self.facts.state.told(key, told_ms);
         self.hold.door.books.fired(rule, due.now_ms, true);
         self.hold_line(due.seq, Some(cfg), review);
         host.break_taken();
@@ -793,7 +819,12 @@ impl<C: Ctl> Session<'_, C> {
     }
 
     /// The guards, from what the loop holds: nothing is read for them.
-    fn occupancy_guards(&self, now: Instant, cfg: &SupervisorConfig, rows: &[String]) -> Guards {
+    pub(super) fn occupancy_guards(
+        &self,
+        now: Instant,
+        cfg: &SupervisorConfig,
+        rows: &[String],
+    ) -> Guards {
         let reader = self.reader(rows);
         let credits =
             !cfg.usage_credits && (self.credits_kept.is_some() || reader.credits(rows).is_some());
@@ -905,6 +936,17 @@ impl<C: Ctl> Session<'_, C> {
             &rules::held_reason(rule, episode, ordinal, held_ms, hold.declared, guard),
             seq,
         );
+    }
+
+    /// The door's books, which the stuck fact's line obeys the session's pace by.
+    pub(super) const fn hold_books(&self) -> &Books {
+        &self.hold.door.books
+    }
+
+    /// A line of the stuck fact's went at `at_ms` (the clock's): it counts toward the session's
+    /// pace as the door's own lines do.
+    pub(super) fn door_lined(&mut self, at_ms: i64) {
+        self.hold.door.books.lined(at_ms);
     }
 
     /// The hold begun at `since_ms` (the clock's) in unix ms, where the loop placed the wall on
@@ -1036,7 +1078,7 @@ impl<C: Ctl> Session<'_, C> {
             }
         };
         if let HoldChange::Closed { .. } = change {
-            self.hold.door.facts.observe_closed(&[]);
+            self.facts.state.observe_closed(FactKind::Hold, &[]);
         }
         review.note(&format!("OCCUPANCY seq={seq} {words}"));
         let row = match change {

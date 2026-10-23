@@ -125,6 +125,7 @@ fn burst_face(style: GlowStyle, mono: bool, control: Control) -> Vec<Shot> {
         body_allowed: true,
         momentum_glow: true,
         user_tinted: false,
+        accent_pinned: false,
     };
     let probe = |typed: usize| {
         let mut cols = vec![' '; g.cols];
@@ -495,6 +496,7 @@ fn typed_frame(
         body_allowed: true,
         momentum_glow: true,
         user_tinted: false,
+        accent_pinned: false,
     };
     let blank = vec![' '; g.cols];
     let mut tint = 0;
@@ -1304,6 +1306,7 @@ fn a_comet_completion_lays_the_path_length_cuts_under_its_letters() {
             body_allowed: true,
             momentum_glow: true,
             user_tinted: false,
+            accent_pinned: false,
         };
         let blank = vec![' '; g.cols];
         let row_with = |shown: usize| {

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE BUS MIRROR, GUI HALF (`docs/DESIGN-session-log-2026-10-15.md` §5.5, session log phase 4): the two bridge-only verbs a bridge mirrors the session logs with, and what this process keeps for them.
+//! THE BUS MIRROR, GUI HALF (`docs/DESIGN-session-log-2026-10-15.md` §5.5): the two bridge-only verbs a bridge mirrors the session logs with, and what this process keeps for them.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,7 +14,7 @@ use aterm_slog::{
     cover_body,
 };
 
-/// The most closed sessions whose bus tails are kept (ruling Q4).
+/// The most closed sessions whose bus tails are kept.
 pub(crate) const RETIRED_MAX: usize = 512;
 /// The most estimated heap the kept tails take together.
 pub(crate) const RETIRED_BYTES: usize = 16 * 1024 * 1024;
@@ -258,7 +258,7 @@ impl StoreMirror {
         self.shared.served()
     }
 
-    /// A session closed with its log: kept for the bus when its log was ever mirrored, or the node mirrors (it is then engaged from its first record, [`sync`]), and the bus does not hold all of it — judged against its live `ms` head (ruling Q4).
+    /// A session closed with its log: kept for the bus when its log was ever mirrored, or the node mirrors (it is then engaged from its first record, [`sync`]), and the bus does not hold all of it — judged against its live `ms` head.
     pub(crate) fn retire(&self, sid: &str, slog: &mut crate::session_log::SessionLog) {
         #[cfg(test)]
         if self.broken() == Broken::DropTail {
@@ -500,7 +500,7 @@ impl TakeRequest {
     }
 }
 
-/// THE ALIAS OF AN EDGE (ruling Q6): `e` and the first 8 hex digits of HMAC-SHA256(`key`, sid) — stable for a node's key, so one edge is one actor on the bus, and no reader without the key can tell which session it is.
+/// THE ALIAS OF AN EDGE: `e` and the first 8 hex digits of HMAC-SHA256(`key`, sid) — stable for a node's key, so one edge is one actor on the bus, and no reader without the key can tell which session it is.
 pub(crate) fn alias_of(key: &[u8; 16], sid: &ShortId) -> Option<ShortId> {
     let mut mac = aterm_digest::HmacSha256::new_from_slice(key).ok()?;
     mac.update(sid.as_str().as_bytes());

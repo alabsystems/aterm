@@ -40,10 +40,9 @@ fn shell_decodes_code_page(console_cp: u32, creator: Option<&str>) -> bool {
     shell && console_cp != 0 && console_cp != UTF8
 }
 
-/// `text` with aterm's typographic punctuation spelled in ASCII, every other
-/// character as it is. The table is the punctuation aterm's CLI text used
-/// (`--help`, `--version`, `help` and its topics, `doctor` and `agents`, read on
-/// 2026-09-28) with the quote and comparison pairs beside it.
+/// `text` with aterm's typographic punctuation (`·`, the dashes and minus, `…`,
+/// `→`, `←`, `▸`, the curly quotes, `≤`, `≥` and `±`) spelled in ASCII, every
+/// other character as it is (`❯`, `×` and `≈` keep their UTF-8 bytes).
 #[cfg(any(windows, test))]
 fn ascii_punctuation(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -175,8 +174,7 @@ mod tests {
     }
 
     /// Off Windows every stream gets the text as it is: the same bytes, not a
-    /// copy, so `--help`, `--version`, `help` and `doctor` print exactly what they
-    /// printed before this module, `·` and `—` included.
+    /// copy, `·` and `—` included.
     #[cfg(not(windows))]
     #[test]
     fn off_windows_every_stream_gets_the_text_as_it_is() {

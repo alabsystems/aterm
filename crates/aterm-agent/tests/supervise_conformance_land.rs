@@ -125,6 +125,7 @@ fn point(said: &str, at: Seen, worked: Option<Duration>) -> TurnEndReading {
         record_turn: None,
         credits: None,
         repo: at.dirty.then(finding),
+        fact: None,
     }
 }
 

@@ -6714,6 +6714,7 @@ impl Acting {
                 disk_resume: Arc::new(|_, _| "wait:inert".to_string()),
                 disk_board: Acts::inert().disk_board,
                 jobs_board: Acts::inert().jobs_board,
+                leader_lives: Acts::inert().leader_lives,
                 program_check: Acts::inert().program_check,
                 occupancy: Acts::inert().occupancy,
                 occupancy_pace: Acts::inert().occupancy_pace,
@@ -15602,6 +15603,80 @@ fn a_workers_canary_reads_its_own_sessions_stuck_call_from_the_jobs_board() {
         worker("s-hung", Acts::inert().jobs_board).background_jobs(),
         BackgroundEvidence::Unknown
     );
+}
+
+/// THE WORKER'S FACTS ARE EACH OF ITS OWN SESSION'S CALLS THAT MADE NO PROGRESS, PROVED ALIVE
+/// ([`IdleHost::facts`], the hung-call design's R2): of tab 4's rows (session `s-hung`), every
+/// live agent call reading `no_progress`, worst first, each regardless of the call beside them
+/// that makes progress (which keeps the canary's evidence `Unknown`), and only those whose leader
+/// is proved alive at the ask ([`Acts::leader_lives`]): the one quiet longest, whose leader ended
+/// since the view was read, is left out, so is one reborn under its pid since (another birth), and
+/// so is one whose birth was not read. The reading is as of the view, fresh. NEGATIVE CONTROLS: a
+/// view past [`crate::vitals_jobs::JOBS_FRESH`], and a board no view was posted to, read nothing.
+#[test]
+fn a_workers_facts_are_its_sessions_calls_that_made_no_progress_proved_alive() {
+    use aterm_agent::supervise::BackgroundEvidence;
+    use aterm_vitals::jobs::{Consumer, JobRow, JobsView};
+    static BOARD: crate::vitals_jobs::JobsBoard = crate::vitals_jobs::JobsBoard::new();
+    static STALE: crate::vitals_jobs::JobsBoard = crate::vitals_jobs::JobsBoard::new();
+    // Every leader lives at the birth the view read but 503, which ended, and 505, whose pid a
+    // later process took (it lives at another birth).
+    fn lives(pid: u32, birth: u64) -> bool {
+        match pid {
+            503 => false,
+            505 => birth == 99,
+            _ => true,
+        }
+    }
+    let worker = |board: &'static crate::vitals_jobs::JobsBoard| {
+        let mut hooks = hooks(
+            &Arc::new(World::default()),
+            Arc::new(|_: &WorkerJob| BodyEnd::Stopped),
+        );
+        hooks.acts = Acts {
+            jobs_board: board,
+            leader_lives: lives,
+            ..Acts::inert()
+        };
+        idle_host("s-hung", Program::Claude, switched(&on()), hooks)
+    };
+    let row = |consumer, stuck, min, pid, birth: Option<u64>| JobRow {
+        leader: (pid, birth),
+        ..crate::vitals_jobs::tests::call_row(4, consumer, stuck, min, pid, "aterm_gui-e0964a")
+    };
+    let view = Arc::new(JobsView {
+        rows: vec![
+            row(Consumer::Agent, true, 20, 501, Some(11)),
+            row(Consumer::AgentBg, true, 31, 27098, Some(12)),
+            row(Consumer::AgentBg, true, 50, 503, Some(13)),
+            row(Consumer::AgentBg, true, 40, 505, Some(15)),
+            row(Consumer::AgentBg, true, 90, 504, None),
+            row(Consumer::AgentBg, false, 5, 502, Some(14)),
+        ],
+        ..JobsView::default()
+    });
+    let sids = std::collections::BTreeMap::from([(4, "s-hung".to_string())]);
+    BOARD.post(Arc::clone(&view), sids.clone(), Instant::now());
+    let reading = worker(&BOARD).facts().expect("a fresh view");
+    let named: Vec<(u32, Option<u64>, u64)> = reading
+        .no_progress
+        .iter()
+        .map(|c| (c.pid, c.birth, c.quiet_min()))
+        .collect();
+    assert_eq!(named, [(27098, Some(12), 31), (501, Some(11), 20)]);
+    let now_ms = i64::try_from(aterm_time::unix_millis().expect("the clock")).unwrap();
+    assert!(reading.fresh_at(now_ms), "{} at {now_ms}", reading.as_of_ms);
+    assert_eq!(
+        worker(&BOARD).background_jobs(),
+        BackgroundEvidence::Unknown,
+        "the canary's evidence asks every call"
+    );
+    let old = Instant::now()
+        .checked_sub(crate::vitals_jobs::JOBS_FRESH + Duration::from_secs(1))
+        .expect("a clock past the bound");
+    STALE.post(view, sids, old);
+    assert_eq!(worker(&STALE).facts(), None);
+    assert_eq!(worker(Acts::inert().jobs_board).facts(), None);
 }
 
 /// The live measure ([`agent_memory`]) of a real stand-in.

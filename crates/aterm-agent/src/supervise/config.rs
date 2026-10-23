@@ -62,6 +62,8 @@ pub const KEYS: &[&str] = &[
     "upgrade_ask",
     "human_grace_s",
     "occupancy",
+    "facts",
+    "stuck_break_note",
 ];
 
 /// The `[harness]` keys this reader retired.
@@ -226,6 +228,25 @@ pub struct PromptGrant {
     _sealed: (),
 }
 
+/// The proof the hung-call stuck fact may be typed at a break (`[harness] stuck_break_note`,
+/// the hung-call design's R3 and the owner's call O10; the occupancy design's §2.1 rank 4):
+/// [`SupervisorConfig::stuck_break_grant`] alone makes one. Not a [`PromptGrant`], which
+/// [`Occupancy::grant`] alone makes: the two keys grant two lines, whatever `occupancy` says.
+#[derive(Debug)]
+pub struct StuckBreakGrant {
+    _sealed: (),
+}
+
+/// WHICH OWNER'S GRANT a line typed at a break goes under (`Session::type_fact`): the occupancy
+/// door's `prompt` or the stuck fact's key.
+#[derive(Debug, Clone, Copy)]
+pub enum BreakGrant<'g> {
+    /// `[harness] occupancy = "prompt"` ([`Occupancy::grant`]).
+    Occupancy(&'g PromptGrant),
+    /// `[harness] stuck_break_note = true` ([`SupervisorConfig::stuck_break_grant`]).
+    StuckBreak(&'g StuckBreakGrant),
+}
+
 const fn accounts_rank(mode: Mode) -> u8 {
     match mode {
         Mode::Off => 0,
@@ -287,11 +308,11 @@ pub struct SupervisorConfig {
     pub limit_reset: bool,
     /// WHICH KINDS OF LIMIT RESET [`Self::limit_reset`] MAY SPEND, AND IN WHAT ORDER (`[harness] limit_reset_kinds = ["full", "weekly", "5-hour"]`; [`reset_kind_word`] names each kind).
     pub limit_reset_kinds: Vec<ResetKind>,
-    /// The usage tap (`crate::harness::tap`): the footer's live weekly figure and the account-stats recorder; at a usage limit its readings time the continuation (`super::tap_clock`). On by default since the owner's 2026-10-22 *"you also need to fix the weekly budget reporting for claude code harness"*; `false` is a limit.
+    /// The usage tap (`crate::harness::tap`): the footer's live weekly figure and the account-stats recorder; at a usage limit its readings time the continuation (`super::tap_clock`). On by default; `false` is a limit.
     pub usage_tap: bool,
     /// On a machine with no listed Claude Code accounts, track the single account's usage from session screens and raise the digest's two lines from it.
     pub usage_notes: bool,
-    /// CONTINUING ON USAGE CREDITS (owner, 2026-10-19: *"for continuing on credits, that's an optional additional feature that's off by default. use subscriptions."*).
+    /// CONTINUING ON USAGE CREDITS: off by default, so a session stays on its subscription; `true` lets the harness carry a session onto paid usage credits.
     pub usage_credits: bool,
     /// THE LOGIN LIFECYCLE (`[harness] logins`, `"renew"` or `"off"`; `docs/DESIGN-claude-accounts-v2-2026-10-15.md` §5).
     pub logins: bool,
@@ -317,6 +338,18 @@ pub struct SupervisorConfig {
     pub human_grace_s: u32,
     /// What the harness does with a session's measured wait ([`Occupancy`]).
     pub occupancy: Occupancy,
+    /// AN `aterm:` FACT ON A PROMPT THE HARNESS TYPES ANYWAY (`[harness] facts`, system
+    /// awareness §14.4): a continuation, a done check, Land's instruction or its nudge may end
+    /// with one measured fact of the session's own (a background call of the agent's that has
+    /// made no progress), once per episode, only where it fits whole. `false` is a limit: no fact
+    /// rides, and none is typed at a break either.
+    pub facts: bool,
+    /// THE STUCK FACT AT A BREAK (`[harness] stuck_break_note`, the owner's call O10): at a break
+    /// of the agent's own background work, where no turn end comes for a fact to ride, the
+    /// session's untold no-progress fact is typed as one line of its own, once per episode. A
+    /// key whose `true` is more power: it ships `false`, and only the root `[harness]` table's
+    /// `true` turns it on ([`Self::stuck_break_grant`]).
+    pub stuck_break_note: bool,
     /// Safe rules a retired key switched off ([`RETIRED_KEYS`]); no key of its own sets it.
     pub withheld: Withheld,
 }
@@ -450,6 +483,8 @@ impl Default for SupervisorConfig {
             upgrade_ask: false,
             human_grace_s: 120,
             occupancy: Occupancy::Observe,
+            facts: true,
+            stuck_break_note: false,
             withheld: Withheld::default(),
         }
     }
@@ -513,6 +548,8 @@ impl SupervisorConfig {
             "upgrade_ask" => switch!(upgrade_ask),
             "stall_term" => switch!(stall_term),
             "rm_breaker_ask" => switch!(rm_breaker_ask),
+            "facts" => switch!(facts),
+            "stuck_break_note" => switch!(stuck_break_note),
             "approve" => match Approve::parse(value) {
                 Some(a) => self.approve = a,
                 None => return bad(self, "all, safe or none"),
@@ -732,6 +769,8 @@ impl SupervisorConfig {
             "stall_term" => self.stall_term = false,
             "human_grace_s" => self.human_grace_s = 3600,
             "occupancy" => self.occupancy = Occupancy::Off,
+            "facts" => self.facts = false,
+            "stuck_break_note" => self.stuck_break_note = false,
             retired if RETIRED_KEYS.contains(&retired) => {
                 let _ = self.retired(retired, true);
             }
@@ -785,6 +824,18 @@ impl SupervisorConfig {
     #[must_use]
     pub fn autopilot_for(&self, word: Option<Autopilot>) -> Autopilot {
         word.unwrap_or(self.autopilot)
+    }
+
+    /// THE ONE PREDICATE the stuck fact's line at a break passes: a [`StuckBreakGrant`] where the
+    /// owner's root table turned [`Self::stuck_break_note`] on and [`Self::facts`] is not off,
+    /// whatever [`Self::occupancy`] says; nothing otherwise.
+    #[must_use]
+    pub const fn stuck_break_grant(&self) -> Option<StuckBreakGrant> {
+        if self.stuck_break_note && self.facts {
+            Some(StuckBreakGrant { _sealed: () })
+        } else {
+            None
+        }
     }
 
     /// The reader of aterm.toml's `[harness]` table.
@@ -1008,13 +1059,15 @@ impl SupervisorConfig {
             && no_more(!self.upgrade_ask, !before.upgrade_ask)
             && self.human_grace_s >= before.human_grace_s
             && self.occupancy.rank() <= before.occupancy.rank()
+            && no_more(self.facts, before.facts)
+            && no_more(self.stuck_break_note, before.stuck_break_note)
             && (self.withheld.rm_breaker || !before.withheld.rm_breaker)
             && (self.withheld.read_outside_cwd || !before.withheld.read_outside_cwd)
     }
 
     /// Every key's value, in [`KEYS`] order, as the text [`Self::set`] takes back.
     #[must_use]
-    pub fn texts(&self) -> [(&'static str, String); 38] {
+    pub fn texts(&self) -> [(&'static str, String); 40] {
         let Self {
             enabled,
             off: _,
@@ -1055,6 +1108,8 @@ impl SupervisorConfig {
             upgrade_ask,
             human_grace_s,
             occupancy,
+            facts,
+            stuck_break_note,
             withheld: _,
         } = self;
         let path = |p: &Option<PathBuf>| p.as_ref().map(|p| p.display().to_string());
@@ -1106,6 +1161,8 @@ impl SupervisorConfig {
             ("upgrade_ask", upgrade_ask.to_string()),
             ("human_grace_s", human_grace_s.to_string()),
             ("occupancy", occupancy.word().to_string()),
+            ("facts", facts.to_string()),
+            ("stuck_break_note", stuck_break_note.to_string()),
         ]
     }
 
@@ -1835,6 +1892,7 @@ mod tests {
                     | "limit_reset_kinds"
                     | "usage_notes"
                     | "usage_credits"
+                    | "stuck_break_note"
                     | "hosts"
             );
             assert_eq!(c == full, text_key, "{key}: only a text has no limit");
@@ -2501,10 +2559,9 @@ mod tests {
         }
     }
 
-    /// THE USAGE TAP SHIPS ON (owner, 2026-10-22: *"you also need to fix the weekly budget
-    /// reporting for claude code harness"*): no file, an empty table and every other key
-    /// leave it on, `false` in the root table is a limit like any other off, and a misplaced
-    /// off limits all the same.
+    /// THE USAGE TAP SHIPS ON: no file, an empty table and every other key leave it on,
+    /// `false` in the root table is a limit like any other off, and a misplaced off limits
+    /// all the same.
     #[test]
     fn usage_tap_ships_on_and_the_root_tables_off_limits_it() {
         let full = SupervisorConfig::default();
@@ -2838,6 +2895,50 @@ mod tests {
             );
             assert_eq!(read(&text).occupancy, want, "{text:?}");
         }
+    }
+
+    /// THE STUCK FACT'S KEY SHIPS OFF, AND ONLY THE ROOT TABLE GRANTS IT: no
+    /// grant by default; the root table's `true` grants it under every
+    /// occupancy mode, and `facts = false` (a limit, in any table) takes it
+    /// away; a misplaced table's `true`, a repeat that says it again, or any
+    /// other key's `true` or limit grants nothing, and the grant it makes is
+    /// no occupancy `prompt`.
+    #[test]
+    fn the_stuck_break_note_ships_off_and_only_the_root_table_grants_it() {
+        let full = SupervisorConfig::default();
+        assert!(full.facts && !full.stuck_break_note);
+        assert!(full.stuck_break_grant().is_none());
+        for mode in Occupancy::ALL {
+            let on = read(&format!(
+                "[harness]\nstuck_break_note = true\noccupancy = \"{}\"\n",
+                mode.word()
+            ));
+            assert!(on.stuck_break_grant().is_some(), "{mode:?}");
+            assert_eq!(on.occupancy.grant().is_some(), mode == Occupancy::Prompt);
+        }
+        for text in [
+            "[harness]\nstuck_break_note = true\nfacts = false\n",
+            "[harness]\nstuck_break_note = true\n[theme]\nharness.facts = false\n",
+            "[theme]\nharness.stuck_break_note = true\n",
+            "[[keybind]]\nharness.stuck_break_note = true\n",
+            "[a]\nharness.stuck_break_note = true\n[harness]\nfacts = true\n",
+            "[harness]\nstuck_break_note = false\nstuck_break_note = true\n",
+            "[harness]\nstuck_break_note = \"sometimes\"\n",
+        ] {
+            assert!(read(text).stuck_break_grant().is_none(), "{text:?}");
+        }
+        for key in KEYS.iter().filter(|k| **k != "stuck_break_note") {
+            let mut c = full.clone();
+            let _ = c.set(key, "true");
+            assert!(c.stuck_break_grant().is_none(), "{key} = true");
+            c.limit(key);
+            assert!(c.stuck_break_grant().is_none(), "{key} at its limit");
+        }
+        let on = read("[harness]\nstuck_break_note = true\n");
+        assert!(!on.limits(&full) && full.limits(&on));
+        let mut c = on.clone();
+        c.limit("facts");
+        assert!(c.limits(&on) && c.stuck_break_grant().is_none());
     }
 
     #[test]

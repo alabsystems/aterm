@@ -2488,14 +2488,19 @@ pub(super) fn resolve_mailbox_dir(home: Option<&Path>, store: &accounts::Store) 
     None
 }
 
-pub(super) fn has_configured_mailbox_for(
+pub(super) fn has_configured_mailbox_for_row(
     home: Option<&Path>,
     store: &accounts::Store,
+    label: Option<&str>,
     target_email: Option<&str>,
 ) -> bool {
     resolve_mailbox_dir(home, store).is_some()
-        || super::headless_oauth::discover_mailbox_config(home, Some(&store.dir))
-            .is_some_and(|cfg| cfg.is_configured_for(target_email))
+        || super::headless_oauth::discover_mailbox_config(home, Some(&store.dir)).is_some_and(
+            |mut cfg| {
+                cfg.alias_label_to_email(label, target_email);
+                cfg.is_configured_for(target_email)
+            },
+        )
 }
 
 fn latest_mailbox_mtime(
@@ -2504,6 +2509,18 @@ fn latest_mailbox_mtime(
 ) -> Option<std::time::SystemTime> {
     let mut paths = vec![store.dir.join(super::headless_oauth::MAILBOX_TOML_FILE)];
     if let Some(h) = home {
+        let secrets_dir = h.join(".secrets");
+        if let Ok(entries) = std::fs::read_dir(&secrets_dir) {
+            for entry in entries.flatten() {
+                if entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                    paths.push(entry.path());
+                }
+            }
+        }
+        paths.push(secrets_dir);
+        paths.push(h.join(".config/aterm/secrets/state.toml"));
+        paths.push(h.join(".config/aterm/aterm.toml"));
+        paths.push(h.join(".config/aterm/accounts.toml"));
         paths.push(
             h.join(".secrets")
                 .join(super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
@@ -3086,13 +3103,22 @@ fn spawn_row_renewal(
     let store = accounts::Store::at(state_dir);
     let mailbox_dir = resolve_mailbox_dir(Some(home), &store);
     let has_mailbox = mailbox_dir.is_some()
-        || has_configured_mailbox_for(Some(home), &store, next_row.email.as_deref());
-    let has_headless_profile = super::headless_oauth::has_browser_profile(
-        &store.dir,
-        &next_row.label,
-        next_row.email.as_deref(),
-    ) && super::headless_oauth::find_headless_browser(Some(home))
-        .is_some();
+        || has_configured_mailbox_for_row(
+            Some(home),
+            &store,
+            Some(&next_row.label),
+            next_row.email.as_deref(),
+        );
+    let has_headless_profile = logins
+        .get(&next_row.label)
+        .and_then(|b| b.wrong_at)
+        .is_none()
+        && super::headless_oauth::has_browser_profile(
+            &store.dir,
+            &next_row.label,
+            next_row.email.as_deref(),
+        )
+        && super::headless_oauth::find_headless_browser(Some(home)).is_some();
     if !allow_default_browser && next_row.browser.is_none() && !has_mailbox && !has_headless_profile
     {
         return false;
@@ -3129,21 +3155,7 @@ fn spawn_row_renewal(
         permit,
         move || {
             let store = accounts::Store::at(&state_owned);
-            let renewed = (|| {
-                let opener = resolve_opener_link(&home_owned, &store);
-                let browser = if (has_mailbox || has_headless_profile) && opener.is_some() {
-                    super::cli::RenewBrowser::Remote { opener }
-                } else {
-                    match select_auto_renew_browser(
-                        next_row.browser.as_deref(),
-                        mailbox_dir.as_deref(),
-                        opener,
-                    ) {
-                        Some(b) => b,
-                        None if allow_default_browser => super::cli::RenewBrowser::Default,
-                        None => return false,
-                    }
-                };
+            let run_attempt = |browser: &super::cli::RenewBrowser, force_headless: bool| -> bool {
                 let Ok(staging) = store.claim_staging_dir(&next_label) else {
                     return false;
                 };
@@ -3167,7 +3179,7 @@ fn spawn_row_renewal(
                     claude_prog.as_os_str(),
                     &staging_text,
                     &next_email,
-                    &browser,
+                    browser,
                 );
                 cmd.env("HOME", &home_owned)
                     .env(super::open_url::EMAIL_ENV, &next_email)
@@ -3198,7 +3210,7 @@ fn spawn_row_renewal(
                 {
                     cmd.env(super::open_url::MAILBOX_ENV, mailbox);
                 }
-                if !has_mailbox && has_headless_profile {
+                if force_headless {
                     cmd.env(super::headless_oauth::HEADLESS_ENV, "1");
                 }
                 let ran = super::align::capture_bounded(cmd, Duration::from_secs(300), 64 * 1024);
@@ -3225,6 +3237,33 @@ fn spawn_row_renewal(
                     &status_got,
                     now_done,
                 )
+            };
+            let renewed = (|| {
+                let opener = resolve_opener_link(&home_owned, &store);
+                let non_headless_fallback = select_auto_renew_browser(
+                    next_row.browser.as_deref(),
+                    mailbox_dir.as_deref(),
+                    opener.clone(),
+                )
+                .or_else(|| allow_default_browser.then_some(super::cli::RenewBrowser::Default));
+                let browser = if (has_mailbox || has_headless_profile) && opener.is_some() {
+                    super::cli::RenewBrowser::Remote { opener }
+                } else {
+                    let Some(b) = non_headless_fallback.clone() else {
+                        return false;
+                    };
+                    b
+                };
+                if run_attempt(&browser, !has_mailbox && has_headless_profile) {
+                    return true;
+                }
+                if !has_mailbox
+                    && has_headless_profile
+                    && let Some(fallback) = non_headless_fallback
+                {
+                    return run_attempt(&fallback, false);
+                }
+                false
             })();
             let now_done = crate::supervise::limit::unix_now().max(now);
             if let Some(request) = &pin_request {
@@ -6931,9 +6970,39 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
         fs::create_dir_all(&secrets).unwrap();
         fs::write(
             secrets.join(super::super::headless_oauth::SECRETS_MAILBOX_TOML_FILE),
-            "[passwords]\n\"star.m27.3@example.test\" = \"secret-pw\"\n",
+            "webmail_url = \"https://mail.proton.me/u/0/inbox\"\n[passwords]\nm27-3 = \"secret-pw\"\n",
         )
         .unwrap();
+        let arr_cfg = super::super::headless_oauth::MailboxConfig::from_toml_str(
+            r#"
+[[accounts]]
+label = "m27-2"
+email = "sun.m27.2@example.test"
+password = "arr-pw"
+totp = "JBSWY3DPEHPK3PXP"
+
+[passwords]
+"*" = "fallback-pw"
+"#,
+            None,
+        )
+        .expect("parse [[accounts]] and wildcard passwords");
+        assert_eq!(
+            arr_cfg
+                .password_for(Some("sun.m27.2@example.test"))
+                .as_deref(),
+            Some("arr-pw")
+        );
+        assert_eq!(
+            arr_cfg
+                .totp_secret_for(Some("sun.m27.2@example.test"))
+                .as_deref(),
+            Some("JBSWY3DPEHPK3PXP")
+        );
+        assert_eq!(
+            arr_cfg.password_for(Some("other@example.test")).as_deref(),
+            Some("fallback-pw")
+        );
 
         struct RecordingHost {
             tty: bool,
@@ -7035,6 +7104,42 @@ m,email,computer,,claude,Open AI,google,meta,Payment,notes,,
             )],
             "renew --due must skip unconfigured m27-2 and run headless-capable m27-3 with Remote browser"
         );
+
+        let secret_file = w.home.join(".secrets/m27_2_password");
+        fs::write(&secret_file, "secret-m27-2\n").unwrap();
+        let mtime_with_secret = latest_mailbox_mtime(Some(&w.home), &store).expect("mtime");
+        let secret_meta_mtime = fs::metadata(&secret_file).unwrap().modified().unwrap();
+        assert!(
+            mtime_with_secret >= secret_meta_mtime,
+            "latest_mailbox_mtime must include individual secret files under ~/.secrets"
+        );
+        let _ = fs::remove_file(&secret_file);
+
+        // A cached headless browser profile for m27-2 must not be treated as headless-capable
+        // when m27-2 already has wrong_at recorded and no mailbox is configured for m27-2.
+        let m27_2_browser_dir =
+            super::super::headless_oauth::browser_profile_dir(&store.dir, Some("m27-2"));
+        fs::create_dir_all(&m27_2_browser_dir).unwrap();
+        non_tty_host.flows.lock().unwrap().clear();
+        out.clear();
+        err.clear();
+        let code_wrong_profile = super::super::cli::run_accounts(
+            &super::super::cli::AccountsCmd::Renew {
+                labels: vec!["m27-2".to_owned()],
+                due: false,
+                on: None,
+            },
+            &env,
+            &non_tty_host,
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code_wrong_profile, ExitCode::SUCCESS);
+        assert!(
+            non_tty_host.flows.lock().unwrap().is_empty(),
+            "row with wrong_at and no mailbox must not run headless via stale browser profile"
+        );
+        let _ = fs::remove_dir_all(&m27_2_browser_dir);
 
         let status = super::super::align::Captured {
             stdout: br#"{"loggedIn":true,"authMethod":"claude.ai","email":"sun.m27.2@example.test","subscriptionType":"max"}"#.to_vec(),

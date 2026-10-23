@@ -6,13 +6,12 @@
 
 //! The Wayland window.
 //!
-//! LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, LW.7): the window's
-//! objects are made here on first-party `aterm-wayland`'s tables (sctk's `XdgShell::
-//! create_window` made them before), with listeners that record their events in the loop's
-//! inbox: the `xdg_surface`'s configure is acked as it arrives, as sctk acked it. A window
-//! dropped on another thread lets go of its state before it tells the loop it closed, so the
-//! loop's reference is the last and the window's objects are destroyed on the loop's thread,
-//! between dispatches, never while it dispatches their events.
+//! LOCAL PATCH (aterm; docs/AUDIT-third-party-2026-10-15.md, LW.7): the window's objects are
+//! made here on first-party `aterm-wayland`'s tables, with listeners that record their events
+//! in the loop's inbox; the `xdg_surface`'s configure is acked as it arrives. A window dropped
+//! on another thread lets go of its state before it tells the loop it closed, so the loop's
+//! reference is the last and the window's objects are destroyed on the loop's thread, between
+//! dispatches, never while it dispatches their events.
 
 use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
@@ -666,9 +665,9 @@ impl Window {
         None
     }
 
-    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6,
-    /// the Linux half): the window's handles for first-party `aterm_types::native_window`, which
-    /// the GL arm and the CPU presenter read; the opt-in `rwh_06` handle wraps this same answer.
+    /// LOCAL PATCH (aterm; docs/AUDIT-third-party-2026-10-15.md, WC.6): the window's handles as
+    /// first-party `aterm_types::native_window`, which the GL arm and the CPU presenter read; the
+    /// opt-in `rwh_06` handle wraps this same answer.
     #[inline]
     pub fn native_window(&self) -> NativeWindow {
         NativeWindow::Wayland {

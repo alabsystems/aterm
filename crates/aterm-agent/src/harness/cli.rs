@@ -55,10 +55,9 @@ pub fn default_config_path() -> Option<PathBuf> {
 
 /// The usage text: the verbs and the flags.
 pub const USAGE: &str = "\
-aterm harness — read views of the agent harness and live upgrades.
-A window's supervisor acts by default on Claude Code, agy, Muse Code, and Gemini CLI
-tabs (`aterm drive` runs its readers from a terminal). Vendor `codex` is shown, not
-supervised; `codex-alab` supervises itself.
+aterm harness — read views of the agent harness, its accounts, and live upgrades.
+A window's supervisor acts on Claude Code, agy, Muse Code and Gemini CLI tabs by default.
+Vendor `codex` is shown, not supervised; `codex-alab` supervises itself.
 
 USAGE:
     aterm harness usage [--json]                 this session's tokens per model and usage-tap windows
@@ -94,16 +93,16 @@ USAGE:
                                                  show or set the upgrade model priority list
     aterm harness tap                            Claude Code statusLine usage tap (`[harness] usage_tap`)
 
-`hook` and `statusline` are retired no-ops (exit 0) for bridges left by older builds.
+`hook` and `statusline` do nothing and exit 0, so settings that still name them stay harmless.
 
 OPTIONS:
     --state <path>      harness state directory (default: $ATERM_HARNESS_STATE, else
                         <aterm state>/harness/claude-harness)
-    --config <path>     config file for [disk] and beside accounts.toml
-                        (default: $XDG_CONFIG_HOME/aterm/aterm.toml)
+    --config <path>     aterm.toml to read; accounts.toml sits beside it (default:
+                        $XDG_CONFIG_HOME/aterm/aterm.toml, else ~/.config/aterm/aterm.toml)
     --sock <path>       limits: control socket (default: resolved socket)
-    --apply <class>     disk: safelist class to remove (`cargo-targets`; `atpkg-gc` and
-                        `claude-purge` are report-only and name the owning command)
+    --apply <class>     disk: safelist class to remove (`cargo-targets`, `claude-stale-versions`;
+                        `atpkg-gc` and `claude-purge` are report-only and name the owning command)
     --dry-run           upgrade: print each session's next step without typing or signalling
     --status            upgrade: print recorded upgrades without sweeping
     --now               upgrade <sid>: move at first pause (still requires idle, empty draft,
@@ -124,56 +123,62 @@ OPTIONS:
 ";
 
 const HELP_USAGE: &str = "\
-`usage` folds this session's transcript and subagent transcripts
+`usage` folds this session's transcript and its subagent transcripts
 (<session>/subagents/**/agent-*.jsonl) per model, up to a 4 GiB cap (`PREFIX` when hit;
-`complete: false` in `--json` if any subagent transcript could not be read).
-  - From Claude Code's tools (`CLAUDE_CODE_SESSION_ID` or `CLAUDE_PID`): folds that
-    session's transcript. `5h`/`7d` (`windows` in `--json`) come from the usage tap for
-    `CLAUDE_PID` when `[harness] usage_tap` is active; `acct <label>` (`label` in `--json`)
-    resolves from `CLAUDE_PID`'s launch env when `accounts.toml` lists 2+ accounts.
-  - From a Codex tool (`CODEX_THREAD_ID`, when no Claude session is named): folds the
-    root thread's rollout and subagent rollouts under `CODEX_HOME` (else `~/.codex`),
-    skipping forked prefix bursts, and prices tokens at list `usd` (\u{2248}$, never a bill).
-  - Anywhere else: folds the newest transcript in `<claude dir>/projects/<cwd>/*.jsonl`
-    (`CLAUDE_CONFIG_DIR`, else `~/.claude`; relative `CLAUDE_CONFIG_DIR` or `CODEX_HOME`
-    folds nothing).
+`complete: false` in `--json` when the totals are not the whole session's).
+  - Under Claude Code's tools (`CLAUDE_CODE_SESSION_ID` or `CLAUDE_PID`): that session's
+    transcript. `5h`/`7d` (`windows` in `--json`) come from the usage tap's reading for
+    `CLAUDE_PID`; `acct <label>` (`label` in `--json`) comes from `CLAUDE_PID`'s launch env
+    when `accounts.toml` lists 2+ accounts.
+  - Under a Codex tool (`CODEX_THREAD_ID`, no Claude session named): the root thread's
+    rollout and its subagent rollouts under `CODEX_HOME` (else `~/.codex`), forked prefixes
+    skipped, priced at list `usd` (\u{2248}$, never a bill).
+  - Anywhere else: the newest transcript in `<claude dir>/projects/<cwd>/*.jsonl`
+    (`CLAUDE_CONFIG_DIR`, else `~/.claude`). A relative `CLAUDE_CONFIG_DIR` or `CODEX_HOME`
+    folds nothing.
 ";
 
 const HELP_LIMITS: &str = "\
-`limits` reads the session's screen once (`text --json tail=40`) and prints:
-  - `wall=<kind>` and `resets_at=`: the wall the last turn ended on, parsed by the foreground
+`limits` reads the session's screen (`text --json`) and prints:
+  - `wall=<kind>` and `resets_at=`: the wall the last turn ended on, read by the foreground
     program's grammar (Claude Code, agy, Muse Code, Gemini CLI; Codex screens are not read).
   - `windows=`: usage windows painted on screen (Claude Code's `/usage` panel).
-  - `credits=in-use|-`: whether Claude Code's notice reports usage credits carrying the
-    session (under `[harness] usage_credits = false`, supervisor pauses until reset/5h probe).
+  - `credits=in-use|-`: whether Claude Code's notice says usage credits carry the session
+    (the supervisor continues a session on credits only under `[harness] usage_credits = true`).
+  At a wall, when `accounts.toml` lists accounts, a second line (not in `--json`) gives
+  `account=` and `next=`.
 Defaults to `$ATERM_PARENT_SESSION_ID`; exits 2 with neither `@<sid>` nor parent session,
 or 1 if the session cannot be read.
 ";
 
 const HELP_DISK: &str = "\
 `disk` reports reclaimable build directories and caches; it removes nothing by default.
-Removal requires both `disk.apply = true` in `aterm.toml` and `--apply <class>` (refusals
-are journalled to `<state>/disk-ledger.jsonl`). Invalid `aterm.toml` or `[disk]` removal
-keys (`apply`, `target_stale_days`, `auto_free_gib`, `dead_build_dirs`, `idle_build_dirs`,
-`idle_build_days`) disable all manual and automatic removals.
+Removal needs both `disk.apply = true` in `aterm.toml` and `--apply <class>`. Every run
+journals its report, and each removal or refusal, to `<state>/disk.jsonl`. An unreadable or
+invalid `aterm.toml`, or a `[disk]` removal key (`apply`, `target_stale_days`,
+`auto_free_gib`, `dead_build_dirs`, `idle_build_dirs`, `idle_build_days`) of the wrong type
+or below another table's header, turns every manual and automatic removal off.
 
 With no `<build-dir>` arguments, `disk` scans this working directory, `$HOME` checkouts
 and worktrees (2 levels deep), `x.py` stage build dirs, aterm's Rust build cache, and
 Claude Code's temp root on the current volume (never crossing mount points or protected
-macOS/Windows cloud folders).
+macOS/Windows cloud folders). `claude-stale-versions` are the installed Claude Code
+versions other than the live one that no lock or running process holds.
 
 THRESHOLDS (`watch:`):
   - `warn`: max(`disk.warn_free_gib` [default 40 GiB], 8% volume [<=64 GiB], 2 * `room`)
-  - `floor`: max(`disk.auto_free_gib` [default 10 GiB; <=0 disables auto], 5% [<=32 GiB], `room`)
-  - `emergency`: max(4 GiB, 1% volume [<=8 GiB]), capped at `floor`
-  - `room`: 2nd-largest 2h free-space drop in the last 7d (clamped to [min(16 GiB, 5%), 10% <=256 GiB]),
-    or `disk.room_gib`. Volume state is `ok` (>=warn), `low` (<warn), or `short` (<floor).
+  - `floor`: max(`disk.auto_free_gib` [default 10 GiB; <=0 turns it off], 5% [<=32 GiB], `room`)
+  - `emergency`: max(4 GiB, 1% volume [<=8 GiB]), capped at `floor`; or <50,000 free inodes
+  - `room`: the 2nd-largest daily 2h fall of free space over 7 days (clamped to
+    [min(16 GiB, 5%), 10% <=256 GiB]), or `disk.room_gib`.
+  A knob written in `aterm.toml` is read as written; only the defaults follow the volume.
+  Volume state is `ok` (>=warn), `low` (<warn), `short` (<floor), or `emergency`.
 
 WINDOW AUTOMATIC TIERS (cheapest first, re-measuring free space before each item):
   - tier 1 (`low`, `disk.dead_build_dirs = true`): whole scratch/workspace build dirs whose
     owner session or checkout is gone, with signed `CACHEDIR.TAG` and no locks or open files.
   - tier 2 (`low`): idle Cargo profile `incremental/` dirs (idle past `disk.target_stale_days`,
-    default 1d) until free space reaches `warn` (or `floor + 5 GiB` when below floor).
+    default 1d) until free space reaches `warn` (when `short`, `floor + 5 GiB` if higher).
   - tier 3 (`short` or `await sys`, `disk.idle_build_dirs = true`): whole profiles of live
     checkouts idle past `disk.idle_build_days` (default 7d) with no running process or bin link.
   - tier 4 (`short`): recent profile caches (untouched for >=10m and unlocked) until free
@@ -184,109 +189,117 @@ WINDOW AUTOMATIC TIERS (cheapest first, re-measuring free space before each item
 ";
 
 const HELP_TAP: &str = "\
-`tap` is the statusLine command aterm adds to Claude Code relaunch lines when
-`[harness] usage_tap = true` (the default; `false` turns it off). Claude Code pipes its
-usage JSON to `<aterm> harness tap` after each reply and every 10 s; `tap` writes
+`tap` is the statusLine command aterm adds to Claude Code relaunch lines while
+`[harness] usage_tap = true` (the default). Claude Code pipes its usage JSON to
+`<aterm> harness tap` after each reply and every 10 s; `tap` writes
 `<state>/rl/<tab>-<pid>.json` (0600), prints `5h <p>% \u{b7} 7d <p>%`, and exits 0.
-Added only on the machine's own login (the default one, the roster's lone one, or, where
-`accounts.toml` has no lone login, any login it lists) in the default Claude home, when no
-custom `CLAUDE_CONFIG_DIR`, credential, `statusLine`, `disableAllHooks`, `apiKeyHelper`, or
-`--settings` is present; a session started by hand carries it once aterm restarts it in
-place. The window's footer shows that tab's own week from it, or from `/usage`, whichever
-was read later: `weekly <p>% left` for 15 minutes, then with its age
-(`weekly <p>% left \u{b7} 40m ago`), and not past an hour. With none it says why:
-`weekly ? \u{b7} restart tab` (the process carries no tap, and a restart in place, offered
-for it now, would add it), `weekly ? \u{b7} /usage` (no restart would),
+It is added only on the machine's own login (the default one, the roster's lone one, or,
+where `accounts.toml` lists two or more accounts, any login it lists or one a renewal moved
+one of its rows away from; one row's tap follows only its current login) in the default
+Claude home, and only where no custom `CLAUDE_CONFIG_DIR`, credential, `statusLine`,
+`disableAllHooks`, `apiKeyHelper`, `--settings` or `--bare` is present; a session started by
+hand gets it when aterm restarts it in place. The window's footer shows the tab's week from
+the tap or from `/usage`, whichever is newer: `weekly <p>% left` up to 15 minutes old,
+`weekly <p>% left \u{b7} 40m ago` up to an hour, then nothing. Without a figure it says why:
+`weekly ? \u{b7} restart tab` (a restart in place, offered now, would add the tap),
+`weekly ? \u{b7} /usage` (the tap is off, or no restart would add it),
 `weekly ? \u{b7} no reply yet` (tapped, and no reply since it started brought the week),
-`weekly ? \u{b7} no reply 1h` (tapped, and its week is over an hour old), and
-`weekly unavailable` (the account's profile could not be read for this process, so no
-figure from either source is trusted). The account-stats recorder rides on the same
-switch. At a usage limit its figures time the continuation (`usage-resume@v1`) to the reset
-they name, from a reading written since the limit was first read; more than six minutes
-from the notice's reset, the later, with a `tap-reset@v1` ledger row. Switched off, none
-times a wait, and no new relaunch carries it; a session tapped before keeps its row and its
-readings until it is relaunched.
+`weekly ? \u{b7} no reply 1h` (tapped, and its week is over an hour old),
+`weekly unavailable` (no account profile is trusted for this process, so neither figure is:
+the profile could not be read, `accounts.toml` or the store's `logins.json` could not be, or
+the roster has no row for this login, or one with no `email` or another one; only the
+default login, where the roster lists at most one account, needs no `email`).
+The account-stats recorder rides on the same switch, and where `accounts.toml` lists two or
+more accounts the readings feed early rotation (`[harness] accounts = \"early\"`). At a
+usage limit a reading written since the limit was first read times the continuation
+(`usage-resume@v1`) to the reset it names; where it and the notice's reset differ by more
+than six minutes, the later wins and a `tap-reset@v1` ledger row records both. Switched off,
+no new relaunch line carries the tap and no reading times a wait; a session already tapped
+keeps writing readings until it is relaunched.
 ";
 
 const HELP_LEDGER: &str = "\
-`ledger` prints the newest rows (default 20) of a harness jsonl ledger:
+`ledger` prints the newest rows (default 20) of a harness jsonl ledger (`--json`: verbatim):
   - `ledger [@<sid>] [<n>]`: supervisor approval decisions (`<aterm state>/drive/<sid>.jsonl`)
-  - `ledger disk [<n>]`: disk cleanup intents, removals, and denials (`<state>/disk-ledger.jsonl`)
+  - `ledger disk [<n>]`: disk reports, removal intents, removals, and refusals
+    (`<state>/disk.jsonl`)
   - `ledger upgrade [<n>]`: live upgrade steps and owner requests (`<state>/upgrade/ledger.jsonl`)
-  - `ledger accounts [<n>]`: account walls, samples, rotations, pins, and auth checks (`<state>/accounts/ledger.jsonl`)
+  - `ledger accounts [<n>]`: account walls, samples, rotations, pins, and auth checks
+    (`<state>/accounts/ledger.jsonl`)
 ";
 
 const HELP_ACCOUNTS: &str = "\
 `accounts` manages Claude Code logins on this machine and reports rotation state.
 The roster is `accounts.toml` beside `aterm.toml`: `[[account]]` rows with `label`,
 `class` (`dedicated` or `shared`), optional `dir` (the one row without `dir` is the
-machine's default login), and optional `email` and `browser`. Invalid rosters are refused
-whole (exit 1). No credentials or emails are ever printed or logged.
+machine's default login), and optional `email` and `browser`. An invalid roster is
+refused whole (exit 1). The report prints no credential or email.
 
 REPORT & ROTATION (`[harness] accounts = \"early\" | \"wall\" | \"off\"`):
-  Prints `active: <label>, N of M sessions on it`, one row per account (`not-enrolled`,
-  `signed-out`, `limited until <time>`, `low`, `usable`, or `unseen`; `active`,
-  `active:unproven`, or `pinned`; `offer:`; `on:`), and `next:`.
+  Prints `active: <label>, N of M sessions on it`; a row per account with its condition
+  (`not-enrolled`, `signed-out`, `limited until <time>`, `low`, `usable`, or `unseen`), its
+  mark (`active`, `active:unproven`, `pinned`, or `-`), and `offer:`, `credits:`,
+  `warned:`, `on:` and `login:` where they apply; then `next:` and `not next:`.
   - Under `early` (default), the supervisor rotates sessions at turn end off a limited or
-    `low` account (>=90% 5h or >=97% week with >15m to reset), and probes `/usage` on idle
+    `low` account (>=90% 5h or >=98% week, with >15m to reset), and probes `/usage` on idle
     full-screen sessions (at most once per 3m per account).
   - Under `wall`, sessions rotate only when a turn ends on a usage limit.
-  - Under `off`, Limits are still recorded, but the supervisor never rotates sessions.
+  - Under `off`, limits are still recorded, but the supervisor never rotates sessions.
 
 LIMIT RESET (`[harness] limit_reset = true`, default false):
-  At Claude Code's usage-limit dialog on the machine's default login (with no other account
-  active in the last 25h, and limit >24h or offer expiring within 24h), the supervisor
-  selects the matching reset row and confirms it, recording `reset-used`, `reset-kept`, or
-  `reset-failed` from the transcript.
+  At Claude Code's usage-limit dialog on the machine's default login (no other account run
+  since 25h before the session started, and a limit >24h away or an offer expiring within
+  24h), the supervisor selects the matching reset row and confirms it, recording
+  `reset-used`, `reset-kept`, or `reset-failed` from the transcript.
 ";
 
-const HELP_ACCOUNTS_VERBS: &str = "\
+const HELP_ACCOUNTS_VERBS: &str = "\n\
 VERBS:
   - `accounts add <label> [--shared] [--email <e>] [--browser <b>]`
     Creates `<state>/accounts/logins/<label>` (0700) and appends the row to `accounts.toml`
-    (also enrolling the default login as `main` on the first `add`). Labels match
-    `[a-z0-9][a-z0-9._-]{0,63}` (not `help`). Rows stay `not-enrolled` until signed in.
+    (the first `add` also lists the default login as `main`). Labels match
+    `[a-z0-9][a-z0-9._-]{0,63}` (not `help`). A row stays `not-enrolled` until signed in.
   - `accounts adopt-default <label> --email <e> [--browser <b>]`
     Lists the machine's default login (no `dir`) as a renewable row.
   - `accounts login <label>`
-    Runs `CLAUDE_CONFIG_DIR='<dir>' claude auth login` in a terminal, then verifies once
+    Runs `CLAUDE_CONFIG_DIR='<dir>' claude auth login` in a terminal, then checks once
     with `claude auth status --json` (20 s cap) under `CLAUDE_SECURESTORAGE_CONFIG_DIR`
-    and records `signed in` (exit 0) or failure (exit 1). Refuses rows that carry `email`
+    and records `signed in` (exit 0) or the failure (exit 1). Refuses a row with `email`
     (use `accounts renew`).
   - `accounts renew [--due | <label>...] [--on <host>,... | --here]`
-    Signs in rows with `email` via a staging dir (`<label>+<n>`), verifies the account
-    email matches, and binds the row in `<state>/accounts/logins.json` so sessions move
-    at their next idle turn end (`wrong-account` deletes the staging dir and changes
+    Signs in rows with `email` through a staging dir (`<label>+<n>`), checks that the
+    account email matches, and binds the row in `<state>/accounts/logins.json` so sessions
+    move at their next idle turn end (`wrong-account` deletes the staging dir and changes
     nothing). Then runs `ssh -t <host> aterm harness accounts renew --due --here` on each
-    host in `--on` (or `[harness] hosts` under `--due`, skipped with `--here`).
+    host in `--on` (or `[harness] hosts` under `--due`; none with `--here`).
   - `accounts use <label> | --auto`
-    Pins an enrolled, signed-in account (clearing its recorded limits) or clears the pin
-    (`--auto`).
+    Pins an enrolled account that is not signed out (clearing its recorded walls), or
+    clears the pin (`--auto`).
   - `accounts stats [--json]`
     Reads 5h, week, and Fable windows, plan, credits, 8-day list-price spend (\u{2248}$), login
     state, and running sessions for the current home (`--json` is schema 1 `account-stats`).
   - `accounts sync [<source>] [--machine <mN>] [--json]`
     Synchronizes this machine's `accounts.toml` and `fleet-accounts.toml` from `<source>` (a
-    file, `~/` the home's; or an http(s) URL fetched with curl, a Sheets `/edit` link as its
-    CSV export; an `rclone:<remote>:<path>` source is refused, since aterm runs no rclone),
-    else from the source this machine configured. With none it reads nothing and exits 1:
-    there is no default source. Waits at most 10 s for the accounts lock, then fails and
-    syncs nothing.
+    file, `~/` for the home; an http(s) URL fetched with curl, a Sheets `/edit` link read as
+    its CSV export; an `rclone:<remote>:<path>` source is refused), else from the source
+    this machine configured. With neither it reads nothing and exits 1. It waits at most
+    10 s for the accounts lock, then fails and syncs nothing.
   - `accounts serve [<source>] [--bind <addr:port>] [--machine <mN>]`
     Serves the LAN account rotation dashboard and `fleet-accounts.toml` (default
     `127.0.0.1:8741`) from the same source.
 
 FLEET ACCOUNTS (off unless this machine names a source):
-  - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, or by running
-    `accounts sync <source>` once (its `fleet-accounts.toml` then says `opt_in = \"named\"`).
-    A `fleet-accounts.toml` without that line (every one aterm 0.112.0 to 0.115.0 wrote from
-    their built-in source) opts nothing in. To opt out, remove the key and delete
-    `fleet-accounts.toml`.
-  - Where a source is configured, a window run under this account's own HOME syncs a
-    missing `accounts.toml` (one try in 10 minutes) and signs a walled login's successor in
-    in the background (`claude auth login --claudeai --email <row's email>`, answered from
-    `<state>/accounts/mailbox` where that folder exists). An instance with a scratch HOME or
-    a private state root (every test's) keeps no fleet accounts.
+  - Opt in with `[fleet] accounts_source = \"<source>\"` in aterm.toml, by running
+    `accounts sync <source>` once (its `fleet-accounts.toml` then says `opt_in = \"named\"`),
+    or by keeping `fleet-accounts.toml`, `ai-accounts.csv`, `ai-mailbox.toml` or
+    `mailbox.toml` in `~/.secrets/`, which a window syncs from. A `fleet-accounts.toml`
+    without `opt_in = \"named\"` opts nothing in. To opt out, remove the key, delete
+    `fleet-accounts.toml`, and move those `~/.secrets/` files away.
+  - Where a source is configured, a window running under this account's own HOME syncs a
+    missing `accounts.toml` (at most once in 10 minutes) and starts a walled login's
+    successor's sign-in in the background (`claude auth login --claudeai --email <row's
+    email>`, answered from `<state>/accounts/mailbox` where that folder exists). An instance
+    with a scratch HOME or a private state root keeps no fleet accounts.
   - Where none is, the window fetches and starts nothing and logs
     `accounts-upkeep=unconfigured` once (`fleet-file=ignored` where a fleet file opts nothing
     in). `accounts renew` by hand needs no source.
@@ -294,18 +307,18 @@ FLEET ACCOUNTS (off unless this machine names a source):
 
 const HELP_UPGRADE: &str = "\
 `upgrade` moves live supervised sessions onto a newer build (and newer model) in place,
-preserving the conversation and running work.
+keeping the conversation and running work.
 
 MODES:
   - Quiet mode (`[harness] upgrade_ask = false`, default): waits for a genuinely idle point
-    (turn over, no child shell/background task/subagent/workflow, no box, empty draft,
-    nobody at the tab, and ladder settle), sends SIGTERM, types the relaunch line with
+    (turn over; no child shell, background task, subagent or workflow; no box; empty draft;
+    nobody at the tab; the ladder's settle), sends SIGTERM, types the relaunch line with
     `--resume <session>`, and resumes without typing a prompt (`done:resumed`;
     `wait:notice-shown` before the move).
   - Cooperative mode (`[harness] upgrade_ask = true`): types a readiness notice asking the
-    agent to finish background work and confirm readiness. Repeats every 30m up to 4
-    notices before resting 2h (then 4h, 8h) and re-arming (`rearmed:<why>`). Never types
-    into a session at a usage limit.
+    agent to finish background work and confirm. It repeats every 30m, up to 4 notices,
+    then rests 2h (then 4h, 8h) and re-arms (`rearmed:<why>`). It never types into a
+    session at a usage limit.
 
 THE LADDER (activity delays, never disables):
   - <20m behind (`prefer`): screen still 20 s, no human input within `[harness] human_grace_s`.
@@ -318,25 +331,25 @@ THE LADDER (activity delays, never disables):
 SCOPE & EXIT CODES:
   - Moves only foreground jobs on an aterm tab's own PTY (tmux/screen/ssh panes wait as
     `held-back:<owner>`; wrapper scripts refuse).
-  - Model upgrades (`aterm harness upgrade models`) ride the relaunch line via `--model`
-    to the newest model of the same family (or up the priority list).
+  - Model upgrades (`aterm harness upgrade models`) ride the relaunch line as `--model`:
+    the newest model of the same family, or the next one up the priority list.
   - Muse Code (`muse resume <uuid>`) and agy (`agy --conversation=<uuid>`) are moved by the
     window in quiet mode only; Codex and Gemini CLI are never moved live.
-  - Hand-run sweeps exit 0, 1 (refused/unwritable), or 75 (`step=busy:another-sweep`).
+  - Hand-run sweeps exit 0, 1 (`[harness] enabled` off, or the sweep lock cannot be made),
+    2 (no home directory), or 75 (`step=busy:another-sweep`).
 ";
 
 const HELP_UPGRADE_STATUS: &str = "\
 `upgrade --status` prints recorded upgrades for live sessions without sweeping:
-  - `pending_for=`, `wait=`, `wait_for=`: time behind and current wait (`settling`,
-    `awaiting-ready`, `ready-unrecorded`, `superseded`, `background`, `draft`, `attended`,
-    `held`, `terminal:<owner>`, `not-idle:busy`, `not-idle:waiting`, `status-stale:<status>`,
-    `release:<gate>`).
+  - `pending_for=`, `wait=`, `wait_for=`: time behind and the current wait (among them
+    `settling`, `awaiting-ready`, `ready-unrecorded`, `superseded`, `background`, `draft`,
+    `attended`, `held`, `terminal:<owner>`, `not-idle:busy`, `not-idle:waiting`,
+    `status-stale:<status>`, `release:<gate>`).
   - `request=`: owner request (`-`, `now`, `defer:<left>`, `skip:<version>`).
   - `next_round=`: time until a stopped round re-arms (`due` when ready, `-` otherwise).
   - `stalled=`: `-` while healthy, else `refused:<why>`, `failed:<why>`, `held-back:<owner>`,
-    `stuck:<exiting|exited|relaunched>` (>5m in restart), `blocked:<wait>` (>30m on
-    `no-shell-integration` or `screen-unreadable`), `unwatched` (>1h without a host look),
-    or `overdue` (>6h behind, or >1h past a usage-limit reset).
+    `stuck:<exiting|exited|relaunched>` (>5m in restart), `unwatched` (>1h without a host
+    look), or `overdue` (>6h behind, >1h past a usage-limit reset, or a notice refused for 90m).
   - `held_by=`: child processes (`<pid>(<name>:<age>),...` or `-`).
   - `release=`: release line owed after an abandoned notice (`gave-up`, `void`, `skipped`,
     `deferred`, `retargeted`, or `-`).
@@ -355,12 +368,12 @@ const HELP_UPGRADE_STATUS: &str = "\
 const HELP_UPGRADE_WORD: &str = "\
 OWNER REQUESTS (`upgrade <sid> --now | --defer <dur> | --skip`):
   Written under the upgrade lock (waits up to 10 s, else exits 75) as `requested:<word>`
-  on the ledger and wakes the tab's worker.
-  - `--now`: jumps to the `land` rung and immediately re-arms a round that gave up (exits 1
-    if the upgrade was refused/failed, is held in a multiplexer pane, or is already
-    restarting).
+  on the ledger; it wakes the tab's worker. It exits 1 when no upgrade is recorded for the
+  tab or its restart is already under way.
+  - `--now`: jumps to the `land` rung and re-arms a round that gave up (exit 1 for a round
+    stopped any other way); a session in a multiplexer pane is recorded, with a note.
   - `--defer <dur>`: holds the upgrade for `<dur>` (up to 30d) and cancels any open notice.
-  - `--skip`: holds the session on its current build until a newer target build arrives.
+  - `--skip`: keeps the session on its current build until a newer target build arrives.
 ";
 
 const HOME_VAR: &str = accounts::HOMEDIR_ENV;
@@ -734,20 +747,21 @@ fn help_reset(takes: impl Fn(ResetKind) -> bool, anchors: &[Anchor]) -> String {
         }
     });
     let mut text = String::from(
-        "FROM CLAUDE CODE 2.1.304 the dialog draws a row for each kind of reset on offer (`Use a\n\
-         <kind> (<n> left, until <day>)`).",
+        "  The dialog draws a row for each kind of reset on offer (`Use a <kind> (<n> left,\n  \
+         until <day>)`).",
     );
     if taken.is_empty() {
         text.push_str(" The supervisor takes no such row.");
     } else {
         text.push_str(
-            " By default the supervisor takes one only where it is\nthe ONE reset on offer and names ",
+            " By default the supervisor takes one only where it is\n  \
+             the only reset on offer and is ",
         );
         text.push_str(&some(&taken));
         text.push('.');
     }
     if !left.is_empty() {
-        text.push_str("\nIt leaves ");
+        text.push_str("\n  It leaves ");
         text.push_str(&some(&left));
         text.push_str(" to you.");
     }
@@ -757,18 +771,17 @@ fn help_reset(takes: impl Fn(ResetKind) -> bool, anchors: &[Anchor]) -> String {
             .map(|kind| format!("\"{}\"", crate::supervise::config::reset_kind_word(*kind)))
             .collect();
         text.push_str(&format!(
-            "\nA dialog that offers several kinds gets its wait row, as with the key off, unless you\n\
-             name the kinds it may spend, first preferred: `[harness] limit_reset_kinds = [{}]`\n\
-             takes the row of the first listed kind on offer, whatever else is offered, and never\n\
-             an unlisted kind.",
+            "\n  Where several kinds are on offer it takes the wait row, unless\n  \
+             `[harness] limit_reset_kinds = [{}]` names the kinds it may spend,\n  \
+             best first: then it takes the first listed kind on offer, and never an unlisted one.\n  \
+             It presses Enter on a row only where the screen read after the arrow keys shows\n  \
+             that row selected.",
             words.join(", ")
         ));
     }
     text.push_str(
-        " A row is entered only where the screen read after the arrow keys still\n\
-         shows it as the row the rule takes.\n\
-         NEVER RUN AGAINST A REAL WALL: none of it was seen on a screen; every text of it was read\n\
-         in Claude Code",
+        "\n  Untested on a real wall: every text it reads comes from\n  \
+         Claude Code",
     );
     if builds.is_empty() {
         text.push_str("'s bundle.\n");
@@ -3993,8 +4006,8 @@ fn upgrade_line_with(
 }
 
 /// What `accounts use` says once the owner's word is recorded.
-pub const ACCOUNTS_USE_RECORDED: &str = "recorded: supervisor moves Claude Code sessions to it \
-                                         at the next turn end (or continues one waiting at its limit)";
+pub const ACCOUNTS_USE_RECORDED: &str = "recorded: the supervisor moves Claude Code sessions to \
+                                         it at their next turn end, and continues one waiting at its limit";
 
 const ACCOUNTS_ADD_LINE: &str = "aterm harness accounts add <label>";
 
@@ -4206,12 +4219,14 @@ fn renew_flow_of(
                     .and_then(|n| n.to_str())
                     .and_then(|s| s.rsplit_once('+').map(|(l, _)| l))
                     .unwrap_or("default");
-                let has_mailbox = super::accounts_sync::has_configured_mailbox_for(
+                let has_mailbox = super::accounts_sync::has_configured_mailbox_for_row(
                     user_home.as_deref(),
                     &store,
+                    Some(label),
                     Some(email),
                 );
-                if !has_mailbox
+                if matches!(browser, RenewBrowser::Remote { .. })
+                    && !has_mailbox
                     && super::headless_oauth::has_browser_profile(&store.dir, label, Some(email))
                 {
                     cmd.env(super::headless_oauth::HEADLESS_ENV, "1");
@@ -6029,11 +6044,21 @@ fn run_accounts_renew(
     let mailbox_dir = super::accounts_sync::resolve_mailbox_dir(env.home.as_deref(), &store);
     let has_headless_browser =
         super::headless_oauth::find_headless_browser(env.home.as_deref()).is_some();
-    let row_can_run_headless = |label: &str| {
+    let row_has_mailbox = |label: &str| {
         let em = roster.row(label).and_then(|r| r.email.as_deref());
         mailbox_dir.is_some()
-            || super::accounts_sync::has_configured_mailbox_for(env.home.as_deref(), &store, em)
+            || super::accounts_sync::has_configured_mailbox_for_row(
+                env.home.as_deref(),
+                &store,
+                Some(label),
+                em,
+            )
+    };
+    let row_can_run_headless = |label: &str| {
+        let em = roster.row(label).and_then(|r| r.email.as_deref());
+        row_has_mailbox(label)
             || (has_headless_browser
+                && logins.get(label).and_then(|b| b.wrong_at).is_none()
                 && super::headless_oauth::has_browser_profile(&store.dir, label, em))
     };
     if due {
@@ -6101,14 +6126,8 @@ fn run_accounts_renew(
             continue;
         };
         let own_dir = file_roster.row(label).and_then(|r| r.dir.as_deref());
-        let browser = if host.under_ssh() || row_can_run_headless(label) {
-            RenewBrowser::Remote {
-                opener: opener
-                    .get_or_insert_with(|| opener_link(&store, host))
-                    .clone(),
-            }
-        } else {
-            match row.browser.as_deref() {
+        let interactive_browser =
+            |opener: &mut Option<Option<PathBuf>>| match row.browser.as_deref() {
                 None => RenewBrowser::Default,
                 Some(profile) => match opener.get_or_insert_with(|| opener_link(&store, host)) {
                     Some(link) => RenewBrowser::Profile {
@@ -6117,9 +6136,23 @@ fn run_accounts_renew(
                     },
                     None => RenewBrowser::Default,
                 },
+            };
+        let used_headless_profile_only =
+            !host.under_ssh() && !row_has_mailbox(label) && row_can_run_headless(label);
+        let browser = if host.under_ssh() || row_can_run_headless(label) {
+            RenewBrowser::Remote {
+                opener: opener
+                    .get_or_insert_with(|| opener_link(&store, host))
+                    .clone(),
             }
+        } else {
+            interactive_browser(&mut opener)
         };
-        let renewal = renew_one(env, host, &store, row, own_dir, &browser, out, err);
+        let mut renewal = renew_one(env, host, &store, row, own_dir, &browser, out, err);
+        if renewal != Renewal::Renewed && used_headless_profile_only && host.stdin_is_terminal() {
+            let fallback = interactive_browser(&mut opener);
+            renewal = renew_one(env, host, &store, row, own_dir, &fallback, out, err);
+        }
         ok &= renewal == Renewal::Renewed;
     }
     for (machine, aterm) in &machines {

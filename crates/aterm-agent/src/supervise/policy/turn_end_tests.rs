@@ -90,6 +90,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         screen_mark: None,
         worked,
         rules: None,
+        fact: None,
         pending_input: false,
         interrupted: false,
         restartable: true,
@@ -4742,6 +4743,73 @@ fn a_box_kept_over_gemini_clis_composer_is_never_typed_at() {
             TurnEndAction::Type { .. }
         ),
         "the control: the composer at rest is continued"
+    );
+}
+
+/// A no-progress fact a reading may carry ([`crate::supervise::facts`]).
+fn hung_fact() -> crate::supervise::facts::Fact {
+    crate::supervise::facts::Fact {
+        key: crate::supervise::facts::EpisodeKey::no_progress(27098, 7),
+        text: "shell task bplle5dxj (pid 27098) has made no progress for 31 min".to_string(),
+        as_of_ms: 0,
+    }
+}
+
+/// A FACT RIDES THE PROMPT THE POLICY TYPES ANYWAY, AFTER ITS STANDING RULES, WHOLE OR NOT AT
+/// ALL, AND NEVER AN ANSWER (system awareness §14.4): the continuation carries
+/// ` (aterm: <fact>)` after its rules; rules long enough that the fact would pass the verbatim
+/// limit leave the continuation as it was, the rules cut no further for it; the answer decided
+/// at a question carries nothing.
+#[test]
+fn a_fact_rides_the_continuation_whole_and_never_an_answer() {
+    let now = t0();
+    let fact = hung_fact();
+    let carrying = |r: &TurnEndReading| TurnEndReading {
+        fact: Some(fact.clone()),
+        ..r.clone()
+    };
+    let mut r = idle("Added the flag; the parser is next.", Some(3 * MIN));
+    r.rules = Some("commit after each stage".to_string());
+    let plain = at(&mut TurnEndState::default(), &r, now);
+    let TurnEndAction::Type {
+        text,
+        rule_id: RULE_CONTINUE,
+    } = &plain
+    else {
+        panic!("{plain:?}");
+    };
+    assert_eq!(
+        at(&mut TurnEndState::default(), &carrying(&r), now),
+        TurnEndAction::Type {
+            text: format!("{text} (aterm: {})", fact.text),
+            rule_id: RULE_CONTINUE,
+        }
+    );
+    let off = SupervisorConfig {
+        facts: false,
+        ..cfg()
+    };
+    let mut st = TurnEndState::default();
+    st.observe(&carrying(&r), now);
+    assert_eq!(
+        decide_turn_end(&st, &carrying(&r), &off, now),
+        plain,
+        "facts = false: none rides"
+    );
+    r.rules = Some("word ".repeat(150).trim_end().to_string());
+    let long = at(&mut TurnEndState::default(), &r, now);
+    assert!(matches!(long, TurnEndAction::Type { .. }), "{long:?}");
+    assert_eq!(
+        at(&mut TurnEndState::default(), &carrying(&r), now),
+        long,
+        "all or nothing"
+    );
+    let asks = idle("Should I add the flag or the option?", Some(3 * MIN));
+    let answer = at(&mut TurnEndState::default(), &asks, now);
+    assert!(answer.rule_id().is_some_and(is_answer_rule), "{answer:?}");
+    assert_eq!(
+        at(&mut TurnEndState::default(), &carrying(&asks), now),
+        answer
     );
 }
 

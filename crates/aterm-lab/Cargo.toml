@@ -90,6 +90,10 @@ atpkg = { workspace = true }
 aterm-bootstrap-verify = { workspace = true }
 
 [dev-dependencies]
+# `trail-gallery burst`'s key schedule is checked against the flying kitty's
+# own summon (`kitty_cursor::CursorCat` on the typing momentum): the model the
+# scenario is paced for, not a copy of its constants.
+aterm-effects = { workspace = true }
 # The tests' one-minute hang detector and the unclocked first exec of a script
 # a test just wrote (`aterm_spec::wait`): the gemini/agy launch fixture.
 aterm-spec = { workspace = true }

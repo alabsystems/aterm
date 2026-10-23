@@ -1330,6 +1330,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
         let label = super::headless_oauth::infer_account_label_from_env();
         let mailbox_cfg =
             super::headless_oauth::discover_mailbox_config(home.as_deref(), store_dir.as_deref())
+                .map(|mut cfg| {
+                    cfg.alias_label_to_email(label.as_deref(), resolved_email.as_deref());
+                    cfg
+                })
                 .filter(|cfg| has_mailbox_env || cfg.is_configured_for(resolved_email.as_deref()));
         if let Some(cfg) = mailbox_cfg {
             match authorize_with_mailbox_config(
@@ -1347,7 +1351,7 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                     }
                 }
             }
-        } else {
+        } else if force_headless || profile.as_deref().is_none_or(|p| p.trim().is_empty()) {
             let has_saved_profile = store_dir.as_deref().is_some_and(|s| {
                 super::headless_oauth::has_browser_profile(
                     s,
@@ -1364,14 +1368,10 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
                     AUTHORIZE_TIMEOUT,
                 ) {
                     Ok(()) => return ExitCode::from(0),
-                    Err(why)
-                        if force_headless
-                            || profile.as_deref().is_none_or(|p| p.trim().is_empty()) =>
-                    {
+                    Err(why) => {
                         eprintln!("{OPENER}: not authorized: {why}");
                         return ExitCode::from(1);
                     }
-                    Err(_) => {}
                 }
             }
         }

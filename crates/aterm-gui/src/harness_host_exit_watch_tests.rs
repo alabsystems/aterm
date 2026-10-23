@@ -71,6 +71,11 @@ fn panicking_host_hooked(
     tweak(&a, &mut h);
     let host = HostHandle::start(on(), false, false, h);
     a.attached(&host, "s-a");
+    // The agent reads as read inside the snapshot hook, before the worker keeps the snapshot a
+    // restarted host arms its exit watch on.
+    until("the carried worker's snapshot kept", || {
+        kept_of(&host, |k| k.snapshot.is_some()).unwrap_or(false)
+    });
     host.shared
         .kept
         .lock()

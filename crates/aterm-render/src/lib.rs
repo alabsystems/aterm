@@ -1311,6 +1311,11 @@ pub struct Renderer {
     keep_spans_scratch: Vec<(usize, usize)>,
     curl_scratch: Vec<(usize, usize, usize, usize, usize, usize, u32)>,
     ligature_break_scratch: Vec<usize>,
+    /// The frame's under-text bodies' boxes ([`knock_rects`]), resident.
+    knock_scratch: Vec<[i32; 4]>,
+    /// [`Renderer::set_knock_out`]: a test's negative control.
+    #[cfg(any(test, debug_assertions))]
+    knock_off: bool,
     color_chain: Vec<ColorFace>,
     color_font_paths: Vec<String>,
     runtime_fallback: RuntimeFallback,
@@ -6245,6 +6250,11 @@ impl Renderer {
             keep_spans_scratch: Vec::new(),
             curl_scratch: Vec::new(),
             ligature_break_scratch: Vec::new(),
+            // Resident from the start: a first body under the text knocks
+            // its letters out without allocating (`free_sprite_alloc`).
+            knock_scratch: Vec::with_capacity(KNOCK_SCRATCH_RESIDENT),
+            #[cfg(any(test, debug_assertions))]
+            knock_off: false,
             color_chain: Vec::new(),
             color_font_paths: Vec::new(),
             runtime_fallback: RuntimeFallback::default(),
@@ -11866,6 +11876,7 @@ impl Renderer {
             }
         }
         self.stamp_free_sprites(pixels, w, h, input, rows.clone(), FreeZ::UnderText);
+        self.knock_out_under_text(pixels, w, input, rows.clone(), base.is_some(), dirty);
         self.draw_fx(pixels, w, h, input, FxSlot::Under, FxBlend::Linear, dirty);
         self.draw_trail(pixels, w, h, input, dirty);
         self.draw_glow_under(pixels, w, h, input, dirty);
@@ -11878,6 +11889,249 @@ impl Renderer {
             }
             self.render_row_fg(ic, pixels, w, h, input, r, &ctx);
             self.fg_clip.0 = i32::MIN;
+        }
+    }
+
+    /// THE KNOCK-OUT: letters on a companion's body read against the page.
+    /// A body drawn under the text ([`FreeZ::UnderText`]: the pet, its
+    /// departures, the idle cat) is knocked out under every glyph that lies
+    /// on it: the glyph's coverage, dilated by one pixel
+    /// ([`KNOCK_DILATE_OFFSETS`]), is stamped in the colour the background
+    /// pass painted under the cell, over the body and before any trail
+    /// draws. The ink then reads against the page, ringed by a one-pixel
+    /// hairline of page, whatever the coat; where no body lies the stamp
+    /// lays the page on the page. It holds while the body is there and
+    /// never comes and goes: a flight keeps its whole silhouette from its
+    /// gather to its landing, a resting cat keeps its full body, and no
+    /// letter under either reads against fur (2026-10-22, the trail
+    /// gallery's `burst`: 1.3 to 4.4:1 under a resting or flying body).
+    /// A cell the background pass left to a wallpaper has no page colour
+    /// here and keeps its body; the GPU builds the same stamps
+    /// (`aterm-gpu`'s glyph-knock stream). The stamp sets the page's colour
+    /// only: each pixel keeps the transmittance it had ([`knock_blend`]), so
+    /// on a translucent window the page round a glyph off the body stays
+    /// glass, where a stamp in the opaque page drew a solid glyph-shaped
+    /// outline round every letter the body's box touched, even under an
+    /// all-transparent body (2026-10-23, review).
+    fn knock_out_under_text<I>(
+        &mut self,
+        pixels: &mut [u32],
+        w: usize,
+        input: &RenderInput,
+        rows: I,
+        wallpaper: bool,
+        dirty: Option<&[bool]>,
+    ) where
+        I: Iterator<Item = usize>,
+    {
+        #[cfg(any(test, debug_assertions))]
+        if self.knock_off {
+            return;
+        }
+        let mut knocks = std::mem::take(&mut self.knock_scratch);
+        knocks.clear();
+        knocks.extend(knock_rects(
+            &input.free_sprites,
+            self.pad as i32,
+            self.grid_top() as i32,
+        ));
+        if !knocks.is_empty() {
+            let sel = self.selection_palette(input);
+            for r in rows {
+                let ctx = self.row_ctx(input, r, sel);
+                let ch = self.cell_h as i32;
+                // Never into a band this composite does not repaint: its
+                // ink is already drawn and a stamp there would erase it.
+                let clip = (
+                    if dirty.is_some_and(|d| r > 0 && !d[r - 1]) {
+                        ctx.y0 as i32
+                    } else {
+                        i32::MIN
+                    },
+                    if dirty.is_some_and(|d| d.get(r + 1).is_some_and(|&n| !n)) {
+                        ctx.y0 as i32 + ch
+                    } else {
+                        i32::MAX
+                    },
+                );
+                self.render_row_knock(pixels, w, input, &ctx, &knocks, clip, wallpaper);
+            }
+        }
+        self.knock_scratch = knocks;
+    }
+
+    /// One row of [`Self::knock_out_under_text`]: each glyph cell within a
+    /// pixel of a knock rect (`[x0, y0, x1, y1)`, frame pixels) stamps its
+    /// dilated coverage in the cell's painted background.
+    #[allow(clippy::too_many_arguments)]
+    fn render_row_knock(
+        &mut self,
+        pixels: &mut [u32],
+        w: usize,
+        input: &RenderInput,
+        ctx: &RowCtx<'_>,
+        knocks: &[[i32; 4]],
+        clip_y: (i32, i32),
+        wallpaper: bool,
+    ) {
+        let RowCtx {
+            cells,
+            row: r,
+            y0,
+            cw,
+            scale,
+            anchor_y,
+            uniform,
+            sel,
+            ..
+        } = *ctx;
+        let ch = self.cell_h as i32;
+        let (band0, band1) = (y0 as i32 - 1, y0 as i32 + ch + 1);
+        if !knocks.iter().any(|k| k[1] < band1 && k[3] > band0) {
+            return;
+        }
+        let cols = input.cols;
+        let pad_x = self.pad;
+        let row_images = input.images.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let row_clusters = input.clusters.get(r).map(Vec::as_slice).unwrap_or(&[]);
+        let row_raster = input.chrome_raster(r);
+        let may_have_sel = input.any_selection();
+        let mut plan: Option<Vec<ColumnGlyph>> = None;
+        for (c, cell) in cells.iter().take(cols).enumerate() {
+            if image_covers(row_images, c) || cell.wide || cell.ch == ' ' || cell.ch.is_control() {
+                continue;
+            }
+            let (x, cell_w, scale, anchor_y) = if uniform {
+                (pad_x + c * cw, cw, scale, anchor_y)
+            } else {
+                let p = self.mixed_cell_place(input, r, c, y0);
+                (p.x, p.w, p.scale, p.anchor_y)
+            };
+            let (x0, x1) = (x as i32 - 1, (x + cell_w) as i32 + 1);
+            if !knocks
+                .iter()
+                .any(|k| k[0] < x1 && k[2] > x0 && k[1] < band1 && k[3] > band0)
+            {
+                continue;
+            }
+            let hit = if may_have_sel {
+                input.selection_hit(r, c, cells.get(c + 1).is_some_and(|n| n.wide), cell.wide)
+            } else {
+                None
+            };
+            let under = match hit {
+                Some(_) => sel.at_hit(hit).bg,
+                None => {
+                    let cell_bg = rgb_to_u32(cell.bg);
+                    if wallpaper && cell_bg == self.cell_default_bg(input, ctx, c) {
+                        continue;
+                    }
+                    cell_bg
+                }
+            };
+            let plan = plan.get_or_insert_with(|| {
+                let mut break_cols = std::mem::take(&mut self.ligature_break_scratch);
+                ligature_break_cols_into(input, r, &self.shaping, &mut break_cols);
+                let mut plan = Vec::new();
+                self.row_glyph_plan(input, r, &break_cols, &mut plan);
+                self.ligature_break_scratch = break_cols;
+                plan
+            });
+            let cluster = cluster_for(row_clusters, c);
+            let key = match plan.get(c).copied().unwrap_or(ColumnGlyph::PerCell) {
+                ColumnGlyph::Ligated(gid) => self.ligature_key(gid, cell_style(cell)),
+                ColumnGlyph::LigatedSlice { gid, k, .. } => {
+                    self.ligature_slice_key(gid, k, cell_style(cell))
+                }
+                ColumnGlyph::PerCell => {
+                    self.resolve_cell_key_for_span(cluster, cell, materialized_cell_span(cells, c))
+                }
+            };
+            let key = self.chrome_icon_key(row_raster, cells, c).unwrap_or(key);
+            let key = shade_phase_key(key, x, y0);
+            let scale = Scale {
+                clip_y0: scale.clip_y0.max(clip_y.0),
+                clip_y1: scale.clip_y1.min(clip_y.1),
+                ..scale
+            };
+            self.blit_glyph_knock(pixels, w, x as i32, anchor_y, key, scale, under);
+        }
+    }
+
+    /// Stamp `key`'s coverage at each of [`KNOCK_DILATE_OFFSETS`] in `page`
+    /// at full alpha ([`Self::knock_out_under_text`]).
+    #[allow(clippy::too_many_arguments)]
+    fn blit_glyph_knock(
+        &mut self,
+        px: &mut [u32],
+        stride: usize,
+        cell_x: i32,
+        cell_y: i32,
+        key: GlyphKey,
+        scale: Scale,
+        page: u32,
+    ) {
+        let baseline = self.baseline;
+        let entry = self.cached_glyph(key);
+        let GlyphImage::Mono {
+            width,
+            height,
+            xmin,
+            ymin,
+            bytes,
+            ..
+        } = &entry.img
+        else {
+            return;
+        };
+        let (width, height, xmin, ymin) = (*width, *height, *xmin, *ymin);
+        if width == 0 || height == 0 {
+            return;
+        }
+        let (xs, ys) = (scale.xs.max(1), scale.ys.max(1));
+        let gx0 = cell_x + xmin * xs as i32;
+        let gy0 = cell_y + ys as i32 * (baseline - height as i32 - ymin);
+        for &(dx, dy) in &KNOCK_DILATE_OFFSETS {
+            blit_mono_with(
+                px,
+                stride,
+                gx0 + dx,
+                gy0 + dy,
+                width,
+                height,
+                bytes,
+                page,
+                255,
+                xs,
+                ys,
+                (scale.clip_y0, scale.clip_y1),
+                (scale.clip_x0, scale.clip_x1),
+                knock_blend,
+            );
+        }
+    }
+
+    /// A test's negative control: draw companions under the text without
+    /// the knock-out ([`Self::knock_out_under_text`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub fn set_knock_out(&mut self, on: bool) {
+        self.knock_off = !on;
+    }
+
+    /// Whether the knock-out draws ([`Self::knock_out_under_text`]); off
+    /// only for a test's negative control ([`Self::set_knock_out`]). The GPU
+    /// renderer reads it to build the same stamps.
+    #[inline]
+    #[must_use]
+    pub const fn knock_out_on(&self) -> bool {
+        #[cfg(any(test, debug_assertions))]
+        {
+            !self.knock_off
+        }
+        #[cfg(not(any(test, debug_assertions)))]
+        {
+            true
         }
     }
 
@@ -14103,7 +14357,66 @@ pub const HALO_DILATE_OFFSETS: [(i32, i32); 14] = [
     (3, 0),
 ];
 
+/// Under-text bodies a frame knocks out before the scratch list grows: the
+/// pet, a departure or two and the idle cat.
+const KNOCK_SCRATCH_RESIDENT: usize = 8;
+
+/// The knock-out's dilation ([`Renderer::knock_out_under_text`]): the
+/// glyph's coverage stamped at every offset within two pixels (a disc, the
+/// corners off). An anti-aliased edge pixel stamps only its own share of
+/// page, so one pixel of dilation left a fur-and-page blend round every
+/// soft edge; two put a whole pixel of page beyond the ink's last soft
+/// pixel.
+pub const KNOCK_DILATE_OFFSETS: [(i32, i32); 21] = [
+    (0, 0),
+    (-1, -1),
+    (0, -1),
+    (1, -1),
+    (-1, 0),
+    (1, 0),
+    (-1, 1),
+    (0, 1),
+    (1, 1),
+    (0, -2),
+    (0, 2),
+    (-2, 0),
+    (2, 0),
+    (-1, -2),
+    (1, -2),
+    (-1, 2),
+    (1, 2),
+    (-2, -1),
+    (-2, 1),
+    (2, -1),
+    (2, 1),
+];
+
+/// The frame-pixel boxes (`[x0, y0, x1, y1)`, right and bottom exclusive)
+/// of the bodies drawn under the text ([`FreeZ::UnderText`]), which the
+/// knock-out cuts the letters out of ([`Renderer::knock_out_under_text`]);
+/// `pad_x`/`pad_y` place the grid-interior sprite in the frame.
+pub fn knock_rects(
+    sprites: &[FreeSprite],
+    pad_x: i32,
+    pad_y: i32,
+) -> impl Iterator<Item = [i32; 4]> + '_ {
+    sprites
+        .iter()
+        .filter(|s| s.z == FreeZ::UnderText && s.alpha > 0 && s.w > 0 && s.h > 0)
+        .map(move |s| {
+            let x0 = pad_x.saturating_add(s.x);
+            let y0 = pad_y.saturating_add(s.y);
+            [
+                x0,
+                y0,
+                x0.saturating_add(i32::from(s.w)),
+                y0.saturating_add(i32::from(s.h)),
+            ]
+        })
+}
+
 #[allow(clippy::too_many_arguments)]
+#[inline]
 fn blit_mono_halo(
     px: &mut [u32],
     stride: usize,
@@ -14120,6 +14433,42 @@ fn blit_mono_halo(
     clip_y1: i32,
     clip_x0: i32,
     clip_x1: i32,
+) {
+    blit_mono_with(
+        px,
+        stride,
+        gx0,
+        gy0,
+        width,
+        height,
+        bytes,
+        color,
+        alpha,
+        xs,
+        ys,
+        (clip_y0, clip_y1),
+        (clip_x0, clip_x1),
+        blend,
+    );
+}
+
+/// [`blit_mono_halo`] composited by `mix(destination, color, coverage)`.
+#[allow(clippy::too_many_arguments)]
+fn blit_mono_with(
+    px: &mut [u32],
+    stride: usize,
+    gx0: i32,
+    gy0: i32,
+    width: usize,
+    height: usize,
+    bytes: &[u8],
+    color: u32,
+    alpha: u8,
+    xs: usize,
+    ys: usize,
+    (clip_y0, clip_y1): (i32, i32),
+    (clip_x0, clip_x1): (i32, i32),
+    mix: impl Fn(u32, u32, u8) -> u32,
 ) {
     let px_len = px.len();
     for j in 0..height {
@@ -14145,12 +14494,24 @@ fn blit_mono_halo(
                         clip_x0,
                         clip_x1,
                     ) {
-                        px[idx] = blend(px[idx], color, a);
+                        px[idx] = mix(px[idx], color, a);
                     }
                 }
             }
         }
     }
+}
+
+/// The knock-out's stamp ([`Renderer::knock_out_under_text`]): `bg`'s
+/// colour taken toward the page `page` by `t` in linear light, as [`blend`]
+/// does, its transmittance kept: the stamp lays the page's colour, never
+/// its opacity, so a pixel that already shows the page is left as it is.
+#[inline]
+fn knock_blend(bg: u32, page: u32, t: u8) -> u32 {
+    if t == 0 || (bg ^ page) & 0x00ff_ffff == 0 {
+        return bg;
+    }
+    (bg & 0xff00_0000) | (blend(bg, page, t) & 0x00ff_ffff)
 }
 
 #[allow(clippy::too_many_arguments)]

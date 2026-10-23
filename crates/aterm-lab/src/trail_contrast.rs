@@ -14,6 +14,15 @@ use crate::{Fail, Res};
 
 /// A glyph's core: at least this share of the way from the clean ground to the clean glyph's extreme, in luminance.
 pub const CORE_SHARE: f64 = 0.70;
+/// A glyph's solid ink, which the local measure judges: a pixel of the clean twin that reads at least this share of
+/// the clean extreme's ratio against the ground, so a frame equal to its twin reads close to what the clean glyph
+/// reads (the antialiased rim reads less on any page, and on paper a pixel nine tenths of the way to the ink in
+/// luminance is still only 6:1).
+pub const SOLID_SHARE: f64 = 0.85;
+/// The legibility bar the local measure counts pixels under (WCAG AA for text).
+pub const LEGIBLE: f64 = 4.5;
+/// The widest ring of untouched ground a pixel's local ground is read from, px (Chebyshev).
+pub const RING_REACH: i64 = 2;
 /// A cell whose extreme is under this ratio against its ground holds no glyph.
 pub const BLANK_BELOW: f64 = 1.5;
 /// A pixel the effects changed: a channel off by more than this.
@@ -35,7 +44,12 @@ TEXT in the screen text; --cells and --row: cells by number; none: every glyph o
 page with the --newest N (3) glyphs left of it, and diff_vs_clean, the pixels the effects changed outside the caret cell.
 With the frame's clean twin (<stem>.<frame>.clean.png, `image clean`) a glyph's ink and ground are the pixels that are
 glyph core and pure ground in the twin, read from the frame, so a halo or a ribbon under the glyph counts against it;
-clean_contrast is the same glyph with no effect drawn. Without one (--no-clean) the coarser `extreme` method is used.
+clean_contrast is the same glyph with no effect drawn. local_contrast judges each solid ink pixel against the ground next
+to it (the median of the nearest ring, 1 then 2 px out, of pixels that are pure ground in the twin, as the frame has
+them) and names the worst pixel row of the glyph (each row's lower median), so a body or a band over part of a glyph
+counts where the whole cell's median ground would hide it; local_min is its worst pixel and local_under the pixels under
+4.5:1. min_contrast and the --min and --newest-min thresholds judge the lower of contrast and local_contrast. Without a
+twin (--no-clean) the coarser `extreme` method is used.
 The sidecars trail-gallery writes (.text.txt, .cursor.txt, .clean.png, .dims.txt) are read when present.
 
 exit: 0; 1 a threshold failed (--min: a selected cell, --newest-min: a glyph left of the caret, --caret-min: the caret
@@ -479,7 +493,7 @@ fn measure_cell(
         median(&bed).unwrap_or_default(),
     );
     let clean_ink = median(&clean_ink).unwrap_or_default();
-    kv(vec![
+    let mut out = kv(vec![
         ("method", J::s("mask")),
         ("ink", J::s(hex(ink))),
         ("ground", J::s(hex(bed))),
@@ -489,7 +503,130 @@ fn measure_cell(
             J::Float(round_to(contrast(clean_ink, clean_ground), 2)),
         ),
         ("core_px", J::Int(core_px)),
-    ])
+    ]);
+    let solid = SOLID_SHARE * contrast(extreme, clean_ground);
+    let local = local_judge(frame, clean, b, clean_ground, |c| {
+        contrast(c, clean_ground) >= solid
+    })
+    .or_else(|| {
+        local_judge(frame, clean, b, clean_ground, |c| {
+            c != clean_ground && (luminance(c) - ground_luma).abs() >= reach
+        })
+    });
+    if let Some(l) = local {
+        out.extend(kv(vec![
+            ("local_contrast", J::Float(round_to(l.worst_row, 2))),
+            ("local_min", J::Float(round_to(l.worst_px, 2))),
+            ("local_under", J::Int(l.under)),
+            ("local_px", J::Int(l.judged)),
+        ]));
+    }
+    out
+}
+
+/// What [`local_judge`] found in one glyph.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Local {
+    /// The worst pixel row's lower median ratio.
+    worst_row: f64,
+    /// The worst single pixel's ratio.
+    worst_px: f64,
+    /// Pixels under [`LEGIBLE`].
+    under: i64,
+    /// Pixels judged.
+    judged: i64,
+}
+
+/// The local ground of the pixel at `x`, `y`: the median of the frame's pixels on the nearest Chebyshev ring (1, then
+/// up to [`RING_REACH`]) that are `ground` in the clean twin; `None` when no such pixel is that close.
+fn ring_ground(frame: &Image, clean: &Image, ground: Rgb, x: i64, y: i64) -> Option<Rgb> {
+    let (w, h) = (
+        i64::try_from(frame.width).unwrap_or(i64::MAX),
+        i64::try_from(frame.height).unwrap_or(i64::MAX),
+    );
+    let mut ring = Vec::new();
+    for d in 1..=RING_REACH {
+        ring.clear();
+        for dy in -d..=d {
+            for dx in -d..=d {
+                if dx.abs().max(dy.abs()) != d {
+                    continue;
+                }
+                let (xx, yy) = (x + dx, y + dy);
+                if !(0..w).contains(&xx) || !(0..h).contains(&yy) {
+                    continue;
+                }
+                let (xu, yu) = (
+                    usize::try_from(xx).unwrap_or(0),
+                    usize::try_from(yy).unwrap_or(0),
+                );
+                if clean.at(xu, yu) == ground {
+                    ring.push(frame.at(xu, yu));
+                }
+            }
+        }
+        if !ring.is_empty() {
+            return median(&ring);
+        }
+    }
+    None
+}
+
+/// Each pixel of `b` whose clean colour is `ink`, judged in the frame against its [`ring_ground`]; `None` when no
+/// such pixel has ground that near.
+fn local_judge(
+    frame: &Image,
+    clean: &Image,
+    b: PxBox,
+    ground: Rgb,
+    ink: impl Fn(Rgb) -> bool,
+) -> Option<Local> {
+    let clip = |v: i64, hi: usize| v.clamp(0, i64::try_from(hi).unwrap_or(i64::MAX));
+    let (x0, x1) = (clip(b.x0, frame.width), clip(b.x1, frame.width));
+    let (y0, y1) = (clip(b.y0, frame.height), clip(b.y1, frame.height));
+    let (mut worst_row, mut worst_px) = (f64::INFINITY, f64::INFINITY);
+    let (mut under, mut judged) = (0i64, 0i64);
+    let mut row = Vec::new();
+    for y in y0..y1 {
+        row.clear();
+        for x in x0..x1 {
+            let (xu, yu) = (
+                usize::try_from(x).unwrap_or(0),
+                usize::try_from(y).unwrap_or(0),
+            );
+            if !ink(clean.at(xu, yu)) {
+                continue;
+            }
+            let Some(g) = ring_ground(frame, clean, ground, x, y) else {
+                continue;
+            };
+            let r = contrast(frame.at(xu, yu), g);
+            row.push(r);
+            worst_px = worst_px.min(r);
+            under += i64::from(r < LEGIBLE);
+            judged += 1;
+        }
+        if !row.is_empty() {
+            row.sort_by(f64::total_cmp);
+            worst_row = worst_row.min(row[(row.len() - 1) / 2]);
+        }
+    }
+    (judged > 0).then_some(Local {
+        worst_row,
+        worst_px,
+        under,
+        judged,
+    })
+}
+
+/// What a cell is judged at: the lower of its whole-cell and its local contrast.
+fn judged(cell: &J) -> Option<f64> {
+    let whole = cell.get("contrast").and_then(J::as_f64)?;
+    Some(
+        cell.get("local_contrast")
+            .and_then(J::as_f64)
+            .map_or(whole, |l| whole.min(l)),
+    )
 }
 
 fn measure_caret(frame: &Image, grid: &Grid, row: i64, col: i64, page: Rgb) -> J {
@@ -937,7 +1074,7 @@ pub fn report(a: &Args) -> Result<J, String> {
             t.width,
         ));
         let cell = J::Obj(entry);
-        if let Some(c) = cell.get("contrast").and_then(J::as_f64) {
+        if let Some(c) = judged(&cell) {
             measured.push(c);
         }
         cells.push(cell);
@@ -998,7 +1135,7 @@ pub fn report(a: &Args) -> Result<J, String> {
             if entry.get("blank").is_some() {
                 break;
             }
-            newest_contrasts.push(entry.get("contrast").and_then(J::as_f64));
+            newest_contrasts.push(judged(&entry));
             newest.push(entry);
             at -= 1;
         }

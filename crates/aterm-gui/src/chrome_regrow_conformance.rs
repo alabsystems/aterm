@@ -391,9 +391,9 @@ fn a_strip_rise_just_before_the_bands_quiet_shrink_holds_it_to_the_floor() {
     });
 }
 
-/// BAND RISE THEN STRIPFALL (the pair measured on 2026-10-19, 38 ms apart):
-/// the strip is up and long settled; a band row rises, and 38 ms later a
-/// Settings edit takes the strip down.
+/// BAND RISE THEN STRIPFALL (a measured pair): the strip is up and long
+/// settled; a band row rises, and 38 ms later a Settings edit takes the strip
+/// down.
 fn band_rise_then_stripfall(rig: &mut Rig) {
     let ms = Duration::from_millis;
     let rise = ms(2000);

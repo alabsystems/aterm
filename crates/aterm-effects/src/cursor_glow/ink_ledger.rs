@@ -5,6 +5,9 @@
 
 use super::*;
 
+mod letter_guard;
+pub(crate) use letter_guard::LetterGuard;
+
 /// Per-band RGB lift per unit coverage for a streak sample ([`InkLedger::admit_axis`]).
 pub(super) type BandLifts = [[f32; 3]; InkLedger::BANDS];
 

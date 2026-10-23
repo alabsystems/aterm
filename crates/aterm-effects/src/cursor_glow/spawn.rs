@@ -353,6 +353,15 @@ impl CursorGlow {
                 }
                 self.snuff_off_line((cr, cc), fire_back_leap, now, geom);
             }
+            // Water's leap off the line keeps to the caret's new row as fire's
+            // does: an Enter's streak ran from the echo's end down across the
+            // line the command printed, and its drops, left on that line's
+            // word gaps, read as punctuation (round 2's judge, 2026-10-23,
+            // `enter-bottom`). The typed line's own wave fades as it would; a
+            // navigation jump still spans its vector.
+            if water && dr_abs >= 1 && !typing && !navigation && !reflow_licensed {
+                self.path_scratch.retain(|&(r, _)| r == cr as i32);
+            }
             if !self.path_scratch.is_empty() {
                 let typing_run = echo_run || shape_wrap;
                 if typing_run {

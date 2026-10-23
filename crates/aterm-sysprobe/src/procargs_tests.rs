@@ -118,7 +118,7 @@ fn this_process_reads_back_as_it_was_exec_d() {
 /// path and the kernel's own strings ride beside them), and the kernel refuses a buffer past
 /// `kern.argmax` plus the argc (`EINVAL`) and fills a smaller one with the record's LAST bytes:
 /// the exec path and the first words are gone, and what follows the argc parses as other
-/// words (measured 2026-10-20: `ps` prints such a process as `ptr_munge= ptr_munge=`).
+/// words (`ps` prints such a process as `ptr_munge= ptr_munge=`).
 #[cfg(target_os = "macos")]
 #[test]
 fn a_record_past_what_the_kernel_hands_over_reads_as_nothing() {

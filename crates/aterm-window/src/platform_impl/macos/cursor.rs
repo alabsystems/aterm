@@ -6,8 +6,7 @@
 
 // LOCAL PATCH (aterm): Objective-C goes through `aterm_objc` (typed `send` prototypes,
 // `Obj`/`Retained` handles, `MainThread` witnesses, the seam's `consts`) where upstream used objc2
-// and its framework bindings. Custom cursors are gone on macOS: this answers the system cursors
-// aterm sets.
+// and its framework bindings. macOS has no custom cursors: this answers the system cursors.
 use aterm_objc::send::{send_bool_id, send_id};
 use aterm_objc::{autoreleasepool, class, sel, Obj};
 
@@ -37,7 +36,8 @@ fn class_cursor(s: aterm_objc::Sel) -> Obj {
     })
 }
 
-/// LOCAL PATCH, 2026-10-15: six icons, the ones aterm sets.
+/// LOCAL PATCH (aterm): `NSCursor`'s system cursor for `icon`. aterm sets the first six on macOS;
+/// the eight resize icons are its Wayland frame's, mapped here so every icon has an answer.
 pub(crate) fn cursor_from_icon(icon: CursorIcon) -> Obj {
     match icon {
         CursorIcon::Default => default_cursor(),
@@ -46,8 +46,8 @@ pub(crate) fn cursor_from_icon(icon: CursorIcon) -> Obj {
         CursorIcon::Grabbing => class_cursor(sel!(closedHandCursor)),
         CursorIcon::ColResize => class_cursor(sel!(resizeLeftRightCursor)),
         CursorIcon::RowResize => class_cursor(sel!(resizeUpDownCursor)),
-        // LOCAL PATCH (aterm): the edges map as upstream's did; the corners are the arrow, because
-        // upstream's corner cursors were undocumented `+_windowResize…Cursor` accessors.
+        // LOCAL PATCH (aterm): the edges map as upstream's do; the corners are the arrow, because
+        // upstream's corner cursors come from undocumented `+_windowResize…Cursor` accessors.
         CursorIcon::NResize => class_cursor(sel!(resizeUpCursor)),
         CursorIcon::SResize => class_cursor(sel!(resizeDownCursor)),
         CursorIcon::EResize => class_cursor(sel!(resizeRightCursor)),

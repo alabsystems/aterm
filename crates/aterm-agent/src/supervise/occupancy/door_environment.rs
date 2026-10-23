@@ -351,6 +351,22 @@
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "OccupancyDoor",
+        action = "OpenStuck",
+        reason = "A fresh facts reading (IdleHost::facts) naming a hung call whose episode is untold, under the owner's stuck_break_note: what FactsState::pending reads in the same break that asks stuck_at_break. The Tier-1 bind's stuck runs open it at that read."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "OccupancyDoor",
+        action = "StuckWithoutKey",
+        reason = "Buggy=22 negative control only; a stuck episode opened with the key off, which stuck_at_break keeps Ungranted"
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "OccupancyDoor",
         action = "RestartClock",
         reason = "Buggy=1 liveness mutant only; a due line's looks restarted"
     )

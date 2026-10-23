@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Andrew Yates
 #
-# THE CLIENT FRAME'S ORACLE RECORDER (L-HEADER-LW7, docs/AUDIT-third-party-
-# 2026-10-15.md, lw5-button-layout-shadow), in ITS OWN WORKSPACE on purpose
-# (the empty `[workspace]` below): sctk-adwaita 0.10.1, the frame the winit
-# fork drew before LW.5, answers how GNOME's `button-layout` places the
-# header's buttons and what its shadow paints outside the window, and
-# aterm-gui is held to the committed recording with no sctk-adwaita anywhere
-# in the workspace graph.
+# THE CLIENT FRAME'S ORACLE RECORDER (docs/AUDIT-third-party-2026-10-15.md,
+# LW.5), in ITS OWN WORKSPACE on purpose (the empty `[workspace]` below):
+# sctk-adwaita 0.10.1, the frame aterm-gui's own Wayland header replaces,
+# answers how GNOME's `button-layout` places the header's buttons and what
+# its shadow paints outside the window. aterm-gui (the buttons) and
+# aterm-window (the shadow) are held to the committed recordings with no
+# sctk-adwaita anywhere in the workspace graph.
 #
 # The functions that answer are private to sctk-adwaita (`Buttons` and
 # `Shadow` are `pub(crate)` types behind a frame that needs a compositor), so
@@ -18,8 +18,8 @@
 # the recorder runs it as it is, with this crate's own `dbus-send` (src/bin)
 # first on PATH printing what the real one prints for a value
 # (`dbus-send --print-reply=literal` through xdg-desktop-portal-gtk on the
-# lane's Ubuntu 24.04 guest, 2026-10-20: `   variant       variant
-# <value>`, no newline).
+# lane's Ubuntu 24.04 guest: `   variant       variant          <value>`, no
+# newline).
 #
 # sctk-adwaita is a dependency only for Linux, so the lock pins it and
 # `targo fetch` puts its source in the registry; the recorder never calls it

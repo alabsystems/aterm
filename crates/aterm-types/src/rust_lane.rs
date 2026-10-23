@@ -1,7 +1,8 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Rust on this machine means the Trust toolchain.
+//! Rust on this machine is the Trust toolchain: the Trust spelling of each stock Rust
+//! command, and the reader that finds a stock Rust tool in a shell command line.
 
 use std::path::{Path, PathBuf};
 
@@ -216,7 +217,7 @@ pub fn trust_spelling(stock: &str, args: &[String]) -> Option<Vec<Spelling>> {
     })
 }
 
-/// [`trust_spelling`] for `cargo`, verb by verb (the module table).
+/// [`trust_spelling`] for `cargo`, by the verb's class ([`cargo_verb`]).
 fn cargo_spelling(args: &[String]) -> Vec<Spelling> {
     let Some(at) = cargo_verb_index(args) else {
         return vec![Spelling {
@@ -1306,7 +1307,7 @@ pub fn refusal(hit: &Hit, pin: Option<(&PinSource, &str)>) -> String {
     out.push_str(&render_spellings(&bounded, "  "));
     if is_unknown_verb(&hit.instead) {
         out.push_str(
-            "If it answers \"no such command\", the extension has no Trust spelling yet: use the \
+            "If it answers \"no such command\", the extension has no Trust spelling: use the \
              escape below.\n",
         );
     }

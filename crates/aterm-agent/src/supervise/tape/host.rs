@@ -19,8 +19,13 @@ use crate::harness::disk::Level;
 use crate::harness::repo_work::RepoWork;
 use crate::harness::upgrade::{LastTurn, StandingLimit};
 use crate::supervise::background::{BackgroundCall, BackgroundEvidence};
+use crate::supervise::facts::FactsReading;
 use crate::supervise::fx::Fx;
 use crate::supervise::memory::{AgentMemory, Pressure};
+use crate::supervise::occupancy::wakes::SysWait;
+use crate::supervise::occupancy::wakes_seen::{
+    AtomKind, Declarer, ExpireWhy, Prio, WakeSeen, WakeState,
+};
 use crate::supervise::occupancy::{
     FactWord, NoteOutcome, OccupancyReading, OccupancySaid, PaceGrant, RuleId, SlotsSeen,
     WakeClaim, WakeDoor, WakesSeen,
@@ -127,16 +132,79 @@ impl ReplayHost {
     }
 }
 
-/// An argument a host's call is taped with: its `Debug` text, compared as it is.
-pub(crate) trait TapeArg: fmt::Debug {}
+/// An argument's stable request text, compared as it is. Most arguments use
+/// their ordinary `Debug`; an input with added diagnostic fields can preserve
+/// its earlier request shape without changing its diagnostic `Debug`.
+pub(crate) trait TapeArg: fmt::Debug {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self, f)
+    }
+}
 
-impl<T: TapeArg + ?Sized> TapeArg for &T {}
-impl<T: TapeArg> TapeArg for Option<T> {}
-impl<T: TapeArg, E: TapeArg> TapeArg for Result<T, E> {}
-impl<A: TapeArg, B: TapeArg> TapeArg for (A, B) {}
-/// A slice of arguments (`needs_standing`'s set): its `Debug` is each
-/// element's in order, so a set told otherwise compares otherwise.
-impl<T: TapeArg> TapeArg for [T] {}
+/// Format a request argument through its tape contract, including when nested.
+struct RequestArg<'a, T: TapeArg + ?Sized>(&'a T);
+
+impl<T: TapeArg + ?Sized> fmt::Debug for RequestArg<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt_request(f)
+    }
+}
+
+impl<T: TapeArg + ?Sized> TapeArg for &T {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        T::fmt_request(*self, f)
+    }
+}
+
+impl<T: TapeArg> TapeArg for Option<T> {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Some(value) => f.debug_tuple("Some").field(&RequestArg(value)).finish(),
+            None => f.write_str("None"),
+        }
+    }
+}
+
+impl<T: TapeArg, E: TapeArg> TapeArg for Result<T, E> {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Ok(value) => f.debug_tuple("Ok").field(&RequestArg(value)).finish(),
+            Err(error) => f.debug_tuple("Err").field(&RequestArg(error)).finish(),
+        }
+    }
+}
+
+impl<A: TapeArg, B: TapeArg> TapeArg for (A, B) {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("")
+            .field(&RequestArg(&self.0))
+            .field(&RequestArg(&self.1))
+            .finish()
+    }
+}
+
+/// A slice's elements in order, so a set told otherwise compares otherwise.
+impl<T: TapeArg> TapeArg for [T] {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter().map(RequestArg)).finish()
+    }
+}
+
+impl TapeArg for Sample {
+    fn fmt_request(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // These six fields are the original account_probed request. The GUI
+        // restamps a probe and note_sample recomputes its per-window read times,
+        // so incoming observation metadata is not part of that request contract.
+        f.debug_struct("Sample")
+            .field("session_pct", &self.session_pct)
+            .field("session_reset", &self.session_reset)
+            .field("week_pct", &self.week_pct)
+            .field("week_reset", &self.week_reset)
+            .field("at", &self.at)
+            .field("by", &self.by)
+            .finish()
+    }
+}
 
 /// Each type an argument of the host's may be, opted in by name: its `Debug` is the text a tape compares, and holds no `Instant`.
 macro_rules! tape_arg_debug {
@@ -166,7 +234,6 @@ tape_arg_debug!(
     UsageSeen,
     AccountPoint,
     AccountBad,
-    Sample,
     ProbeMiss,
     ResetAsk,
     ResetEnd,
@@ -177,11 +244,12 @@ tape_arg_debug!(
     FactWord,
 );
 
-/// A call's request as a tape holds it: `name=<Debug>` for each argument, a line each, in the signature's order; nothing for a call with none.
+/// A call's request: `name=<request text>` for each argument, a line each,
+/// in signature order; nothing for a call with none.
 pub(crate) fn request(args: &[(&str, &dyn TapeArg)]) -> Vec<u8> {
     let text = args
         .iter()
-        .map(|(name, arg)| format!("{name}={arg:?}"))
+        .map(|(name, arg)| format!("{name}={:?}", RequestArg(*arg)))
         .collect::<Vec<_>>()
         .join("\n");
     #[cfg(test)]
@@ -615,68 +683,109 @@ impl TapeValue for Option<(String, HostTurn)> {
     }
 }
 
+/// One background call as a tape holds it ([`BackgroundCall`]). A tape from a build before the
+/// leader's birth was read holds none (`birth` absent).
+#[derive(Serialize, Deserialize)]
+struct CallWire {
+    pid: u32,
+    pgid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    birth: Option<u64>,
+    exe: String,
+    task: Option<String>,
+    quiet_ms: u64,
+    wait: Option<String>,
+}
+
+/// [`BackgroundCall`] as its wire.
+fn call_wire(call: &BackgroundCall) -> CallWire {
+    let BackgroundCall {
+        pid,
+        pgid,
+        birth,
+        exe,
+        task,
+        quiet_ms,
+        wait,
+    } = call;
+    CallWire {
+        pid: *pid,
+        pgid: *pgid,
+        birth: *birth,
+        exe: exe.clone(),
+        task: task.clone(),
+        quiet_ms: *quiet_ms,
+        wait: wait.clone(),
+    }
+}
+
+/// [`call_wire`] read back.
+fn call_of(w: CallWire) -> BackgroundCall {
+    BackgroundCall {
+        pid: w.pid,
+        pgid: w.pgid,
+        birth: w.birth,
+        exe: w.exe,
+        task: w.task,
+        quiet_ms: w.quiet_ms,
+        wait: w.wait,
+    }
+}
+
 /// `background_jobs`'s answer as a tape holds it
 /// ([`BackgroundEvidence`]): `"unknown"`, or the call that made no progress.
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 enum EvidenceWire {
     Unknown,
-    NoProgress {
-        pid: u32,
-        pgid: u32,
-        exe: String,
-        task: Option<String>,
-        quiet_ms: u64,
-        wait: Option<String>,
-    },
+    NoProgress(CallWire),
 }
 
 impl TapeValue for BackgroundEvidence {
     fn to_tape(&self) -> Vec<u8> {
         json(&match self {
             BackgroundEvidence::Unknown => EvidenceWire::Unknown,
-            BackgroundEvidence::NoProgress { worst } => {
-                let BackgroundCall {
-                    pid,
-                    pgid,
-                    exe,
-                    task,
-                    quiet_ms,
-                    wait,
-                } = worst;
-                EvidenceWire::NoProgress {
-                    pid: *pid,
-                    pgid: *pgid,
-                    exe: exe.clone(),
-                    task: task.clone(),
-                    quiet_ms: *quiet_ms,
-                    wait: wait.clone(),
-                }
-            }
+            BackgroundEvidence::NoProgress { worst } => EvidenceWire::NoProgress(call_wire(worst)),
         })
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
         Ok(match of_json(bytes)? {
             EvidenceWire::Unknown => BackgroundEvidence::Unknown,
-            EvidenceWire::NoProgress {
-                pid,
-                pgid,
-                exe,
-                task,
-                quiet_ms,
-                wait,
-            } => BackgroundEvidence::NoProgress {
-                worst: BackgroundCall {
-                    pid,
-                    pgid,
-                    exe,
-                    task,
-                    quiet_ms,
-                    wait,
-                },
-            },
+            EvidenceWire::NoProgress(w) => BackgroundEvidence::NoProgress { worst: call_of(w) },
         })
+    }
+}
+
+/// `facts`'s answer as a tape holds it ([`FactsReading`]): when it was taken and each call it
+/// names, or `null` for no reading.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct FactsWire {
+    as_of_ms: i64,
+    no_progress: Vec<CallWire>,
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.facts` asked nothing there and
+/// typed no fact, so its replay answers no reading ([`TapeValue::absent`]) where the tape's
+/// header says that build lacked the door, and only there.
+impl TapeValue for Option<FactsReading> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.as_ref().map(|r| FactsWire {
+            as_of_ms: r.as_of_ms,
+            no_progress: r.no_progress.iter().map(call_wire).collect(),
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<FactsWire>>(bytes)?.map(|w| FactsReading {
+            as_of_ms: w.as_of_ms,
+            no_progress: w.no_progress.into_iter().map(call_of).collect(),
+        }))
+    }
+
+    fn absent() -> Option<Self> {
+        Some(None)
     }
 }
 
@@ -810,11 +919,107 @@ impl TapeValue for PaceGrant {
     }
 }
 
-/// `wakes`' answer as a tape holds it ([`WakesSeen`]): its counts.
+/// One wake of `wakes`' answer as a tape holds it ([`WakeSeen`]): closed words and numbers.
+#[derive(Serialize, Deserialize)]
+struct WakeWire {
+    ord: u16,
+    class: String,
+    prio: String,
+    state: String,
+    door: Option<String>,
+    at_ms: Option<i64>,
+    declared_ms: i64,
+    ready_since_ms: Option<i64>,
+    kinds: Vec<String>,
+    need: Option<String>,
+    need_slots: bool,
+    await_only: bool,
+}
+
+/// `wakes`' answer as a tape holds it ([`WakesSeen`]): its live wakes. A need reads back through
+/// the wake grammar ([`SysWait::of_spelling`]) in its canonical spelling, so no word a tape holds
+/// that is not a machine term reaches the loop.
 #[derive(Serialize, Deserialize)]
 struct WakesWire {
-    pending: u16,
-    ready: u16,
+    wakes: Vec<WakeWire>,
+}
+
+fn wake_wire(w: &WakeSeen) -> WakeWire {
+    let (door, at_ms) = match w.state {
+        WakeState::Answering { at_ms } | WakeState::Answered { at_ms } => (None, Some(at_ms)),
+        WakeState::Claimed { door, at_ms } | WakeState::Told { door, at_ms } => {
+            (Some(door.word().to_string()), Some(at_ms))
+        }
+        WakeState::Expired { why } => (Some(why.word().to_string()), None),
+        WakeState::Pending | WakeState::Ready | WakeState::Taken => (None, None),
+    };
+    WakeWire {
+        ord: w.ord,
+        class: w.class.word().to_string(),
+        prio: w.prio.word().to_string(),
+        state: w.state.word().to_string(),
+        door,
+        at_ms,
+        declared_ms: w.declared_ms,
+        ready_since_ms: w.ready_since_ms,
+        kinds: w.kinds.iter().map(|k| k.word().to_string()).collect(),
+        need: w.need.clone(),
+        need_slots: w.need_slots,
+        await_only: w.await_only,
+    }
+}
+
+fn wake_of(w: WakeWire) -> Result<WakeSeen, CodecError> {
+    const UNKNOWN: CodecError = bad("a wake word this build does not know");
+    let at = || w.at_ms.ok_or(UNKNOWN);
+    let door = || w.door.as_deref().and_then(WakeDoor::of_word).ok_or(UNKNOWN);
+    let state = match w.state.as_str() {
+        "pending" => WakeState::Pending,
+        "ready" => WakeState::Ready,
+        "answering" => WakeState::Answering { at_ms: at()? },
+        "answered" => WakeState::Answered { at_ms: at()? },
+        "claimed" => WakeState::Claimed {
+            door: door()?,
+            at_ms: at()?,
+        },
+        "told" => WakeState::Told {
+            door: door()?,
+            at_ms: at()?,
+        },
+        "taken" => WakeState::Taken,
+        "expired" => WakeState::Expired {
+            why: w
+                .door
+                .as_deref()
+                .and_then(ExpireWhy::of_word)
+                .ok_or(UNKNOWN)?,
+        },
+        _ => return Err(UNKNOWN),
+    };
+    let kinds = w
+        .kinds
+        .iter()
+        .map(|k| AtomKind::of_word(k).ok_or(UNKNOWN))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(WakeSeen {
+        ord: w.ord,
+        class: Declarer::of_word(&w.class).ok_or(UNKNOWN)?,
+        prio: Prio::of_word(&w.prio).ok_or(UNKNOWN)?,
+        state,
+        declared_ms: w.declared_ms,
+        ready_since_ms: w.ready_since_ms,
+        kinds,
+        need: w
+            .need
+            .map(|need| {
+                SysWait::of_spelling(&need)
+                    .map(|wait| wait.canonical().to_string())
+                    .map_err(|_| bad("a need this build does not read"))
+            })
+            .transpose()?,
+        need_slots: w.need_slots,
+        await_only: w.await_only,
+    })
 }
 
 /// A DOOR NEWER THAN THE TAPE: a recording build with no `host.wakes` kept no book of wakes, so
@@ -822,13 +1027,16 @@ struct WakesWire {
 /// build lacked the door, and only there.
 impl TapeValue for WakesSeen {
     fn to_tape(&self) -> Vec<u8> {
-        let WakesSeen { pending, ready } = *self;
-        json(&WakesWire { pending, ready })
+        json(&WakesWire {
+            wakes: self.wakes.iter().map(wake_wire).collect(),
+        })
     }
 
     fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
-        let WakesWire { pending, ready } = of_json(bytes)?;
-        Ok(WakesSeen { pending, ready })
+        let WakesWire { wakes } = of_json(bytes)?;
+        Ok(WakesSeen {
+            wakes: wakes.into_iter().map(wake_of).collect::<Result<_, _>>()?,
+        })
     }
 
     fn absent() -> Option<Self> {

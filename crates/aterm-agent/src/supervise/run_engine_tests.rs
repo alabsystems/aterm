@@ -6812,14 +6812,12 @@ fn looks_at_one_point(
     }
 }
 
-/// A LOOK THAT FINDS NOTHING DECIDES THE POINT NO MORE (`docs/measured/vitals-3-2026-10-22.md`,
-/// V2). The window looks every `first_look` at a conversation it has not named; the look's step
-/// takes nothing. The point is decided twice, as before: once when it is new, and once more to
-/// carry out that decision, which the host's step at the new point came before. Then however
-/// many looks follow, the decision stands: no third decision, one journal `WAITING` line, one
-/// ledger `waiting` row, the host told its wait once, nothing typed. Measured live on main
-/// (Gemini CLI 0.46.0's ladder tab, `v3b-gl`): 36 looks, 48 decisions for 7 points, and 28 of its
-/// 35 `WAITING` lines the same line again, 20 s apart.
+/// A LOOK THAT FINDS NOTHING DECIDES NOTHING (`docs/measured/vitals-3-2026-10-22.md`, V2). The
+/// window looks every `first_look` at a conversation it has not named; the look's step takes
+/// nothing. The point is decided twice: once when it is new, and once more to carry out that
+/// decision, which the host's step at the new point came before. Then however many looks
+/// follow, the decision stands: no third decision, one journal `WAITING` line, one ledger
+/// `waiting` row, the host told its wait once, nothing typed.
 ///
 /// NEGATIVE CONTROL: a look whose step took something and left the point standing
 /// (`upgrade step=wait:settling`) still decides the point again at each look (the host may have

@@ -1495,13 +1495,19 @@ pub const VERBS: &[VerbSpec] = &[
         Write,
         Status,
         App,
-        "program-check [full|live]: the stuck check's reading of macOS's program check",
-        "Answers `OK reading=<live|full> syspolicyd=<-|ok|full|stuck> \
+        "program-check [full|live|held <pid>|held -]: the stuck check's reading of macOS's \
+         program check",
+        "Answers `OK reading=<live|full> held=<pid|-> syspolicyd=<-|ok|full|stuck> \
          syspolicyd_workers=<n>/<limit|->|- syspolicyd_full_ms=<ms|->`: the board carried on \
          `status` (`aterm help permissions`, SLOW FIRST RUNS), sampled once a minute on macOS. \
          `program-check full` stages `syspolicyd` at the kernel thread limit (5 min reads \
          `stuck`, raising the restart alert and pausing harness continuations); `program-check \
-         live` restores live sampling (requires `dev-seams`).",
+         live` restores live sampling. `program-check held <pid>` has the jobs engine read \
+         `<pid>` as held at macOS's program check wherever it reads a start (a tab's job \
+         member, or another process of this user with at most 20 ms of CPU): `sys jobs` shows \
+         `wait=program-check` and a `finding kind=program-check` row, and the engine reads \
+         every 30 s with no window; `program-check held -` ends it (each requires \
+         `dev-seams`).",
     )
     .input(Input::NONE),
     v(

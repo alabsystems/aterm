@@ -14,13 +14,13 @@ use crate::upstream_identity::Resolved;
 
 /// Exported by the spawn seams.
 pub const REROUTE_DIR_ENV: &str = "ATERM_REROUTE_DIR";
-/// Exported by the front door (`crates/aterm/src/main.rs`) to a TTY session on every lane, engaged reroute or not.
+/// Exported by the front door (`crates/aterm/src/main.rs`) to a TTY session, whether or not reroute is engaged.
 pub const AGENTS_DIR_ENV: &str = "ATERM_AGENTS_DIR";
 /// INTERNAL PROTOCOL, not a setting: the marker of a session with every upstream tool restored.
 pub const PASSTHROUGH_ENV: &str = "__ATERM_REROUTE_PASSTHROUGH";
 /// cargo's mark of its own compile.
 pub const CARGO_CRATE_ENV: &str = "CARGO_CRATE_NAME";
-/// Trust's cargo's second mark of its own compile, beside [`CARGO_CRATE_ENV`] on exactly the same processes (measured 2026-10-02 on trust 9192: `targo` and the store's `cargo`, one binary).
+/// Trust's cargo's second mark of its own compile, set beside [`CARGO_CRATE_ENV`] on the same processes (`targo` and the store's `cargo` are one binary).
 pub const TARGO_CRATE_ENV: &str = "TARGO_CRATE_NAME";
 /// The rows cargo spawns for a crate, the stubs that take a stock cargo's [`CARGO_CRATE_ENV`] as [`ANNOUNCED_ENV`].
 pub const CARGO_COMPILERS: &[&str] = &["rustc", "rustdoc"];
@@ -30,7 +30,7 @@ pub const ANNOUNCED_ENV: &str = "__ATERM_REROUTE_ANNOUNCED";
 pub const STUB_MARKER: &str = "# atpkg reroute stub v1";
 /// The hidden verb a stub execs: `atpkg __reroute <upstream> [args…]`.
 pub const HIDDEN_VERB: &str = "__reroute";
-/// The exit of a refusal (strict's refusals, a non-Trust `cargo`/`rustc` inside a Trust source checkout, a `__reroute` usage error).
+/// The exit of a refusal: strict's, a non-Trust `cargo`/`rustc` inside a Trust source checkout, a `__reroute` call naming no rerouted tool, and `atpkg lane`'s.
 pub const REFUSAL_EXIT: u8 = 2;
 /// The directory under the manager prefix (`<prefix>/reroute`).
 pub const DIR_NAME: &str = "reroute";
@@ -55,7 +55,7 @@ pub struct SourceVerb {
     pub ext: &'static str,
 }
 
-/// The per-row policy — philosophy §4's table, one variant per column.
+/// The per-row policy (`docs/DESIGN-toolchain-philosophy-2026-08-29.md` §4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Policy {
     Direct {
@@ -106,7 +106,7 @@ const RUSTC_LANES: &[Lane] = &[
     },
 ];
 
-/// `cargo <verb>` for a verb that IS a direct-row operation: one branded spelling and no lane question.
+/// `cargo <verb>` spellings that run a DIRECT row's tool: one Trust spelling, no lane.
 pub const CARGO_VERB_REROUTES: &[(&str, &str)] = &[("clippy", "targo tippy"), ("fmt", "targo fmt")];
 
 /// The table.
@@ -205,7 +205,7 @@ pub const fn program_of(row: &Row) -> &'static str {
     }
 }
 
-/// `<prefix>/reroute` — never `bin/`, so `ToolName`'s deny-list keeps meaning exactly what it means.
+/// `<prefix>/reroute`, a directory of its own: `bin/` holds only the store's shims.
 #[must_use]
 pub fn dir(layout: &Layout) -> PathBuf {
     layout.prefix.join(DIR_NAME)
@@ -217,7 +217,7 @@ pub fn stub_path(layout: &Layout, upstream: &str) -> PathBuf {
     dir(layout).join(upstream)
 }
 
-/// The one reading of the [`PASSTHROUGH_ENV`] marker, `aterm_types`' `env_flag_engaged` rule restated so a present-but-empty value (which travels) never counts.
+/// Whether a marker ([`PASSTHROUGH_ENV`], [`ANNOUNCED_ENV`]) is set: non-empty and not `0`, the stub's own `sh` test and `aterm_types::control_socket::env_flag_engaged`'s rule.
 #[must_use]
 pub fn engaged(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
@@ -299,7 +299,7 @@ fn pin_lines(pin: &Pin) -> String {
 /// The DIRECT row's one line: what runs, then the escape.
 #[must_use]
 pub fn direct_announcement(upstream: &str, branded: &str, upstream_found: bool) -> String {
-    let mut line = format!("aterm: running {branded}, Trust's '{upstream}'.");
+    let mut line = format!("aterm: running {branded} in place of '{upstream}'.");
     if upstream_found {
         line.push(' ');
         line.push_str(&escape_clause(upstream));
@@ -618,7 +618,7 @@ pub const EXPLICIT_LANE_VERBS: &[&str] = &["trust", "--unverified"];
 /// The program `aterm pkg install` names for `targo`, the tool an explicit lane runs.
 pub const EXPLICIT_LANE_PROGRAM: &str = "trust";
 
-/// `cargo metadata`, `cargo locate-project`, `cargo version` and `cargo --version`.
+/// Cargo queries that take no lane: an installed `targo` answers them with no line.
 pub const LANE_FREE_QUERIES: &[&str] = &["metadata", "locate-project", "version", "--version"];
 
 /// The one line printed when `cargo trust …`/`cargo --unverified …` runs `targo`.
@@ -998,7 +998,7 @@ pub fn stub_body_sh(upstream: &str, atpkg: &Path, reroute_dir: &Path, strict: bo
     s
 }
 
-/// THE AGENT PROGRAMS' STUB (2026-09-23).
+/// The agent programs' stub: inside an aterm session it execs the managed twin, elsewhere the next copy on PATH.
 #[must_use]
 pub fn agents_stub_body_sh(name: &str, agents_dir: &Path) -> String {
     let mut s = String::from("#!/bin/sh\n");

@@ -97,11 +97,38 @@ impl CursorGlow {
         }
     }
 
-    /// Host observation.
+    /// Host observation: the cells of the frame about to be presented, the
+    /// window's own ([`Self::observe_frame_text_at`] at `(0, 0)`).
+    #[inline]
     pub fn observe_frame_text(
         &mut self,
         cur: Option<(u16, u16)>,
         cells: &[Vec<aterm_core::terminal::RenderCell>],
+        now: Instant,
+    ) {
+        self.observe_frame_text_at(cur, cells, (0, 0), now);
+    }
+
+    /// Test seam: how many lettered cells this frame's text reads.
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub fn frame_text_letters(&self) -> usize {
+        self.frame_text
+            .pairs
+            .iter()
+            .filter(|p| matches!(p, Some((Some(_), _))))
+            .count()
+    }
+
+    /// Host observation: the cells of the frame about to be presented,
+    /// whose first cell is window cell `at` (a split's focused pane hands
+    /// its own cells at its offset, the window's composite being drawn only
+    /// after the cursor's step). `cur` is in window cells.
+    pub fn observe_frame_text_at(
+        &mut self,
+        cur: Option<(u16, u16)>,
+        cells: &[Vec<aterm_core::terminal::RenderCell>],
+        at: (u16, u16),
         now: Instant,
     ) {
         /// The most rows one frame reads: a leap longer than this keeps its
@@ -123,37 +150,39 @@ impl CursorGlow {
             take(a);
             take(b);
         }
+        let (r0, c0) = (i32::from(at.0), i32::from(at.1));
         let ft = &mut self.frame_text;
         ft.rows.clear();
         ft.pairs.clear();
         ft.cols = 0;
+        ft.col0 = c0;
         ft.at = Some(now);
         if lo > hi {
             return;
         }
-        let lo = (lo - 1 - Self::FRAME_TEXT_RISE).max(0);
-        let hi = (hi + 1).min(cells.len() as i32 - 1).min(lo + MAX_ROWS - 1);
+        let lo = (lo - 1 - Self::FRAME_TEXT_RISE).max(r0);
+        let hi = (hi + 1)
+            .min(r0 + cells.len() as i32 - 1)
+            .min(lo + MAX_ROWS - 1);
         ft.lo = lo;
         if lo > hi {
             return;
         }
-        ft.cols = (lo..=hi)
-            .map(|r| cells[r as usize].len())
-            .max()
-            .unwrap_or(0);
+        let line = |row: i32| &cells[(row - r0) as usize];
+        ft.cols = (lo..=hi).map(|r| line(r).len()).max().unwrap_or(0);
         let rgb = |c: [u8; 3]| (u32::from(c[0]) << 16) | (u32::from(c[1]) << 8) | u32::from(c[2]);
         let n_rows = (hi - lo + 1) as usize;
         ft.rows.reserve(n_rows);
         ft.pairs.reserve(n_rows * ft.cols);
         for row in lo..=hi {
-            let line = &cells[row as usize];
+            let line = line(row);
             let glyph = |c: &aterm_core::terminal::RenderCell| c.ch != ' ' || c.wide;
             let mut span: Option<(i32, i32)> = None;
             let n_cols = line.len().min(ft.cols);
             for (c, cell) in line[..n_cols].iter().enumerate() {
                 let is_glyph = glyph(cell);
                 if is_glyph {
-                    let ci = c as i32;
+                    let ci = c0 + c as i32;
                     span = Some(span.map_or((ci, ci + 1), |(f, _)| (f, ci + 1)));
                 }
                 ft.pairs

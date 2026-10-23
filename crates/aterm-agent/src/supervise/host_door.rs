@@ -380,9 +380,20 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
         crate::supervise::occupancy::OccupancyReading::default()
     }
 
-    /// Notifies the host that the occupancy door typed its line at a break (the occupancy
+    /// Returns the session's facts the agent may be told
+    /// (`docs/DESIGN-hung-background-call-2026-10-20.md` R2, R3): each live background call of
+    /// the agent's that reads no progress, worst first, each leader proven alive at its own birth
+    /// at this ask. `None` where the host has no reading, or none fresh; an empty list is a fresh
+    /// reading that names nothing. Asked where a fact may ride a decided prompt (`[harness]
+    /// facts`) and at a break the stuck fact may be typed at (`[harness] stuck_break_note`).
+    fn facts(&self) -> Option<crate::supervise::facts::FactsReading> {
+        None
+    }
+
+    /// Notifies the host that the harness typed a line of its own at a break (the occupancy
     /// design's §2.1): the break was taken, as one [`Self::at_background`] steps at is. Called
-    /// under `occupancy = "prompt"` alone.
+    /// for the occupancy door's line under `occupancy = "prompt"` and for the stuck fact's under
+    /// `[harness] stuck_break_note`.
     fn break_taken(&self) {}
 
     /// Notifies the host of what the occupancy door says now (the occupancy design's §6), once

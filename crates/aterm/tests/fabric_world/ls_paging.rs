@@ -37,8 +37,8 @@ impl Page {
         }
     }
 
-    /// A page carrying NO rows and a cursor — the shape the contract permits and
-    /// the shape the old reader read as "the fleet ends here".
+    /// A page carrying NO rows and a cursor: the contract permits it, and it does
+    /// not mean "the fleet ends here".
     fn empty(resume: &str) -> Self {
         Self {
             rows: Vec::new(),
@@ -49,10 +49,9 @@ impl Page {
 
 /// `aterm link` with no rendezvous file to read: the child's `XDG_RUNTIME_DIR`
 /// is an empty scratch dir, so `ls` gets exactly the flags a test spells out.
-/// Against the real one, a machine where `aterm fabric on` had written it
-/// filled in its `--cap-file`, and `ls` opened with the `Hello` an attach
-/// needs, which these stubs (they speak `Last` only) hang up on — every test
-/// here red on 2026-09-30 for the machine, not the tree. The dir goes when the
+/// Against the real one, on a machine where `aterm fabric on` has written it,
+/// `ls` fills in its `--cap-file` and opens with the `Hello` an attach needs,
+/// which these stubs (they speak `Last` only) hang up on. The dir goes when the
 /// returned guard drops: hold it until the child has exited.
 fn aterm_link() -> (Command, aterm_tempfile::TempDir) {
     let runtime = aterm_tempfile::Builder::new()
@@ -140,11 +139,11 @@ fn ls(tag: &str, pages: Vec<Page>, extra: &[&str]) -> (String, String, bool) {
     )
 }
 
-/// `--attention` (§9.3's ESCALATION VIEW) PRINTS THE ESCALATING ROWS AND ONLY
-/// THEM, wherever the walk finds them: a quiet row first, then an empty page
-/// with a live cursor, then the node raising `attention=`. A filter that kept
-/// everything prints two lines; a walk that stopped at the empty page prints
-/// nothing and exits 0 — silence indistinguishable from "nobody needs you".
+/// `--attention` PRINTS THE ESCALATING ROWS AND ONLY THEM, wherever the walk
+/// finds them: a quiet row first, then an empty page with a live cursor, then
+/// the node raising `attention=`. A filter that kept everything prints two
+/// lines; a walk that stopped at the empty page prints nothing and exits 0 —
+/// silence indistinguishable from "nobody needs you".
 #[test]
 fn ls_attention_prints_only_the_escalating_rows_past_an_empty_page() {
     let (stdout, stderr, ok) = ls(

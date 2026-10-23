@@ -22,19 +22,27 @@ aterm-win32-oracle — generated declaration closure and independent Windows ABI
 
 usage: targo --unverified run -p aterm-win32-oracle -- <gen|check|record|oracle|oracle-052> [options]
 
-  --root <checkout>     checkout containing win32-oracle/ (default: ancestor of cwd)
-  --upstream <dir>      pinned registry windows-sys 0.61.2 source (default: $WINDOWS_SYS_SRC or Cargo registry)
+  --root <checkout>     checkout holding win32-oracle/ and crates/aterm-win32/ (default: the nearest such
+                        ancestor of cwd)
+  --upstream <dir>      not oracle-052: pinned registry windows-sys 0.61.2 source (default: $WINDOWS_SYS_SRC,
+                        else the Cargo registry, fetched when missing)
   --out <dir>           gen only: write into a checkout-shaped output tree
-  --target-dir <dir>    oracle build dir (default: $ORACLE_TARGET_DIR, <root>/win32-oracle/target.noindex,
-                        or <root>/crates/aterm-windows-sys-052/tests/oracle/target.noindex)
+  --target-dir <dir>    record/oracle/oracle-052 build dir (default: $ORACLE_TARGET_DIR, else
+                        <root>/win32-oracle/target.noindex; for oracle-052,
+                        <root>/crates/aterm-windows-sys-052/tests/oracle/target.noindex)
   --stock <toolchain>   oracle/oracle-052 only: stock rustup toolchain (default: stable)
   --no-format           gen only: skip trustfmt on emitted Rust
 
-The driver, graph and host recorder use Trust. oracle and oracle-052 are a STOCK EXCEPTION:
-stock Cargo/RUSTC compile Windows std; no Windows program runs. The reference workspaces have
-no [patch] table: gen/check read pinned registry source and Cargo's consumer/feature graph,
-record rewrites win32-oracle/recorded.json from host answers, check never blesses drift, and
-oracle-052 holds crates/aterm-windows-sys-052 to registry windows-sys 0.52.0.
+gen writes crates/aterm-win32, crates/aterm-windows-sys's feature list and the win32-oracle
+conformance and recorder crates from the pinned registry source and Cargo's consumer/feature
+graph; check regenerates into scratch and reports DRIFT, never writing; record rewrites
+win32-oracle/recorded.json from the host's answers, then runs gen; oracle compiles the
+conformance crate, compares the facade's import tables with upstream's and requires every
+planted fault to be caught, on both Windows triples; oracle-052 holds
+crates/aterm-windows-sys-052 to registry windows-sys 0.52.0. The reference workspaces have no
+[patch] table. The driver, graph and host recorder use Trust; oracle and oracle-052 are a STOCK
+EXCEPTION: stock Cargo/RUSTC compile Windows std, and no Windows program runs.
+`targo --unverified verify cells` runs both with a Windows cell.
 Exit: 0 pass, 1 finding, 2 usage, 3 could not run; no proof or Windows-runtime claim.
 ";
 #[derive(Clone)]

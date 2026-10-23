@@ -3,17 +3,13 @@
 
 //! `aterm fleet`: this machine's membership in a fleet, the machines
 //! `aterm ctl survey --fleet` reads (`docs/DESIGN-sessions-as-subagents-2026-10-15.md`
-//! §5).
-//!
-//! Its earlier modes are gone, and each answers with what replaced it: the
-//! local NDJSON bridge (`events`, `exec`), which `aterm ctl survey` and
-//! `subscribe` cover, and the embedded operator's attention-queue clients
-//! (`status`, `manage`, `next`, …), which left with the operator (design §7).
+//! §5). A removed mode word exits 2 naming the `aterm ctl` verb that does its
+//! work.
 
 use std::process::ExitCode;
 
-/// The whole fleet CLI as a callable: `argv[1..]` in, process exit code out,
-/// served by `aterm fleet …` and the argv0 alias.
+/// `aterm fleet …` and the `aterm-fleet` argv0 alias: `argv[1..]` in, exit
+/// code out.
 pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     let mode = argv.first().map(|a| a.to_string_lossy().into_owned());
     match route(mode.as_deref()) {
@@ -23,7 +19,6 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
             eprintln!("aterm fleet: `{mode}` is no longer an `aterm fleet` mode; {instead}");
             ExitCode::from(2)
         }
-        // This machine's membership in a fleet (`crate::fleet_member`).
         #[cfg(unix)]
         Route::Membership => crate::fleet_member::main_entry(&mode.unwrap_or_default(), &argv[1..]),
         #[cfg(not(unix))]
@@ -38,13 +33,13 @@ pub fn main_entry(argv: Vec<std::ffi::OsString>) -> ExitCode {
     }
 }
 
-/// What `aterm fleet <mode>` is, decided apart from doing it: the dispatcher's
-/// table, which a test reads without running any mode.
+/// Where `aterm fleet <mode>` goes, decided without running it so a test can
+/// read it.
 #[derive(Debug, PartialEq, Eq)]
 enum Route {
     /// No mode, `-h` or `--help`: the usage, exit 0.
     Help,
-    /// A removed mode, with what took its work ([`gone_to`]).
+    /// A removed mode, with what does its work ([`gone_to`]).
     Gone(&'static str),
     /// A membership mode the usage names (`init`, `join`, `peers`, `allow`,
     /// `leave`).
@@ -61,7 +56,7 @@ fn route(mode: Option<&str>) -> Route {
     }
 }
 
-/// What took a removed mode's work, for its refusal.
+/// What does a removed mode's work, named in its refusal.
 fn gone_to(mode: &str) -> Option<&'static str> {
     Some(match mode {
         "events" => "use `aterm ctl survey` or `aterm ctl subscribe @a,@b events`",
@@ -87,8 +82,8 @@ fn usage() -> ExitCode {
 mod tests {
     use super::*;
 
-    /// Help, bare or asked for, is the usage; each membership mode is one; a
-    /// removed mode names what replaced it; anything else is unknown.
+    /// No mode, `-h` and `--help` are help; the five membership words are
+    /// membership; each removed mode is refused; any other word is unknown.
     #[test]
     fn every_mode_word_routes_to_its_one_answer() {
         for help in [None, Some("--help"), Some("-h")] {
@@ -118,9 +113,8 @@ mod tests {
         }
     }
 
-    /// Help exits 0; a removed mode and an unknown word are usage errors (2).
-    /// Only words whose answer is a line of text run here: a membership mode
-    /// changes the machine, so its route is read above and never run.
+    /// Help exits 0; a removed mode or an unknown word exits 2. A membership
+    /// mode changes the machine, so only its route is tested, never a run.
     #[test]
     fn help_succeeds_and_a_refused_word_is_a_usage_error() {
         let exit = |args: &[&str]| main_entry(args.iter().map(std::ffi::OsString::from).collect());

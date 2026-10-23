@@ -397,8 +397,8 @@ pub fn place_handoff_policy(
 
 /// The bundle executable's mode: runnable, and writable by nobody. `~/.local/bin/aterm` is
 /// a link to this file, so a `cp build ~/.local/bin/aterm` with a write bit here opens the
-/// RUNNING app's own inode: the kernel kills every aterm window (CODESIGNING, Invalid
-/// Page) and a copy cut short with them leaves an app that cannot start (2026-10-19).
+/// running app's own inode: the kernel kills every aterm window (CODESIGNING, Invalid
+/// Page), and a copy cut short with them leaves an app that cannot start.
 #[cfg(unix)]
 const EXE_MODE: u32 = 0o555;
 

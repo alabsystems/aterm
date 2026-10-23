@@ -74,7 +74,7 @@ pub(crate) fn host_winsize() -> (u16, u16) {
     (ws.ws_row, ws.ws_col)
 }
 
-/// Validate that `path` is an existing executable regular file.
+/// Whether `path` is a regular file this user can execute, and if not, which cause.
 pub(crate) fn shell_check(path: &str) -> crate::ShellCheck {
     use crate::ShellCheck;
     match std::fs::metadata(path) {

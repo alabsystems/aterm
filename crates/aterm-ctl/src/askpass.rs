@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The `aterm-askpass` role: the `SUDO_ASKPASS` helper aterm points every macOS session at
+//! The `aterm-askpass` role: the `SUDO_ASKPASS` helper aterm sets in its macOS sessions
 //! (`docs/DESIGN-sudo-askpass-2026-10-15.md` §3.3).
 
 use aterm_uds::sudo::{Secret, WireBuffer};

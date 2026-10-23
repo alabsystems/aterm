@@ -8,7 +8,7 @@ use super::*;
 const WGHT: u32 = u32::from_be_bytes(*b"wght");
 
 /// The sizes the box is compared at: what windows at 1x, 1.5x, 2x and 3x of
-/// the common font sizes ask for, and the 9 px the defect was found at.
+/// the common font sizes ask for, and 9 px, where Cinzel's 500 and 600 boxes differ.
 const SIZES: [f32; 12] = [
     9.0, 11.0, 12.0, 13.5, 16.0, 18.0, 19.5, 24.0, 27.0, 32.0, 36.0, 48.0,
 ];
@@ -59,21 +59,20 @@ fn configured(bytes: &[u8], px: f32, requests: &[(u32, f32)], nudge: f32) -> Ren
     r
 }
 
-/// The reviewer's case (2026-10-16): Cinzel at `wght` 500 with a nudge of
-/// 100. Its 600 instance has the 500 instance's box at 16 px but not at 9 px,
-/// so a gate that compares the two boxes at the active size alone admits the
-/// nudge at 16 px and a theme flip then moves the box of a window at 9 px.
-/// Whatever size is active when the nudge is decided, a flip either way now
-/// moves no box at any size, and the kept answers are what the face derives.
+/// Cinzel at `wght` 500 with a nudge of 100. Its 600 instance has the 500
+/// instance's box at 16 px but not at 9 px, so a gate that compared the two
+/// boxes at the active size alone would admit the nudge at 16 px, and a theme
+/// flip would then move the box of a window at 9 px. Whatever size is active
+/// when the nudge is decided, a flip either way moves no box at any size, and
+/// the kept answers are what the face derives.
 ///
-/// NEGATIVE CONTROL: the 600 instance's own box does move against the 500
-/// one's at some size in [`SIZES`] while it holds at 16 px, so the one-size
-/// gate would have admitted it there (measured before the fix: built at
-/// 16 px, the flip to light moved the box at 9 and 27 px).
+/// NEGATIVE CONTROL: the 600 instance's own box moves against the 500 one's at
+/// some size in [`SIZES`] while it holds at 16 px, so a one-size gate would
+/// admit it there.
 ///
-/// Held twice, and mutation-checked: the gate refuses this nudge (restoring
-/// the one-size gate fails the next test), and the box is derived from the
-/// un-nudged instance whatever the gate admits (deriving it from the drawn
+/// Two mechanisms hold this: the gate refuses this nudge (a one-size gate fails
+/// `the_nudge_does_not_depend_on_the_active_size`), and the box is derived from
+/// the un-nudged instance whatever the gate admits (deriving it from the drawn
 /// instance fails the SF Mono test's "derives nothing"). Undoing both fails
 /// this one.
 #[test]
@@ -114,8 +113,8 @@ fn a_theme_flip_moves_no_cell_box_at_any_size() {
     }
 }
 
-/// NEGATIVE CONTROL: before the fix Cinzel 500 + 100 resolved 500 at 9 px
-/// and 600 at 16 px.
+/// NEGATIVE CONTROL: a gate that compares the boxes at the active size alone
+/// resolves Cinzel 500 + 100 to 500 at 9 px and to 600 at 16 px.
 #[test]
 fn the_nudge_does_not_depend_on_the_active_size() {
     let bytes = cinzel();

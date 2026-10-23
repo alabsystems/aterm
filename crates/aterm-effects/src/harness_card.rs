@@ -65,9 +65,11 @@ pub(crate) const RIM_COVER_MAX: usize = 32;
 
 const _: () = assert!(
     CARD_UNDER_ITEMS_MAX == 2 * 48 + 2 + 6 * 16
+        && CARD_OVER_ITEMS_MAX == 1 + 4 * 32 + 4 * (3 * 16 + 2) * (9 + 8 + 3 + 5)
         && CARD_ITEMS_MAX == CARD_UNDER_ITEMS_MAX + CARD_OVER_ITEMS_MAX
         && CARD_ITEMS_MAX < u16::MAX as usize,
-    "the card's item bound is the design's under content and a star term, no art term"
+    "the card's item bound is the design's (§4.8): the under content, then the kitty, the rim's \
+     cover cut round the trail's hole and every star's tone rectangles, no art term"
 );
 
 /// Initial border hue period (ms) at the start of an intro episode.

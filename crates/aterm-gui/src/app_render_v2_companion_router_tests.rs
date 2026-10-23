@@ -442,3 +442,82 @@ fn the_word_cats_yield_to_the_flying_head_at_its_seat() {
         .expect("saturated reservation");
     assert_eq!((reserved.0, reserved.1), (i32::MAX, i32::MAX));
 }
+
+/// A headless capture is a frame like a present: it offers the resident's
+/// drawn body to the sky, so the stars it draws next stay off the fur. The
+/// twin ticks the same pet onto the glass without an offer, the control: its
+/// body is drawn and its sky shades nothing.
+#[test]
+fn a_capture_shades_the_sky_where_the_pet_is_drawn() {
+    fn pet_app() -> App {
+        let mut app = App::headless_for_test();
+        app.config.cursor_trail = Some(true);
+        app.config.cursor_trail_style = Some("rainbow kitty pet".into());
+        app.config.motion = Some("full".into());
+        app.windows.get_mut(&WindowId(0)).expect("window").focused = true;
+        app.recompute_sparkle();
+        assert!(app.trail_is_kitty_pet(), "fixture: the pet is the trail");
+        app
+    }
+    let wid = WindowId(0);
+    let t0 = Instant::now();
+    let mut app = pet_app();
+    let drawn = (0..600u64)
+        .find_map(|k| {
+            app.capture_words(wid, t0 + Duration::from_millis(16 * k));
+            app.windows[&wid].fx.companion().hit_rect()
+        })
+        .expect("fixture: the pet reached the glass in 10 s of captures");
+    let ws = &app.windows[&wid];
+    assert!(
+        ws.fx.cursor().glow.v2_status().is_some(),
+        "fixture: the v2 sky owns the frame"
+    );
+    assert_eq!(
+        ws.fx.cursor().glow.pet_shade(),
+        Some(drawn),
+        "the capture's sky shades the body the capture drew"
+    );
+
+    let mut twin = pet_app();
+    let cfg = twin.glow_config();
+    let tw = twin.windows.get_mut(&wid).expect("window");
+    tw.fx
+        .cursor_mut()
+        .glow
+        .tick(Some((5, 10)), t0, &cfg, glow_geom(), &mut Vec::new());
+    let on_glass = (0..100u64).any(|k| {
+        crate::app_render::pet_tick_for_test(
+            tw,
+            aterm_effects::host::CaptureMode::Present,
+            aterm_effects::kitty_pet::PetSense {
+                caret_drawn: true,
+                now: t0 + Duration::from_millis(100 * k),
+                caret: Some((5, 10)),
+                rows: 24,
+                cols: 80,
+                cell_w: 10,
+                cell_h: 20,
+                reduced_motion: false,
+                output_burst: false,
+                pointer: None,
+                wrapped: false,
+            },
+        )
+        .alpha
+            > 0
+    });
+    assert!(
+        on_glass,
+        "control fixture: the twin's pet reached the glass"
+    );
+    assert!(
+        tw.fx.cursor().glow.v2_status().is_some(),
+        "control fixture: the twin's v2 sky owns the frame"
+    );
+    assert_eq!(
+        tw.fx.cursor().glow.pet_shade(),
+        None,
+        "control: a pet ticked onto the glass with no offer leaves the sky unshaded"
+    );
+}

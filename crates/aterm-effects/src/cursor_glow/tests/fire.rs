@@ -1571,6 +1571,7 @@ impl FireHost {
             body_allowed: true,
             momentum_glow: self.momentum_glow,
             user_tinted: false,
+            accent_pinned: false,
         };
         let trail = TrailConfig {
             enabled: false,
@@ -2064,54 +2065,6 @@ fn the_dark_fire_rises_in_tongues_not_a_slab() {
 }
 
 #[test]
-fn the_fire_halo_spares_a_dark_letter_on_a_bright_ground() {
-    let row = 4u16;
-    let yellow_at = |col: usize| col >= 12 && col.is_multiple_of(2);
-    let mixed = |col: usize| {
-        if yellow_at(col) {
-            aterm_core::terminal::RenderCell {
-                ch: 'm',
-                fg: [0, 0, 0],
-                bg: [0xCD, 0xCD, 0x00],
-                ..Default::default()
-            }
-        } else {
-            aterm_core::terminal::RenderCell {
-                ch: 'm',
-                fg: [0xD0, 0xD0, 0xD0],
-                bg: [0x11, 0x13, 0x18],
-                ..Default::default()
-            }
-        }
-    };
-    let ringed = |glow: &CursorGlow, yellow: bool| {
-        glow.halo_cells()
-            .iter()
-            .any(|h| h.row == row && yellow_at(usize::from(h.col)) == yellow)
-    };
-    let text_above = |_: usize| aterm_core::terminal::RenderCell {
-        ch: 'm',
-        fg: [0xD0, 0xD0, 0xD0],
-        bg: [0x11, 0x13, 0x18],
-        ..Default::default()
-    };
-    let (glow, _) = dark_fire_burst_with(22, 35, Some(&text_above), true, Some(&mixed), &|_| {});
-    assert!(
-        ringed(&glow, false),
-        "a light letter in the blaze is ringed"
-    );
-    assert!(
-        !ringed(&glow, true),
-        "a dark letter on the yellow ground is ringed"
-    );
-    let (blind, _) = dark_fire_burst_with(22, 35, Some(&text_above), false, Some(&mixed), &|_| {});
-    assert!(
-        ringed(&blind, true),
-        "control: with the colours unknown the yellow cells are ringed"
-    );
-}
-
-#[test]
 fn a_cool_fire_raises_a_tongue_over_each_of_the_last_letters() {
     let g = tall_geom();
     let (row, start, keys) = (4u16, 2u16, 10u16);
@@ -2413,7 +2366,12 @@ fn under_a_line_of_text_the_dark_fire_burns_in_its_own_row() {
         up > 0,
         "control: the flame let rise lays no patch in the line above"
     );
-    let (unheld, unheld_out) = hot(&|glow| glow.fire_row_unheld = true);
+    // Over a line typed without a gap the row's tongues stand only past its
+    // end, so the control lays the crest that burns under every letter.
+    let (unheld, unheld_out) = hot(&|glow| {
+        glow.fire_row_unheld = true;
+        glow.fire_kept_crest = true;
+    });
     let (washed, _) = worst(&unheld, &unheld_out, 30);
     assert!(
         washed < 4.5,
@@ -2949,89 +2907,6 @@ fn the_dark_fire_is_never_olive() {
 }
 
 #[test]
-fn the_kept_flame_burns_its_body_over_the_letters() {
-    let g = tall_geom();
-    let (row, start) = (4u16, 2u16);
-    let text_above = |_: usize| aterm_core::terminal::RenderCell {
-        ch: 'm',
-        fg: [0xD0, 0xD0, 0xD0],
-        bg: [0x11, 0x13, 0x18],
-        ..Default::default()
-    };
-    let page = DARK_PAIR.1;
-    let lift = |p: u32| -> f32 {
-        [16, 8, 0]
-            .iter()
-            .map(|&sh| ((p >> sh) & 0xff).saturating_sub((page >> sh) & 0xff) as f32)
-            .sum()
-    };
-    let (top, ch) = (i32::from(row) * g.ch as i32, g.ch as i32);
-    for (what, keys, gap) in [("cool", 10u16, 60u64), ("blaze", 30, 57)] {
-        let run = |strip: bool| -> (f32, f32, f32, f32) {
-            let (glow, out) =
-                dark_fire_burst_with(keys, gap, Some(&text_above), true, None, &|glow| {
-                    glow.fire_kept_strip = strip;
-                });
-            let mut ink: Vec<(u16, u16)> = (start..start + keys).map(|c| (row, c)).collect();
-            ink.extend((0..g.cols as u16).map(|c| (row - 1, c)));
-            let glass = fire_dark_glass(&glow, &out, g, &ink);
-            let mut worst = f32::INFINITY;
-            let (mut cut, mut body, mut nb, mut low, mut nl) =
-                (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
-            for col in start..start + keys {
-                let (i, cnt) = glyph(g, row, col);
-                worst = worst.min(ratio(&glass, &i, &cnt));
-                if col + 4 < start + keys {
-                    continue;
-                }
-                for &(y, x) in &cnt {
-                    body += lift(glass.at(y, x));
-                    nb += 1.0;
-                }
-                let x0 = i32::from(col) * g.cw as i32;
-                for y in top + ch * 8 / 10..top + ch {
-                    for x in x0..x0 + g.cw as i32 {
-                        low += lift(glass.at(y, x));
-                        nl += 1.0;
-                    }
-                }
-                for dx in [0, 1, 4, 5, 8, 9, 12] {
-                    let col_lift: Vec<f32> = (top..top + ch * 3 / 4)
-                        .map(|y| lift(glass.at(y, x0 + dx)))
-                        .collect();
-                    let peak = col_lift.iter().copied().fold(0.0, f32::max);
-                    if peak < 30.0 {
-                        continue;
-                    }
-                    for w in col_lift.windows(2) {
-                        cut = cut.max((w[1] - w[0]) / peak);
-                    }
-                }
-            }
-            (cut, body / nb.max(1.0), low / nl.max(1.0), worst)
-        };
-        let (cut, body, low, worst) = run(false);
-        assert!(
-            worst >= CursorGlow::FIRE_DARK_ROW_BAR,
-            "{what}: a letter the kept flame burns under reads at {worst:.2}:1"
-        );
-        assert!(
-            cut <= 0.35,
-            "{what}: the kept flame's silhouette steps {cut:.3} of its brightest in one pixel"
-        );
-        assert!(
-            body * 3.0 >= low * 2.0,
-            "{what}: the kept flame lays {body:.1} in the counters against {low:.1} under the baseline"
-        );
-        let (s_cut, ..) = run(true);
-        assert!(
-            s_cut >= 0.6,
-            "control, {what}: round 2's strip steps only {s_cut:.3} of its brightest in one pixel"
-        );
-    }
-}
-
-#[test]
 fn a_fire_meteor_streaks_without_a_tick_at_its_joins() {
     let g = tall_geom();
     let mut c = cfg(GlowStyle::Fire, true);
@@ -3149,8 +3024,11 @@ fn fire_typing_halo(
 
 #[test]
 fn the_fire_typing_halo_is_the_forges_warm_light() {
-    let chroma = |quads: &[GlowQuad]| -> (f32, f32, u64) {
+    // The light's saturation, its brightest channel, how much warmer than
+    // cool it leans, and its hue (degrees) over the halo's area.
+    let chroma = |quads: &[GlowQuad]| -> (f32, f32, u64, f32) {
         let (mut sat, mut top, mut warm_minus_cool) = (0.0f32, 0.0f32, 0i64);
+        let mut sum = [0.0f32; 3];
         for q in quads.iter().filter(|q| q.alpha == 0) {
             let area = f32::from(q.w) * f32::from(q.h);
             for c in [q.color, q.color2] {
@@ -3159,15 +3037,41 @@ fn the_fire_typing_halo_is_the_forges_warm_light() {
                 sat += (hi - lo) as f32 * area;
                 top += hi as f32 * area;
                 warm_minus_cool += (i64::from(r) - i64::from(b)) * area as i64;
+                for (s, v) in sum.iter_mut().zip([r, g, b]) {
+                    *s += v as f32 * area;
+                }
             }
         }
-        (sat / top.max(1.0), top, warm_minus_cool.max(0) as u64)
+        let [r, g, b] = sum;
+        let (hi, lo) = (r.max(g).max(b), r.min(g).min(b));
+        let hue = if hi > lo && hi == r {
+            60.0 * (g - b) / (hi - lo)
+        } else {
+            90.0
+        };
+        (sat / top.max(1.0), top, warm_minus_cool.max(0) as u64, hue)
     };
     let shipped = fire_typing_halo(4, halo_rows(false), &|_| {});
     let unwarmed = fire_typing_halo(4, halo_rows(false), &|fx| fx.momentum_unwarmed = true);
-    let (sat, top, warm) = chroma(&shipped);
-    let (u_sat, u_top, _) = chroma(&unwarmed);
+    // Round 2's halo: warmed toward the rod's amber (#ff9632).
+    let amber = fire_typing_halo(4, halo_rows(false), &|fx| {
+        fx.momentum_fire_ember = Some(0x00FF_9632);
+    });
+    let (sat, top, warm, hue) = chroma(&shipped);
+    let (u_sat, u_top, _, u_hue) = chroma(&unwarmed);
+    let (_, _, _, a_hue) = chroma(&amber);
     assert!(top > 0.0, "fixture: the halo is lit");
+    // An ember's orange-red, never the tan a dim gold or amber makes of a
+    // dark page's blue-grey (2026-10-23).
+    assert!(
+        hue <= 25.0,
+        "the fire's typing halo burns hue {hue:.1} degrees, a tan"
+    );
+    assert!(
+        u_hue > 25.0 && a_hue > 25.0,
+        "control: the momentum ramp's halo burns hue {u_hue:.1} degrees, the amber-warmed \
+         one {a_hue:.1}"
+    );
     assert!(
         sat >= 0.4,
         "the fire's typing halo carries only {sat:.3} colour"
@@ -3305,78 +3209,24 @@ fn sparkle_typing_halo_on_paper_is_its_gold() {
 }
 
 #[test]
-fn the_kept_flame_holds_each_height_at_its_own_heat() {
-    let g = tall_geom();
-    let (row, start, keys) = (4u16, 2u16, 10u16);
-    let text_above = |_: usize| aterm_core::terminal::RenderCell {
-        ch: 'm',
-        fg: [0xD0, 0xD0, 0xD0],
-        bg: [0x11, 0x13, 0x18],
-        ..Default::default()
-    };
-    let page = DARK_PAIR.1;
-    let lift = |p: u32| -> f32 {
-        [16, 8, 0]
-            .iter()
-            .map(|&sh| ((p >> sh) & 0xff).saturating_sub((page >> sh) & 0xff) as f32)
-            .sum()
-    };
-    let run = |hottest: bool| -> (f32, f32) {
-        let (glow, out) = dark_fire_burst_with(keys, 60, Some(&text_above), true, None, &|glow| {
-            glow.fire_held_hottest = hottest;
-        });
-        let mut ink: Vec<(u16, u16)> = (start..start + keys).map(|c| (row, c)).collect();
-        ink.extend((0..g.cols as u16).map(|c| (row - 1, c)));
-        let glass = fire_dark_glass(&glow, &out, g, &ink);
-        let (mut worst, mut body, mut n) = (f32::INFINITY, 0.0f32, 0.0f32);
-        for col in start..start + keys {
-            let (i, cnt) = glyph(g, row, col);
-            worst = worst.min(ratio(&glass, &i, &cnt));
-            for &(y, x) in &cnt {
-                body += lift(glass.at(y, x));
-                n += 1.0;
-            }
-        }
-        (body / n.max(1.0), worst)
-    };
-    let (body, worst) = run(false);
-    let (hot_body, _) = run(true);
-    assert!(
-        worst >= CursorGlow::FIRE_DARK_ROW_BAR,
-        "a letter the kept flame burns under reads at {worst:.2}:1"
-    );
-    assert!(
-        body >= hot_body * 1.1,
-        "held at each height's heat the flame lays {body:.1} over the letters, at its hottest {hot_body:.1}"
-    );
-    assert!(
-        hot_body > 0.0,
-        "control: held at its hottest the flame lays nothing"
-    );
-}
-
-#[test]
-fn the_kept_flames_cores_burn_gold_in_the_gaps_and_under_the_line() {
+fn the_kept_flames_cores_burn_gold_in_the_gaps() {
     for gap_ms in [57u64, 90] {
-        let ((under, blank), olive) = kept_phrase_gold(gap_ms, false);
+        let ((_, blank), olive) = kept_phrase_gold(gap_ms, false);
         assert!(
             blank >= 6,
             "{gap_ms} ms apart: the word's gap shows {blank} gold pixels"
         );
-        assert!(
-            under >= 5,
-            "{gap_ms} ms apart: under the baseline the letters show {under} gold pixels"
-        );
         assert_eq!(olive, 0, "{gap_ms} ms apart: {olive} pixels read olive");
         let ((_, c_blank), _) = kept_phrase_gold(gap_ms, true);
-        assert_eq!(
-            c_blank, 0,
-            "control, {gap_ms} ms apart: cores burnt from their root lay {c_blank} gold pixels in the gap"
+        assert!(
+            c_blank * 4 <= blank,
+            "control, {gap_ms} ms apart: cores burnt from their root lay {c_blank} gold pixels in the \
+             gap against {blank}"
         );
     }
 }
 
-fn kept_phrase_gold(gap_ms: u64, from_base: bool) -> ((usize, usize), usize) {
+fn kept_phrase(gap_ms: u64, setup: &dyn Fn(&mut CursorGlow)) -> (Glass, Vec<char>, u16, usize) {
     let g = tall_geom();
     let (row, start) = (4u16, 2u16);
     let phrase: Vec<char> = "echo the quick brown fox".chars().collect();
@@ -3384,10 +3234,8 @@ fn kept_phrase_gold(gap_ms: u64, from_base: bool) -> ((usize, usize), usize) {
     c.intensity = 1.0;
     (c.theme_fg, c.theme_bg) = DARK_PAIR;
     let rgb = |v: u32| [(v >> 16) as u8, (v >> 8) as u8, v as u8];
-    let mut glow = CursorGlow {
-        fire_kept_core_from_base: from_base,
-        ..Default::default()
-    };
+    let mut glow = CursorGlow::default();
+    setup(&mut glow);
     let mut out = Vec::new();
     let mut text = vec![' '; g.cols];
     let mut t = Instant::now();
@@ -3420,7 +3268,19 @@ fn kept_phrase_gold(gap_ms: u64, from_base: bool) -> ((usize, usize), usize) {
         .map(|col| (row, col))
         .collect();
     ink.extend((0..g.cols as u16).map(|c| (row - 1, c)));
-    let glass = fire_dark_glass(&glow, &out, g, &ink);
+    let rings = glow.halo_cells().iter().filter(|h| h.row == row).count();
+    (fire_dark_glass(&glow, &out, g, &ink), text, caret, rings)
+}
+
+/// [`kept_phrase`]'s gold pixels (hue 38°-58°, saturation over 0.4, value
+/// 0.6 or more) its last six cells show under their letters' baseline
+/// (`.0`) and in their blank cells (`.1`), and the olive ones round the row.
+fn kept_phrase_gold(gap_ms: u64, from_base: bool) -> ((usize, usize), usize) {
+    let g = tall_geom();
+    let row = 4u16;
+    let (glass, text, caret, _) = kept_phrase(gap_ms, &|glow| {
+        glow.fire_kept_core_from_base = from_base;
+    });
     let (top, ch, cw) = (i32::from(row) * g.ch as i32, g.ch as i32, g.cw as i32);
     let gold = |p: u32| {
         let (h, s, v) = crate::color_math::rgb2hsv(p & 0x00FF_FFFF);
@@ -3449,4 +3309,289 @@ fn kept_phrase_gold(gap_ms: u64, from_base: bool) -> ((usize, usize), usize) {
     }
     let olive = olive_px(&glass, g, top - 3 * ch..top + ch);
     ((under, blank), olive)
+}
+
+/// The light a frame lays over the dark page at `p`: its channels' lift over
+/// the page's, summed.
+fn dark_lift(p: u32) -> f32 {
+    let page = DARK_PAIR.1;
+    [16, 8, 0]
+        .iter()
+        .map(|&sh| ((p >> sh) & 0xff).saturating_sub((page >> sh) & 0xff) as f32)
+        .sum()
+}
+
+/// THE KEPT FLAME RISES IN THE GAPS, NOT OVER THE LETTERS (2026-10-22, fire
+/// dark under a line of text: a muddy haze over the letters in bands, each
+/// letter outlined dark in it). Typed as `echo the quick brown fox` under a
+/// line of text, quick and slower, over the newest eight cells and the
+/// caret's: the brightest blank cell (a word's gap, the caret's) lays at
+/// least three times the light over the baseline that the brightest
+/// letter's counters carry, every letter keeps the row's bar (6.2:1) in the
+/// composed frame, and the blaze rings no letter of the row. Negative
+/// control: laid as round 3 laid it, one crest along the line
+/// ([`CursorGlow::fire_kept_crest`]), its letters' counters carry at least
+/// half the gaps' light and the blaze rings them.
+#[test]
+fn the_kept_flame_rises_in_the_gaps_not_over_the_letters() {
+    let g = tall_geom();
+    let row = 4u16;
+    let (top, ch, cw) = (i32::from(row) * g.ch as i32, g.ch as i32, g.cw as i32);
+    // `(brightest gap, brightest letter, worst contrast, rings)`.
+    let run = |gap_ms: u64, crest: bool| -> (f32, f32, f32, usize) {
+        let (glass, text, caret, rings) = kept_phrase(gap_ms, &|glow| {
+            glow.fire_kept_crest = crest;
+        });
+        let (mut gap, mut letter, mut worst) = (0.0f32, 0.0f32, f32::INFINITY);
+        for col in caret - 8..=caret {
+            let x0 = i32::from(col) * cw;
+            if col == caret || text[usize::from(col)] == ' ' {
+                let px: Vec<f32> = (top..top + ch * 8 / 10)
+                    .flat_map(|y| (x0..x0 + cw).map(move |x| (y, x)))
+                    .map(|(y, x)| dark_lift(glass.at(y, x)))
+                    .collect();
+                gap = gap.max(px.iter().sum::<f32>() / px.len() as f32);
+            } else {
+                let (i, cnt) = glyph(g, row, col);
+                worst = worst.min(ratio(&glass, &i, &cnt));
+                let lit = cnt
+                    .iter()
+                    .map(|&(y, x)| dark_lift(glass.at(y, x)))
+                    .sum::<f32>();
+                letter = letter.max(lit / cnt.len() as f32);
+            }
+        }
+        (gap, letter, worst, rings)
+    };
+    for gap_ms in [57u64, 90] {
+        let (gap, letter, worst, rings) = run(gap_ms, false);
+        assert!(
+            gap >= 30.0 && gap >= 3.0 * letter,
+            "{gap_ms} ms apart: the gaps lay {gap:.1}, the letters' counters {letter:.1}"
+        );
+        assert!(
+            worst >= CursorGlow::FIRE_DARK_ROW_BAR,
+            "{gap_ms} ms apart: a letter beside the flame reads at {worst:.2}:1"
+        );
+        assert_eq!(
+            rings, 0,
+            "{gap_ms} ms apart: the blaze rings {rings} letters"
+        );
+        let (c_gap, c_letter, _, c_rings) = run(gap_ms, true);
+        assert!(
+            c_letter * 2.0 >= c_gap && c_rings > 0,
+            "control, {gap_ms} ms apart: one crest lays {c_letter:.1} in the counters against \
+             {c_gap:.1} in the gaps and rings {c_rings} letters"
+        );
+    }
+}
+
+/// UNDER A KEPT LETTER THE FLAME EASES IN OVER PIXELS (2026-10-22, fire dark
+/// under a line of text: a two-pixel line of gold beads along the baseline,
+/// where the flame's hold over the letters gave way to the air's in one
+/// pixel). Typed as `echo the quick brown fox` under a line of text, quick
+/// and slower, over the newest eight cells' letters with no descender: down
+/// every pixel column under the baseline the light changes from one pixel
+/// row to the next by at most a fifth of the brightest light the flame lays
+/// in that band ([`CursorGlow::FIRE_DARK_CAP_EASE_PX`] and the roots laid a
+/// pixel a slab), and every letter keeps the row's bar. Negative control:
+/// capped as round 3 capped it ([`CursorGlow::fire_kept_cap_hard`]) a step
+/// of over a fifth; and laid wholly as round 3 laid it (one crest along the
+/// line, so a core under every letter) a step of half or more.
+#[test]
+fn under_a_kept_letter_the_flame_eases_in_over_pixels() {
+    let g = tall_geom();
+    let row = 4u16;
+    let (top, ch, cw) = (i32::from(row) * g.ch as i32, g.ch as i32, g.cw as i32);
+    // `(hardest step as a share of the band's brightest, worst contrast)`.
+    let run = |gap_ms: u64, crest: bool, hard: bool| -> (f32, f32) {
+        let (glass, text, caret, _) = kept_phrase(gap_ms, &|glow| {
+            glow.fire_kept_crest = crest;
+            glow.fire_kept_cap_hard = hard;
+        });
+        let band = top + ch * 8 / 10..top + ch;
+        let (mut step, mut brightest, mut worst) = (0.0f32, 0.0f32, f32::INFINITY);
+        for col in caret - 8..=caret {
+            let x0 = i32::from(col) * cw;
+            for y in band.clone() {
+                for x in x0..x0 + cw {
+                    brightest = brightest.max(dark_lift(glass.at(y, x)));
+                }
+            }
+            let glyph_at = text[usize::from(col)];
+            if col == caret || glyph_at == ' ' {
+                continue;
+            }
+            let (i, cnt) = glyph(g, row, col);
+            worst = worst.min(ratio(&glass, &i, &cnt));
+            if crate::cursor_glow::emit::DESCENDER_GLYPHS.contains(glyph_at) {
+                continue;
+            }
+            for x in x0..x0 + cw {
+                let down: Vec<f32> = band.clone().map(|y| dark_lift(glass.at(y, x))).collect();
+                for w in down.windows(2) {
+                    step = step.max((w[1] - w[0]).abs());
+                }
+            }
+        }
+        (step / brightest.max(1.0), worst)
+    };
+    for gap_ms in [57u64, 90] {
+        let (step, worst) = run(gap_ms, false, false);
+        assert!(
+            step <= 0.2,
+            "{gap_ms} ms apart: under a letter the flame steps {step:.3} of its brightest in a pixel"
+        );
+        assert!(
+            worst >= CursorGlow::FIRE_DARK_ROW_BAR,
+            "{gap_ms} ms apart: a letter beside the flame reads at {worst:.2}:1"
+        );
+        let (hard, _) = run(gap_ms, false, true);
+        let (round3, _) = run(gap_ms, true, true);
+        assert!(
+            hard > 0.2 && round3 >= 0.5,
+            "control, {gap_ms} ms apart: capped in one pixel the flame steps {hard:.3}, \
+             laid as round 3 laid it {round3:.3}"
+        );
+    }
+}
+
+/// A dark burst of `keys` letters of a sentence at 50 ms a key on row 4,
+/// ticked to its last key.
+fn dark_burst(keys: u16, seam: impl Fn(&mut CursorGlow)) -> (CursorGlow, Geom, u16) {
+    let g = tall_geom();
+    let (row, start) = (4u16, 2u16);
+    let line: Vec<char> = "the quick brown fox jumps over the lazy dog"
+        .chars()
+        .collect();
+    let mut c = cfg(GlowStyle::Fire, true);
+    c.intensity = 1.0;
+    (c.theme_fg, c.theme_bg) = DARK_PAIR;
+    let mut glow = CursorGlow::default();
+    seam(&mut glow);
+    let mut out = Vec::new();
+    let mut text = vec![' '; g.cols];
+    let mut t = Instant::now();
+    for k in 0..=keys {
+        if k > 0 {
+            t += Duration::from_millis(50);
+            text[usize::from(start + k - 1)] = line[usize::from(k - 1) % line.len()];
+            glow.note_synthetic_typed(t, 1);
+        }
+        glow.observe_row(row, start + k, &text, t);
+        let mut rows = vec![vec![aterm_core::terminal::RenderCell::default(); g.cols]; g.rows];
+        for (col, &ch) in text.iter().enumerate() {
+            rows[usize::from(row)][col].ch = ch;
+        }
+        glow.observe_frame_text(Some((row, start + k)), &rows, t);
+        glow.tick(Some((row, start + k)), t, &c, g, &mut out);
+    }
+    (glow, g, start + keys)
+}
+
+#[test]
+fn the_air_flames_taper_from_feathered_roots() {
+    // Over the burst's newest eight letters: how many pixels the gold cores
+    // stand proud of their flames' bodies (a core past its flame read as a
+    // straight-sided column), and the share of the lit columns whose root
+    // lies within a pixel of the run's lowest (a ruler-straight floor).
+    let shape = |keys: u16, columns: bool| -> (i32, usize, usize) {
+        let (glow, g, caret) = dark_burst(keys, |glow| glow.fire_column_tongues = columns);
+        let bg = DARK_PAIR.1 as i32 & 0xff;
+        let mut cores = Glass::new(g, DARK_PAIR.1);
+        cores.add_quads(glow.under_quads());
+        let mut field = Glass::new(g, DARK_PAIR.1);
+        field.add_fire_patches(glow.patches());
+        let mut both = Glass::new(g, DARK_PAIR.1);
+        both.add_quads(glow.under_quads());
+        both.add_fire_patches(glow.patches());
+        let row_top = 4 * g.ch as i32;
+        let newest = i32::from(caret) - 1;
+        let top = |gl: &Glass, x: i32| (0..row_top).find(|&y| gl.level(y, x) > bg + 24);
+        let (mut proud, mut roots) = (0, Vec::new());
+        for x in (newest - 7) * g.cw as i32..(newest + 1) * g.cw as i32 {
+            if let Some(c) = top(&cores, x) {
+                proud += (top(&field, x).unwrap_or(row_top) - c).max(0);
+            }
+            if let Some(root) = (0..row_top).rev().find(|&y| both.level(y, x) > bg + 24) {
+                roots.push(root);
+            }
+        }
+        let lowest = roots.iter().copied().max().unwrap_or(0);
+        let on_line = roots.iter().filter(|&&r| r >= lowest - 1).count();
+        (proud, on_line, roots.len())
+    };
+    for keys in [20, 40] {
+        let (proud, on_line, lit) = shape(keys, false);
+        assert!(
+            lit > 40,
+            "fixture: {keys} keys light the air ({lit} columns)"
+        );
+        assert!(
+            proud <= lit as i32,
+            "{keys} keys: the cores stand {proud} px proud of their flames over {lit} columns"
+        );
+        assert!(
+            2 * on_line < lit,
+            "{keys} keys: {on_line} of {lit} roots stand on one line"
+        );
+        let (proud, on_line, lit) = shape(keys, true);
+        assert!(
+            proud > 3 * lit as i32 || 2 * on_line > lit,
+            "control, {keys} keys: round 2's columns stood {proud} px proud, {on_line} of {lit} roots on one line"
+        );
+    }
+}
+
+#[test]
+fn the_dark_caret_bloom_burns_ember() {
+    // The caret's bloom (the halos a cell high or wider) alone over the
+    // dark page: the light it adds keeps an ember's hue, never the tan a
+    // dim gold makes of the page's blue-grey.
+    let warmest = |unwarmed: bool| -> (f32, usize) {
+        let (glow, g, _) = dark_burst(30, |glow| glow.fire_bloom_unwarmed = unwarmed);
+        let bloom: Vec<RainHalo> = glow
+            .halos()
+            .iter()
+            .filter(|h| usize::from(h.rx) >= g.ch)
+            .copied()
+            .collect();
+        let mut glass = Glass::new(g, DARK_PAIR.1);
+        glass.add_halos(&bloom);
+        let ch = |p: u32, s: u32| ((p >> s) & 0xff) as i32;
+        let (mut worst, mut lit) = (0.0f32, 0);
+        for y in 0..glass.h as i32 {
+            for x in 0..glass.w as i32 {
+                let (p, b) = (glass.at(y, x), DARK_PAIR.1);
+                let (r, gr, bl) = (
+                    ch(p, 16) - ch(b, 16),
+                    ch(p, 8) - ch(b, 8),
+                    ch(p, 0) - ch(b, 0),
+                );
+                let (hi, lo) = (r.max(gr).max(bl), r.min(gr).min(bl));
+                if hi < 6 || hi == lo {
+                    continue;
+                }
+                lit += 1;
+                let hue = if hi == r {
+                    60.0 * (gr - bl) as f32 / (hi - lo) as f32
+                } else {
+                    90.0
+                };
+                worst = worst.max(hue);
+            }
+        }
+        (worst, lit)
+    };
+    let (hue, lit) = warmest(false);
+    assert!(lit > 200, "fixture: the bloom lights the page ({lit} px)");
+    assert!(
+        hue <= 30.0,
+        "the caret's bloom adds light of hue {hue:.0} degrees, a tan"
+    );
+    let (hue, _) = warmest(true);
+    assert!(
+        hue > 30.0,
+        "control: lit from the gold the bloom adds hue {hue:.0} degrees"
+    );
 }

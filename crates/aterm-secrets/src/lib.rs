@@ -51,8 +51,8 @@ pub const ALAB_DEFAULT_URL: &str = aterm_types::macos_setup::DEFAULT_VAULT_URL;
 /// The ALab vault's signing key (standard padded base64 of the Ed25519 public key), the
 /// pin a machine that accepts [`ALAB_DEFAULT_URL`] uses instead of trusting on first use,
 /// and the pin `aterm secrets serve` holds for `alab`: the key `aterm secrets create` made
-/// on m22 on 2026-10-20 (fingerprint `fed4-97da-a265-0615-9f56`). An empty pin would mean
-/// the default URL is trusted on first use like any other.
+/// on m22 (fingerprint `fed4-97da-a265-0615-9f56`). An empty pin would mean the default URL
+/// is trusted on first use like any other.
 ///
 /// After a rotation of the ALab vault the next release sets this to the new key and adds
 /// the old one to [`ALAB_RETIRED`] (the rotating `aterm secrets` command prints both, for a

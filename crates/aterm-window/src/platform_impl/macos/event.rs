@@ -86,7 +86,8 @@ pub fn get_modifierless_char(scancode: u16) -> Key {
     Key::Character(SmolStr::new(chars))
 }
 
-/// LOCAL PATCH (aterm), 2026-10-20.
+/// LOCAL PATCH (aterm): a keyboard layout as a key table: the selected layout
+/// (`CurrentLayout`) or a test's fixed one.
 pub(crate) trait LayoutKeys {
     /// The character `scancode` types with `mods`, Carbon's `UCKeyTranslate` modifier byte.
     fn typed(&self, scancode: u16, mods: u32) -> Option<char>;
@@ -96,7 +97,8 @@ pub(crate) trait LayoutKeys {
 pub(crate) const UC_SHIFT: u32 = 0x02;
 pub(crate) const UC_OPTION: u32 = 0x08;
 
-/// The printable ASCII character the Option chord on `scancode` types (with Shift when `shift`).
+/// The printable ASCII character the Option chord on `scancode` types (with Shift when `shift`),
+/// when no key types that character bare or with Shift alone.
 pub(crate) fn option_only_ascii(
     keys: &impl LayoutKeys,
     scancode: u16,

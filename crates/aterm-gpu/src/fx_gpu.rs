@@ -5,7 +5,7 @@
 
 use super::*;
 use aterm_core::render::{FxArt, FxBlend, FxContent, FxInk, FxItem, FxLayer, FxSlot, FxTexels};
-use aterm_render::{FxBudget, FxFrame, FxSlice, FxSliceSink, FxSlicer, GlowQuad};
+use aterm_render::{FxFrame, FxSlice, FxSliceSink, FxSlicer, GlowQuad};
 
 /// One band slice of one fx item, as the vertex stage reads it ([`pipeline_table::FX_LAYOUT`]).
 #[repr(C)]
@@ -388,25 +388,24 @@ impl FxAtlas {
 #[derive(Debug, Default)]
 pub(crate) struct FxGpu {
     pub(crate) atlas: FxAtlas,
+    /// The instances' slicer, whose frame art budget is ruled once a frame:
+    /// by [`Self::admit`], then read by [`Self::build`]'s slice of the same
+    /// layers. Nothing else rules it, so a ruling afresh is the admission's
+    /// sign that the layers changed.
     slicer: FxSlicer,
     /// This frame's palette words.
     pub(crate) palette: Vec<u32>,
     /// `(content pointer, base)` of the contents drawn this frame: each
     /// content's palette is appended once.
     bases: Vec<(usize, u32)>,
-    /// The content identities and draw eligibility the last admission saw:
-    /// slot and blend filter the sprite walk, even when content is unchanged.
-    memo_contents: Vec<(Arc<FxContent>, FxSlot, FxBlend)>,
     memo_prefetch: Vec<Arc<FxArt>>,
     memo_cap: u32,
-    /// Admission scratch, by atlas: the arts the frame's sprites draw (the
-    /// frame budget's, [`Self::budget`]) and the prefetched ones.
+    /// Admission scratch, by atlas: the arts the frame's sprites draw (those
+    /// the frame art budget admits, ruled on [`Self::slicer`]) and the
+    /// prefetched ones.
     want: [Vec<Arc<FxArt>>; 2],
     hint: [Vec<Arc<FxArt>>; 2],
     seen: FxHashSet<u128>,
-    /// The frame art budget's ruling the admission reads (the slicer rules
-    /// the same one for the instances).
-    budget: FxBudget,
     /// Sprite items refused this frame, drawing nothing.
     pub(crate) refused: u64,
     /// Atlas bytes the arm uploaded for this frame (set by the arm's sync).
@@ -420,27 +419,18 @@ pub(crate) struct FxGpu {
 impl FxGpu {
     /// Make every art this frame's layers draw, and every prefetched art, resident in the CPU atlases.
     pub(crate) fn admit(&mut self, layers: &[FxLayer], prefetch: &[Arc<FxArt>], cap: u32) {
-        let same = self.memo_cap == cap
-            && self.memo_contents.len() == layers.len()
-            && self
-                .memo_contents
-                .iter()
-                .zip(layers)
-                .all(|((m, slot, blend), l)| {
-                    Arc::ptr_eq(m, &l.content) && *slot == l.slot && *blend == l.blend
-                })
-            && self.prefetch_admitted(prefetch);
-        if same {
+        let changed = self.slicer.rule(layers);
+        if !changed && self.memo_cap == cap && self.prefetch_admitted(prefetch) {
             return;
         }
         for w in self.want.iter_mut().chain(&mut self.hint) {
             w.clear();
         }
         self.seen.clear();
-        self.budget.rule(layers);
         let Self {
-            want, seen, budget, ..
+            want, seen, slicer, ..
         } = self;
+        let budget = slicer.budget();
         aterm_render::for_each_drawn_sprite(layers, |sp| {
             if !budget.refuses(&sp.art) && seen.insert(sp.art.id()) {
                 want[FxAtlasKind::of(sp.art.texels()) as usize].push(Arc::clone(&sp.art));
@@ -456,12 +446,6 @@ impl FxGpu {
                 side.admit(want, hint, cap);
             }
         }
-        self.memo_contents.clear();
-        self.memo_contents.extend(
-            layers
-                .iter()
-                .map(|l| (Arc::clone(&l.content), l.slot, l.blend)),
-        );
         self.memo_prefetch.clear();
         self.memo_prefetch.extend(prefetch.iter().cloned());
         self.memo_cap = cap;
@@ -915,6 +899,43 @@ mod tests {
         fx.build(&f, &layers, &[], |_| true, &mut out);
         assert_eq!(fx.refused, 1, "the unfit art's item is refused");
         assert!(out[FxStream::Over as usize].iter().all(|i| i.src[2] == 40));
+    }
+
+    /// ONE RULING A FRAME: the atlas admission and the instances' slice read
+    /// one frame art budget, ruled once when the frame's layers change and
+    /// not at all while they stand.
+    #[test]
+    fn a_frame_rules_its_art_budget_once() {
+        let mut fx = FxGpu::default();
+        let f = FxFrame {
+            w: 800,
+            h: 64,
+            pad: 0,
+            grid_top: 0,
+            cell_h: 16,
+            rows: 4,
+        };
+        let mut out: [Vec<FxInstance>; FX_STREAM_COUNT] = Default::default();
+        let mut frame = |layers: &[FxLayer]| {
+            let _ = aterm_render::test_counters::take_budget_rulings();
+            fx.admit(layers, &[], FX_ATLAS_CAP);
+            fx.build(&f, layers, &[], |_| true, &mut out);
+            aterm_render::test_counters::take_budget_rulings()
+        };
+        let arts = vec![art(40, 40, 1), art(20, 10, 2)];
+        let layers = [sprite_layer(&arts)];
+        assert_eq!(frame(&layers), 1, "a new frame is ruled once");
+        assert_eq!(frame(&layers), 0, "a standing frame is not ruled");
+        assert_eq!(
+            frame(&[sprite_layer(&arts)]),
+            1,
+            "a new content is ruled once"
+        );
+        assert_eq!(
+            out[FxStream::Over as usize].len(),
+            3 + 1,
+            "CONTROL: both sprites drawn, the 40-tall one in its three bands"
+        );
     }
 
     /// THE FRAME BUDGET FITS THE ATLAS: at the cap, every frame whose drawn

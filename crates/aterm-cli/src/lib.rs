@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `aterm`: a transparent, introspecting terminal.
+//! `aterm`'s front door: `--help`, the verb roster, the diagnostic subcommands
+//! (`doctor`, `show-config`, …) and the plain PTY shell session.
 #![cfg_attr(
     test,
     allow(
@@ -68,7 +69,7 @@ macro_rules! session_shell {
     };
 }
 pub(crate) use session_shell;
-/// The `--help` line under the origin line, built on [`session_shell!`].
+/// The `--help` line under the origin line.
 #[cfg(not(windows))]
 const HELP_SESSION_LINE: &str = concat!(
     "Runs ",
@@ -102,9 +103,8 @@ const HELP_HEAD: &str = concat!(
     "OPTIONS:\n",
     "        --containment <MODE>  user (the default: no sandbox, no extra limits),\n",
     "        --containment=<MODE>  safety (capped limits, no OS sandbox) or\n",
-    "                              containment (= --sandbox). The last\n",
-    "                              flag wins; an invalid value fails closed to\n",
-    "                              containment.\n",
+    "                              containment (= --sandbox). The last flag wins;\n",
+    "                              an invalid value fails closed to containment.\n",
     "        --sandbox             Shorthand for --containment containment, the\n",
     "                              macOS sandbox: no network, writes only to temp\n",
     "                              dirs and shell history, no credential stores or\n",
@@ -119,13 +119,13 @@ const HELP_HEAD: &str = concat!(
     "    -h, --help                Print this help and exit.\n",
     "    -V, --version             Print the version and exit.\n",
     "\n",
-    "SUBCOMMANDS (print info and exit; no shell is spawned):\n",
-    "    show-config               Print this session's shell, TERM, size and\n",
+    "SUBCOMMANDS (each exits without starting a shell):\n",
+    "    show-config               Print the version, shell, TERM, size and\n",
     "                              containment default.\n",
     "    explain-config            Explain how aterm resolves its configuration.\n",
     "    doctor                    Check health, instances, the fabric broker and the\n",
     "                              packages, and repair what aterm lays; --read-only\n",
-    "                              changes nothing. --check / --apply / --restore: the\n",
+    "                              changes nothing. --check, --apply, --restore: the\n",
     "                              macOS fleet settings profile alone.\n",
     "    list-fonts                List available font families.\n",
     "    show-face <family>        Show a font family's file and cell metrics.\n",
@@ -169,11 +169,11 @@ pub enum Verb {
     Fabric,
     /// `aterm ship` — the release tool (publishing; source checkouts only).
     Ship,
-    /// `aterm update` — the headless update lane (status/check, no window).
+    /// `aterm update` — the headless update lane (`status`, `check`, `identity`).
     Update,
     /// `aterm agents` — the coding-agent primer installer.
     Agents,
-    /// `aterm ai` — AI CLI login management, doctor, and cross-AI reviews.
+    /// `aterm ai` — AI CLI logins, doctor, cross-AI reviews and the signed fleet document.
     Ai,
     /// `aterm machines` — macOS lab configuration over SSH.
     Machines,
@@ -187,7 +187,7 @@ pub enum Verb {
     Keeper,
     /// `aterm caffeine` — the macOS menu-bar keep-awake helper.
     Caffeine,
-    /// `aterm theme` — list, validate, create, export, and import themes.
+    /// `aterm theme` — list, check, create, export, import, pack and install themes.
     Theme,
     /// `aterm edit` — amacs editor (also the `amacs` argv0 alias).
     Edit,
@@ -258,8 +258,7 @@ impl Verb {
         }
     }
 
-    /// The argv0 compat alias this verb also answers to, if any (shipped as a
-    /// symlink onto the one binary).
+    /// The argv0 alias this verb also answers to, if any (a symlink onto the one binary).
     #[cfg(test)]
     const fn argv0_alias(self) -> Option<&'static str> {
         match self {
@@ -363,32 +362,36 @@ impl Verb {
                 "other (ls | add | set | rm | spawn | show | map).",
             ],
             Verb::ResourceRun => &[
-                "Run an exact command with authenticated per-tab resource ownership.",
-                "--session @self --job label -- program [args]; optional --ai label.",
+                "Run a command with its CPU and memory charged to",
+                "a tab (--session @self --job LABEL [--ai LABEL]",
+                "-- PROGRAM [ARGS...]).",
             ],
             Verb::Pkg => &["Install, update and verify the toolchain."],
-            Verb::Agh => {
-                &["GitHub reads as the routed identity: JSON out, typed exits (agh help)."]
-            }
+            Verb::Agh => &[
+                "GitHub reads as the routed identity: JSON out,",
+                "typed exits (`aterm agh help`).",
+            ],
             Verb::Fleet => &[
-                "This machine's membership in a fleet, the aterms of one LAN",
-                "that read each other (init | join | peers | allow | leave);",
-                "`allow drive --from <node>` lets that node drive this machine",
-                "with `aterm ctl --host <h> …` (`aterm help workers`).",
+                "This machine's membership in a fleet, the aterms",
+                "of one LAN that read each other (init | join |",
+                "peers | allow | leave); `allow drive --from",
+                "<host|node>` lets that node drive this machine",
+                "(`aterm ctl --host <h> …`, `aterm help workers`).",
             ],
             Verb::Link => &[
                 "The fabric bridge: carries inbox and post",
                 "traffic between this instance and the bus.",
             ],
             Verb::Fabric => &[
-                "The fabric: mail between sessions and people (status | tail |",
-                "on | off | doctor | mint-for | halt | inbox | post); `status`",
-                "is the default.",
+                "The fabric: mail between sessions and people",
+                "(status | tail | brief | on | off | doctor |",
+                "mint-for | halt | inbox | post); `status` is the",
+                "default.",
             ],
             Verb::Drive => &[
-                "The window harness's readers, run by hand (classify | phase |",
-                "answer | ledger | tape | replay); workers and reads are",
-                "`aterm ctl`'s.",
+                "The window harness's readers, run by hand",
+                "(classify | phase | answer | ledger | tape |",
+                "replay); workers and reads are `aterm ctl`'s.",
             ],
             Verb::Ship => &[
                 "Publish aterm: provision a signing machine, cut",
@@ -404,28 +407,35 @@ impl Verb {
             ],
             Verb::Ai => &[
                 "This machine's AI CLIs (claude, codex, agy, muse):",
-                "one working login each (doctor | login), and",
-                "reviews one AI asks of another (review).",
+                "one working login each (status | doctor | login),",
+                "reviews one AI asks of another (review), and the",
+                "signed fleet document (fleet).",
             ],
             Verb::Machines => &[
-                "Configure and manage a lab of Macs over SSH from this one (init |",
-                "scan | enroll | status | plan | apply | person | screen). macOS.",
+                "Configure and manage a lab of Macs over SSH from",
+                "this one (init | scan | enroll | status | plan |",
+                "apply | person | screen …). macOS.",
             ],
             Verb::Init => &[
-                "Restore aterm's commands and shell integration (over SSH too), then set",
-                "this Mac's keyboard, scrolling, widgets, Dock and accounts (at its console).",
-                "Optional init.toml GitHub authentication and clones. Current macOS user.",
-                "`--develop`: a checkout fast-forwarded and its test tools, no settings.",
+                "Restore aterm's commands and shell integration",
+                "(over SSH too); at this Mac's console, set its",
+                "keyboard, scrolling, widgets, Dock and accounts.",
+                "Join the secrets vault; init.toml adds GitHub",
+                "authentication and clones. Current macOS user.",
+                "`--develop`: fast-forward recorded checkouts and",
+                "provision their test tools, no settings.",
             ],
             Verb::Secrets => &[
-                "One credentials file for every machine: the vault, its server",
-                "and ~/.secrets (status | join | sync | edit | approve | serve …);",
-                "`status` is the default.",
+                "One credentials file for every machine: the",
+                "vault, its server and ~/.secrets (status | join |",
+                "sync | edit | approve | serve …); `status` is the",
+                "default.",
             ],
             Verb::Harness => &[
-                "Claude Code's spend, limits and accounts, the disk, the ledger",
-                "(usage | limits | accounts | disk | ledger); `upgrade` moves a",
-                "live Claude Code onto a newer build. The window supervises.",
+                "Claude Code's spend, limits and accounts, the",
+                "disk, the ledger (usage | limits | accounts |",
+                "disk | ledger); `upgrade` moves a live Claude Code",
+                "onto a newer build. The window supervises.",
             ],
             Verb::Keeper => &[
                 "The PTY keeper holds every terminal's master, so",
@@ -433,18 +443,21 @@ impl Verb {
                 "status | serve). macOS only, opt-in.",
             ],
             Verb::Caffeine => &[
-                "The menu-bar keep-awake mug: a click keeps this Mac awake,",
-                "a right click picks 1, 8, 24 h or forever (on | off | status). macOS.",
+                "The menu-bar keep-awake mug: a click keeps this",
+                "Mac awake, a right click picks 1, 8 or 24 hours or",
+                "forever (on | off | status | startup …). macOS.",
             ],
             Verb::Theme => &[
                 "Colour themes (list | new | check | export |",
-                "schema | import); import converts kitty, Ghostty,",
-                "Alacritty, iTerm2, Windows Terminal and base16.",
+                "schema | import | pack | install); import converts",
+                "kitty, Ghostty, Alacritty, iTerm2, Windows",
+                "Terminal and base16/base24.",
             ],
             Verb::Edit => &[
-                "amacs, aterm's editor: open a file in a fresh Editor tab",
-                "beside this one and wait until it is closed (`amacs` is",
-                "the same command, for $EDITOR).",
+                "amacs, aterm's editor: inside aterm, open a file",
+                "in an Editor tab beside this one and wait until it",
+                "is closed; elsewhere, edit it in the terminal",
+                "(`amacs` is the same command, for $EDITOR).",
             ],
             Verb::NewTab => &[
                 "Open a tab: a new window by default, or a tab in",
@@ -514,7 +527,7 @@ const HELP_TAIL: &str = concat!(
     "    aterm doctor --read-only           Check this machine; change nothing.\n",
 );
 
-/// Diagnostic subcommands: `aterm <name>` prints introspection and exits without spawning a shell (no `list-keybinds`: the passthrough has no keymap).
+/// The diagnostic subcommands and their `--help` lines: `aterm <name>` reports and exits without starting a shell.
 pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     (
         "show-config",
@@ -526,7 +539,7 @@ pub const DIAG_COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "doctor",
-        "Check the shell, macOS access (and whether macOS checks each new program aterm starts), running instances, the fabric's broker (does it answer, what tier it serves, is its log poisoned), past crashes and the packages (`aterm pkg doctor`'s view), on a develop machine the develop items `aterm init --develop` converges (read only and offline: each recorded checkout against origin as last fetched, its submodule and its tools), and fix what aterm can (the shell integration, the installed commands and their ~/.local/bin links, the reroute stubs, the rustup link, exec roots and stale copies of aterm to the Trash; the Developer Tools pane opened for you); --read-only fixes nothing; --json prints every row in the one report schema; --only <id,...> narrows to those items, families or layers; exits 0 only when all selected checks are satisfied or not applicable; unresolved plans, manual steps, blocked or deferred work, unknown state and failed changes exit 1; the shell is always checked. On macOS the fleet settings profile is settings-only: --check checks it, --apply backs it up and applies it, --restore restores the backup (--json: its fleet report; drift exits 1). See `aterm help doctor`.",
+        "Check the shell, macOS access (Full Disk Access, debugger access, Developer Tools, macOS's check of each new program), running instances, the fabric's broker, past crashes, open exceptions, the packages (`aterm pkg doctor`'s rows) and, on a develop machine, what `aterm init --develop` converges (each recorded checkout against origin as last fetched, its submodule and its tools; read-only and offline). Repair what aterm lays: the shell integration, the installed commands and their ~/.local/bin links, the reroute stubs, the rustup link and exec roots; it moves stale copies of aterm to the Trash and, when aterm is off in Developer Tools, opens that pane for you. --read-only changes nothing; --json prints every row in the JSON schema `aterm init --json` shares; --only <id,...> narrows to those items, families or layers (the shell is always checked). Exits 0 when every selected check is satisfied or not applicable, 2 on a usage error, else 1. On macOS, --check, --apply and --restore act on the fleet settings profile alone: --check checks it, --apply backs it up and applies it, --restore restores the backup (--json: its fleet report; drift exits 1). See `aterm help doctor`.",
     ),
     ("list-fonts", "List available font families, one per line."),
     (
@@ -613,8 +626,7 @@ fn explain_config_report() -> String {
          \x20              nothing. Safety's caps, as hard limits.\n",
     );
     out.push_str("  safety       Soft resource caps (binding on Windows), no OS sandbox.\n");
-    out.push_str("  user         No sandbox, no extra limits (the default).\n\n");
-    out.push_str("No environment variable selects the containment mode.\n");
+    out.push_str("  user         No sandbox, no extra limits (the default).\n");
     #[cfg(windows)]
     out.push_str(WINDOWS_CONFIG_PARAGRAPH);
     #[cfg(target_os = "macos")]
@@ -665,35 +677,33 @@ const MACHINE_CONFIG_PARAGRAPH: &str = "\n\
      \x20 universal_control       \"off\" (default) | \"leave\". Off writes the two per-host keys\n\
      \x20                         that stop the cursor and keyboard roaming to other Macs and\n\
      \x20                         iPads on the same Apple account; leave never touches them.\n\
-     \x20 rosetta                 true (default) | false. On Apple silicon, true installs Rosetta\n\
-     \x20                         2 when it is missing (`softwareupdate --install-rosetta`, as\n\
-     \x20                         you, no admin password); false never does. An Intel Mac\n\
-     \x20                         ignores it.\n\
-     \x20 It is applied by `aterm pkg machine apply`, which aterm runs once a day at the\n\
-     \x20 first window or interactive terminal session, and by a package pass (update,\n\
-     \x20 seed, install) when the [machine] table changed since it was last applied; no\n\
-     \x20 pass runs while [packages] enabled = false, so an edit then waits for the daily\n\
-     \x20 apply. `aterm pkg machine` reads the measured state. Settings ▸ Security sets\n\
-     \x20 it, shows that state under its row and, while there is something to apply,\n\
-     \x20 offers Apply Now, which applies it at once. `defaults` writes the ACCOUNT's\n\
-     \x20 per-host domain regardless of $HOME, so an apply under a redirected HOME is\n\
-     \x20 refused and says so, as is one whose aterm.toml does not parse (fix it with\n\
-     \x20 `aterm --window --validate-config`). Undo Universal Control with the revert\n\
-     \x20 line `aterm pkg machine` prints (`defaults -currentHost delete\n\
-     \x20 com.apple.universalcontrol Disable`, then the same for DisableMagicEdges) AND\n\
-     \x20 set universal_control = \"leave\", or the next apply disables it again.\n";
+     \x20 rosetta                 true (default) | false. On Apple silicon, true installs\n\
+     \x20                         Rosetta 2 when it is missing, as you and with no admin\n\
+     \x20                         password (`softwareupdate --install-rosetta`); false never\n\
+     \x20                         does. An Intel Mac ignores it.\n\
+     \x20 The table is applied by `aterm pkg machine apply`, which aterm runs once a day\n\
+     \x20 at the first window or interactive terminal session, and by a package pass\n\
+     \x20 (update, seed, install) when the table changed since it was last applied. With\n\
+     \x20 [packages] enabled = false no pass runs, so an edit waits for the daily apply.\n\
+     \x20 `aterm pkg machine` reads the measured state. Settings ▸ Security sets the\n\
+     \x20 keys, shows that state and, while something is unapplied, offers Apply Now.\n\
+     \x20 An apply is refused, and says so, under a redirected $HOME (`defaults` writes\n\
+     \x20 the account's per-host domain whatever $HOME says) or while aterm.toml does\n\
+     \x20 not parse (`aterm --window --validate-config` says why). To undo Universal\n\
+     \x20 Control, run the revert line `aterm pkg machine` prints (`defaults -currentHost\n\
+     \x20 delete com.apple.universalcontrol Disable`, then the same for DisableMagicEdges)\n\
+     \x20 AND set universal_control = \"leave\", or the next apply turns it off again.\n";
 
 /// The `[privacy]` paragraph of `explain-config`.
 #[cfg(target_os = "macos")]
 const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      [privacy] — macOS consent (aterm.toml; the window reads it, `aterm doctor` only `observer`):\n\
      \x20 enabled / check         the silent, prompt-free probes: Full Disk Access (opens your\n\
-     \x20                         TCC.db unread, or on macOS 27, which keeps none per user, the\n\
-     \x20                         system one), the debugger rule (`DevToolsSecurity -status`) and\n\
-     \x20                         the Developer Tools list (tccd's log, and its switch in the\n\
-     \x20                         system TCC.db, read-only). They read state that already\n\
-     \x20                         exists and raise NO dialog. Off, every field reads `unknown` —\n\
-     \x20                         which is not `denied`, and the report says which it is.\n\
+     \x20                         TCC.db unread, or the system one where there is none per\n\
+     \x20                         user), the debugger rule (`DevToolsSecurity -status`) and the\n\
+     \x20                         Developer Tools list (tccd's log, and its switch in the system\n\
+     \x20                         TCC.db, read-only). They raise NO dialog. Off, every field\n\
+     \x20                         reads `unknown`, which is not `denied`; the report says which.\n\
      \x20 notice                  the Full Disk Access ask, in two places. At launch, while the\n\
      \x20                         grant reads off on a Mac where aterm has never seen it on,\n\
      \x20                         System Settings opens at Privacy & Security \u{25b8} Full Disk\n\
@@ -703,46 +713,44 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         Once per version, never on a build whose grant would not last\n\
      \x20                         (ad hoc or unsigned), never within 10 minutes of another\n\
      \x20                         Settings page; Not now holds 30 days, then 90. aterm presses\n\
-     \x20                         nothing there: switching it on is yours. Later, after macOS shows\n\
-     \x20                         the \"access data from other apps\" dialog for a program of yours\n\
-     \x20                         (or refuses aterm a read), it files one entry in aterm's\n\
-     \x20                         Messages with an Open Settings button. At most once a week; a\n\
-     \x20                         window started before you pressed Open Settings waits 14 days;\n\
-     \x20                         Dismiss all files it for 30 days, then 90. Off, it also keeps\n\
-     \x20                         aterm from asking, once per Mac and account after those\n\
-     \x20                         pages, whether to allow debugger access (macOS's developer\n\
-     \x20                         mode) in its own alert; no key makes aterm ask it.\n\
-     \x20 report_attribution      per-session corroboration of the app macOS holds responsible for\n\
-     \x20                         each session. It only corroborates: aterm's own adoption record\n\
-     \x20                         decides whether a session reads `live` or `adopted`.\n\
-     \x20 observer                absent: a narrow sentinel watches for the one log line macOS\n\
-     \x20                         writes when it shows a consent dialog: it decides when to ask,\n\
-     \x20                         and any other dialog it can name is a record in Messages saying\n\
-     \x20                         which tab asked (with notice on). false: off. true: the full\n\
-     \x20                         stream, the tab mark and a banner per dialog. enabled = false\n\
-     \x20                         turns every mode off, true included. Config only; nothing in a\n\
-     \x20                         session can set it.\n\
-     \x20                         false also stops the Developer Tools row's reads (tccd's log\n\
-     \x20                         and the switch), the window's and both doctors' alike.\n\
+     \x20                         nothing there: switching it on is yours. Later, after macOS\n\
+     \x20                         shows the \"access data from other apps\" dialog for a program\n\
+     \x20                         of yours (or refuses aterm a read), it files one entry in\n\
+     \x20                         aterm's Messages with an Open Settings button: at most once a\n\
+     \x20                         week; a window started before you pressed Open Settings waits\n\
+     \x20                         14 days; Dismiss all files it for 30 days, then 90. Off, it\n\
+     \x20                         also keeps aterm from asking (once per Mac and account, after\n\
+     \x20                         those pages) whether to allow debugger access (macOS's\n\
+     \x20                         developer mode) in its own alert; no key makes aterm ask it.\n\
+     \x20 report_attribution      per-session corroboration of the app macOS holds responsible\n\
+     \x20                         for each session; aterm's own adoption record decides whether\n\
+     \x20                         a session reads `live` or `adopted`.\n\
+     \x20 observer                absent: a narrow sentinel watches for the log line macOS writes\n\
+     \x20                         when it shows a consent dialog; it decides when to ask, and any\n\
+     \x20                         other dialog it can name becomes a record in Messages naming\n\
+     \x20                         the tab that asked (with notice on). false: off, which also\n\
+     \x20                         stops the Developer Tools row's reads (tccd's log and the\n\
+     \x20                         switch) in the window and both doctors. true: the full stream,\n\
+     \x20                         the tab mark and a banner per dialog. enabled = false turns\n\
+     \x20                         every mode off. Config only; nothing in a session can set it.\n\
      \x20 warmup                  \"automatic\" (default) | \"on-request\" | \"never\". The warm-up\n\
      \x20                         asks macOS for the folders up front, which RAISES the dialogs\n\
      \x20                         on purpose, while you are at the screen rather than inside an\n\
-     \x20                         agent's blocked read. automatic: the button in Settings, and\n\
-     \x20                         at launch while Full Disk Access reads off, once the Full Disk\n\
-     \x20                         Access page was left without you acting on it (Not now, or its\n\
-     \x20                         panel lapsed) or was not offered, at the first quiet moment.\n\
-     \x20                         Acting on that page (switching it on, dropping the icon) asks\n\
-     \x20                         for no folder that launch; once every folder has an answer,\n\
-     \x20                         this app is not walked at launch again. on-request: only the\n\
-     \x20                         button. never: neither. No program inside a session can start\n\
-     \x20                         it.\n\
+     \x20                         agent's blocked read. automatic: the button in Settings, and,\n\
+     \x20                         while Full Disk Access reads off, a pass at a launch's first\n\
+     \x20                         quiet moment once the Full Disk Access page was left without\n\
+     \x20                         you acting on it (Not now, or its panel lapsed) or was not\n\
+     \x20                         offered. Acting on that page (switching it on, dropping the\n\
+     \x20                         icon) asks for no folder that launch; once every folder has an\n\
+     \x20                         answer, no launch asks again. on-request: only the button.\n\
+     \x20                         never: neither. No program inside a session can start it.\n\
      \x20 warmup_folders          what the warm-up asks for. Default: Documents, Desktop and\n\
      \x20                         Downloads. `app-data` (every other app's own data) is a valid\n\
-     \x20                         name but not asked for by default, and never at launch: macOS\n\
+     \x20                         name, not in the default and never asked at launch: macOS\n\
      \x20                         forgets that answer when the process that received it is\n\
-     \x20                         replaced. Network and removable volumes are not on the list:\n\
-     \x20                         the warm-up has no name for them, and whether Full Disk\n\
-     \x20                         Access reaches them is unmeasured (`aterm ctl privacy`).\n\
+     \x20                         replaced. Network and removable volumes have no name here,\n\
+     \x20                         and whether Full Disk Access reaches them is unmeasured\n\
+     \x20                         (`aterm ctl privacy`).\n\
      \x20 warmup_hold_ms          how long a pending update waits for a running warm-up\n\
      \x20                         (default 120000, at most 600000).\n\
      \x20 probe_interval_ms       the shortest gap between access re-checks (default 5000);\n\
@@ -750,11 +758,11 @@ const PRIVACY_CONFIG_PARAGRAPH: &str = "\n\
      \x20                         check.\n\
      \x20 protected_roots         the sensitive set; empty = the containment tier's own list, so\n\
      \x20                         the two tiers cannot disagree about which paths are sensitive.\n\
-     \x20 auto_accept             RESERVED, and not implemented: aterm does not answer macOS\n\
-     \x20                         consent dialogs. Granting Full Disk Access in Settings is the\n\
-     \x20                         supported answer, and only a human can do it.\n\
+     \x20 auto_accept             reserved, not implemented: aterm never answers a macOS consent\n\
+     \x20                         dialog. Granting Full Disk Access in Settings is the answer,\n\
+     \x20                         and only a person can give it.\n\
      \x20 Settings \u{25b8} Security \u{25b8} Ask Again clears macOS's saved refusals for the folders it\n\
-     \x20 lists, after you confirm. No key in this section needs anything beyond saving the file.\n";
+     \x20 lists, after you confirm. Every key here applies once the file is saved.\n";
 
 fn list_fonts_report() -> String {
     let fonts = aterm_render::list_fonts();
@@ -803,7 +811,7 @@ struct ExceptionsRead {
     log: aterm_messages::MessageLog,
     /// Lines the codec refused (torn, foreign, corrupt).
     skipped: usize,
-    /// Whether any of the two files was there to read.
+    /// Whether either file was there to read.
     found: bool,
     /// The path that is there but unread: `messages.log`, or its rotated `.1` when nothing
     /// was read.
@@ -1008,9 +1016,9 @@ pub enum Mark {
     Ok,
     /// A fact worth reporting that is not a failure — nothing to fix, or nothing aterm can fix, and never a reason to refuse to launch.
     Note,
-    /// A measured cost the person is paying now, with a fix only they can make (atpkg's `warn`): louder than a note and counted on the health line, but it does not move the exit code.
+    /// A measured cost the person is paying now, with a fix only they can make (atpkg's `warn`): louder than a note, and a step for the person that leaves `aterm doctor` not ready.
     Warn,
-    /// The check failed: `health: FAIL` and exit 1.
+    /// The check failed; only the shell row fails.
     Fail,
 }
 
@@ -1392,9 +1400,8 @@ fn doctor_facts_rows(fix: bool) -> Vec<DoctorRow> {
     })
 }
 
-/// `aterm-cli`'s half of `aterm doctor` run alone, as `crates/aterm` runs it with its
-/// packages' items beside: gathered with `fix`, applied (the stale copies to the Trash)
-/// or, without `fix`, planned.
+/// `aterm-cli`'s half of `aterm doctor`, without the packages' items: gathered, then
+/// applied with `fix` (the stale copies to the Trash) or planned without it.
 #[cfg(all(test, any(windows, target_os = "macos")))]
 fn doctor_report(fix: bool) -> (String, i32) {
     let gathered = doctor::gather(fix);
@@ -2143,7 +2150,7 @@ const SHELL_REMEDY: &str = if cfg!(windows) {
     "set $SHELL to an installed shell"
 };
 
-/// Render the `doctor` report and exit code (`0` = no [`Mark::Fail`], `1` = any [`Mark::Fail`]).
+/// `doctor`'s rows from the gathered facts, in report order.
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is one gathered fact; passing them in is what keeps the report pure"
@@ -2248,8 +2255,8 @@ fn doctor_rows(
     checks
 }
 
-/// [`doctor_rows`] through the engine and rendered: the report the pure tests read,
-/// planned and never applied — the items and the renderer `aterm doctor` runs.
+/// [`doctor_rows`] as `aterm doctor`'s items, planned (never applied) and rendered with
+/// the `health:` line: the report the pure tests read.
 #[cfg(test)]
 #[allow(
     clippy::too_many_arguments,
@@ -2348,8 +2355,8 @@ enum CliAction {
     /// `<diag> --help`: print that subcommand's description and usage, exit 0,
     /// never run it.
     DiagHelp { cmd: String },
-    /// `help [topic]`: print the toolchain manual (via [`manual`]) and exit 0
-    /// without spawning a shell.
+    /// `help [topic]`: print a manual page ([`manual`]); exit 0, or 2 for an
+    /// unknown topic.
     Manual { topic: Option<String> },
     /// `agents [<cmd> [<agent>…]]`: manage the coding-agent primer and exit
     /// without spawning a shell.
@@ -2527,7 +2534,8 @@ fn running_build() -> Option<u64> {
 
 static FIRST_SHELL_OUTPUT: std::sync::OnceLock<fn()> = std::sync::OnceLock::new();
 
-/// Register the [`FIRST_SHELL_OUTPUT`] hook; returns `false` if already set.
+/// Register the hook the session runs once, when the shell first writes output; `false`
+/// if one is already set.
 pub fn on_first_shell_output(hook: fn()) -> bool {
     FIRST_SHELL_OUTPUT.set(hook).is_ok()
 }
@@ -2556,7 +2564,7 @@ fn answer_and_exit(text: &str, code: i32) -> ! {
     )
 }
 
-/// Dependency-free argument parser, the effectful shell around [`decide_args`]: prints help/version and exits 0, prints a usage error and exits 2, or records the launch flags ([`SessionFlags`]) and returns.
+/// The effectful shell around [`decide_args`]: answers `--help`, `--version`, a diagnostic, `help` or `agents` and exits (2 on a usage error), or records the launch flags ([`SessionFlags`]) and returns whether `--quiet` was given.
 pub fn parse_args(argv: Vec<std::ffi::OsString>) -> bool {
     match decide_args(argv.into_iter().map(|a| a.to_string_lossy().into_owned())) {
         CliAction::Help => answer_and_exit(&help_text(), 0),
@@ -2728,8 +2736,8 @@ fn managed_agents_dir(
 
 /// The mode for the managed `agents/` directory, restating
 /// `atpkg::store::Layout::ensure_dir`'s rule: a root-owned prefix that is not
-/// group/other-writable (`platform::dir_meta_is_system`) ⇒ `0755`; a prefix we
-/// own ⇒ `0700`; any other owner ⇒ `None` (refuse).
+/// group/other-writable (`platform::dir_meta_is_system`) ⇒ `0755`; a prefix this
+/// user owns ⇒ `0700`; any other owner ⇒ `None` (refuse).
 #[cfg(any(unix, test))]
 const fn agents_dir_mode(prefix_uid: u32, prefix_mode: u32, our_uid: u32) -> Option<u32> {
     if prefix_uid == 0 && prefix_mode & 0o022 == 0 {
@@ -2789,8 +2797,8 @@ fn ensure_agents_dir(prefix: &std::path::Path, dir: &std::path::Path) -> Result<
     }
 }
 
-/// [`ensure_agents_dir`] where no reroute handle is ever handed (Windows lays no stubs, so
-/// this is unreached in practice): a plain `create_dir`, the symlink refusal kept.
+/// [`ensure_agents_dir`] off Unix: a plain `create_dir`, the symlink refusal kept. Unreached in
+/// practice: Windows lays no reroute stubs, so no reroute directory is handed.
 #[cfg(not(unix))]
 fn ensure_agents_dir(_prefix: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
     match std::fs::symlink_metadata(dir) {
@@ -4717,9 +4725,9 @@ mod tests {
         }
     }
 
-    /// Running `doctor_report` from a test binary outside an `.app` bundle must
-    /// report `not measured` without probing `tccd`, `DevToolsSecurity`, `csops`,
-    /// `Copies`, or Spotlight.
+    /// `doctor_report` from a test binary, outside an `.app` bundle, measures nothing: the
+    /// privacy, debugger, devtools and Spotlight rows read `not measured`, and the stale-copy
+    /// prune does not run.
     #[cfg(target_os = "macos")]
     #[test]
     fn doctor_run_from_a_test_binary_measures_nothing() {

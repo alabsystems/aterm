@@ -221,8 +221,8 @@ fn the_decoder_reads_the_recorded_frames_as_one_stream() {
 }
 
 /// What each zstd frame of a multi-frame file holds, in order: pzstd split
-/// its 2,700,000-byte input at 2 MiB (`zstd -dc` of the file cut after its
-/// first frame gave 2,097,152 bytes; zstd 1.5.7, 2026-10-16, ZC.6).
+/// its 2,700,000-byte input at 2 MiB (zstd 1.5.7's `zstd -dc` of the file cut
+/// after its first frame gives 2,097,152 bytes).
 const FRAME_CONTENT: &[(&str, &[usize])] =
     &[("repetitive-2700k.pzstd1.zst", &[2_097_152, 602_848])];
 

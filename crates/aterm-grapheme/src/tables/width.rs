@@ -1,8 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 //
-// Derived from the Unicode 16.0.0 Character Database on 2026-04-15 by `aterm build rust`, a
-// generator this repository never carried; maintained by hand since, so edit it here.
+// From the Unicode 16.0.0 Character Database. No generator makes this file: edit it here.
 
 //! East Asian Width lookup tables for character display width.
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE HOLD'S CLOCK (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.1, with the red-team's F5):
+//! THE HOLD'S CLOCK (`docs/DESIGN-harness-occupancy-2026-10-20.md` §3.1):
 //! how long a session has waited on its own background work, and whether the agent said so.
 
 /// What the loop saw, in the order it saw it ([`HoldClock::step`]).

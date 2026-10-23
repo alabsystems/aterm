@@ -1626,17 +1626,17 @@ mod tests {
         let (w, h) = (32, 24);
         let desk = Desk::open(&x, w, h);
         let dev = desk.device();
-        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
+        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()), None)
             .expect("a window surface");
         surface.standin(&dev).expect("the stand-in");
         surface
-            .present(&dev, FILL)
+            .present(&dev, FILL, None)
             .expect("a present on the live window posts");
         // SAFETY: the window this test made, on its live display.
         unsafe { (x.destroy_window)(desk.dpy, desk.win) };
         desk.sync();
         let failed = surface
-            .present(&dev, FILL)
+            .present(&dev, FILL, None)
             .expect_err("a present on a window that answers no size posted");
         assert_eq!(
             failed.kind,
@@ -1698,11 +1698,11 @@ mod tests {
         let (w, h) = (32, 24);
         let desk = Desk::open(&x, w, h);
         let dev = desk.device();
-        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()))
+        let mut surface = GlWindowSurface::create(&dev, desk.native(), w, h, Box::new(()), None)
             .expect("a window surface");
         surface.standin(&dev).expect("the stand-in");
         surface
-            .present(&dev, FILL)
+            .present(&dev, FILL, None)
             .expect("a present on the live connection posts");
         assert!(!dev.shared().lost(), "a post latches nothing");
         // SAFETY: a live display; both handlers have Xlib's signatures and
@@ -1724,7 +1724,7 @@ mod tests {
             "the hang-up"
         );
         for n in 1..=64 {
-            let failed = surface.present(&dev, FILL);
+            let failed = surface.present(&dev, FILL, None);
             assert!(failed.is_err(), "present {n} after the hang-up posted");
         }
         assert!(dev.shared().lost(), "the hang-up latched the device lost");

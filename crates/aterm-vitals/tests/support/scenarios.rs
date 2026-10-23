@@ -1644,7 +1644,237 @@ pub fn all() -> Vec<Scenario> {
             ],
             model: true,
         },
+        Scenario {
+            name: "held.setsid",
+            row: "PC an agent's call whose program macOS's program check holds from its fork \
+                  (I1's gh: work in line, fine however long, never quiet or stuck)",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, held_at_start(CHILD, "gh", true)),
+            each: nothing,
+            id: "a400",
+            until_ms: M20 + 10_000,
+            expect: &[
+                WaitAt(M1, WaitName::ProgramCheck),
+                At(M1, Fine),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+                PhiAtMost(0, 0),
+                NoProgressNever,
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_unflagged.setsid",
+            row: "PC the same call with its program not read as held: an unnamed wait, quiet at \
+                  the prior's first crossing, never stuck",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, held_at_start(CHILD, "gh", false)),
+            each: nothing,
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::Unnamed),
+                At(M1, Fine),
+                FirstAt(Quiet, 416_000),
+                At(M20, Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_behind_pipe.setsid",
+            row: "PC a call's reader blocked on a pipe whose writer, another call's program, \
+                  macOS's program check holds (M12's ugrep behind its otool): fine throughout",
+            stretch_milli: 1000,
+            setup: |w| behind_a_pipe(w, true),
+            each: nothing,
+            id: "a500",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::Pipe),
+                At(M1, Fine),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "unheld_behind_pipe.setsid",
+            row: "PC the same pipe with its writer not held: the reader goes quiet",
+            stretch_milli: 1000,
+            setup: |w| behind_a_pipe(w, false),
+            each: nothing,
+            id: "a500",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::Pipe),
+                At(M1, Fine),
+                At(M20, Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_then_runs.setsid",
+            row: "PC held 10 min, then the program starts and prints each tick: running at \
+                  once, its held time never counted against it",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, held_at_start(CHILD, "git-remote-https", true)),
+            each: |w, rel| {
+                if rel == 600_000 {
+                    let p = w.p(CHILD);
+                    p.held = false;
+                    p.cpu_per_s = 40_000_000;
+                }
+                if rel >= 600_000 {
+                    w.call_file(CALL).size += 40;
+                }
+            },
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::ProgramCheck),
+                At(598_000, Fine),
+                ClassAt(600_000, Class::Running),
+                ClassAt(M20, Class::Running),
+                Never(Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_beside_curl.setsid",
+            row: "PC a call whose job reads a quiet socket in one leaf while macOS's program check \
+                  holds its other leaf: program-check ranks first, fine throughout",
+            stretch_milli: 1000,
+            setup: |w| {
+                setsid(w, curl(CHILD));
+                let mut gh = held_at_start(CHILD + 1, "gh", true);
+                gh.ppid = CALL;
+                gh.pgid = CALL;
+                gh.sid = CALL;
+                w.add(gh);
+            },
+            each: nothing,
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::ProgramCheck),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+                NoProgressNever,
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_raw.pty",
+            row: "PC the person's foreground program left the terminal raw and is held at macOS's \
+                  program check: program-check before the terminal's word",
+            stretch_milli: 1000,
+            setup: |w| {
+                pty(w, held_at_start(FG, "gh", true), "gh pr view");
+                w.tty_mode(1, false, false);
+            },
+            each: nothing,
+            id: "b51",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::ProgramCheck),
+                At(M1, Fine),
+                At(M20, Fine),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_noecho.pty",
+            row: "PC the same with the terminal canonical and silent: program-check, not a \
+                  password prompt that waits for you",
+            stretch_milli: 1000,
+            setup: |w| {
+                pty(w, held_at_start(FG, "gh", true), "gh auth status");
+                w.tty_mode(1, true, false);
+            },
+            each: nothing,
+            id: "b51",
+            until_ms: M20,
+            expect: &[
+                WaitAt(M1, WaitName::ProgramCheck),
+                At(M1, Fine),
+                At(M20, Fine),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_from_20s.setsid",
+            row: "PC the call's program reads held only from 20 s past its fork, as macOS reads \
+                  it: program-check and legitimate at that reading",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, held_at_start(CHILD, "gh", false)),
+            each: |w, rel| {
+                if rel == 20_000 {
+                    w.p(CHILD).held = true;
+                }
+            },
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                WaitAt(18_000, WaitName::Unnamed),
+                WaitAt(20_000, WaitName::ProgramCheck),
+                At(M20, Fine),
+                Never(Quiet),
+                Never(Stuck),
+            ],
+            model: true,
+        },
+        Scenario {
+            name: "held_after_quiet.setsid",
+            row: "PC a wrapper quiet for 8 min execs a program macOS's program check holds: fine at \
+                  the reading that sees it held",
+            stretch_milli: 1000,
+            setup: |w| setsid(w, held_at_start(CHILD, "sh", false)),
+            each: |w, rel| {
+                if rel == 480_000 {
+                    let p = w.p(CHILD);
+                    p.held = true;
+                    p.exec = 2;
+                    p.name = "gh".to_owned();
+                }
+            },
+            id: "a400",
+            until_ms: M20,
+            expect: &[
+                FirstAt(Quiet, 416_000),
+                At(478_000, Quiet),
+                At(480_000, Fine),
+                WaitAt(480_000, WaitName::ProgramCheck),
+                At(M20, Fine),
+                Never(Stuck),
+            ],
+            model: true,
+        },
     ]
+}
+
+/// A program macOS's program check holds from its fork, as M1 and M4 read one: asleep, about
+/// 2 ms of CPU (the fork child's work before its exec), held where `flagged`.
+fn held_at_start(pid: u32, name: &str, flagged: bool) -> Proc {
+    let mut p = sleeper(pid, name);
+    p.counters.cpu_ns = 2_000_000;
+    p.held = flagged;
+    p
+}
+
+/// Call 400 runs `otool` (held where `held`) writing a pipe that call 500's `ugrep` reads.
+fn behind_a_pipe(w: &mut World, held: bool) {
+    let mut otool = held_at_start(CHILD, "otool", held);
+    otool.fds.push(pipe_end(1, 0xE2, 0xE1, true, 0, 0));
+    setsid(w, otool);
+    let mut ugrep = sleeper(501, "ugrep");
+    ugrep.fds.push(pipe_end(0, 0xE1, 0xE2, false, 0x8, 0));
+    w.call(1, AGENT, 500, ugrep, None);
 }
 
 fn deadlocked(w: &mut World) {

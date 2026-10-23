@@ -386,6 +386,42 @@ fn split_compose_recovery_bypasses_identical_key_at_shipping_callsite() {
     );
 }
 
+/// A split's first compose hands the cursor's step its focused pane's own
+/// text (the letter guard's letters, the dark streak's air): the window's
+/// cells are composed only after that step. Control: before the compose the
+/// window's own cells, which that step read until 2026-10-23, hold no letter.
+#[test]
+fn a_split_s_first_compose_reads_its_focused_pane_s_text() {
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    app.split_active_stub_tab_dir(wid, crate::pane::SplitDir::Vertical);
+    crate::term_lock(&app.front_terminal(wid).expect("focused pane").term).process(b"letters");
+    let (rows, cols) = {
+        let ws = &app.windows[&wid];
+        (usize::from(ws.rows), usize::from(ws.cols))
+    };
+    assert!(
+        app.windows[&wid]
+            .input_scratch
+            .cells
+            .iter()
+            .flatten()
+            .all(|c| c.ch == ' '),
+        "control: the window's own cells hold no letter before the first compose"
+    );
+    let now = std::time::Instant::now();
+    assert!(
+        app.redraw_compose(wid, rows, cols, false, false, None, 0, now)
+            .is_some(),
+        "fixture: the first split compose presents"
+    );
+    let read = app.windows[&wid].fx.cursor().glow.frame_text_letters();
+    assert!(
+        read >= "letters".len(),
+        "the cursor's step read {read} letters of the focused pane"
+    );
+}
+
 #[test]
 fn zoomed_split_live_and_capture_use_the_visible_panes_effective_background() {
     let mut app = App::headless_for_test();

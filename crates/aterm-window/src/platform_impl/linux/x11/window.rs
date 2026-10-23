@@ -61,8 +61,10 @@ pub struct SharedState {
     pub urgent: bool,
     /// What hides the window, and what `WindowEvent::Occluded` last said of it.
     pub occlusion: Occlusion,
-    /// Whether the server asked for the window to be drawn again since its last `RedrawRequested` (`Expose`).
-    pub exposed: bool,
+    /// What the server asked to be drawn again since the window's last `RedrawRequested` (`Expose`).
+    pub exposed: Option<Exposure>,
+    /// The newest post the application said drew a whole area of the window (`WindowExtX11::x11_area_posted`).
+    pub posted: Option<Post>,
     /// Cached `_NET_WM_STATE` until invalidated by `UnownedWindow::wm_state_changed`.
     shown: Option<ShownState>,
     /// Monotonic counter of `_NET_WM_STATE` invalidations.
@@ -86,7 +88,8 @@ pub enum Visibility {
     YesWait,
 }
 
-/// LOCAL PATCH (aterm), 2026-10-22.
+/// LOCAL PATCH (aterm): what hides the window. It is occluded while any of `unmapped`, `hidden`
+/// and `obscured` holds, and `WindowEvent::Occluded` is sent only when that answer changes.
 #[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
 pub struct Occlusion {
     /// Unmapped since it was last mapped.
@@ -105,6 +108,42 @@ impl Occlusion {
         change(self);
         let occluded = self.unmapped || self.hidden || self.obscured;
         (replace(&mut self.reported, occluded) != occluded).then_some(occluded)
+    }
+}
+
+/// What an `Expose` series asked to be drawn again.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Exposure {
+    /// Its newest event's serial: the last of this client's requests the server had processed
+    /// when it sent that event, on the numbering of the requests the window's connection sends.
+    pub serial: u64,
+    /// The bounds of its rectangles, `[x0, y0, x1, y1]`, half-open.
+    pub area: [u32; 4],
+}
+
+/// A request of the application's that drew all of `area` of the window.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct Post {
+    /// The request's sequence number on the window's connection.
+    pub sequence: u64,
+    /// `[x0, y0, x1, y1]`, half-open.
+    pub area: [u32; 4],
+}
+
+impl Exposure {
+    /// `exposure` with one more event's rectangle `[x0, y0, x1, y1]`, sent at `serial`.
+    pub fn widened(exposure: Option<Self>, serial: u64, rect: [u32; 4]) -> Self {
+        let Some(Self { area: [x0, y0, x1, y1], .. }) = exposure else {
+            return Self { serial, area: rect };
+        };
+        Self { serial, area: [x0.min(rect[0]), y0.min(rect[1]), x1.max(rect[2]), y1.max(rect[3])] }
+    }
+
+    /// Whether `post` drew all of it again: the server processed the post's request after it
+    /// sent the exposure's newest event, and the post's area holds the exposure's.
+    pub fn repaired_by(&self, post: Post) -> bool {
+        let ([x0, y0, x1, y1], [px0, py0, px1, py1]) = (self.area, post.area);
+        post.sequence > self.serial && px0 <= x0 && py0 <= y0 && px1 >= x1 && py1 >= y1
     }
 }
 
@@ -132,7 +171,8 @@ impl SharedState {
             has_focus: false,
             urgent: false,
             occlusion: Occlusion::default(),
-            exposed: false,
+            exposed: None,
+            posted: None,
             shown: None,
             shown_changes: 0,
         })
@@ -1186,7 +1226,8 @@ impl UnownedWindow {
         (new_width, new_height)
     }
 
-    /// LOCAL PATCH (aterm), 2026-10-17 (docs/AUDIT-third-party-2026-10-15.md, winit-core step 6, the Linux half).
+    /// LOCAL PATCH (aterm; docs/AUDIT-third-party-2026-10-15.md, WC.6): the window's handles as
+    /// first-party `aterm_types::native_window`.
     #[inline]
     pub fn native_window(&self) -> NativeWindow {
         NativeWindow::Xlib {
@@ -1406,9 +1447,20 @@ impl UnownedWindow {
         self.redraw_sender.send(WindowId(self.xwindow as _)).unwrap();
     }
 
-    /// Whether the server asked for the window to be drawn again since the last look ([`SharedState::exposed`]), which this clears.
+    /// Whether the server asked for the window to be drawn again since the last look and no post
+    /// the application noted drew it again since ([`SharedState::exposed`], which this clears).
     pub(crate) fn take_exposed(&self) -> bool {
-        std::mem::take(&mut self.shared_state_lock().exposed)
+        let mut state = self.shared_state_lock();
+        let posted = state.posted;
+        state
+            .exposed
+            .take()
+            .is_some_and(|exposure| !posted.is_some_and(|post| exposure.repaired_by(post)))
+    }
+
+    /// The application's request `sequence` drew all of `area` of the window (`WindowExtX11::x11_area_posted`).
+    pub fn area_posted(&self, sequence: u64, area: [u32; 4]) {
+        self.shared_state_lock().posted = Some(Post { sequence, area });
     }
 
     #[inline]

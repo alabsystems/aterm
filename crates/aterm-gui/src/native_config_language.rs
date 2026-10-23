@@ -1423,6 +1423,34 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
         true,
     ),
     manual(
+        "harness.facts",
+        "Tell the agent of its hung background calls",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "supervisor",
+            "facts",
+            "background",
+            "stuck",
+            "hung",
+            "prompt",
+        ],
+        true,
+    ),
+    manual(
+        "harness.stuck_break_note",
+        "Type a hung call's fact at a stuck break",
+        ConfigSchemaKind::Scalar(EditKind::Bool),
+        &[
+            "supervisor",
+            "facts",
+            "background",
+            "stuck",
+            "hung",
+            "break",
+        ],
+        true,
+    ),
+    manual(
         "harness.upgrade",
         "Restart Claude Code sessions onto a newer build",
         ConfigSchemaKind::Scalar(EditKind::Bool),
@@ -5502,7 +5530,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · 5-hour, weekly or full, first preferred · the row of the first listed kind on offer is taken, whatever else is offered, never an unlisted kind or a Fable reset · empty: only the one reset on offer"
         }
         "harness.usage_tap" => {
-            " · through Claude Code's own status line on the relaunch lines aterm types, for this machine's own login only (its default or lone one, or, where accounts.toml has no lone login, one it lists); not where your own statusLine or --settings is set; it moves no session · its readings give the footer its weekly figure and the account stats their recorder, and time the continuation at a usage limit, to the reset they read · on by default"
+            " · through Claude Code's own status line on the relaunch lines aterm types, for this machine's own login only (its default or lone one, or, where accounts.toml lists two or more accounts, one it lists or one a renewal moved a row away from); not where your own statusLine, apiKeyHelper, credential or --settings is set · its readings give the footer its weekly figure and the account stats their recorder, time the continuation at a usage limit to the reset they read, and, where accounts.toml lists two or more accounts, feed accounts = \"early\", which moves a session to the next account ahead of its limit · on by default"
         }
         "harness.usage_credits" => {
             " · Claude Code only · on: a consent box that names usage credits is taken (`Continue with <model>` is kept by Claude Code for good for that model and account; `Continue with usage credits` saves nothing and carries the session onto credits already on) and a model limit that asks for it is continued into it · off by default: the harness keeps sessions on the subscription; such a box is cancelled with Esc, a session credits carry gets no turn of the harness's own until the reset their notice names (then one turn, which another window may still bill to credits), and no session is moved onto a model billed to credits · nothing is ever bought either way"
@@ -5518,6 +5546,12 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
         }
         "harness.memory_ceiling" => {
             " · auto, off or a number of GiB · the agent is restarted only when the Mac is short of memory and it holds the most"
+        }
+        "harness.facts" => {
+            " · once each time a call stops making progress, on a prompt aterm types anyway, only when it fits whole · off: none"
+        }
+        "harness.stuck_break_note" => {
+            " · off by default · on: one line of aterm's own at a break of the agent's background work, once each time a call stops making progress"
         }
         "harness.upgrade_ask" => {
             " · asks the agent to reach a stopping point and answer READY first · off: a session moves only when it is idle"

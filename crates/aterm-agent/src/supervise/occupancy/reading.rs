@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! THE MACHINE'S OCCUPANCY AS THE HOST READS IT FOR ONE SESSION
-//! (`docs/DESIGN-harness-occupancy-2026-10-20.md` §2, §4.2; the red-team's F15): what
-//! `IdleHost::occupancy` answers, from the window's facts board taken once a disk look.
+//! (`docs/DESIGN-harness-occupancy-2026-10-20.md` §2, §4.2): what `IdleHost::occupancy`
+//! answers, from the window's facts board taken once a disk look.
 
 use crate::harness::disk::Level;
 use crate::supervise::memory::Pressure;

@@ -3001,6 +3001,28 @@ impl App {
         }
     }
 
+    /// The cursor glow's box for a capture of window `wid`, as the present's
+    /// `cursor_frame` builds it: the window pixels the sky draws its stars in.
+    fn capture_glow_geom(
+        &self,
+        wid: WindowId,
+        (cw, ch): (usize, usize),
+        (rows, cols): (usize, usize),
+    ) -> crate::cursor_glow::Geom {
+        let (origin_x, origin_y, win_w, win_h, head) = self.effects_origin_win(wid, rows, cols, ch);
+        crate::cursor_glow::Geom {
+            cw,
+            ch,
+            rows,
+            cols,
+            origin_x,
+            origin_y,
+            win_w,
+            win_h,
+            head,
+        }
+    }
+
     fn capture_composed_words(
         &mut self,
         wid: WindowId,
@@ -3081,7 +3103,8 @@ impl App {
         else {
             return;
         };
-        let (origin_x, origin_y, _, _, _) = self.effects_origin_win(wid, rows, cols, cell_h);
+        let glow_geom = self.capture_glow_geom(wid, (cell_w, cell_h), (rows, cols));
+        let (origin_x, origin_y) = (glow_geom.origin_x, glow_geom.origin_y);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -3204,6 +3227,12 @@ impl App {
         });
         let escort_caret = pet_tick.escort_caret();
         let pet = ws.fx.companion_mut().tick(pet_tick);
+        // The split present's offer (`redraw_compose_after_focused_extract`):
+        // the body the sky draws no star on, in the focused pane's cells.
+        let focus_off = panes
+            .get(focus_index)
+            .map_or((0, 0), |(r, _)| (r.row_off, r.col_off));
+        ws.fx.offer_pet_v2(&pet.pet, glow_geom, focus_off, now);
         let ctx = crate::app_render::ComposeDecoCtx {
             panes: &panes,
             focus,
@@ -3353,7 +3382,8 @@ impl App {
         else {
             return;
         };
-        let (origin_x, origin_y, _, _, _) = self.effects_origin_win(wid, rows, cols, cell_h);
+        let glow_geom = self.capture_glow_geom(wid, (cell_w, cell_h), (rows, cols));
+        let (origin_x, origin_y) = (glow_geom.origin_x, glow_geom.origin_y);
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -3463,6 +3493,10 @@ impl App {
         });
         let cur = pet_tick.escort_caret();
         let pet = ws.fx.companion_mut().tick(pet_tick);
+        // The present's offer (`redraw_window_with_layout`): without it a
+        // capture's sky never learns where the pet flies and draws its stars
+        // on the fur.
+        ws.fx.offer_pet_v2(&pet.pet, glow_geom, (0, 0), now);
         let words_suspended = exact_focus.alternate_screen && suppress_alt;
         if load_shed || words_suspended || sparkle.is_none() {
             // The word field freezes under load or alternate-screen suppression; an explicit feature disable resets it.

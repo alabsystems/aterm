@@ -17,6 +17,7 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
         (4, "UnnamedNeverEntersStuck"),
         (5, "NoFlap"),
         (6, "FlaggedOnTime"),
+        (7, "HeldWaitNeverQuiet"),
     ] {
         let mut m = interp::with_buggy(&model, dial);
         m.actions
@@ -71,6 +72,18 @@ fn the_stuck_verdict_holds_and_each_law_has_its_own_mutant() {
     assert_eq!((s["cls"], s["q"], s["v"]), (3, 4, 1));
     assert!(model.fire("Relabel", &mut s));
     assert_eq!((s["cls"], s["v"]), (2, 2));
+    assert!(model.fire("Hold", &mut s));
+    assert_eq!(
+        (s["cls"], s["q"], s["v"]),
+        (1, 0, 0),
+        "a held job waits legitimately"
+    );
+    assert!(
+        !model.action_enabled("BecomeSuspect", &s),
+        "no suspicion while it is held"
+    );
+    assert!(model.fire("Release", &mut s));
+    assert!(model.action_enabled("BecomeSuspect", &s));
 }
 
 #[test]

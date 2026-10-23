@@ -57,7 +57,7 @@ enum Step {
     Peek,
 }
 
-/// The test suite's own wall instant (`TEST_NOW`, 2026-05-19 14:00 PDT).
+/// The wall instant these tests fix their clocks at: 2026-05-19 14:00 PDT.
 const NOW: i64 = 1_779_224_400;
 
 /// `ScriptedClock` matches `OldKnobs` step by step across fixed times, staged jumps, and non-consuming peeks.

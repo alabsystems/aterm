@@ -19,11 +19,11 @@ pub const USAGE: &str =
                 check --commit <it> --cut`)? Asked by that commit's own cutter:
                 ATERM_RELEASE_CUTTER (the running release's) when set, else one built
                 in a throwaway worktree of it. Exit 0 yes, 1 a gate refuses (named),
-                2 it could not be asked
+                2 it could not be asked, 3 a gate could not run
   post-promote  `ship site`; its promote-time run (PUB_STAGING_COMMIT set, no --latest)
                 does nothing
-  transforms    rewrite the export at EXPORT by CAPTURED_COMMIT's own rules (ROOT: the
-                repository); exit 0 done, 1 refused or failed (named)";
+  transforms    rewrite the export at EXPORT by CAPTURED_COMMIT's own rules (default
+                HEAD; ROOT: the repository); exit 0 done, 1 refused or failed (named)";
 
 /// `ship hook …`: the hook's exit code.
 #[must_use]
@@ -570,7 +570,8 @@ pub type There<'a> = dyn FnMut(&Path, &str, &Path) -> Result<i32, String> + 'a;
 /// The rewrites over a commit's export, run here.
 pub type Here<'a> = dyn FnMut(&crate::transforms::Inputs) -> Result<Vec<String>, String> + 'a;
 
-/// THE EXPORT IS REWRITTEN BY THE EXPORTED COMMIT'S OWN RULES.
+/// Rewrite the export by the captured commit's own rules: `here` when this cutter's
+/// source is that commit, else `there`, that commit's own cutter in a worktree of it.
 pub fn transforms(
     facts: &Transforms,
     here: &mut Here<'_>,

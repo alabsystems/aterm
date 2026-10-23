@@ -84,7 +84,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// The bytes of disk the open `file` holds: its allocation, which for a compressed or sparse file is what it really holds, not its length (measured 2026-10-19 on NTFS: 3 MiB of one byte value held 3 MiB plain, 192 KiB in a compressed folder, 0 sparse — the same figures `GetCompressedFileSizeW` reads by path).
+/// The bytes of disk the open `file` holds: its allocation, which for a compressed or sparse file is what it really holds, not its length (on NTFS, 3 MiB of one byte value holds 3 MiB plain, 192 KiB in a compressed folder, 0 sparse — the same figures `GetCompressedFileSizeW` reads by path).
 /// # Errors
 /// The query failed.
 pub(crate) fn allocated(file: &std::fs::File) -> io::Result<u64> {
@@ -323,7 +323,7 @@ unsafe extern "system" {
     ) -> i32;
 }
 
-/// TEST FIXTURE: give the open `file` (a file, or an EMPTY folder, opened for writing as itself) a reparse point that is NO LINK ([`FOREIGN_REPARSE_TAG`]) — what a cloud placeholder is to std, made without a privilege (measured 2026-10-19: a plain account sets one; std then reads the file as `is_file`, not `is_symlink`, attributes `0x420`, and an open that does not ask for the point itself fails with `ERROR_CANT_ACCESS_FILE`).
+/// TEST FIXTURE: give the open `file` (a file, or an EMPTY folder, opened for writing as itself) a reparse point that is NO LINK ([`FOREIGN_REPARSE_TAG`]) — what a cloud placeholder is to std, made without a privilege (a plain account sets one; std then reads the file as `is_file`, not `is_symlink`, attributes `0x420`, and an open that does not ask for the point itself fails with `ERROR_CANT_ACCESS_FILE`).
 /// # Errors
 /// The file system refused the reparse point.
 #[cfg(test)]

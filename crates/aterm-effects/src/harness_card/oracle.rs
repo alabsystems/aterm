@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE QUAD ORACLE: the card as it was drawn before fx layers, a stream of
-//! [`GlowQuad`]s each inside one cell-row band, kept for the tests
+//! THE QUAD ORACLE (test-only): the card drawn as a stream of [`GlowQuad`]s,
+//! each inside one cell-row band, that the tests hold its fx layers to
 //! (`docs/DESIGN-card-engine-2026-10-19.md` §4.9, migration exactness).
 
 use aterm_render::{GlowQuad, premul_rgb};

@@ -33,7 +33,7 @@ pub(crate) enum Side {
     Right,
 }
 
-/// Where the header's buttons go, each end's left to right: GNOME's `org.gnome.desktop.wm.preferences button-layout` (`appmenu:close`, `close,minimize,maximize:`) as sctk-adwaita 0.10.1 read it before LW.5 (tests/recorded/sctk-adwaita-0.10.1-frame.tsv is its answer for each value, and [`Self::parse`] is held to it).
+/// Where the header's buttons go, each end's left to right: GNOME's `org.gnome.desktop.wm.preferences button-layout` (`appmenu:close`, `close,minimize,maximize:`) as sctk-adwaita 0.10.1 reads it (tests/recorded/sctk-adwaita-0.10.1-frame.tsv is its answer for each value, and [`Self::parse`] is held to it).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ButtonLayout {
     left: [Option<LayoutButton>; 3],

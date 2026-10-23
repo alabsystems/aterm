@@ -296,6 +296,21 @@ pub struct JobProc {
     pub wchan: Option<String>,
     /// Its descriptors, when asked for; `None` when not asked or refused.
     pub fds: Option<Vec<Fd>>,
+    /// Whether macOS's program check holds it before its first instruction (`aterm_sysprobe::jobs::AtStart::Held`).
+    pub program_check: bool,
+}
+
+/// One process of aterm's user that macOS's program check holds, member of a job or not, as the host read it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct HeldProc {
+    /// Its pid.
+    pub pid: u32,
+    /// Which program the pid runs: its pid version where read (it moves on exec), else its start. A wrapper that execs its held tool starts a new held time.
+    pub exec: u64,
+    /// Its executable's basename, else its short name.
+    pub name: String,
+    /// Whether aterm started it (a tab's member, or aterm's resource coalition): words only.
+    pub aterm: bool,
 }
 
 /// One OSC 133 command block of a tab.
@@ -511,6 +526,8 @@ pub struct JobTick {
     pub lanes: LanesSeen,
     /// The per-user process limit (`kern.maxprocperuid`, `RLIMIT_NPROC`).
     pub process_limit: Option<u64>,
+    /// aterm's user's processes macOS's program check holds now.
+    pub held: Vec<HeldProc>,
 }
 
 /// One process the host should read in detail.
@@ -693,6 +710,8 @@ impl Verdict {
 /// The named waits (§11.5 Tier A, and the Tier B words a request adds).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WaitName {
+    /// Held at macOS's program check before its first instruction: work in line.
+    ProgramCheck,
     /// The person's foreground job reads a password (canonical, no echo).
     TtyPassword,
     /// The shell's own `read` builtin.
@@ -738,6 +757,7 @@ impl WaitName {
     #[must_use]
     pub const fn word(self) -> &'static str {
         match self {
+            Self::ProgramCheck => "program-check",
             Self::TtyPassword => "tty-password",
             Self::TtyBuiltinRead => "tty-builtin-read",
             Self::TtyRaw => "tty-raw",
@@ -960,8 +980,21 @@ pub struct Named {
     pub name: String,
     /// The tab, when it is in one.
     pub tab: Option<u64>,
-    /// How long, ms (D-state and busy orphans).
+    /// How long, ms (D-state, busy orphans, and held since the first reading that saw it held).
     pub for_ms: u64,
+}
+
+/// A stretch of readings in which macOS's program check is backed up (`docs/DESIGN-leftover-processes-2026-10-16.md` §5.1): it opens at the first reading where one of aterm's user's programs was held at the reading before too, or three are held at once, and closes at the second reading in a row that finds none held.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HeldEpisode {
+    /// The reading it opened at, host ms.
+    pub opened_ms: u64,
+    /// From its opening to its last reading that found a program held (this one, while one is held), ms.
+    pub for_ms: u64,
+    /// The most programs held at one reading.
+    pub peak: u32,
+    /// The longest any of them was held, ms.
+    pub oldest_ms: u64,
 }
 
 /// Per-process findings (§11.9), whatever the jobs' classes.
@@ -975,6 +1008,14 @@ pub struct Findings {
     pub d_state: Vec<Named>,
     /// Orphans burning a core for ≥ 10 min with no side writes.
     pub busy_orphans: Vec<Named>,
+    /// Own processes macOS's program check holds, members of a job or not, each held since the first reading that saw it held, by pid; a lower bound (only aterm's user is read).
+    pub program_check: Vec<Named>,
+    /// Of those, the ones aterm started: how many, and the longest held, ms.
+    pub program_check_aterm: (u32, u64),
+    /// The backed-up episode this reading is in.
+    pub program_check_episode: Option<HeldEpisode>,
+    /// The episode that closed at this reading (set on that one view only).
+    pub program_check_drained: Option<HeldEpisode>,
     /// Own-uid processes, zombies included.
     pub own_procs: u64,
     /// The per-user limit.

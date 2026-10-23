@@ -23809,7 +23809,7 @@ pub fn main_entry_with_first_run(argv: Vec<std::ffi::OsString>, first_run: Optio
         ContainmentMode::User,
     )
     .unwrap_or_else(|e| {
-        // The session's words (aterm-cli `session_main`): the accepted values.
+        // The sentence aterm-cli's `session_main` prints for the same refusal.
         if matches!(e, aterm_containment::InitModeFromFlagError::Parse(_)) {
             crate::logging::stderr_line!(
                 "aterm-gui: --containment takes user, safety or containment; using containment"
@@ -27557,7 +27557,8 @@ mod headless_video_tests;
 #[path = "lib_visible_content_route_tests.rs"]
 mod visible_content_route_tests;
 
-/// Locate and exec the release tool for `aterm ship …`.
+/// Run the release tool for `aterm ship …`: `aterm-release` beside this binary, else in the
+/// `target/` of a checkout at or above the current directory.
 pub fn run_ship(rest: &[String]) -> i32 {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(exe) = std::env::current_exe()

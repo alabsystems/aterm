@@ -3409,8 +3409,8 @@ fn each_decisions_clock_uses_its_events_offset_not_the_readings() {
     assert_eq!(clocks, ["03:30", "06:30 UTC"]);
 }
 
-/// THE STATS READING DIALS A SIBLING AS ITS HANDSHAKE ASKS (2026-10-18): the
-/// token beside the sibling's socket on an `AUTH <hex>` line, then `ls`.
+/// THE STATS READING DIALS A SIBLING AS ITS HANDSHAKE ASKS: the token beside
+/// the sibling's socket on an `AUTH <hex>` line, then `ls`.
 #[cfg(unix)]
 #[test]
 fn the_stats_reading_dials_a_sibling_on_its_auth_line_and_never_blind() {

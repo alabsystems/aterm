@@ -148,9 +148,9 @@ fn triple(text: &str, at: usize) -> Option<usize> {
 }
 
 /// The note lines: `<p class="install-note"[^>]*>` then `<code>aterm[^<]*</code>`,
-/// then optionally a version cell (the pre-2026-08-28 shape) and optionally a size
-/// cell — consumed, so a page in an older shape is migrated. The inner span is
-/// everything after the `<p …>` opening tag.
+/// then optionally a version cell (an older page shape) and optionally a size cell.
+/// Both are consumed, so the rewrite drops a version cell. The inner span is everything
+/// after the `<p …>` opening tag.
 fn notes(text: &str) -> Vec<Hit> {
     const OPEN: &str = "<p class=\"install-note\"";
     let mut hits = Vec::new();

@@ -347,7 +347,7 @@ fn a_spare_runs_no_startup_file_until_asked_and_signs_one_start_record() {
     }
 }
 
-/// THE PARKED RETARGET (2026-10-18): a parked shell started in one folder and told `go <folder>` reads, at its first prompt, as a cold shell started in that folder: its `$PWD`, the folder its commands run in (`pwd -P`), and its `$OLDPWD`, set or not and handed to a command or not, before and after its first `cd` (zsh starts with `$OLDPWD` at `$PWD`; bash with it unset but exported, or the one it inherited). NEGATIVE CONTROL: a plain `go` leaves it in the folder it was started in, even with a `__aterm_spare_cd` in the environment it inherited: only a line told names a folder.
+/// A parked shell started in one folder and told `go <folder>` reads, at its first prompt, as a cold shell started in that folder: its `$PWD`, the folder its commands run in (`pwd -P`), and its `$OLDPWD`, set or not and handed to a command or not, before and after its first `cd` (zsh starts with `$OLDPWD` at `$PWD`; bash with it unset but exported, or the one it inherited). NEGATIVE CONTROL: a plain `go` leaves it in the folder it was started in, even with a `__aterm_spare_cd` in the environment it inherited: only the `go` line names a folder.
 #[cfg(unix)]
 #[test]
 fn a_parked_shell_told_a_folder_reads_as_a_cold_shell_started_there() {

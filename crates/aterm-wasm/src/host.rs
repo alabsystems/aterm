@@ -7,8 +7,7 @@
 //! aterm-wasm-abi's raw `aterm_host` imports (`aterm_wasm_abi::host`), which
 //! the glue that `verify glue` writes provides.
 //!
-//! `aterm-gpu-web` makes the same calls the same way in its own
-//! `src/host.rs` (docs/AUDIT-third-party-2026-10-15.md, wasm-platform WP.8).
+//! `aterm-gpu-web` makes the same calls the same way in its own `src/host.rs`.
 //!
 //! Debug builds also export what `crates/aterm-verify/perf/wasm/smoke.mjs` drives in
 //! a browser (`verify wasm-smoke`); a release module has none of it.

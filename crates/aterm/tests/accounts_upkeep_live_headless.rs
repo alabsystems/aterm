@@ -19,8 +19,8 @@ use crate::headless_boot::{self, Instance};
 /// The network witness's jail (SBPL, the last rule that matches wins): a name
 /// lookup (the resolver's socket), or an IP connection to anything but IPv4
 /// loopback, kills the process that asked, at once. The resolver's rule comes
-/// first: after the loopback allowance it killed an established loopback
-/// connection too (macOS 27, measured 2026-10-22).
+/// first: after the loopback allowance it also kills an established loopback
+/// connection (macOS 27).
 const NETWORK_JAIL: &str = concat!(
     "(version 1)(allow default)",
     "(deny network-outbound (literal \"/private/var/run/mDNSResponder\") ",

@@ -6,8 +6,9 @@
 //! and Land its scenarios) and caught at `Buggy = 1`, each law broken by the mutant written to
 //! break it with every other mutant removed, and walked along the paths the design names: a
 //! nudge at a hold of age, the upgrade's notice first, a wake over the notice under Land, the K
-//! Entry, a hold that outlasts its breaks and a harness line's answer, and a crash between the
-//! intent row and the line. Tier-1 is
+//! Entry, a hold that outlasts its breaks and a harness line's answer, a crash between the
+//! intent row and the line, and the stuck fact under its key (`Key`, both key-on scenarios
+//! checked with the three autopilots). Tier-1 is
 //! `aterm-agent/tests/conformance_occupancy.rs`.
 //!
 //! The non-vacuity sweep over the three configurations and the audit of `TheDueIsToldOrRaised`
@@ -20,7 +21,7 @@ use aterm_spec::interp;
 use aterm_spec::walk::walk;
 
 /// Each mutant, its dial, the law it was written to break, and the autopilot it breaks it under.
-const MUTANTS: [(&str, i64, &str, i64); 22] = [
+const MUTANTS: [(&str, i64, &str, i64); 23] = [
     ("RestartClock", 1, "TheClockNeverRestarts", 1),
     ("LoseDeadline", 1, "TheDeadlineStaysArmed", 1),
     ("TypeAtAnyDoor", 2, "NoLineIntoATurn", 1),
@@ -43,11 +44,17 @@ const MUTANTS: [(&str, i64, &str, i64); 22] = [
     ("CloseEarly", 19, "AnEpisodeEndsWithItsCondition", 1),
     ("TypeOverNotice", 20, "TheNoticeGoesFirst", 1),
     ("NudgeUnheld", 21, "TheNudgeWaitsForItsAge", 1),
+    ("StuckWithoutKey", 22, "TheStuckLineNeedsItsKey", 1),
 ];
 
 /// The model under autopilot `mode` (0 Off, 1 Cruise, 2 Land).
 fn under(mode: i64) -> Model {
     interp::with_consts(&occupancy_door_model(), &[("Mode", mode)])
+}
+
+/// The model under autopilot `mode` with the stuck fact's key on.
+fn keyed(mode: i64) -> Model {
+    interp::with_consts(&occupancy_door_model(), &[("Mode", mode), ("Key", 1)])
 }
 
 /// `m` with every mutant removed but `keep`.
@@ -61,8 +68,11 @@ fn alone(m: &Model, keep: &str) -> Model {
 #[test]
 fn occupancy_door_fires_exactly_its_committed_moves() {
     let mut fired = std::collections::BTreeSet::new();
-    for mode in [0, 1, 2] {
-        let m = under(mode);
+    for (mode, m) in [0, 1, 2]
+        .map(|mode| (mode, under(mode)))
+        .into_iter()
+        .chain([1, 2].map(|mode| (mode, keyed(mode))))
+    {
         assert!(
             interp::violated_invariants(&m).is_empty(),
             "every law holds under Mode = {mode}"
@@ -148,7 +158,7 @@ fn a_nudge_goes_once_at_a_break_under_cruise_only() {
     }
 }
 
-/// F11, DECIDED UPGRADE-FIRST: with the upgrade's notice due (`IdleHost::upgrade_due`, asked only
+/// THE UPGRADE FIRST: with the upgrade's notice due (`IdleHost::upgrade_due`, asked only
 /// after the grant), a nudge waits and the notice is the break's one line, an act untaken until
 /// the agent takes it; the next read after that has the nudge. A wake outranks the notice:
 /// under Land it goes with the notice still due, and the notice does not.
@@ -177,7 +187,7 @@ fn the_upgrade_notice_goes_first_but_under_a_wake() {
     );
     assert!(!m.action_enabled("Type", &noticed), "one line a door");
     // The notice stands untaken past its door: a later read of the same break has no line
-    // until the agent takes it (the safety review's F-A).
+    // until the agent takes it.
     let untaken = walk(
         &m,
         &[
@@ -269,7 +279,7 @@ fn a_due_line_is_raised_at_its_kth_look() {
     assert!(!buggy.check_invariant("TheDeadlineStaysArmed", &lost));
 }
 
-/// THE HOLD'S CLOCK (F7): a hold of age outlasts an idle read with no point (a new break, and a
+/// THE HOLD'S CLOCK: a hold of age outlasts an idle read with no point (a new break, and a
 /// new door), and ends only at a live turn or a point, its rules' condition with it; a clock
 /// that restarts at the idle read ends it there.
 #[test]
@@ -286,7 +296,7 @@ fn a_hold_outlasts_its_breaks() {
     assert!(!restarts.check_invariant("TheHoldOutlastsItsBreaks", &wrong));
 }
 
-/// THE HARNESS'S OWN LINE (§3.1, F5): the turn that answers a line typed in a hold of age, and
+/// THE HARNESS'S OWN LINE (§3.1): the turn that answers a line typed in a hold of age, and
 /// the point that ends that answer, keep the hold; the turn after that point, or a break's read
 /// of the answer, ends the answer, and a turn the harness did not type may end the hold. Closed
 /// at the line's own turn, or at its answer's point, the hold breaks the law each copy breaks.
@@ -348,4 +358,51 @@ fn a_crash_after_the_intent_leaves_the_episode_untold() {
     );
     assert_eq!((wrong["told"], wrong["wrote"]), (1, 0));
     assert!(!seeded.check_invariant("TheBookMatchesTheScreen", &wrong));
+}
+
+/// THE STUCK FACT (R3, §2.1's rank 4): with the key on, a held condition opens its own episode
+/// under Cruise and Land, waits for the upgrade's notice and its act, goes once, and goes again
+/// only after its condition failed and the episode closed; under Off it never goes, and with the
+/// key off it never opens: opened anyway, its line breaks the key's law.
+#[test]
+fn the_stuck_line_needs_its_key_and_goes_once_an_episode() {
+    let m = keyed(1);
+    let open = ["Break", "Holds", "OpenStuck", "Intend"];
+    let at_door = walk(&m, &open);
+    assert!(m.action_enabled("Type", &at_door), "{at_door:?}");
+    assert!(
+        !m.action_enabled("OpenWake", &walk(&m, &["Break", "Holds"])),
+        "the key-on scenarios leave the wake out"
+    );
+    let then = |more: &[&'static str]| [&open[..], more].concat();
+    let notice = walk(&m, &then(&["UpgradeDue"]));
+    assert!(!m.action_enabled("Type", &notice), "{notice:?}");
+    assert!(m.action_enabled("UpgradeTypes", &notice), "{notice:?}");
+    let after = walk(
+        &m,
+        &then(&["UpgradeDue", "UpgradeTypes", "ActTaken", "IdleRead"]),
+    );
+    assert!(m.action_enabled("Type", &after), "{after:?}");
+    let told = walk(&m, &then(&["Type"]));
+    assert_eq!(
+        (told["told"], told["wrote"], told["due"], told["skey"]),
+        (1, 1, 0, 1)
+    );
+    assert!(!m.action_enabled("OpenStuck", &told), "once an episode");
+    let reopened = walk(&m, &then(&["Type", "Fails", "Close", "Holds"]));
+    assert!(m.action_enabled("OpenStuck", &reopened), "{reopened:?}");
+    let land = keyed(2);
+    assert!(land.action_enabled("Type", &walk(&land, &open)));
+    let off = keyed(0);
+    assert!(!off.action_enabled("Type", &walk(&off, &open)));
+    let unkeyed = under(1);
+    let held = walk(&unkeyed, &["Break", "Holds"]);
+    assert!(!unkeyed.action_enabled("OpenStuck", &held), "{held:?}");
+    let ignored = interp::with_buggy(&unkeyed, 22);
+    let wrong = walk(
+        &ignored,
+        &["Break", "Holds", "StuckWithoutKey", "Intend", "Type"],
+    );
+    assert_eq!((wrong["wrote"], wrong["skey"]), (1, 0));
+    assert!(!ignored.check_invariant("TheStuckLineNeedsItsKey", &wrong));
 }

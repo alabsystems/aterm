@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Wayland oracle's recorder (LW.6 of docs/AUDIT-third-party-2026-10-15.md), built outside the
-//! aterm workspace (see Cargo.toml): wayland-scanner 0.31.10 generates the C tables from
-//! aterm-wayland's protocol files, and this prints them, one row per interface and one per message.
+//! The Wayland oracle's recorder, built outside the aterm workspace (see Cargo.toml):
+//! wayland-scanner 0.31.10 generates the C tables from aterm-wayland's protocol files, and this
+//! prints them, one row per interface and one per message.
 
 #![allow(non_upper_case_globals, dead_code, clippy::all)]
 

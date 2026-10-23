@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A screen reader hears Claude's words under the harness's glass (review G3, owner decision
-//! 2026-10-20): the accessibility tree's grid text is read from the cells Claude wrote
-//! (`claude_footer::ProgramCells`), as copy and `text`/`screen` keep them, never the glass's `YOLO
-//! on`, `✦ alab.systems`, facts or the card's line.
+//! A screen reader hears Claude's words under the harness's glass: the accessibility tree's grid
+//! text is read from the cells Claude wrote (`claude_footer::ProgramCells`), as copy and
+//! `text`/`screen` keep them, never the glass's `YOLO on`, `✦ alab.systems`, facts or the card's
+//! line.
 
 use super::*;
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The edges LW.5-LW.7 left untested (`docs/AUDIT-third-party-2026-10-15.md`, step L-HEADER-LW7).
+//! The Linux proof's edge rows (`linux edges`): the X11 and Wayland server variants of LW.5-LW.7 (`docs/AUDIT-third-party-2026-10-15.md`) that its other rows do not run, one per [`Edge`].
 
 use std::path::Path;
 use std::time::{Duration, Instant};

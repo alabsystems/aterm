@@ -184,6 +184,7 @@ fn reading(
         record_turn: None,
         credits: None,
         repo: None,
+        fact: None,
     }
 }
 

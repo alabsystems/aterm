@@ -32,9 +32,7 @@ pub const GUEST_DIR: &str = "aterm-lane";
 /// holds. Cargo hashes a path package by its path inside the workspace and
 /// keeps its dep-info relative to it, so the output another checkout left
 /// (`--keep-build`, or an `up` never taken `down`) reads as fresh to this
-/// one's build, which then links that checkout's units: measured 2026-10-19,
-/// when a run took another worktree's aterm-serde-derive and atpkg failed
-/// with E0782 on a method only that worktree's aterm-serde had.
+/// one's build, which then links that checkout's units.
 pub const BUILT_FROM: &str = "built-from";
 
 /// Exit status of a lane that could not run (no lima, no VM, no display): never a pass.
@@ -205,7 +203,7 @@ impl Out {
         self.code == Some(0)
     }
 
-    /// How the command ended, for a failure's detail, so an empty reply still tells the guest's side from this Mac's: `exit N`; `exit 255, nothing said` (a guest command that a signal ended comes back so through `limactl shell`, measured 2026-10-21, as does one that exited 255 silently); or `no exit status` (`limactl` itself was ended by a signal, which its text then names, or never ran).
+    /// How the command ended, for a failure's detail, so an empty reply still tells the guest's side from this Mac's: `exit N`; `exit 255, nothing said` (a guest command that a signal ended comes back so through `limactl shell`, as does one that exited 255 silently); or `no exit status` (`limactl` itself was ended by a signal, which its text then names, or never ran).
     #[must_use]
     pub fn status(&self) -> String {
         match self.code {

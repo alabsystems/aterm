@@ -93,6 +93,19 @@ pub fn span(ms: i64) -> String {
     }
 }
 
+/// THE STUCK FACT'S LINE AT A BREAK (system awareness §14.4, "The background break"): the mark,
+/// then the fact's own sentence (`BackgroundCall::told`, a closed template) and a full stop,
+/// `[aterm harness] aterm: shell task bplle5dxj (pid 27098) has made no progress for 31 min.`
+/// No advice and no rule name: it is a measurement, said once per episode.
+#[must_use]
+pub fn stuck_line(fact: &str) -> String {
+    debug_assert!(
+        fact.chars().count() <= FACT_CAP,
+        "fact sentence over FACT_CAP"
+    );
+    format!("{HEAD}{fact}.")
+}
+
 /// `wait-nudge@v1`: the hold has stood `held_ms` and the agent has not declared it.
 #[must_use]
 pub fn wait_nudge(held_ms: i64) -> FactLine {

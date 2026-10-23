@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! WHICH TAB RANG (2026-10-22): each session's own record of the bells its programs rang, so "why
-//! do I keep hearing a ping?" has an answer after the fact.
+//! WHICH TAB RANG: each session's own record of the bells its programs rang, so "why do I keep
+//! hearing a ping?" has an answer after the fact.
 
 use std::sync::Mutex;
 

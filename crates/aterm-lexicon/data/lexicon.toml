@@ -4,14 +4,13 @@
 # Sparkle-words lexicon. Each [[entry]] declares surface forms for one
 # (class, language). class = "profanity" | "feline" | "canine" | "animal" | "emphasis".
 # Cross-class homographs resolve by total order: profanity > feline > canine > animal > emphasis.
-# (class = "orca" was deleted 2026-09-27 with the suspended orca splash; an external
-# lexicon's orca entries are skipped: they decorate nothing, and no longer outrank the
-# same word under animal or emphasis, which now decorates as that class.)
+# class = "orca" entries (a lexicon override file may carry them) are skipped.
 # class = "animal" entries additionally carry species = "<id>" naming the authored sprite.
 # mode="suffix": surfaces = stems x suffixes (+ forms[]). mode="forms": forms[] only.
 # cjk=true: no-space script; forms[] are whole compounds matched by maximal run.
 # ambiguous=true: only loaded when the entry's lang is in the configured `languages`.
-# Seed authored with machine assistance; best-effort, extend via PR. See docs/sparkle-words-design.md
+# Seed authored with machine assistance; best-effort, extend via PR. The effects these
+# classes drive: docs/sparkle-words-v2-design.md and docs/sparkle-words-v3-design.md.
 
 # ===================== group: en =====================
 [[entry]]
@@ -1094,22 +1093,18 @@ notes    = "kucing=cat (shared with id/ms); kitten = 'kucing cilik' (small cat) 
 
 # ===================== group: emphasis =====================
 # Hype / emphasis words — the animated-ink-only class (no sprite overlay).
-# INTENTIONALLY EMPTY: the builtin ships no emphasis forms (the 2026-07-02
-# product decision — earlier hype-oriented seeds were removed). The
-# class exists so user words flow in via [sparkle_words.emphasis].extra_words
-# (or a lexicon override file) with zero lexicon changes.
+# Intentionally empty: the builtin ships no emphasis forms. The class exists
+# so user words flow in via [sparkle_words.emphasis].extra_words (or a
+# lexicon override file) with zero lexicon changes.
 
 
-# ===================== profanity: un-gated split (2026-07-24) =====================
-# These surfaces were previously trapped behind `ambiguous = true` alongside
-# genuine homographs, so 18 languages' profanity NEVER LOADED on the shipped
-# default (`languages = ["en"]`) — 97 of 323 surfaces, 30%. Polish `kurwa`,
-# Arabic, Hebrew, Persian, Bengali, Swedish and Tagalog all silently had no
-# f-bomb. The gate is real and stays on the surfaces that earn it (Swedish
-# `fan` vs English "fan", Hebrew `כוס` = cup, zh 操/草/干 = everyday words,
-# Romanian `fut` prefixing "future"); it does NOT belong on a surface whose
-# only collision is with ANOTHER language's profanity, which fires profanity
-# either way.
+# ===================== profanity: un-gated split =====================
+# Profanity surfaces that collide with nothing benign load plain
+# (ambiguous = false), so they fire under the default `languages = ["en"]`.
+# The gate stays on the surfaces that earn it (Swedish `fan` vs English "fan",
+# Hebrew `כוס` = cup, zh 操/草/干 = everyday words, Romanian `fut` prefixing
+# "future"); it does NOT belong on a surface whose only collision is with
+# ANOTHER language's profanity, which fires profanity either way.
 
 [[entry]]
 class    = "profanity"
@@ -1373,9 +1368,9 @@ ambiguous= true
 notes    = "FOLD COLLISION with ordinary English: sūds -> suds. Matching folds diacritics away (see fold.rs), so these surfaces become common English words for every user who has not asked for lv — 'pick' fired an f-bomb because Turkish piç folds to 'pic', and 'skit'/'suds'/'pica' did the same. Split out of the unambiguous lv entry and gated behind ambiguous=true, so a lv user who lists the language still gets them and nobody else eats a false positive. Pinned by `no_unambiguous_surface_is_an_ordinary_english_word`."
 
 
-# ===================== group: canine (2026-08-10) =====================
-# The dog / puppy family — the canine counterpart of the feline group, added
-# for the typed-word dog summon. Same laws as feline: whole-word only,
+# ===================== group: canine =====================
+# The dog / puppy family — the canine counterpart of the feline group, and the
+# typed-word dog cameo's trigger. Same laws as feline: whole-word only,
 # profanity outranks canine (id/ms "anjing" and jv "asu" are profanity-claimed
 # and stay that way), and any surface that folds to an ordinary English word
 # rides ambiguous=true (pinned by `no_unambiguous_surface_is_an_ordinary_english_word`).
@@ -1661,20 +1656,19 @@ cjk      = false
 ambiguous= false
 notes    = "سگ = dog; توله / توله سگ = puppy; سگ کوچولو = little doggy. Multiword -> forms mode."
 
-# ===================== group: animal (2026-08-10) =====================
+# ===================== group: animal =====================
 # The ambient animal-word roster: ordinary English animal nouns, each entry
 # tagged with the species id that names its authored sprite (see
-# crates/aterm-effects/art/animal/ and the Animal collection in
-# word_decorations). EVERY entry rides ambiguous = true by design: these
+# crates/aterm-effects/art/animal/ and `Collection::Animals` in
+# word_decorations). Every English entry rides ambiguous = true: these
 # surfaces ARE ordinary English prose, so the live-caret deferral is the
 # mid-typing guard ('bee' inside 'been' never fires) and the fold-collision
 # gate's unambiguous set stays clean; the default languages = ["en"]
 # un-gates them for everyone. Homograph law: profanity > feline > canine >
 # animal, so cat/kitty keep the cat. One surface -> one species, pinned by
-# the conflicts channel (expanded_builtin_stays_conflict_free).
-# (2026-08-10: the ambiguous=true law above is the ENGLISH group's — the
-# animal-multilingual group at the end of this file extends the roster to
-# zh/ja/ko/hi/th/vi/id under its own load laws; see that header.)
+# the conflicts channel (expanded_builtin_stays_conflict_free). The
+# animal-multilingual group at the end of this file carries the other
+# languages under its own load laws.
 
 [[entry]]
 class    = "animal"
@@ -2280,16 +2274,14 @@ ambiguous= true
 notes    = "Generic avian, with its OWN authored songbird head (decision: new art rather than aliasing into parrot/sparrow — 'bird' is the highest-frequency avian word and deserves a species-neutral sprite; every specific bird word keeps its specific head). 'birdie' doubles as the golf term — same deliberate call as bear/seal/bat."
 
 
-# ===================== group: animal-multilingual (2026-08-10) =====================
-# The menagerie's zh / ja / ko (+ hi / th / vi / id) expansion. Owner verbatim:
-# "these need to work for Chinese and Korean and Japanese and other asian
-# languages." Laws, extending the animal group's:
+# ===================== group: animal-multilingual =====================
+# The animal roster in zh / ja / ko (+ hi / th / vi / id). Laws, extending the
+# animal group's:
 #
 #  * Multi-character CJK compounds load PLAIN (ambiguous = false) — the
 #    feline/canine CJK precedent: they are not ordinary Latin prose, so the
 #    class's live-caret-deferral rationale does not apply, and a language gate
-#    would leave them silent for every default (languages = ["en"]) user,
-#    which is exactly the bug this group fixes.
+#    would leave them silent for every default (languages = ["en"]) user.
 #  * SINGLE-character han/kana/hangul forms are listed but ride the scanner's
 #    class-agnostic `cjk_single_char` opt-in (the scanner drops 1-char CJK
 #    hits without it, for every class): a lone ideograph fires anywhere the
@@ -2302,16 +2294,16 @@ notes    = "Generic avian, with its OWN authored songbird head (decision: new ar
 #    load only for users who list the language. Devanagari (hi) loads plain
 #    per the canine hi precedent: a spaced script that cannot appear
 #    mid-English-typing and cannot fold-collide with ASCII.
-#  * In-language homograph bombs get the kuma treatment (an ambiguous = true
-#    sibling entry) when the collision is open-ended, or an exceptions.toml
-#    suppression when the bomb list is small and finite (カメラ for カメ,
+#  * An in-language homograph with open-ended collisions gets an
+#    ambiguous = true sibling entry (as sw `kuma` does); a small finite
+#    collision list gets an exceptions.toml suppression (カメラ for カメ,
 #    오리지널 for 오리). A species with no clean form in a language is SKIPPED,
 #    never force-fitted; skips are recorded in the surviving entry's notes.
 #  * One surface -> one species still holds across languages (獅子 is the lion
 #    for zh AND ja: same species, language sets union).
 #
 # Not expanded here: cat and dog words are Class::Feline / Class::Canine and
-# already speak zh/ja/ko (th/lo/km cats too); this group is the OTHER 67 heads.
+# already speak zh/ja/ko (th/lo/km cats too); this group is the other 67 heads.
 
 # ---- zh: Mandarin (Hans + Hant surfaces in one entry, the feline precedent) ----
 
@@ -4668,7 +4660,7 @@ notes    = "टर्की = turkey — bird and country, same as the English s
 
 # ---- th: Thai (no-space script, cjk=true — the feline th precedent). Curated
 # ---- to the words with clean munch behavior; skips: ปู (crab — also
-# ---- grandfather/to pave), หมึก (octopus — also INK, of all things), นาก
+# ---- grandfather/to pave), หมึก (octopus — also ink), นาก
 # ---- (otter — also common name). Dogs/cats live in their own classes. ----
 
 [[entry]]
@@ -5035,8 +5027,8 @@ notes    = "ngựa = horse (ự survives the fold)."
 # ---- id: Indonesian (Latin, spaced). ambiguous=true like the en group: these
 # ---- load for users who list id (several are ordinary English-adjacent
 # ---- folds, and a few are in-language double entendres the opt-in makes
-# ---- consensual). Skipped: babi (pig — profanity-adjacent slur usage, the
-# ---- anjing lesson), paus (whale — also 'pope'), and every hyphenated
+# ---- consensual). Skipped: babi (pig — profanity-adjacent slur usage, like
+# ---- anjing), paus (whale — also 'pope'), and every hyphenated
 # ---- reduplication (kupu-kupu, laba-laba, lumba-lumba, ubur-ubur,
 # ---- kura-kura, berang-berang — hyphens never tokenize as one word). ----
 

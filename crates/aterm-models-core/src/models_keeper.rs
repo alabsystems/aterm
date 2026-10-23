@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The pty keeper (`docs/DESIGN-pty-keeper-2026-09-26.md` §6.1, §6.2).
+//! The pty keeper (`docs/DESIGN-pty-keeper-2026-09-26.md` §6.1, §6.2, §6.5, §6.6).
 
 use aterm_spec::derive::Model;
 
@@ -471,7 +471,7 @@ pub fn keeper_death_judgement_model() -> Model {
     }
 }
 
-/// One record's crash-restore COMPANION (the crash-restore plan §5, §7.2) across its reader, an update's two claimants, and the recovering windows offered it after the reader dies.
+/// One record's crash-restore COMPANION (§6.6) across its reader, an update's two claimants, and the recovering windows offered it after the reader dies.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn keeper_companion_custody_model() -> Model {

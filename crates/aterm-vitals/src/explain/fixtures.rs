@@ -360,7 +360,8 @@ pub fn apple(pid: u32, birth_ms: i64, exe: &str, id: &str) -> LeadIdentity {
     }
 }
 
-/// The 2026-10-20 machine's timeline (`brief-macos-why.md`, `probes/pidwrap-out-1.txt`).
+/// RD's machine's timeline on 2026-10-20: booted 16:06:13Z, asleep from 16:26:38Z, woken by the
+/// trackpad (`RTP.multi-touch`) 5 s before userspace started.
 #[must_use]
 pub fn timeline_1020() -> TimelineSample {
     TimelineSample {
@@ -376,7 +377,7 @@ pub const USERSPACE_MS: i64 = 1_792_517_318_000;
 /// When launchd was born on 2026-10-20, 16:06:14Z.
 pub const LAUNCHD_MS: i64 = 1_792_512_374_000;
 
-/// The identities of the 10:32 moment's leads (`probes/ident-out-1.txt`,
+/// The identities of the 10:32 moment's leads (RD's evidence `probes/ident-out-1.txt`,
 /// launchd's `probes/why-out-1.txt`): Apple's daemons, and aterm under its
 /// Developer ID.
 fn identities_1032() -> Vec<LeadIdentity> {
@@ -411,7 +412,7 @@ pub fn tab(key: u64, shell_pid: u32) -> TabRoot {
     }
 }
 
-/// RD's 10:32 moment (constructed there, `At a glance`).
+/// RD's 10:32 moment (§2.5, Example A, constructed).
 #[must_use]
 pub fn spotlight_1032() -> Scene {
     let start = USERSPACE_MS;
@@ -622,7 +623,8 @@ pub fn build_start_1032() -> Scene {
     scene
 }
 
-/// The liar (RD §17).
+/// The liar (RD §6.2): the 10:32 moment with mds and mds_stores signed ad hoc under Apple's
+/// signing identifiers.
 #[must_use]
 pub fn liar_1032() -> Scene {
     let mut scene = spotlight_1032();
@@ -678,7 +680,7 @@ pub fn finished_1032() -> Scene {
     scene
 }
 
-/// RD's calm Mac (§5.6; plan Example B), 15:10:02.120 PDT (22:10:02.120Z), 4 h 41 min after start-up.
+/// RD's calm Mac (§2.6, Example B), 15:10:02.120 PDT (22:10:02.120Z), 4 h 41 min after start-up.
 #[must_use]
 pub fn calm_1510() -> Scene {
     let start = USERSPACE_MS;
@@ -784,7 +786,7 @@ pub fn app_work_1510() -> Scene {
     scene
 }
 
-/// A tab-2 build 20 minutes after start-up (RD §17), 10:48:41.200 PDT.
+/// A tab-2 build 20 minutes after start-up (RD §6.2), 10:48:41.200 PDT.
 #[must_use]
 pub fn tab2_build_1048() -> Scene {
     let start = USERSPACE_MS;
@@ -847,7 +849,8 @@ pub fn tab2_build_1048() -> Scene {
     }
 }
 
-/// The wrapped pid space (RD §2.4, §17; `probes/pidwrap-out-1.txt`), 12:18:30 PDT (19:18:30Z).
+/// The wrapped pid space (RD §6.2; RD's evidence `probes/pidwrap-out-1.txt`) at 12:18:30 PDT
+/// (19:18:30Z): tab 2's shell, pid 159, is younger than every higher pid.
 #[must_use]
 pub fn wrapped_1218() -> Scene {
     let mut scene = spotlight_1032();

@@ -6234,6 +6234,8 @@ pub(crate) struct CursorFxInputs {
     pub print_anchor: Option<(u16, u16, u64)>,
     /// The glyph at that print run's last cell (`Terminal::print_anchor_glyph`), same hold and live-viewport guard.
     pub print_anchor_glyph: Option<char>,
+    /// Where this frame's text is read: `None`, the window's own `input_scratch` (the single-pane redraw and the cursor-only and capture paths extract it before the cursor's step); `Some(offset)`, the focused pane's `composed_focus_scratch` at that window offset (a split's redraw composes the window's cells only after the cursor's step, so its `input_scratch` still holds the last frame's).
+    pub pane_text: Option<(u16, u16)>,
 }
 
 #[cfg(test)]
@@ -6258,6 +6260,7 @@ impl CursorFxInputs {
             default_fg: Theme::default().fg,
             print_anchor: None,
             print_anchor_glyph: None,
+            pane_text: None,
         }
     }
 }
@@ -7929,6 +7932,7 @@ impl App {
             row_probe_neighbors,
             print_anchor,
             print_anchor_glyph,
+            pane_text,
         } = fx;
         self.reconcile_licence(id);
         let cur = aterm_effects::host::motion_caret(cur, cursor_visible, hidden_withheld);
@@ -8050,6 +8054,7 @@ impl App {
                     body_allowed: cursor_body_allowed,
                     momentum_glow: self.config.cursor_momentum_glow_or_default(),
                     user_tinted: self.config.trail_color().chosen(),
+                    accent_pinned: self.config.cursor_trail_accent_u32().is_some(),
                 },
                 glow: &glow_cfg,
                 trail: trail_cfg,
@@ -8068,7 +8073,11 @@ impl App {
                         )),
                     }
                 }),
-                frame_cells: Some(&ws.input_scratch.cells),
+                frame_cells: Some(match pane_text {
+                    None => &ws.input_scratch.cells,
+                    Some(_) => &ws.composed_focus_scratch.cells,
+                }),
+                frame_cells_at: pane_text.unwrap_or((0, 0)),
                 pending_keys: 0,
                 print_anchor,
                 print_anchor_glyph,
@@ -8723,6 +8732,9 @@ impl App {
                 print_anchor_glyph: (display_offset == 0)
                     .then_some(sampled_print_anchor_glyph)
                     .flatten(),
+                // Every caller extracts into the window's own cells first
+                // (the headless capture, the composed redraw's staging).
+                pane_text: None,
             },
         ) else {
             return false;
@@ -11330,6 +11342,7 @@ impl App {
                     print_anchor_glyph: (display_offset == 0)
                         .then_some(print_anchor_glyph)
                         .flatten(),
+                    pane_text: None,
                 },
             ) else {
                 if sync_hold {
@@ -15039,6 +15052,7 @@ impl App {
                 row_probe_neighbors: Some((focus_probe_above, focus_probe_below)),
                 print_anchor: focus_print_anchor,
                 print_anchor_glyph: focus_print_anchor_glyph,
+                pane_text: Some(focus_off),
             },
         )?;
         let glow_fp = fx.glow_fp;

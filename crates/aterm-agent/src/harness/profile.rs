@@ -839,9 +839,7 @@ impl WeeklyFigure {
     }
 }
 
-/// WHY A CLAUDE CODE FOOTER HAS NO WEEKLY FIGURE ([`SubscriptionDisplay::weekly_gap`]),
-/// where it once said `weekly unavailable` and no more (owner, 2026-10-22: *"you also need
-/// to fix the weekly budget reporting for claude code harness"*).
+/// WHY A CLAUDE CODE FOOTER HAS NO WEEKLY FIGURE ([`SubscriptionDisplay::weekly_gap`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WeeklyGap {
     /// `[harness] usage_tap` is off, or the harness is off for Claude Code: only a person's

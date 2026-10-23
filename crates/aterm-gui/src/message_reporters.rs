@@ -3416,7 +3416,7 @@ pub(crate) fn occupancy_prompt_key() -> String {
     digest_key(Family::Occupancy, "aterm-toml", "prompt")
 }
 
-/// THE OWNER'S `occupancy = "prompt"` IN FORCE (docs/DESIGN-harness-occupancy-2026-10-20.md §1.1; the red-team's F14, R9).
+/// THE OWNER'S `occupancy = "prompt"` IN FORCE (docs/DESIGN-harness-occupancy-2026-10-20.md §1.1).
 pub(crate) fn occupancy_prompt_entry() -> Entry {
     Entry::new(
         Family::Occupancy,

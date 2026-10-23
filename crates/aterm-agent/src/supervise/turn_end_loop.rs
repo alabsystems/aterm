@@ -1862,6 +1862,7 @@ impl<C: Ctl> Session<'_, C> {
         mut shadow: Option<&mut ShadowPoint>,
     ) -> Result<(TurnEndAction, bool), Fail> {
         self.decided_withheld = host_withholds(opts);
+        self.fact_offer(None, &TurnEndAction::Nothing);
         if self.decided_withheld {
             if let Some(point) = shadow {
                 point.withheld = true;
@@ -1903,8 +1904,10 @@ impl<C: Ctl> Session<'_, C> {
         if action.rule_id().is_some() {
             self.program = self.foreground_program()?;
             r.person = self.person_ago(now);
+            r.fact = self.fact_for(&action, opts);
             action = self.turn_end_decision(&r, &cfg, now, "pass:final", trace);
         }
+        self.fact_offer(r.fact.clone(), &action);
         let limit_draft_holds = (r.autopilot != Autopilot::Off)
             && crate::supervise::policy::exception::draft_holds_limit_switch(
                 &self.turn_end,
@@ -2363,10 +2366,18 @@ impl<C: Ctl> Session<'_, C> {
             self.set_due(at, format!("the login's sign-in is {by}'s"));
             return Ok(());
         }
+        let fact = self.fact_intends(&action, seq);
+        // Left: the text, any fact with it, stands in the composer unsent.
+        let mut left = false;
         let typed = match &action {
             TurnEndAction::Accept { .. } => self.accept_suggestion(point, &text, rule, review),
             TurnEndAction::Submit { .. } => self.submit_draft(point, &text, rule, review),
-            _ => self.type_text(point, &text, rule, review),
+            _ => self
+                .type_text_written(point, &text, rule, review)
+                .map(|written| {
+                    left = written == Written::Left;
+                    written == Written::Submitted
+                }),
         };
         if rule == RULE_LOGIN
             && !matches!(&typed, Ok(true))
@@ -2376,6 +2387,10 @@ impl<C: Ctl> Session<'_, C> {
         }
         let typed = typed?;
         if !typed {
+            if let Some(fact) = &fact {
+                let why = if left { "not-submitted" } else { "not-written" };
+                self.fact_rode(fact, Some(why), seq, review);
+            }
             return Ok(());
         }
         if rule == RULE_LIMIT_RESUME {
@@ -2384,6 +2399,9 @@ impl<C: Ctl> Session<'_, C> {
         let r = self.turn_end_reread(&point.screen, opts);
         let land = self.turn_end.land_episode().0;
         self.turn_end.acted(&action, &r, self.fx.mono());
+        if let Some(fact) = &fact {
+            self.fact_rode(fact, None, seq, review);
+        }
         if !land && self.turn_end.land_episode().0 {
             self.land_report = self.point_said.clone();
         }
@@ -2979,13 +2997,32 @@ impl<C: Ctl> Session<'_, C> {
         rule: &str,
         review: &mut dyn Review,
     ) -> Result<bool, Fail> {
+        self.type_text_written(point, text, rule, review)
+            .map(|written| written == Written::Submitted)
+    }
+
+    /// [`Self::type_text`], saying how far the text went: a guarded write that typed nothing
+    /// is [`Written::Not`].
+    pub(super) fn type_text_written(
+        &mut self,
+        point: &Turn,
+        text: &str,
+        rule: &str,
+        review: &mut dyn Review,
+    ) -> Result<Written, Fail> {
         self.under_hand(|s| match s.type_fenced(point, text, rule, review)? {
-            Some(written) => Ok(written == Written::Submitted),
-            None => s.type_guarded(point, text, rule, review),
+            Some(written) => Ok(written),
+            None => s.type_guarded(point, text, rule, review).map(|typed| {
+                if typed {
+                    Written::Submitted
+                } else {
+                    Written::Not
+                }
+            }),
         })
     }
 
-    /// Type an occupancy-door line at a break using [`Self::type_fenced`] under
+    /// Type a fact line at a break (the door's under `prompt`, or the stuck fact's under `stuck_break_note`: `grant` names whose) using [`Self::type_fenced`] under
     /// [`Self::under_hand`].
     #[cfg_attr(
         any(test, debug_assertions),
@@ -2997,7 +3034,7 @@ impl<C: Ctl> Session<'_, C> {
     )]
     pub(super) fn type_fact(
         &mut self,
-        _grant: &crate::supervise::config::PromptGrant,
+        _grant: crate::supervise::config::BreakGrant<'_>,
         point: &Turn,
         text: &str,
         rule: &str,

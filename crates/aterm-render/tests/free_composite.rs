@@ -307,12 +307,38 @@ fn free_z_under_text_over_legacy_and_over_text() {
         px(0, 0).iter().all(|&p| p == fg),
         "UnderText: the full-block glyph must draw OVER the multi-row sprite"
     );
+    // The knock-out cuts the body under the glyph's ink and two pixels round it
+    // (`KNOCK_DILATE_OFFSETS`), clipped as the glyph is to the foot of its row: the block's
+    // page ring lies in the cell beside it.
+    let reach = |x: usize, y: usize| {
+        y < ch
+            && aterm_render::KNOCK_DILATE_OFFSETS.iter().any(|&(dx, dy)| {
+                let (bx, by) = (x as i64 - i64::from(dx), y as i64 - i64::from(dy));
+                (0..cw as i64).contains(&bx) && (0..ch as i64).contains(&by)
+            })
+    };
+    let page = rgb_to_u32(input.cells[0][0].bg);
+    let band = |row: usize, col: usize| -> Vec<(usize, usize, u32)> {
+        let mut out = Vec::new();
+        for y in row * ch..(row + 1) * ch {
+            for x in col * cw..(col + 1) * cw {
+                out.push((x, y, f.pixels[y * f.width + x]));
+            }
+        }
+        out
+    };
     assert!(
-        px(0, 1).iter().all(|&p| p == red),
-        "B1-then-B2: the free under-sprite must draw OVER the legacy cat quad"
+        band(0, 1)
+            .iter()
+            .all(|&(x, y, p)| if reach(x, y) { p == page } else { p == red }),
+        "B1-then-B2: the free under-sprite must draw OVER the legacy cat quad, and the \
+         knock-out lays the page round the block's ink"
     );
     assert!(
-        px(1, 0).iter().all(|&p| p == red) && px(1, 1).iter().all(|&p| p == red),
+        band(1, 0)
+            .iter()
+            .chain(&band(1, 1))
+            .all(|&(x, y, p)| if reach(x, y) { p == page } else { p == red }),
         "the sprite's second band must not be clobbered by that row's bg"
     );
 

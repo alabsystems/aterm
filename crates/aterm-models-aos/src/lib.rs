@@ -4,7 +4,7 @@
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
 
-//! aterm's models of Aos hosted execution (`docs/DESIGN-aos-hosted-execution-2026-10-21.md`).
+//! aterm's model of an Aos hosted task's boundary publication (`docs/DESIGN-aos-hosted-execution-2026-10-21.md` §3.9, §6).
 
 mod models_publication;
 

@@ -134,6 +134,7 @@ impl Session {
                 body_allowed: true,
                 momentum_glow: false,
                 user_tinted: self.tinted,
+                accent_pinned: false,
             },
             &self.glow,
             self.trail,

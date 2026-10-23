@@ -68,10 +68,9 @@ fn subscription_display_uses_one_selected_accounts_email_plan_and_weekly_cache()
     }
 }
 
-/// THE ONE AGE RULE of every weekly figure (owner, 2026-10-22: *"you also need to fix the
-/// weekly budget reporting for claude code harness"*): current for fifteen minutes, then
-/// with its age up to an hour, and nothing older, from the future or past its reset; tenths
-/// as the `/usage` cache has them.
+/// THE ONE AGE RULE of every weekly figure: current for fifteen minutes, then with its age
+/// up to an hour, and nothing older, from the future or past its reset; tenths as the
+/// `/usage` cache has them.
 #[test]
 fn a_weekly_figure_is_current_for_fifteen_minutes_then_aged_for_an_hour() {
     const AT: i64 = 1_792_050_000;

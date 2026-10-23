@@ -36,7 +36,8 @@ dirs, a private control socket, a lifeline; ended by its process group, never by
   --aterm PATH  the aterm to run (default: the lab's pick, `targo --unverified lab paths`); a release build keeps the
                 60 ms cadence (`targo --unverified build --release -p aterm`, then --aterm target/release/aterm)
   --theme       dark (the default theme), light (\"GitHub Light\") or both (the default)
-  --scenario    typing (default), context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi, settings, or all; repeatable
+  --scenario    typing (default), burst, context, steam, enter-bottom, idle10, redraw-stall, fold-rest, cjk, bidi,
+                settings, or all; repeatable
   --extra       a top-level aterm.toml line for every instance, replacing the base line of its key (the base lines:
                 the style, motion = \"full\", trail_sounds = false, and on light the theme)
   --columns --lines --font-px   the grid (default 72x14 cells of 22 px; settings 110x40 of 16 px)
@@ -86,6 +87,12 @@ impl Theme {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Scenario {
     Typing,
+    /// A sustained line typed fast and long enough to earn the flying
+    /// kitty's head ([`BURST_TEXT`] a key per [`BURST_KEY_MS`]): `fly` while
+    /// it flies (key [`BURST_FLY_KEY`]), `t0` at the last key, then
+    /// [`BURST_AFTER_MS`] (`t120`, `t470`, and `l3600` to `l4500` as it
+    /// lands).
+    Burst,
     Context,
     Steam,
     EnterBottom,
@@ -99,8 +106,9 @@ pub enum Scenario {
 
 impl Scenario {
     /// Every scenario, in the order `all` runs them.
-    pub const ALL: [Scenario; 10] = [
+    pub const ALL: [Scenario; 11] = [
         Scenario::Typing,
+        Scenario::Burst,
         Scenario::Context,
         Scenario::Steam,
         Scenario::EnterBottom,
@@ -116,6 +124,7 @@ impl Scenario {
     pub const fn name(self) -> &'static str {
         match self {
             Scenario::Typing => "typing",
+            Scenario::Burst => "burst",
             Scenario::Context => "context",
             Scenario::Steam => "steam",
             Scenario::EnterBottom => "enter-bottom",
@@ -391,6 +400,49 @@ fn keys_of(word: &str) -> Vec<String> {
         .collect()
 }
 
+/// The line `typing`, `context` and `steam` type, a key per
+/// [`TYPING_KEY_MS`] unless a frame is slower.
+pub const TYPING_TEXT: &str = "echo the quick brown fox";
+/// See [`TYPING_TEXT`].
+pub const TYPING_KEY_MS: u64 = 60;
+
+/// The `burst` scenario's line: the longest a 72-column row holds after the
+/// prompt with the caret still on it.
+pub const BURST_TEXT: &str = "echo the quick brown fox jumps over the lazy dog as the kitty flies";
+
+/// The `burst` scenario's pace, ms a key: a fast typist's, under the 60 ms
+/// of every other burst. The flying kitty's head is earned by the typing
+/// momentum (`aterm_effects::typing_momentum`, the cat's band held for its
+/// dwell over at least its run of keys, `aterm_effects::kitty_cursor`): at
+/// this pace about 2.2 s of the line, at any pace under 250 ms a key about
+/// as long, so a slow frame only spends more keys on it.
+pub const BURST_KEY_MS: u64 = 50;
+
+/// The key (0-based, of [`BURST_TEXT`]) after which `burst` keeps its `fly`
+/// frame: past the summon and the cat's fade in, at this pace or slower.
+pub const BURST_FLY_KEY: usize = 56;
+
+/// The `burst` frames after its last key, ms: the flight going on (`t120`,
+/// `t470`), then its landing (`l<ms>`) as the momentum decays to the cat's
+/// grounding (about 3.9 s from a full run) and its exit fades it out.
+pub const BURST_AFTER_MS: [u64; 6] = [120, 470, 3600, 3900, 4200, 4500];
+
+/// A frame label of `burst` for `ms` after its last key ([`BURST_AFTER_MS`]).
+#[must_use]
+pub fn burst_frame(ms: u64) -> String {
+    if ms < 1000 {
+        format!("t{ms}")
+    } else {
+        format!("l{ms}")
+    }
+}
+
+/// The `burst` scenario's keys (one per character of [`BURST_TEXT`]).
+#[must_use]
+pub fn burst_keys() -> Vec<String> {
+    keys_of(BURST_TEXT)
+}
+
 /// The gallery's private PTY child: a stalled synchronized redraw, or bare echo for the fold probe.
 pub fn cmd_redraw_fixture(args: &[String]) -> Res {
     use std::io::Read as _;
@@ -430,7 +482,7 @@ pub fn cmd_redraw_fixture(args: &[String]) -> Res {
             }
             continue;
         }
-        let redraw = key[0] == 7 && !restored && text == "echo the quick brown fox";
+        let redraw = key[0] == 7 && !restored && text == TYPING_TEXT;
         match key[0] {
             3 | 4 => break,
             7 if redraw => {}
@@ -745,18 +797,28 @@ impl Shot<'_> {
     /// A typed burst, a key per 60 ms (~17 keys/s) unless a frame is slower,
     /// each followed by a frame: key `mid` is kept as `mid`.
     fn burst(&mut self, mid: Option<u64>, keys: &[String]) -> Result<(), Stopped> {
+        self.paced(TYPING_KEY_MS, mid.map(|i| (i, "mid")), keys)
+    }
+
+    /// A typed burst, a key per `every` ms unless a frame is slower, each
+    /// followed by a frame: the key `keep.0` is kept as `keep.1`.
+    fn paced(
+        &mut self,
+        every: u64,
+        keep: Option<(u64, &str)>,
+        keys: &[String],
+    ) -> Result<(), Stopped> {
         self.mark("burst-start");
         let start = self.mark;
         for (i, k) in (0u64..).zip(keys) {
             if i > 0 {
-                Shot::pace(start, i * 60)?;
+                Shot::pace(start, i * every)?;
             }
             self.press(k);
-            stop::sleep(Duration::from_millis(30))?;
-            if mid == Some(i) {
-                self.snap("mid");
-            } else {
-                self.tick();
+            stop::sleep(Duration::from_millis(every.min(60) / 2))?;
+            match keep {
+                Some((at, frame)) if at == i => self.snap(frame),
+                _ => self.tick(),
             }
         }
         self.mark("burst-end");
@@ -801,7 +863,7 @@ impl Shot<'_> {
 
     fn run(&mut self, scenario: Scenario) -> Result<(), Stopped> {
         let sleep = |ms| stop::sleep(Duration::from_millis(ms));
-        let word = keys_of("echo the quick brown fox");
+        let word = keys_of(TYPING_TEXT);
         match scenario {
             Scenario::Typing => {
                 self.burst(Some(12), &word)?;
@@ -820,6 +882,18 @@ impl Shot<'_> {
                     self.tick();
                 }
                 self.snap("rest");
+            }
+            Scenario::Burst => {
+                self.paced(
+                    BURST_KEY_MS,
+                    Some((BURST_FLY_KEY as u64, "fly")),
+                    &burst_keys(),
+                )?;
+                self.snap("t0");
+                for ms in BURST_AFTER_MS {
+                    self.tick_until(ms, Duration::from_millis(40))?;
+                    self.snap(&burst_frame(ms));
+                }
             }
             Scenario::Context | Scenario::Cjk | Scenario::Bidi => {
                 let (mid, keys) = match scenario {

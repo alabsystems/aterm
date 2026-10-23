@@ -611,12 +611,10 @@ impl<T: 'static> EventLoop<T> {
 
 /// What a failed display call ends the loop with, and its exit code (the display's errno, else
 /// 1). [`EventLoopError::DisplayLost`] when the connection's transport failed: libwayland's
-/// `EPIPE` (which it also reports for end of file) or `ECONNRESET`, the compositor gone (the
-/// Linux lane, 2026-10-17: weston killed at rest read as `EPIPE`, once as `ECONNRESET`, and
-/// killed mid-resize as `ECONNRESET`), or
-/// any error after the wait saw the socket hang up or fail (`hung_up`) but a protocol error
-/// (`EPROTO`: the compositor ended the connection over a request it refused, then closed it).
-/// Any other failure is the call's own error.
+/// `EPIPE` (which it also reports for end of file) or `ECONNRESET`, either of which a killed
+/// compositor can produce, or any error after the wait saw the socket hang up or fail
+/// (`hung_up`) except a protocol error (`EPROTO`: the compositor refused a request and closed
+/// the connection). Any other failure is the call's own error.
 fn wire_failure(error: aterm_wayland::proxy::Error, hung_up: bool) -> (EventLoopError, i32) {
     let errno = match error {
         aterm_wayland::proxy::Error::Display(errno) if errno > 0 => Some(errno),

@@ -37,6 +37,7 @@ use crate::platform_impl::platform::x11::ActiveEventLoop;
 use crate::platform_impl::platform::ActiveEventLoop as PlatformActiveEventLoop;
 use crate::platform_impl::x11::atoms::*;
 use crate::platform_impl::x11::util::cookie::GenericEventCookie;
+use crate::platform_impl::x11::window::Exposure;
 use crate::platform_impl::x11::{
     mkdid, mkwid, util, CookieResultExt, Device, DeviceId, DeviceInfo, Dnd, DndState, ImeReceiver,
     ReportExt, ScrollOrientation, UnownedWindow, WindowId,
@@ -972,12 +973,22 @@ impl EventProcessor {
     where
         F: FnMut(&RootAEL, Event<T>),
     {
+        let window = xev.window as xproto::Window;
+        let at = |v: c_int| u32::try_from(v).unwrap_or(0);
+        let rect = [
+            at(xev.x),
+            at(xev.y),
+            at(xev.x).saturating_add(at(xev.width)),
+            at(xev.y).saturating_add(at(xev.height)),
+        ];
+        self.with_window(window, |window| {
+            let mut state = window.shared_state_lock();
+            state.exposed = Some(Exposure::widened(state.exposed, xev.serial, rect));
+        });
+
         // We issue `RedrawRequested` only for the last event of such a series.
         if xev.count == 0 {
-            let window = xev.window as xproto::Window;
             let window_id = mkwid(window);
-
-            self.with_window(window, |window| window.shared_state_lock().exposed = true);
 
             let event = Event::WindowEvent { window_id, event: WindowEvent::RedrawRequested };
 

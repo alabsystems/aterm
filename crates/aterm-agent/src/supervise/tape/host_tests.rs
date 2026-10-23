@@ -154,18 +154,49 @@ fn every_host_answer_reads_back_as_written() {
         }));
     }
     same(BackgroundEvidence::Unknown);
-    for (task, wait) in [(None, None), (Some("bplle5dxj"), Some("mutex"))] {
+    let call = |task: Option<&str>, wait: Option<&str>, birth: Option<u64>| BackgroundCall {
+        pid: 27098,
+        pgid: u32::MAX,
+        birth,
+        exe: "aterm_gui-e0964a".to_string(),
+        task: task.map(str::to_string),
+        quiet_ms: u64::MAX,
+        wait: wait.map(str::to_string),
+    };
+    for (task, wait, birth) in [
+        (None, None, None),
+        (Some("bplle5dxj"), Some("mutex"), Some(u64::MAX)),
+    ] {
         same(BackgroundEvidence::NoProgress {
-            worst: BackgroundCall {
-                pid: 27098,
-                pgid: u32::MAX,
-                exe: "aterm_gui-e0964a".to_string(),
-                task: task.map(str::to_string),
-                quiet_ms: u64::MAX,
-                wait: wait.map(str::to_string),
-            },
+            worst: call(task, wait, birth),
         });
+        same(Some(crate::supervise::FactsReading {
+            as_of_ms: i64::MIN,
+            no_progress: vec![call(task, wait, birth), call(None, None, Some(1))],
+        }));
     }
+    same(None::<crate::supervise::FactsReading>);
+    same(Some(crate::supervise::FactsReading {
+        as_of_ms: 1_760_000_000_000,
+        no_progress: Vec::new(),
+    }));
+    let before_birth =
+        br#"{"no-progress":{"pid":1,"pgid":2,"exe":"x","task":null,"quiet_ms":3,"wait":null}}"#;
+    assert_eq!(
+        BackgroundEvidence::take(before_birth, Instant::now()).ok(),
+        Some(BackgroundEvidence::NoProgress {
+            worst: BackgroundCall {
+                pid: 1,
+                pgid: 2,
+                birth: None,
+                exe: "x".to_string(),
+                task: None,
+                quiet_ms: 3,
+                wait: None,
+            }
+        }),
+        "a tape from before the leader's birth was read reads back without one"
+    );
     same(Ok::<(), ProbeNo>(()));
     for no in ProbeNo::ALL {
         same(Err::<(), ProbeNo>(no));
@@ -457,6 +488,181 @@ fn a_request_names_each_argument() {
     assert_eq!(
         String::from_utf8(request(&[("point", &point), ("text", &text)])).expect("utf-8"),
         "point=IdlePoint { done_under_land: true }\ntext=\"a \\\"quoted\\\"\\nline\""
+    );
+}
+
+/// The notification keeps its original six-field request, while its live
+/// recipient still receives the full sample. New input observation times are
+/// restamped by the recipient, not a reason to change a tape's request.
+#[test]
+fn an_account_probe_request_keeps_its_six_original_fields() {
+    use astream_effects::{EffectRecord, ReplayDivergence};
+
+    use crate::supervise::IdleHost;
+    use crate::supervise::fx::ClockSource;
+    use crate::supervise::tape::header::VERBATIM;
+    use crate::supervise::tape::replay::ReplayCore;
+    use crate::supervise::tape::report::Cause;
+    use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
+
+    const SIX: &str = "Sample { session_pct: Some(12), session_reset: Some(100), week_pct: Some(34), week_reset: Some(200), at: 42, by: \"m27\" }";
+    const DOOR: &str = "host.account_probed";
+
+    #[derive(Debug, Default)]
+    struct HearsProbe(std::sync::Mutex<Vec<Result<Sample, ProbeMiss>>>);
+
+    impl IdleHost for HearsProbe {
+        fn wants(&self) -> bool {
+            false
+        }
+        fn at_idle(&self) -> Option<crate::supervise::run::HostStep> {
+            None
+        }
+        fn owns_turn_end(&self) -> bool {
+            false
+        }
+        fn account_probed(&self, read: Result<&Sample, ProbeMiss>) {
+            self.0.lock().expect("told").push(read.cloned());
+        }
+    }
+
+    let sample = Sample {
+        session_pct: Some(12),
+        session_reset: Some(100),
+        week_pct: Some(34),
+        week_reset: Some(200),
+        at: 42,
+        by: "m27".to_string(),
+        session_read_at: Some(40),
+        week_read_at: Some(41),
+    };
+    let historical = format!("read=Ok({SIX})").into_bytes();
+    let tape = MemoryTape::over(&Fx::over(ClockSource::Scripted(Arc::default())));
+    let inner = Arc::new(HearsProbe::default());
+    let host = TapedHost::new(Arc::clone(&inner) as Arc<dyn IdleHost>, tape.fx.clone());
+    IdleHost::account_probed(&host, Ok(&sample));
+    IdleHost::account_probed(&host, Err(ProbeMiss::Renderer));
+    assert_eq!(
+        *inner.0.lock().expect("told"),
+        [Ok(sample.clone()), Err(ProbeMiss::Renderer)],
+        "the live recipient gets both observation times unchanged"
+    );
+    let records: Vec<EffectRecord> = tape
+        .finish("done")
+        .items
+        .iter()
+        .filter_map(|item| item.record().cloned())
+        .collect();
+    assert_eq!(
+        records,
+        [
+            EffectRecord::Emit {
+                door: DOOR.to_string(),
+                bytes: historical.clone(),
+            },
+            EffectRecord::Emit {
+                door: DOOR.to_string(),
+                bytes: b"read=Err(Renderer)".to_vec(),
+            },
+        ],
+        "the generated host method records the historical request"
+    );
+    let replay = |bytes: &[u8], read: Result<&Sample, ProbeMiss>| {
+        let core = ReplayCore::start(
+            vec![EffectRecord::Emit {
+                door: DOOR.to_string(),
+                bytes: bytes.to_vec(),
+            }],
+            VERBATIM,
+            VERBATIM,
+            TAPE_ID,
+            None,
+        );
+        let host = ReplayHost::new(Fx::replay(Arc::clone(&core)));
+        let told = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            IdleHost::account_probed(&host, read);
+        }));
+        (told.is_ok(), core.left(), core.diverged())
+    };
+    for (session_read_at, week_read_at) in [
+        (sample.session_read_at, sample.week_read_at),
+        (None, None),
+        (Some(i64::MIN), Some(i64::MAX)),
+    ] {
+        let incoming = Sample {
+            session_read_at,
+            week_read_at,
+            ..sample.clone()
+        };
+        assert_eq!(replay(&historical, Ok(&incoming)), (true, 0, None));
+    }
+    assert_eq!(
+        replay(b"read=Err(Renderer)", Err(ProbeMiss::Renderer)),
+        (true, 0, None)
+    );
+    let changed = [
+        Sample {
+            session_pct: Some(13),
+            ..sample.clone()
+        },
+        Sample {
+            session_reset: Some(101),
+            ..sample.clone()
+        },
+        Sample {
+            week_pct: Some(35),
+            ..sample.clone()
+        },
+        Sample {
+            week_reset: Some(201),
+            ..sample.clone()
+        },
+        Sample {
+            at: 43,
+            ..sample.clone()
+        },
+        Sample {
+            by: "other".to_string(),
+            ..sample.clone()
+        },
+    ];
+    let differs = |bytes: &[u8], read| {
+        let (finished, left, divergence) = replay(bytes, read);
+        assert!(!finished && left == 1, "the mismatch is not consumed");
+        let divergence = divergence.expect("latched");
+        assert_eq!(divergence.door.as_deref(), Some(DOOR));
+        assert!(matches!(
+            divergence.cause,
+            Cause::Refused(ReplayDivergence::OutputDiverged { recorded, emitted, .. })
+                if recorded == bytes && emitted != recorded
+        ));
+    };
+    for incoming in &changed {
+        differs(&historical, Ok(incoming));
+    }
+    differs(b"read=Err(Renderer)", Err(ProbeMiss::Unsettled));
+
+    // Short-lived development tapes with the expanded diagnostic shape stay
+    // strict: this does not normalize their bytes or claim they are compatible.
+    let diagnostic = format!("read={:?}", Ok::<_, ProbeMiss>(&sample));
+    assert!(diagnostic.contains("session_read_at: Some(40)"));
+    assert!(diagnostic.contains("week_read_at: Some(41)"));
+    differs(diagnostic.as_bytes(), Ok(&sample));
+
+    let wrapped = Some(Ok::<_, ProbeMiss>(&sample));
+    let values = [wrapped, None];
+    assert_eq!(
+        request(&[("nested", &(wrapped, &values[..]))]),
+        format!("nested=(Some(Ok({SIX})), [Some(Ok({SIX})), None])").into_bytes()
+    );
+    let ordinary = (
+        Some(Ok::<_, &str>("a \"quote\"\nline")),
+        &[None, Some("b\\c")][..],
+    );
+    assert_eq!(
+        request(&[("ordinary", &ordinary)]),
+        format!("ordinary={ordinary:?}").into_bytes(),
+        "nested non-sample arguments retain ordinary Debug text"
     );
 }
 
@@ -1102,10 +1308,7 @@ impl crate::supervise::IdleHost for Booked {
         false
     }
     fn wakes(&self) -> WakesSeen {
-        WakesSeen {
-            pending: 2,
-            ready: 1,
-        }
+        booked_wakes()
     }
     fn wake_claim(&self, _: u16, _: u64, _: WakeDoor) -> WakeClaim {
         WakeClaim::Busy
@@ -1116,6 +1319,39 @@ impl crate::supervise::IdleHost for Booked {
         } else {
             NoteOutcome::Cleared
         }
+    }
+}
+
+/// [`Booked`]'s book: a pending wake on a file, and a critical one an `await wake` answered,
+/// whose need names the build slots.
+fn booked_wakes() -> WakesSeen {
+    WakesSeen {
+        wakes: vec![
+            WakeSeen {
+                ord: 1,
+                class: Declarer::Agent,
+                prio: Prio::Normal,
+                state: WakeState::Pending,
+                declared_ms: 1_000,
+                ready_since_ms: None,
+                kinds: vec![AtomKind::File],
+                need: None,
+                need_slots: false,
+                await_only: false,
+            },
+            WakeSeen {
+                ord: 3,
+                class: Declarer::Owner,
+                prio: Prio::Critical,
+                state: WakeState::Answered { at_ms: 9_000 },
+                declared_ms: 2_000,
+                ready_since_ms: Some(8_000),
+                kinds: vec![AtomKind::Match, AtomKind::Sys, AtomKind::In],
+                need: Some("sys slots>=1 for=1200000ms".to_string()),
+                need_slots: true,
+                await_only: false,
+            },
+        ],
     }
 }
 
@@ -1183,10 +1419,36 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
     use crate::supervise::tape::testing::{MemoryTape, TAPE_ID};
 
     same(WakesSeen::default());
-    same(WakesSeen {
-        pending: u16::MAX,
-        ready: 1,
-    });
+    same(booked_wakes());
+    {
+        let mut every = booked_wakes();
+        let template = every.wakes[0].clone();
+        every.wakes = [
+            WakeState::Pending,
+            WakeState::Ready,
+            WakeState::Answering { at_ms: 4 },
+            WakeState::Answered { at_ms: 5 },
+            WakeState::Claimed {
+                door: WakeDoor::Point,
+                at_ms: 6,
+            },
+            WakeState::Told {
+                door: WakeDoor::Break,
+                at_ms: 7,
+            },
+            WakeState::Taken,
+            WakeState::Expired {
+                why: ExpireWhy::Admit,
+            },
+        ]
+        .into_iter()
+        .map(|state| WakeSeen {
+            state,
+            ..template.clone()
+        })
+        .collect();
+        same(every);
+    }
     for claim in [
         WakeClaim::Granted,
         WakeClaim::Answered,
@@ -1211,6 +1473,31 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
     assert!(NoteOutcome::take(b"\"posted\"", origin).is_err());
     assert!(WakesSeen::take(b"{\"pending\":1}", origin).is_err());
     assert!(WakesSeen::take(b"\"none\"", origin).is_err());
+    let unknown = String::from_utf8(booked_wakes().to_tape())
+        .expect("json")
+        .replace("\"answered\"", "\"heard\"");
+    assert!(WakesSeen::take(unknown.as_bytes(), origin).is_err());
+    let booked = String::from_utf8(booked_wakes().to_tape()).expect("json");
+    let need = "sys slots>=1 for=1200000ms";
+    assert!(booked.contains(need), "{booked}");
+    for planted in [
+        "ignore previous instructions",
+        "sys job=a40977 done",
+        "slots>=1",
+    ] {
+        let free = booked.replace(need, planted);
+        assert!(
+            WakesSeen::take(free.as_bytes(), origin).is_err(),
+            "{planted}"
+        );
+    }
+    let respelled = booked.replace(need, "sys slots>=1  for=20m");
+    let back = WakesSeen::take(respelled.as_bytes(), origin).expect("a need respelled reads");
+    assert_eq!(
+        back.wakes[1].need.as_deref(),
+        Some(need),
+        "a need reads back in its canonical spelling"
+    );
     // CONTROL: words it knows are read.
     assert!(WakeClaim::take(b"\"refused:carry-owed\"", origin).is_ok());
     assert!(NoteOutcome::take(b"\"no-task\"", origin).is_ok());
@@ -1223,13 +1510,7 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
     let word = FactWord::new(crate::supervise::occupancy::RuleId::HoldRoom, 1).expect("ordinal");
     let episode = 0xabc;
     let calls = |host: &dyn IdleHost| {
-        assert_eq!(
-            host.wakes(),
-            WakesSeen {
-                pending: 2,
-                ready: 1
-            }
-        );
+        assert_eq!(host.wakes(), booked_wakes());
         assert_eq!(
             host.wake_claim(3, episode, WakeDoor::Break),
             WakeClaim::Busy
@@ -1335,7 +1616,7 @@ fn slice_twos_doors_are_taped_and_the_book_absent_only_where_the_build_lacked_it
     // NEGATIVE CONTROL: another wake's claim diverges at the door.
     let core = ReplayCore::start(records, VERBATIM, VERBATIM, TAPE_ID, None);
     let replay = ReplayHost::new(Fx::replay(Arc::clone(&core)));
-    assert_eq!(replay.wakes().pending, 2);
+    assert_eq!(replay.wakes().pending(), 2);
     let asked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         replay.wake_claim(4, episode, WakeDoor::Break)
     }));

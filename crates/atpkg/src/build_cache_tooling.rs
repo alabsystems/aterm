@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! The tooling cache's share of the reclaim (docs/DESIGN-init-system-2026-10-20.md §4.1, §4.4).
+//! The tooling cache's share of the reclaim.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};

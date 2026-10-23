@@ -529,7 +529,7 @@ fn the_network_drives_left_credentials_are_named_from_its_table() {
     );
 }
 
-/// A TABLE A REMOVED FEATURE LEFT BEHIND (`[operator]`, 2026-10-15) is one
+/// A TABLE A REMOVED FEATURE LEFT BEHIND (`[operator]`) is one
 /// line of the digest while `aterm.toml` still writes it — said again at a
 /// reload, still one line — its one step the deletion that ends it, its
 /// navigation opening the file at the table's line, and its reason and
@@ -957,11 +957,10 @@ fn a_full_disk_is_one_standing_alert_and_what_was_freed_is_a_fact() {
     );
 }
 
-/// THE DEVELOPER TOOLS LIST is one line however often a
-/// reading says `not_granted`, whose one press opens the Developer Tools pane and whose
-/// second capsule opens aterm's own Settings ▸ Security, in `atpkg::devtools`' words (owner
-/// ask 2026-10-15: one spelling on every surface); a reading that finds aterm on the list
-/// ends it; `unknown` leaves it as it was.
+/// THE DEVELOPER TOOLS LIST is one line however often a reading says `not_granted`, whose one
+/// press opens the Developer Tools pane and whose second capsule opens aterm's own Settings ▸
+/// Security, in `atpkg::devtools`' words (one spelling on every surface); a reading that finds
+/// aterm on the list ends it; `unknown` leaves it as it was.
 #[test]
 fn the_developer_tools_list_is_one_line_and_a_reading_decides_it() {
     use crate::devtools_watch::Step;
@@ -1959,12 +1958,10 @@ const REAL_SID: &str = "s-3e79b5bde172ad0088ad";
 /// The sid of a tab that is not there.
 const CLOSED_SID: &str = "s-9f8e7d6c5b4a39281706";
 
-/// A RELAUNCH LINE ENDS WITH ITS TAB (review of 2026-09-29): the worker of a
-/// closed tab has no later word, so a claim that is still ripening, and a line
-/// already standing, end when no tab shows the session — the line of what a
-/// restart did not bring back too (`not-restored`, the decision review's
-/// RR-LC-2: it has no ending word at all, and stood with a Show-tab link to a
-/// tab that was gone).
+/// A RELAUNCH LINE ENDS WITH ITS TAB: the worker of a closed tab has no later
+/// word, so a claim that is still ripening, and a line already standing, end
+/// when no tab shows the session — the line of what a restart did not bring
+/// back too (`not-restored`, which has no ending word at all).
 #[test]
 fn a_relaunch_claim_and_line_end_when_their_tab_is_gone() {
     let mut app = App::headless_for_test();
@@ -2076,11 +2073,11 @@ fn a_resume_that_would_lose_turns_is_never_told_to_be_resumed() {
     }
 }
 
-/// A `lost` LINE ENDS WITH ITS TAB TOO (the review of LC-4):
-/// it says "run the command below in that tab" and shows that tab, and its
-/// host forgets the tab's word with it, so nothing would end it once the
-/// tab is gone — a Warn that resurfaces for the rest of the process, its
-/// action pointing at a tab that is gone or another tab now.
+/// A `lost` LINE ENDS WITH ITS TAB TOO: it says "run the command below in
+/// that tab" and shows that tab, and its host forgets the tab's word with it,
+/// so nothing would end it once the tab is gone — a Warn that resurfaces for
+/// the rest of the process, its action pointing at a tab that is gone or
+/// another tab now.
 #[test]
 fn a_lost_line_ends_when_its_tab_is_gone() {
     let mut app = App::headless_for_test();
@@ -2290,8 +2287,8 @@ fn stuck_login_exception() -> Exception {
 /// step changes it): a tab's lost login carried to the owner's sign-in is ONE
 /// standing row, `harness.resume-ask.<tab>.<code>`, `Now`-class, in the
 /// owner's four parts — the one step first, then what happened, what aterm
-/// did and what follows — and NO line of the digest beside it: Settings > Messages lists
-/// the ask once (the review's messages-double).
+/// did and what follows — and NO line of the digest beside it: Settings ▸
+/// Messages lists the ask once.
 #[test]
 fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     use aterm_messages::need::Need;
@@ -2397,9 +2394,8 @@ fn a_now_no_escalation_carries_is_a_standing_ask_until_its_point_moves_on() {
     assert_eq!(asks(&app), [sign_in("s-3")]);
 }
 
-/// ONE LOSS, ONE ROW IN SETTINGS ▸ MESSAGES (the owner's capture, 2026-10-19:
-/// "Claude's login expired in tab 1" listed three times, beside "Claude
-/// sign-in cancelled"): a tab's login notices are one story.
+/// ONE LOSS, ONE ROW IN SETTINGS ▸ MESSAGES: a tab's login notices (an
+/// expired login, a cancelled sign-in) are one story.
 #[test]
 fn a_lost_logins_notices_are_one_row_in_their_latest_words_closed_fixed_once_it_is_back() {
     use aterm_messages::need::Need;
@@ -2758,12 +2754,10 @@ fn a_carried_notice_told_again_closes_fixed_when_the_login_is_back() {
     }
 }
 
-/// A USAGE LIMIT'S RECORD CLOSES AS THE SWITCH IT WAS, NEVER AS A LOGIN BACK
-/// (the review of the login carry, r8c-7: once a move onto another account
-/// landed, every usage limit's record in Settings ▸ Messages read `Claude's
-/// login is back`, though no login was lost): the host's login-back note
-/// closes the story in its notice's own fix words, its row still standing or
-/// already withdrawn.
+/// A USAGE LIMIT'S RECORD CLOSES AS THE SWITCH IT WAS, NEVER AS A LOGIN BACK:
+/// the host's login-back note closes the story in its notice's own fix words,
+/// its row still standing or already withdrawn, so a usage limit's record
+/// never reads `Claude's login is back`.
 #[test]
 fn a_usage_limits_record_closes_as_a_switch_never_as_a_login_back() {
     for (text, words) in [
@@ -2808,11 +2802,11 @@ fn a_usage_limits_record_closes_as_a_switch_never_as_a_login_back() {
     }
 }
 
-/// A USAGE LIMIT THAT ENDED BY ITSELF CLOSES AS NO SWITCH (the review of
-/// the login carry, r9h-3): the row withdrawn and the story kept whatever
-/// ended the ask, a login back told later — a lost login's, an account move
-/// days on — closed the limit's record `Claude switched accounts`, though
-/// its reset had ended it.
+/// A USAGE LIMIT THAT ENDED BY ITSELF CLOSES AS NO SWITCH: once its reset
+/// (`LimitOver`) or the story's span has ended the ask, a login back told
+/// later — a lost login's, an account move days on — leaves the limit's
+/// record withdrawn, never `Claude switched accounts`; with neither, the
+/// login back closes it as the switch.
 #[test]
 fn a_usage_limit_that_ended_by_itself_closes_as_no_switch() {
     use crate::exceptions_host::NOTICE_STORY_SPAN;
@@ -3192,6 +3186,7 @@ fn a_stall_on_a_call_that_made_no_progress_names_its_pid_and_passes_the_door() {
     let call = BackgroundCall {
         pid: 27098,
         pgid: 27090,
+        birth: None,
         exe: "aterm_gui-e0964a".to_string(),
         task: Some("bplle5dxj".to_string()),
         quiet_ms: 61 * 60_000,
@@ -3887,14 +3882,15 @@ fn a_silent_usage_tap_is_one_line_once_a_day_and_ends_with_the_last_tab() {
     assert!(note(&mut app, "s-3", false).is_empty());
 }
 
-/// THE OWNER'S `occupancy = "prompt"` IS ONE ENTRY WHILE IT STANDS (occupancy 1e; the
-/// red-team's F14, R9): the policy wake alone — the watcher's post, which comes at every
-/// launch and on a read no config generation admits — whose root `[harness]` table says it
-/// raises the entry naming that the harness types occupancy lines, once however many posts say
-/// it, and the board takes the mode, which opens the GUI's own gate (`prompt_now`) under `prompt`
-/// alone; a later post that no longer says it clears it. No config generation is applied here:
-/// the launch's unchanged file sends none. NEGATIVE CONTROLS: `observe`, `off`, a word that is no
-/// mode, and no key raise nothing and leave the gate shut, and a stale stamp changes nothing.
+/// THE OWNER'S `occupancy = "prompt"` IS ONE ENTRY WHILE IT STANDS
+/// (`docs/DESIGN-harness-occupancy-2026-10-20.md` §1.1): the policy wake alone — the watcher's
+/// post, which comes at every launch and on a read no config generation admits — whose root
+/// `[harness]` table says it raises the entry naming that the harness types occupancy lines, once
+/// however many posts say it, and the board takes the mode, which opens the GUI's own gate
+/// (`prompt_now`) under `prompt` alone; a later post that no longer says it clears it. No config
+/// generation is applied here: the launch's unchanged file sends none. NEGATIVE CONTROLS:
+/// `observe`, `off`, a word that is no mode, and no key raise nothing and leave the gate shut, and
+/// a stale stamp changes nothing.
 #[test]
 fn the_owners_prompt_is_one_entry_while_the_policy_in_force_says_it() {
     use crate::app_config::HarnessPolicy;

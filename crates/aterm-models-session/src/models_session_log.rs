@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The session log (`docs/DESIGN-session-log-2026-10-15.md` §9): the per-session ring with its open/close discipline and level-aware eviction, a reader's cursor over it, the turn tracker over screen verdict words, and the disk journal's reader view.
+//! The session log's formal models (`docs/DESIGN-session-log-2026-10-15.md` §9): the per-session ring with its open/close discipline and level-aware eviction, a reader's cursor over it, the turn tracker over screen verdict words, the disk journal's reader view, the mark quota, the program share, the timeline rows, the fold and its claims, the transcript join and the mail link.
 
 use aterm_spec::derive::*;
 
-/// SESSION LOG RING (phase 2A): one session's bounded ring of records, evicting level-aware (§5.1), over the open path of one run, its turn and the turn's step.
+/// SESSION LOG RING: one session's bounded ring of records, evicting level-aware (§5.1), over the open path of one run, its turn and the turn's step.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_ring_model() -> Model {
@@ -481,7 +481,7 @@ pub fn session_log_ring_model() -> Model {
     }
 }
 
-/// SESSION LOG CURSOR (phase 2A): what a reader pulling through `aterm_slog::Log::read` is told, over four seqs, now that level-aware eviction takes records from the middle of the window and a carried update leaves seqs the log never held (`Log::skip_to`).
+/// SESSION LOG CURSOR: what a reader pulling through `aterm_slog::Log::read` is told, over four seqs, where level-aware eviction takes records from the middle of the window and a carried update leaves seqs the log never held (`Log::skip_to`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_cursor_model() -> Model {
@@ -1021,7 +1021,7 @@ pub fn turn_tracker_model() -> Model {
     }
 }
 
-/// SESSION LOG JOURNAL VIEW (phase 2B): what a `log @<sid>` answered from the disk journal shows, over three seqs of one session's space: the session's open (seq 1), a run's under it (2) and a turn's under the run (3).
+/// SESSION LOG JOURNAL VIEW: what a `log @<sid>` answered from the disk journal shows, over three seqs of one session's space: the session's open (seq 1), a run's under it (2) and a turn's under the run (3).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_journal_model() -> Model {
@@ -1739,7 +1739,7 @@ pub fn session_log_claims_model() -> Model {
     }
 }
 
-/// SESSION LOG FOLD (plan §4.2): what `aterm_slog::Fold::apply` and the clause make of one agent run, its one turn, one need-bearing step of that turn (a wall the screen saw), one claimed need and one label, as records arrive and time passes.
+/// SESSION LOG FOLD (design §7.1): what `aterm_slog::Fold::apply` and the clause make of one agent run, its one turn, one need-bearing step of that turn (a wall the screen saw), one claimed need and one label, as records arrive and time passes.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_fold_model() -> Model {
@@ -1900,7 +1900,7 @@ pub fn session_log_fold_model() -> Model {
     }
 }
 
-/// TRANSCRIPT JOIN (plan §4.3): what `aterm_slog::TurnTracker::transcript` makes of one agent run's vendor turns while the screen drives the same tracker.
+/// TRANSCRIPT JOIN (design §2.4): what `aterm_slog::TurnTracker::transcript` makes of one agent run's vendor turns while the screen drives the same tracker.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn transcript_join_model() -> Model {
@@ -2205,7 +2205,7 @@ pub fn transcript_join_model() -> Model {
     }
 }
 
-/// SESSION LOG MAIL LINK ( design §2.6, DESIGN:203-207): the heuristic mail → turn link `aterm_slog::Fold::apply` makes as a session's mail and turns arrive and time passes (`aterm_slog::mail_link_of`, `fold_mail.rs`).
+/// SESSION LOG MAIL LINK (design §2.6): the heuristic mail → turn link `aterm_slog::Fold::apply` makes as a session's mail and turns arrive and time passes (`aterm_slog::mail_link_of`, `fold_mail.rs`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn session_log_mail_link_model() -> Model {

@@ -130,6 +130,7 @@ fn reading(st: &State, worked: Option<Duration>, at: Instant) -> TurnEndReading 
         record_turn: None,
         credits: None,
         repo: None,
+        fact: None,
     }
 }
 
@@ -346,7 +347,7 @@ fn the_buggy_model_disagrees_with_the_real_decider() {
     );
 }
 
-/// The words this bind hands the decider for each of the model's causes are the cause the reader reads them as — a reply cut off, a server never reached — and a reply past its output token maximum, which was a cut-off until 2026-10-15, is a cause of its own and none of this model's.
+/// The words this bind hands the decider for each of the model's causes are the cause the reader reads them as — a reply cut off, a server never reached — and a reply past its output token maximum is a cause of its own, not a cut-off, and none of this model's.
 #[test]
 fn the_models_words_read_as_the_causes_it_stands_for() {
     let api = |cause| {

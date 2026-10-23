@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
-//! WHAT THIS MACHINE CAN SAY, measured on it (design
+//! What this machine's readers can say, measured on it (design
 //! `docs/DESIGN-system-awareness-2026-10-16.md` §4.2, §4.6, §16).
 
 use std::fmt;

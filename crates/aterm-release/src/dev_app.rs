@@ -48,10 +48,10 @@ pub const USAGE: &str = "
                             install there instead of /Applications (or
                             ~/Applications when /Applications is not writable);
                             only an install in those is told to LaunchServices
-        --no-link           leave ~/.local/bin/aterm as it is; by default a link
-                            there is pointed at this build, which never updates,
-                            and what it displaced is named (a file that is not a
-                            link is left alone)
+        --no-link           leave ~/.local/bin/aterm and amacs as they are; by
+                            default each link there is pointed at this build,
+                            which never updates, and what it displaced is named
+                            (a file that is not a link is left alone)
         --no-pin            omit the ATermDevBuild mark: the updater then tries
                             this install and every update fails
 

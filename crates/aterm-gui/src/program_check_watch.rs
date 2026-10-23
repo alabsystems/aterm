@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Background watcher for macOS `syspolicyd` worker pool saturation.
+//! Background watcher for macOS `syspolicyd` worker pool saturation, and a development build's stand-ins for it and for a program it holds.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Instant;
 
@@ -53,8 +53,25 @@ static WATCHING: AtomicBool = AtomicBool::new(false);
 /// daemon's reading as full ([`stood_in`]).
 static FULL_STAND_IN: AtomicBool = AtomicBool::new(false);
 
+/// The pid `program-check held <pid>` stands in as held at macOS's program
+/// check ([`held_stand_in`]); 0 for none.
+static HELD_STAND_IN: AtomicU32 = AtomicU32::new(0);
+
 /// The verb's usage line.
-const USAGE: &str = "usage: program-check [full|live]";
+const USAGE: &str = "usage: program-check [full|live|held <pid>|held -]";
+
+/// The pid the jobs pass reads as held at macOS's program check wherever it
+/// reads a start (`program-check held <pid>`, a development build's); `None`
+/// in every other build, or once `program-check held -` ended it.
+pub(crate) fn held_stand_in() -> Option<u32> {
+    if !STAND_IN_ENABLED {
+        return None;
+    }
+    match HELD_STAND_IN.load(Ordering::SeqCst) {
+        0 => None,
+        pid => Some(pid),
+    }
+}
 
 /// The milliseconds the judge reads, from the watch's first reading.
 fn now_ms() -> u64 {
@@ -129,29 +146,46 @@ fn stood_in(look: Look, full: bool) -> Look {
     }
 }
 
-/// The verb's ask: `None` to read, `Some(full)` to set the stand-in, refused
-/// where this build does not stand one in or no look would read it. Pure.
-fn parse(rest: &str, injection: bool, watching: bool) -> Result<Option<bool>, &'static str> {
-    let full = match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
-        [] => return Ok(None),
-        ["full"] => true,
-        ["live"] => false,
+/// What the verb asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ask {
+    /// Read the board.
+    Read,
+    /// `full` (true) or `live` (false): the pool's stand-in.
+    Pool(bool),
+    /// `held <pid>` or `held -` (`None`): the held program's stand-in.
+    Held(Option<u32>),
+}
+
+/// The verb's ask, refused where this build does not stand one in or no look
+/// would read it. Pure.
+fn parse(rest: &str, injection: bool, watching: bool) -> Result<Ask, &'static str> {
+    let ask = match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [] => return Ok(Ask::Read),
+        ["full"] => Ask::Pool(true),
+        ["live"] => Ask::Pool(false),
+        ["held", "-"] => Ask::Held(None),
+        ["held", pid] => match pid.parse::<u32>() {
+            Ok(pid) if pid > 0 => Ask::Held(Some(pid)),
+            _ => return Err(USAGE),
+        },
         _ => return Err(USAGE),
     };
     if !injection {
-        return Err("program-check full|live needs a development build (dev-seams)");
+        return Err("program-check full|live|held needs a development build (dev-seams)");
     }
     if !watching {
-        return Err("program-check full|live: this instance runs no stuck check (not macOS)");
+        return Err("program-check full|live|held: this instance runs no stuck check (not macOS)");
     }
-    Ok(Some(full))
+    Ok(ask)
 }
 
-/// Handles the `program-check [full|live]` control verb.
+/// Handles the `program-check [full|live|held <pid>|held -]` control verb.
 pub(crate) fn cmd(rest: &str) -> String {
     match parse(rest, STAND_IN_ENABLED, WATCHING.load(Ordering::SeqCst)) {
-        Ok(Some(full)) => FULL_STAND_IN.store(full, Ordering::SeqCst),
-        Ok(None) => {}
+        Ok(Ask::Pool(full)) => FULL_STAND_IN.store(full, Ordering::SeqCst),
+        Ok(Ask::Held(pid)) => HELD_STAND_IN.store(pid.unwrap_or(0), Ordering::SeqCst),
+        Ok(Ask::Read) => {}
         Err(refusal) => return format!("ERR {refusal}\n"),
     }
     let reading = if FULL_STAND_IN.load(Ordering::SeqCst) {
@@ -159,7 +193,8 @@ pub(crate) fn cmd(rest: &str) -> String {
     } else {
         "live"
     };
-    format!("OK reading={reading} {}\n", status_fields())
+    let held = held_stand_in().map_or_else(|| "-".to_owned(), |pid| pid.to_string());
+    format!("OK reading={reading} held={held} {}\n", status_fields())
 }
 
 /// Returns whether `board` currently judges `syspolicyd` stuck.
@@ -410,13 +445,24 @@ mod tests {
 
     #[test]
     fn the_verb_reads_bare_and_stands_in_only_where_a_look_reads() {
-        assert_eq!(parse("", false, false), Ok(None));
-        assert_eq!(parse("  ", true, true), Ok(None));
-        assert_eq!(parse("full", true, true), Ok(Some(true)));
-        assert_eq!(parse(" live ", true, true), Ok(Some(false)));
+        assert_eq!(parse("", false, false), Ok(Ask::Read));
+        assert_eq!(parse("  ", true, true), Ok(Ask::Read));
+        assert_eq!(parse("full", true, true), Ok(Ask::Pool(true)));
+        assert_eq!(parse(" live ", true, true), Ok(Ask::Pool(false)));
         assert_eq!(parse("stuck", true, true), Err(USAGE));
         assert_eq!(parse("full live", true, true), Err(USAGE));
         assert!(parse("full", false, true).is_err_and(|e| e.contains("development build")));
         assert!(parse("live", true, false).is_err_and(|e| e.contains("runs no stuck check")));
+    }
+
+    #[test]
+    fn the_held_stand_in_needs_a_development_build_and_a_pid() {
+        assert_eq!(parse("held 25311", true, true), Ok(Ask::Held(Some(25311))));
+        assert_eq!(parse(" held  - ", true, true), Ok(Ask::Held(None)));
+        for refused in ["held", "held gh", "held 0", "held -1", "held 7 8"] {
+            assert_eq!(parse(refused, true, true), Err(USAGE), "{refused:?}");
+        }
+        assert!(parse("held 25311", false, true).is_err_and(|e| e.contains("development build")));
+        assert!(parse("held -", true, false).is_err_and(|e| e.contains("runs no stuck check")));
     }
 }

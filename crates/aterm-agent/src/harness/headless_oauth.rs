@@ -116,48 +116,76 @@ impl MailboxConfig {
     /// True when a mailbox source is configured that can serve `target_email`.
     #[must_use]
     pub fn is_configured_for(&self, target_email: Option<&str>) -> bool {
+        let has_pw_or_unscoped =
+            self.passwords.is_empty() || self.password_for(target_email).is_some();
         self.dir.is_some()
             || self.http_url.is_some()
-            || self.imap_url.is_some()
-            || self.webmail_url.is_some()
+            || (self.imap_url.is_some() && has_pw_or_unscoped)
+            || (self.webmail_url.is_some() && has_pw_or_unscoped)
             || self.password_for(target_email).is_some()
             || (target_email.is_none() && !self.passwords.is_empty())
     }
 
-    /// Look up the password for `target_email` (falling back to the default `password`).
+    /// Look up the password for `target_email` (checking email, local-part, and derived account label before falling back to `password` or `"*"`).
     #[must_use]
     pub fn password_for(&self, target_email: Option<&str>) -> Option<String> {
-        if let Some(email) = target_email {
-            let key = email.trim().to_ascii_lowercase();
+        for key in candidate_lookup_keys(target_email) {
             if let Some(p) = self.passwords.get(&key) {
                 return Some(p.clone());
             }
         }
-        self.password.clone()
+        self.password
+            .clone()
+            .or_else(|| self.passwords.get("*").cloned())
     }
 
-    /// Look up the second-stage mailbox password for `target_email` (falling back to `mailbox_password`).
+    /// Look up the second-stage mailbox password for `target_email` (falling back to `mailbox_password` or `"*"`).
     #[must_use]
     pub fn mailbox_password_for(&self, target_email: Option<&str>) -> Option<String> {
-        if let Some(email) = target_email {
-            let key = email.trim().to_ascii_lowercase();
+        for key in candidate_lookup_keys(target_email) {
             if let Some(p) = self.mailbox_passwords.get(&key) {
                 return Some(p.clone());
             }
         }
-        self.mailbox_password.clone()
+        self.mailbox_password
+            .clone()
+            .or_else(|| self.mailbox_passwords.get("*").cloned())
     }
 
-    /// Look up the Base32 TOTP secret for `target_email` (falling back to `totp_secret`).
+    /// Look up the Base32 TOTP secret for `target_email` (falling back to `totp_secret` or `"*"`).
     #[must_use]
     pub fn totp_secret_for(&self, target_email: Option<&str>) -> Option<String> {
-        if let Some(email) = target_email {
-            let key = email.trim().to_ascii_lowercase();
+        for key in candidate_lookup_keys(target_email) {
             if let Some(s) = self.totp_secrets.get(&key) {
                 return Some(s.clone());
             }
         }
-        self.totp_secret.clone()
+        self.totp_secret
+            .clone()
+            .or_else(|| self.totp_secrets.get("*").cloned())
+    }
+
+    /// Map any per-account credentials keyed by `label` onto `email`.
+    pub fn alias_label_to_email(&mut self, label: Option<&str>, email: Option<&str>) {
+        let (Some(lbl), Some(em)) = (
+            label.map(str::trim).filter(|s| !s.is_empty()),
+            email.map(str::trim).filter(|s| !s.is_empty()),
+        ) else {
+            return;
+        };
+        let label_key = lbl.to_ascii_lowercase();
+        let email_key = em.to_ascii_lowercase();
+        if let Some(pw) = self.passwords.get(&label_key).cloned() {
+            self.passwords.entry(email_key.clone()).or_insert(pw);
+        }
+        if let Some(mpw) = self.mailbox_passwords.get(&label_key).cloned() {
+            self.mailbox_passwords
+                .entry(email_key.clone())
+                .or_insert(mpw);
+        }
+        if let Some(totp) = self.totp_secrets.get(&label_key).cloned() {
+            self.totp_secrets.entry(email_key).or_insert(totp);
+        }
     }
 
     /// Effective IMAP/IMAPS URL for `target_email`, auto-discovering standard IMAPS endpoints
@@ -285,10 +313,12 @@ impl MailboxConfig {
         }
     }
 
-    /// Parse a [`MailboxConfig`] from a TOML string.
+    /// Parse a [`MailboxConfig`] from a TOML string (or a single-line secret from `aterm secrets set`).
     #[must_use]
     pub fn from_toml_str(text: &str, home: Option<&Path>) -> Option<Self> {
-        let doc = aterm_toml::from_str::<aterm_toml::Table>(text).ok()?;
+        let Ok(doc) = aterm_toml::from_str::<aterm_toml::Table>(text) else {
+            return parse_single_line_mailbox_secret(text);
+        };
         let table = doc
             .get("ai")
             .and_then(aterm_toml::Value::as_table)
@@ -313,9 +343,7 @@ impl MailboxConfig {
         };
         let read_secret_file = |raw: &str| -> Option<String> {
             let path = expand_path(raw);
-            let file = std::fs::File::open(path).ok()?;
-            let mut s = String::new();
-            file.take(4096).read_to_string(&mut s).ok()?;
+            let s = super::accounts::read_bounded(&path, 4096).ok()??;
             let trimmed = s.trim_end_matches(['\r', '\n']).trim();
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
         };
@@ -451,11 +479,31 @@ impl MailboxConfig {
                 }
             }
         }
-        let mut parse_account_entry = |raw_key: &str, v: &aterm_toml::Value| {
-            let key = raw_key.trim().to_ascii_lowercase();
+        let mut parse_account_entry = |raw_key: Option<&str>, v: &aterm_toml::Value| {
+            let base_key = raw_key
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_ascii_lowercase);
             if let Some(s) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) {
-                cfg.passwords.entry(key).or_insert_with(|| s.to_owned());
+                if let Some(key) = base_key {
+                    cfg.passwords.entry(key).or_insert_with(|| s.to_owned());
+                }
             } else if let Some(sub) = v.as_table() {
+                let mut keys = Vec::new();
+                if let Some(k) = base_key {
+                    keys.push(k);
+                }
+                for field in ["email", "user", "username", "label", "name", "id"] {
+                    if let Some(val) = get_str_in(sub, &[field]) {
+                        let k = val.to_ascii_lowercase();
+                        if !keys.contains(&k) {
+                            keys.push(k);
+                        }
+                    }
+                }
+                if keys.is_empty() {
+                    return;
+                }
                 if let Some(pw) = get_str_in(
                     sub,
                     &[
@@ -474,7 +522,9 @@ impl MailboxConfig {
                     )
                     .and_then(|p| read_secret_file(&p))
                 }) {
-                    cfg.passwords.insert(key.clone(), pw);
+                    for k in &keys {
+                        cfg.passwords.insert(k.clone(), pw.clone());
+                    }
                 }
                 if let Some(mpw) = get_str_in(sub, &["mailbox_password", "second_password"])
                     .or_else(|| {
@@ -482,7 +532,9 @@ impl MailboxConfig {
                             .and_then(|p| read_secret_file(&p))
                     })
                 {
-                    cfg.mailbox_passwords.insert(key.clone(), mpw);
+                    for k in &keys {
+                        cfg.mailbox_passwords.insert(k.clone(), mpw.clone());
+                    }
                 }
                 if let Some(totp) = get_str_in(
                     sub,
@@ -500,18 +552,26 @@ impl MailboxConfig {
                     )
                     .and_then(|p| read_secret_file(&p))
                 }) {
-                    cfg.totp_secrets.insert(key, totp);
+                    for k in &keys {
+                        cfg.totp_secrets.insert(k.clone(), totp.clone());
+                    }
                 }
             }
         };
-        if let Some(accts) = table.get("accounts").and_then(aterm_toml::Value::as_table) {
-            for (k, v) in accts {
-                parse_account_entry(k, v);
+        if let Some(accts_val) = table.get("accounts") {
+            if let Some(accts) = accts_val.as_table() {
+                for (k, v) in accts {
+                    parse_account_entry(Some(k), v);
+                }
+            } else if let Some(accts_arr) = accts_val.as_array() {
+                for item in accts_arr {
+                    parse_account_entry(None, item);
+                }
             }
         }
         for (k, v) in table {
-            if k.contains('@') {
-                parse_account_entry(k, v);
+            if k.contains('@') || k == "*" || is_machine_account_label(k) {
+                parse_account_entry(Some(k), v);
             }
         }
         let derived_totp_emails: Vec<(String, String)> = cfg
@@ -539,6 +599,133 @@ impl MailboxConfig {
     }
 }
 
+fn is_machine_account_label(key: &str) -> bool {
+    let lower = key.trim().to_ascii_lowercase();
+    let (m_part, slot_part) = lower
+        .split_once('-')
+        .map_or((lower.as_str(), None), |(a, b)| (a, Some(b)));
+    let valid_m = m_part.strip_prefix('m').is_some_and(|d| {
+        (1..=3).contains(&d.len())
+            && d.bytes().all(|b| b.is_ascii_digit())
+            && d.parse::<u32>().is_ok_and(|n| n >= 1)
+    });
+    let valid_slot = slot_part.is_none_or(|s| {
+        (1..=2).contains(&s.len())
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && s.parse::<u32>().is_ok_and(|n| n >= 1)
+    });
+    valid_m && valid_slot
+}
+
+/// Derive a canonical machine/slot account label (such as `"m27"` or `"m27-2"`) from an email address.
+#[must_use]
+pub fn derive_account_label_from_email(email: &str) -> Option<String> {
+    let (local, _) = email.trim().split_once('@')?;
+    let tokens: Vec<String> = local
+        .split(['.', '-', '_'])
+        .map(str::to_ascii_lowercase)
+        .collect();
+    for (idx, tok) in tokens.iter().enumerate() {
+        let is_m = tok.strip_prefix('m').is_some_and(|d| {
+            (1..=3).contains(&d.len())
+                && d.bytes().all(|b| b.is_ascii_digit())
+                && d.parse::<u32>().is_ok_and(|n| (1..=999).contains(&n))
+        });
+        if !is_m {
+            continue;
+        }
+        let mut machines = vec![tok.clone()];
+        let mut slot = None;
+        for (rem_idx, next) in tokens[idx + 1..].iter().enumerate() {
+            if next.is_empty() || !next.bytes().all(|b| b.is_ascii_digit()) {
+                break;
+            }
+            let Ok(n) = next.parse::<u32>() else {
+                break;
+            };
+            let is_last = idx + 1 + rem_idx + 1 == tokens.len();
+            if is_last && (2..=9).contains(&n) {
+                slot = Some(n);
+            } else if (1..=999).contains(&n) {
+                let m2 = format!("m{n}");
+                if !machines.contains(&m2) {
+                    machines.push(m2);
+                }
+            }
+        }
+        let base = machines.join("-");
+        return Some(match slot {
+            Some(n) => format!("{base}-{n}"),
+            None => base,
+        });
+    }
+    None
+}
+
+fn candidate_lookup_keys(target_email: Option<&str>) -> Vec<String> {
+    let mut keys = Vec::new();
+    let Some(raw) = target_email.map(str::trim).filter(|s| !s.is_empty()) else {
+        return keys;
+    };
+    let lower = raw.to_ascii_lowercase();
+    keys.push(lower.clone());
+    let sanitized = sanitize_profile_key(&lower);
+    if !keys.contains(&sanitized) {
+        keys.push(sanitized);
+    }
+    if let Some((local, _)) = lower.split_once('@') {
+        let local_str = local.to_owned();
+        if !keys.contains(&local_str) {
+            keys.push(local_str);
+        }
+        let dashed = local.replace(['.', '_'], "-");
+        if !keys.contains(&dashed) {
+            keys.push(dashed);
+        }
+        if let Some(lbl) = derive_account_label_from_email(&lower)
+            && !keys.contains(&lbl)
+        {
+            keys.push(lbl);
+        }
+    }
+    keys
+}
+
+fn parse_single_line_mailbox_secret(text: &str) -> Option<MailboxConfig> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed.contains(['\n', '\r']) || trimmed.starts_with(['#', '[']) {
+        return None;
+    }
+    let mut cfg = MailboxConfig::default();
+    if let Some(params) = parse_otpauth_uri(trimmed) {
+        cfg.totp_secret = Some(trimmed.to_owned());
+        if let Some(email) = params.account_email {
+            cfg.totp_secrets.insert(email.clone(), trimmed.to_owned());
+            cfg.user = Some(email);
+        }
+        return Some(cfg);
+    }
+    if trimmed.starts_with("imap://") || trimmed.starts_with("imaps://") {
+        cfg.imap_url = Some(trimmed.to_owned());
+        return Some(cfg);
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        cfg.http_url = Some(trimmed.to_owned());
+        return Some(cfg);
+    }
+    if !trimmed.contains('=') && !trimmed.chars().any(char::is_whitespace) {
+        cfg.password = Some(trimmed.to_owned());
+        return Some(cfg);
+    }
+    None
+}
+
+fn read_single_line_secret_file(path: &Path) -> Option<String> {
+    let s = super::accounts::read_bounded(path, 4096).ok()??;
+    let trimmed = s.trim_end_matches(['\r', '\n']).trim();
+    (!trimmed.is_empty() && !trimmed.contains(['\r', '\n'])).then(|| trimmed.to_owned())
+}
+
 fn discover_mailbox_config_files_raw(
     home: Option<&Path>,
     store_dir: Option<&Path>,
@@ -555,9 +742,18 @@ fn discover_mailbox_config_files_raw(
         toml_candidates.push(h.join(".config/aterm").join(MAILBOX_TOML_FILE));
         toml_candidates.push(h.join(".config/aterm/aterm.toml"));
     }
+    let mut roster_candidates = Vec::new();
+    if let Some(h) = home {
+        let roster_path = h.join(".config/aterm/accounts.toml");
+        toml_candidates.push(roster_path.clone());
+        roster_candidates.push(roster_path);
+    }
     if let Some(cfg_file) = config_path {
         if let Some(parent) = cfg_file.parent() {
             toml_candidates.push(parent.join(MAILBOX_TOML_FILE));
+            let sibling_roster = parent.join("accounts.toml");
+            toml_candidates.push(sibling_roster.clone());
+            roster_candidates.push(sibling_roster);
         }
         toml_candidates.push(cfg_file.to_path_buf());
     }
@@ -567,6 +763,150 @@ fn discover_mailbox_config_files_raw(
             && let Some(parsed) = MailboxConfig::from_toml_str(&text, home)
         {
             cfg.merge_from(parsed);
+        }
+    }
+    if let Some(h) = home {
+        let secrets_dir = h.join(".secrets");
+        if secrets_dir.is_dir() {
+            for name in [
+                "ai_mailbox_password",
+                "ai-mailbox-password",
+                "mailbox_password",
+                "mailbox-password",
+                "proton_password",
+                "proton-password",
+                "imap_password",
+                "webmail_password",
+            ] {
+                if cfg.password.is_none()
+                    && let Some(secret) = read_single_line_secret_file(&secrets_dir.join(name))
+                {
+                    cfg.password = Some(secret);
+                }
+            }
+            for name in [
+                "ai_mailbox_totp",
+                "ai-mailbox-totp",
+                "mailbox_totp",
+                "mailbox-totp",
+                "proton_totp",
+                "proton-totp",
+                "totp_secret",
+                "totp-secret",
+            ] {
+                if cfg.totp_secret.is_none()
+                    && let Some(secret) = read_single_line_secret_file(&secrets_dir.join(name))
+                {
+                    if let Some(params) = parse_otpauth_uri(&secret)
+                        && let Some(email) = params.account_email
+                    {
+                        cfg.totp_secrets
+                            .entry(email)
+                            .or_insert_with(|| secret.clone());
+                    }
+                    cfg.totp_secret = Some(secret);
+                }
+            }
+            if let Ok(entries) = std::fs::read_dir(&secrets_dir) {
+                for entry in entries.flatten() {
+                    if !entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                        continue;
+                    }
+                    let Ok(fname) = entry.file_name().into_string() else {
+                        continue;
+                    };
+                    let lower = fname.to_ascii_lowercase();
+                    if matches!(
+                        lower.as_str(),
+                        "ai_mailbox_password"
+                            | "ai-mailbox-password"
+                            | "mailbox_password"
+                            | "mailbox-password"
+                            | "proton_password"
+                            | "proton-password"
+                            | "imap_password"
+                            | "webmail_password"
+                            | "ai_mailbox_totp"
+                            | "ai-mailbox-totp"
+                            | "mailbox_totp"
+                            | "mailbox-totp"
+                            | "proton_totp"
+                            | "proton-totp"
+                            | "totp_secret"
+                            | "totp-secret"
+                    ) {
+                        continue;
+                    }
+                    if let Some(acct) = lower
+                        .strip_suffix("_mailbox_password")
+                        .or_else(|| lower.strip_suffix("-mailbox-password"))
+                        .or_else(|| lower.strip_suffix("_second_password"))
+                        .or_else(|| lower.strip_suffix("-second-password"))
+                        .filter(|a| !a.is_empty())
+                    {
+                        if let Some(secret) = read_single_line_secret_file(&entry.path()) {
+                            cfg.mailbox_passwords
+                                .entry(acct.to_owned())
+                                .or_insert(secret);
+                        }
+                    } else if let Some(acct) = lower
+                        .strip_suffix("_password")
+                        .or_else(|| lower.strip_suffix("-password"))
+                        .or_else(|| lower.strip_suffix(".pass"))
+                        .filter(|a| !a.is_empty())
+                    {
+                        if let Some(secret) = read_single_line_secret_file(&entry.path()) {
+                            cfg.passwords.entry(acct.to_owned()).or_insert(secret);
+                        }
+                    } else if let Some(acct) = lower
+                        .strip_suffix("_totp_secret")
+                        .or_else(|| lower.strip_suffix("-totp-secret"))
+                        .or_else(|| lower.strip_suffix("_totp"))
+                        .or_else(|| lower.strip_suffix("-totp"))
+                        .or_else(|| lower.strip_suffix(".totp"))
+                        .filter(|a| !a.is_empty())
+                        && let Some(secret) = read_single_line_secret_file(&entry.path())
+                    {
+                        if let Some(params) = parse_otpauth_uri(&secret)
+                            && let Some(email) = params.account_email
+                        {
+                            cfg.totp_secrets
+                                .entry(email)
+                                .or_insert_with(|| secret.clone());
+                        }
+                        cfg.totp_secrets.entry(acct.to_owned()).or_insert(secret);
+                    }
+                }
+            }
+        }
+    }
+    for roster_path in roster_candidates {
+        if roster_path.is_file()
+            && let Ok(roster) = super::accounts::Roster::load(&roster_path)
+        {
+            for row in &roster.rows {
+                let Some(email) = row
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let label_key = row.label.trim().to_ascii_lowercase();
+                let email_key = email.to_ascii_lowercase();
+                if let Some(pw) = cfg.passwords.get(&label_key).cloned() {
+                    cfg.passwords.entry(email_key.clone()).or_insert(pw);
+                }
+                if let Some(mpw) = cfg.mailbox_passwords.get(&label_key).cloned() {
+                    cfg.mailbox_passwords
+                        .entry(email_key.clone())
+                        .or_insert(mpw);
+                }
+                if let Some(totp) = cfg.totp_secrets.get(&label_key).cloned() {
+                    cfg.totp_secrets.entry(email_key).or_insert(totp);
+                }
+            }
         }
     }
     if cfg.dir.is_none() {
@@ -905,6 +1245,33 @@ pub fn resolve_browser_profile_dir(
     browser_profile_dir(store_dir, email.or(label))
 }
 
+/// Run authorization with a persistent store profile or an owned scratch profile.
+/// An authorization error does not make persistent cookies or profile data disposable.
+///
+/// # Errors
+///
+/// Scratch allocation failure or the authorization's diagnostic, unchanged.
+#[cfg(unix)]
+pub(super) fn with_browser_profile(
+    store_dir: Option<&Path>,
+    label: Option<&str>,
+    email: Option<&str>,
+    authorize: impl FnOnce(&Path) -> Result<(), &'static str>,
+) -> Result<(), &'static str> {
+    let temp_dir;
+    let profile_dir = if let Some(store) = store_dir {
+        let dir = resolve_browser_profile_dir(store, label, email);
+        let _ = aterm_types::fs_restricted::ensure_private_dir(dir.parent().unwrap_or(store));
+        let _ = aterm_types::fs_restricted::ensure_private_dir(&dir);
+        dir
+    } else {
+        temp_dir =
+            aterm_tempfile::tempdir().map_err(|_| "could not create scratch browser profile")?;
+        temp_dir.path().to_path_buf()
+    };
+    authorize(&profile_dir)
+}
+
 /// Build the command-line arguments for launching `browser` with `profile_dir`.
 #[must_use]
 pub fn headless_launch_args(browser: &HeadlessBrowser, profile_dir: &Path) -> Vec<OsString> {
@@ -1190,23 +1557,43 @@ pub fn extract_credential_from_email(
         .next()
 }
 
-fn persistent_credential_digest(cred: &MailboxCredential) -> Option<String> {
-    match cred {
-        MailboxCredential::MagicLink(u) => Some(fnv1a_hex(u)),
-        MailboxCredential::Otp(_) => None,
-    }
-}
-
 fn extract_unseen_credential_from_email(
     raw_email: &str,
     target_email: Option<&str>,
-    seen: &BTreeSet<String>,
-) -> Option<MailboxCredential> {
-    extract_all_credentials_from_email(raw_email, target_email)
+    seen_digests: &BTreeSet<String>,
+    seen_otps: &BTreeSet<String>,
+) -> Option<(MailboxCredential, bool)> {
+    let mut unseen = extract_all_credentials_from_email(raw_email, target_email)
         .into_iter()
-        .find(|cred| {
-            persistent_credential_digest(cred).is_none_or(|digest| !seen.contains(&digest))
-        })
+        .filter(|cred| match cred {
+            MailboxCredential::MagicLink(url) => !seen_digests.contains(&fnv1a_hex(url)),
+            MailboxCredential::Otp(code) => !seen_otps.contains(&otp_flow_key(code, target_email)),
+        });
+    let cred = unseen.next()?;
+    let exhausted = unseen.next().is_none();
+    Some((cred, exhausted))
+}
+
+fn record_consumed_credential(
+    seen_file: Option<&Path>,
+    seen_digests: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
+    target_email: Option<&str>,
+    message_digest: &str,
+    cred: &MailboxCredential,
+    exhausted: bool,
+) {
+    if exhausted {
+        record_seen_digest(seen_file, seen_digests, message_digest);
+    }
+    match cred {
+        MailboxCredential::MagicLink(url) => {
+            record_seen_digest(seen_file, seen_digests, &fnv1a_hex(url));
+        }
+        MailboxCredential::Otp(code) => {
+            seen_otps.insert(otp_flow_key(code, target_email));
+        }
+    }
 }
 
 fn fnv1a_hex(input: &str) -> String {
@@ -1383,6 +1770,7 @@ fn fetch_imap_tcp_credential(
     target_email: Option<&str>,
     seen_file: Option<&Path>,
     seen: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
     let addr = (host, port).to_socket_addrs().ok()?.next()?;
     let stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).ok()?;
@@ -1466,14 +1854,25 @@ fn fetch_imap_tcp_credential(
         if seen.contains(&digest) {
             continue;
         }
-        if let Some(cred) = extract_unseen_credential_from_email(&raw_msg, target_email, seen) {
-            let store_cmd = format!("s{idx} STORE {seq} +FLAGS (\\Seen)\r\na9 LOGOUT\r\n");
+        if let Some((cred, exhausted)) =
+            extract_unseen_credential_from_email(&raw_msg, target_email, seen, seen_otps)
+        {
+            let store_cmd = if exhausted {
+                format!("s{idx} STORE {seq} +FLAGS (\\Seen)\r\na9 LOGOUT\r\n")
+            } else {
+                "a9 LOGOUT\r\n".to_owned()
+            };
             let _ = writer.write_all(store_cmd.as_bytes());
             let _ = writer.flush();
-            record_seen_digest(seen_file, seen, &digest);
-            if let Some(cred_digest) = persistent_credential_digest(&cred) {
-                record_seen_digest(seen_file, seen, &cred_digest);
-            }
+            record_consumed_credential(
+                seen_file,
+                seen,
+                seen_otps,
+                target_email,
+                &digest,
+                &cred,
+                exhausted,
+            );
             return Some(cred);
         }
     }
@@ -1490,6 +1889,7 @@ fn fetch_imaps_curl_credential(
     target_email: Option<&str>,
     seen_file: Option<&Path>,
     seen: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
     let userpwd = format!("{user}:{password}");
     let search_url = format!(
@@ -1561,11 +1961,18 @@ fn fetch_imaps_curl_credential(
         if seen.contains(&digest) {
             continue;
         }
-        if let Some(cred) = extract_unseen_credential_from_email(&raw_msg, target_email, seen) {
-            record_seen_digest(seen_file, seen, &digest);
-            if let Some(cred_digest) = persistent_credential_digest(&cred) {
-                record_seen_digest(seen_file, seen, &cred_digest);
-            }
+        if let Some((cred, exhausted)) =
+            extract_unseen_credential_from_email(&raw_msg, target_email, seen, seen_otps)
+        {
+            record_consumed_credential(
+                seen_file,
+                seen,
+                seen_otps,
+                target_email,
+                &digest,
+                &cred,
+                exhausted,
+            );
             return Some(cred);
         }
     }
@@ -1576,6 +1983,7 @@ fn fetch_imap_credential(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
     seen: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
     let imap_url = cfg.effective_imap_url(target_email)?;
     let parsed = parse_imap_url(&imap_url)?;
@@ -1599,6 +2007,7 @@ fn fetch_imap_credential(
             target_email,
             cfg.seen_file.as_deref(),
             seen,
+            seen_otps,
         )
     } else {
         fetch_imap_tcp_credential(
@@ -1610,6 +2019,7 @@ fn fetch_imap_credential(
             target_email,
             cfg.seen_file.as_deref(),
             seen,
+            seen_otps,
         )
     }
 }
@@ -1647,6 +2057,7 @@ fn fetch_http_mailbox_credential(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
     seen: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
     let raw_url = cfg.http_url.as_deref()?;
     let url = if raw_url.contains("{email}") {
@@ -1704,13 +2115,18 @@ fn fetch_http_mailbox_credential(
                 if seen.contains(&digest) {
                     continue;
                 }
-                if let Some(cred) =
-                    extract_unseen_credential_from_email(&item_str, target_email, seen)
+                if let Some((cred, exhausted)) =
+                    extract_unseen_credential_from_email(&item_str, target_email, seen, seen_otps)
                 {
-                    record_seen_digest(cfg.seen_file.as_deref(), seen, &digest);
-                    if let Some(cred_digest) = persistent_credential_digest(&cred) {
-                        record_seen_digest(cfg.seen_file.as_deref(), seen, &cred_digest);
-                    }
+                    record_consumed_credential(
+                        cfg.seen_file.as_deref(),
+                        seen,
+                        seen_otps,
+                        target_email,
+                        &digest,
+                        &cred,
+                        exhausted,
+                    );
                     return Some(cred);
                 }
             }
@@ -1722,11 +2138,17 @@ fn fetch_http_mailbox_credential(
     if seen.contains(&digest) {
         return None;
     }
-    let cred = extract_unseen_credential_from_email(&body, target_email, seen)?;
-    record_seen_digest(cfg.seen_file.as_deref(), seen, &digest);
-    if let Some(cred_digest) = persistent_credential_digest(&cred) {
-        record_seen_digest(cfg.seen_file.as_deref(), seen, &cred_digest);
-    }
+    let (cred, exhausted) =
+        extract_unseen_credential_from_email(&body, target_email, seen, seen_otps)?;
+    record_consumed_credential(
+        cfg.seen_file.as_deref(),
+        seen,
+        seen_otps,
+        target_email,
+        &digest,
+        &cred,
+        exhausted,
+    );
     Some(cred)
 }
 
@@ -1734,6 +2156,7 @@ fn scan_maildir_once(
     mailbox_dir: &Path,
     target_email: Option<&str>,
     tried: &mut BTreeSet<(PathBuf, u64, std::time::SystemTime)>,
+    seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
     let dirs = [
         mailbox_dir.to_path_buf(),
@@ -1776,30 +2199,39 @@ fn scan_maildir_once(
     if candidates.is_empty() && !mailbox_dir.is_dir() {
         return None;
     }
+    let no_seen_digests = BTreeSet::new();
     candidates.sort_by_key(|a| std::cmp::Reverse(a.0));
     for (mtime, len, path) in candidates {
-        tried.insert((path.clone(), len, mtime));
         let mut raw = String::new();
         let Ok(file) = std::fs::File::open(&path) else {
+            tried.insert((path.clone(), len, mtime));
             continue;
         };
         if file.take(EMAIL_FILE_MAX).read_to_string(&mut raw).is_err() {
+            tried.insert((path.clone(), len, mtime));
             continue;
         }
-        if let Some(found) = extract_credential_from_email(&raw, target_email) {
-            if let Some(name) = path.file_name() {
-                let name_str = name.to_string_lossy();
-                let parent = path.parent().unwrap_or(mailbox_dir);
-                let marker = parent.join(format!("{name_str}.clicked"));
-                let _ = std::fs::write(marker, b"1\n");
-                if parent != mailbox_dir {
-                    let base_name = name_str.split(":2,").next().unwrap_or(&name_str);
-                    let root_marker = mailbox_dir.join(format!("{base_name}.clicked"));
-                    let _ = std::fs::write(root_marker, b"1\n");
+        if let Some((found, exhausted)) =
+            extract_unseen_credential_from_email(&raw, target_email, &no_seen_digests, seen_otps)
+        {
+            remember_flow_otp(&found, target_email, seen_otps);
+            if exhausted {
+                tried.insert((path.clone(), len, mtime));
+                if let Some(name) = path.file_name() {
+                    let name_str = name.to_string_lossy();
+                    let parent = path.parent().unwrap_or(mailbox_dir);
+                    let marker = parent.join(format!("{name_str}.clicked"));
+                    let _ = std::fs::write(marker, b"1\n");
+                    if parent != mailbox_dir {
+                        let base_name = name_str.split(":2,").next().unwrap_or(&name_str);
+                        let root_marker = mailbox_dir.join(format!("{base_name}.clicked"));
+                        let _ = std::fs::write(root_marker, b"1\n");
+                    }
                 }
             }
             return Some(found);
         }
+        tried.insert((path.clone(), len, mtime));
     }
     None
 }
@@ -1809,16 +2241,17 @@ fn poll_non_webmail_once(
     target_email: Option<&str>,
     tried_files: &mut BTreeSet<(PathBuf, u64, std::time::SystemTime)>,
     seen_digests: &mut BTreeSet<String>,
+    seen_otps: &mut BTreeSet<String>,
 ) -> Option<MailboxCredential> {
     if let Some(dir) = cfg.dir.as_deref()
-        && let Some(cred) = scan_maildir_once(dir, target_email, tried_files)
+        && let Some(cred) = scan_maildir_once(dir, target_email, tried_files, seen_otps)
     {
         return Some(cred);
     }
-    if let Some(cred) = fetch_imap_credential(cfg, target_email, seen_digests) {
+    if let Some(cred) = fetch_imap_credential(cfg, target_email, seen_digests, seen_otps) {
         return Some(cred);
     }
-    if let Some(cred) = fetch_http_mailbox_credential(cfg, target_email, seen_digests) {
+    if let Some(cred) = fetch_http_mailbox_credential(cfg, target_email, seen_digests, seen_otps) {
         return Some(cred);
     }
     None
@@ -1829,6 +2262,16 @@ pub fn poll_mailbox_config_for_credential(
     cfg: &MailboxConfig,
     target_email: Option<&str>,
     timeout: Duration,
+) -> Result<MailboxCredential, &'static str> {
+    let mut seen_otps = BTreeSet::new();
+    poll_mailbox_config_for_credential_with_seen_otps(cfg, target_email, timeout, &mut seen_otps)
+}
+
+fn poll_mailbox_config_for_credential_with_seen_otps(
+    cfg: &MailboxConfig,
+    target_email: Option<&str>,
+    timeout: Duration,
+    seen_otps: &mut BTreeSet<String>,
 ) -> Result<MailboxCredential, &'static str> {
     let has_non_webmail = cfg.dir.is_some()
         || cfg.effective_imap_url(target_email).is_some()
@@ -1847,7 +2290,7 @@ pub fn poll_mailbox_config_for_credential(
 
     loop {
         if let Some(dir) = cfg.dir.as_deref()
-            && let Some(cred) = scan_maildir_once(dir, target_email, &mut tried_files)
+            && let Some(cred) = scan_maildir_once(dir, target_email, &mut tried_files, seen_otps)
         {
             return Ok(cred);
         }
@@ -1857,10 +2300,13 @@ pub fn poll_mailbox_config_for_credential(
             if cfg.effective_imap_url(target_email).is_some() || cfg.http_url.is_some() {
                 last_network_poll = Some(Instant::now());
             }
-            if let Some(cred) = fetch_imap_credential(cfg, target_email, &mut seen_digests) {
+            if let Some(cred) =
+                fetch_imap_credential(cfg, target_email, &mut seen_digests, seen_otps)
+            {
                 return Ok(cred);
             }
-            if let Some(cred) = fetch_http_mailbox_credential(cfg, target_email, &mut seen_digests)
+            if let Some(cred) =
+                fetch_http_mailbox_credential(cfg, target_email, &mut seen_digests, seen_otps)
             {
                 return Ok(cred);
             }
@@ -2071,9 +2517,30 @@ pub fn oauth_step_js(
 {CODE_INPUT_HELPERS_JS}
 {SUBMIT_INPUT_HELPERS_JS}
   const buttons = Array.from(document.querySelectorAll("button, input[type='submit'], input[type='image'], [role='button'], a[href]"));
+  const emailVal = {email_json};
+  const targetEmail = String(emailVal || "").trim().toLowerCase();
+  const bodyText = String(document.body && document.body.innerText || "").toLowerCase();
+  const btnText = (btn) => String(btn.innerText || btn.value || btn.getAttribute("aria-label") || "").trim().toLowerCase();
+  const switchBtn = buttons.find(btn => !btn.disabled &&
+    /use another account|different account|switch account|sign in with another|not you|sign out|log out/i.test(btnText(btn)));
+  const emailsIn = (text) => String(text).toLowerCase().match(/[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{{2,}}/g) || [];
+  const hasTargetEmail = (text) => emailsIn(text).includes(targetEmail);
+  const pageEmails = emailsIn(bodyText)
+    .filter(e => !e.endsWith("@anthropic.com"));
+  const hasForeignAccount = Boolean(targetEmail) && !hasTargetEmail(bodyText) && (
+    buttons.some(btn => !btn.disabled && btnText(btn).startsWith("continue as ") && emailsIn(btnText(btn)).length > 0 && !hasTargetEmail(btnText(btn))) ||
+    (pageEmails.length > 0 && (Boolean(switchBtn) || /signed in as|logged in as|continuing as/i.test(bodyText)))
+  );
+  if (hasForeignAccount) {{
+    if (switchBtn) {{
+      switchBtn.click();
+      return {{ state: "switched_account", url: href }};
+    }}
+    return {{ state: "wrong_account", url: href }};
+  }}
   for (const btn of buttons) {{
     if (btn.disabled) continue;
-    const text = String(btn.innerText || btn.value || btn.getAttribute("aria-label") || "").trim().toLowerCase();
+    const text = btnText(btn);
     const hrefAttr = String(btn.getAttribute("href") || "");
     const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject");
     if (!isCancel && (
@@ -2119,7 +2586,6 @@ pub fn oauth_step_js(
     return {{ state: "needs_mailbox", url: href }};
   }}
   const emailInput = document.querySelector("input[type='email'], input[name='email'], input[autocomplete*='email'], input[autocomplete='username']");
-  const emailVal = {email_json};
   const emailDone = {email_submitted};
   if (emailInput && emailVal && !emailDone) {{
     setNativeValue(emailInput, emailVal);
@@ -2128,14 +2594,27 @@ pub fn oauth_step_js(
     }}
     return {{ state: "submitted_email", url: href }};
   }}
-  const bodyText = String(document.body && document.body.innerText || "").toLowerCase();
   if (bodyText.includes("check your email") || bodyText.includes("magic link") || bodyText.includes("sent a link") || bodyText.includes("verification code")) {{
     return {{ state: "needs_mailbox", url: href }};
   }}
+  if (targetEmail) {{
+    for (const btn of buttons) {{
+      if (btn.disabled) continue;
+      const text = btnText(btn);
+      const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject");
+      if (!isCancel && text.startsWith("continue as ") && hasTargetEmail(text)) {{
+        btn.click();
+        return {{ state: "clicked_consent", url: href, target: text }};
+      }}
+    }}
+  }}
   for (const btn of buttons) {{
     if (btn.disabled) continue;
-    const text = String(btn.innerText || btn.value || btn.getAttribute("aria-label") || "").trim().toLowerCase();
+    const text = btnText(btn);
     const isCancel = text.includes("cancel") || text.includes("deny") || text.includes("decline") || text.includes("reject");
+    if (targetEmail && text.startsWith("continue as ") && emailsIn(text).length > 0 && !hasTargetEmail(text)) {{
+      continue;
+    }}
     if (!isCancel && (
       text.startsWith("continue as ") ||
       (href.includes("/oauth/") && (text === "continue" || text === "confirm" || text === "select"))
@@ -2588,7 +3067,7 @@ pub fn poll_webmail_via_cdp(
 
         for _ in 0..80 {
             if let Some(cred) =
-                poll_non_webmail_once(cfg, target_email, &mut tried_files, seen_digests)
+                poll_non_webmail_once(cfg, target_email, &mut tried_files, seen_digests, seen_otps)
             {
                 return Ok(cred);
             }
@@ -2670,34 +3149,24 @@ pub fn poll_webmail_via_cdp(
                             text
                         );
                         let digest = fnv1a_hex(&synthetic);
-                        if !seen_digests.contains(&digest) {
-                            for cred in extract_all_credentials_from_email(&synthetic, target_email)
-                            {
-                                let (unseen_credential, persistent_credential) = match &cred {
-                                    MailboxCredential::MagicLink(url) => {
-                                        let cred_digest = fnv1a_hex(url);
-                                        (!seen_digests.contains(&cred_digest), Some(cred_digest))
-                                    }
-                                    MailboxCredential::Otp(code) => {
-                                        (seen_otps.insert(otp_flow_key(code, target_email)), None)
-                                    }
-                                };
-                                if unseen_credential {
-                                    record_seen_digest(
-                                        cfg.seen_file.as_deref(),
-                                        seen_digests,
-                                        &digest,
-                                    );
-                                    if let Some(cred_digest) = persistent_credential {
-                                        record_seen_digest(
-                                            cfg.seen_file.as_deref(),
-                                            seen_digests,
-                                            &cred_digest,
-                                        );
-                                    }
-                                    return Ok(cred);
-                                }
-                            }
+                        if !seen_digests.contains(&digest)
+                            && let Some((cred, exhausted)) = extract_unseen_credential_from_email(
+                                &synthetic,
+                                target_email,
+                                seen_digests,
+                                seen_otps,
+                            )
+                        {
+                            record_consumed_credential(
+                                cfg.seen_file.as_deref(),
+                                seen_digests,
+                                seen_otps,
+                                target_email,
+                                &digest,
+                                &cred,
+                                exhausted,
+                            );
+                            return Ok(cred);
                         }
                     }
                 }
@@ -2739,7 +3208,13 @@ pub fn poll_mailbox_or_webmail_for_credential(
         let mut seen_digests = load_seen_digests(cfg.seen_file.as_deref());
         let mut tried_files = BTreeSet::new();
         let from_non_webmail = if has_non_webmail {
-            poll_non_webmail_once(cfg, target_email, &mut tried_files, &mut seen_digests)
+            poll_non_webmail_once(
+                cfg,
+                target_email,
+                &mut tried_files,
+                &mut seen_digests,
+                seen_otps,
+            )
         } else {
             None
         };
@@ -2761,17 +3236,18 @@ pub fn poll_mailbox_or_webmail_for_credential(
                     if !has_non_webmail || t0.elapsed() >= timeout {
                         Err(err)
                     } else {
-                        poll_mailbox_config_for_credential(
+                        poll_mailbox_config_for_credential_with_seen_otps(
                             cfg,
                             target_email,
                             timeout.saturating_sub(t0.elapsed()),
+                            seen_otps,
                         )
                     }
                 }
             }
         }
     } else if has_non_webmail {
-        poll_mailbox_config_for_credential(cfg, target_email, timeout)
+        poll_mailbox_config_for_credential_with_seen_otps(cfg, target_email, timeout, seen_otps)
     } else {
         Err("headless browser requires sign-in, but no mailbox is configured")
     };
@@ -2940,11 +3416,14 @@ pub fn drive_cdp_oauth_with_webmail(
             }
 
             match state {
-                "clicked_consent" => {
+                "clicked_consent" | "switched_account" => {
                     needs_mailbox_ticks = 0;
                     if !poll_interval.is_zero() {
                         std::thread::sleep(poll_interval);
                     }
+                }
+                "wrong_account" => {
+                    return Err("headless browser profile is signed in to a different account");
                 }
                 "submitted_email" => {
                     email_submitted = true;
@@ -3069,77 +3548,64 @@ pub(super) fn authorize_with_headless_browser_config_and_credential(
         .or_else(|| extract_login_hint(authorize_url));
 
     let label = infer_account_label_from_env();
-    let temp_dir;
-    let (profile_dir, created_profile_dir) = if let Some(store) = store_dir {
-        let dir = resolve_browser_profile_dir(store, label.as_deref(), email.as_deref());
-        let existed = dir.is_dir();
-        let _ = aterm_types::fs_restricted::ensure_private_dir(dir.parent().unwrap_or(store));
-        let _ = aterm_types::fs_restricted::ensure_private_dir(&dir);
-        (dir, !existed)
-    } else {
-        temp_dir =
-            aterm_tempfile::tempdir().map_err(|_| "could not create scratch browser profile")?;
-        (temp_dir.path().to_path_buf(), false)
-    };
+    with_browser_profile(
+        store_dir,
+        label.as_deref(),
+        email.as_deref(),
+        |profile_dir| {
+            let (cmd_read, cmd_write) =
+                std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
+            let (out_read, out_write) =
+                std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
 
-    let result = (|| {
-        let (cmd_read, cmd_write) =
-            std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
-        let (out_read, out_write) = std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
+            let mut cmd = LaneCommand::new(&browser.path);
+            cmd.args(headless_launch_args(&browser, profile_dir))
+                .stdin(ChildStdio::Null)
+                .stdout(ChildStdio::Null)
+                .stderr(ChildStdio::Null);
 
-        let mut cmd = LaneCommand::new(&browser.path);
-        cmd.args(headless_launch_args(&browser, &profile_dir))
-            .stdin(ChildStdio::Null)
-            .stdout(ChildStdio::Null)
-            .stderr(ChildStdio::Null);
+            let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
+                .map_err(|_| "could not spawn headless browser")?;
 
-        let child = spawn_with_two_fds(cmd, OwnedFd::from(cmd_read), OwnedFd::from(out_write))
-            .map_err(|_| "could not spawn headless browser")?;
-
-        struct ChildGuard(aterm_uds::spawnfd::LaneChild);
-        impl Drop for ChildGuard {
-            fn drop(&mut self) {
-                let _ = self.0.kill();
-                let _ = self.0.wait();
+            struct ChildGuard(aterm_uds::spawnfd::LaneChild);
+            impl Drop for ChildGuard {
+                fn drop(&mut self) {
+                    let _ = self.0.kill();
+                    let _ = self.0.wait();
+                }
             }
-        }
-        let _guard = ChildGuard(child);
-        let mut cdp = CdpClient::new(cmd_write, out_read);
-        let mut seen_otps = BTreeSet::new();
+            let _guard = ChildGuard(child);
+            let mut cdp = CdpClient::new(cmd_write, out_read);
+            let mut seen_otps = BTreeSet::new();
 
-        drive_cdp_oauth_with_webmail(
-            &mut cdp,
-            authorize_url,
-            email.as_deref(),
-            timeout,
-            Duration::from_millis(200),
-            |cdp_inner, em| {
-                let mb = mailbox_cfg
-                    .filter(|c| c.is_configured_for(em))
-                    .ok_or("headless browser requires sign-in, but no mailbox is configured")?;
-                poll_mailbox_or_pending_credential(
-                    &mut pending_credential,
-                    cdp_inner,
-                    mb,
-                    em,
-                    timeout,
-                    Duration::from_millis(200),
-                    &mut seen_otps,
-                )
-            },
-            |cb_url| {
-                let mut cookies = BTreeMap::new();
-                super::open_url::loopback_http_exchange("GET", cb_url, &mut cookies, None)
-                    .map(|r| r.status)
-            },
-        )
-    })();
-    let unauthenticated_profile = store_dir.is_some()
-        && result == Err("headless browser requires sign-in, but no mailbox is configured");
-    if (created_profile_dir && result.is_err()) || unauthenticated_profile {
-        let _ = std::fs::remove_dir_all(&profile_dir);
-    }
-    result
+            drive_cdp_oauth_with_webmail(
+                &mut cdp,
+                authorize_url,
+                email.as_deref(),
+                timeout,
+                Duration::from_millis(200),
+                |cdp_inner, em| {
+                    let mb = mailbox_cfg
+                        .filter(|c| c.is_configured_for(em))
+                        .ok_or("headless browser requires sign-in, but no mailbox is configured")?;
+                    poll_mailbox_or_pending_credential(
+                        &mut pending_credential,
+                        cdp_inner,
+                        mb,
+                        em,
+                        timeout,
+                        Duration::from_millis(200),
+                        &mut seen_otps,
+                    )
+                },
+                |cb_url| {
+                    let mut cookies = BTreeMap::new();
+                    super::open_url::loopback_http_exchange("GET", cb_url, &mut cookies, None)
+                        .map(|r| r.status)
+                },
+            )
+        },
+    )
 }
 
 /// Non-Unix continuation stub for [`authorize_with_headless_browser_config`].

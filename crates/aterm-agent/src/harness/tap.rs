@@ -636,9 +636,10 @@ pub struct Armed {
     pub exe: PathBuf,
     /// The login of the machine's one account where it has a directory of its own.
     pub lone_login: Option<String>,
-    /// Where the machine has no lone login, every login its roster names
-    /// ([`accounts::listed_logins_at`]): a line on one of them is tapped as the machine's own
-    /// ([`Self::lone_for`]), on a roster of two or more accounts each listed account's.
+    /// Where the machine has no lone login, every login a roster of two or more accounts
+    /// names as the store binds it, a renewal's old logins too
+    /// ([`accounts::listed_logins_at`]): a line on one of them is tapped as that listed
+    /// account's ([`Self::lone_for`]).
     pub listed: Vec<String>,
 }
 
@@ -646,8 +647,9 @@ impl Armed {
     /// THE TAP ARMED for the relaunch lines one pass types, the one block every pass that
     /// relaunches shares (the window's background lane, `aterm harness upgrade`): when `on`,
     /// for the aterm `exe` names ([`stable_exe`]), with the lone login of the roster at
-    /// `roster` as `store` binds it at `now` ([`accounts::lone_login_at`]), else every login
-    /// that roster names ([`accounts::listed_logins_at`]); neither where `now` was not read.
+    /// `roster` as `store` binds it at `now` ([`accounts::lone_login_at`]), else, on a roster
+    /// of two or more rows, every login it names ([`accounts::listed_logins_at`]); neither
+    /// where `now` was not read or the store's logins cannot be.
     #[must_use]
     pub fn arm(
         on: bool,
@@ -789,7 +791,8 @@ pub enum Refusal {
     Home,
     /// A login no relaunch line taps as the machine's own: neither the default one, the
     /// roster's lone one, nor, where it has none, one the roster names ([`own_login`],
-    /// [`Armed::lone_for`]).
+    /// [`Armed::lone_for`]). Past the footer's account gate, only a login a renewal moved the
+    /// roster's one row away from: the same account, whose tap follows its current login.
     Login,
     /// Its own `--settings` or `--bare` ([`line_refusal`]).
     Line,

@@ -48,5 +48,104 @@ fn each_word_reads_back_as_what_wrote_it() {
 #[test]
 fn the_default_book_is_empty() {
     let seen = WakesSeen::default();
-    assert_eq!((seen.pending, seen.ready), (0, 0));
+    assert_eq!((seen.pending(), seen.ready()), (0, 0));
+    assert!(seen.head_due().is_none());
+}
+
+/// Every closed word of the book reads back as what wrote it, and the words are distinct within
+/// their kind. NEGATIVE CONTROL: a word none writes reads as none.
+#[test]
+fn the_books_words_read_back() {
+    fn back<T: Copy + PartialEq + std::fmt::Debug>(
+        all: &[T],
+        word: fn(T) -> &'static str,
+        of: fn(&str) -> Option<T>,
+    ) {
+        let words: std::collections::BTreeSet<&str> = all.iter().map(|t| word(*t)).collect();
+        assert_eq!(words.len(), all.len(), "{words:?}");
+        for t in all {
+            assert_eq!(of(word(*t)), Some(*t));
+        }
+        for bad in ["", "Ready", "yours ", "later"] {
+            assert_eq!(of(bad), None, "{bad:?}");
+        }
+    }
+    back(&Declarer::ALL, Declarer::word, Declarer::of_word);
+    back(&Prio::ALL, Prio::word, Prio::of_word);
+    back(&AtomKind::ALL, AtomKind::word, AtomKind::of_word);
+    back(&ExpireWhy::ALL, ExpireWhy::word, ExpireWhy::of_word);
+}
+
+fn wake(ord: u16, prio: Prio, state: WakeState, await_only: bool) -> WakeSeen {
+    WakeSeen {
+        ord,
+        class: Declarer::Agent,
+        prio,
+        state,
+        declared_ms: 1_000,
+        ready_since_ms: None,
+        kinds: vec![AtomKind::File],
+        need: None,
+        need_slots: false,
+        await_only,
+    }
+}
+
+/// THE HEAD OF THE BOOK: of the wakes ready (or answered), a critical one first, then the lowest
+/// ordinal; a time-only wake is never a door's; the counts read the live wakes and those met.
+/// NEGATIVE CONTROL: a book with nothing ready has no head.
+#[test]
+fn the_head_is_critical_first_then_the_lowest_ordinal() {
+    let ready = WakeState::Ready;
+    let seen = WakesSeen {
+        wakes: vec![
+            wake(1, Prio::Normal, WakeState::Pending, false),
+            wake(2, Prio::Normal, ready, true),
+            wake(3, Prio::Normal, ready, false),
+            wake(4, Prio::Normal, ready, false),
+            wake(5, Prio::Critical, WakeState::Answered { at_ms: 9 }, false),
+        ],
+    };
+    assert_eq!(seen.head_due().map(|w| w.ord), Some(5));
+    assert_eq!((seen.pending(), seen.ready()), (5, 4));
+    let mut normal = seen.clone();
+    normal.wakes.pop();
+    assert_eq!(
+        normal.head_due().map(|w| w.ord),
+        Some(3),
+        "the lowest ordinal, not await-only"
+    );
+    let none = WakesSeen {
+        wakes: vec![
+            wake(1, Prio::Critical, WakeState::Pending, false),
+            wake(2, Prio::Normal, ready, true),
+            wake(
+                3,
+                Prio::Normal,
+                WakeState::Claimed {
+                    door: WakeDoor::Break,
+                    at_ms: 1,
+                },
+                false,
+            ),
+        ],
+    };
+    assert!(none.head_due().is_none());
+}
+
+/// A wake's episode is the built-in rules' form over its declaration and ordinal: two wakes of
+/// one book, or one ordinal declared twice, are two episodes.
+#[test]
+fn a_wakes_episode_is_its_declaration_and_ordinal() {
+    let one = wake(1, Prio::Normal, WakeState::Ready, false);
+    assert_eq!(
+        one.episode(),
+        aterm_hash::fnv1a_64(b"wake@v1 builtin 1000 1")
+    );
+    let mut other = one.clone();
+    other.ord = 2;
+    assert_ne!(other.episode(), one.episode());
+    other.ord = 1;
+    other.declared_ms = 1_001;
+    assert_ne!(other.episode(), one.episode());
 }

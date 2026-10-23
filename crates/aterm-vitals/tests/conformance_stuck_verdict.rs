@@ -15,7 +15,7 @@ use aterm_models_misc::stuck_verdict_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp;
 use aterm_vitals::jobs::step::Effective;
-use aterm_vitals::jobs::{Fault, JobRow, Verdict};
+use aterm_vitals::jobs::{Class, Fault, JobRow, JobsView, Verdict};
 use scenarios::{Scenario, Trace};
 
 type S = BTreeMap<&'static str, i64>;
@@ -74,14 +74,33 @@ fn fire(
     Ok(())
 }
 
+/// The model's `held` input at one tick: the job waits, and the process it waits in is one the
+/// view's findings name as held at macOS's program check. Read from the findings (what the host
+/// handed the engine), never from the row's wait name, so an engine that does not name the wait
+/// still drives `Hold`.
+fn held(r: &JobRow, view: &JobsView) -> bool {
+    r.class == Class::Waiting
+        && r.wait
+            .as_ref()
+            .is_some_and(|w| view.findings.program_check.iter().any(|n| n.pid == w.leaf))
+}
+
 /// Replay `t` on `m`: the error names the first tick the model refuses.
 fn replay(m: &Model, t: &Trace, fired: &mut BTreeSet<&'static str>) -> Result<S, String> {
     let mut s = m.init_state();
-    for (rel, row, _) in &t.ticks {
+    for (rel, row, view) in &t.ticks {
         let Some(r) = row else { continue };
         let next = cls(r.tick.effective);
         let (b, v) = (band(r), rank(r.verdict));
+        let held_now = held(r, view);
         let step = |s: &mut S, fired: &mut BTreeSet<&'static str>| -> Result<(), String> {
+            if s["cls"] != 4 {
+                match (held_now, s["held"]) {
+                    (true, 0) => fire(m, s, "Hold", fired)?,
+                    (false, 1) => fire(m, s, "Release", fired)?,
+                    _ => {}
+                }
+            }
             let now = s["cls"];
             match (now, next) {
                 (4, _) => return Ok(()),
@@ -181,6 +200,8 @@ fn every_covered_scenario_is_a_run_of_the_model() {
         "Relabel",
         "Exit",
         "Watch",
+        "Hold",
+        "Release",
     ] {
         assert!(fired.contains(a), "no scenario drives `{a}`: {fired:?}");
     }
@@ -251,6 +272,16 @@ fn letting_unnamed_reach_stuck_is_caught_by_unnamed_never_enters_stuck() {
 #[test]
 fn never_raising_a_named_wait_is_caught_by_flagged_on_time() {
     caught(Fault::NeverRaiseNamed, "curl.setsid", 6, "FlaggedOnTime");
+}
+
+#[test]
+fn ignoring_the_program_check_is_caught_by_held_wait_never_quiet() {
+    caught(
+        Fault::IgnoreProgramCheck,
+        "held.setsid",
+        7,
+        "HeldWaitNeverQuiet",
+    );
 }
 
 /// A liveness defect: the healthy step flags the scenario's true stall, the

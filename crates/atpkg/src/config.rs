@@ -349,7 +349,7 @@ impl RerouteConfig {
     }
 }
 
-/// The `[abrew]` table — aterm's Homebrew ([`crate::abrew`], docs/DESIGN-abrew-2026-10-19.md).
+/// The `[abrew]` table — aterm's Homebrew ([`crate::abrew`]).
 #[derive(Debug, Default, Clone, serde::Deserialize)]
 #[serde(default)]
 pub struct AbrewConfig {

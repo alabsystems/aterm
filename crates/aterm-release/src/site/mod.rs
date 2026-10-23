@@ -33,8 +33,9 @@ pub const USAGE: &str = "usage: targo --unverified ship site [--latest] [--dry-r
   --site-dir DIR the site checkout (else SITE_DIR, else publish/site.toml's dir)
   --releases FILE plan offline from this release list instead of asking GitHub (needs
                  --dry-run)
-exit: 0 synced (or synced and the live site unreadable, said), deferred or planned · 1 failed · 2 usage or an unreadable publish/site.toml · \
-     3 no usable site checkout · 4 the live site does not show the committed site";
+exit: 0 synced (said when not deployed or the live site is unreadable), planned, skipped
+      or deferred · 1 failed · 2 usage or an unreadable publish/site.toml · 3 no usable
+      site checkout · 4 the live site does not show the committed site";
 
 /// Closure fetching up to the given byte count from a release asset URL.
 pub type Fetch<'f> = dyn FnMut(&str, u64) -> Result<Vec<u8>, String> + 'f;

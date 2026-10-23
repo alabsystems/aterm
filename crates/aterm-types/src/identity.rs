@@ -1,8 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Who makes aterm: the origin every user-facing surface prints under its title
-//! (`aterm --help`, `--version`, the manual, `atpkg help`, Settings ▸ About), defined once.
+//! Who makes aterm, defined once: the origin user-facing surfaces print under their title
+//! (`aterm --help`, `--version`, `aterm help`, `aterm pkg help`, `aterm --window --help`,
+//! Settings ▸ About).
 
 /// The author.
 pub const AUTHOR: &str = "Andrew Yates";

@@ -91,6 +91,93 @@ fn the_writes_holds_go_in_order_and_only_a_nudge_waits_for_the_upgrade() {
     }
 }
 
+/// THE STUCK FACT'S LINE AT A BREAK, IN ORDER (§2.1's rank 4): nothing without its key; then the
+/// first guard that holds a line under the autopilots it is for (Cruise and Land, never Off);
+/// then the write's own holds, the upgrade's notice among them, so rank 3 goes first; then the
+/// session's pace, one line at a time with the nudges'; else due.
+#[test]
+fn the_stuck_line_holds_in_order_and_waits_for_the_upgrades_notice() {
+    let (cfg, _) =
+        crate::supervise::SupervisorConfig::from_aterm_toml("[harness]\nstuck_break_note = true\n");
+    let grant = cfg.stuck_break_grant().expect("the root table grants it");
+    let books = Books::default();
+    let at = |g: &Guards, w: AtWrite| stuck_at_break(Some(&grant), g, w, &books, 0);
+    let open = Guards::clear(Autopilot::Cruise);
+    let notice = AtWrite {
+        upgrade_due: true,
+        ..AtWrite::default()
+    };
+    assert_eq!(
+        stuck_at_break(None, &open, AtWrite::default(), &books, 0),
+        StuckVerdict::Ungranted
+    );
+    assert_eq!(at(&open, AtWrite::default()), StuckVerdict::Due);
+    assert_eq!(
+        at(&Guards::clear(Autopilot::Land), AtWrite::default()),
+        StuckVerdict::Due
+    );
+    assert_eq!(
+        at(&Guards::clear(Autopilot::Off), AtWrite::default()),
+        StuckVerdict::Held(Guard::Autopilot)
+    );
+    let person = Guards {
+        person: true,
+        ..open
+    };
+    assert_eq!(at(&person, notice), StuckVerdict::Held(Guard::Person));
+    assert_eq!(at(&open, notice), StuckVerdict::Held(Guard::UpgradeDue));
+    let mut lined = Books::default();
+    lined.lined(0);
+    assert_eq!(
+        stuck_at_break(Some(&grant), &open, AtWrite::default(), &lined, 60_000),
+        StuckVerdict::Paced {
+            next_ms: rules::SESSION_PACE_MS
+        }
+    );
+    assert_eq!(
+        stuck_at_break(
+            Some(&grant),
+            &open,
+            AtWrite::default(),
+            &lined,
+            rules::SESSION_PACE_MS
+        ),
+        StuckVerdict::Due
+    );
+}
+
+/// A SUCCESSOR SEEDS EVERY KIND'S ROWS BY ITS OWN KEY: a no-progress intent and its outcome are
+/// read back by the `kind=` word and the episode, beside the hold's; an intent of a kind this
+/// build does not know is passed over.
+#[test]
+fn a_successor_seeds_the_no_progress_rows_by_their_kind() {
+    let hung = EpisodeKey::no_progress(27098, 7);
+    let intent = fact_intent_reason(hung, FactDoor::Break);
+    let skipped = fact_outcome_reason(hung, FactDoor::TurnEnd, Told::Skipped("not-written"));
+    let rule = FactKind::NoProgress.rule();
+    let body = [
+        row(SID, 1, INTENT_RULE, Outcome::Waiting, &intent),
+        row(SID, 2, rule, Outcome::Typed, &intent),
+        row(SID, 3, rule, Outcome::Skipped, &skipped),
+        row(
+            SID,
+            4,
+            INTENT_RULE,
+            Outcome::Waiting,
+            &intent.replace("kind=no-progress", "kind=later"),
+        ),
+    ]
+    .join("\n");
+    assert_eq!(
+        seed_rows_in(&body, Some(SID)),
+        [
+            (hung, 1, SeedOutcome::Intent),
+            (hung, 2, SeedOutcome::Typed),
+            (hung, 3, SeedOutcome::Skipped),
+        ]
+    );
+}
+
 #[test]
 fn every_pace_answer_reads_back_by_its_word() {
     let answers = [

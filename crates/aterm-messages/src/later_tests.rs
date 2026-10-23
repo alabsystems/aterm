@@ -570,12 +570,33 @@ fn conditional_settlement_rejects_reopened_or_restated_entries() {
         c.digest_entry(new_id).is_some(),
         "the newer occurrence stays open"
     );
-    let wrong_key = format!("settle another {new_id} {latest_revision}");
-    assert_eq!(
-        notice(&mut c, &mut g, &wrong_key, 3 * DAY_MS, now).reply,
-        "OK settled=- how=gone"
+    let other_line = SETUP.replace(
+        "codex.security-setup.0123abcd",
+        "codex.security-setup.5678abcd",
     );
-    assert!(c.digest_entry(new_id).is_some());
+    let (other_id, _) = later_reply(&notice(&mut c, &mut g, &other_line, 3 * DAY_MS, now));
+    assert_ne!(new_id, other_id);
+    assert_eq!(
+        c.digest_entry(new_id).unwrap().key,
+        "wire.codex.security-setup.0123abcd"
+    );
+    assert_eq!(
+        c.digest_entry(other_id).unwrap().key,
+        "wire.codex.security-setup.5678abcd"
+    );
+    let before = c.digest();
+    assert_eq!(before.len(), 2);
+    let revision = c.digest_revision();
+    let projection = c.projection_revision();
+    // Both keys exist and the revision is current: only the key/id binding can
+    // reject using the first entry's id to settle the second entry's key.
+    let wrong_key = format!("settle codex.security-setup.5678abcd {new_id} {revision}");
+    let gone = notice(&mut c, &mut g, &wrong_key, 3 * DAY_MS, now);
+    assert_eq!(gone.reply, "OK settled=- how=gone");
+    assert_eq!((gone.paint, gone.note), (Paint::None, false));
+    assert_eq!(c.digest(), before);
+    assert_eq!(c.digest_revision(), revision);
+    assert_eq!(c.projection_revision(), projection);
 }
 
 #[test]

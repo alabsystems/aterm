@@ -356,7 +356,8 @@ pub fn gather(fix: bool) -> Gathered {
     }
 }
 
-/// The diagnostic facts' legacy shell-health assessment, used by isolated fact tests.
+/// The report closed by its `health:` line, and 1 when a row failed: the form the isolated
+/// fact tests read.
 #[must_use]
 pub fn render(gathered: &Gathered, rows: &[ItemReport], sections: &[Section]) -> (String, i32) {
     super::render_doctor_lines(&report_lines(gathered, rows, sections))

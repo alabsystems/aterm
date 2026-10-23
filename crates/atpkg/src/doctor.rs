@@ -1,8 +1,9 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg doctor`: read-only diagnostic over store, shim, signature ([`crate::sig::Floor`]), and
-//! status invariants.
+//! `atpkg doctor`: a read-only report on the package store and what it relies on (shims,
+//! reroute stubs, PATH, rustup's `trust` entry, shell wiring, the accepted index
+//! ([`crate::sig::Floor`]), macOS settings). It changes nothing and opens no network connection.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -227,7 +228,7 @@ pub struct LocalSealProbe {
     pub stale: Option<crate::seam::Stale>,
 }
 
-/// The environment-dependent probes `run` takes and `run_with` only reports.
+/// The environment-dependent probes: [`rows`] takes them, [`run_with`] is handed them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Probes {
     pub workspace: Option<WorkspacePolicyProbe>,
@@ -562,11 +563,12 @@ pub enum DefaultState {
     Default,
     /// Set by hand to something else.
     Manual(String),
-    /// Not set, and not added.
+    /// Not set, and not added: an effort is set by hand (named here).
     HeldForEffort(String),
-    /// Not set, and not added.
+    /// Not set, and not added: the survey rate is set by hand (its value here).
     HeldForRate(String),
-    /// Not set, and not added.
+    /// Not set, and not added: Claude Code's autocompact offer was answered Keep, or its
+    /// record cannot be read (the reason here).
     HeldForOffer(String),
     /// The top-effort key ([`CLAUDE_TOP_EFFORT_KEY`]) `true` beside a hand-set effort.
     OverridesEffort(String),
@@ -849,7 +851,7 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
     ("ATERM_VERBOSE", "aterm --verbose"),
     (
         "ATERM_DRIVE_READY",
-        "aterm ctl @<sid> await match <regex> (aterm drive has no --ready now)",
+        "aterm ctl @<sid> await match <regex> (aterm drive takes no --ready)",
     ),
 ];
 
@@ -1018,7 +1020,7 @@ pub fn rows(layout: &Layout) -> Vec<ItemReport> {
     rows_reading(layout, crate::devtools::facts())
 }
 
-/// [`rows`] without the Developer Tools read (one `sqlite3` and one `log show`, up to 8 s).
+/// [`rows`] without the Developer Tools read ([`crate::devtools::facts`]: a TCC.db read and a `log show`, which can take seconds).
 #[must_use]
 pub fn packages_rows(layout: &Layout) -> Vec<ItemReport> {
     rows_reading(layout, None)
@@ -1369,7 +1371,7 @@ pub fn spelled(row: &Row) -> String {
     format!("{} \u{2014} {}", level_word(row.level), row.text)
 }
 
-/// The testable core: `home`, the `PATH` value.
+/// [`run`] over an injected environment: `home`, `PATH`, the clock, the account and the probes.
 #[must_use]
 #[allow(clippy::too_many_arguments)] // the injected environment, plus the speaker and its streams
 pub fn run_with(
@@ -1401,7 +1403,7 @@ pub fn report_with(
     crate::converge::report(read(layout, home, path_var, now, cfg_account, probes))
 }
 
-/// Read the machine once: checks (0)–(11), in order, each leaving a [`Finding`] per thing it found.
+/// Read the machine once, in report order: one [`Finding`] per thing found.
 #[must_use]
 #[allow(clippy::too_many_lines)] // one read pass, in the order the report prints it
 pub(crate) fn read(
@@ -1571,7 +1573,7 @@ pub(crate) fn read(
                 id,
                 Class::Relay,
                 title,
-                format!("reroute stub {name} not laid: Windows lays no reroute stubs yet (TARGET)"),
+                format!("reroute stub {name} not laid: Windows lays no reroute stubs"),
             ),
             crate::reroute::StubState::Missing if layout.declined().is_file() => Finding::note(
                 id,
@@ -3392,7 +3394,7 @@ const EXEC_ROOT_FIX: &str = "`aterm pkg repair` lays the exec root (a copy-on-wr
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolClaim {
-    /// Nothing withheld: the (5f)(c) note.
+    /// Nothing withheld: the exec root's note.
     Runs,
     /// The warn says the tool cannot run.
     CannotRun,

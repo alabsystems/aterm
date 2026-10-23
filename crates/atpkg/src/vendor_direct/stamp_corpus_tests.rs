@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! A vendor-direct program's stamp file under the mutations the first-party
-//! serde must answer exactly as registry serde did
-//! (docs/AUDIT-third-party-2026-10-15.md, SP.3). Unknown keys ride
-//! `#[serde(flatten)]` into an `aterm_toml::Value` map and are written back;
+//! A vendor-direct program's stamp file under mutations, each answered as the
+//! committed corpus `tests/fixtures/serde-corpus/stamp.txt` records. Unknown keys
+//! ride `#[serde(flatten)]` into an `aterm_toml::Value` map and are written back;
 //! `last_head`, `high_water` and the legacy pair use `Version`'s serde impls.
 
 use crate::serde_corpus_tests::answers::Corpus;

@@ -227,12 +227,33 @@ pub struct CatFrame {
     pub sing: f32,
 }
 
+/// Whether `variant`'s art carries markings (pattern or coat-shade layers) a
+/// face swap would drop.
+const fn marked(variant: CatGlyphId) -> bool {
+    let layers = crate::cat_glyphs_gen::GLYPHS[variant as usize].layers;
+    let mut i = 0;
+    while i < layers.len() {
+        if matches!(
+            layers[i].role,
+            crate::cat_glyphs_gen::GlyphRole::Pattern | crate::cat_glyphs_gen::GlyphRole::CoatShade
+        ) {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 impl CatFrame {
     /// Resolve the authored art for this expression (typed glyph ids, so roster additions cannot shift it).
     #[must_use]
     #[inline]
     pub const fn render_look(&self) -> KittyLook {
-        let flourish_face_earned = self.fade_out >= EXIT_FACE_FADE;
+        // The goodbye keeps the cat's markings: the flourish faces carry no
+        // pattern layers, so a marked cat (a calico patch, an eye patch)
+        // waves goodbye in its own head and the flourish rides beside it
+        // (round 2's judge, 2026-10-23: nyan's l4200 lost its coat).
+        let flourish_face_earned = self.fade_out >= EXIT_FACE_FADE && !marked(self.look.variant);
         let variant = match (self.exit, self.reaction) {
             (_, CatReaction::Startled) => CatGlyphId::S121,
             (CatExit::StarWink, _) if flourish_face_earned => CatGlyphId::S121,
@@ -2037,6 +2058,12 @@ mod tests {
         let mut saw_plain_head = 0u32;
         for keys in 120..160u64 {
             let mut c = CursorCat::default();
+            // An unmarked head: a marked one keeps its own head through the
+            // goodbye ([`a_marked_cat_s_goodbye_keeps_its_markings`]).
+            c.set_look(KittyLook {
+                variant: CatGlyphId::S100,
+                ..KittyLook::default()
+            });
             let t = Instant::now();
             for i in 0..keys {
                 c.on_key(t + Duration::from_millis(i * 60), true);
@@ -2392,6 +2419,58 @@ mod tests {
 
         let still_held = cat.frame(resumed_at + Duration::from_secs_f32(DISCOVERY_HOLD - 0.001));
         assert!(still_held.discovery, "only drawable time consumes the hold");
+    }
+
+    /// Round 2's judge (2026-10-23, nyan's `burst` l4200): the goodbye face
+    /// dropped a marked cat's coat. Every head whose art carries markings
+    /// keeps its own head, coat and iris through both flourishes; the
+    /// control: an unmarked head still swaps to the flourish face, so the
+    /// frames below are the goodbye's.
+    #[test]
+    fn a_marked_cat_s_goodbye_keeps_its_markings() {
+        use crate::cat_glyphs_gen::{GLYPH_IDS, GLYPHS, GlyphKind, GlyphRole};
+        let mut marked_heads = 0;
+        let mut swapped_plain = 0;
+        for (i, def) in GLYPHS.iter().enumerate() {
+            if def.kind != GlyphKind::Head {
+                continue;
+            }
+            let variant = GLYPH_IDS[i];
+            let look = KittyLook {
+                variant,
+                coat: 5,
+                iris: 2,
+                ..KittyLook::default()
+            };
+            let has_marks = def
+                .layers
+                .iter()
+                .any(|l| matches!(l.role, GlyphRole::Pattern | GlyphRole::CoatShade));
+            for exit in [CatExit::StarWink, CatExit::HeartMeow] {
+                let mut f = CursorCat::default().frame(Instant::now());
+                f.look = look;
+                f.exit = exit;
+                f.fade_out = 0.6;
+                f.alpha = 90;
+                let drawn = f.render_look();
+                if has_marks {
+                    assert_eq!(
+                        drawn,
+                        look.normalized(),
+                        "{} waves goodbye ({exit:?}) without its markings",
+                        def.id
+                    );
+                } else if drawn.variant != variant {
+                    swapped_plain += 1;
+                }
+            }
+            marked_heads += usize::from(has_marks);
+        }
+        assert!(marked_heads > 0, "the roster has marked heads");
+        assert!(
+            swapped_plain > 0,
+            "an unmarked head still makes the flourish face"
+        );
     }
 
     #[test]

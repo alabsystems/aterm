@@ -856,6 +856,8 @@ pub(crate) struct FrameText {
     /// Row-major cell `(ink, ground)` pairs (`0x00RRGGBB`) for each read row.
     pub(super) pairs: Vec<Option<(Option<u32>, u32)>>,
     pub(super) cols: usize,
+    /// The window column of `pairs`' first column (a split pane's offset).
+    pub(super) col0: i32,
 }
 
 impl FrameText {
@@ -863,7 +865,7 @@ impl FrameText {
     /// the frame's own cells, or `None` for a cell the frame did not read.
     #[inline]
     pub(crate) const fn pair(&self, row: i32, col: i32) -> Option<(Option<u32>, u32)> {
-        let i = row - self.lo;
+        let (i, col) = (row - self.lo, col - self.col0);
         if i < 0 || i as usize >= self.rows.len() || col < 0 || col as usize >= self.cols {
             return None;
         }

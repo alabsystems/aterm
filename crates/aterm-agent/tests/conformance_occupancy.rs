@@ -2,21 +2,23 @@
 // Copyright 2026 Andrew Yates
 
 //! Tier-1 conformance tests binding `OccupancyDoor` to `occupancy::decide`, `write_held`,
-//! `HoldClock`, and `Books`.
+//! `HoldClock`, and `Books`, and, in its stuck runs (`Key = 1`), to the stuck fact's door:
+//! `FactsState::observe`/`pending` on a facts reading and `stuck_at_break` under the owner's
+//! `[harness] stuck_break_note` grant.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use aterm_agent::harness::disk::Level;
-use aterm_agent::supervise::facts::{EpisodeKey, FactKind, FactsState, SeedOutcome};
+use aterm_agent::supervise::facts::{EpisodeKey, FactKind, FactsReading, FactsState, SeedOutcome};
 use aterm_agent::supervise::occupancy::fault::{self, Fault};
 use aterm_agent::supervise::occupancy::rules::{
     HOLD_ROOM_AFTER_MS, HOLD_ROOM_APART_MS, SESSION_PACE_MS, WAIT_NUDGE_AFTER_MS, episode,
 };
 use aterm_agent::supervise::occupancy::{
     AtWrite, Books, Guards, HoldClock, HoldEvent, HoldSeen, OccupancyReading, RuleId, SlotsSeen,
-    Verdict, decide, write_held,
+    StuckVerdict, Verdict, decide, stuck_at_break, write_held,
 };
-use aterm_agent::supervise::{Autopilot, Guard};
+use aterm_agent::supervise::{Autopilot, BackgroundCall, Guard, SupervisorConfig};
 use aterm_models_harness::occupancy_door_model;
 use aterm_spec::derive::Model;
 
@@ -48,6 +50,11 @@ struct Real {
     upgrade_due: bool,
     /// The host typed its own line at this break (`IdleHost::at_background`).
     host_line: bool,
+    /// The stuck fact's book: which no-progress episodes this session was told.
+    facts: FactsState,
+    /// The hung call's leader's birth: an episode closed in an odd variant's run reopens on a
+    /// call born later in the same group.
+    birth: u64,
 }
 
 /// How a walk departs from the committed real code, for the negative controls.
@@ -58,6 +65,50 @@ struct Run {
     variant: usize,
     /// The defect planted, if any.
     fault: Option<Fault>,
+    /// The model's `Key`: the owner's `stuck_break_note` grant, on or off.
+    key: i64,
+    /// The run walks the stuck fact's line (`OpenStuck`, `cond` a facts reading naming the hung
+    /// call) instead of the rule's nudge.
+    stuck: bool,
+}
+
+/// The hung call's group, which every episode of the stuck runs is of.
+const PGID: u32 = 27_098;
+
+fn hung(birth: u64) -> BackgroundCall {
+    BackgroundCall {
+        pid: PGID,
+        pgid: PGID,
+        birth: Some(birth),
+        exe: String::from("cargo"),
+        task: Some(String::from("bplle5dxj")),
+        quiet_ms: 31 * 60_000,
+        wait: None,
+    }
+}
+
+/// The host's facts reading at the loop's clock: naming the hung call, or fresh and naming none.
+fn facts_read(r: &Real, names: bool) -> FactsReading {
+    FactsReading {
+        as_of_ms: r.now,
+        no_progress: if names {
+            vec![hung(r.birth)]
+        } else {
+            Vec::new()
+        },
+    }
+}
+
+/// The owner's grant as the root table makes it, under `key`.
+fn grant(key: i64) -> Option<aterm_agent::supervise::config::StuckBreakGrant> {
+    let toml = if key == 1 {
+        "[harness]\nstuck_break_note = true\n"
+    } else {
+        "[harness]\n"
+    };
+    SupervisorConfig::from_aterm_toml(toml)
+        .0
+        .stuck_break_grant()
 }
 
 fn project(r: &Real, rule: RuleId) -> State {
@@ -145,7 +196,33 @@ enum Said {
     Other(String),
 }
 
+/// What the stuck fact's door says at a break: quiet with no untold episode on a fresh reading,
+/// else `stuck_at_break`'s verdict under the run's grant.
+fn stuck_said(m: &Model, st: &State, r: &Real, run: Run) -> Said {
+    let read = facts_read(r, st["cond"] == 1);
+    let mut facts = r.facts.clone();
+    facts.observe(Some(&read), r.now);
+    if facts.pending(Some(&read), r.now).is_none() {
+        return Said::Quiet;
+    }
+    let g = guards(st, autopilot(m), run.variant);
+    let at = AtWrite {
+        host_line: r.host_line,
+        withheld: false,
+        upgrade_due: r.upgrade_due,
+    };
+    match stuck_at_break(grant(cnst(m, "Key")).as_ref(), &g, at, &r.books, r.now) {
+        StuckVerdict::Ungranted => Said::Quiet,
+        StuckVerdict::Held(g) => Said::Held(term(g)),
+        StuckVerdict::Paced { .. } => Said::Paced,
+        StuckVerdict::Due => Said::Due,
+    }
+}
+
 fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
+    if run.stuck {
+        return stuck_said(m, st, r, run);
+    }
     let reading = match run.rule {
         RuleId::WaitNudge => OccupancyReading::default(),
         RuleId::HoldRoom => board(st["cond"] == 1),
@@ -182,10 +259,11 @@ fn decided(m: &Model, st: &State, r: &Real, run: Run) -> Said {
     said
 }
 
-fn agrees(m: &Model, st: &State, said: &Said) -> bool {
+fn agrees(m: &Model, st: &State, said: &Said, stuck: bool) -> bool {
     let mut s = st.clone();
-    if m.action_enabled("OpenNudge", &s) {
-        m.fire("OpenNudge", &mut s);
+    let open = if stuck { "OpenStuck" } else { "OpenNudge" };
+    if m.action_enabled(open, &s) {
+        m.fire(open, &mut s);
     }
     if s["due"] == 0 || s["cond"] == 0 {
         return *said == Said::Quiet;
@@ -202,7 +280,7 @@ fn agrees(m: &Model, st: &State, said: &Said) -> bool {
         ("task", s["task"] == 1),
         ("brake", s["brake"] == 0),
         ("untaken", s["untaken"] == 0),
-        ("mode", mode == 1 || (mode == 2 && s["due"] == 2)),
+        ("mode", mode == 1 || (mode == 2 && s["due"] > 1)),
         ("upg", s["due"] == 2 || s["upg"] == 0),
         ("lines", s["lines"] == 0),
     ]
@@ -216,19 +294,37 @@ fn agrees(m: &Model, st: &State, said: &Said) -> bool {
     }
 }
 
-fn realizable(st: &State, action: &str, r: &Real, rule: RuleId) -> bool {
+fn realizable(st: &State, action: &str, r: &Real, run: Run) -> bool {
+    let rule = run.rule;
     let eager = (st["due"] > 0 && st["intent"] == 0 && st["cond"] == 0)
         || (st["intent"] == 1 && st["cond"] == 0);
     if eager && action != "Lapse" && action != "Skip" {
         return false;
     }
+    // A fresh reading that no longer names a told call forgets it at once (`FactsState::observe`):
+    // the call is named again only in an episode the model has closed.
+    if run.stuck && st["due"] == 0 && st["told"] > 0 && st["cond"] == 0 && action == "Holds" {
+        return false;
+    }
     match action {
         "OpenWake" => false,
+        "OpenNudge" => !run.stuck,
+        "OpenStuck" => run.stuck,
         "Intend" | "Type" => st["door"] == 1,
         "UpgradeTypes" => st["held"] == 1,
         "HoldAges" => st["told"] == 0 && st["paced"] == 0,
-        "Holds" => rule == RuleId::HoldRoom,
-        "Fails" => rule == RuleId::HoldRoom || st["owed"] == 0,
+        // A stuck line typed in a young hold: the pace's lapse must not age it unseen.
+        "PaceLapses" if run.stuck => {
+            st["held"] == 1
+                || r.clock
+                    .held_ms(r.now + SESSION_PACE_MS)
+                    .is_none_or(|ms| ms < age_ms(rule))
+        }
+        "Holds" => run.stuck || rule == RuleId::HoldRoom,
+        "Fails" => run.stuck || rule == RuleId::HoldRoom || st["owed"] == 0,
+        // A door's second line is held by the pace its first one set, which the real door says
+        // and the model's `lines` term does not tell apart: an episode closes past the door.
+        "Close" if run.stuck => st["lines"] == 0,
         "Close" => {
             rule == RuleId::WaitNudge
                 || (st["paced"] == 0
@@ -321,26 +417,39 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
                 r.pointed = true;
             }
         }
+        "Fails" if run.stuck => {}
         "Fails" if rule == RuleId::WaitNudge => {
             r.clock.step(HoldEvent::HarnessLine);
             r.clock.step(HoldEvent::AnswerTail { waiting_line: true });
         }
         "PaceLapses" => r.now += SESSION_PACE_MS,
         "Close" => {
-            if rule == RuleId::HoldRoom {
+            if rule == RuleId::HoldRoom && !run.stuck {
                 r.now += HOLD_ROOM_APART_MS;
+            }
+            if run.stuck && run.variant % 2 == 1 {
+                r.birth += 1;
             }
             r.episode = None;
         }
         "Intend" => {
-            let key = episode_now(r, rule);
+            let key = if run.stuck {
+                EpisodeKey::no_progress(PGID, r.birth)
+            } else {
+                episode_now(r, rule)
+            };
             r.rows.push((key, r.now, SeedOutcome::Intent));
             r.intent = Some(key);
             r.episode = Some(key);
         }
         "Type" => {
             let key = r.intent.take().expect("an intent row before the line");
-            r.books.fired(rule, r.now, true);
+            if run.stuck {
+                r.books.lined(r.now);
+                r.facts.told(key, r.now);
+            } else {
+                r.books.fired(rule, r.now, true);
+            }
             r.rows.push((key, r.now, SeedOutcome::Typed));
             r.clock.step(HoldEvent::HarnessLine);
         }
@@ -355,8 +464,15 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
             if seeded.is_told(key) != (next["told"] > 0) {
                 return false;
             }
+            if run.stuck {
+                r.facts = seeded;
+            }
         }
         _ => {}
+    }
+    if run.stuck && st["cond"] == 1 && next["cond"] == 0 {
+        let gone = facts_read(r, false);
+        r.facts.observe(Some(&gone), r.now);
     }
     if let Some(since) = r.clock.since_ms() {
         r.books.hold(since);
@@ -365,6 +481,9 @@ fn mirror(action: &str, st: &State, next: &State, r: &mut Real, run: Run) -> boo
         let mut seeded = FactsState::default();
         seeded.seed(&r.rows, i64::MAX);
         if seeded.is_told(key) != (next["told"] > 0) {
+            return false;
+        }
+        if run.stuck && next["cond"] == 1 && r.facts.is_told(key) != (next["told"] > 0) {
             return false;
         }
     }
@@ -384,7 +503,7 @@ impl Walked {
         let mut ok = stepped && ["held", "owed"].iter().all(|v| real[v] == st[v]);
         let said = (st["door"] == 1).then(|| decided(m, st, r, run));
         if let Some(said) = &said {
-            ok &= agrees(m, st, said);
+            ok &= agrees(m, st, said, run.stuck);
             self.said.insert(format!("{said:?}"));
         }
         if !ok {
@@ -419,6 +538,8 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
             pointed: false,
             upgrade_due: false,
             host_line: false,
+            facts: FactsState::default(),
+            birth: 11,
         };
         let mut w = Walked {
             states: HashSet::new(),
@@ -440,7 +561,7 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
                 let Some(next) = m.successors_in(action, &env, &st).into_iter().next() else {
                     continue;
                 };
-                if !realizable(&st, action.name, &real, run.rule) {
+                if !realizable(&st, action.name, &real, run) {
                     continue;
                 }
                 let mut r = real.clone();
@@ -459,11 +580,13 @@ fn walk(m: &Model, strict: bool, run: Run) -> Walked {
 }
 
 fn walks(runs: &[(i64, Run)], strict: bool) -> Vec<Walked> {
-    aterm_spec::check::each(runs, |&(mode, run)| walk(&under(mode), strict, run))
+    aterm_spec::check::each(runs, |&(mode, run)| {
+        walk(&under(mode, run.key), strict, run)
+    })
 }
 
-fn under(mode: i64) -> Model {
-    aterm_spec::interp::with_consts(&occupancy_door_model(), &[("Mode", mode)])
+fn under(mode: i64, key: i64) -> Model {
+    aterm_spec::interp::with_consts(&occupancy_door_model(), &[("Mode", mode), ("Key", key)])
 }
 
 #[test]
@@ -479,12 +602,32 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
                         rule,
                         variant,
                         fault: None,
+                        key: 0,
+                        stuck: false,
                     },
                 ));
             }
         }
+        let variants = if mode == 0 { 0..1 } else { 0..4 };
+        for variant in variants {
+            runs.push((
+                mode,
+                Run {
+                    rule: RuleId::WaitNudge,
+                    variant,
+                    fault: None,
+                    key: 1,
+                    stuck: true,
+                },
+            ));
+        }
     }
-    for (&(mode, Run { rule, .. }), w) in runs.iter().zip(walks(&runs, true)) {
+    for (&(mode, Run { rule, stuck, .. }), w) in runs.iter().zip(walks(&runs, true)) {
+        let what = if stuck {
+            String::from("the stuck fact")
+        } else {
+            format!("{rule:?}")
+        };
         let mut own = vec![
             "Turn",
             "Break",
@@ -503,7 +646,7 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
             "Fails",
             "UpgradeDue",
             "UpgradeTypes",
-            "OpenNudge",
+            if stuck { "OpenStuck" } else { "OpenNudge" },
             "Intend",
             "Skip",
             "Lapse",
@@ -511,25 +654,26 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
             "Sample",
             "SampleLast",
         ];
-        if rule == RuleId::HoldRoom {
+        if stuck || rule == RuleId::HoldRoom {
             own.push("Holds");
         }
-        if mode == 1 {
+        let types = mode == 1 || (stuck && mode == 2);
+        if types {
             own.extend(["Type", "PaceLapses", "Close"]);
         } else {
             assert!(
                 !w.fired.contains_key("Type"),
-                "{rule:?} is Cruise's: nothing is typed under Mode = {mode}"
+                "{what} is not Mode = {mode}'s: nothing is typed under it"
             );
         }
         for a in own {
             assert!(
                 w.fired.contains_key(a),
-                "{rule:?}, Mode = {mode}: {a} never mirrored: {:?}",
+                "{what}, Mode = {mode}: {a} never mirrored: {:?}",
                 w.fired
             );
         }
-        let want: &[&str] = if mode == 1 {
+        let want: &[&str] = if types {
             &[
                 "Quiet",
                 "Due",
@@ -546,9 +690,12 @@ fn tier1_the_real_decider_says_due_exactly_where_the_model_types() {
         for said in want {
             assert!(
                 w.said.contains(*said),
-                "{rule:?}, Mode = {mode}: never said {said}: {:?}",
+                "{what}, Mode = {mode}: never said {said}: {:?}",
                 w.said
             );
+        }
+        if stuck && types {
+            assert!(w.said.contains("Paced"), "{what}: {:?}", w.said);
         }
         assert!(w.states.len() > 100, "{}", w.states.len());
     }
@@ -623,10 +770,37 @@ fn tier1_each_planted_defect_disagrees_where_the_model_says() {
                         rule,
                         variant,
                         fault: Some(fault),
+                        key: 0,
+                        stuck: false,
                     },
                 ));
                 checks.push((fault, shows, among));
             }
+        }
+    }
+    // The stuck fact's: over the upgrade's notice with the key on, and with the key off judged
+    // as if it were on (`Key = 0`, where the model never opens the episode).
+    let stuck: [(Fault, i64, Shows); 2] = [
+        (Fault::StuckOverNotice, 1, |st| {
+            st["door"] == 1 && st["upg"] == 1
+        }),
+        (Fault::StuckWithoutKey, 0, |st| {
+            st["door"] == 1 && st["cond"] == 1
+        }),
+    ];
+    for (fault, key, shows) in stuck {
+        for variant in 0..3 {
+            runs.push((
+                1,
+                Run {
+                    rule: RuleId::WaitNudge,
+                    variant,
+                    fault: Some(fault),
+                    key,
+                    stuck: true,
+                },
+            ));
+            checks.push((fault, shows, None));
         }
     }
     let walked = walks(&runs, false);

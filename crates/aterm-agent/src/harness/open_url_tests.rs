@@ -522,6 +522,124 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
 
 #[cfg(unix)]
 #[test]
+fn headless_profiles_keep_persistent_data_after_authorization_errors() {
+    use crate::harness::headless_oauth::{browser_profile_dir, with_browser_profile};
+
+    let tmp = aterm_tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("accounts");
+    let label = browser_profile_dir(&store, Some("m27-2"));
+    std::fs::create_dir_all(&label).unwrap();
+    std::fs::write(label.join("Cookies"), b"existing label cookies").unwrap();
+    let no_mailbox = "headless browser requires sign-in, but no mailbox is configured";
+    assert_eq!(
+        with_browser_profile(
+            Some(&store),
+            Some("m27-2"),
+            Some("user@example.test"),
+            |dir| {
+                assert_eq!(dir, label);
+                std::fs::write(dir.join("Local State"), b"partially refreshed state").unwrap();
+                Err(no_mailbox)
+            }
+        ),
+        Err(no_mailbox),
+    );
+    assert_eq!(
+        std::fs::read(label.join("Cookies")).unwrap(),
+        b"existing label cookies"
+    );
+    assert_eq!(
+        std::fs::read(label.join("Local State")).unwrap(),
+        b"partially refreshed state"
+    );
+
+    let email = browser_profile_dir(&store, Some("user@example.test"));
+    std::fs::create_dir_all(&email).unwrap();
+    std::fs::write(email.join("Cookies"), b"existing email cookies").unwrap();
+    assert_eq!(
+        with_browser_profile(
+            Some(&store),
+            Some("m27-2"),
+            Some("user@example.test"),
+            |dir| {
+                assert_eq!(dir, email);
+                Err(no_mailbox)
+            }
+        ),
+        Err(no_mailbox),
+    );
+    assert_eq!(
+        std::fs::read(email.join("Cookies")).unwrap(),
+        b"existing email cookies"
+    );
+    assert_eq!(
+        std::fs::read(label.join("Cookies")).unwrap(),
+        b"existing label cookies"
+    );
+
+    let fresh = browser_profile_dir(&store, Some("fresh@example.test"));
+    assert!(!fresh.exists());
+    let timeout = "headless browser OAuth exceeded maximum steps without reaching callback";
+    assert_eq!(
+        with_browser_profile(
+            Some(&store),
+            Some("new-row"),
+            Some("fresh@example.test"),
+            |dir| {
+                assert_eq!(dir, fresh);
+                std::fs::write(dir.join("Cookies"), b"newly acquired cookies").unwrap();
+                Err(timeout)
+            }
+        ),
+        Err(timeout),
+    );
+    assert_eq!(
+        std::fs::read(fresh.join("Cookies")).unwrap(),
+        b"newly acquired cookies"
+    );
+
+    let wrong_account = "headless browser profile is signed in to a different account";
+    assert_eq!(
+        with_browser_profile(
+            Some(&store),
+            Some("m27-2"),
+            Some("user@example.test"),
+            |dir| {
+                assert_eq!(dir, email);
+                Err(wrong_account)
+            }
+        ),
+        Err(wrong_account),
+    );
+    assert_eq!(
+        std::fs::read(email.join("Cookies")).unwrap(),
+        b"existing email cookies"
+    );
+    assert_eq!(
+        std::fs::read(label.join("Cookies")).unwrap(),
+        b"existing label cookies"
+    );
+
+    for result in [Err(no_mailbox), Err(wrong_account), Ok(())] {
+        let mut scratch = None;
+        assert_eq!(
+            with_browser_profile(None, None, None, |dir| {
+                assert!(dir.is_dir());
+                std::fs::write(dir.join("Cookies"), b"scratch cookies").unwrap();
+                scratch = Some(dir.to_path_buf());
+                result
+            }),
+            result,
+        );
+        assert!(
+            !scratch.unwrap().exists(),
+            "the owned scratch profile is released"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
     use crate::harness::headless_oauth::{
         MailboxCredential, mailbox_config_from_override, poll_mailbox_config_for_credential,
@@ -588,6 +706,91 @@ fn mailbox_overrides_preserve_local_path_bytes_and_trim_urls() {
         assert!(cfg.dir.is_none());
     }
     assert!(!mailbox_config_from_override(OsStr::new(""), None).is_configured());
+}
+
+#[cfg(unix)]
+#[test]
+fn mailbox_secret_files_require_complete_regular_contents() {
+    use super::super::headless_oauth::{MailboxConfig, discover_mailbox_config_files};
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, symlink};
+
+    let home = aterm_tempfile::tempdir().expect("private secret home");
+    let secrets = home.path().join(".secrets");
+    std::fs::create_dir(&secrets).unwrap();
+    let secret = secrets.join("ai_mailbox_password");
+    let discovered = || {
+        discover_mailbox_config_files(Some(home.path()), None, None).and_then(|cfg| cfg.password)
+    };
+    let configured = || {
+        MailboxConfig::from_toml_str(
+            "password_file = '~/.secrets/ai_mailbox_password'\n",
+            Some(home.path()),
+        )
+        .and_then(|cfg| cfg.password)
+    };
+
+    assert!(discovered().is_none() && configured().is_none());
+    for (bytes, expected_discovery, expected_config) in [
+        (
+            b"  complete-secret\r\n".to_vec(),
+            Some("complete-secret".to_owned()),
+            Some("complete-secret".to_owned()),
+        ),
+        (
+            vec![b'x'; 4096],
+            Some("x".repeat(4096)),
+            Some("x".repeat(4096)),
+        ),
+        (vec![b'x'; 4097], None, None),
+        ([vec![b'x'; 4096], vec![0xff]].concat(), None, None),
+        (vec![0xff], None, None),
+        (b"\r\n  \r\n".to_vec(), None, None),
+        (
+            b"first\nsecond\n".to_vec(),
+            None,
+            Some("first\nsecond".to_owned()),
+        ),
+    ] {
+        std::fs::write(&secret, &bytes).unwrap();
+        assert_eq!(discovered(), expected_discovery);
+        assert_eq!(configured(), expected_config);
+        assert_eq!(std::fs::read(&secret).unwrap(), bytes);
+    }
+    std::fs::remove_file(&secret).unwrap();
+    std::fs::create_dir(&secret).unwrap();
+    assert!(discovered().is_none() && configured().is_none());
+    assert!(secret.is_dir());
+    std::fs::remove_dir(&secret).unwrap();
+
+    let fifo_name = std::ffi::CString::new(secret.as_os_str().as_bytes()).unwrap();
+    // SAFETY: one NUL-terminated private path; mkfifo retains no pointer.
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    assert!(discovered().is_none() && configured().is_none());
+    assert!(
+        std::fs::symlink_metadata(&secret)
+            .unwrap()
+            .file_type()
+            .is_fifo()
+    );
+    assert_eq!(
+        MailboxConfig::from_toml_str(
+            "password = 'explicit-secret'\npassword_file = '~/.secrets/ai_mailbox_password'\n",
+            Some(home.path()),
+        )
+        .and_then(|cfg| cfg.password)
+        .as_deref(),
+        Some("explicit-secret")
+    );
+    std::fs::remove_file(&secret).unwrap();
+
+    let target = home.path().join("regular-secret");
+    std::fs::write(&target, "aliased-secret\n").unwrap();
+    symlink(&target, &secret).unwrap();
+    assert_eq!(discovered().as_deref(), Some("aliased-secret"));
+    assert_eq!(configured().as_deref(), Some("aliased-secret"));
+    assert_eq!(std::fs::read_link(&secret).unwrap(), target);
+    assert_eq!(std::fs::read(&target).unwrap(), b"aliased-secret\n");
 }
 
 #[test]
@@ -1609,6 +1812,178 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         assert_eq!(
             generate_totp_at(&resolved_totp, 59).as_deref(),
             Some("287082")
+        );
+
+        let step_js = super::super::headless_oauth::oauth_step_js(
+            Some("sol-m27@proton.me"),
+            None,
+            false,
+            false,
+        );
+        assert!(step_js.contains("switched_account"));
+        assert!(step_js.contains("wrong_account"));
+
+        let (to_r, to_w) = std::io::pipe().expect("pipe1");
+        let (from_r, mut from_w) = std::io::pipe().expect("pipe2");
+        let wrong_thread = std::thread::spawn(move || {
+            let mut reader = to_r;
+            let mut pending = Vec::new();
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = reader.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                pending.extend_from_slice(&buf[..n]);
+                for req in super::super::headless_oauth::split_nul_messages(&mut pending) {
+                    let id = req.get("id").and_then(aterm_json::Value::as_u64).unwrap();
+                    let method = req
+                        .get("method")
+                        .and_then(aterm_json::Value::as_str)
+                        .unwrap_or("");
+                    let result = match method {
+                        "Target.createTarget" => aterm_json::json!({"targetId": "t_wrong"}),
+                        "Target.attachToTarget" => aterm_json::json!({"sessionId": "s_wrong"}),
+                        "Runtime.evaluate" => aterm_json::json!({
+                            "result": {
+                                "type": "object",
+                                "value": {
+                                    "state": "wrong_account",
+                                    "url": "https://claude.com/cai/oauth/authorize"
+                                }
+                            }
+                        }),
+                        _ => aterm_json::json!({}),
+                    };
+                    let mut out = aterm_json::to_vec(&aterm_json::json!({
+                        "id": id,
+                        "result": result
+                    }))
+                    .unwrap();
+                    out.push(0);
+                    let _ = from_w.write_all(&out);
+                    let _ = from_w.flush();
+                    if method == "Browser.close" {
+                        return;
+                    }
+                }
+            }
+        });
+        let mut wrong_cdp = super::super::headless_oauth::CdpClient::new(to_w, from_r);
+        let wrong_res = super::super::headless_oauth::drive_cdp_oauth_with_webmail(
+            &mut wrong_cdp,
+            "https://claude.com/cai/oauth/authorize?client_id=c1&redirect_uri=http%3A%2F%2F127.0.0.1%3A9123%2Fcallback&state=st_wrong",
+            Some("sol-m27@proton.me"),
+            Duration::from_secs(5),
+            Duration::ZERO,
+            |_, _| Err("mailbox must not be polled on wrong_account"),
+            |_| Ok(200),
+        );
+        assert_eq!(
+            wrong_res,
+            Err("headless browser profile is signed in to a different account")
+        );
+        wrong_thread.join().expect("wrong_account browser fixture");
+
+        assert_eq!(
+            super::super::headless_oauth::derive_account_label_from_email("sol-m27@proton.me")
+                .as_deref(),
+            Some("m27")
+        );
+        assert_eq!(
+            super::super::headless_oauth::derive_account_label_from_email("sun.m27.2@proton.me")
+                .as_deref(),
+            Some("m27-2")
+        );
+        assert_eq!(
+            super::super::headless_oauth::derive_account_label_from_email("solar.m27.3@proton.me")
+                .as_deref(),
+            Some("m27-3")
+        );
+
+        let one_line_cfg =
+            super::super::headless_oauth::MailboxConfig::from_toml_str("raw-secret-pass\n", None)
+                .expect("single-line password in ai-mailbox.toml");
+        assert_eq!(
+            one_line_cfg
+                .password_for(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some("raw-secret-pass")
+        );
+
+        let label_home = tmp.path().join("label_secrets_home");
+        std::fs::create_dir_all(label_home.join(".secrets")).expect("create .secrets");
+        std::fs::write(label_home.join(".secrets/m27_password"), "m27-file-pw\n")
+            .expect("write m27_password");
+        std::fs::write(
+            label_home.join(".secrets/m27-2_password"),
+            "m27-2-file-pw\n",
+        )
+        .expect("write m27-2_password");
+        std::fs::write(
+            label_home.join(".secrets/m27_totp"),
+            format!("{otpauth_uri}\n"),
+        )
+        .expect("write m27_totp");
+        let label_cfg = discover_mailbox_config_files(Some(&label_home), None, None)
+            .expect("discover from single-line secret files");
+        assert_eq!(
+            label_cfg.password_for(Some("sol-m27@proton.me")).as_deref(),
+            Some("m27-file-pw")
+        );
+        assert_eq!(
+            label_cfg
+                .password_for(Some("sun.m27.2@proton.me"))
+                .as_deref(),
+            Some("m27-2-file-pw")
+        );
+        assert_eq!(
+            label_cfg
+                .totp_secret_for(Some("sol-m27@proton.me"))
+                .as_deref(),
+            Some(otpauth_uri)
+        );
+
+        let thread_dir = tmp.path().join("multi_otp_thread_mb");
+        std::fs::create_dir_all(&thread_dir).expect("mkdir multi_otp_thread_mb");
+        let thread_cfg = MailboxConfig {
+            dir: Some(thread_dir.clone()),
+            ..MailboxConfig::default()
+        };
+        std::fs::write(
+            thread_dir.join("thread.eml"),
+            "To: <sol-m27@proton.me>\r\n\r\nEarlier verification code: 111111\r\nLatest verification code: 908172\r\n",
+        )
+        .expect("write two-OTP thread");
+        let mut thread_seen_otps = std::collections::BTreeSet::new();
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_or_webmail_for_credential(
+                &mut cdp,
+                &thread_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_secs(5),
+                Duration::ZERO,
+                &mut thread_seen_otps,
+            ),
+            Ok(MailboxCredential::Otp("111111".to_owned()))
+        );
+        assert!(
+            !thread_dir.join("thread.eml.clicked").exists(),
+            "thread file with remaining unseen OTP must not be marked clicked yet"
+        );
+        assert_eq!(
+            super::super::headless_oauth::poll_mailbox_or_webmail_for_credential(
+                &mut cdp,
+                &thread_cfg,
+                Some("sol-m27@proton.me"),
+                Duration::from_secs(5),
+                Duration::ZERO,
+                &mut thread_seen_otps,
+            ),
+            Ok(MailboxCredential::Otp("908172".to_owned()))
+        );
+        assert!(
+            thread_dir.join("thread.eml.clicked").exists(),
+            "thread file is marked clicked once its final unseen OTP is consumed"
         );
     }
 }

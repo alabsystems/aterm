@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! "No upgrade stuck for ever" as a bounded model (`docs/DESIGN-upgrade-never-stuck-2026-09-28.md` §4).
+//! "No upgrade stuck forever" as a bounded model (`docs/DESIGN-upgrade-never-stuck-2026-09-28.md` §4).
 
 use aterm_spec::derive::*;
 

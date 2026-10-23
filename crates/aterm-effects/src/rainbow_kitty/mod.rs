@@ -1695,7 +1695,7 @@ impl Engine {
         if !rows.is_empty() {
             self.restore_released_rows(rows);
         }
-        self.ribbon.plan(&ctx);
+        self.ribbon.plan_over(&ctx, Some(self.stardust.probe()));
         ctx.caret_t = self.ribbon.field_at_caret();
 
         self.meteor.set_hand_floor(self.ribbon.hand_floor_cell());
@@ -2078,6 +2078,19 @@ impl Engine {
     #[inline]
     pub fn catch_star(&mut self, star: companion::StarCatch, at: Instant) -> bool {
         self.stardust.catch(star.x, star.y, star.born, at)
+    }
+
+    /// The pet's drawn box this frame, window pixels (`None`: off glass): no star is drawn on its body ([`companion::PetShade`]).
+    #[inline]
+    pub const fn note_pet_body(&mut self, body: Option<(i32, i32, i32, i32)>) {
+        self.stardust.shade.note(body);
+    }
+
+    /// The body box the sky last drew no star on ([`companion::PetShade::body`]).
+    #[cfg(any(test, debug_assertions))]
+    #[must_use]
+    pub const fn pet_shade(&self) -> Option<(i32, i32, i32, i32)> {
+        self.stardust.shade.body()
     }
 
     /// Seam point 11 (`drain_sound_cues`).

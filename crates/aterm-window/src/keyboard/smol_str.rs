@@ -6,13 +6,10 @@
 
 //! The key-text string type.
 //!
-//! Added by the aterm project in 2026; see the repository NOTICE. Upstream winit re-exports
-//! `smol_str::SmolStr` here; this fork defines its own (2026-10-15,
-//! docs/AUDIT-third-party-2026-10-15.md, winit-core step 2), which retired the vendored
-//! `smol_str` 0.2.2 fork. Every caller, in this fork and in aterm, only builds one with
-//! [`SmolStr::new`] and reads it as a `str`, so the type is that and the traits the key and
-//! event types derive, with no `unsafe`: the inline arm is read back through a checked
-//! `str::from_utf8`.
+//! Upstream winit re-exports `smol_str::SmolStr` here; this fork defines its own
+//! (docs/AUDIT-third-party-2026-10-15.md, WC.2) with only what callers use: [`SmolStr::new`]
+//! and `From`, reading it as a `str`, and the traits the key and event types derive. It has no
+//! `unsafe`: the inline arm is read back through a checked `str::from_utf8`.
 
 use std::borrow::Borrow;
 use std::cmp::Ordering;

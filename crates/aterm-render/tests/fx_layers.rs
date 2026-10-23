@@ -562,6 +562,7 @@ fn grid_space_is_window_space_at_the_grid_origin() {
 #[test]
 fn a_linear_fx_sprite_is_the_free_sprite_stamp() {
     let mut rend = renderer();
+    rend.set_knock_out(false);
     let (cw, ch) = rend.cell_size();
     let (rows, cols) = (4u16, 14u16);
     let mut t = term(rows, cols);

@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Windows console driver for the `aterm` passthrough binary.
+//! Windows console passthrough driver: raw console modes, the ConPTY read loop, an input pump
+//! (console key events or a pipe), resize forwarding, and the shell `doctor` and `show-config`
+//! report.
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
@@ -91,7 +93,7 @@ struct InputRecord {
     event: EventUnion,
 }
 
-/// Ask the console for its window size; fall back to 24x80 (same as unix).
+/// Host console size as `(rows, cols)`, falling back to `(24, 80)`.
 pub(crate) fn host_winsize() -> (u16, u16) {
     // SAFETY: out-param query on the process stdout handle; the zeroed struct is a plain POD
     // out-buffer.

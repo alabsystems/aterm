@@ -697,3 +697,43 @@ fn a_light_water_drop_is_clear_blue() {
         "control: the dark drop is light"
     );
 }
+
+/// Round 2's judge (2026-10-23, the trail gallery's `enter-bottom`): water's
+/// Enter streak ran from the echo's end down across the line the command
+/// printed, and its drops sat in that line's word gaps, reading as
+/// punctuation. An Enter's leap keeps to the new prompt's row: no spark it
+/// lays stands on another. The control: a navigation jump of the same vector
+/// still spans the rows between.
+#[test]
+fn water_s_enter_keeps_its_leap_to_the_prompt_row() {
+    let g = geom();
+    let c = cfg(GlowStyle::Water, true);
+    let t0 = Instant::now();
+    let at = t0 + Duration::from_millis(5);
+    let laid = |enter: bool| {
+        let mut out = Vec::new();
+        let mut glow = CursorGlow::default();
+        glow.tick(Some((2, 24)), t0, &c, g, &mut out);
+        if enter {
+            glow.note_return(at);
+        } else {
+            glow.note_navigation(at);
+        }
+        glow.tick(Some((4, 2)), at, &c, g, &mut out);
+        glow.sparks
+            .iter()
+            .filter(|s| s.born == at)
+            .map(|s| s.row)
+            .collect::<Vec<u16>>()
+    };
+    let rows = laid(true);
+    assert!(
+        !rows.is_empty() && rows.iter().all(|&r| r == 4),
+        "the Enter's leap laid sparks on rows {rows:?}"
+    );
+    let rows = laid(false);
+    assert!(
+        rows.iter().any(|&r| r != 4),
+        "the control (a navigation jump) laid sparks on rows {rows:?} only"
+    );
+}

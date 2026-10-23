@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! The Windows arm's DECODERS (design `docs/DESIGN-system-awareness-2026-10-16.md` §5.4, §9.6, §16).
+//! The Windows arm's decoders: pure functions over the buffers Windows fills, so every host
+//! compiles and tests them (design `docs/DESIGN-system-awareness-2026-10-16.md` §5.4, §9.6, §16).
 
 use std::collections::HashMap;
 use std::mem::{offset_of, size_of};

@@ -30,6 +30,10 @@ struct DoorHost {
     board: Mutex<OccupancyReading>,
     /// The board as the host re-reads it for a slot rule's write; `None`, its board.
     reread: Mutex<Option<OccupancyReading>>,
+    /// The hung calls the host's facts reading names (`IdleHost::facts`); `None`, no reading.
+    facts: Mutex<Option<Vec<crate::supervise::BackgroundCall>>>,
+    /// The wall (unix ms) of the read the run is at, when the facts reading is taken.
+    facts_at: Mutex<i64>,
     calls: Mutex<Vec<String>>,
 }
 
@@ -89,6 +93,14 @@ impl IdleHost for DoorHost {
     }
     fn inform(&self, text: &str) {
         self.called(format!("inform {text}"));
+    }
+    fn facts(&self) -> Option<crate::supervise::FactsReading> {
+        self.called("facts".to_string());
+        let calls = self.facts.lock().expect("facts").clone()?;
+        Some(crate::supervise::FactsReading {
+            as_of_ms: *self.facts_at.lock().expect("facts_at"),
+            no_progress: calls,
+        })
     }
 }
 
@@ -325,6 +337,7 @@ impl<'a> Script<'a> {
                 if board {
                     *self.host.board.lock().expect("board") = room_at(looked_at);
                 }
+                *self.host.facts_at.lock().expect("facts_at") = at_ms;
                 before(&mut s, i);
                 let screen = s.screen().expect("the break's read");
                 s.clock_marks = Some((s.fx.mono(), at_ms));
@@ -1776,3 +1789,6 @@ fn a_fact_row_closes_no_remembered_wall() {
     assert_eq!(rebooked(crate::supervise::facts::FactKind::Hold.rule()), 0);
     assert_eq!(rebooked(RULE_CONTINUE), 1, "a policy's act closes it");
 }
+
+#[path = "facts_loop_tests.rs"]
+mod facts_loop;

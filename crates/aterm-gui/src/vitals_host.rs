@@ -68,12 +68,21 @@ const WHY_FIXTURE_SEAM: &str = "ATERM_DEV_WHY_FIXTURE";
 /// Pulls that arm the split set (`sys why`).
 pub(crate) static SPLIT_ARMED: Arming = Arming::new();
 
+/// How soon a reading no window shows is due again after one that gave `view`: at the engine's own `Demand` while a live job stands, and at the latest after Slow's 30 s while a program of this user waits at macOS's program check or its backed-up episode has not yet had its closing reading (leftover §5.1); else `None`. The engine's `Demand` itself stays its jobs' own, so a window's bars keep its cadence.
 fn job_demand_after(view: &aterm_vitals::jobs::JobsView) -> Option<Duration> {
     let live = view
         .rows
         .iter()
         .any(|r| r.verdict != aterm_vitals::jobs::Verdict::Exited);
-    let every = view.demand.every_ms().filter(|_| live)?;
+    let held =
+        !view.findings.program_check.is_empty() || view.findings.program_check_episode.is_some();
+    let every = [
+        view.demand.every_ms().filter(|_| live),
+        aterm_vitals::jobs::Demand::Slow.every_ms().filter(|_| held),
+    ]
+    .into_iter()
+    .flatten()
+    .min()?;
     Some(Duration::from_millis(every).max(JOBS_FLOOR))
 }
 
@@ -392,15 +401,14 @@ impl Parked {
     }
 }
 
-/// HOW MANY OF THE PTY READER'S FEEDS MOVED THE SCREEN (design §6.1, "What brings job demand
-/// back"): counted by the reader under its own hold of the term lock, after each feed, where the
-/// screen's generation ([`crate::control::screen_gen`]) is not the one it saw after its last feed.
-/// The output wake reads it WITHOUT the term lock ([`crate::App::vitals_output_kind`]), and a
-/// reading's terminal mode word holds while it stands ([`TtyWord`]). The wake used to read the
-/// generation itself and, meeting the lock held (a control worker's `text` or `status`, a watcher
-/// the same burst rang), counted the write as moved; the word used to fall to any read. Either way
-/// Muse Code's colour reset at rest, which moves no cell, armed `system_vitals`
-/// (`docs/measured/vitals-3-2026-10-22.md`, V1).
+/// HOW MANY OF THE PTY READER'S FEEDS MOVED THE SCREEN (`docs/DESIGN-system-awareness-2026-10-16.md`
+/// §6.1, "What brings job demand back"): counted by the reader under its own hold of the term lock,
+/// after each feed, where the screen's generation ([`crate::control::screen_gen`]) is not the one it
+/// saw after its last feed. The output wake reads it WITHOUT the term lock
+/// ([`crate::App::vitals_output_kind`]), so a lock held elsewhere (a control worker's `text` or
+/// `status`, a watcher the same burst rang) never passes for a move, and a reading's terminal mode
+/// word holds while it stands ([`TtyWord`]): a write that moves no cell, such as Muse Code's colour
+/// reset at rest, never arms `system_vitals` (`docs/measured/vitals-3-2026-10-22.md`, V1).
 #[derive(Debug, Default)]
 pub(crate) struct ScreenMoves {
     /// The generation the reader saw after its last feed; only the feeding side takes it.
@@ -424,8 +432,8 @@ impl ScreenMoves {
             // the output wake clears that latch, then reads this count. Without a fence on each
             // side both reads may take the value from before the other's write (the store-buffer
             // outcome, which Release and Acquire allow): the reader coalesces into a wake whose
-            // pass reads the old count, and the move is no edge until the next one. The term lock
-            // the wake took to read the screen used to order the two.
+            // pass reads the old count, and the move is no edge until the next one. The wake reads
+            // the count without the term lock, so only these fences order the two.
             fence(Ordering::SeqCst);
         }
     }

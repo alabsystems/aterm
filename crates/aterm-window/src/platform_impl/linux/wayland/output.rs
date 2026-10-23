@@ -6,10 +6,9 @@
 //! Modified by the aterm project in 2026; see the repository NOTICE. (A monitor is a
 //! first-party `aterm_wayland::output::Output`, read as of its last `done`, where upstream read
 //! smithay-client-toolkit's `OutputData`: docs/AUDIT-third-party-2026-10-15.md, LW.7. Its
-//! position is `wl_output.geometry`'s; sctk 0.19.2 bound xdg-output where the compositor offers
-//! it, as Mutter and weston do, and gave its logical position. aterm-gui reads a monitor's
-//! position to place a restored window and to cascade a new one, and on Wayland both only feed
-//! `set_outer_position`, which a Wayland client cannot do.)
+//! position is `wl_output.geometry`'s, not xdg-output's logical one. aterm-gui reads a
+//! monitor's position only to place a restored window and to cascade a new one, and on Wayland
+//! both only feed `set_outer_position`, which a Wayland client cannot do.)
 
 use aterm_wayland::output::{Output, OutputInfo};
 

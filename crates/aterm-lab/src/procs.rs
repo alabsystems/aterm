@@ -107,9 +107,8 @@ fn settled(pid: i32, exited: bool, limit: Duration) -> bool {
 /// The rest of [`wait_gone`] for a `pid` the kernel would not watch: it has
 /// ended, or it is ENDING — the kernel refuses the watch of a process already
 /// on its way out that still answers `kill(pid, 0)` and is not a zombie yet,
-/// so one read of [`alive`] took a SIGKILLed child of ours for alive (the
-/// merge contract's run of 2026-10-17, under load:
-/// `a_wait_that_runs_out_leaves_the_child_to_a_later_one`).
+/// so under load one read of [`alive`] can take a SIGKILLed child of ours for
+/// alive (`a_wait_that_runs_out_leaves_the_child_to_a_later_one`).
 fn ended_within(pid: i32, limit: Duration) -> bool {
     let deadline = std::time::Instant::now() + limit;
     loop {

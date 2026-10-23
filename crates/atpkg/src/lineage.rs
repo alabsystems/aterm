@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! LINEAGE — which compiler built a toolchain or a payload, decided by CONTENT and never by a name (owner order 2026-09-29: "NO STOCK RUST IN THE TOOLCHAIN FOR TRUST").
+//! LINEAGE — which compiler built a toolchain or a payload, decided by CONTENT and never by a name, so no stock Rust passes for Trust.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;

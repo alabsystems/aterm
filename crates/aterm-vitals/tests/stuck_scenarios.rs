@@ -11,8 +11,8 @@ mod scenarios;
 
 use aterm_vitals::jobs::wire::{exe_word, is_exe_word};
 use aterm_vitals::jobs::{
-    Block, Class, Consumer, Demand, GateWord, JobKind, JobsView, MuFrom, NamedWait, ProcState,
-    TierB, Verdict, WaitName, command_class,
+    Block, Class, Consumer, Demand, Findings, GateWord, HeldEpisode, JobKind, JobsView, MuFrom,
+    Named, NamedWait, ProcState, TierB, Verdict, WaitName, command_class,
 };
 use scenarios::{TICK_MS, curl, follow_fds, pipe_end, sleeper, spinner, tcp_fd};
 use world::{OutFile, Proc, World, hint};
@@ -395,6 +395,169 @@ fn findings_count_stopped_d_state_and_the_process_table() {
     assert!(
         lines.contains(&"finding kind=process-table own=3 limit=5333".to_owned()),
         "{lines:?}"
+    );
+}
+
+/// A held process outside every tab's tree: launchd adopted it (I1's `gh`).
+fn held_orphan(pid: u32, name: &str, aterm: bool) -> Proc {
+    let mut p = sleeper(pid, name);
+    p.ppid = 1;
+    p.held = true;
+    p.aterm = aterm;
+    p
+}
+
+/// What the view's program-check findings say: `(pid, for_ms, tab)` each.
+fn held_rows(v: &JobsView) -> Vec<(u32, u64, Option<u64>)> {
+    v.findings
+        .program_check
+        .iter()
+        .map(|n| (n.pid, n.for_ms, n.tab))
+        .collect()
+}
+
+#[test]
+fn held_rows_count_from_their_first_sighting_and_open_one_episode_when_backed_up() {
+    let mut w = World::new();
+    let mut gh = sleeper(401, "gh");
+    gh.held = true;
+    w.call(1, 300, 400, gh, None);
+    let v = w.observe();
+    assert_eq!(held_rows(&v), vec![(401, 0, Some(1))], "a first sighting");
+    assert_eq!(
+        v.findings.program_check_episode, None,
+        "one row at one reading: no episode yet (a normal exec reads held for under 0.3 ms)"
+    );
+    let opened = w.at + TICK_MS;
+    let v = w.tick(TICK_MS);
+    assert_eq!(held_rows(&v), vec![(401, TICK_MS, Some(1))]);
+    let backed_up = HeldEpisode {
+        opened_ms: opened,
+        for_ms: 0,
+        peak: 1,
+        oldest_ms: TICK_MS,
+    };
+    assert_eq!(
+        v.findings.program_check_episode,
+        Some(backed_up),
+        "held across two readings: backed up"
+    );
+    w.p(401).exec = 2;
+    let v = w.tick(TICK_MS);
+    assert_eq!(
+        held_rows(&v),
+        vec![(401, 0, Some(1))],
+        "an exec starts a new held time"
+    );
+    w.p(401).held = false;
+    let v = w.tick(TICK_MS);
+    assert!(v.findings.program_check.is_empty());
+    assert!(
+        v.findings.program_check_episode.is_some() && v.findings.program_check_drained.is_none(),
+        "one reading with nothing held does not close it"
+    );
+    let v = w.tick(TICK_MS);
+    assert_eq!(v.findings.program_check_episode, None);
+    assert_eq!(
+        v.findings.program_check_drained,
+        Some(HeldEpisode {
+            for_ms: TICK_MS,
+            ..backed_up
+        }),
+        "the second empty reading closes it: open to its last held reading"
+    );
+    let v = w.tick(TICK_MS);
+    assert_eq!(
+        v.findings.program_check_drained, None,
+        "said on one view only"
+    );
+
+    let mut w = World::new();
+    w.add(held_orphan(7002, "python3", false));
+    let v = w.observe();
+    assert_eq!(
+        v.findings.program_check_aterm,
+        (0, 0),
+        "started outside aterm"
+    );
+    let mut gh = sleeper(401, "gh");
+    gh.held = true;
+    w.call(1, 300, 400, gh, None);
+    w.add(held_orphan(7001, "agy", true));
+    let v = w.tick(TICK_MS);
+    assert_eq!(
+        held_rows(&v),
+        vec![(401, 0, Some(1)), (7001, 0, None), (7002, TICK_MS, None)],
+        "a member has its tab, an orphan none"
+    );
+    assert_eq!(
+        v.findings.program_check_aterm,
+        (2, 0),
+        "aterm's: the member and the one aterm's coalition holds, and their oldest"
+    );
+
+    let mut w = World::new();
+    for (pid, name) in [(7001, "agy"), (7003, "otool"), (7004, "codex")] {
+        w.add(held_orphan(pid, name, true));
+    }
+    let at = w.at;
+    let v = w.observe();
+    assert_eq!(
+        v.findings.program_check_episode,
+        Some(HeldEpisode {
+            opened_ms: at,
+            for_ms: 0,
+            peak: 3,
+            oldest_ms: 0,
+        }),
+        "three at one reading: a queue"
+    );
+}
+
+#[test]
+fn a_held_program_leaves_demand_to_the_jobs() {
+    let mut w = World::new();
+    w.add(held_orphan(7001, "gh", true));
+    let v = w.observe();
+    assert!(v.rows.is_empty(), "no job: {:?}", v.rows);
+    assert_eq!(
+        v.demand,
+        Demand::Idle,
+        "no job to watch: a window's bars keep the idle engine's cadence (the host reads a held \
+         program with no window)"
+    );
+    let v = w.tick(TICK_MS);
+    assert!(v.findings.program_check_episode.is_some());
+    assert_eq!(v.demand, Demand::Idle, "an open episode is no job either");
+}
+
+#[test]
+fn a_held_finding_prints_one_row_with_its_age() {
+    let f = Findings {
+        program_check: vec![
+            Named {
+                pid: 25311,
+                name: "gh".into(),
+                tab: None,
+                for_ms: 35_940_000,
+            },
+            Named {
+                pid: 72969,
+                name: "reroute codex\u{1b}[31m".into(),
+                tab: Some(3),
+                for_ms: 1_140_000,
+            },
+        ],
+        own_procs: 576,
+        ..Findings::default()
+    };
+    assert_eq!(
+        f.wire_lines(),
+        [
+            "finding kind=program-check pid=25311 exe=gh for_ms=35940000",
+            "finding kind=program-check pid=72969 exe=- for_ms=1140000",
+            "finding kind=process-table own=576",
+        ]
     );
 }
 

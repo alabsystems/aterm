@@ -4374,6 +4374,7 @@ impl CursorScene {
                 body_allowed: true,
                 momentum_glow: self.cursor.trail_enabled && self.cursor.momentum_glow,
                 user_tinted: self.cursor.color.chosen(),
+                accent_pinned: self.cursor.accent.is_some(),
             },
             &glow,
             comet,

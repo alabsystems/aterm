@@ -253,9 +253,7 @@ fn until_field(w: &World, sid: &str, key: &str, want: &str) -> Duration {
 
 /// The fake Claude: Claude Code's live zone painted by `printf`, with the
 /// terminal's cursor left on the prompt box's caret row as Claude Code keeps it
-/// (measured 2026-09-27; the server reads `idle` only at a box holding the
-/// cursor), advanced by
-/// Enter.
+/// (the server reads `idle` only at a box holding the cursor), advanced by Enter.
 fn write_fake_claude(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let rule = "─".repeat(120);
     let indicator = format!("{}12% until auto-compact", " ".repeat(96));
@@ -420,10 +418,9 @@ fn write_marked_program(dir: &std::path::Path, name: &str) -> PathBuf {
 }
 
 /// **A `meta` CHANGE AFTER THE FIRST READ REACHES THE BUS BY THE PUSH, AND
-/// ONLY BY THE PUSH.** Since 2026-09-23 the roster round reads `meta` only
-/// for a slot never read (or one a `GAP` marked unread); `attention=` — the
-/// field remote notifiers and `glance` read — `role=` and `title=` move on
-/// the `EVENT <local> meta` push.
+/// ONLY BY THE PUSH.** The roster round reads `meta` only for a slot never read
+/// (or one a `GAP` marked unread); `attention=` — the field remote notifiers and
+/// `glance` read — `role=` and `title=` move on the `EVENT <local> meta` push.
 #[test]
 fn a_meta_change_after_the_first_read_rides_the_push_alone() {
     let w = World::boot_with(

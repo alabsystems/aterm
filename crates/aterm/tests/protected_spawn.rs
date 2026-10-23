@@ -65,8 +65,7 @@ fn wait_with_output_bounded(mut child: Child) -> Output {
                 let out = join_bounded(stdout);
                 let err = join_bounded(stderr);
                 panic!(
-                    "CLI did not exit within {}s — the doesn't-exit regression this test \
-                     guards against; captured stdout={out:?} stderr={err:?}",
+                    "CLI did not exit within {}s; captured stdout={out:?} stderr={err:?}",
                     CLI_EXIT_DEADLINE.as_secs()
                 );
             }

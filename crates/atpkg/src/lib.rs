@@ -31,7 +31,6 @@ macro_rules! eprintln {
     };
 }
 
-/// abrew — aterm's Homebrew, an atpkg extension (`docs/DESIGN-abrew-2026-10-19.md`).
 pub mod abrew;
 pub mod activate;
 #[cfg(target_os = "macos")]
@@ -53,7 +52,7 @@ pub(crate) mod clone;
 /// Per-build exec roots (`<prefix>/compat/trust/<build>`) and `bin/` shim routing for Trust bundles.
 pub mod compat;
 pub mod config;
-/// `aterm pkg doctor`'s checks as converge items (docs/DESIGN-init-system-2026-10-20.md §4.2).
+/// `aterm pkg doctor`'s checks as converge items.
 pub mod converge;
 /// Stale copies of aterm beside the installed release (macOS).
 pub mod copies;
@@ -71,7 +70,7 @@ pub mod freespace;
 pub mod gate;
 pub mod gc;
 pub mod hooks;
-/// Which program and build a running image is, from the executable the kernel mapped (`docs/DESIGN-card-engine-2026-10-19.md` §3.2).
+/// Which program and build a running image is, from the executable the kernel mapped.
 pub mod image;
 /// Cheap, cross-process discovery of the next published toolchain index.
 pub mod index_probe;

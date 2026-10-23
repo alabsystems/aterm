@@ -119,8 +119,9 @@ fn shimmer_bounded_displacement_and_scoped_to_region() {
     let (rows, cols) = (12usize, 30usize);
     let (cw, ch) = gpu.cell_size();
     let mut term = Terminal::new(rows as u16, cols as u16);
+    // Stripes of white ground, no glyphs: the haze bends no letter.
     for r in (0..rows).step_by(2) {
-        term.process(format!("\x1b[{};1H{}", r + 1, "\u{2588}".repeat(cols)).as_bytes());
+        term.process(format!("\x1b[{};1H\x1b[47m{}\x1b[0m", r + 1, " ".repeat(cols)).as_bytes());
     }
     let mut input = term.cell_frame(rows, cols);
     input.cursor_visible = false;
@@ -377,5 +378,67 @@ fn shimmer_region_derivation_sanity() {
     assert!(
         gpu.shimmer_region_for_test(&dark).is_none(),
         "dark stream: no region"
+    );
+}
+
+/// The haze never bends a letter: it rises through the blank rows over the
+/// hot band and fades out at the foot of the first lettered row, so the
+/// letters there keep every pixel. The control is the same frame with that
+/// row blank: its haze rises the full height and bends the ground.
+#[test]
+fn shimmer_stops_at_the_foot_of_the_first_lettered_row() {
+    let mut gpu = gpu();
+    gpu.set_bloom(false); // isolate the shimmer layer
+    gpu.set_shimmer_phase_for_test(Some(0.31));
+    let (rows, cols) = (10usize, 30usize);
+    let (cw, ch) = gpu.cell_size();
+    let frame = |text: &str| {
+        let mut term = Terminal::new(rows as u16, cols as u16);
+        term.process(
+            format!(
+                "\x1b[5;1H\x1b[47m{}\x1b[0m\x1b[5;1H{text}",
+                " ".repeat(cols)
+            )
+            .as_bytes(),
+        );
+        let mut input = term.cell_frame(rows, cols);
+        input.cursor_visible = false;
+        input.cursor_glow_add = fire_comet(6, 4..14, cw, ch);
+        input.fire_patch = fire_marker();
+        input
+    };
+    let lettered = frame("$ echo the quick brown fox");
+    let blank = frame("");
+    let grid_top = (gpu.pad_top() + gpu.head()) as u32;
+    let foot = grid_top + (5 * ch) as u32;
+
+    let (_, open_y0, _, _) = gpu
+        .shimmer_region_for_test(&blank)
+        .expect("control: a region");
+    assert!(
+        open_y0 < foot,
+        "control: over a blank row the haze rises past its foot ({open_y0} < {foot})"
+    );
+    let (_, y0, _, _) = gpu
+        .shimmer_region_for_test(&lettered)
+        .expect("the blank row between the letters and the fire still shimmers");
+    assert_eq!(y0, foot, "the haze starts at the lettered row's foot");
+
+    let mut win = aterm_gpu::WindowGpu::new();
+    let mut render = |input: &aterm_render::RenderInput, on: bool| {
+        gpu.set_shimmer(on);
+        gpu.render_input(&mut win, input, None)
+    };
+    let (off, on) = (render(&lettered, false), render(&lettered, true));
+    let w = off.width;
+    let row = |px: &[u32]| px[(grid_top as usize + 4 * ch) * w..foot as usize * w].to_vec();
+    assert!(
+        row(&on.pixels) == row(&off.pixels),
+        "the lettered row keeps every pixel under the haze"
+    );
+    let (off, on) = (render(&blank, false), render(&blank, true));
+    assert!(
+        row(&on.pixels) != row(&off.pixels),
+        "control: the haze bends the blank row's striped ground"
     );
 }

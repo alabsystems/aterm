@@ -215,3 +215,117 @@ fn the_checkouts_are_read_from_gits_own_files() {
     assert_eq!(checkouts(&root), vec![root.clone()]);
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// The cat a schedule of forward keys (ms from the first) earns, read at
+/// each of `at` (ms from the first key): its opacity and whether it is
+/// fading out, presented every 16 ms as a window presents it.
+fn flying_kitty(keys: &[u64], at: &[u64]) -> Vec<(u8, bool)> {
+    use aterm_effects::kitty_cursor::CursorCat;
+    let t0 = std::time::Instant::now();
+    let mut cat = CursorCat::default();
+    let mut out = vec![(0u8, false); at.len()];
+    let end = at
+        .iter()
+        .copied()
+        .chain(keys.iter().copied())
+        .max()
+        .unwrap_or(0)
+        + 16;
+    let mut next_key = keys.iter().copied().peekable();
+    for ms in 0..=end {
+        let now = t0 + Duration::from_millis(ms);
+        let mut keyed = false;
+        while next_key.peek() == Some(&ms) {
+            next_key.next();
+            cat.on_key(now, true);
+            keyed = true;
+        }
+        let read: Vec<usize> = (0..at.len()).filter(|&i| at[i] == ms).collect();
+        if keyed || ms % 16 == 0 || !read.is_empty() {
+            let f = cat.frame(now);
+            for i in read {
+                out[i] = (f.alpha, f.fade_out > 0.0);
+            }
+        }
+    }
+    out
+}
+
+/// THE BURST EARNS THE FLYING KITTY (2026-10-22: `flying kitty` and the
+/// owner's `nyan rainbow` showed no kitty in any gallery frame; its head is
+/// earned by the typing momentum held in the cat's band for its dwell, and
+/// every burst the gallery typed ended at 0.19-0.54). `burst`'s own keys at
+/// its pace, and at a slow frame's (each key 80 ms), fed to the cat the
+/// window runs (`CursorCat`, presented every 16 ms): at its `fly` frame (30
+/// ms after key [`BURST_FLY_KEY`]), at `t0` and through `t470` the kitty
+/// flies whole; and of its landing frames (`l…`) at least two catch it
+/// landing (fading out on its exit), none before it has flown. NEGATIVE
+/// CONTROL: the `typing` scenario's line at its 60 ms never earns it: no
+/// frame from its first key to a second past its last draws the cat.
+#[test]
+fn the_burst_earns_the_flying_kitty_and_typing_does_not() {
+    let n = burst_keys().len();
+    assert!(
+        n + 2 < 72 && BURST_FLY_KEY + 1 < n,
+        "fixture: the line fits its row and flies before its end"
+    );
+    for every in [BURST_KEY_MS, 80] {
+        let keys: Vec<u64> = (0..n as u64).map(|k| k * every).collect();
+        let last = keys[n - 1];
+        let mut at = vec![keys[BURST_FLY_KEY] + 30, last + 30];
+        at.extend(BURST_AFTER_MS.iter().map(|ms| last + 30 + ms));
+        let seen = flying_kitty(&keys, &at);
+        let labels: Vec<String> = ["fly".to_string(), "t0".to_string()]
+            .into_iter()
+            .chain(BURST_AFTER_MS.iter().map(|&ms| burst_frame(ms)))
+            .collect();
+        for (label, &(alpha, fading)) in labels.iter().zip(&seen) {
+            if label.starts_with('l') {
+                continue;
+            }
+            assert!(
+                alpha == 255 && !fading,
+                "a key per {every} ms: at `{label}` the kitty is not flying whole (alpha \
+                 {alpha}, fading {fading}): {seen:?}"
+            );
+        }
+        let landing = labels
+            .iter()
+            .zip(&seen)
+            .filter(|(l, (alpha, fading))| l.starts_with('l') && *fading && *alpha > 0)
+            .count();
+        assert!(
+            landing >= 2,
+            "a key per {every} ms: {landing} of the landing frames catch the kitty \
+             landing: {:?}",
+            labels.iter().zip(&seen).collect::<Vec<_>>()
+        );
+    }
+    let typing = keys_of(TYPING_TEXT);
+    let keys: Vec<u64> = (0..typing.len() as u64)
+        .map(|k| k * TYPING_KEY_MS)
+        .collect();
+    let at: Vec<u64> = (0..=keys[keys.len() - 1] + 1000).step_by(10).collect();
+    let drawn = flying_kitty(&keys, &at)
+        .iter()
+        .filter(|(alpha, _)| *alpha > 0)
+        .count();
+    assert_eq!(
+        drawn, 0,
+        "control: the typing scenario's line draws the kitty in {drawn} frames"
+    );
+}
+
+#[test]
+fn burst_frames_are_named_for_their_time() {
+    assert_eq!(burst_frame(120), "t120");
+    assert_eq!(burst_frame(3600), "l3600");
+    assert_eq!(
+        instance_name("nyan rainbow", Theme::Dark, Scenario::Burst),
+        "nyan-rainbow-dark-burst"
+    );
+    assert_eq!(
+        paint(Scenario::Burst, Theme::Dark),
+        paint(Scenario::Typing, Theme::Dark)
+    );
+}

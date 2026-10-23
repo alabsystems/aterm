@@ -2139,6 +2139,8 @@ pub(crate) struct Acts {
     pub(crate) disk_board: &'static Shelf,
     /// The jobs board the worker reads its agent's background calls from ([`WorkerIdle::background_jobs`], the stall canary's evidence).
     pub(crate) jobs_board: &'static crate::vitals_jobs::JobsBoard,
+    /// Whether a call's leader still lives at its birth ([`WorkerIdle::facts`]' re-proof): live [`crate::vitals_jobs::leader_lives`], a test's own in tests.
+    pub(crate) leader_lives: fn(u32, u64) -> bool,
     /// The program check's board the worker reads whether macOS's program check is stuck from ([`WorkerIdle::program_check_stuck`]).
     pub(crate) program_check: &'static Mutex<crate::program_check_watch::Board>,
     /// The occupancy facts board the worker reads the machine from ([`WorkerIdle::occupancy`], the occupancy door's reading).
@@ -3176,6 +3178,26 @@ impl IdleHost for WorkerIdle {
             .acts
             .jobs_board
             .evidence(&self.sid, Instant::now())
+    }
+
+    /// This tab's live agent calls at no progress ([`IdleHost::facts`]), worst first, as of the board's view; `None` with no view or one older than [`crate::vitals_jobs::JOBS_FRESH`]. A call is named only once its leader is proved alive at its birth now ([`Acts::leader_lives`], after the board's lock is let go).
+    fn facts(&self) -> Option<aterm_agent::supervise::FactsReading> {
+        let (age, calls) = self
+            .hooks
+            .acts
+            .jobs_board
+            .facts(&self.sid, Instant::now())?;
+        let now_ms = i64::try_from(aterm_time::unix_millis()?).ok()?;
+        let age_ms = i64::try_from(age.as_millis()).unwrap_or(i64::MAX);
+        let lives = self.hooks.acts.leader_lives;
+        Some(aterm_agent::supervise::FactsReading {
+            as_of_ms: now_ms.saturating_sub(age_ms),
+            no_progress: calls
+                .into_iter()
+                .filter(|(leader, call)| call.birth.is_some_and(|birth| lives(*leader, birth)))
+                .map(|(_, call)| call)
+                .collect(),
+        })
     }
 
     /// The machine as the occupancy facts board last judged it for this session ([`Acts::occupancy`], live [`crate::occupancy_host::reading_for`]).
@@ -13071,6 +13093,7 @@ fn live_acts(store: Store, sock: String) -> Acts {
         }),
         disk_board: &crate::disk_board::SHELF,
         jobs_board: &crate::vitals_jobs::BOARD,
+        leader_lives: crate::vitals_jobs::leader_lives,
         program_check: &crate::program_check_watch::BOARD,
         occupancy: Arc::new(crate::occupancy_host::reading_for),
         occupancy_pace: Arc::new(crate::occupancy_host::pace_for),
@@ -17331,6 +17354,8 @@ impl Acts {
                 static INERT: crate::vitals_jobs::JobsBoard = crate::vitals_jobs::JobsBoard::new();
                 &INERT
             },
+            // Nothing is proved alive: no call is told of.
+            leader_lives: |_, _| false,
             program_check: {
                 static INERT: Mutex<crate::program_check_watch::Board> =
                     Mutex::new(crate::program_check_watch::Board::new());

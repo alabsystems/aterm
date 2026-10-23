@@ -116,7 +116,7 @@ fn the_tap_value_is_exact_and_only_it_is_ours() {
 /// ON WINDOWS THE VALUE NAMES A DRIVE PATH WITH `/` SEPARATORS. Claude Code runs a status-line
 /// command through Git Bash (else PowerShell), where a `\` is an escape: the path the window's
 /// canonical `current_exe` gives (`\\?\C:\…`) is spelled `C:/…`, which Git Bash, pwsh 7 and
-/// Windows PowerShell 5.1 each ran (measured 2026-10-17), and the value round-trips as ours.
+/// Windows PowerShell 5.1 each run, and the value round-trips as ours.
 #[cfg(windows)]
 #[test]
 fn a_windows_exe_is_named_with_forward_slashes() {
@@ -1128,9 +1128,18 @@ fn the_taps_row_reads_idle_and_keeps_the_mode_row_for_every_reader() {
 /// THE ONE BLOCK THAT ARMS THE TAP ([`Armed::arm`]), for the window's background lane and
 /// `aterm harness upgrade` alike: on when the switch is and there is an aterm to name, with
 /// the lone login the store binds to a one-row roster, else every login a roster of several
-/// names (neither where the clock was not read), and off otherwise.
+/// names as the store binds it, each login a renewal moved a row away from too (the logins
+/// the footer's `row_left` promises a restart for), and none where the clock was not read or
+/// the store's logins cannot be; off otherwise.
 #[test]
 fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
+    let abs = |path: &str| {
+        if cfg!(windows) {
+            format!("C:{path}")
+        } else {
+            path.to_owned()
+        }
+    };
     let root = scratch("armed");
     let roster = root.path().join(accounts::ACCOUNTS_FILE);
     std::fs::write(
@@ -1139,7 +1148,8 @@ fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
     )
     .expect("roster");
     let now = 1_792_050_000;
-    let login = "/s/main.1";
+    let login = abs("/s/main.1");
+    let login = login.as_str();
     let mut logins = accounts::Logins::default();
     accounts::note_renewed(
         &mut accounts::State::default(),
@@ -1174,11 +1184,10 @@ fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
         }),
         "no clock read: no login"
     );
-    let work = if cfg!(windows) {
-        "C:/s/work"
-    } else {
-        "/s/work"
-    };
+    let work = abs("/s/work");
+    let work = work.as_str();
+    let work_renewed = abs("/s/work.1");
+    let work_renewed = work_renewed.as_str();
     std::fs::write(
         &roster,
         format!(
@@ -1200,6 +1209,49 @@ fn the_tap_is_armed_by_one_block_with_the_rosters_lone_login() {
         "a login no row names"
     );
     assert_eq!(several.lone_for(None), None, "the default login needs none");
+    accounts::note_renewed(
+        &mut accounts::State::default(),
+        &mut logins,
+        "work",
+        Some(work),
+        work_renewed,
+        None,
+        now,
+    );
+    store.save_logins(&logins).expect("logins");
+    let renewed = arm(true, Some(exe.clone()), Some(now)).expect("armed");
+    assert_eq!(
+        renewed.listed,
+        vec![login.to_owned(), work_renewed.to_owned(), work.to_owned()],
+        "a row a renewal moved: its new login, and the one it left (`Row::was`), which the \
+         footer's `row_left` promises a restart for"
+    );
+    assert_eq!(renewed.lone_for(Some(work_renewed)), Some(work_renewed));
+    assert_eq!(
+        renewed.lone_for(Some(work)),
+        Some(work),
+        "a session still on the login the renewal left is tapped as that account's"
+    );
+    let logins_file = store.logins_file();
+    let kept = std::fs::read(&logins_file).expect("logins.json");
+    std::fs::write(&logins_file, "{ torn").expect("torn");
+    assert_eq!(
+        arm(true, Some(exe.clone()), Some(now)).map(|a| (a.lone_login, a.listed)),
+        Some((None, Vec::new())),
+        "logins.json unread: no login, as the host's attribution and the footer's gate refuse \
+         that roster too"
+    );
+    std::fs::write(&logins_file, kept).expect("restored");
+    std::fs::write(
+        &roster,
+        "[[account]]\nlabel = \"solo\"\nclass = \"dedicated\"\n",
+    )
+    .expect("one row, no login of its own");
+    assert_eq!(
+        arm(true, Some(exe.clone()), Some(now)).map(|a| (a.lone_login, a.listed)),
+        Some((None, Vec::new())),
+        "one row with no login of its own: only the default login is the machine's"
+    );
     assert_eq!(
         Armed::arm(true, || Some(exe.clone()), None, &store, Some(now)).map(|a| a.lone_login),
         Some(None),

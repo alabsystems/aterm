@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE FOOTER READS ITS OWN TAB'S USAGE TAP (owner, 2026-10-22: *"you also need to fix the
-//! weekly budget reporting for claude code harness"*): the resolver's weekly figure from this
-//! process's own `rl/<tab>-<pid>.json` beside Claude Code's `/usage` cache, the newer of the
-//! two, under the one age rule (`profile::WeeklyFigure::words`); a reason where there is none
-//! (`profile::WeeklyGap`), a restart promised only where a relaunch would carry the tap; and
-//! the accounts store's figures and walls under the same rule ([`super::store_week`]).
+//! THE FOOTER READS ITS OWN TAB'S USAGE TAP: the resolver's weekly figure from this process's own
+//! `rl/<tab>-<pid>.json` beside Claude Code's `/usage` cache, the newer of the two, under the one
+//! age rule (`profile::WeeklyFigure::words`); a reason where there is none (`profile::WeeklyGap`),
+//! a restart promised only where a relaunch would carry the tap; and the accounts store's figures
+//! and walls under the same rule ([`super::store_week`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -628,6 +627,51 @@ fn a_named_logins_tap_figure_is_its_own_and_its_restart_taps_the_login_every_rel
         ),
         "the same process, read again once the roster is down to one row whose renewal \
          moved it to another login: the lone login is that one, so no restart taps this"
+    );
+    fn two_rows_bound() -> Option<accounts::Roster> {
+        accounts::Store::at(&store()).bound(&two_rows()?, NOW).ok()
+    }
+    let shown = reread(
+        &timeline,
+        &mut identity,
+        Asks {
+            roster: two_rows_bound,
+            ..asks(|pid| on_login(untapped(pid)), stored)
+        },
+    );
+    assert_eq!(
+        (shown.email.as_deref(), shown.weekly, shown.weekly_gap),
+        (Some("tap@example.test"), None, Some(WeeklyGap::Untapped)),
+        "two rows again, this one renewed away from this login (`row_left`): the restart \
+         taps it"
+    );
+    let file = root().join(accounts::ACCOUNTS_FILE);
+    std::fs::write(
+        &file,
+        format!(
+            "[[account]]\nlabel = \"main\"\nclass = \"dedicated\"\ndir = \"{LOGIN}\"\n\
+             email = \"tap@example.test\"\n\
+             [[account]]\nlabel = \"work\"\nclass = \"dedicated\"\ndir = \"/logins/work-2\"\n\
+             email = \"work@example.test\"\n"
+        ),
+    )
+    .unwrap();
+    let relaunch = tap::Armed::arm(
+        true,
+        || {
+            Some(PathBuf::from(
+                "/Applications/aterm.app/Contents/MacOS/aterm",
+            ))
+        },
+        Some(&file),
+        &accounts::Store::at(&store()),
+        Some(NOW),
+    )
+    .expect("armed");
+    assert_eq!(
+        relaunch.lone_for(Some(LOGIN)),
+        Some(LOGIN),
+        "and every relaunch line does tap it, by the logins the same roster and store arm"
     );
     fn elsewhere(_: i32) -> Option<atpkg::caller_shell::ProcArgs> {
         Some(atpkg::caller_shell::ProcArgs {

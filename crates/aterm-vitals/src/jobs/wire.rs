@@ -246,6 +246,7 @@ fn wait_words(w: &Wait) -> String {
             || "a full pipe".to_owned(),
             |p| format!("a full pipe to pid {p}"),
         ),
+        WaitName::ProgramCheck => "macOS's program check".to_owned(),
         WaitName::Kernel => "an uninterruptible kernel wait".to_owned(),
         WaitName::EventLoop => "an event loop, nothing pending".to_owned(),
         WaitName::Unnamed => "a wait not named".to_owned(),
@@ -334,6 +335,14 @@ impl Findings {
         for n in &self.busy_orphans {
             out.push(format!(
                 "finding kind=busy-orphan pid={} exe={} for_ms={}",
+                n.pid,
+                exe_word(&n.name),
+                n.for_ms
+            ));
+        }
+        for n in &self.program_check {
+            out.push(format!(
+                "finding kind=program-check pid={} exe={} for_ms={}",
                 n.pid,
                 exe_word(&n.name),
                 n.for_ms

@@ -245,6 +245,10 @@ fn a_frame_measured_against_its_own_clean_twin_changes_nothing() {
         assert_eq!(field(&cell, "contrast"), field(&cell, "clean_contrast"));
         assert_eq!(field(&cell, "contrast"), round_to(contrast(INK, PAGE), 2));
         assert_eq!(cell.get("core_px").and_then(J::as_i64), Some(12));
+        assert_eq!(field(&cell, "local_contrast"), field(&cell, "contrast"));
+        assert_eq!(field(&cell, "local_min"), field(&cell, "contrast"));
+        assert_eq!(cell.get("local_under").and_then(J::as_i64), Some(0));
+        assert_eq!(cell.get("local_px").and_then(J::as_i64), Some(12));
     }
     let blank = J::Obj(measure_cell(&clean, Some(&clean), &GRID, 0, 5, 1));
     assert_eq!(blank.get("blank"), Some(&J::Bool(true)));
@@ -253,14 +257,23 @@ fn a_frame_measured_against_its_own_clean_twin_changes_nothing() {
     assert_eq!(diff.get("outside_caret_bbox"), Some(&J::Null));
 }
 
+/// The ribbon under `c` meets the glyph's foot: the whole cell's median ground is still the page, but the foot's row
+/// reads against the ribbon next to it, and the local measure (the one the thresholds judge) says so. `a` is untouched.
 #[test]
 fn a_ribbon_under_a_glyph_counts_against_it_and_nothing_else() {
     let (clean, frame) = (clean_frame(), trail_frame());
     let a = J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 0, 1));
     let c = J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 2, 1));
     assert_eq!(field(&a, "contrast"), field(&a, "clean_contrast"));
+    assert_eq!(field(&a, "local_contrast"), field(&a, "clean_contrast"));
     assert_eq!(field(&c, "clean_contrast"), field(&a, "clean_contrast"));
     assert_eq!(field(&c, "contrast"), field(&c, "clean_contrast"));
+    assert_eq!(
+        field(&c, "local_contrast"),
+        round_to(contrast(INK, RIBBON), 2)
+    );
+    assert_eq!(c.get("local_under").and_then(J::as_i64), Some(2));
+    assert_eq!(judged(&c), Some(round_to(contrast(INK, RIBBON), 2)));
     let caret_box = GRID.cell_box(1, 3, 1);
     let diff = diff_vs_clean(&frame, &clean, Some(caret_box));
     assert_eq!(diff.get("outside_caret_px").and_then(J::as_i64), Some(12));
@@ -303,6 +316,49 @@ fn a_glyph_on_a_bed_of_its_own_colour_is_unreadable() {
     );
 }
 
+/// A body over the top of a glyph, on less than half its ground: the whole-cell median ground stays the page (the
+/// gap: the cell measure reads it clean), while each ink pixel's own ring of ground lies on the body and the local
+/// measure takes the glyph under the bar. A body kept a ring of page away from the ink (the knock-out's hairline)
+/// reads clean locally too.
+#[test]
+fn a_body_over_part_of_a_glyph_is_judged_by_the_ground_next_to_its_ink() {
+    let clean = clean_frame();
+    let b = GRID.cell_box(1, 1, 1);
+    let lay = |rows: std::ops::Range<i64>| {
+        let mut frame = clean.clone();
+        for y in rows {
+            for x in b.x0..b.x1 {
+                let (xu, yu) = (usize::try_from(x).unwrap(), usize::try_from(y).unwrap());
+                if clean.at(xu, yu) == PAGE {
+                    frame.px[yu * W + xu] = RIBBON;
+                }
+            }
+        }
+        J::Obj(measure_cell(&frame, Some(&clean), &GRID, 1, 1, 1))
+    };
+    // On the glyph's top row and above it.
+    let over = lay(b.y0..b.y0 + 3);
+    assert_eq!(
+        field(&over, "contrast"),
+        field(&over, "clean_contrast"),
+        "negative control: the whole-cell ground misses a body on under half the ground"
+    );
+    assert_eq!(
+        field(&over, "local_contrast"),
+        round_to(contrast(INK, RIBBON), 2)
+    );
+    assert!(field(&over, "local_min") < LEGIBLE);
+    // The top row's two, and the stroke pixel below them whose nearest ground (2 px out) is mostly the body.
+    assert_eq!(over.get("local_under").and_then(J::as_i64), Some(3));
+    // Two pixels clear of the ink: the ring next to every ink pixel is still the page.
+    let clear = lay(b.y0..b.y0 + 1);
+    assert_eq!(
+        field(&clear, "local_contrast"),
+        field(&clear, "clean_contrast")
+    );
+    assert_eq!(clear.get("local_under").and_then(J::as_i64), Some(0));
+}
+
 #[test]
 fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
     let dir = scratch("report");
@@ -341,7 +397,16 @@ fn the_report_reads_the_sidecars_and_turns_ratios_into_failures() {
         .filter_map(|c| c.get("col")?.as_i64())
         .collect();
     assert_eq!(newest, vec![2, 1, 0]);
-    assert_eq!(r.get("failures"), Some(&J::Arr(Vec::new())));
+    // `c`'s foot reads against the ribbon next to it (local_contrast), under 3:1.
+    assert_eq!(
+        r.get("failures"),
+        Some(&J::Arr(vec![J::s("1 measured glyph cell(s) under 3.00:1")]))
+    );
+    let lenient = parse_args(&args(&[&png_s, "--find", "ab", "--min", "3"])).unwrap();
+    assert_eq!(
+        report(&lenient).unwrap().get("failures"),
+        Some(&J::Arr(Vec::new()))
+    );
 
     let strict = parse_args(&args(&[
         &png_s,

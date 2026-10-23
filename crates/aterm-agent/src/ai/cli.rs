@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! THE COMMAND: `aterm ai` (design §7–§9).
+//! `aterm ai`: status, doctor, login, review and fleet.
 
 use std::ffi::OsString;
 use std::io::{self, Read as _, Write};
@@ -24,31 +24,35 @@ use super::store::Store;
 
 /// The usage text.
 pub const USAGE: &str = "\
-aterm ai — AI CLIs on this machine (claude, codex, agy, muse): logins, doctor, and cross-AI reviews.
+aterm ai — this machine's AI CLIs (claude, codex, agy, muse): health, sign-in, cross-AI reviews.
 
-  aterm ai [status] [--json]    read-only status and health (exit 0)
+  aterm ai [status] [--json]    one row per CLI and a health line, read-only (exit 0)
   aterm ai doctor [--read-only] [--json] [--on <host>,\u{2026} | --fleet]
-                                inspect CLIs and, in an interactive terminal, sign in any
-                                that need it (--on / --fleet also run over ssh via [harness] hosts)
-  aterm ai login <cli>          run one CLI's vendor sign-in flow
+                                the same with fixes; for a person at a terminal (no
+                                --read-only or --json) it installs or signs in each CLI that
+                                needs it; exit 1 while one is signed out or not installed;
+                                --on / --fleet ([harness] hosts): those machines too, over ssh
+  aterm ai login <cli>          run one CLI's vendor sign-in (a person at a terminal)
   aterm ai review [--with <cli>,\u{2026} | --all] [--from <cli>] [--base <ref> | --uncommitted]
                   [--permissions <inherit|yolo|edits|ask|plan>] [--timeout <s>] [--json]
                   [--] [<what to look for> | -]
-                                ask other configured AI CLIs to review this directory's change
-                                at the asking agent's permission level
+                                ask the other AI CLIs used here to review this repository's
+                                change (the branch's since its upstream, unless --base or
+                                --uncommitted), by default at the asking agent's permission level
   aterm ai review --show <id> [--json]
                                 reprint a saved review (kept 24h)
-  aterm ai fleet [status]       show fleet document source, signer, and cached state
-  aterm ai fleet fetch          fetch and verify the fleet document from its https:// URL
+  aterm ai fleet [status]       the fleet document's source, signer, state and fetched copy
+  aterm ai fleet fetch          fetch and verify it from the https:// URL `[ai] fleet` names
+                                (`aterm ai doctor` also fetches, at most every 6h)
   aterm ai fleet keygen <secret-key-file>
                                 generate an Ed25519 signing keypair (0600, never overwritten)
   aterm ai fleet sign <doc> --key <secret-key-file>
                                 sign <doc> and write <doc>.sig beside it
   aterm ai fleet verify <doc> [--key <public-key>]
-                                verify <doc> against <doc>.sig
+                                verify <doc> against <doc>.sig (--key, else [ai] fleet_key)
 
-Config: `[ai]` in `aterm.toml` and `ai-fleet.toml` (or `[ai] fleet` path / https:// URL).
-See `aterm help ai`.";
+Config: `[ai]` in `aterm.toml`; the fleet document is `[ai] fleet` (a path or https:// URL),
+else `ai-fleet.toml` beside `aterm.toml`. See `aterm help ai`.";
 
 /// Everything the verbs read of the process, once.
 #[derive(Debug, Clone)]
@@ -275,7 +279,7 @@ fn pad(s: &str, w: usize) -> String {
     format!("{s:<w$}")
 }
 
-/// The doctor's text.
+/// The look as text; `fixes` adds the fix under each row that warns or fails.
 pub fn render_text(out: &mut dyn Write, look: &Look, fixes: bool, next: &str) {
     let s = &look.settings;
     let from = |f: config::From| match f {
@@ -348,8 +352,8 @@ fn default_reviewers<'s>(s: &'s Settings, asker: &str) -> Vec<&'s str> {
         .collect()
 }
 
-/// The asking CLI: `--from`, else the agent among the ancestors, else the agent's own
-/// variables, else the preferred CLI.
+/// The asking CLI when no `--from` names it: the agent among the ancestors, else the agent's
+/// own variables, else the preferred CLI.
 fn asker_id(env: &Env, s: &Settings) -> &'static str {
     if let Some((id, _)) = env.asker.agent() {
         return id;
@@ -363,11 +367,11 @@ fn asker_id(env: &Env, s: &Settings) -> &'static str {
     }
 }
 
-/// The doctor's reviews line.
+/// The text's `reviews:` line.
 fn reviews_line(look: &Look) -> String {
     let s = &look.settings;
     if !s.reviews.0 {
-        return format!("off ([ai] reviews = false, {})", s.reviews.1.word());
+        return format!("off (reviews = false, set in {})", s.reviews.1.word());
     }
     let asker = look.asker.agent().map_or(s.preferred.0.id, |(id, _)| id);
     let who = default_reviewers(s, asker);
@@ -417,7 +421,7 @@ fn rfc(n: Option<i64>) -> Value {
         })
 }
 
-/// The doctor's one JSON object.
+/// The look as one JSON object.
 #[must_use]
 pub fn render_json(look: &Look, now: i64, next: &str) -> String {
     let s = &look.settings;
@@ -915,7 +919,7 @@ fn fleet_poll(
                 None => {
                     let _ = writeln!(
                         out,
-                        "  could not be read (unreachable, or no aterm with `ai` there)"
+                        "  could not be read (ssh failed, or no usable `ai doctor --json` answer)"
                     );
                 }
             }
@@ -1177,7 +1181,7 @@ fn review_verb(
         return refuse(
             err,
             &format!(
-                "reviews are off ([ai] reviews = false, {})",
+                "reviews are off (reviews = false, set in {})",
                 s.reviews.1.word()
             ),
         );
@@ -1504,7 +1508,7 @@ fn fleet_sign(doc: &Path, key: &Path, out: &mut dyn Write) -> Result<(), String>
     );
     match seq {
         Some(n) => {
-            let _ = writeln!(out, "seq {n}: a machine takes it only over a lower seq");
+            let _ = writeln!(out, "seq {n}: a machine holding a higher seq refuses it");
         }
         None => {
             let _ = writeln!(out, "warning: no `seq`; URL fetches require `seq = <n>`");

@@ -1,25 +1,19 @@
 <!-- Copyright 2026 Andrew Yates -->
 <!-- SPDX-License-Identifier: Apache-2.0 -->
 
-# aterm-policy: spec recovery from its 60 unit tests
+# aterm-policy: specs recovered from its unit tests
 
-> Status 2026-10-16, after the merge with the tests-and-gates audit: the rows naming 36 tests it
-> deleted are gone, and the spec rows no longer cite those tests. Counts elsewhere in this file
-> were taken before.
+This is the crate's migration worklist. Each of the 19 specs below is to be proved through
+Trust/Clean about the compiled Rust function, and the tests it subsumes then deleted. None is
+proved yet.
 
-> Status 2026-10-16: this is the crate's migration worklist. Each of the 19 specs below is
-> proved through Trust/Clean about the compiled Rust function, and then the tests it subsumes
-> are deleted. Nothing has been proved or deleted yet.
+The specs restate what the crate's 27 `#[test]`s sample (`src/engine.rs` 3, `src/limits.rs` 12,
+`src/selector.rs` 3, `src/tests.rs` 8, `tests/serde_corpus.rs` 1), read against the code they
+reach (`src/lib.rs`, `src/profiles.rs`, `src/aliases.rs`). Decisions are consumed in
+`crates/aterm-core/src/terminal/policy_bridge.rs`. The claims come from reading the code, not
+from running it.
 
-Source: `crates/aterm-policy` (read only). I read every `#[test]`:
-`src/engine.rs` 7, `src/limits.rs` 16, `src/selector.rs` 17, `src/tests.rs` 19 and
-`tests/serde_corpus.rs` 1, so 60 in all. I also read the code they reach: `src/lib.rs`,
-`src/profiles.rs` and `src/aliases.rs`. Nothing was compiled or run. The claims below come
-from reading the code. To see how decisions are consumed, I also read
-`crates/aterm-core/src/policy_bridge.rs`. The recovery was then checked against an earlier
-draft of this catalogue. The two agree, and the corrections are in §5.
-
-Result: **19 specs**, covering **58 tests**. **2 tests are not spec samples** (§4).
+Result: **19 specs**; every test is a sample of one of them.
 
 Gap numbers in the `blocking_gaps` column refer to the table in §7 of
 `docs/AUDIT-trust-for-test-migration-2026-10-15.md`. Gap 0 (the installed seal publishes no
@@ -30,7 +24,7 @@ Lean-discharged row) blocks every spec, so it is listed on every row.
 - `rank(o)` = `OriginTag::trust_rank(o)`. In declaration order: Host 0, ConfigFile 1, User 2,
   UserTyped 3, Ai 4, PtySafe 5, Pty 6, NetworkUntrusted 7.
 - `strict(r)`: the response strictness order Drop 4, Warn 3, Rewrite 2, Ask 1, Execute 0.
-  Today it exists only as the `#[cfg(test)]` `profiles::refinement::response_rank`.
+  It exists only as the `#[cfg(test)]` `profiles::refinement::response_rank`.
   **Recommendation:** make it a spec-only fn, because `profile-refinement` is stated with it.
 - `Sel(s)` = `SequenceSelector::parse(s)`. `M(sel,seq)` = `sel.matches(seq)`.
   `pm(p,a)` = `SelectorParam::matches(p,a)`.
@@ -130,7 +124,6 @@ emit schema-fitting text.
 ## 2. Test → spec map (TSV)
 
 `primary` is the spec that retires the test. `also` lists the other specs the same test samples.
-A `primary` of `-` means the test is not a spec sample (§4).
 
 ```tsv
 file	test	primary	also
@@ -165,19 +158,14 @@ tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	p
 
 ## 3. Coverage
 
-- 60 original tests read. 58 map to one of the 19 specs. 2 are not spec samples (§4).
-- The biggest collapses: `selector-parse-denotation` (10 primary), `engine-evaluate-first-match`
-  (6), `builtin-profiles-wellformed` (6), `token-bucket-guards` (5), `selector-alias-expansion`
-  (5), `origin-dominates-order` (4), `limiter-set-consume-slot` (4).
-- `engine-evaluate-first-match` has 6 primary tests, but proving it makes
-  `builtin-profile-denotation` a finite case split, and `profile-refinement` then follows at once.
+- All 27 tests have a primary spec. 16 specs retire at least one test; `bucket-key-projection`,
+  `selector-alias-expansion` and `policy-toml-roundtrip` retire none.
+- The biggest collapses: `token-bucket-guards` (4 primary), `engine-evaluate-first-match` (3),
+  `builtin-profiles-wellformed` (3), `limiter-set-consume-slot` (3).
+- Proving `engine-evaluate-first-match` makes `builtin-profile-denotation` a finite case split,
+  and `profile-refinement` then follows at once.
 
-## 4. Tests that are not spec samples
-
-| test | why | recommendation |
-|---|---|---|
-
-## 5. Implied specs that look wrong, or disagree with the code
+## 4. Implied specs that look wrong, or disagree with the code
 
 1. **The Standard profile's doc comment contradicts the engine** (`src/profiles.rs`). Its Drop
    rules are gated `origin_min = Host`, and an origin that fails a gate falls through to the
@@ -228,7 +216,7 @@ tests/serde_corpus.rs	policy_documents_answer_as_recorded	policy-decode-schema	p
     does `builtin-profiles-wellformed`. The exact fact (`{Host, ConfigFile}`) is the stronger spec
     if the doc is corrected.
 
-## 6. Proof order (easiest, high value first)
+## 5. Proof order (easiest, high value first)
 
 No spec is blocked by gap 0 alone. Every one also needs gap 1 (non-scalar carriers), because
 even `trust_rank` is stated over an enum. For the first step, gap 1 means only finite Copy enums,
@@ -237,17 +225,17 @@ are the cheapest (finite enums, scalar fields, no loops, no generics, no other c
 
 1. **`origin-rank-table`** then **`origin-dominates-order`**. Const fns over an 8-variant
    enum and u8 comparison; the quantifiers are finite and decidable by enumeration. They retire
-   5 tests and are the origin-gate lemma `engine-evaluate-first-match` needs.
+   2 tests and are the origin-gate lemma `engine-evaluate-first-match` needs.
 2. **`bucket-key-projection`** and **`selector-param-matches`**. Field projection and
-   four-arm `&str` equality, no loops. They retire 3 tests and are the leaves of the matcher.
+   four-arm `&str` equality, no loops. They retire 1 test and are the leaves of the matcher.
 3. **`token-bucket-guards`**. u64 comparisons with an unchanged-state frame and an unread
-   clock. It retires 5 tests; only gap 11 (the generic clock) stands beyond the shared ones.
+   clock. It retires 4 tests; only gap 11 (the generic clock) stands beyond the shared ones.
 4. **`builtin-profiles-wellformed`**. Evaluating three constant constructors; decidable once
-   content models exist. Retires 6 tests.
+   content models exist. Retires 3 tests.
 5. `selector-matches-denotation`, `token-bucket-refill-debit`, `limiter-set-from-policy`,
    `limiter-set-consume-slot`, `limiter-slot-resolution` (loops, f64, frames).
 6. `selector-parse-denotation` → `selector-alias-expansion` → `engine-evaluate-first-match`
-   → `builtin-profile-denotation` → `profile-refinement`. The highest value chain (24 tests),
+   → `builtin-profile-denotation` → `profile-refinement`. The highest value chain (7 tests),
    but string parsing and the bucket invariant make it the hardest.
 7. `token-bucket-rate-safety` (trace induction under f64).
 8. `policy-toml-roundtrip`, `policy-decode-schema` last: they wait on gaps 9 and 12.

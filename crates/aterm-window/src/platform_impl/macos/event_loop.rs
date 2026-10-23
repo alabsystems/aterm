@@ -78,9 +78,9 @@ pub struct ActiveEventLoop {
     pub(super) mtm: MainThread,
 }
 
-/// LOCAL PATCH (aterm), 2026-09-26: the AppKit loop's delegate, or the
-/// display-free loop's state (`headless.rs`), whose arms below answer without
-/// AppKit or CoreGraphics' display services (a WindowServer connection).
+/// LOCAL PATCH (aterm): the AppKit loop's delegate, or the display-free loop's state
+/// (`headless.rs`), whose arms below answer without AppKit or CoreGraphics' display services
+/// (a WindowServer connection).
 #[derive(Debug)]
 enum Backend {
     AppKit(aterm_objc::Retained<ApplicationDelegate>),
@@ -581,11 +581,9 @@ impl<T> EventLoopProxy<T> {
     }
 
     pub fn send_event(&self, event: T) -> Result<(), EventLoopClosed<T>> {
-        // LOCAL PATCH (aterm), 2026-10-16: the signal comes AFTER the push, and
-        // a drain that found the queue's lock held relies on it
-        // (`wake_queue.rs`). 2026-10-17: only from the send that armed the
-        // wake; the sends behind it until the next take are drained by the
-        // turn that signal brings (`wake_queue.rs`, COALESCED WAKES).
+        // LOCAL PATCH (aterm): only the send that armed the wake signals, and only after its
+        // push. A drain that found the queue's lock held relies on that signal, and the sends
+        // behind it until the next take are drained by the turn it brings (`wake_queue.rs`).
         if self.sender.send(event).map_err(EventLoopClosed)? {
             unsafe {
                 CFRunLoopSourceSignal(self.source);

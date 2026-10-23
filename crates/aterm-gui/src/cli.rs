@@ -113,39 +113,39 @@ const HELP_HEAD: &str = concat!(
     "    aterm-gui [OPTIONS]\n",
     "    aterm-gui [-d <dir>] -e <command> [args...]\n\n",
     "OPTIONS:\n",
-    "    -e, --command <cmd> [args...]  Run <cmd> instead of $SHELL; window closes on exit.\n",
-    "                                   Consumes the rest of the command line.\n",
+    "    -e, --command <cmd> [args...]  Run <cmd> instead of the shell; the window closes when\n",
+    "                                   it exits. Takes the rest of the command line.\n",
     "    -d, --working-directory <dir>  Start the shell or command in <dir>.\n",
     "        --hold                     Keep the window open after the -e command exits.\n",
-    "        --font-px <px>             Font size in px at 1x, points on macOS (6..=200),\n",
-    "                                   for this launch. [config: font_px]\n",
+    "        --font-px <px>             Font size for this launch: px at 1x, points on macOS\n",
+    "                                   (6..=200). [config: font_px]\n",
     "        --font <name|path>         Primary font family or font file for this launch.\n",
     "                                   [config: font_family]\n",
     shell_flag_help!(),
-    "        --scale <f>                Force render scale factor (font + padding); headless,\n",
-    "                                   sets `image` capture DPI (e.g. 2 = 2x Retina).\n",
-    "        --gpu                      Force GPU rendering — the DEFAULT (Metal/GL/DX12;\n",
-    "                                   auto CPU fallback). [config: gpu]\n",
-    "        --cpu                      Force CPU renderer (last of --cpu/--gpu wins).\n",
-    "        --containment <mode>       Containment mode: user|safety|containment\n",
-    "                                   (invalid values fail closed to containment).\n",
+    "        --scale <f>                Force the render scale (font + padding); headless, it\n",
+    "                                   sets the `image` capture DPI (2 = 2x Retina).\n",
+    "        --gpu                      GPU rendering, the default (Metal/GL/DX12; falls back\n",
+    "                                   to CPU). [config: gpu]\n",
+    "        --cpu                      CPU rendering (the last of --cpu/--gpu wins).\n",
+    "        --containment <mode>       user (default) | safety | containment; an invalid\n",
+    "                                   value fails closed to containment.\n",
     "        --sandbox                  Shorthand for --containment containment.\n",
     "        --no-sandbox               Shorthand for --containment user.\n",
-    "        --control-sock <path>      Bind control socket at <path> (or 0/off to disable);\n",
+    "        --control-sock <path>      Bind the control socket at <path> (0 or off: none);\n",
     "                                   clients connect with --sock <path>.\n",
     "        --no-control-sock          Disable the control socket.\n",
-    "        --headless                 No window; engine + control socket only. Announces\n",
-    "                                   mode on stderr; SIGTERM/SIGINT/SIGHUP quits cleanly\n",
-    "                                   (a second exits immediately; ignored signals stay ignored).\n",
-    "        --lifeline-fd <n>          With --headless: shut down when descriptor <n> (pipe\n",
-    "                                   read end) reaches EOF because its launcher exited.\n",
+    "        --headless                 No window: engine + control socket only; says so on\n",
+    "                                   stderr. SIGTERM, SIGINT or SIGHUP quits cleanly, a\n",
+    "                                   second at once; an ignored signal stays ignored.\n",
+    "        --lifeline-fd <n>          With --headless: quit when descriptor <n> (a pipe's\n",
+    "                                   read end) reaches EOF, i.e. its launcher exited.\n",
     "        --ready-fd <n>             With --headless: write one byte to descriptor <n> (3+)\n",
     "                                   and close it once the control socket listens (closed\n",
     "                                   empty if the socket is disabled).\n",
     "        --columns <n>              Initial width in columns (20..=500).\n",
     "        --lines <n>                Initial height in rows (5..=300).\n",
-    "        --shell-integration        OSC 133/633 command marks (default on; no-op).\n",
-    "        --no-shell-integration     Disable shell-integration marks.\n",
+    "        --shell-integration        OSC 133/633 command marks (the default; a no-op).\n",
+    "        --no-shell-integration     Start shells without shell integration.\n",
     "        --verbose                  Verbose diagnostics on stderr.\n",
     "        --diagnose                 Print diagnostics (version, build, renderer,\n",
     "                                   capabilities, config, env) and exit.\n",
@@ -165,9 +165,8 @@ const HELP_HEAD: &str = concat!(
     "    -V, --version                  Print the version and exit.\n\n",
 );
 
-/// The macOS keyboard-shortcut help: the common Cmd-* chords. Other platforms list the
-/// Ctrl+Shift defaults seeded by [`crate::keybinding::Keybindings::platform_defaults`] (no Cmd
-/// key there, and the desktop grabs Super).
+/// The macOS KEYS section: the common Cmd chords, which the menu bar and `on_key` own (macOS
+/// seeds no default keybindings).
 #[cfg(target_os = "macos")]
 const KEYS_HELP: &str = concat!(
     "KEYS (in the window):\n",
@@ -175,21 +174,21 @@ const KEYS_HELP: &str = concat!(
     "    Cmd-= / Cmd--     Zoom font in / out.   Cmd-0  Reset zoom.\n",
     "    Cmd-click         Open hyperlink, URL (http/https/mailto) or file:line citation;\n",
     "                      Cmd-Option-click where the program tracks the mouse.\n",
+    "    Option-drag       Rectangular selection (a plain one where the program tracks the mouse).\n",
     "    Cmd-F             Find (screen + scrollback): type, Enter/Shift-Enter, Esc.\n",
-    "    Cmd-S / Cmd-R     Emacs search forward / backward; repeat to navigate + wrap.\n",
-    "    Cmd-,             Open Settings tab; Manual edits aterm.toml.\n",
+    "    Cmd-S / Cmd-R     Search forward / backward (Emacs style); repeat to step, wrapping.\n",
+    "    Cmd-,             Settings tab (its Manual page edits aterm.toml).\n",
     "    Cmd-N / Cmd-T     New window (same process) / new tab (same window).\n",
     "    Cmd-W             Close focused pane -> tab -> window; last window quits aterm.\n",
     "    Cmd-Shift-T       Reopen most recently closed tab.\n",
     "    Cmd-Shift-] / [   Next / previous tab (wraps).   Cmd-1..9  Nth tab.\n",
     "    Cmd-Shift-P       Command Palette (every action, searchable).\n",
     "    Cmd-Opt-Arrow     Focus pane in that direction (no menu item).\n",
-    "    The menu bar lists every action (splits, move-tab, and more) with its live chord.\n\n",
+    "    The menu bar shows the rest (splits, moving tabs, and more) with their chords.\n\n",
 );
 
 /// The non-macOS KEYS section, generated from
-/// [`crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS`] (the table `platform_defaults()`
-/// seeds) so it cannot drift from the window.
+/// [`crate::keybinding::Keybindings::PLATFORM_DEFAULT_PAIRS`] so it cannot drift from the window.
 #[cfg(not(target_os = "macos"))]
 fn keys_help() -> String {
     let mut groups: Vec<(&str, Vec<&str>)> = Vec::new();
@@ -209,21 +208,21 @@ fn keys_help() -> String {
         .max()
         .unwrap_or(0);
     let mut s = String::from(
-        "KEYS (in the window; no menu bar off macOS, so these chords ARE the app menu —\n",
+        "KEYS (in the window; there is no menu bar, so these defaults are the app's chords,\n",
     );
-    s.push_str("each row is a DEFAULT, rebindable via [keybindings]; see --list-keybinds):\n");
+    s.push_str("each rebindable in [keybindings]; --list-keybinds lists them):\n");
     for (chords, action) in rows {
         s.push_str(&format!("    {chords:<width$}  {action}\n"));
     }
     s.push_str("    ctrl+click  Open hyperlink, URL (http/https/mailto) or file:line citation;\n");
     s.push_str("                ctrl+alt+click where the program tracks the mouse.\n");
+    s.push_str("    shift+drag  Select text where the program tracks the mouse.\n");
     s.push_str(
-        "    shift+drag  Select text where the program tracks the mouse (alt+drag too).\n\n",
+        "    alt+drag    Rectangular selection (a plain one where the program tracks the mouse).\n\n",
     );
     s
 }
 
-/// The macOS KEYS section, hand-written: macOS seeds no default chords (the menu bar owns them).
 #[cfg(target_os = "macos")]
 fn keys_help() -> String {
     KEYS_HELP.to_string()
@@ -231,10 +230,11 @@ fn keys_help() -> String {
 
 const HELP_TAIL: &str = concat!(
     "CHILD-SHELL ENV HYGIENE:\n",
-    "    Spawned shells strip AI-agent context variables before exec (CLAUDE*,\n",
-    "    ANTHROPIC_*, COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_*,\n",
-    "    _DEVTOOL_*) via aterm_types::env_sanitize so outer agent state never leaks in.\n\n",
-    "CONFIG:  <aterm.toml>  (live settings reload; launch/session settings disclose their timing; precedence flag > config > default)\n",
+    "    Spawned shells start without AI-agent variables (CLAUDE*, ANTHROPIC_*,\n",
+    "    COPILOT_*, CODEX_*, ANTIGRAVITY_*, GEMINI_*, CURSOR_*, AI_*, _DEVTOOL_*),\n",
+    "    so an outer agent's state never reaches them.\n\n",
+    "CONFIG:  <aterm.toml>  (live settings reload on save; launch settings apply at\n",
+    "         relaunch, session settings to new sessions; flag > config > default)\n",
     "  Appearance  font_px, font_family, theme (name, or dark:<name>,light:<name>),\n",
     "              foreground, background, cursor_color, selection_color,\n",
     "              selection_foreground, palette [array of #RRGGBB], window_theme,\n",
@@ -272,12 +272,11 @@ const HELP_TAIL: &str = concat!(
 
 const CONFIG_PATH_SLOT: &str = "<aterm.toml>";
 
-/// The variables the loader resolves the config path from, for the one message
-/// that has to name them: none of them is set.
+/// The variables the config path resolves from, named when none of them is set.
 #[cfg(windows)]
-const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME, APPDATA and HOME";
+pub(crate) const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME, APPDATA and HOME";
 #[cfg(not(windows))]
-const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME and HOME";
+pub(crate) const CONFIG_PATH_VARS: &str = "XDG_CONFIG_HOME and HOME";
 
 fn config_path_display() -> String {
     match crate::app_config::config_path() {
@@ -310,8 +309,8 @@ macro_rules! starter_shell_block {
     () => {
         "\
 # shell = \"bash\"        # interactive shell: \"bash\" (finds Git Bash even off PATH),
-#                       # \"pwsh\", \"cmd\", \"wsl\", \"nu\", or a path. Unset = platform
-#                       # default (pwsh > powershell > %COMSPEC% > cmd; `aterm doctor`
+#                       # \"pwsh\", \"cmd\", \"wsl\", \"nu\", or a path. Unset = pwsh >
+#                       # powershell > %COMSPEC% > cmd (`aterm --window --show-config`
 #                       # names it). Override with --shell; applies to new sessions.
 #                       # Shell integration is injected for zsh/bash/fish/pwsh and
 #                       # \"wsl\" (bash login); \"cmd\" is partial (no command text or
@@ -326,8 +325,9 @@ macro_rules! starter_shell_block {
     () => {
         "\
 # shell = \"bash\"        # interactive shell: a name on PATH (\"bash\", \"zsh\", \"fish\")
-#                       # or a path. Unset = $SHELL, else login shell (`aterm doctor`
-#                       # names it). Override with --shell; applies to new sessions.
+#                       # or a path. Unset = $SHELL, else the login shell (`aterm
+#                       # --window --show-config` names it). Override with --shell;
+#                       # applies to new sessions.
 #                       # Shell integration is injected for zsh, bash, fish and pwsh.
 # shell_args = [\"-l\", \"-i\"]  # extra argv after the shell (macOS starts a login shell
 #                       # already; elsewhere aterm starts an interactive non-login shell)
@@ -341,7 +341,7 @@ const STARTER_CONFIG: &str = concat!(
 # aterm — <aterm.toml>
 # Every setting is optional; uncomment to override. Live settings reload on save;
 # renderer/initial-grid settings require relaunch, and session settings require a new session.
-# Launch flags (aterm-gui --help) take precedence over this file for that launch.
+# Launch flags (aterm --window --help) take precedence over this file for that launch.
 
 # --- shell --------------------------------------------------------------------
 ",
@@ -368,10 +368,10 @@ const STARTER_CONFIG: &str = concat!(
 # selection_inactive = false       # dim selection band while window is unfocused
 # split_focus_mark = true          # in a split, ink the divider edge of the focused pane
 # scrollbar = true                 # overlay scrollbar in right gutter (default: Windows on, else off)
-# window_colorspace = \"srgb\"       # macOS GPU CAMetalLayer tag: srgb (colour-managed) | display-p3 (legacy stretched)
+# window_colorspace = \"srgb\"       # macOS GPU CAMetalLayer tag: srgb (colour-managed) | display-p3 (sRGB values read as P3)
 # minimum_contrast = 1             # per-cell WCAG contrast floor, 1 (off) ..= 21; unset on Windows holds theme colours to 4.5:1
 # background_opacity = 1           # macOS GPU window glass, 0 (transparent) ..= 1 (solid); <1 auto-floors contrast to 4.5:1
-# background_material = \"none\"     # macOS vibrancy behind glass: none | hud | sidebar | under-window
+# background_material = \"none\"     # material behind glass (macOS vibrancy; a DWM backdrop on Windows): none | hud | sidebar | under-window
 # window_padding = 12              # interior padding, logical px per edge (0..=64; hot-applies)
 # window_padding_top = 2           # top-edge override (0..=window_padding; titlebar band supplies the rest)
 # bold_is_bright = true            # SGR bold promotes ANSI 0-7 to bright 8-15
@@ -400,7 +400,7 @@ const STARTER_CONFIG: &str = concat!(
 #                                  #   | rainbow kitty flying (aliases: \"flying kitty\", \"kitty flying\", \"nyan rainbow\", \"nyan\", \"rainbow\")
 #                                  #   | rainbow kitty flat (aliases: \"rainbow flat\", \"flat rainbow\", \"nyan flat\")
 #                                  #   | phaser | fire | water | laser (alias: \"lightning\") | comet | sparkle | lumen | beam
-#                                  #   | classic (v0.28 comet + jump trail; \"cursor\" colour = classic mono) | off
+#                                  #   | classic (comet + jump trail) | classic mono | off
 # cursor_trail_color = \"#50FA7B\"      # base colour (\"cursor\" uses live cursor colour; unset = style default or cursor colour)
 # cursor_trail_accent = \"#7AA2F7\"     # comet-tail / ring colour (default: brightened base)
 # cursor_trail_ms = 260                # fade duration in ms (30..=2000)
@@ -408,6 +408,13 @@ const STARTER_CONFIG: &str = concat!(
 # cursor_trail_intensity = 1           # trail brightness 0..=1 (every style)
 # cursor_trail_radius = 0.6            # bloom-crown radius in cells (0..=2)
 # cursor_trail_ring = true             # expanding landing \"ping\" ring on a jump (default ON)
+# cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
+# cursor_trail_bloom_strength = 0.85   # 0..=3 (halo intensity)
+# cursor_trail_bloom_radius = 2.2      # 0.5..=8 half-res blur texels (default 2.2; 1.8 for rainbow kitty)
+# cursor_fire_shimmer = true           # GPU-only heat-haze refraction above burning cells (default ON)
+# hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR / Windows scRGB; default ON)
+# cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only; 0 = off)
+
 # --- sound (Settings > Sound) -------------------------------------------------
 # trail_sounds = true              # master synth switch (typing notes, song, bed, chimes, bonk; macOS-only, default ON)
 # trail_sound_volume = 0.4         # 0..=1 synth level (default 0.4 ~= -22 dBFS; does not scale bell_sound)
@@ -418,13 +425,6 @@ const STARTER_CONFIG: &str = concat!(
 # trail_sound_bed = true           # continuous ambient bed texture behind notes (default ON)
 # trail_sound_riff = true          # held-key sing-along song (default ON; false quiets song, keeps visuals)
 # bell_sound = true                # audible BEL beep (macOS NSBeep / Windows MessageBeep / X11 bell; default ON)
-# cursor_trail_bloom = true            # GPU-only soft halo around the comet (default ON)
-# cursor_trail_bloom_strength = 0.85   # 0..=3 (halo intensity)
-# cursor_trail_bloom_radius = 2.2      # 0.5..=8 half-res blur texels (default 2.2; 1.8 for rainbow kitty)
-# cursor_fire_shimmer = true           # GPU-only heat-haze refraction above burning cells (default ON)
-# hdr_glow = true                      # EDR cursor glow above SDR white (GPU + HDR panel, macOS EDR / Windows scRGB; default ON)
-# cursor_glow_sdr_boost = 0.25         # GPU-only SDR crown strength 0..=1 (dark themes only; 0 = off)
-# temporal_recording = false       # per-session replay spine (`aterm-ctl temporal [tick]`); default off, applies to new sessions
 
 # --- text shaping -------------------------------------------------------------
 # ligatures = true                 # programming ligatures (=>, !=, >=, ===, ...)
@@ -448,7 +448,7 @@ const STARTER_CONFIG: &str = concat!(
 # font_weight_dark_nudge = 0       # extra wght on dark themes (applied only when grid-safe)
 
 # --- behaviour ----------------------------------------------------------------
-# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); false or --cpu forces CPU next launch
+# gpu = false                      # GPU rendering is ON by default (auto CPU fallback); false forces CPU from the next launch
 # copy_on_select = true            # auto-copy mouse selection to CLIPBOARD (default on; off on Linux, where selection owns PRIMARY)
 # show_build_badge = false         # floating top-right v<version>·<build> pill (default off; menu bar shows v<version>)
 # confirm_multiline_paste = true   # confirm unbracketed multiline paste (sheet / dialog / banner)
@@ -458,6 +458,7 @@ const STARTER_CONFIG: &str = concat!(
 #                                  #   macOS: UNUserNotificationCenter from Applications/aterm.app once authorized,
 #                                  #   else /usr/bin/osascript when run outside an app bundle).
 #                                  #   Program OSC 9/99/777 notifications are gated by allow_notifications below
+# temporal_recording = false       # per-session screen history for `aterm ctl temporal` (default off; new sessions)
 
 # --- program permissions (default OFF unless noted) --------------------------
 # allow_window_ops = false         # XTWINOPS title/grid/pixel/cell-size reports (position/screen size stay unanswered);
@@ -497,7 +498,7 @@ const STARTER_CONFIG: &str = concat!(
 # ignore_words = [\"fluff\"]         # never decorate these as profanity
 # [sparkle_words.feline]
 # enabled = true                   # default ON (requires master enabled)
-# style = \"cat\"                    # \"cat\" (graphic) | \"paw\" (legacy ink-only)
+# style = \"cat\"                    # \"cat\" (graphic) | \"paw\" (ink only)
 # magic = true                     # Fortune (1/512) / Nebula (1/1024) rare cats
 # allow_bare_cat = true            # default ON: decorate literal 3-letter \"cat\"
 # cjk_single_char = false          # decorate lone 猫 anywhere
@@ -519,13 +520,13 @@ const STARTER_CONFIG: &str = concat!(
 # extra_words = [\"megathink\"]      # extra words to treat as emphasis
 # ignore_words = [\"turbo\"]         # never decorate these as emphasis
 
-# --- matrix rain (PHOSPHOR; purely visual — falls under text in empty cells only;
-# copy/selection/search/recordings read exact bytes). OFF by default; per-session
-# toggles (View > Matrix Rain, palette, `aterm-ctl rain`, `toggle_matrix_rain`)
-# override `enabled` either way for that session's lifetime. -------------------
+# --- matrix rain (purely visual: drawn in empty cells, under text; copy, selection,
+# search and recordings read the exact bytes). OFF by default; per-session toggles
+# (View > Matrix Rain, palette, `aterm ctl rain`, `toggle_matrix_rain`) override
+# `enabled` either way for that session's lifetime. ------------------------------
 # [matrix_rain]
 # enabled = false                  # default for every session (OFF; per-session toggles override)
-# fps = 30                         # WORKING tick rate (12..=60; CALM always runs 12 Hz)
+# fps = 30                         # tick rate in \"working\" weather (12..=60; \"calm\" runs 12 Hz)
 # density = 6                      # column density (1..=12)
 # speed = 5                        # fall speed (1..=10; 5 = neutral)
 # trail = 5                        # trail length (1..=10; 5 = neutral)
@@ -556,7 +557,7 @@ const STARTER_CONFIG: &str = concat!(
 # universal_control = \"off\"        # \"off\" (default: disable for this host) | \"leave\"
 # rosetta = true                   # Apple silicon: install Rosetta 2 when missing (no password) | false
 
-# --- system awareness: live Global / aterm / Tab stats bars (⌘I opens close-up)
+# --- system awareness: live Global / aterm / Tab stats bars (⌘I: Stats Lens)
 # [sys]
 # stats_bars = \"deck\"              # \"deck\" (default: under titlebar) | \"sill\" (bottom padding) | \"off\"
 # stats_deck_size = \"auto\"         # \"auto\" (default: Full on tall window, Folded on short) | \"full\" | \"folded\"
@@ -568,7 +569,7 @@ const STARTER_CONFIG: &str = concat!(
 # \"shift+enter\" = \"\\n\"        # send a literal newline (LF)
 # 'f5' = '\\e[15~'              # ESC[15~
 #
-# --- keybindings (MUST be the LAST section: a TOML table runs to EOF) ---------
+# --- keybindings (a [table] runs to the next header: top-level keys go above it)
 # [keybindings]
 # \"ctrl+shift+t\" = \"new_tab\"
 ",
@@ -1118,7 +1119,7 @@ mod tests {
 
     #[test]
     fn a_vanished_start_folder_stops_a_launch_and_never_an_update_relaunch() {
-        let gone = std::env::temp_dir().join("aterm-start-dir-that-is-not-there-r8-6");
+        let gone = std::env::temp_dir().join("aterm-start-dir-that-is-not-there");
         let gone = gone.to_string_lossy();
         assert!(
             super::start_dir_refusal(&gone, false).is_some_and(|why| why.contains(&*gone)),
@@ -1340,7 +1341,7 @@ mod tests {
     fn unset_default_terminal_is_never_gated_while_set_refuses() {
         assert!(
             !crate::defterm_win::handoff_server_available(),
-            "no COM handoff server ships in this build yet"
+            "no COM handoff server ships in this build"
         );
         let set_err = crate::defterm_win::set_default_terminal()
             .expect_err("set must refuse while nothing can answer the handoff");
@@ -1420,7 +1421,7 @@ mod tests {
                 assert!(
                     aterm_toml::from_str::<Config>(rest).is_ok(),
                     "STARTER_CONFIG ships an uncommentable key — uncommenting it would \
-                     abort the config load and revert to defaults:\n  {rest}"
+                     fail the config load and revert to defaults:\n  {rest}"
                 );
                 checked.push(key.to_string());
             }
@@ -1498,7 +1499,7 @@ mod tests {
         let parsed: Config = aterm_toml::from_str(&block).unwrap_or_else(|e| {
             panic!(
                 "STARTER_CONFIG ships an uncommentable [matrix_rain] line — \
-                 uncommenting the block would abort the config load:\n{block}\n{e}"
+                 uncommenting the block would fail the config load:\n{block}\n{e}"
             )
         });
         let mr = parsed

@@ -30,6 +30,7 @@ pub use background::{BackgroundCall, BackgroundEvidence};
 pub use blocks::View;
 pub use classify::{DEFAULT_PYTHON_ALLOW, classify_command_with};
 pub use config::{Autopilot, LandAt, Occupancy, SupervisorConfig};
+pub use facts::{Fact, FactsReading};
 pub use journal::{Journal, read_journal};
 pub use ledger::{
     ClockAnchor, Format as LedgerFormat, LedgerHost, LedgerOpts, LedgerSource, gather, parse_since,

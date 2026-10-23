@@ -18,6 +18,7 @@ use crate::spectrum::{spectrum, spectrum_with_min_saturation};
 
 use super::meteor::tri;
 use super::spine::{DISP_RELEASE_TAU, PHASE_RATE};
+use super::stardust::GlyphProbe;
 use super::timing::{
     EDGE_IN_S, FLIGHT_MIN_MS, IOI_DEFAULT_MS, JUMP_MIN_CELLS, REDUCED_MOTION_FADE_MS, clamp01,
     edge_in, flight_ms, ioi_next, kill_span_s, phrase_rest_ms, smoothstep01, spend, suck_in,
@@ -143,6 +144,20 @@ pub const ATTACK_WIPE_FRONT: f32 = 0.35;
 /// How far below the row bottom the vivid rail may reach, in cells.
 pub const RAIL_REACH_MAX_CH: f32 = DN_TOP_CH;
 
+/// The hairline of body the vivid rail leaves under the row, in cells
+/// ([`rail_gap_px`]): a descender's foot ends on the row's last pixel row,
+/// and a rail laid at the row's bottom met it, so the foot read against the
+/// rail's gold next to it (`g` of `dog` at 1.38:1, 2026-10-22, every rainbow
+/// kitty burst).
+pub const RAIL_GAP_CH: f32 = 0.06;
+
+/// [`RAIL_GAP_CH`] in whole device pixels at cell height `ch`, at least one.
+#[inline]
+#[must_use]
+pub fn rail_gap_px(ch: f32) -> f32 {
+    (RAIL_GAP_CH * ch).round().max(1.0)
+}
+
 const _: () = assert!(RAIL_REACH_MAX_CH < aterm_render::SUB_CEILING);
 
 /// The bed's byte ceiling.
@@ -189,8 +204,13 @@ pub const PAPER_BAR_THEME_SHARE: f32 = 0.8;
 /// The leading-only body's weight (the underline spelling, [`InkRole::Leading`]).
 pub const PAPER_WEIGHT_LEADING: f32 = 0.30;
 
-/// The least contrast the caret block keeps against a light page ([`paper_caret_ink`]).
-pub const PAPER_CARET_CONTRAST: f32 = 3.0;
+/// The least contrast the caret block keeps against a light page
+/// ([`paper_caret_ink`]): the caret law's 4.5:1, as every effect-owned
+/// caret's ([`crate::cursor_fx::CARET_PAGE_MIN_CONTRAST`]). Held to a
+/// graphic's 3:1, a hot burst's green and orange stops printed their carets
+/// at 3.26:1 on white (`#6a9d01`, `#f35d01`; 2026-10-22, the trail gallery's
+/// `burst`, every rainbow spelling on both light themes).
+pub const PAPER_CARET_CONTRAST: f32 = crate::cursor_fx::CARET_PAGE_MIN_CONTRAST;
 
 /// The least contrast a point mark keeps against a light page ([`paper_mark_ink`]).
 pub const PAPER_MARK_CONTRAST: f32 = 4.5;
@@ -953,11 +973,46 @@ fn onto_luma(rgb: u32, target: f32) -> u32 {
     }
 }
 
-/// The bed's on-glass ink.
+/// The bed's on-glass ink: the stop, its hue bent off the dark bed's mud
+/// ([`DARK_HUE_BEND`]), held to the letters' luminance budget.
 #[inline]
 #[must_use]
 pub fn bed_ink(rgb: u32, budget: f32) -> u32 {
+    onto_luma(
+        dark_hue_bent(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR)),
+        budget,
+    )
+}
+
+/// Round 2's bed ink, unbent (a test's control).
+#[cfg(test)]
+pub(crate) fn bed_ink_unbent(rgb: u32, budget: f32) -> u32 {
     onto_luma(spectrum_with_min_saturation(rgb, BED_SAT_FLOOR), budget)
+}
+
+/// THE DARK BED KEEPS ITS STOPS' CHROMA: held to the letters' luminance
+/// budget (some 0.07 under `#d0d0d0` text), every hue from orange to
+/// yellow-green has no vivid colour left in sRGB (OKLab chroma 0.08 to 0.10:
+/// `#753a00` brown, `#4d4d00` olive, `#375200`), and a third of the walk drew
+/// the body in mud (`#524504`, `#374e03`, 2026-10-23, the round-2 judges).
+/// The bend draws orange as a red-orange and yellow as a deep orange, both
+/// as vivid as the budget allows (chroma 0.12 and more), and crosses the
+/// basin to green inside the yellow→green interval, as the light bed's
+/// [`PAPER_HUE_BEND`] bends yellow off the paper. Degrees in → out.
+const DARK_HUE_BEND: [(f32, f32); 4] = [(0.0, 0.0), (30.0, 14.0), (60.0, 24.0), (90.0, 92.0)];
+
+fn dark_hue_bent(rgb: u32) -> u32 {
+    let (h, s, v) = rgb2hsv(rgb);
+    if v <= 0.0 || s <= 0.0 {
+        return rgb;
+    }
+    let bent = DARK_HUE_BEND
+        .windows(2)
+        .find(|k| (k[0].0..k[1].0).contains(&h))
+        .map_or(h, |k| {
+            k[0].1 + (k[1].1 - k[0].1) * (h - k[0].0) / (k[1].0 - k[0].0)
+        });
+    if bent == h { rgb } else { hsv2rgb(bent, s, v) }
 }
 
 /// The bed's light twin, its ink on paper.
@@ -1466,7 +1521,20 @@ struct Run {
     at_caret: bool,
     born: Instant,
     stream_dir: i8,
+    /// How far the run is held inside its row ([`Ribbon::plan_over`]), `0`
+    /// to `1`: at `1` the body is laid inside the typed row, as on a pane's
+    /// last row, and the rail is dark, so no light lies on the next line's
+    /// ascenders; between, both shapes blend and the rail dims.
+    hold: f32,
 }
+
+/// How long a line's light takes to settle into its row when the next row
+/// inks under it (and to reach below again when it clears), seconds.
+pub const HOLD_EASE_S: f32 = 0.15;
+
+/// How long a held row takes to let go of its row, seconds: when the next
+/// row clears, and when a line on it flows into the fold.
+pub const HOLD_RELEASE_S: f32 = 0.60;
 
 /// The feather a run the hand has left wears at its head end ([`Ribbon::head_feather`]): `1` everywhere for a run at the caret.
 #[derive(Clone, Copy, Debug)]
@@ -1594,6 +1662,24 @@ pub struct Ribbon {
     /// Test-only: lay the boundaries inside a head feather's reach at the stride, as they were ([`for_each_feathered`]), the negative control of the smooth feather's test.
     #[cfg(test)]
     feather_coarse: bool,
+    /// Test-only: step a line's hold to its target in one frame, as it first
+    /// did, the negative control of the hold's ease.
+    #[cfg(test)]
+    hold_steps: bool,
+    /// Test-only: lay the rail at the row's bottom ([`RAIL_GAP_CH`] off), as
+    /// it was, the negative control of the descenders' hairline.
+    #[cfg(test)]
+    rail_flush: bool,
+    /// Test-only: leave each row's hold behind when a scroll or a band move
+    /// carries its line away, as it first did, the negative control of the
+    /// carried hold.
+    #[cfg(test)]
+    holds_left_behind: bool,
+    /// Each row's hold ([`Run::hold`]), with when it was last eased, and its
+    /// next frame's list (resident and reused). By row: the runs of a row
+    /// share seams, so they share a floor.
+    holds: Vec<(u16, f32, Instant)>,
+    holds_next: Vec<(u16, f32, Instant)>,
     /// The live cells, resident and reused (§18: no allocation per frame).
     cells: Vec<Cell>,
     cohorts: Vec<Cohort>,
@@ -4081,6 +4167,29 @@ impl Ribbon {
 
     /// Build this frame's [`Ribbon::plan`] and [`FieldIndex`].
     pub fn plan(&mut self, ctx: &Ctx<'_>) {
+        self.plan_over(ctx, None);
+    }
+
+    /// [`Self::plan`] told what the glyphs below the light hold (`below`, the
+    /// frame's [`GlyphProbe`]). A row of light whose next row is probed with
+    /// ink under it (a column either side of its span included) is held
+    /// inside its own row: its body takes the pane's last-row shape (spine
+    /// lifted by the lower reach, so nothing reaches past the row's bottom)
+    /// and its rail stays dark. Without it the body's lower reach
+    /// ([`DN_FLOOR_CH`] to [`DN_TOP_CH`]), a wave crest's core and the rail lay
+    /// up to a third of a cell of light on the next line's ascenders (the
+    /// 2026-10-22 context and enter-bottom frames: 1 to 5 px of the core
+    /// across the tops of the row below). The pane's last row is held (it has
+    /// no row under it). A row first lit over ink is born held, one first lit
+    /// over a blank row or a row the probe does not know is born free; one
+    /// whose next row inks while it is lit eases into its row over
+    /// [`HOLD_EASE_S`], and one whose next row clears, or whose line flows into
+    /// the fold, lets go over [`HOLD_RELEASE_S`]; while the probe does not know
+    /// the row below (a scroll's frame clears it) the row keeps its level. A
+    /// scroll or a band move carries each row's hold with its line, so a line
+    /// typed on the last row and scrolled up by its Enter over the line it
+    /// prints stays in its row from the scroll's frame on.
+    pub fn plan_over(&mut self, ctx: &Ctx<'_>, below: Option<&GlyphProbe>) {
         self.ink.sync(ctx.cfg);
         self.ground = ctx.cfg.theme_bg;
         self.caret = Some(ctx.caret);
@@ -4096,7 +4205,7 @@ impl Ribbon {
             self.seam = None;
         }
         self.heal_seams();
-        self.build(ctx);
+        self.build(ctx, below);
         self.scroll_followed = false;
         self.followed_now.clear();
         self.short_reanchor = None;
@@ -4311,7 +4420,7 @@ impl Ribbon {
         }
     }
 
-    fn build(&mut self, ctx: &Ctx<'_>) {
+    fn build(&mut self, ctx: &Ctx<'_>, below: Option<&GlyphProbe>) {
         let cols = u16::try_from(ctx.geom.cols).unwrap_or(u16::MAX);
         self.plan.clear();
         self.runs.clear();
@@ -4372,7 +4481,7 @@ impl Ribbon {
             self.index.set(row, col, cell.t);
         }
         self.slabs = Self::slabs_for(ctx, sorted.len());
-        self.build_runs(ctx, &sorted);
+        self.build_runs(ctx, &sorted, below);
         self.sorted = sorted;
         self.runs
             .sort_unstable_by(|a, b| b.at_caret.cmp(&a.at_caret).then(b.born.cmp(&a.born)));
@@ -4395,7 +4504,12 @@ impl Ribbon {
         (fit.max(1.0) as usize).clamp(1, SLABS_PER_CELL)
     }
 
-    fn build_runs(&mut self, ctx: &Ctx<'_>, sorted: &[(u16, u16, u32)]) {
+    fn build_runs(
+        &mut self,
+        ctx: &Ctx<'_>,
+        sorted: &[(u16, u16, u32)],
+        below: Option<&GlyphProbe>,
+    ) {
         const fn cohort_of(cells: &[Cell], e: (u16, u16, u32)) -> Option<u32> {
             let idx = e.2 as usize;
             if idx < cells.len() {
@@ -4404,8 +4518,41 @@ impl Ribbon {
                 None
             }
         }
+        // One answer per row (its runs share seams, so they share a floor).
+        let mut held_row: Option<(u16, f32)> = None;
+        let chf = ctx.geom.ch as f32;
+        let pane_bot = self.pane_bot(ctx, chf);
         let mut s = 0usize;
         while s < sorted.len() {
+            let row = sorted[s].0;
+            let hold = match held_row {
+                Some((r, hold)) if r == row => hold,
+                _ => {
+                    let last = sorted[s..]
+                        .iter()
+                        .take_while(|e| e.0 == row)
+                        .last()
+                        .map_or(sorted[s].1, |e| e.1);
+                    let floor = f32::from(ctx.geom.origin_y) + (f32::from(row) + 1.0) * chf;
+                    let held = if floor >= pane_bot {
+                        Some(true)
+                    } else {
+                        below.and_then(|p| Self::inked_below(p, ctx, row, sorted[s].1, last))
+                    };
+                    let flowing = sorted[s..]
+                        .iter()
+                        .take_while(|e| e.0 == row)
+                        .filter_map(|e| cohort_of(&self.cells, *e))
+                        .any(|id| {
+                            self.cohorts
+                                .iter()
+                                .any(|c| c.id == id && c.flow.is_some() && c.phase.is_retracting())
+                        });
+                    let hold = self.ease_hold(ctx, row, held.map(|h| h && !flowing));
+                    held_row = Some((row, hold));
+                    hold
+                }
+            };
             let mut e = s;
             while e + 1 < sorted.len()
                 && sorted[e + 1].0 == sorted[s].0
@@ -4430,9 +4577,61 @@ impl Ribbon {
                 None
             };
             let right = nb(Some(e + 1), sorted[e].1.checked_add(1));
-            self.plan_run(ctx, &sorted[s..=e], seam, right);
+            self.plan_run(ctx, &sorted[s..=e], seam, right, hold);
             s = e + 1;
         }
+        mem::swap(&mut self.holds, &mut self.holds_next);
+        self.holds_next.clear();
+    }
+
+    /// Row `row`'s hold this frame, eased toward `held` from its last
+    /// ([`HOLD_EASE_S`] in, [`HOLD_RELEASE_S`] out), or born at it; recorded
+    /// for the next frame. `None` (the row below not known: the frame of a
+    /// scroll, which clears the probe, or a row away from the caret's) keeps
+    /// the level the row had, and a row first lit so is born free.
+    fn ease_hold(&mut self, ctx: &Ctx<'_>, row: u16, held: Option<bool>) -> f32 {
+        #[cfg(test)]
+        let steps = self.hold_steps;
+        #[cfg(not(test))]
+        let steps = false;
+        let last = self.holds.iter().find(|h| h.0 == row).map(|h| (h.1, h.2));
+        let level = match (held.map(|h| f32::from(u8::from(h))), last) {
+            (None, Some((level, _))) => level,
+            (None, None) => 0.0,
+            (Some(target), Some((level, at))) if !steps && !ctx.cfg.reduced_motion => {
+                let dt = ctx.now.saturating_duration_since(at).as_secs_f32();
+                if target > level {
+                    (level + dt / HOLD_EASE_S).min(target)
+                } else {
+                    (level - dt / HOLD_RELEASE_S).max(target)
+                }
+            }
+            (Some(target), _) => target,
+        };
+        self.holds_next.push((row, level, ctx.now));
+        level
+    }
+
+    /// Does `probe` know ink on the row below `row`, under `col0..=col1` or a
+    /// column either side? `Some(false)` when it knows every one of them
+    /// blank, `None` when it knows no ink there and not all of them.
+    fn inked_below(
+        probe: &GlyphProbe,
+        ctx: &Ctx<'_>,
+        row: u16,
+        col0: u16,
+        col1: u16,
+    ) -> Option<bool> {
+        let below = i32::from(row) + 1;
+        let mut known = true;
+        for col in col0.saturating_sub(1)..=col1.saturating_add(1) {
+            match probe.at(below, col, ctx.geom.rows) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => known = false,
+            }
+        }
+        known.then_some(false)
     }
 
     fn sample(
@@ -4441,6 +4640,7 @@ impl Ribbon {
         cell: &Cell,
         coh: Option<&Cohort>,
         sp: f32,
+        hold: f32,
     ) -> (f32, f32, f32, f32) {
         let chf = ctx.geom.ch as f32;
         let prof = Self::body_profile(ctx.cfg);
@@ -4474,30 +4674,48 @@ impl Ribbon {
         let span = coh.map_or(1.0, |c| f32::from(c.col1.saturating_sub(c.col0)).max(1.0));
         let behind = sp * span;
         let bloom = clamp01(ctx.disp) * (1.0 - smoothstep01(behind / BLOOM_REACH_CELLS));
-        let pane_bot = self.pane_bot(ctx, chf);
         let row_bot = f32::from(ctx.geom.origin_y) + (f32::from(cell.row) + 1.0) * chf;
-        let room_below = pane_bot - row_bot;
-        let last_row = room_below < prof.dn_ch * chf;
-        let dn_ch = if last_row { DN_TOP_CH } else { prof.dn_ch };
-        let dn_open = chf * (DN_FLOOR_CH + (dn_ch - DN_FLOOR_CH) * clamp01(bloom));
-        let dn = (dn_open - wave.max(0.0)).max(DN_FLOOR_CH * chf);
-        let dn = (DN_FLOOR_CH * chf
-            + (dn - DN_FLOOR_CH * chf) * (1.0 - FLOW_SETTLE_SHARE * settle))
-            * (1.0 - breath);
-        let up_ch = if Self::comet(ctx.cfg) && !last_row {
-            prof.up_ch
-                * (1.0
-                    - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
-                        * smoothstep01(behind / COMET_TAPER_CELLS))
-        } else {
-            prof.up_ch
+        // The body over a floor at `pane_bot`: a held row's floor is its own
+        // bottom, where it is laid as a last row is.
+        let shape = |pane_bot: f32| -> (f32, f32, f32) {
+            let room_below = pane_bot - row_bot;
+            let last_row = room_below < prof.dn_ch * chf;
+            let dn_ch = if last_row { DN_TOP_CH } else { prof.dn_ch };
+            let dn_open = chf * (DN_FLOOR_CH + (dn_ch - DN_FLOOR_CH) * clamp01(bloom));
+            let dn = (dn_open - wave.max(0.0)).max(DN_FLOOR_CH * chf);
+            let dn = (DN_FLOOR_CH * chf
+                + (dn - DN_FLOOR_CH * chf) * (1.0 - FLOW_SETTLE_SHARE * settle))
+                * (1.0 - breath);
+            let up_ch = if Self::comet(ctx.cfg) && !last_row {
+                prof.up_ch
+                    * (1.0
+                        - (1.0 - COMET_UP_TAIL_CH / TALL_UP_CH)
+                            * smoothstep01(behind / COMET_TAPER_CELLS))
+            } else {
+                prof.up_ch
+            };
+            let up = (up_ch * chf + wave.min(0.0)).max(0.0)
+                * (1.0 - FLOW_SETTLE_SHARE * settle)
+                * (1.0 - breath);
+            let spine = (row_bot + wave)
+                .min(pane_bot - dn)
+                .max(ctx.geom.fx_top() as f32);
+            (spine, up, dn)
         };
-        let up = (up_ch * chf + wave.min(0.0)).max(0.0)
-            * (1.0 - FLOW_SETTLE_SHARE * settle)
-            * (1.0 - breath);
-        let spine = (row_bot + wave)
-            .min(pane_bot - dn)
-            .max(ctx.geom.fx_top() as f32);
+        let pane_bot = self.pane_bot(ctx, chf);
+        let (spine, up, dn) = if hold <= 0.0 {
+            shape(pane_bot)
+        } else if hold >= 1.0 {
+            shape(pane_bot.min(row_bot))
+        } else {
+            let (free, held) = (shape(pane_bot), shape(pane_bot.min(row_bot)));
+            let mix = |a: f32, b: f32| a + (b - a) * hold;
+            (
+                mix(free.0, held.0),
+                mix(free.1, held.1),
+                mix(free.2, held.2),
+            )
+        };
         (spine, up, dn, self.cov_of(ctx, cell, coh))
     }
 
@@ -4741,6 +4959,7 @@ impl Ribbon {
         run: &[(u16, u16, u32)],
         seam: Option<Segment>,
         right_nb: Option<Cell>,
+        hold: f32,
     ) {
         let row = run[0].0;
         let (col0, col1) = (run[0].1, run[run.len() - 1].1);
@@ -4821,11 +5040,11 @@ impl Ribbon {
             };
             let sp = |c: &Cell| f32::from(head_col.abs_diff(c.col)) / span;
             debug_assert_eq!(left_sample.is_some(), left.is_some());
-            let sa = left_sample.unwrap_or_else(|| self.sample(ctx, a, coh, sp(a)));
+            let sa = left_sample.unwrap_or_else(|| self.sample(ctx, a, coh, sp(a), hold));
             let sb = if a.col == b.col {
                 sa
             } else {
-                self.sample(ctx, b, coh, sp(b))
+                self.sample(ctx, b, coh, sp(b), hold)
             };
             left_sample = right.map(|_| sb);
             let mid = |u: f32, v: f32| (u + v) * 0.5;
@@ -4958,6 +5177,7 @@ impl Ribbon {
                 at_caret,
                 born,
                 stream_dir,
+                hold,
             });
         }
     }
@@ -4999,6 +5219,14 @@ impl Ribbon {
         let pane_bot = self.pane_bot(ctx, chf);
         let dn_floor = DN_FLOOR_CH * chf;
         let rail_reach_max = RAIL_REACH_MAX_CH * chf;
+        #[cfg(test)]
+        let rail_gap = if self.rail_flush {
+            0.0
+        } else {
+            rail_gap_px(chf)
+        };
+        #[cfg(not(test))]
+        let rail_gap = rail_gap_px(chf);
         let plan = &self.plan;
         let ink = &self.ink;
         let head_feather = |run: &Run| self.head_feather(ctx, run);
@@ -5009,7 +5237,7 @@ impl Ribbon {
         {
             let mut paint = |out: &mut Vec<GlowQuad>, run: &Run, rail_layer: bool| -> bool {
                 let row_bottom = f32::from(ctx.geom.origin_y) + (f32::from(run.row) + 1.0) * chf;
-                if rail_layer && (!rail || row_bottom >= pane_bot) {
+                if rail_layer && (!rail || run.hold >= 1.0 || row_bottom >= pane_bot) {
                     return true;
                 }
                 let head_feather_of = head_feather(run);
@@ -5032,7 +5260,8 @@ impl Ribbon {
                         if i == Some(run.head - run.lo) {
                             head_rev = verts.len();
                         }
-                        let top = row_bottom.max(seg.spine);
+                        // The vivid rail lies a hairline below the row's bottom.
+                        let top = (row_bottom + rail_gap).max(seg.spine);
                         let dn = (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max);
                         verts.push(RibbonVertex {
                             x: seg.x,
@@ -5042,7 +5271,7 @@ impl Ribbon {
                             core_up: 0.0,
                             core_dn: dn * RAIL_CORE_SHARE,
                             color: ink.rail_at(seg.t),
-                            cov: seg.cov * RAIL_GAIN * feather(seg.x),
+                            cov: seg.cov * RAIL_GAIN * feather(seg.x) * (1.0 - run.hold),
                             lift: 0.0,
                             lift_span: 0.0,
                         });
@@ -5856,6 +6085,17 @@ impl Ribbon {
         if let Some(gate) = &mut self.fresh_line {
             gate.left_row = gate.left_row.and_then(|row| row.checked_sub(rows));
         }
+        self.holds.retain_mut(|h| match h.0.checked_sub(rows) {
+            Some(row) => {
+                h.0 = row;
+                true
+            }
+            None => false,
+        });
+        #[cfg(test)]
+        if self.holds_left_behind {
+            self.holds.clear();
+        }
         self.index.translate(rows);
         self.plan.clear();
         self.runs.clear();
@@ -5929,6 +6169,18 @@ impl Ribbon {
             gate.left_row = gate
                 .left_row
                 .and_then(|row| band_row(row, top, bottom, delta));
+        }
+        self.holds
+            .retain_mut(|h| match band_row(h.0, top, bottom, delta) {
+                Some(row) => {
+                    h.0 = row;
+                    true
+                }
+                None => false,
+            });
+        #[cfg(test)]
+        if self.holds_left_behind {
+            self.holds.clear();
         }
         self.index.translate_band(top, bottom, delta);
         self.plan.clear();
@@ -6034,6 +6286,60 @@ impl Ribbon {
 mod tests {
     use super::*;
     use crate::cursor_glow::{Geom, SoundCue};
+
+    #[test]
+    fn the_dark_bed_keeps_its_stops_chroma() {
+        // Under `#d0d0d0` text the dark bed is held to some 0.07 of
+        // luminance. Every named stop keeps a vivid colour there (OKLab
+        // chroma), the walk's warm half (red to green) draws little of its
+        // length in the olive and brown basin, and the letters' budget
+        // holds. (The green-to-blue crossing's teal is the same physics,
+        // and no judge's mud: it is left as main drew it.)
+        let budget = bed_luma_budget(0x00D0_D0D0);
+        let chroma = |rgb: u32| {
+            let [_, a, b] = crate::color_math::oklab(rgb);
+            a.hypot(b)
+        };
+        let warm = (0..BED_INK_LUT_LEN)
+            .take_while(|&i| {
+                let (h, ..) = rgb2hsv(walk_arc_at(i));
+                h <= 120.0
+            })
+            .count();
+        let muddy = |ink: fn(u32, f32) -> u32| {
+            (0..warm)
+                .filter(|&i| chroma(ink(walk_arc_at(i), budget)) < 0.105)
+                .count()
+        };
+        for (i, &stop) in crate::spectrum::SPECTRUM_ANCHORS.iter().enumerate() {
+            let ink = bed_ink(stop, budget);
+            assert!(
+                chroma(ink) >= 0.11,
+                "stop {i} holds to #{ink:06x}, chroma {:.3}",
+                chroma(ink)
+            );
+            assert!(
+                relative_luminance(ink) <= budget + 0.002,
+                "stop {i} #{ink:06x} passes the letters' budget"
+            );
+        }
+        let (bent, unbent) = (muddy(bed_ink), muddy(bed_ink_unbent));
+        assert!(warm > 40, "fixture: the warm half spans {warm} stations");
+        assert!(
+            5 * bent <= warm,
+            "{bent} of the warm half's {warm} stations hold to mud"
+        );
+        assert!(
+            3 * unbent > warm,
+            "control: unbent, {unbent} of {warm} warm stations hold to mud"
+        );
+        let yellow = bed_ink_unbent(0x00FF_FF00, budget);
+        assert!(
+            chroma(yellow) < 0.1,
+            "control: unbent, yellow holds to #{yellow:06x}, chroma {:.3}",
+            chroma(yellow)
+        );
+    }
     use aterm_render::{GlowQuad, RainHalo, over_premul, premul_rgb};
     use std::time::Duration;
 
@@ -6430,8 +6736,23 @@ mod tests {
                 );
             }
         }
-        assert_eq!(paper_caret_ink(0x00FF_0000, 0x00FF_FFFF), 0x00FF_0000);
+        // Blue stands 8.6:1 on white and stays pure; red, at 4.0:1, is
+        // deepened along its own ray to the caret law's 4.5:1.
         assert_eq!(paper_caret_ink(0x0000_00FF, 0x00FF_FFFF), 0x0000_00FF);
+        let red = paper_caret_ink(0x00FF_0000, 0x00FF_FFFF);
+        assert!(
+            red & 0x0000_FFFF == 0 && contrast(red, 0x00FF_FFFF) >= 4.5,
+            "red carets #{red:06X}"
+        );
+        // Control: held to a graphic's 3:1, a stop's caret on white falls
+        // under the caret law.
+        let low = (0..=128u32)
+            .map(|i| {
+                let stop = spectrum(i as f32 / 128.0);
+                contrast(paper_vivid_ink(stop, 0x00FF_FFFF, 3.0), 0x00FF_FFFF)
+            })
+            .fold(f32::INFINITY, f32::min);
+        assert!(low < 4.5, "control: at 3:1 every caret stands {low:.2}:1");
         let (h, ..) = rgb2hsv(paper_caret_ink(0x00FF_FF00, 0x00FF_FFFF));
         assert!(
             (35.0..=50.0).contains(&h),
@@ -9612,6 +9933,65 @@ mod tests {
         );
     }
 
+    /// The vivid rail stands a hairline below the row ([`RAIL_GAP_CH`]):
+    /// the first pixels under the row's bottom, where a descender's foot
+    /// meets the ground next to it, keep the text at the body's bar at every
+    /// phase of the wave, and the rail is still lit below them. Negative
+    /// control: the rail laid at the row's bottom (`rail_flush`) takes those
+    /// pixels to 1.35:1 (2026-10-22: `g` of `dog` at 1.38:1 by its foot in
+    /// every rainbow kitty burst).
+    #[test]
+    fn the_rail_leaves_the_descenders_a_hairline_of_body() {
+        let c = cfg(true, true);
+        let g = geom();
+        let ch = g.ch as f32;
+        let row_bottom = f32::from(g.origin_y) + 3.0 * ch;
+        let gap = rail_gap_px(ch);
+        assert!(gap >= 1.0, "premise: a hairline of at least a pixel");
+        for flush in [false, true] {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.rail_flush = flush;
+            type_run(&mut rib, t0, 10, 8, &c, 0.9);
+            let (mut worst, mut rail_lit) = (f64::INFINITY, false);
+            for ph in 0..8u16 {
+                let mut cx = ctx(at(t0, 8 * 60), &c, (2, 18), 0.9);
+                cx.phase = f32::from(ph) / 8.0;
+                rib.plan(&cx);
+                let mut sink = Sink::default();
+                {
+                    let mut f = sink.frame();
+                    rib.emit(&cx, &mut f);
+                }
+                let mut x = f32::from(g.origin_x) + 10.0 * g.cw as f32;
+                while x < f32::from(g.origin_x) + 18.0 * g.cw as f32 {
+                    for d in 0..gap as i32 {
+                        let lit = composite_at(&sink.under, x, row_bottom + d as f32);
+                        worst = worst.min(f64::from(contrast(DEFAULT_FG, lit)));
+                    }
+                    for d in gap as i32..(gap as i32 + 4) {
+                        let lit = composite_at(&sink.under, x, row_bottom + d as f32);
+                        rail_lit |= contrast(DEFAULT_FG, lit) < 3.0;
+                    }
+                    x += 1.0;
+                }
+            }
+            if flush {
+                assert!(
+                    worst < f64::from(BODY_CONTRAST_BAR),
+                    "negative control: the flush rail meets the row's bottom ({worst:.2}:1)"
+                );
+            } else {
+                assert!(
+                    worst >= f64::from(BODY_CONTRAST_BAR),
+                    "the hairline under the row reads the text at {worst:.2}:1, under the \
+                     body's {BODY_CONTRAST_BAR}:1"
+                );
+                assert!(rail_lit, "the rail is still lit below the hairline");
+            }
+        }
+    }
+
     #[test]
     fn the_flat_spelling_draws_no_rail() {
         let c = flat(true, true);
@@ -9646,6 +10026,252 @@ mod tests {
                 "the flat body is the bed everywhere: #{lit:06X} at y {}",
                 q.y
             );
+        }
+    }
+
+    /// A row of light whose next line holds ink stays inside its own row: no
+    /// body, core, wave crest or rail lies on the next line's ascenders, at any
+    /// phase of the wave, dark or light, tall, short or flat (the 2026-10-22
+    /// context and enter-bottom frames: the core 1 to 5 px into the row
+    /// below). The band is still drawn in its row. Negative controls: the same
+    /// typing over a row probed blank, and over no probe at all, reaches below
+    /// the row's bottom.
+    #[test]
+    fn a_row_with_ink_below_keeps_its_light_inside_the_row() {
+        let g = geom();
+        let ch = g.ch as f32;
+        let row_top = f32::from(g.origin_y) + 2.0 * ch;
+        let row_bottom = row_top + ch;
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(3, &[[true; 30], [false; 30]].concat());
+        let mut blank = GlyphProbe::new();
+        blank.probe_row(3, &[false; 120]);
+        // Ink only far from the run (cols 40..) holds nothing either.
+        let mut aside = GlyphProbe::new();
+        aside.probe_row(3, &[[false; 40], [true; 40]].concat());
+        for (c, name) in [
+            (cfg(true, true), "tall dark"),
+            (cfg(true, false), "short dark"),
+            (cfg(false, true), "tall light"),
+            (flat(true, true), "flat dark"),
+        ] {
+            for (probe, held, what) in [
+                (Some(&inked), true, "ink below"),
+                (Some(&blank), false, "blank below"),
+                (Some(&aside), false, "ink below, away from the run"),
+                (None, false, "no probe"),
+            ] {
+                let t0 = Instant::now();
+                let mut rib = Ribbon::new();
+                type_run(&mut rib, t0, 10, 8, &c, 0.9);
+                // The line was typed with no probe: told of the row below, it
+                // settles over the ease, judged once that is spent.
+                rib.plan_over(&ctx(at(t0, 8 * 60), &c, (2, 18), 0.9), probe);
+                let judged_at = at(t0, 8 * 60 + (HOLD_EASE_S * 1000.0) as u64 + 16);
+                let mut deepest = f32::NEG_INFINITY;
+                let mut in_row = 0usize;
+                for step in 0..8u16 {
+                    let mut cx = ctx(judged_at, &c, (2, 18), 0.9);
+                    cx.phase = f32::from(step) / 8.0;
+                    rib.plan_over(&cx, probe);
+                    let mut sink = Sink::default();
+                    {
+                        let mut f = sink.frame();
+                        rib.emit(&cx, &mut f);
+                    }
+                    for q in sink.under.iter().filter(|q| q.color != 0) {
+                        let bottom = f32::from(q.y) + f32::from(q.h);
+                        deepest = deepest.max(bottom);
+                        in_row += usize::from(f32::from(q.y) >= row_top && bottom <= row_bottom);
+                    }
+                    // Lifted into its row, the body keeps the typed letters at the bar.
+                    if held && c.dark_theme {
+                        let cw = g.cw as f32;
+                        let mut x = f32::from(g.origin_x) + 10.0 * cw;
+                        while x < f32::from(g.origin_x) + 18.0 * cw {
+                            let mut y = row_top;
+                            while y < row_bottom {
+                                let lit = composite_at(&sink.under, x, y);
+                                let k = contrast(DEFAULT_FG, lit);
+                                assert!(
+                                    k >= BODY_CONTRAST_BAR,
+                                    "{name}, {what}: the held body takes the typed letters to \
+                                     {k:.2}:1 at x {x}, {:.0} px above the row bottom",
+                                    row_bottom - y
+                                );
+                                y += 1.0;
+                            }
+                            x += 1.0;
+                        }
+                    }
+                }
+                assert!(in_row > 0, "{name}, {what}: the band must still be drawn");
+                if held {
+                    assert!(
+                        deepest <= row_bottom,
+                        "{name}, {what}: light reaches {:.1} px past the row's bottom onto the \
+                         next line's ascenders",
+                        deepest - row_bottom
+                    );
+                } else {
+                    assert!(
+                        deepest > row_bottom + 1.0,
+                        "negative control, {name}, {what}: the body's lower reach must lie \
+                         below the row (deepest {:.1} px past it)",
+                        deepest - row_bottom
+                    );
+                }
+            }
+        }
+    }
+
+    /// A lit line whose next row inks under it settles into its row over
+    /// [`HOLD_EASE_S`], never in one frame: the frame after the ink lands it
+    /// still reaches below the row by most of its reach, and once the ease is
+    /// spent nothing does. Negative control: the hold stepped to its target
+    /// (`hold_steps`) is inside the row in the first frame.
+    #[test]
+    fn a_line_whose_next_row_inks_settles_into_its_row_over_the_ease() {
+        let g = geom();
+        let row_bottom = f32::from(g.origin_y) + 3.0 * g.ch as f32;
+        let mut inked = GlyphProbe::new();
+        inked.probe_row(3, &[[true; 30], [false; 30]].concat());
+        let mut blank = GlyphProbe::new();
+        blank.probe_row(3, &[false; 120]);
+        let c = cfg(true, true);
+        let deepest = |rib: &mut Ribbon, now: Instant, probe: &GlyphProbe| {
+            let cx = ctx(now, &c, (2, 18), 0.9);
+            rib.plan_over(&cx, Some(probe));
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            sink.under
+                .iter()
+                .filter(|q| q.color != 0)
+                .map(|q| f32::from(q.y) + f32::from(q.h))
+                .fold(f32::NEG_INFINITY, f32::max)
+                - row_bottom
+        };
+        for steps in [false, true] {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.hold_steps = steps;
+            type_run(&mut rib, t0, 10, 8, &c, 0.9);
+            let lit = at(t0, 8 * 60);
+            let free = deepest(&mut rib, lit, &blank);
+            assert!(
+                free > 2.0,
+                "premise: a free line reaches {free:.1} px below"
+            );
+            let first = deepest(&mut rib, at(t0, 8 * 60 + 16), &inked);
+            let settled = deepest(
+                &mut rib,
+                at(t0, 8 * 60 + 16 + (HOLD_EASE_S * 1000.0) as u64 + 16),
+                &inked,
+            );
+            assert!(
+                settled.is_finite(),
+                "steps {steps}: the line is still lit once the ease is spent"
+            );
+            assert!(
+                settled <= 0.0,
+                "steps {steps}: once the ease is spent nothing reaches below the row \
+                 ({settled:.1} px)"
+            );
+            if steps {
+                assert!(
+                    first <= 0.0,
+                    "negative control: a stepped hold is in its row in one frame ({first:.1} px)"
+                );
+            } else {
+                assert!(
+                    first > 0.5 * free,
+                    "the frame after the ink lands the line still reaches {first:.1} of its \
+                     {free:.1} px below: it eases in, not in one frame"
+                );
+            }
+        }
+    }
+
+    /// A LINE A SCROLL CARRIES UP KEEPS ITS ROW'S SHAPE (the 2026-10-23
+    /// `enter-bottom` frame: Enter on the bottom row scrolled the echo up over
+    /// the line it printed, and that frame laid the core across the printed
+    /// ascenders, 1.5:1 by the lab's local judge). Typed on the pane's last
+    /// row, the line is laid inside its row; carried up two rows, on the
+    /// scroll's frame (the probe cleared, knowing nothing below) and on every
+    /// frame after (the probe knowing the printed line), no light lies past
+    /// its row's bottom. Negative control: the hold left behind by the scroll
+    /// (`holds_left_behind`) lays the body's lower reach on the printed line
+    /// in the scroll's frame.
+    #[test]
+    fn a_line_a_scroll_carries_up_keeps_its_rows_shape() {
+        let g = Geom {
+            rows: 14,
+            win_h: 14 * 18,
+            ..geom()
+        };
+        let ch = g.ch as f32;
+        let c = cfg(true, true);
+        let bottom = 13u16;
+        let echo = bottom - 2;
+        let echo_bottom = f32::from(g.origin_y) + f32::from(echo + 1) * ch;
+        let mut printed = GlyphProbe::new();
+        printed.probe_row(i32::from(echo) + 1, &[[true; 30], [false; 30]].concat());
+        let deepest = |rib: &mut Ribbon, now: Instant, probe: Option<&GlyphProbe>| {
+            let cx = ctx_in(now, &c, (bottom, 2), 0.9, g);
+            rib.plan_over(&cx, probe);
+            let mut sink = Sink::default();
+            {
+                let mut f = sink.frame();
+                rib.emit(&cx, &mut f);
+            }
+            sink.under
+                .iter()
+                .filter(|q| q.color != 0)
+                .map(|q| f32::from(q.y) + f32::from(q.h))
+                .fold(f32::NEG_INFINITY, f32::max)
+                - echo_bottom
+        };
+        for left_behind in [false, true] {
+            let t0 = Instant::now();
+            let mut rib = Ribbon::new();
+            rib.holds_left_behind = left_behind;
+            let keys = Keys {
+                g,
+                row: bottom,
+                col0: 2,
+                n: 12,
+                period_ms: 60,
+                disp: 0.9,
+            };
+            type_keys(&mut rib, t0, keys, &c);
+            rib.translate_scroll(2);
+            let scrolled = deepest(&mut rib, at(t0, 12 * 60), None);
+            assert!(
+                scrolled.is_finite(),
+                "left behind {left_behind}: the carried line is still lit"
+            );
+            if left_behind {
+                assert!(
+                    scrolled > 2.0,
+                    "negative control: with the hold left behind the scroll's frame reaches \
+                     only {scrolled:.1} px onto the printed line"
+                );
+                continue;
+            }
+            assert!(
+                scrolled <= 0.0,
+                "the scroll's frame lays light {scrolled:.1} px onto the printed line"
+            );
+            for ms in (16..=320).step_by(16) {
+                let later = deepest(&mut rib, at(t0, 12 * 60 + ms), Some(&printed));
+                assert!(
+                    later <= 0.0,
+                    "+{ms} ms: light reaches {later:.1} px onto the printed line"
+                );
+            }
         }
     }
 
@@ -12838,6 +13464,7 @@ mod tests {
             at_caret: true,
             born: now,
             stream_dir,
+            hold: 0.0,
         });
 
         let mut sink = Sink::default();
@@ -12882,6 +13509,7 @@ mod tests {
                 at_caret: true,
                 born: now,
                 stream_dir: -1,
+                hold: 0.0,
             },
             Run {
                 row: OWNER_ROW,
@@ -12895,6 +13523,7 @@ mod tests {
                 at_caret: false,
                 born: now,
                 stream_dir: -1,
+                hold: 0.0,
             },
         ]);
         let mut sink = Sink::default();

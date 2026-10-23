@@ -14,6 +14,7 @@ mod blit_invert;
 mod capture_tap_conformance;
 mod card_parity;
 mod cat_parity;
+mod companion_knock_gpu;
 mod conformance_gpuencode;
 mod conformance_tray_card_ring;
 mod cursor_shapes_gpu;
